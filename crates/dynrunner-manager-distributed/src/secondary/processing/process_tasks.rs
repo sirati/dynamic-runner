@@ -599,6 +599,17 @@ where
                 // replaced, so the worker doesn't get a chance
                 // to react.
                 self.op_mut().pool.workers[wid as usize].kill_subprocess();
+                // Sweep any task still bound to this slot in `active_tasks`
+                // into the reinject path BEFORE the restart replaces the
+                // subprocess (a new generation), so the replaced generation
+                // cannot strand it. The Disconnected / OOM paths that fed
+                // `restart_set` already swept with their specific failure
+                // classification, so this is a no-op for them; the
+                // `pending_worker_restarts`-sourced restarts (assignment-
+                // failure respawns) are the ones a residual entry could
+                // otherwise outlive. Belt-and-braces with the generation
+                // gate, which prevents the drift in the first place.
+                self.sweep_replaced_worker_task(wid).await?;
                 if let Err(e) = self
                     .op_mut()
                     .pool

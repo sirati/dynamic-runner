@@ -49,6 +49,28 @@ where
         event: WorkerEvent<I>,
         oom_watcher: &OomWatcher,
     ) -> Result<Option<WorkerId>, String> {
+        // Generation gate (root fix for the type-shift-respawn wedge).
+        //
+        // A worker-replacement edge (type-shift respawn, OOM/disconnect
+        // restart) bumps the slot's generation and installs a fresh
+        // subprocess. The prior subprocess's poll task may have buffered
+        // a TERMINAL event the pool's `abort_poll_task` could not retract
+        // (the poll loop resolves `poll_status` and `tx.send`s the
+        // terminal with no await in between). That stale event carries
+        // the OLD generation. Without this gate the secondary's terminal
+        // arms resolve the task by scanning `active_tasks` for the
+        // event's `worker_id` — so the stale terminal CONSUMES / mis-
+        // attributes the entry of whatever task the fresh subprocess was
+        // since bound to, leaving the real in-flight task orphaned
+        // (assigned-never-terminal) and wedging the phase barrier.
+        //
+        // The check (and its WARN) is owned by the pool, which owns
+        // worker identity + the per-slot generation — see
+        // [`dynrunner_manager_local::WorkerPool::is_stale_event`].
+        if self.op_mut().pool.is_stale_event(&event) {
+            return Ok(None);
+        }
+
         match event {
             WorkerEvent::TaskCompleted {
                 worker_id,
@@ -225,6 +247,7 @@ where
                 worker_id,
                 result,
                 binary,
+                ..
             } => {
                 // Reap the subprocess BEFORE reclaim_protocol so the
                 // exit status rides the same log line as the
@@ -390,15 +413,16 @@ where
             WorkerEvent::PhaseUpdate {
                 worker_id,
                 phase_name,
+                ..
             } => {
                 tracing::debug!(worker_id, phase = %phase_name, "phase update");
                 Ok(None)
             }
-            WorkerEvent::Keepalive { worker_id } => {
+            WorkerEvent::Keepalive { worker_id, .. } => {
                 tracing::trace!(worker_id, "worker keepalive");
                 Ok(None)
             }
-            WorkerEvent::Ready { worker_id } => {
+            WorkerEvent::Ready { worker_id, .. } => {
                 // Reclaim the protocol state from the background
                 // `wait_ready` watcher task that either
                 // `WorkerPool::ensure_worker_for_type_async` (type-shift

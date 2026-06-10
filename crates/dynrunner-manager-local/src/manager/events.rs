@@ -39,6 +39,16 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         factory: &mut impl WorkerFactory<M>,
         oom_watcher: &OomWatcher,
     ) {
+        // Generation gate: drop any event from a dead subprocess. A
+        // replacement edge bumps the slot's generation; a buffered stale
+        // terminal `abort_poll_task` could not retract would otherwise
+        // `clear_task` / reclaim against the FRESH slot, wiping the
+        // newly-assigned task's metadata. The check (and its WARN) is
+        // owned by the pool — see [`WorkerPool::is_stale_event`].
+        if self.pool.is_stale_event(&event) {
+            return;
+        }
+
         match event {
             WorkerEvent::TaskCompleted {
                 worker_id,
@@ -46,6 +56,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 result_data,
                 binary,
                 estimated_resources,
+                ..
             } => {
                 // Reclaim protocol state from the spawned poll task
                 self.pool.workers[worker_id as usize]
@@ -127,6 +138,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 worker_id,
                 result,
                 binary,
+                ..
             } => {
                 // Reap the subprocess BEFORE reclaim_protocol so the
                 // exit status rides the same log line as the
@@ -204,13 +216,14 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 self.restart_worker(worker_id, factory).await;
                 self.pending_worker_assignments.insert(worker_id);
             }
-            WorkerEvent::Ready { worker_id } => {
+            WorkerEvent::Ready { worker_id, .. } => {
                 tracing::info!(worker_id, "worker became ready");
                 self.pending_worker_assignments.remove(&worker_id);
             }
             WorkerEvent::PhaseUpdate {
                 worker_id,
                 phase_name,
+                ..
             } => {
                 tracing::debug!(worker_id, phase = %phase_name, "phase update");
                 let worker = &mut self.pool.workers[worker_id as usize];
@@ -219,7 +232,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 worker.phase_started_at = Some(Instant::now());
                 worker.phase_status_log_idx = 0;
             }
-            WorkerEvent::Keepalive { worker_id } => {
+            WorkerEvent::Keepalive { worker_id, .. } => {
                 tracing::trace!(worker_id, "keepalive");
                 self.pool.workers[worker_id as usize].last_keepalive = Some(Instant::now());
             }

@@ -36,6 +36,22 @@ use super::exit_status::{WorkerExitStatus, try_reap_subprocess};
 /// channel. This avoids head-of-line blocking when polling multiple workers.
 pub struct WorkerHandle<M: ManagerEndpoint, I: Identifier> {
     pub worker_id: WorkerId,
+    /// Monotonic per-slot subprocess generation. Set once at
+    /// construction and immutable for the handle's lifetime; the pool's
+    /// replacement edges (`replace_worker_slot`,
+    /// `ensure_worker_for_type_async`) construct the successor handle
+    /// with `predecessor.generation + 1` so each spawned subprocess in a
+    /// slot carries a strictly-increasing id.
+    ///
+    /// Every [`WorkerEvent`] the handle's poll machinery emits is stamped
+    /// with this value (captured at poll-task spawn). A consumer that
+    /// keeps the slot's CURRENT generation (the live handle's) can reject
+    /// any event whose generation is stale — the buffered-terminal a
+    /// type-shift respawn leaves behind on the pool's shared channel
+    /// (`abort_poll_task` cannot retract an already-sent message) carries
+    /// the OLD generation and is dropped rather than mis-attributed to
+    /// the fresh subprocess's task.
+    pub generation: u64,
     pub reserved_budgets: ResourceMap,
     pub estimated_resources: ResourceMap,
     pub current_binary: Option<TaskInfo<I>>,
@@ -91,12 +107,14 @@ pub struct WorkerHandle<M: ManagerEndpoint, I: Identifier> {
 impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     pub fn new(
         worker_id: WorkerId,
+        generation: u64,
         transport: M,
         event_tx: mpsc::UnboundedSender<WorkerEvent<I>>,
     ) -> Self {
         let waiting = RunnerProtocol::connect(transport);
         Self {
             worker_id,
+            generation,
             reserved_budgets: ResourceMap::new(),
             estimated_resources: ResourceMap::new(),
             current_binary: None,
@@ -372,6 +390,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                 self.idle = true;
                 Some(WorkerEvent::Ready {
                     worker_id: self.worker_id,
+                    generation: self.generation,
                 })
             }
             WaitReadyResult::NotYet(w) => {
@@ -382,6 +401,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                 self.protocol = RunnerProtocolState::Stopped(s);
                 Some(WorkerEvent::Disconnected {
                     worker_id: self.worker_id,
+                    generation: self.generation,
                     // Phase D: framework can't tell from a closed
                     // transport whether the worker process died from
                     // a deterministic bug or from an environment
@@ -446,6 +466,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
             .take_waiting()
             .ok_or_else(|| "spawn_ready_watcher requires WaitingForReady state".to_string())?;
         let worker_id = self.worker_id;
+        // Capture the slot's generation for the spawned task: immutable
+        // for the task's lifetime, so every event it emits carries the
+        // generation of the subprocess it is watching.
+        let generation = self.generation;
         let tx = self.event_tx.clone();
         let handle = tokio::task::spawn_local(async move {
             match waiting.wait_ready().await {
@@ -455,7 +479,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                     // before `reclaim_protocol` runs. The returned
                     // protocol state is the manager-side handle the
                     // reclaim path will re-install.
-                    let _ = tx.send(WorkerEvent::Ready { worker_id });
+                    let _ = tx.send(WorkerEvent::Ready {
+                        worker_id,
+                        generation,
+                    });
                     RunnerProtocolState::Idle(idle)
                 }
                 WaitReadyResult::NotYet(_) => {
@@ -476,6 +503,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                     // is the correct fail-safe.
                     let _ = tx.send(WorkerEvent::Disconnected {
                         worker_id,
+                        generation,
                         result: TaskResult::error(
                             ErrorType::Recoverable,
                             "Worker emitted non-Ready response \
@@ -489,6 +517,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                 WaitReadyResult::Disconnected(stopped) => {
                     let _ = tx.send(WorkerEvent::Disconnected {
                         worker_id,
+                        generation,
                         result: TaskResult::error(
                             ErrorType::Recoverable,
                             "Disconnected before Ready".into(),
@@ -567,12 +596,18 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
             AssignResult::Assigned(processing) => {
                 // Spawn a background task that polls the worker protocol.
                 let worker_id = self.worker_id;
+                // Capture the slot's generation: immutable for the
+                // poll task's lifetime, so every event the poll loop
+                // emits (including a terminal buffered past a
+                // replacement) carries this subprocess's generation.
+                let generation = self.generation;
                 let binary_clone = binary.clone();
                 let tx = self.event_tx.clone();
 
                 let est_clone = estimated_resources.clone();
                 let handle = tokio::task::spawn_local(async move {
-                    Self::poll_loop(processing, worker_id, binary_clone, est_clone, tx).await
+                    Self::poll_loop(processing, worker_id, generation, binary_clone, est_clone, tx)
+                        .await
                 });
 
                 self.poll_task = Some(handle);
@@ -598,6 +633,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     async fn poll_loop(
         mut processing: RunnerProtocol<Processing, M>,
         worker_id: WorkerId,
+        generation: u64,
         binary: TaskInfo<I>,
         estimated_resources: ResourceMap,
         tx: mpsc::UnboundedSender<WorkerEvent<I>>,
@@ -611,6 +647,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                 } => {
                     let _ = tx.send(WorkerEvent::TaskCompleted {
                         worker_id,
+                        generation,
                         result,
                         result_data,
                         binary: Some(binary),
@@ -627,16 +664,21 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                     if let Some(phase) = phase_update {
                         let _ = tx.send(WorkerEvent::PhaseUpdate {
                             worker_id,
+                            generation,
                             phase_name: phase,
                         });
                     } else if got_keepalive {
-                        let _ = tx.send(WorkerEvent::Keepalive { worker_id });
+                        let _ = tx.send(WorkerEvent::Keepalive {
+                            worker_id,
+                            generation,
+                        });
                     }
                     // Loop to read the next response
                 }
                 PollResult::Disconnected { result, protocol } => {
                     let _ = tx.send(WorkerEvent::Disconnected {
                         worker_id,
+                        generation,
                         result,
                         binary: Some(binary),
                     });
@@ -678,8 +720,8 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         }
     }
 
-    /// Abort the background poll task (if any) so it cannot emit
-    /// further [`WorkerEvent`]s on the pool's shared event channel.
+    /// Abort the background poll task (if any) so it stops emitting
+    /// [`WorkerEvent`]s on the pool's shared event channel.
     ///
     /// # Single concern
     ///
@@ -689,18 +731,20 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     /// might still emit (a buffered `Response::Completed` read from
     /// the closing pipe, a `Disconnected` synthesised from pipe-EOF
     /// after `kill_subprocess`) would land on the pool's `event_tx`
-    /// with the original `worker_id` and be processed by the
-    /// secondary's `handle_worker_event` AS IF it came from the
-    /// fresh subprocess — but the secondary has already removed the
-    /// killed task from `active_tasks`, so the lookup misses and
-    /// the event surfaces as `task done task_hash=None` (the
-    /// observed wedge symptom).
+    /// with the original `worker_id`.
     ///
-    /// `JoinHandle::abort` cancels the spawned task at its next
-    /// await point; the protocol state it was driving is forfeited
-    /// (the slot is being replaced anyway, so the prior protocol
-    /// state is no longer needed). The `tx` clone the task held
-    /// drops with the task, so no further events can be sent. The
+    /// `JoinHandle::abort` is BEST-EFFORT: it cancels the spawned
+    /// task at its NEXT await point — it CANNOT retract a terminal
+    /// the resolved `poll_status` already `tx.send`'d (the send is
+    /// synchronous, with no await between resolve and send). Such a
+    /// buffered stale terminal survives the abort and carries the OLD
+    /// generation; it is neutralized at the CONSUMER by the generation
+    /// gate (`WorkerPool::is_stale_event` — every event is stamped
+    /// with the emitting subprocess's [`Self::generation`], and the
+    /// replacement edge bumps the slot's generation, so the gate drops
+    /// the stale event instead of processing it against the fresh
+    /// slot's bindings). The protocol state the task was driving is
+    /// forfeited (the slot is being replaced anyway). The
     /// `WorkerHandle` itself is unchanged from the caller's
     /// perspective; the pool's replacement code follows with the
     /// usual `kill_subprocess` + new-handle assignment.

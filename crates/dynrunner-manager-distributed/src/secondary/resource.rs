@@ -268,6 +268,50 @@ where
         self.send_to_primary(msg).await
     }
 
+    /// Sweep any `active_tasks` entry bound to `worker_id` into the
+    /// reinject path before the slot's subprocess is REPLACED.
+    ///
+    /// A worker-replacement edge installs a fresh subprocess (a new
+    /// generation) into the slot. If the slot still carries an
+    /// `active_tasks` entry, the bound task would otherwise be silently
+    /// abandoned — assigned-never-terminal — and wedge the phase
+    /// barrier. This sweeps that entry through the SAME backpressure-
+    /// shaped reinject contract `report_deferred_task_lost` already
+    /// uses (the authority requeues + re-dispatches without consuming
+    /// retry budget). No-op when the slot has no bound task (the common
+    /// case: replacement of an idle or already-swept slot).
+    ///
+    /// The paths that report a SPECIFIC terminal disposition before
+    /// replacing the worker (OOM-kill → `ResourceExhausted`; explicit
+    /// wire-failure → `NonRecoverable`) sweep `active_tasks` themselves
+    /// with that classification and do NOT call this — this is the
+    /// generic reinject for a replacement that carries no other failure
+    /// signal (the type-shift respawn of a slot that drifted to holding
+    /// a stale `active_tasks` entry).
+    pub(in crate::secondary) async fn sweep_replaced_worker_task(
+        &mut self,
+        worker_id: WorkerId,
+    ) -> Result<(), String> {
+        let file_hash = self
+            .op_mut()
+            .active_tasks
+            .iter()
+            .find(|&(_, &wid)| wid == worker_id)
+            .map(|(hash, _)| hash.clone());
+        if let Some(hash) = file_hash {
+            self.op_mut().active_tasks.remove(&hash);
+            tracing::warn!(
+                worker_id,
+                task_hash = %hash,
+                "worker slot replaced while still bound to a task; \
+                 sweeping it into reinject (backpressure) so the \
+                 replaced generation cannot strand it"
+            );
+            self.report_deferred_task_lost(worker_id, &hash).await?;
+        }
+        Ok(())
+    }
+
     /// Route the resource-pressure decision tick through the OOM
     /// watcher (mirrors `LocalManager::check_resource_pressure_via_watcher`).
     /// The watcher invokes `WorkerPool::check_resource_pressure`

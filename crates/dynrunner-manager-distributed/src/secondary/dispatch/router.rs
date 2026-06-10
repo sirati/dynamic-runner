@@ -247,6 +247,29 @@ where
                                 "type-bind respawn in progress; deferring task until \
                                  worker Ready (respawn-HOLD)"
                             );
+                            // The type-shift respawn just REPLACED the slot's
+                            // subprocess (a new generation). Sweep any task
+                            // still bound to this slot in `active_tasks` into
+                            // the reinject path so the replaced generation
+                            // cannot strand it (assigned-never-terminal). The
+                            // deferred task we are about to stash lives in
+                            // `pending_first_bind`, NOT `active_tasks`, so the
+                            // sweep never touches it. No-op when the slot was
+                            // idle/already-swept (the common case — the
+                            // dispatch target was selected idle). This is the
+                            // belt-and-braces companion to the generation
+                            // gate: the gate stops a stale terminal from
+                            // mis-attributing; this stops a replacement from
+                            // abandoning a still-bound task.
+                            //
+                            // ORDERING: the sweep runs after the generation
+                            // bump, in the SAME select-arm body — the event
+                            // channel cannot drain between bump and sweep
+                            // within one loop iteration. Keep them adjacent;
+                            // even if a future refactor yielded to the event
+                            // arm in between, the bumped generation makes the
+                            // gate drop a draining stale terminal first.
+                            self.sweep_replaced_worker_task(target_wid).await?;
                             self.op_mut().pending_first_bind.insert(
                                 target_wid,
                                 super::super::PendingFirstBind {
