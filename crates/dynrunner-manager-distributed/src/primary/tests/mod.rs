@@ -42,6 +42,7 @@ mod retry;
 mod setup_promote;
 mod stranded;
 mod terminal_ack;
+mod terminal_verdict;
 mod wire;
 mod worker_lifecycle;
 

@@ -92,15 +92,48 @@ async fn on_phase_end_raise_surfaces_fatal_policy_exit() {
                 .run(SeedSource::PromotionSnapshot, on_start, on_end)
                 .await;
 
-            // The contract under test is the RUN RESULT. The
-            // worker-mgmt-fail early-return surfaces the fatal outcome
-            // BEFORE the terminal `RunComplete` broadcast (same as the
-            // pre-existing `RunShouldFail`→`Other` path), so the
-            // straggler secondary is not signalled to exit here — abort
-            // its task rather than awaiting it (the production cluster
-            // teardown is a separate concern, out of 6c scope).
+            // #313 — the terminal RUN VERDICT. The worker-mgmt-fail
+            // early-return must broadcast the honest `RunAborted` (the
+            // failure twin of `RunComplete`) before exiting. Pre-fix it
+            // broadcast NOTHING: the primary just vanished, the straggler
+            // secondary idled into its own timeouts (this test had to
+            // `abort()` it), and the observer reported nothing. The
+            // primary's own local apply is the faithful observable for
+            // WHAT was broadcast.
+            let state = primary.cluster_state_for_test();
+            let abort_reason = state
+                .run_aborted()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a fatal-policy exit must broadcast RunAborted \
+                         (run_aborted() = Some); run_complete()={}",
+                        state.run_complete()
+                    )
+                })
+                .to_string();
+            assert!(
+                !state.run_complete(),
+                "a fatal-policy exit must NOT latch RunComplete — the fleet \
+                 would narrate a false success"
+            );
+            assert!(
+                abort_reason.contains("on_phase_end"),
+                "the abort reason must carry the FatalPolicyExit render naming \
+                 the raised hook, got: {abort_reason}"
+            );
+
+            // Fleet-teardown half (#313): the verdict landed on the REAL
+            // secondary's CRDT mirror, so its `process_tasks` loop exits on
+            // its own (`SecondaryTerminal::Aborted` → non-zero at the PyO3
+            // boundary) instead of idling into a timeout. A hung handle
+            // here is the pre-fix defect.
+            let sec_exit = tokio::time::timeout(Duration::from_secs(10), sec_handle).await;
+            assert!(
+                sec_exit.is_ok(),
+                "the RunAborted verdict must tear the secondary down on its \
+                 own; it idled past the 10s budget (the pre-#313 defect)"
+            );
             drop(primary);
-            sec_handle.abort();
 
             match result {
                 Err(RunError::FatalPolicyExit { reason }) => {
@@ -184,6 +217,19 @@ async fn non_raising_on_phase_end_completes_cleanly() {
 
             let completed = primary.completed_count();
             let failed = primary.failed_count();
+            // Verdict control (#313): the clean path latches the SUCCESS
+            // terminal, never the failure twin — pins that the abort
+            // broadcast is gated strictly on the fatal latch.
+            let state = primary.cluster_state_for_test();
+            assert!(
+                state.run_aborted().is_none(),
+                "a clean run must not broadcast RunAborted, got: {:?}",
+                state.run_aborted()
+            );
+            assert!(
+                state.run_complete(),
+                "a clean run must latch RunComplete"
+            );
             drop(primary);
             let _ = sec_handle.await;
 

@@ -119,6 +119,72 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
     }
 
+    /// Broadcast a TERMINAL run verdict and hold the settle window so it
+    /// lands on every connected peer before the dispatchers tear the
+    /// transport down.
+    ///
+    /// THE single origination mechanism for the run's replicated terminal
+    /// fact (#313): `ClusterMutation::RunComplete` (the success latch) and
+    /// `ClusterMutation::RunAborted { reason }` (the failure twin) both
+    /// ship through here — same `apply_and_broadcast_cluster_mutations`
+    /// pipeline, same `PRIMARY_BROADCAST_SETTLE` window. Consumers: a
+    /// secondary's `process_tasks` loop (and its setup-wait twin) exits on
+    /// either latch (`RunAborted` → `SecondaryTerminal::Aborted`, non-zero
+    /// at the PyO3 boundary); the observer's `evaluate_exit` relays the
+    /// verdict to the operator (aborted checked FIRST, never narrated as
+    /// complete). Best-effort by design: the primary is about to exit, so
+    /// delivery failures are logged, never propagated.
+    ///
+    /// # Which exit paths broadcast a verdict (the #313 classification)
+    ///
+    /// A verdict fires ONLY on a DELIBERATE terminal exit — the run is
+    /// over (cleanly, or unsalvageably failed) and the fleet must tear
+    /// down. It must NEVER fire where the election should win instead: a
+    /// primary that dies WITHOUT a verdict is exactly the case failover
+    /// exists for (the survivors elect + promote from the replicated
+    /// CRDT and the run continues).
+    ///
+    /// VERDICT (deliberate terminal — the fleet tears down):
+    /// - clean counter finish → `RunComplete`
+    ///   (`finalize_terminal_accounting`);
+    /// - routing collapse, `stranded > 0` → `RunAborted`
+    ///   (`finalize_terminal_accounting`, also reached by the pre-loop
+    ///   `bail_to_finalize` collapse gates);
+    /// - wholesale runtime spawn rejection → `RunAborted`
+    ///   (`finalize_terminal_accounting`; pre-#313 this path broadcast a
+    ///   FALSE `RunComplete` and only the local return was honest);
+    /// - the worker-management fail latch (`RunShouldFail` /
+    ///   `PolicyFatalExit` → `Other` / `FatalPolicyExit`) → `RunAborted`
+    ///   (`run_operational_and_finalize`): a deliberate policy decision
+    ///   that the run must fail — a promoted successor would inherit the
+    ///   same replicated facts and re-decide it;
+    /// - pre-phase duplicate task id (#3a) → `RunAborted`
+    ///   (`fire_pending_run_abort`);
+    /// - `NoRelocationTarget` → `RunAborted` (`run_pipeline`'s SetupPeer
+    ///   arm): NO peer advertised `can_be_primary`, so an election can
+    ///   never produce a primary — without the verdict the connected
+    ///   non-promotable fleet idles into its timeouts.
+    ///
+    /// NO VERDICT (failover's jurisdiction, or unreachable):
+    /// - panik (`PanikShutdown`): operator killed THIS node, not the run —
+    ///   the self-authored `PeerRemoved { SelfDeparture }` is the
+    ///   broadcast; peers continue / re-elect;
+    /// - every generic `Other` from the bootstrap chain / drain dispatch
+    ///   errors: transport-shaped failures a promoted successor may well
+    ///   survive — a verdict here would tear down a salvageable run;
+    /// - crashes / panics / SIGKILL: no code runs; failover handles it.
+    pub(crate) async fn broadcast_terminal_verdict(&mut self, mutation: ClusterMutation<I>) {
+        self.apply_and_broadcast_cluster_mutations(vec![mutation])
+            .await;
+        // Brief settle window so the broadcast lands on every peer before
+        // the dispatcher tears down its transport. Without this, fast
+        // dispatcher exits race the broadcast and some peers miss the
+        // signal — the symptom is leftover SLURM jobs in CG state for the
+        // wrappers whose secondaries didn't see the verdict. See
+        // `PRIMARY_BROADCAST_SETTLE` for the rationale.
+        tokio::time::sleep(crate::primary::PRIMARY_BROADCAST_SETTLE).await;
+    }
+
     /// Originate the CRDT `Pending → InFlight` transition for a task
     /// that was just committed locally (`commit_assignment`) AND
     /// successfully sent to its secondary.

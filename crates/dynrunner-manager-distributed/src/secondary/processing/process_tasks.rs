@@ -595,9 +595,13 @@ where
             // `active_tasks` to drain (the run is being torn down, not
             // finished). Returns `RunOutcome::Terminal` projecting to
             // `SecondaryTerminal::Aborted` so the PyO3 secondary/observer
-            // wrappers translate it to `std::process::exit(1)`. Single
-            // originator today: the
-            // pre-phase duplicate-task-id case (#3a).
+            // wrappers translate it to `std::process::exit(1)`. Originators
+            // (#313): every deliberate fail-loud primary terminal — the
+            // pre-phase duplicate-task-id case (#3a), the routing-collapse
+            // strand, the wholesale spawn rejection, the worker-management
+            // fail latch (`RunShouldFail` / `PolicyFatalExit`), and the
+            // no-relocation-target topology. See the primary's
+            // `broadcast_terminal_verdict` for the full classification.
             if let Some(reason) = self.cluster_state.run_aborted() {
                 let reason = reason.to_string();
                 tracing::error!(
