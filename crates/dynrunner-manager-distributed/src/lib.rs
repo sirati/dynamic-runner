@@ -10,6 +10,7 @@ pub mod peer_lifecycle;
 pub mod primary;
 pub mod process;
 pub(crate) mod run_narrator;
+pub mod runtime_watchdog;
 pub mod secondary;
 pub mod state;
 pub mod task_completed;

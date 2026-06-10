@@ -52,6 +52,8 @@ import argparse
 import runpy
 import sys
 
+from ._fault_dumps import enable_fault_dumps
+
 
 def _build_bootstrap_parser() -> argparse.ArgumentParser:
     """Parser for the minimal bootstrap argv the shim itself consumes.
@@ -117,6 +119,14 @@ def main(bootstrap_argv: list[str] | None = None) -> None:
     A test passes an explicit slice.
     """
     raw = list(sys.argv[1:] if bootstrap_argv is None else bootstrap_argv)
+
+    # Install per-process Python frame dumps (fatal-signal + on-demand
+    # SIGUSR1) BEFORE the consumer module runs, so the runtime-starvation
+    # watchdog's SIGUSR1 (or an operator `kill -USR1`) dumps every thread's
+    # stack for the lifetime of this process. Self-contained, best-effort, no
+    # behaviour change otherwise (see `_fault_dumps`). Uses the bootstrap argv
+    # to resolve the durable dump target's `--full-log-dir`.
+    enable_fault_dumps(raw)
 
     parser = _build_bootstrap_parser()
     args, _passthrough = parser.parse_known_args(raw)

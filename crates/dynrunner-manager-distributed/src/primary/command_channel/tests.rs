@@ -1842,3 +1842,130 @@ async fn bounded_reinject_used_survives_promotion() {
         })
         .await;
 }
+
+/// `drain_callback_queued_commands` drains MORE than its yield budget worth of
+/// commands FULLY, in FIFO order, while cooperatively yielding so a
+/// co-scheduled sibling task makes progress.
+///
+/// Pins all three properties of the cooperative-drain hardening:
+///   1. **Full drain** — every one of `N` (> 2× the yield budget) queued
+///      `FailPermanent`s is applied (the loop ends only on an empty channel).
+///   2. **FIFO + identity** — each command lands on its OWN target hash with
+///      its OWN `last_error` (the enqueue index), so nothing is dropped,
+///      reordered onto, or cross-applied. tokio's mpsc is FIFO, and the drain
+///      does one `try_recv` per turn, so order is structural; this asserts it
+///      end-to-end.
+///   3. **Cooperative yield** — a sibling task spawned on the SAME
+///      `current_thread` runtime advances DURING the drain. Without the
+///      `yield_now().await` at the budget boundary, a synchronous drain would
+///      monopolise the single executor and the sibling would not be polled
+///      until the whole drain finished (its counter would stay 0). A non-zero
+///      sibling count is the direct evidence the drain yielded.
+#[tokio::test(flavor = "current_thread")]
+async fn drain_yields_and_drains_past_budget_in_order() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+
+            // N greater than 3× the drain yield budget so three budget
+            // boundaries (yields) are crossed. The sibling's first poll is
+            // consumed reaching its own `yield_now`, so it only INCREMENTS on
+            // the 2nd..Nth drain-yield — three drain-yields ⇒ ticks ≥ 2, which
+            // proves the yield is RECURRING (not a one-shot) while staying
+            // robust to the off-by-one first-poll consumption.
+            const N: usize = 3 * 1024 + 5;
+
+            // Seed N distinct tasks into the CRDT + a pool owning their phase
+            // so each `FailPermanent` has a meta to fail and a phase to
+            // discount against.
+            let mut hashes = Vec::with_capacity(N);
+            let mut phase_set = std::collections::HashSet::new();
+            for i in 0..N {
+                let binary = make_binary(&format!("t{i}"), 100);
+                let hash = compute_task_hash(&binary);
+                phase_set.insert(binary.phase_id.clone());
+                coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                    hash: hash.clone(),
+                    task: binary.clone(),
+                });
+                hashes.push(hash);
+            }
+            coordinator.pending = Some(
+                dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new())
+                    .expect("pool init"),
+            );
+
+            // Queue N FailPermanent commands, each tagged with its enqueue
+            // index in `reason` so we can read back the per-hash identity.
+            let (tx, rx) = tokio::sync::mpsc::channel(N + 1);
+            for (i, hash) in hashes.iter().enumerate() {
+                let (reply_tx, _reply_rx) = oneshot::channel();
+                tx.try_send(PrimaryCommand::FailPermanent {
+                    hash: hash.clone(),
+                    error: ErrorType::NonRecoverable,
+                    reason: i.to_string(),
+                    reply: reply_tx,
+                })
+                .expect("queue command");
+            }
+            // Drop the original sender; the drain re-borrows the receiver via
+            // the `&mut Option<_>` it is handed. Keeping a sender alive is
+            // unnecessary — `try_recv` returns `Empty` (→ break) once drained,
+            // which is the full-drain terminator.
+            drop(tx);
+            let mut command_rx = Some(rx);
+
+            // Sibling task that ticks a shared counter every time it is
+            // polled-and-resumed. On a current_thread runtime it only advances
+            // when the drain yields the executor.
+            let ticks = Rc::new(Cell::new(0usize));
+            let ticks_for_task = Rc::clone(&ticks);
+            let sibling = tokio::task::spawn_local(async move {
+                loop {
+                    tokio::task::yield_now().await;
+                    ticks_for_task.set(ticks_for_task.get() + 1);
+                }
+            });
+
+            coordinator
+                .drain_callback_queued_commands(&mut command_rx)
+                .await;
+
+            sibling.abort();
+
+            // (1) Full drain: every hash failed.
+            assert_eq!(
+                coordinator.failed_tasks.len(),
+                N,
+                "every one of {N} queued FailPermanents must be drained",
+            );
+
+            // (2) FIFO + identity: each hash carries its own enqueue index.
+            for (i, hash) in hashes.iter().enumerate() {
+                match coordinator.cluster_state.task_state(hash) {
+                    Some(TaskState::Failed { last_error, .. }) => {
+                        assert_eq!(
+                            last_error, &i.to_string(),
+                            "hash #{i} must carry its OWN reason — no drop / reorder / \
+                             cross-apply",
+                        );
+                    }
+                    other => panic!("hash #{i} expected Failed, got {other:?}"),
+                }
+            }
+
+            // (3) Cooperative yield: the sibling advanced during the drain.
+            assert!(
+                ticks.get() >= 2,
+                "the drain must yield at least twice across {N} commands (budget 1024); \
+                 sibling tick count was {} (0 would mean the drain monopolised the \
+                 single-thread executor — the hazard this hardening fixes)",
+                ticks.get(),
+            );
+        })
+        .await;
+}
