@@ -469,6 +469,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -642,6 +643,7 @@ dependencies = [
  "dynrunner-protocol-manager-worker",
  "dynrunner-transport-channel",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

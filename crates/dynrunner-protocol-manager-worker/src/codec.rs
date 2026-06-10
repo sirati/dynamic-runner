@@ -26,12 +26,67 @@ struct WorkerExceptionWire {
     error_type: Option<String>,
 }
 
+/// Wire payload for `Response::Custom` / `Command::Custom` (the two
+/// directions share one frame shape: `"custom:<b64 {topic,
+/// data_b64}>\n"`). Base64-JSON for the same reason as
+/// [`WorkerExceptionWire`]: consumer topics and payloads may contain
+/// newlines or `:` characters, and the b64 envelope keeps the
+/// line-delimited text format intact. `data_b64` is the standard-
+/// alphabet base64 of the raw payload bytes (the payload is opaque
+/// `Vec<u8>`, not necessarily UTF-8, so it cannot ride JSON as a
+/// string directly). Old parsers that predate the frame ignore it
+/// (`parse_response` returns no match for unknown prefixes only
+/// after every known prefix — see the `custom:` arms below).
+#[derive(Debug, Serialize, Deserialize)]
+struct CustomMessageWire {
+    topic: String,
+    data_b64: String,
+}
+
+/// Encode one custom-message line frame (shared by the command and
+/// response serializers — the two directions are byte-identical on
+/// the wire).
+fn serialize_custom_frame(topic: &str, data: &[u8]) -> Vec<u8> {
+    let wire = CustomMessageWire {
+        topic: topic.to_owned(),
+        data_b64: BASE64.encode(data),
+    };
+    // Serialising a two-string-field struct cannot fail.
+    let json = serde_json::to_string(&wire)
+        .unwrap_or_else(|_| "{\"topic\":\"\",\"data_b64\":\"\"}".into());
+    let encoded = BASE64.encode(json.as_bytes());
+    format!("custom:{encoded}\n").into_bytes()
+}
+
+/// Topic stamped on a custom frame whose b64-JSON payload failed to
+/// decode. Mirrors the `MalformedException` fallback on the
+/// `error:exception:` idiom: the frame is surfaced loudly (raw bytes
+/// as `data`) instead of being silently dropped — and crucially
+/// instead of returning `None`, which the manager-side transports
+/// map onto "connection closed".
+pub const MALFORMED_CUSTOM_TOPIC: &str = "__malformed_custom__";
+
+/// Decode the body of a custom frame (the bytes after the `custom:`
+/// prefix) into `(topic, data)`. On any decode failure, falls back to
+/// `(MALFORMED_CUSTOM_TOPIC, <raw post-prefix bytes>)` — loud beats
+/// silent, and a `None` would be misread as a disconnect.
+fn parse_custom_frame(rest: &str) -> (String, Vec<u8>) {
+    if let Ok(json_bytes) = BASE64.decode(rest.as_bytes())
+        && let Ok(wire) = serde_json::from_slice::<CustomMessageWire>(&json_bytes)
+        && let Ok(data) = BASE64.decode(wire.data_b64.as_bytes())
+    {
+        return (wire.topic, data);
+    }
+    (MALFORMED_CUSTOM_TOPIC.to_owned(), rest.as_bytes().to_vec())
+}
+
 /// Serialize a command to bytes (line-delimited text, backward-compatible with Python).
 ///
 /// Format:
 ///   "stop\n"
 ///   "<relative_path>\n"                                                          (legacy ProcessTask, no optional fields)
 ///   "task:<json {path, payload?, resolved_path?, predecessor_outputs?}>\n"  (any optional field present)
+///   "custom:<b64 {topic, data_b64}>\n"                                      (secondary→worker custom message)
 ///
 /// The `task:` prefix routes the new form. Legacy paths starting
 /// with the literal string `task:` would collide; in practice
@@ -91,6 +146,7 @@ pub fn serialize_command(cmd: &Command) -> Vec<u8> {
             // safe to embed in a single line.
             format!("task:{}\n", value).into_bytes()
         }
+        Command::Custom { topic, data } => serialize_custom_frame(topic, data),
     }
 }
 
@@ -104,6 +160,16 @@ pub fn parse_command(line: &str) -> Option<Command> {
     }
     if line == "stop" {
         return Some(Command::Stop);
+    }
+    if let Some(rest) = line.strip_prefix("custom:") {
+        // Secondary→worker custom message: `custom:<b64 {topic,
+        // data_b64}>`. Checked BEFORE the bare-path fallback so a
+        // custom frame can never be misread as a legacy task path.
+        // (Legacy paths starting with the literal `custom:` would
+        // collide — same documented non-collision contract as the
+        // `task:` prefix above.)
+        let (topic, data) = parse_custom_frame(rest);
+        return Some(Command::Custom { topic, data });
     }
     if let Some(rest) = line.strip_prefix("task:") {
         // New form: task:<json {path, payload?, resolved_path?, predecessor_outputs?}>.
@@ -160,6 +226,7 @@ pub fn parse_command(line: &str) -> Option<Command> {
 ///   "error:<type>:<message>\n"
 ///   "phase:<name>\n"
 ///   "keepalive\n"
+///   "custom:<b64 {topic, data_b64}>\n"  (worker→secondary custom message)
 ///
 /// The bytes after `done:` are fully opaque to the framework: the
 /// codec round-trips them as a `Vec<u8>` and never inspects them.
@@ -202,6 +269,7 @@ pub fn serialize_response(resp: &Response) -> Vec<u8> {
         }
         Response::PhaseUpdate { phase_name } => format!("phase:{phase_name}\n").into_bytes(),
         Response::Keepalive => b"keepalive\n".to_vec(),
+        Response::Custom { topic, data } => serialize_custom_frame(topic, data),
     }
 }
 
@@ -232,6 +300,12 @@ pub fn parse_response(line: &str) -> Option<Response> {
         return Some(Response::PhaseUpdate {
             phase_name: phase_name.to_owned(),
         });
+    }
+    if let Some(rest) = line.strip_prefix("custom:") {
+        // Worker→secondary custom message: `custom:<b64 {topic,
+        // data_b64}>`. Same frame shape as the command direction.
+        let (topic, data) = parse_custom_frame(rest);
+        return Some(Response::Custom { topic, data });
     }
     if let Some(rest) = line.strip_prefix("error:exception:") {
         // Modern shape: base64-JSON {type, message, traceback,

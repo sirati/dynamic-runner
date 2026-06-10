@@ -15,6 +15,7 @@ readme.workspace       = true
 dynrunner-core = { workspace = true }
 dynrunner-protocol-manager-worker = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 dynrunner-transport-channel = { workspace = true }

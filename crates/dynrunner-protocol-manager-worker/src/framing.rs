@@ -64,8 +64,8 @@ use crate::command::Response;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// One bounded line-read outcome. Crate-internal: the public surface
-/// is [`recv_response_bounded`], which maps these onto the protocol's
-/// response vocabulary.
+/// is [`recv_response_bounded`] / [`ResponseFrameReader`], which map
+/// these onto the protocol's response vocabulary.
 enum BoundedLine {
     /// A complete (or EOF-truncated, matching `read_line`) frame under
     /// the cap.
@@ -79,24 +79,78 @@ enum BoundedLine {
     Eof,
 }
 
+/// Persistent partial-frame state for [`read_line_bounded`] — the
+/// piece that makes the bounded read CANCEL-SAFE.
+///
+/// The accumulating buffer (and the mid-drain counter for an
+/// oversize line) used to be locals of the read future; dropping the
+/// future between `fill_buf` awaits (e.g. a losing `tokio::select!`
+/// arm) destroyed the already-consumed prefix of the in-flight frame
+/// and corrupted framing on the next read. Holding the state OUTSIDE
+/// the future (on the transport, via [`ResponseFrameReader`])
+/// preserves it across cancellation: every mutation happens
+/// synchronously between awaits, `fill_buf` itself only peeks the
+/// `BufRead`'s internal buffer, and `consume` is synchronous — so a
+/// dropped future leaves `(reader, state)` at a consistent resume
+/// point. This is the cancel-safety contract
+/// `dynrunner_core::MessageReceiver` documents; the manager-side
+/// socket transports need it because the per-task poll now races the
+/// transport read against the custom-message outbox
+/// (`RunnerProtocol::poll_status_with_custom_outbox`).
+#[derive(Debug, Default)]
+pub struct FrameReadState {
+    /// Bytes of the current frame consumed so far (no newline yet).
+    buf: Vec<u8>,
+    /// `Some(total_bytes_seen)` while discarding the remainder of an
+    /// over-cap line; the next call resumes the drain.
+    drain: Option<usize>,
+}
+
 /// Read one `\n`-terminated line, accumulating at most `cap` bytes.
 /// On overflow, switches to a drain loop that discards (but counts)
 /// the rest of the line so the stream stays frame-aligned.
+///
+/// Cancel-safe with respect to `state`: see [`FrameReadState`].
 async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
     cap: usize,
+    state: &mut FrameReadState,
 ) -> std::io::Result<BoundedLine> {
-    let mut buf: Vec<u8> = Vec::new();
+    // Resume an interrupted oversize-drain first (a cancelled call
+    // may have left the discard loop mid-line).
+    if let Some(mut total) = state.drain {
+        loop {
+            let chunk = reader.fill_buf().await?;
+            if chunk.is_empty() {
+                state.drain = None;
+                return Ok(BoundedLine::Oversize { len: total });
+            }
+            let pos = chunk.iter().position(|&b| b == b'\n');
+            let consume = match pos {
+                Some(p) => p + 1,
+                None => chunk.len(),
+            };
+            total += consume;
+            reader.consume(consume);
+            state.drain = Some(total);
+            if pos.is_some() {
+                state.drain = None;
+                return Ok(BoundedLine::Oversize { len: total });
+            }
+        }
+    }
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
             // EOF. Preserve `read_line` semantics: no buffered bytes
             // means a clean close; a partial line is surfaced for a
             // best-effort parse.
-            return if buf.is_empty() {
+            return if state.buf.is_empty() {
                 Ok(BoundedLine::Eof)
             } else {
-                Ok(BoundedLine::Line(into_utf8(buf)?))
+                Ok(BoundedLine::Line(into_utf8(std::mem::take(
+                    &mut state.buf,
+                ))?))
             };
         }
         let newline_pos = available.iter().position(|&b| b == b'\n');
@@ -104,18 +158,20 @@ async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
             Some(pos) => pos + 1, // include the newline, like read_line
             None => available.len(),
         };
-        if buf.len() + take > cap {
+        if state.buf.len() + take > cap {
             // Overflow: drain the rest of the line without
             // accumulating it. Count what we already buffered plus
             // everything drained so the error can name the real size.
-            let mut total = buf.len();
-            drop(buf);
+            let mut total = state.buf.len();
+            state.buf = Vec::new();
+            state.drain = Some(total);
             loop {
                 let chunk = reader.fill_buf().await?;
                 if chunk.is_empty() {
                     // EOF mid-drain (sender died mid-frame). Still
                     // report the oversize — loud beats silent, and the
                     // bytes seen already prove the violation.
+                    state.drain = None;
                     return Ok(BoundedLine::Oversize { len: total });
                 }
                 let pos = chunk.iter().position(|&b| b == b'\n');
@@ -125,15 +181,19 @@ async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
                 };
                 total += consume;
                 reader.consume(consume);
+                state.drain = Some(total);
                 if pos.is_some() {
+                    state.drain = None;
                     return Ok(BoundedLine::Oversize { len: total });
                 }
             }
         }
-        buf.extend_from_slice(&available[..take]);
+        state.buf.extend_from_slice(&available[..take]);
         reader.consume(take);
         if newline_pos.is_some() {
-            return Ok(BoundedLine::Line(into_utf8(buf)?));
+            return Ok(BoundedLine::Line(into_utf8(std::mem::take(
+                &mut state.buf,
+            ))?));
         }
     }
 }
@@ -175,14 +235,44 @@ fn oversize_response(len: usize) -> Response {
 /// * `Some(parsed)` — frame under the cap (unchanged).
 /// * `Some(Error(NonRecoverable, …))` — frame over the cap; the stream
 ///   is drained past the offending line and left recoverable.
+///
+/// NOT cancel-safe: the partial-frame buffer is a per-call local
+/// (fresh [`FrameReadState`] each invocation), so dropping the
+/// returned future mid-frame loses the consumed prefix. Callers that
+/// race this read in a `select!` must hold the state across calls —
+/// use [`ResponseFrameReader`] instead (the manager-side socket
+/// transports do).
 pub async fn recv_response_bounded<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> Option<Response> {
-    match read_line_bounded(reader, MAX_RESPONSE_FRAME_BYTES).await {
-        Ok(BoundedLine::Eof) => None,
-        Ok(BoundedLine::Line(line)) => codec::parse_response(&line),
-        Ok(BoundedLine::Oversize { len }) => Some(oversize_response(len)),
-        Err(_) => None,
+    let mut state = FrameReadState::default();
+    ResponseFrameReader { state: &mut state }.recv(reader).await
+}
+
+/// Cancel-safe bounded response reader: borrows a caller-held
+/// [`FrameReadState`] so a cancelled `recv` future resumes the same
+/// in-flight frame on the next call. The manager-side transports own
+/// one `FrameReadState` per connection and build this view per
+/// `recv` call.
+pub struct ResponseFrameReader<'a> {
+    pub state: &'a mut FrameReadState,
+}
+
+impl ResponseFrameReader<'_> {
+    /// Receive one response frame with the
+    /// [`MAX_RESPONSE_FRAME_BYTES`] guard — same outcome mapping as
+    /// [`recv_response_bounded`], plus cancellation safety via the
+    /// borrowed state.
+    pub async fn recv<R: tokio::io::AsyncBufRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> Option<Response> {
+        match read_line_bounded(reader, MAX_RESPONSE_FRAME_BYTES, self.state).await {
+            Ok(BoundedLine::Eof) => None,
+            Ok(BoundedLine::Line(line)) => codec::parse_response(&line),
+            Ok(BoundedLine::Oversize { len }) => Some(oversize_response(len)),
+            Err(_) => None,
+        }
     }
 }
 
@@ -230,7 +320,9 @@ mod tests {
         data.extend_from_slice(b"ready\n");
         let mut reader = BufReader::new(std::io::Cursor::new(data));
 
-        let first = read_line_bounded(&mut reader, cap).await.unwrap();
+        let first = read_line_bounded(&mut reader, cap, &mut FrameReadState::default())
+            .await
+            .unwrap();
         match first {
             BoundedLine::Oversize { len } => assert_eq!(len, oversize_line_len),
             BoundedLine::Line(_) | BoundedLine::Eof => {
@@ -253,7 +345,9 @@ mod tests {
         // No terminating newline: sender died mid-frame.
         let total = data.len();
         let mut reader = BufReader::new(std::io::Cursor::new(data));
-        let out = read_line_bounded(&mut reader, cap).await.unwrap();
+        let out = read_line_bounded(&mut reader, cap, &mut FrameReadState::default())
+            .await
+            .unwrap();
         match out {
             BoundedLine::Oversize { len } => assert_eq!(len, total),
             BoundedLine::Line(_) | BoundedLine::Eof => {
@@ -280,6 +374,100 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    /// CANCEL-SAFETY pin for [`ResponseFrameReader`]: a `recv` future
+    /// dropped mid-frame (after the first chunk of a multi-chunk line
+    /// was consumed) must NOT lose the consumed prefix — the next
+    /// `recv` against the SAME `FrameReadState` resumes and yields
+    /// the complete frame. This is the property the custom-outbox
+    /// `select!` in `RunnerProtocol::poll_status_with_custom_outbox`
+    /// relies on.
+    #[tokio::test]
+    async fn frame_reader_resumes_after_cancelled_recv() {
+        use tokio::io::AsyncRead;
+
+        /// Reader that yields `Pending` once after each chunk so the
+        /// test can deterministically cancel between chunks.
+        struct ChunkedReader {
+            chunks: Vec<Vec<u8>>,
+            pending_next: bool,
+        }
+        impl AsyncRead for ChunkedReader {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if self.pending_next {
+                    self.pending_next = false;
+                    cx.waker().wake_by_ref();
+                    return std::task::Poll::Pending;
+                }
+                if let Some(chunk) = self.chunks.first().cloned() {
+                    buf.put_slice(&chunk);
+                    self.chunks.remove(0);
+                    self.pending_next = true;
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    std::task::Poll::Ready(Ok(()))
+                }
+            }
+        }
+
+        // One frame split across two chunks; the BufReader surfaces
+        // them as two fill_buf rounds with a Pending in between.
+        let mut reader = BufReader::new(ChunkedReader {
+            chunks: vec![b"done:he".to_vec(), b"llo\nready\n".to_vec()],
+            pending_next: false,
+        });
+        let mut state = FrameReadState::default();
+
+        // First recv: poll ONCE (consumes chunk 1 into the state),
+        // then DROP the future — the select!-loses-the-race shape.
+        {
+            let mut frame_reader = ResponseFrameReader { state: &mut state };
+            let mut fut = std::pin::pin!(frame_reader.recv(&mut reader));
+            let poll = futures_poll_once(fut.as_mut()).await;
+            assert!(poll.is_none(), "first poll must be Pending (chunk gap)");
+            // fut dropped here, mid-frame.
+        }
+
+        // Second recv against the SAME state: must resume the frame,
+        // not corrupt it.
+        let resp = ResponseFrameReader { state: &mut state }
+            .recv(&mut reader)
+            .await;
+        match resp {
+            Some(Response::Done { result_data }) => {
+                assert_eq!(result_data.unwrap(), b"hello");
+            }
+            other => panic!("expected resumed Done frame, got {other:?}"),
+        }
+        // And the stream stays frame-aligned for the next frame.
+        let next = ResponseFrameReader { state: &mut state }
+            .recv(&mut reader)
+            .await;
+        assert!(matches!(next, Some(Response::Ready)));
+    }
+
+    /// Poll a future exactly once; `Some(v)` if Ready, `None` if Pending.
+    async fn futures_poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> Option<F::Output> {
+        struct PollOnce<'a, F>(Option<std::pin::Pin<&'a mut F>>);
+        impl<'a, F: std::future::Future> std::future::Future for PollOnce<'a, F> {
+            type Output = Option<F::Output>;
+            fn poll(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                let inner = self.0.take().expect("polled after completion");
+                match inner.poll(cx) {
+                    std::task::Poll::Ready(v) => std::task::Poll::Ready(Some(v)),
+                    std::task::Poll::Pending => std::task::Poll::Ready(None),
+                }
+            }
+        }
+        PollOnce(Some(fut)).await
     }
 
     /// A partial line at EOF (no newline, under cap) is surfaced for a

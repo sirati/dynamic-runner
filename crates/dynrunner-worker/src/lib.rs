@@ -55,6 +55,21 @@ pub async fn runner_main_loop<E: RunnerEndpoint>(
     loop {
         match MessageReceiver::<Command>::recv(endpoint).await {
             Some(Command::Stop) => break,
+            Some(Command::Custom { topic, data }) => {
+                // Consumer custom message (worker↔secondary channel,
+                // feature 2). The Rust runner loop exposes no
+                // consumer message surface — the consumer-facing
+                // runtime is the Python worker (`Task.poll_messages`
+                // / `@message_handler`). Mirror its no-handler
+                // disposition: drop with a debug log, never fail the
+                // loop.
+                tracing::debug!(
+                    topic = %topic,
+                    bytes = data.len(),
+                    "dropping custom message: the Rust runner loop has no \
+                     consumer message surface"
+                );
+            }
             Some(Command::ProcessTask {
                 relative_path,
                 payload,
