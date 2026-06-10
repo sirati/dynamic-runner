@@ -1332,6 +1332,366 @@ async fn single_survivor_election_converges_and_commits() {
     }
 }
 
+// ── Election ping-pong (asm-dataset 2212c136: deposed ex-primary
+//    self-assertion over an asymmetric dead leg) ─────────────────────────
+//
+// Production replay: 3 compute peers; the secondary-2↔secondary-0 mesh leg
+// blackholed (secondary-2 ABSENT from secondary-0's transport membership,
+// its QUIC connection torn down) and never healed. Epoch 1: secondary-0 is
+// primary; epoch 2: the fleet elects secondary-1. From the DEPOSED
+// secondary-0's view the live-peer set was then EMPTY — secondary-1
+// excluded as the current primary, secondary-2 invisible over the dead leg
+// — so `failover_quorum(0) == 1` let secondary-0 SELF-PROMOTE with ZERO
+// peer agreement every time an arming leg tripped: the metronomic ~25s
+// primary ping-pong (epochs 3/5/7/9 were secondary-0's self-assertions,
+// 0-13s before any peer saw them) that ended in "cluster routing
+// collapsed". These tests pin the fix: a peer that the MESH MEMBERSHIP
+// still lists is not GONE — it counts in the failover-quorum DENOMINATOR
+// even while role-excluded from the candidate set — and a deposed
+// primary's re-candidacy needs positive peer agreement.
+
+/// THE PING-PONG REPLAY (RED→GREEN): the deposed ex-primary, with the new
+/// primary STILL a connected mesh member (its multi-role `Secondary`
+/// keepalives arriving) and the third peer unreachable over the dead leg,
+/// trips an arming leg repeatedly. It must NEVER self-promote — the
+/// member-listed current primary is evidence the fleet is NOT gone, so the
+/// quorum denominator stays at 2 (self + the member primary), unreachable
+/// without real peer agreement. Pre-fix every cycle committed an in-tick
+/// lone-survivor promotion (`actions.promoted == true`) — the flip-back.
+/// GREEN: the node converges back to Normal on the next genuine primary
+/// frame and `current_primary` HOLDS at secondary-1 across all cycles.
+#[tokio::test(flavor = "current_thread")]
+async fn deposed_ex_primary_never_self_promotes_while_new_primary_is_a_member() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    // secondary-0's view: ONLY secondary-1 is a transport member (the
+    // secondary-2 leg is blackholed; its QUIC connection tore down).
+    let (mut sec, _members) = make_secondary_membership(
+        election_config("secondary-0"),
+        vec![PeerId::from("secondary-1")],
+    );
+    sec.enter_operational_for_test();
+    sec.mesh.degraded = false;
+    // Epoch 1: THIS node held the primary role. Epoch 2: the fleet elected
+    // secondary-1 — this node is DEPOSED. Both applied through the real
+    // dispatch hook so the deposition is observed where production observes it.
+    for (new, epoch) in [("secondary-0", 1), ("secondary-1", 2)] {
+        let promote = DistributedMessage::ClusterMutation {
+            target: None,
+            sender_id: "setup".into(),
+            timestamp: 0.0,
+            mutations: vec![ClusterMutation::PrimaryChanged {
+                new: new.into(),
+                epoch,
+                reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+            }],
+        };
+        sec.dispatch_message(promote, &mut FakeWorkerFactory)
+            .await
+            .expect("PrimaryChanged handler succeeds");
+    }
+    assert_eq!(sec.cluster_state.current_primary(), Some("secondary-1"));
+    sec.record_primary_message();
+
+    // ≥2 metronome cycles (production flipped at epochs 3/5/7/9).
+    for cycle in 0..3 {
+        // secondary-1's multi-role SECONDARY keepalive keeps arriving over
+        // the healthy leg (the real recognition path files it in
+        // `peer_keepalives`; it is NOT a primary-liveness signal).
+        sec.handle_inbound(
+            keepalive_from("secondary-1", KeepaliveRole::Secondary),
+            &mut FakeWorkerFactory,
+        )
+        .await;
+
+        // The arming trip: the silent window on the PRIMARY-liveness axis
+        // that armed secondary-0 in production (leg (B) backstop here —
+        // deterministic stand-in for whichever leg tripped on-cluster).
+        sec.op_mut().primary_last_seen =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+        let armed = sec.run_election_tick();
+        assert!(
+            !armed.promoted,
+            "cycle {cycle}: the arming tick must never commit a promotion",
+        );
+
+        // Gather window elapses; the tally tick. Pre-fix: live-peer set
+        // empty (secondary-1 minus'd as current primary, secondary-2 not a
+        // member) → quorum 1 → in-tick self-promotion with ZERO peer
+        // agreement — the flip-back.
+        tokio::time::sleep(ONE_INTERVAL).await;
+        let tally = sec.run_election_tick();
+        assert!(
+            !tally.promoted,
+            "cycle {cycle}: FLIP-BACK — the deposed ex-primary self-promoted \
+             with zero peer agreement while the new primary was still a \
+             connected mesh member",
+        );
+        assert!(
+            !matches!(sec.op_mut().election, ElectionState::Promoted),
+            "cycle {cycle}: the election must never reach Promoted solo",
+        );
+        assert!(
+            !tally
+                .broadcast
+                .iter()
+                .any(|m| matches!(m, DistributedMessage::PromotionVote { target: _, .. })),
+            "cycle {cycle}: no self-candidacy broadcast without quorum",
+        );
+        assert_eq!(
+            sec.cluster_state.current_primary(),
+            Some("secondary-1"),
+            "cycle {cycle}: the recognized primary HOLDS at secondary-1",
+        );
+
+        // The next genuine Primary-role frame from secondary-1 cancels the
+        // (still-unresolved) suspicion — the node converges back to Normal.
+        sec.handle_inbound(
+            keepalive_from("secondary-1", KeepaliveRole::Primary),
+            &mut FakeWorkerFactory,
+        )
+        .await;
+        assert!(
+            matches!(sec.op_mut().election, ElectionState::Normal),
+            "cycle {cycle}: a genuine primary frame converges the node to Normal",
+        );
+    }
+}
+
+/// Leg 3 — deposed-primary re-assertion needs POSITIVE peer agreement: when
+/// the new primary GENUINELY departs the mesh too (the self-promotion edge
+/// that survives the denominator fix), a DEPOSED ex-primary must NOT take
+/// the lone-survivor in-tick fast path. It becomes a Candidate (broadcasts
+/// its `PromotionVote`) and promotes only on a real peer confirm. Pre-fix
+/// the tally tick committed the promotion solo (`actions.promoted == true`).
+#[tokio::test(flavor = "current_thread")]
+async fn deposed_lone_survivor_requires_positive_peer_agreement() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    let (mut sec, members) = make_secondary_membership(
+        election_config("secondary-0"),
+        vec![PeerId::from("secondary-1")],
+    );
+    sec.enter_operational_for_test();
+    sec.mesh.degraded = false;
+    for (new, epoch) in [("secondary-0", 1), ("secondary-1", 2)] {
+        let promote = DistributedMessage::ClusterMutation {
+            target: None,
+            sender_id: "setup".into(),
+            timestamp: 0.0,
+            mutations: vec![ClusterMutation::PrimaryChanged {
+                new: new.into(),
+                epoch,
+                reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+            }],
+        };
+        sec.dispatch_message(promote, &mut FakeWorkerFactory)
+            .await
+            .expect("PrimaryChanged handler succeeds");
+    }
+    sec.record_primary_message();
+
+    // The new primary secondary-1 now GENUINELY dies: its QUIC connection
+    // tears down and the membership view republishes without it. Its
+    // (corpse) `peer_keepalives` entry may linger — membership is the
+    // death evidence.
+    sec.op_mut()
+        .peer_keepalives
+        .insert("secondary-1".into(), std::time::Instant::now());
+    members.borrow_mut().clear();
+    sec.publish_membership();
+
+    // Arm + gather + tally.
+    sec.op_mut().primary_last_seen =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    sec.run_election_tick();
+    assert!(matches!(
+        sec.op_mut().election,
+        ElectionState::Suspecting { .. }
+    ));
+    tokio::time::sleep(ONE_INTERVAL).await;
+    let tally = sec.run_election_tick();
+
+    // The deposed ex-primary must NOT commit solo, even as a genuine lone
+    // survivor: its own deposition is evidence the fleet elected around it.
+    assert!(
+        !tally.promoted,
+        "a DEPOSED ex-primary must not take the lone-survivor in-tick \
+         self-quorum — positive peer agreement is required",
+    );
+    assert!(
+        matches!(sec.op_mut().election, ElectionState::Candidate { .. }),
+        "the deposed lone survivor campaigns as a Candidate instead; got {:?}",
+        std::mem::discriminant(&sec.op_mut().election),
+    );
+    assert!(
+        tally
+            .broadcast
+            .iter()
+            .any(|m| matches!(m, DistributedMessage::PromotionVote { target: _, candidate_id, .. } if candidate_id == "secondary-0")),
+        "the candidacy is broadcast so a surviving/recovered peer can confirm",
+    );
+
+    // POSITIVE peer agreement arrives (secondary-1 recovered, or another
+    // survivor heard the campaign): one real confirm promotes.
+    let promoted = sec.record_promotion_confirm("secondary-1".into(), "secondary-0".into(), 1);
+    assert!(
+        promoted,
+        "one real peer confirm IS positive agreement — the deposed candidate promotes",
+    );
+    assert!(matches!(sec.op_mut().election, ElectionState::Promoted));
+}
+
+/// The quorum-DENOMINATOR rule (`failover_quorum_peer_count`), pinned
+/// directly: a member-listed current primary COUNTS (role-excluded from the
+/// candidate set, but not gone), and drops out the moment it departs the
+/// transport membership — so a genuinely-dead primary still shrinks the
+/// denominator within one mesh-pump cycle (#317/#332 convergence intact).
+#[tokio::test(flavor = "current_thread")]
+async fn member_listed_current_primary_counts_in_quorum_denominator() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    let (mut sec, members) = make_secondary_membership(
+        election_config("sec-b"),
+        vec![PeerId::from("sec-a"), PeerId::from("sec-c")],
+    );
+    sec.enter_operational_for_test();
+    // Both peers keepalive-tracked; sec-a is the current primary (a
+    // multi-role host whose Secondary keepalive files the entry).
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-a".into(), std::time::Instant::now());
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-c".into(), std::time::Instant::now());
+    sec.cluster_state.apply(ClusterMutation::PrimaryChanged {
+        new: "sec-a".into(),
+        epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+    });
+
+    // Candidate/voter eligibility NEVER contains the current primary.
+    assert!(
+        !sec.live_peer_ids().any(|id| id == "sec-a"),
+        "the current primary is role-excluded from the candidate set",
+    );
+    // …but the member-listed primary COUNTS in the quorum denominator.
+    assert!(sec.current_primary_in_quorum());
+    assert_eq!(
+        sec.failover_quorum_peer_count(),
+        2,
+        "denominator = live peer (sec-c) + member-listed primary (sec-a)",
+    );
+
+    // The primary GENUINELY dies: QUIC teardown → membership departure.
+    members
+        .borrow_mut()
+        .retain(|id| id != &PeerId::from("sec-a"));
+    sec.publish_membership();
+    assert!(!sec.current_primary_in_quorum());
+    assert_eq!(
+        sec.failover_quorum_peer_count(),
+        1,
+        "a membership-departed primary no longer inflates the denominator \
+         (lone-/below-majority-survivor convergence preserved)",
+    );
+}
+
+/// First-hand reachability veto (named decision): a voter never confirms a
+/// candidate absent from its OWN live transport membership — even a
+/// lex-lowest one. Structurally `live_peer_ids ⊆ membership` already makes
+/// a non-member unable to be the computed lowest; this pins the veto as an
+/// explicit, logged contract independent of the lowest-id arithmetic.
+#[tokio::test(flavor = "current_thread")]
+async fn promotion_vote_for_unreachable_candidate_is_vetoed() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    // Voter sec-z: its membership holds only sec-m. The dead primary has
+    // departed; primary-silence is genuine (backdated below).
+    let (mut sec, _members) =
+        make_secondary_membership(election_config("sec-z"), vec![PeerId::from("sec-m")]);
+    sec.enter_operational_for_test();
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-m".into(), std::time::Instant::now());
+    sec.cluster_state.apply(ClusterMutation::PrimaryChanged {
+        new: "primary-orig".into(),
+        epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+    });
+    sec.record_primary_message();
+    sec.op_mut().primary_last_seen =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+
+    // "sec-a" is lex-lowest — but this voter has NO ROUTE to it (it is not
+    // in the membership view). The vote must be vetoed, not confirmed.
+    assert!(
+        sec.record_promotion_vote("sec-a".into(), 1).is_none(),
+        "a no-route candidate must never receive this voter's confirm",
+    );
+    assert!(
+        !matches!(sec.op_mut().election, ElectionState::Voting { .. }),
+        "a vetoed vote must not move the voter into Voting for the \
+         unreachable candidate",
+    );
+
+    // Control: the same vote for the REACHABLE member peer is confirmed
+    // (sec-m is the lowest reachable candidate).
+    let reply = sec.record_promotion_vote("sec-m".into(), 1);
+    assert!(
+        matches!(
+            reply,
+            Some(DistributedMessage::PromotionConfirm { ref new_primary_id, .. })
+                if new_primary_id == "sec-m"
+        ),
+        "a reachable lowest candidate is confirmed as before; got {reply:?}",
+    );
+}
+
+/// First-hand liveness on a self-query: a node asked (via `TimeoutQuery`)
+/// about ITSELF must answer with positive first-hand evidence (age 0), not
+/// `None` ("no evidence" — which the querier's tally counts as AGREEMENT
+/// that the node is dead). Pre-fix the responder read its own id out of
+/// `peer_keepalives` (structurally absent — a node does not receive its own
+/// broadcasts), reported `None`, and thereby AGREED TO ITS OWN DEATH —
+/// letting a suspecting peer count the very node it suspects toward the
+/// death quorum.
+#[tokio::test(flavor = "current_thread")]
+async fn timeout_query_about_self_reports_first_hand_liveness() {
+    let mut sec = make_secondary(election_config("sec-a"));
+    sec.enter_operational_for_test();
+
+    assert_eq!(
+        sec.queried_node_liveness_age("sec-a"),
+        Some(0.0),
+        "a self-query is answered with first-hand liveness (age 0), never None",
+    );
+
+    // Through the real inbound arm: the queued TimeoutResponse carries the
+    // same first-hand answer onto the wire.
+    sec.handle_inbound(
+        DistributedMessage::TimeoutQuery {
+            target: None,
+            sender_id: "sec-z".into(),
+            timestamp: timestamp_now(),
+            query_node_id: "sec-a".into(),
+        },
+        &mut FakeWorkerFactory,
+    )
+    .await;
+    let (_, response) = sec
+        .op_mut()
+        .pending_peer_messages
+        .pop()
+        .expect("the TimeoutQuery arm queues a TimeoutResponse");
+    assert!(
+        matches!(
+            response,
+            DistributedMessage::TimeoutResponse {
+                last_keepalive: Some(age),
+                ..
+            } if age == 0.0
+        ),
+        "the wire response reports the first-hand self-liveness; got {response:?}",
+    );
+}
+
 /// The REAL recovery path is NOT broken: a genuine `Primary`-role keepalive
 /// from the EXPECTED current primary, fed through the real `handle_inbound`
 /// recognition path, STILL aborts an in-flight election (reverts to Normal).
