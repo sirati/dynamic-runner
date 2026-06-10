@@ -84,6 +84,11 @@
 //!   blackholed-but-live-leg repro (transport-Ok send retained awaiting
 //!   `TerminalAck`; ack-timeout replays with the same seq; the ack is the
 //!   only drop site; failover-arming inputs untouched).
+//! - [`replay_backoff`] — the replay-flood repro: an unACKed retained
+//!   report replays on the per-entry exponential backoff schedule
+//!   (`ack_timeout` → 2× → 4× … capped), at most once per seq per drain
+//!   pass, with the route-restored edge (`drain_report_replays_now`)
+//!   retrying promptly; the wake deadline is the min `next_due`.
 
 #![cfg(test)]
 
@@ -111,6 +116,7 @@ mod peer_mesh_watchdog;
 mod processing;
 mod r1;
 mod relocation_handoff_race;
+mod replay_backoff;
 mod run_config_responder;
 mod terminal_ack;
 mod voting_candidate_death;
