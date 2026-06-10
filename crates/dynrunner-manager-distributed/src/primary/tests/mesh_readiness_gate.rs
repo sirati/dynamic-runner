@@ -308,3 +308,104 @@ async fn reactive_task_request_is_honored_even_when_member_unconfirmed() {
         })
         .await;
 }
+
+/// #360 — the first-dispatch exemption is GONE: a member that has never
+/// been dispatched to AND has not confirmed its mesh leg gets NOTHING from
+/// the proactive path. In run_20260610_144905 the exemption admitted the
+/// first work onto unconfirmed `secondary-2`; its first-bind continuation
+/// then ran the task and the terminal vanished on the half-formed leg.
+/// "Never dispatched" is not proof of a working leg — only `MeshReady` is.
+///
+/// Bring-up cannot deadlock on this: the cold-start fan-out
+/// (`perform_initial_assignment`) does not consult the gate, MeshReady
+/// emission on a member is dispatch-independent (operational-entry hook +
+/// mesh watchdog + keepalive tick), and the pull path (`TaskRequest`,
+/// request-driven) stays exempt as its own delivery proof.
+///
+/// The recovery half pins the new confirmation→dispatch wakeup: a landing
+/// `MeshReady` emits `TasksAdded` on the worker-management bus (a member
+/// becoming confirmed enlarges the assignable set — dispatch re-evaluates
+/// on every event that can create a match), so the withheld work flows at
+/// the confirmation edge with no unrelated event needed.
+#[tokio::test(flavor = "current_thread")]
+async fn first_dispatch_to_unconfirmed_member_is_withheld_until_mesh_ready() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let id = ends[0].0.clone();
+
+            let t0 = one_task("boot");
+            let hash = compute_task_hash(&t0);
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(PhaseId::from("p"), vec![])]),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: hash.clone(),
+                    task: t0,
+                });
+            }
+            primary.hydrate_from_cluster_state();
+            let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
+            primary.register_idle_worker_for_test(id.clone(), 0, budget);
+
+            // Never dispatched to, never confirmed: the exact member the
+            // deleted exemption used to admit.
+            primary.mark_member_mesh_unconfirmed_for_test(&id);
+
+            run_dispatch_recheck(&mut primary).await;
+            settle_pump().await;
+
+            assert!(
+                assigned_ids(&mut ends[0].1).is_empty(),
+                "NO work may be pushed to a member whose mesh leg is \
+                 unconfirmed — not even its first dispatch (the #360 bypass: \
+                 the first task's terminal swallows on the half-formed leg \
+                 exactly like any later one)"
+            );
+            assert!(
+                primary.slot_is_idle_for_test(&id, 0),
+                "the unconfirmed member's worker stays idle"
+            );
+
+            // CONFIRMATION EDGE: the member's MeshReady lands. It must both
+            // recover the member into the assignable set AND wake dispatch
+            // via the worker-management bus — no manual recheck, no
+            // unrelated event.
+            let (wm_tx, mut wm_rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
+            primary
+                .cluster_state_mut_for_test()
+                .install_worker_mgmt_sender(wm_tx);
+            primary.handle_mesh_ready(DistributedMessage::MeshReady {
+                target: None,
+                sender_id: id.clone(),
+                timestamp: 0.0,
+                secondary_id: id.clone(),
+                peer_count: 1,
+            });
+            let batch = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                recv_worker_signal_batch(&mut wm_rx),
+            )
+            .await
+            .expect("a landing MeshReady must wake dispatch (TasksAdded on the bus)")
+            .expect("emit must produce a batch");
+            primary.react_to_worker_signal_batch(batch).await;
+            settle_pump().await;
+
+            assert_eq!(
+                assigned_ids(&mut ends[0].1),
+                vec!["boot".to_string()],
+                "the withheld work flows at the confirmation edge"
+            );
+        })
+        .await;
+}

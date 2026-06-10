@@ -1290,3 +1290,125 @@ async fn primary_link_recovery_edge_drains_replay_buffer() {
         })
         .await;
 }
+
+/// #360 repro — the production pair (asm-dataset run_20260610_144905): the
+/// primary's dispatch gate vetoed proactive dispatch to `secondary-2`
+/// ("got work but no MeshReady received") in the SAME second the member's
+/// own first-bind continuation logged "pending first-bind assigned
+/// post-Ready". The continuation BOUND deferred work onto a member whose
+/// mesh leg was never confirmed — the leg that then swallowed the task's
+/// terminal.
+///
+/// Contract under fix: the post-Ready first-bind assignment re-consults the
+/// member-side half of the pairwise dispatch-readiness predicate
+/// ("mesh leg confirmed to the current primary") before binding. A stash
+/// whose member is UNCONFIRMED at Ready-time is NOT assigned — it is routed
+/// through the existing deferred-task reinject (`report_deferred_task_lost`,
+/// backpressure-shaped) so the task returns to the authority's pool for a
+/// confirmed member. The member's worker stays idle and gets nothing.
+///
+/// The recovery arc is also pinned: once the member's mesh settles, the
+/// authority's re-dispatch of the requeued task binds normally (the slot
+/// already carries the type — the same-type fast path assigns directly).
+#[tokio::test(flavor = "current_thread")]
+async fn pending_first_bind_reinjects_when_mesh_leg_unconfirmed_at_ready() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            // Model the production member shape at first-bind time: peers
+            // were expected, the dials have not settled, and no `MeshReady`
+            // has been emitted to the primary — the mesh leg is UNCONFIRMED
+            // (`mesh_ready_sent == false` and the reporter has nothing to
+            // report yet: watchdog pending, zero alive peer-secondaries).
+            secondary.mesh.peer_dial_count = 1;
+            secondary.mesh.peer_mesh_check_at =
+                Some(std::time::Instant::now() + Duration::from_secs(30));
+
+            let binary = make_binary("mesh-gated-task", 50);
+            let file_hash = "f360a360".to_string();
+            let assignment = task_assignment("setup", "sec-2", 0, &binary, &file_hash);
+            secondary
+                .handle_inbound(assignment, &mut FakeWorkerFactory)
+                .await;
+            assert!(
+                secondary.op_mut().pending_first_bind.contains_key(&0),
+                "first-bind must stash the binary in pending_first_bind"
+            );
+
+            // The type-shift respawn completes: the fresh subprocess
+            // reports Ready while the mesh leg is STILL unconfirmed.
+            let oom = test_oom_watcher();
+            let ready = secondary
+                .op_mut()
+                .pool
+                .recv_event()
+                .await
+                .expect("fresh subprocess must emit a Ready event");
+            assert!(
+                matches!(ready, WorkerEvent::Ready { worker_id: 0, .. }),
+                "expected Ready for worker 0; got {ready:?}"
+            );
+            secondary.handle_worker_event(ready, &oom).await.unwrap();
+
+            // THE #360 assertion: the continuation must NOT bind work onto
+            // the unconfirmed member ("pending first-bind assigned
+            // post-Ready" on a member the gate is withholding).
+            assert!(
+                !secondary.op_mut().active_tasks.contains_key(&file_hash),
+                "the post-Ready continuation must NOT assign deferred work \
+                 while the member's mesh leg is unconfirmed — the production \
+                 #360 bypass"
+            );
+            assert!(
+                !secondary.op_mut().pending_first_bind.contains_key(&0),
+                "the stash must be DRAINED (reinjected), not parked forever"
+            );
+            assert!(
+                log.borrow().iter().any(|m| matches!(
+                    m,
+                    DistributedMessage::TaskFailed { task_hash, error_type, .. }
+                    if *task_hash == file_hash && *error_type == ErrorType::Recoverable
+                )),
+                "the deferred task must be reinjected to the authority \
+                 (backpressure-shaped TaskFailed) so a CONFIRMED member can \
+                 run it; got {:?}",
+                log.borrow()
+            );
+            assert!(
+                secondary.op_mut().pool.workers[0].is_idle_state(),
+                "the unconfirmed member's worker stays idle — it gets nothing"
+            );
+            assert!(
+                !secondary
+                    .op_mut()
+                    .pending_worker_restarts
+                    .contains(&0),
+                "the worker is healthy (it reached Ready); the mesh gate must \
+                 not flag it for restart"
+            );
+
+            // RECOVERY: the mesh settles (watchdog terminal). The authority
+            // re-dispatches the requeued task; the slot already carries the
+            // type, so the same-type fast path binds it directly.
+            secondary.mesh.peer_mesh_check_at = None;
+            let assignment = task_assignment("setup", "sec-2", 0, &binary, &file_hash);
+            secondary
+                .handle_inbound(assignment, &mut FakeWorkerFactory)
+                .await;
+            assert!(
+                secondary.op_mut().active_tasks.contains_key(&file_hash),
+                "once the mesh leg settles, the re-dispatched task binds \
+                 normally (late join must recover)"
+            );
+        })
+        .await;
+}
