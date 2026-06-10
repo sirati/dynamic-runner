@@ -101,4 +101,21 @@ pub enum SlurmError {
     /// not a benign skip.
     #[error("wrapper source binary not found: {0}")]
     WrapperBinaryNotFound(std::path::PathBuf),
+    /// The post-upload freshness verification in
+    /// [`SlurmJobManager::upload_binary_hash_conditional`] found the
+    /// gateway copy's SHA-256 diverging from the local source's right
+    /// after a transfer (truncated/corrupted transfer, or an
+    /// out-of-band clobber racing the upload). Hard error: every job
+    /// in the run would `exec` the staged binary, so wrong bytes at
+    /// the staging path must fail dispatch loudly — a stale wrapper
+    /// fleet is far costlier than an aborted submit.
+    #[error(
+        "staged binary failed post-upload hash verification at {remote}: \
+         local sha256 {local_hash}, remote sha256 {remote_hash:?}"
+    )]
+    StagedBinaryHashMismatch {
+        remote: String,
+        local_hash: String,
+        remote_hash: Option<String>,
+    },
 }
