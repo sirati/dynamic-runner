@@ -102,6 +102,25 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         self.drain_new_connections();
         let mut clocks = now_clocks();
         self.router.prune(clocks.now);
+        // One-shot gate on the reconnect-tick arm. Unlike the other five
+        // arms — each of which keeps a network-held sender clone alive, so
+        // `recv()` never resolves `None` while the network lives — the
+        // tick arm's sole production sender is MOVED into the spawned 5 s
+        // tick task (`peer/mod.rs`). If that task ever ends (panic, or the
+        // runtime tearing it down), `reconnect_tick_rx` closes and a closed
+        // `UnboundedReceiver::recv()` resolves `None` SYNCHRONOUSLY on every
+        // poll, making this arm always-ready: the inner `loop` then re-polls
+        // the `select!` without ever parking, burning ~100% CPU (the
+        // lifetime-heat half of the livelock RCA — see
+        // `tests/recv_tick_closed_spins.rs`). Flipping this bool on the first
+        // `None` disables the arm (`, if !tick_closed`) for the rest of this
+        // `recv_peer` call, mirroring the `transport_closed` one-shot gate the
+        // operational loop uses for its own inbound arm. The reconnect cadence
+        // is lost for the remainder of the call (the tick task is gone), but
+        // redials still fire on the authoritative disconnect arm + Router's
+        // own redial pulse — correctness is preserved, only the periodic
+        // backstop is dropped, and the WARN names the regression.
+        let mut tick_closed = false;
         loop {
             // All three select arms poll cancel-safe channel
             // receivers via disjoint-field borrows of `self`. The
@@ -180,16 +199,37 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                     }
                     None
                 }
-                _ = self.reconnect_tick_rx.recv() => {
-                    // Periodic reconnect-tick. The tracker
-                    // reconciles against the authoritative cluster
-                    // list (peer_dial_info) so a peer that dropped
-                    // out of `connections` via any path — not just
-                    // the broadcast disconnect detector — gets
-                    // picked up here. `spawn_redial` deduplicates
-                    // against `connections` so duplicate dials on
-                    // a freshly-restored peer are harmless.
-                    self.process_reconnect_tick();
+                tick = self.reconnect_tick_rx.recv(), if !tick_closed => {
+                    match tick {
+                        Some(()) => {
+                            // Periodic reconnect-tick. The tracker
+                            // reconciles against the authoritative cluster
+                            // list (peer_dial_info) so a peer that dropped
+                            // out of `connections` via any path — not just
+                            // the broadcast disconnect detector — gets
+                            // picked up here. `spawn_redial` deduplicates
+                            // against `connections` so duplicate dials on
+                            // a freshly-restored peer are harmless.
+                            self.process_reconnect_tick();
+                        }
+                        None => {
+                            // The 5 s tick task ended, closing the channel.
+                            // A closed receiver resolves `None` forever and
+                            // synchronously, so leaving the arm enabled would
+                            // hot-loop the `select!` at ~100% CPU. Gate it off
+                            // for the rest of this call (see the `tick_closed`
+                            // declaration above). One WARN names the
+                            // regression so the lost reconnect backstop is
+                            // visible in the operator log.
+                            tick_closed = true;
+                            tracing::warn!(
+                                "reconnect-tick channel closed (the 5s tick task ended); \
+                                 disabling the tick arm for the remainder of this recv_peer \
+                                 to avoid a busy-spin — periodic redials are now driven only \
+                                 by the disconnect arm + Router's redial pulse"
+                            );
+                        }
+                    }
                     None
                 }
                 redialed = self.bootstrap_redial_rx.recv() => {

@@ -1046,6 +1046,15 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
 }
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
+    /// Max commands `drain_callback_queued_commands` processes between
+    /// cooperative `yield_now().await`s. Bounds how long the single-thread
+    /// executor can be monopolised by a self-requeueing command drain before
+    /// sibling LocalSet tasks (the inbound recv, mesh pump, QUIC driver) get
+    /// to run. Large enough that the common case (a handful of callback-queued
+    /// commands) never yields; small enough that a pathological requeue loop
+    /// can't wedge the runtime.
+    const DRAIN_YIELD_BUDGET: u32 = 1024;
+
     pub fn new(
         config: PrimaryConfig,
         client: crate::process::MeshClient<I>,
@@ -3929,6 +3938,56 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
     }
 
+    /// Cooperatively drain every command an `on_phase_end` callback queued
+    /// via the in-runtime `PrimaryHandle` path, dispatching each through the
+    /// `handle_primary_command` chokepoint in FIFO order.
+    ///
+    /// # Why cooperative
+    ///
+    /// This whole node runs on ONE `current_thread` tokio runtime + LocalSet
+    /// (the relocated primary's `py.detach` block in
+    /// `dynrunner-pyo3/.../secondary/run.rs`). A synchronous `try_recv`-drain
+    /// that never reaches a coop yield point can monopolise the single
+    /// executor thread — starving the operational loop's `inbox.recv()`, the
+    /// mesh pump, and the QUIC driver. The hazard is concrete: a queued
+    /// command (e.g. a callback's `SpawnTasks`) can, via the recursive phase
+    /// cascade (`apply_fail_permanent` → `note_item_failed` →
+    /// `process_phase_lifecycle`), re-queue ANOTHER command onto
+    /// `command_rx`, so this loop can run unboundedly without the inner
+    /// `handle_primary_command().await` ever yielding to siblings.
+    ///
+    /// We bound the work between yields to [`Self::DRAIN_YIELD_BUDGET`] and
+    /// `yield_now().await` once the budget is spent. Semantics are preserved:
+    /// the drain STILL drains fully (it only stops on an empty channel) and
+    /// processing ORDER is FIFO (one `try_recv` per iteration); the yield
+    /// merely lets sibling LocalSet tasks make progress between batches.
+    ///
+    /// `Box::pin` breaks the async-recursion cycle (this is reachable from
+    /// `process_phase_lifecycle`, which this can re-enter via the cascade);
+    /// without it the compiler can't size the future.
+    pub(super) async fn drain_callback_queued_commands(
+        &mut self,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) {
+        let mut processed_since_yield: u32 = 0;
+        loop {
+            let cmd = match command_rx.as_mut() {
+                Some(rx) => rx.try_recv().ok(),
+                None => None,
+            };
+            let Some(cmd) = cmd else { break };
+            Box::pin(crate::primary::command_channel::handle_primary_command(
+                self, cmd, command_rx,
+            ))
+            .await;
+            processed_since_yield += 1;
+            if processed_since_yield >= Self::DRAIN_YIELD_BUDGET {
+                tokio::task::yield_now().await;
+                processed_since_yield = 0;
+            }
+        }
+    }
+
     /// Drive `Drained` phases through `on_phase_end` → `mark_phase_done`
     /// → newly-Active phases through `on_phase_start`. Called from
     /// the same code paths that update `completed_tasks` / `failed_tasks`
@@ -4108,17 +4167,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // cascade re-entry only happens via this dispatch
                 // call — so the box allocation is gated on a
                 // callback actually queueing a command.
-                loop {
-                    let cmd = match command_rx.as_mut() {
-                        Some(rx) => rx.try_recv().ok(),
-                        None => None,
-                    };
-                    let Some(cmd) = cmd else { break };
-                    Box::pin(crate::primary::command_channel::handle_primary_command(
-                        self, cmd, command_rx,
-                    ))
-                    .await;
-                }
+                self.drain_callback_queued_commands(command_rx).await;
                 // Per-phase proceed-or-fail decision, evaluated AFTER the
                 // retry-bucket cascade has exhausted every reinjection
                 // path (both buckets above returned `false`) and BEFORE

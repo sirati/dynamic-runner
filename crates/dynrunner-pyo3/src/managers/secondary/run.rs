@@ -607,6 +607,25 @@ impl PySecondaryCoordinator {
                     }
                 }
 
+                // ── Runtime-starvation self-watchdog ──────────────────────
+                //
+                // Independent of the beacon (above) but borrowing the same
+                // survival property: a dedicated OS thread that detects when
+                // THIS node's single current-thread runtime stops making
+                // progress (wedged or busy-spinning) and raises SIGUSR1 so the
+                // Python `faulthandler` (registered in the secondary
+                // bootstrap) dumps every thread's stack — automatically, at the
+                // next freeze, with no operator. Detection + dump only: no
+                // failover coupling, no process exit (those are a separate,
+                // owner-adjudicated design). The handle is held for the run so
+                // its `Drop` joins the checker thread at scope exit; the
+                // returned heartbeat future is the "I'm alive" pulse and runs
+                // ON this runtime via `spawn_local`, so it stops advancing
+                // exactly when the runtime freezes.
+                let (_runtime_watchdog, watchdog_heartbeat) =
+                    dynrunner_manager_distributed::runtime_watchdog::RuntimeWatchdog::spawn();
+                tokio::task::spawn_local(watchdog_heartbeat);
+
                 // Spawn the panik watcher and register its signal
                 // receiver on the coordinator BEFORE entering the
                 // setup-promote loop. The watcher polls
