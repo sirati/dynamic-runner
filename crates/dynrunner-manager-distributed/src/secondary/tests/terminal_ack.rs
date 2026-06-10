@@ -307,3 +307,76 @@ async fn ack_timeout_replay_never_feeds_failover_arming() {
         })
         .await;
 }
+
+/// The permanent-failure detector (#366): each timed-out replay of one
+/// seq bumps its `terminal_replay_attempts` tally (the entry itself is
+/// recreated per re-retention, so the seq-keyed tally is what survives
+/// to cross the escalation threshold), and the ack clears the tally
+/// along with the retention.
+#[tokio::test(flavor = "current_thread")]
+async fn timed_out_replays_tally_per_seq_and_ack_clears_the_tally() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log, _membership) =
+                make_secondary_recording_with_membership(election_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+            secondary.terminal_ack_timeout = Duration::from_millis(20);
+
+            secondary
+                .report_deferred_task_lost(0, "tally-hash")
+                .await
+                .unwrap();
+            secondary.drain_egress().await;
+            let seq = secondary.pending_terminal_replays[0]
+                .frame
+                .delivery_seq()
+                .expect("stamped");
+            assert!(
+                secondary.terminal_replay_attempts.is_empty(),
+                "the first SEND is not a replay; the tally starts on the \
+                 first timed-out re-send"
+            );
+
+            // Three timed-out replay rounds → tally 3 for this seq.
+            for round in 1..=3u32 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                secondary.drain_terminal_replays().await;
+                secondary.drain_egress().await;
+                assert_eq!(
+                    secondary.terminal_replay_attempts.get(&seq),
+                    Some(&round),
+                    "each timed-out replay must bump the seq's tally"
+                );
+            }
+            assert_eq!(
+                sent_seqs_for_hash(&log, "tally-hash").len(),
+                4,
+                "first send + 3 replays on the wire"
+            );
+
+            // The ack releases the retention AND the tally.
+            secondary
+                .handle_inbound(
+                    DistributedMessage::TerminalAck {
+                        target: None,
+                        sender_id: "setup".into(),
+                        timestamp: 0.0,
+                        seq,
+                    },
+                    &mut factory,
+                )
+                .await;
+            assert!(secondary.pending_terminal_replays.is_empty());
+            assert!(
+                secondary.terminal_replay_attempts.is_empty(),
+                "a confirmed delivery must clear the permanent-failure tally"
+            );
+        })
+        .await;
+}
