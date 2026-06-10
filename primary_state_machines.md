@@ -154,7 +154,6 @@ followed by the UNCONDITIONAL `hydrate_from_cluster_state` at
         │            respawn req / join             :576/:613                 │
         │            panik signal                   :648 ─→ panik_outcome     │
         │            setup-promote deadline         :691 ─→ deadline_outcome  │
-        │            stuck-worker 5-min watchdog     :715                     │
         │   (dispatch_message routes every TaskComplete/TaskFailed/TaskRequest │
         │    /Keepalive/ClusterMutation → TASK + WORKER + PHASE machines)     │
         └───────────────────────────────────────────────────────────────────┘

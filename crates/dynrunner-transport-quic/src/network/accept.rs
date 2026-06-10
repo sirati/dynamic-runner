@@ -10,14 +10,17 @@
 use std::time::Duration;
 
 use dynrunner_core::{Identifier, MessageReceiver};
-use dynrunner_protocol_primary_secondary::{DistributedMessage, codec};
+use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_transport_tunnel::{InboundTap, PeerRegistration, RegistrationSink};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::Message;
 
+use crate::framing;
 use crate::transport::{QuicConnection, QuicListener};
 use crate::wss::{WssConnection, WssListener};
+
+/// Handler-provenance tag carried by the framed-IO pump logs.
+const CTX: &str = "network-accepted";
 
 /// How long the per-connection handler waits for the peer's first
 /// frame (`SecondaryWelcome`) before dropping the connection as
@@ -128,7 +131,7 @@ async fn handle_new_quic_connection<I: Identifier>(
     }
 
     // Create per-connection write channel
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
+    let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
 
     // Register: hand the per-connection writer to the unified
     // transport's `recv_peer` demux (it inserts into the shared
@@ -151,50 +154,21 @@ async fn handle_new_quic_connection<I: Identifier>(
     let (send_stream, recv_stream, existing_buf) = conn.into_parts();
 
     // Reader task: read from QUIC recv stream, forward to incoming
-    let reader_tx = incoming_tx;
-    let reader_id = peer_id.clone();
-    let mut reader = tokio::task::spawn_local(async move {
-        let mut recv_buf = existing_buf;
-        let mut recv = recv_stream;
-        loop {
-            // Try to decode a complete frame from the buffer
-            match codec::decode_frame::<I>(&recv_buf) {
-                Ok(Some((msg, consumed))) => {
-                    recv_buf.drain(..consumed);
-                    if reader_tx.send(msg).is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => {
-                    // Need more data
-                    let mut tmp = [0u8; 8192];
-                    match recv.read(&mut tmp).await {
-                        Ok(Some(n)) => recv_buf.extend_from_slice(&tmp[..n]),
-                        _ => break,
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        tracing::debug!(peer = %reader_id, "QUIC reader done");
-    });
+    let mut reader = tokio::task::spawn_local(framing::run_quic_reader(
+        recv_stream,
+        existing_buf,
+        incoming_tx,
+        CTX,
+        peer_id.clone(),
+    ));
 
     // Writer task: drain outgoing channel, write to QUIC send stream
-    let writer_id = peer_id;
-    let mut writer = tokio::task::spawn_local(async move {
-        let mut send = send_stream;
-        while let Some(msg) = outgoing_rx.recv().await {
-            match codec::serialize_message(&msg) {
-                Ok(frame) => {
-                    if send.write_all(&frame).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        tracing::debug!(peer = %writer_id, "QUIC writer done");
-    });
+    let mut writer = tokio::task::spawn_local(framing::run_quic_writer(
+        send_stream,
+        outgoing_rx,
+        CTX,
+        peer_id,
+    ));
 
     // Wait for either task to finish, then abort the other
     tokio::select! {
@@ -247,7 +221,7 @@ async fn handle_new_wss_connection<I: Identifier>(
     }
 
     // Create per-connection write channel
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
+    let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
 
     // Register: hand the per-connection writer to the unified
     // transport's `recv_peer` demux (it inserts into the shared
@@ -266,46 +240,23 @@ async fn handle_new_wss_connection<I: Identifier>(
     }
 
     // Split the WebSocket stream into independent read/write halves
-    let (mut ws_write, mut ws_read) = conn.into_inner().split();
+    let (ws_write, ws_read) = conn.into_inner().split();
 
     // Reader task: read from WebSocket, decode, forward to incoming
-    let reader_tx = incoming_tx;
-    let reader_id = peer_id.clone();
-    let mut reader = tokio::task::spawn_local(async move {
-        loop {
-            match ws_read.next().await {
-                Some(Ok(Message::Binary(data))) => match codec::decode_frame::<I>(&data) {
-                    Ok(Some((msg, _))) => {
-                        if reader_tx.send(msg).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => continue,
-                    Err(_) => break,
-                },
-                Some(Ok(Message::Close(_))) | None => break,
-                Some(Ok(_)) => continue, // skip ping/pong/text
-                Some(Err(_)) => break,
-            }
-        }
-        tracing::debug!(peer = %reader_id, "WSS reader done");
-    });
+    let mut reader = tokio::task::spawn_local(framing::run_wss_reader(
+        ws_read,
+        incoming_tx,
+        CTX,
+        peer_id.clone(),
+    ));
 
     // Writer task: drain outgoing channel, write to WebSocket
-    let writer_id = peer_id;
-    let mut writer = tokio::task::spawn_local(async move {
-        while let Some(msg) = outgoing_rx.recv().await {
-            match codec::serialize_message(&msg) {
-                Ok(frame) => {
-                    if ws_write.send(Message::Binary(frame.into())).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        tracing::debug!(peer = %writer_id, "WSS writer done");
-    });
+    let mut writer = tokio::task::spawn_local(framing::run_wss_writer(
+        ws_write,
+        outgoing_rx,
+        CTX,
+        peer_id,
+    ));
 
     // Wait for either task to finish, then abort the other
     tokio::select! {

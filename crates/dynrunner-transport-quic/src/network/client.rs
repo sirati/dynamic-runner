@@ -28,12 +28,13 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
-use dynrunner_protocol_primary_secondary::{DistributedMessage, codec};
+use dynrunner_protocol_primary_secondary::DistributedMessage;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::framing;
 use crate::transport::QuicConnection;
 use crate::wss::{WssConnection, connect_wss};
 
@@ -226,50 +227,45 @@ impl<I: Identifier> MessageReceiver<DistributedMessage<I>> for NetworkClient<I> 
     }
 }
 
+/// Handler-provenance tag carried by the framed-IO pump logs. The
+/// client dials exactly one server, so there is no per-peer id yet —
+/// the pump's `peer` slot carries the same fixed label.
+const CTX: &str = "network-client";
+
 /// Spawn reader + writer tasks for a fresh QuicConnection and return
 /// the application-side channel pair wrapped in a `BridgedConnection`.
+///
+/// The reader is `framing::run_quic_reader` (the shared wire-frame
+/// policy pump, #366); the writer stays local because it owns the
+/// [`Outgoing`] envelope (`Flush` rendezvous), but each `Msg` is
+/// encoded through the same `framing::encode_outbound` gate — an
+/// unsendable frame is dropped loudly there and the connection kept.
 fn spawn_quic_bridge<I: Identifier>(conn: QuicConnection) -> BridgedConnection<I> {
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Outgoing<I>>();
     let (incoming_tx, incoming_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
 
     let (send_stream, recv_stream, existing_buf) = conn.into_parts();
 
-    let reader = tokio::task::spawn_local(async move {
-        let mut recv_buf = existing_buf;
-        let mut recv = recv_stream;
-        loop {
-            match codec::decode_frame::<I>(&recv_buf) {
-                Ok(Some((msg, consumed))) => {
-                    recv_buf.drain(..consumed);
-                    if incoming_tx.send(msg).is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => {
-                    let mut tmp = [0u8; 8192];
-                    match recv.read(&mut tmp).await {
-                        Ok(Some(n)) => recv_buf.extend_from_slice(&tmp[..n]),
-                        _ => break,
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        tracing::debug!("NetworkClient QUIC reader done");
-    });
+    let reader = tokio::task::spawn_local(framing::run_quic_reader(
+        recv_stream,
+        existing_buf,
+        incoming_tx,
+        CTX,
+        CTX.to_string(),
+    ));
 
     let writer = tokio::task::spawn_local(async move {
         let mut send = send_stream;
         while let Some(item) = outgoing_rx.recv().await {
             match item {
-                Outgoing::Msg(msg) => match codec::serialize_message(&msg) {
-                    Ok(frame) => {
-                        if send.write_all(&frame).await.is_err() {
-                            break;
-                        }
+                Outgoing::Msg(msg) => {
+                    let Some(frame) = framing::encode_outbound(&msg, CTX, CTX) else {
+                        continue;
+                    };
+                    if send.write_all(&frame).await.is_err() {
+                        break;
                     }
-                    Err(_) => break,
-                },
+                }
                 Outgoing::Flush(ack) => {
                     // FIFO order on the mpsc means every preceding
                     // Msg's write_all has already returned by the
@@ -291,44 +287,33 @@ fn spawn_quic_bridge<I: Identifier>(conn: QuicConnection) -> BridgedConnection<I
     }
 }
 
-/// Spawn reader + writer tasks for a fresh WssConnection.
+/// Spawn reader + writer tasks for a fresh WssConnection. Same shape
+/// as [`spawn_quic_bridge`] — shared reader pump, local Flush-aware
+/// writer with the shared encode gate.
 fn spawn_wss_bridge<I: Identifier>(conn: WssConnection) -> BridgedConnection<I> {
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Outgoing<I>>();
     let (incoming_tx, incoming_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
 
-    let (mut ws_write, mut ws_read) = conn.into_inner().split();
+    let (mut ws_write, ws_read) = conn.into_inner().split();
 
-    let reader = tokio::task::spawn_local(async move {
-        loop {
-            match ws_read.next().await {
-                Some(Ok(Message::Binary(data))) => match codec::decode_frame::<I>(&data) {
-                    Ok(Some((msg, _))) => {
-                        if incoming_tx.send(msg).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => continue,
-                    Err(_) => break,
-                },
-                Some(Ok(Message::Close(_))) | None => break,
-                Some(Ok(_)) => continue,
-                Some(Err(_)) => break,
-            }
-        }
-        tracing::debug!("NetworkClient WSS reader done");
-    });
+    let reader = tokio::task::spawn_local(framing::run_wss_reader(
+        ws_read,
+        incoming_tx,
+        CTX,
+        CTX.to_string(),
+    ));
 
     let writer = tokio::task::spawn_local(async move {
         while let Some(item) = outgoing_rx.recv().await {
             match item {
-                Outgoing::Msg(msg) => match codec::serialize_message(&msg) {
-                    Ok(frame) => {
-                        if ws_write.send(Message::Binary(frame.into())).await.is_err() {
-                            break;
-                        }
+                Outgoing::Msg(msg) => {
+                    let Some(frame) = framing::encode_outbound(&msg, CTX, CTX) else {
+                        continue;
+                    };
+                    if ws_write.send(Message::Binary(frame.into())).await.is_err() {
+                        break;
                     }
-                    Err(_) => break,
-                },
+                }
                 Outgoing::Flush(ack) => {
                     // See `spawn_quic_bridge` for the FIFO rationale —
                     // every preceding Msg's `ws_write.send.await` has

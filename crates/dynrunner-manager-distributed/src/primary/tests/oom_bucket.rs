@@ -1,7 +1,7 @@
 //! OOM-retry-bucket dispatch-shape coverage.
 //!
 //! Single concern: pin the OOM-bucket throughput optimization (user
-//! spec 2026-05-17) end-to-end at the unit-test boundary. The four
+//! spec 2026-05-17) end-to-end at the unit-test boundary. The three
 //! invariants that fall under this file:
 //!
 //!   1. Memory-DESC pairing: candidates sorted by estimator-memory
@@ -14,16 +14,11 @@
 //!      OOM bucket is reinjecting and `false` outside (including
 //!      after the bucket settles with no candidates left or with
 //!      its budget exhausted).
-//!   4. 5-min stuck-worker watchdog is disabled during the bucket
-//!      (single-worker memory-pressed retries can legitimately
-//!      exceed the watchdog window).
 //!
-//! Tests #1, #2, #3 exercise the retry-bucket primitive directly
+//! All three exercise the retry-bucket primitive directly
 //! against a coordinator state seeded by hand (no transport
 //! traffic) — this keeps each invariant testable in isolation
-//! without re-spinning the full distributed pipeline. Test #4
-//! pins the watchdog gate by inspecting `failed_tasks` after a
-//! synthetic OOM-bucket window.
+//! without re-spinning the full distributed pipeline.
 
 use std::collections::HashMap;
 
@@ -510,63 +505,3 @@ async fn flag_clears_on_oom_bucket_with_no_candidates() {
         .await;
 }
 
-/// Test #4: 5-min stuck-worker watchdog is gated by
-/// `single_worker_mode`. The operational-loop arm `if
-/// !self.single_worker_mode()` parks the watchdog future
-/// indefinitely while the OOM bucket runs; this test pins the
-/// gate at the coordinator-state level (the operational-loop arm
-/// reads `self.single_worker_mode()` directly).
-///
-/// Approach: prove the gate's READ contract — the arm-condition
-/// evaluates the same way the watchdog sees it. We can't
-/// reasonably run the 5-min timer in a unit test; the
-/// integration coverage in production is the
-/// `operational_loop.rs:_ = sleep(300s), if !self.single_worker_mode()`
-/// arm guard which is structurally tied to this flag.
-#[tokio::test(flavor = "current_thread")]
-async fn watchdog_arm_is_gated_by_single_worker_mode() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (transport, _ends) = setup_test(0);
-            let tasks = vec![phased_task("t_synth", "default", 50)];
-            let (mut primary, _mesh) =
-                make_primed_primary(transport, /* oom_passes */ 1, tasks);
-            register_secondary_with_workers(&mut primary, "sec-A", 1024, 1);
-
-            // Pre-bucket: watchdog arm-condition is enabled.
-            assert!(
-                !primary.single_worker_mode(),
-                "pre-bucket: watchdog arm enabled (flag false)"
-            );
-
-            // Enter OOM bucket: arm-condition disables watchdog.
-            mark_all_failed_oom(&mut primary);
-            let mut command_rx = None;
-            let phase = PhaseId::from("default");
-            primary
-                .try_run_phase_retry_bucket(&phase, BucketKind::Oom, &mut command_rx)
-                .await
-                .expect("OOM bucket must succeed");
-            assert!(
-                primary.single_worker_mode(),
-                "during OOM bucket: watchdog arm disabled (flag true)"
-            );
-            // The arm guard's negation in `operational_loop.rs`
-            // (`if !self.single_worker_mode()`) is the only
-            // call-site consumer — so the flag's read here is the
-            // exact signal the watchdog would see.
-
-            // Settle the bucket: arm-condition re-enables.
-            mark_all_failed_oom(&mut primary);
-            primary
-                .try_run_phase_retry_bucket(&phase, BucketKind::Oom, &mut command_rx)
-                .await
-                .expect("budget-exhaust pass must succeed");
-            assert!(
-                !primary.single_worker_mode(),
-                "post-bucket: watchdog arm re-enabled (flag false)"
-            );
-        })
-        .await;
-}

@@ -1017,7 +1017,7 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// candidates left OR budget exhausted).
     ///
     /// Read by dispatch-shape sites (`dispatch_to_idle_workers`,
-    /// `handle_task_request`, the operational-loop 5-min timeout arm)
+    /// `handle_task_request`)
     /// through the accessor [`Self::single_worker_mode`] / the
     /// composed predicate [`Self::should_skip_worker_for_dispatch`].
     /// Call sites never branch on this directly — the masking + the
@@ -1034,6 +1034,18 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// dispatch tends to share secondaries with the OOM-bucket
     /// retries anyway).
     pub(super) single_worker_mode: bool,
+
+    /// Per-task reconciliation-probe deadlines (#308) — the persistent
+    /// timing state behind the "do you still hold task X?" backstop.
+    /// Owns every deadline / outstanding-response window / poll cadence
+    /// on its own clock (stored `Instant`s) so they elapse on wall time
+    /// regardless of `select!` activity; the operational loop polls it
+    /// once per iteration ([`Self::reconciliation_probe_tick`]) and the
+    /// inbound `TaskHoldResponse` arm feeds it answers
+    /// ([`Self::handle_task_hold_response`]). Constructed from
+    /// `config.task_reconciliation_timeout` + the keepalive-derived
+    /// response window. See [`crate::primary::reconciliation_probe`].
+    pub(super) recon_prober: super::reconciliation_probe::ReconciliationProber,
 
     /// The consumer's run configuration — the byte-identical token
     /// sequence the framework forwards onto a joining / respawned /
@@ -1146,6 +1158,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // moves into `this.config`, mirroring `next_secondary_id`. The
         // responder reads this verbatim; it never re-reads `config`.
         let forwarded_argv = config.forwarded_argv.clone();
+        // Reconciliation prober (#308), built off `config` before it
+        // moves into `this.config` (mirroring the snapshots above). The
+        // response window — how long an emitted probe waits before the
+        // prober gives up and re-arms — is the cluster's established
+        // "should have heard back by now" quantum
+        // (`keepalive_interval × keepalive_miss_threshold`, ≈15s at the
+        // defaults); the silent-holder case past it belongs to the
+        // keepalive machinery, not the probe.
+        let recon_prober = super::reconciliation_probe::ReconciliationProber::new(
+            config.task_reconciliation_timeout,
+            config
+                .keepalive_interval
+                .saturating_mul(config.keepalive_miss_threshold),
+        );
         let mut this = Self {
             config,
             client,
@@ -1216,6 +1242,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             worker_mgmt_fail_outcome: None,
             pending_run_abort: None,
             single_worker_mode: false,
+            recon_prober,
             forwarded_argv,
             pending_cold_seed_broadcast: Vec::new(),
             op_loop_arm_stats: None,
@@ -1811,9 +1838,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// True while the per-phase OOM retry bucket is actively
     /// reinjecting + draining. Sole writer: `try_run_phase_retry_bucket`
     /// (set true on `BucketKind::Oom` entry, reset on its `Ok(false)`
-    /// returns). Read by the dispatch-shape pipeline and the
-    /// operational-loop 5-min timeout arm. See the field doc on
-    /// `single_worker_mode` for the user-spec rationale.
+    /// returns). Read by the dispatch-shape pipeline. See the field
+    /// doc on `single_worker_mode` for the user-spec rationale.
     pub(super) fn single_worker_mode(&self) -> bool {
         self.single_worker_mode
     }

@@ -42,6 +42,22 @@ pub const NO_FAULT_PREEMPT_WIRE_MESSAGE: &str = "worker no-fault preempt; resour
 pub(in crate::secondary) const DEFAULT_TERMINAL_ACK_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(15);
 
+/// How many timed-out-and-replayed sends of ONE terminal report before
+/// the drain escalates the per-attempt WARN to a PERMANENT-failure
+/// ERROR (#366) — and re-escalates on every further multiple.
+///
+/// 8 attempts × the 15s default ack timeout ≈ 2 minutes of continuous
+/// non-delivery: far past any transient blip the replay loop exists to
+/// ride out (one mesh redial cycle, an election round), yet quick
+/// enough that an operator watching a wedging phase barrier gets the
+/// "this report is never going to make it" line while the run is still
+/// inspectable. The canonical permanent cause is a frame over the mesh
+/// wire limit — dropped LOUDLY at the transport egress gate
+/// (`dynrunner-transport-quic::framing`) but undeliverable forever, so
+/// without this tally its replay churn would look like an ordinary
+/// outage WARN every 15s.
+pub(in crate::secondary) const TERMINAL_REPLAY_ESCALATION_ATTEMPTS: u32 = 8;
+
 /// One retained terminal-bearing report in the buffered-terminal-replay
 /// queue, tagged with WHY it is retained (the retention reason decides
 /// when the next drain re-sends it).
@@ -417,6 +433,9 @@ where
         let before = self.pending_terminal_replays.len();
         self.pending_terminal_replays
             .retain(|entry| entry.frame.delivery_seq() != Some(seq));
+        // Delivery confirmed: clear the permanent-failure tally (#366)
+        // so the map only ever holds still-undelivered seqs.
+        self.terminal_replay_attempts.remove(&seq);
         if self.pending_terminal_replays.len() < before {
             tracing::debug!(
                 seq,
@@ -498,6 +517,35 @@ where
                      (possible blackholed-but-live leg); treating as \
                      no-route-equivalent and replaying with the same seq"
                 );
+                // Permanent-failure escalation (#366): tally the
+                // timed-out replays per seq (the entry itself is
+                // recreated by the re-send's re-retention, so the seq
+                // is the sticky identity) and escalate to ERROR at the
+                // threshold + every further multiple. The NoRoute
+                // retention reason is deliberately NOT tallied: it
+                // re-sends on EVERY drain trigger (loop-tick cadence)
+                // and its absorb site already WARNs per occurrence.
+                if let Some(seq) = seq {
+                    let attempts = self.terminal_replay_attempts.entry(seq).or_insert(0);
+                    *attempts += 1;
+                    if *attempts >= TERMINAL_REPLAY_ESCALATION_ATTEMPTS
+                        && attempts.is_multiple_of(TERMINAL_REPLAY_ESCALATION_ATTEMPTS)
+                    {
+                        tracing::error!(
+                            task_hash = ?task_hash,
+                            delivery_seq = seq,
+                            attempts = *attempts,
+                            "terminal report has been replayed {attempts} times \
+                             without an ack — PERMANENT delivery failure \
+                             suspected. Likely causes: the frame exceeds the \
+                             mesh wire limit (look for 'dropping outbound mesh \
+                             frame' ERRORs from the transport egress gate) or \
+                             the primary link is persistently blackholed. The \
+                             task stays unresolved at the authority until this \
+                             report lands"
+                        );
+                    }
+                }
             }
             // `send_to_primary` absorbs a no-route into `Ok(())` and
             // re-retains the frame either way (`NoRoute` on re-absorb —

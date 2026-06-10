@@ -717,6 +717,134 @@ pub(super) async fn fake_secondary_with_addrs(
     }
 }
 
+/// Reconciliation-probe fixture (#308): a fake secondary with AMNESIA —
+/// it handshakes like [`fake_secondary_with_addrs`] (welcome + cert +
+/// `MeshReady`), but SWALLOWS its first batch of assigned work (the
+/// `InitialAssignment` binaries, or — if that batch was empty — the
+/// first `TaskAssignment`): no `TaskComplete`, no `TaskFailed`, no
+/// follow-up `TaskRequest`. It stays LIVE on the wire, and when the
+/// primary's reconciliation probe asks `TaskHoldQuery` it answers
+/// `held = false` — the truthful "not in my bookkeeping" denial of a
+/// node that lost the tasks (sweep bug / stranded bookkeeping / rejoin
+/// after restart). Every assignment AFTER the swallowed batch is
+/// completed normally, so the post-verdict requeue + re-dispatch
+/// converges no matter which secondary the scheduler picks next.
+///
+/// This is precisely the failure class the probe owns: the holder is
+/// neither dead (class 2, silence machinery) nor did it send a terminal
+/// whose delivery was lost (class 1, #352 replay) — it simply will
+/// never report, and only its own denial can prove that.
+pub(super) async fn fake_amnesiac_secondary(
+    secondary_id: String,
+    num_workers: u32,
+    ram_bytes: u64,
+    mut incoming_from_primary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    outgoing_to_primary: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+) {
+    outgoing_to_primary
+        .send(DistributedMessage::SecondaryWelcome {
+            target: Some(Destination::Primary),
+            sender_id: secondary_id.clone(),
+            timestamp: 0.0,
+            secondary_id: secondary_id.clone(),
+            resources: vec![dynrunner_core::ResourceAmount {
+                kind: dynrunner_core::ResourceKind::memory(),
+                amount: ram_bytes,
+            }],
+            worker_count: num_workers,
+            hostname: "test-host".into(),
+            is_observer: false,
+            can_be_primary: false,
+        })
+        .unwrap();
+    outgoing_to_primary
+        .send(DistributedMessage::CertExchange {
+            target: Some(Destination::Primary),
+            sender_id: secondary_id.clone(),
+            timestamp: 0.0,
+            secondary_id: secondary_id.clone(),
+            public_cert_pem: "FAKE_CERT".into(),
+            ipv4_address: Some("127.0.0.1".into()),
+            ipv6_address: None,
+            quic_port: 5000,
+            liveness_port: None,
+        })
+        .unwrap();
+    outgoing_to_primary
+        .send(DistributedMessage::MeshReady {
+            target: Some(Destination::Primary),
+            sender_id: secondary_id.clone(),
+            timestamp: 0.0,
+            secondary_id: secondary_id.clone(),
+            peer_count: 0,
+        })
+        .unwrap();
+
+    // `true` until the first non-empty batch of work has been
+    // swallowed; everything after that is completed normally.
+    let mut amnesia_pending = true;
+    while let Some(msg) = incoming_from_primary.recv().await {
+        match msg {
+            DistributedMessage::InitialAssignment { zip_files, .. } => {
+                let batch: usize = zip_files.iter().map(|zf| zf.binaries.len()).sum();
+                if batch > 0 {
+                    // SWALLOW the whole batch: the tasks vanish from
+                    // this node's "bookkeeping" without any terminal.
+                    amnesia_pending = false;
+                }
+            }
+            DistributedMessage::TaskAssignment { file_hash, .. } => {
+                if amnesia_pending {
+                    // Swallow exactly this one, then behave.
+                    amnesia_pending = false;
+                    continue;
+                }
+                outgoing_to_primary
+                    .send(DistributedMessage::TaskComplete {
+                        target: Some(Destination::Primary),
+                        sender_id: secondary_id.clone(),
+                        timestamp: 0.0,
+                        secondary_id: secondary_id.clone(),
+                        worker_id: 0,
+                        task_hash: file_hash,
+                        result_data: None,
+                        delivery_seq: None,
+                    })
+                    .unwrap();
+                outgoing_to_primary
+                    .send(DistributedMessage::TaskRequest {
+                        target: Some(Destination::Primary),
+                        sender_id: secondary_id.clone(),
+                        timestamp: 0.0,
+                        secondary_id: secondary_id.clone(),
+                        worker_id: 0,
+                        available_resources: vec![dynrunner_core::ResourceAmount {
+                            kind: dynrunner_core::ResourceKind::memory(),
+                            amount: ram_bytes,
+                        }],
+                    })
+                    .unwrap();
+            }
+            DistributedMessage::TaskHoldQuery { task_hash, .. } => {
+                // The probe. This fake holds NOTHING (it either
+                // swallowed the task into the void or completed it
+                // synchronously), so the truthful answer is always the
+                // positive denial.
+                outgoing_to_primary
+                    .send(DistributedMessage::TaskHoldResponse {
+                        target: Some(Destination::Primary),
+                        sender_id: secondary_id.clone(),
+                        timestamp: 0.0,
+                        task_hash,
+                        held: false,
+                    })
+                    .unwrap();
+            }
+            _ => {}
+        }
+    }
+}
+
 /// A relocation-target fake that is TRANSPORT-CONNECTED but NEVER
 /// OPERATIONAL: it sends `SecondaryWelcome` (with `can_be_primary: true`,
 /// so it is an eligible `select_relocation_target` candidate) +

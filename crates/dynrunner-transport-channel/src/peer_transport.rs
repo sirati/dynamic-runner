@@ -73,6 +73,13 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
         // `send_to_primary`); excluding it would be a role concern the
         // transport must not encode (TRANSPORT⊥ROLES) — the single
         // authoritative exclusion lives at the coordinator edge.
+        //
+        // No broadcast-miss WARN here (cf. the QUIC twin's #363
+        // missed-set sweep): this transport has NO authoritative roster
+        // distinct from its connections — `connect_to_peers` is a no-op,
+        // adjacency is pre-wired (`peer_mesh*`) or test-mutated
+        // (`disconnect_from`/`connect_to`), so `outgoing` IS the known
+        // set and "known ∖ connected" is empty by construction.
         for tx in self.outgoing.values() {
             // Closed senders are tolerated — the peer simply went away.
             let _ = tx.send(msg.clone());

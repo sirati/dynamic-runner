@@ -752,6 +752,32 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
         }
     }
 
+    /// Whether `task_hash` is in ANY of this node's live own-worker
+    /// bookkeeping — the truth source for the reconciliation-probe
+    /// responder (#308, `TaskHoldQuery`). "Live bookkeeping" means: the
+    /// (generation-aware, post-#341-truthful) `active_tasks` map in
+    /// whichever state carries it, PLUS the `Operational`-only
+    /// `pending_first_bind` deferrals (a respawn-HOLD task is genuinely
+    /// held — its dispatch is parked, not lost). Any state with no such
+    /// bookkeeping (pre-`Configuring`, terminal) holds nothing.
+    ///
+    /// `false` is a POSITIVE denial the primary acts on (fail +
+    /// requeue), which is exactly right in every reachable case: a node
+    /// whose maps genuinely don't know the hash will never produce a
+    /// terminal for it.
+    pub(in crate::secondary) fn holds_task(&self, task_hash: &str) -> bool {
+        match self {
+            SecondaryLifecycle::Configuring(cfg) => cfg.active_tasks.contains_key(task_hash),
+            SecondaryLifecycle::Operational(op) => {
+                op.active_tasks.contains_key(task_hash)
+                    || op
+                        .pending_first_bind
+                        .values()
+                        .any(|pending| pending.file_hash == task_hash)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Capability invariants that exist ONLY in `AwaitingPrimary`.

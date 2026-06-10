@@ -9,6 +9,31 @@ use crate::primary::PrimaryCoordinator;
 use crate::primary::command_channel::PrimaryCommand;
 use crate::worker_signal::WorkerMgmtSignal;
 
+/// THE single classifier for a BACKPRESSURE-shaped `TaskFailed`: a
+/// requeue signal, not a terminal failure — the task never ran to
+/// completion anywhere, so it re-enters the pool and consumes no retry
+/// budget. One predicate (previously the same marker list was inlined
+/// twice in `handle_task_failed`) so the dedup gate and the requeue arm
+/// can never drift, and a new marker is added in exactly one place.
+///
+/// The recognised markers:
+///   * `"No idle worker available"` — the peer's worker pool was full
+///     at dispatch time.
+///   * `"worker pipe broken; respawning"` — the peer's target worker
+///     subprocess died between tasks; the pipe-write never landed.
+///   * [`crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE`] —
+///     a no-fault scheduler-driven preempt displaced the task.
+///   * [`crate::primary::reconciliation_probe::RECONCILIATION_LOST_WIRE_MESSAGE`]
+///     — the reconciliation probe's holder positively denied holding
+///     the task (#308): its terminal will never come, but it did not
+///     FAIL anywhere, so it requeues without burning retry budget.
+fn is_backpressure_shaped(error_message: &str) -> bool {
+    error_message == "No idle worker available"
+        || error_message == "worker pipe broken; respawning"
+        || error_message == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE
+        || error_message == crate::primary::reconciliation_probe::RECONCILIATION_LOST_WIRE_MESSAGE
+}
+
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// `command_rx` threads the operational-loop's command-channel
     /// receiver into the cascade so a callback-issued `spawn_tasks`
@@ -50,10 +75,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // re-queue is idempotent (the binary either gets
             // requeued or has already been requeued by an
             // earlier landing).
-            let dedup_is_backpressure = error_message == "No idle worker available"
-                || error_message == "worker pipe broken; respawning"
-                || error_message == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE;
-            if !dedup_is_backpressure
+            let is_backpressure = is_backpressure_shaped(error_message);
+            if !is_backpressure
                 && (self.completed_tasks.contains(task_hash)
                     || self.failed_tasks.contains_key(task_hash))
             {
@@ -74,10 +97,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // backpressure-requeue and terminal-failure arms below can
             // recover the binary. A stale TaskFailed for a slot already
             // reassigned to a later task returns `None` — a safe no-op.
-            // All three terminal-shaped paths in this function
+            // Both terminal-shaped paths in this function
             // (backpressure-requeue, terminal TaskFailed) share this
-            // one resolution; the stuck-worker watchdog in
-            // `operational_loop` routes through the same helper.
+            // one resolution.
             let recovered_binary: Option<TaskInfo<I>> = self
                 .free_slot_on_terminal(&secondary_id, worker_id, &task_hash)
                 .map(|entry| entry.task);
@@ -108,34 +130,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // keeps cycling work back to it. Tokenizer hit this on
             // a 1791-task cohort: 3128 errors all on one secondary,
             // 1511 permanent failures.
-            // Two backpressure shapes — both mean "task DIDN'T
-            // actually run; requeue at the pool, do not consume
-            // retry budget":
-            //
-            //   1. "No idle worker available" — peer's worker
-            //      pool was full at dispatch time.
-            //   2. "worker pipe broken; respawning" — peer's
-            //      target worker subprocess died between tasks;
-            //      pipe-write failed; the peer is respawning.
-            //      The not-yet-attempted task comes back with
-            //      this marker so the primary requeues into the
-            //      pool and re-dispatches once a peer signals
-            //      capacity. Without this case Bug C produced
-            //      silent task loss on every Broken-pipe assign
-            //      attempt at a peer secondary (#46 secondary-
-            //      side fix needed this primary-side companion
-            //      to actually requeue rather than mark-as-failed).
-            // The third marker (`NO_FAULT_PREEMPT_WIRE_MESSAGE`) signals
-            // a no-fault scheduler-driven preempt — the secondary's
-            // worker was killed by `ResourceStealingScheduler` because
-            // the task was opportunistic or the worker was still under
-            // its reserved budget. The displaced task is innocent;
-            // routing it through the backpressure path (re-queue, no
-            // retry-budget consumption) preserves the same contract as
-            // the other two markers.
-            let is_backpressure = error_message == "No idle worker available"
-                || error_message == "worker pipe broken; respawning"
-                || error_message == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE;
+            // The recognised marker set — every shape meaning "the task
+            // DIDN'T actually run to a terminal anywhere; requeue at
+            // the pool, do not consume retry budget" — is the single
+            // [`is_backpressure_shaped`] predicate above (computed once
+            // before the dedup gate; this arm and the gate share it so
+            // they can never drift). See the predicate's doc for the
+            // per-marker rationale (#46 Bug C, no-fault preempt, the
+            // #308 reconciliation-probe loss).
             if is_backpressure {
                 let backoff_ms = 500;
                 self.backpressured_secondaries.insert(
