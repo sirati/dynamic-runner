@@ -613,12 +613,9 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
             // `TasksAdded` rather than dispatching inline. Drain the coalesced
             // batch and run the worker-management reaction synchronously —
             // exactly what the operational loop's worker-management arm does.
-            let batch = crate::worker_signal::drain_worker_signal_batch(
-                &mut wm_rx,
-                Duration::from_millis(50),
-            )
-            .await
-            .expect("dead-secondary requeue must emit a TasksAdded batch");
+            let batch = crate::worker_signal::recv_worker_signal_batch(&mut wm_rx)
+                .await
+                .expect("dead-secondary requeue must emit a TasksAdded batch");
             assert!(
                 batch
                     .signals
@@ -1356,12 +1353,9 @@ async fn lazy_requeue_fires_at_dispatch_altitude_when_only_silent_held_work_rema
 
             // The requeue re-emitted a `TasksAdded` (production drains it next
             // iteration). Drive that recheck synchronously to re-dispatch.
-            let followup = crate::worker_signal::drain_worker_signal_batch(
-                &mut wm_rx,
-                Duration::from_millis(50),
-            )
-            .await
-            .expect("the lazy requeue must re-emit a TasksAdded batch");
+            let followup = crate::worker_signal::recv_worker_signal_batch(&mut wm_rx)
+                .await
+                .expect("the lazy requeue must re-emit a TasksAdded batch");
             // Keep the survivor live across the re-dispatch reaction (production
             // invariant: a live secondary keeps sending keepalives).
             primary.record_keepalive("sec-b");

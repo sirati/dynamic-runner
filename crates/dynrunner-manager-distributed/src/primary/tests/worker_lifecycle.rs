@@ -68,7 +68,7 @@ fn primary_with_pool_and_idle_worker(
     // mesh-pump (aborted on its Drop). Dropping it here would kill the pump,
     // so a queued `client.send` would fail once the aborted task is reaped —
     // exactly the "egress receiver dropped" failure that wedged the deferred
-    // dispatch recheck in tests that yield (e.g. a `drain_worker_signal_batch`
+    // dispatch recheck in tests that yield (e.g. a `recv_worker_signal_batch`
     // wait) between the fixture build and the dispatch.
     (primary, ends, mesh)
 }
@@ -341,12 +341,9 @@ async fn stale_complete_after_reassignment_is_noop_on_slot() {
             primary
                 .handle_task_complete(task_complete("sec-0", 0, &first_hash), &mut None)
                 .await;
-            let batch = crate::worker_signal::drain_worker_signal_batch(
-                &mut wm_rx,
-                std::time::Duration::from_millis(50),
-            )
-            .await
-            .expect("completion must emit a TasksAdded batch");
+            let batch = crate::worker_signal::recv_worker_signal_batch(&mut wm_rx)
+                .await
+                .expect("completion must emit a TasksAdded batch");
             primary.react_to_worker_signal_batch(batch).await;
             assert!(
                 primary.slot_holds_hash_for_test("sec-0", 0, &other_hash),

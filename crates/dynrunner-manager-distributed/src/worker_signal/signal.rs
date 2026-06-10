@@ -21,7 +21,7 @@ use dynrunner_core::PhaseId;
 /// the bus installed via
 /// [`crate::cluster_state::ClusterState::install_worker_mgmt_sender`];
 /// drained as a coalesced batch by
-/// [`super::drain_worker_signal_batch`] from inside worker
+/// [`super::recv_worker_signal_batch`] from inside worker
 /// management's operational `select!`.
 ///
 /// Each variant carries the full payload worker management needs to act

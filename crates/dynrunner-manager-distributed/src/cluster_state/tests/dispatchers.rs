@@ -246,7 +246,7 @@ async fn task_completed_dedup_does_not_re_emit() {
 // directly — exactly the entry point the future call sites will use.
 
 /// A burst of `emit_worker_mgmt` calls, with a sender installed,
-/// coalesces into one batch via `drain_worker_signal_batch` that
+/// coalesces into one batch via `recv_worker_signal_batch` that
 /// preserves every signal in arrival order. Pins the
 /// install → emit → drain plumbing end-to-end.
 #[tokio::test(flavor = "current_thread")]
@@ -267,12 +267,9 @@ async fn worker_mgmt_emit_burst_coalesces_into_one_drained_batch() {
     s.emit_worker_mgmt(s2.clone());
     s.emit_worker_mgmt(s3.clone());
 
-    let batch = crate::worker_signal::drain_worker_signal_batch(
-        &mut rx,
-        std::time::Duration::from_millis(50),
-    )
-    .await
-    .expect("emitted burst should produce a batch");
+    let batch = crate::worker_signal::recv_worker_signal_batch(&mut rx)
+        .await
+        .expect("emitted burst should produce a batch");
     assert_eq!(batch.signals, vec![s1, s2, s3]);
 }
 

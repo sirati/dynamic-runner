@@ -43,7 +43,7 @@ use dynrunner_protocol_primary_secondary::KeepaliveRole;
 
 use crate::primary::command_channel::handle_primary_command;
 use crate::primary::wire::compute_task_hash;
-use crate::worker_signal::{WorkerMgmtSignal, drain_worker_signal_batch};
+use crate::worker_signal::{WorkerMgmtSignal, recv_worker_signal_batch};
 
 type TestPrimary = PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>;
 
@@ -140,9 +140,12 @@ async fn inject_and_recheck(
         .await
         .expect("spawn reply oneshot closed")
         .expect("spawn_tasks failed");
-    assert!(errors.is_empty(), "no spawn rejections expected: {errors:?}");
+    assert!(
+        errors.is_empty(),
+        "no spawn rejections expected: {errors:?}"
+    );
 
-    let batch = drain_worker_signal_batch(wm_rx, Duration::from_millis(50))
+    let batch = recv_worker_signal_batch(wm_rx)
         .await
         .expect("runtime spawn must emit a TasksAdded batch");
     primary.react_to_worker_signal_batch(batch).await;
@@ -267,8 +270,7 @@ async fn injected_batch_on_promoted_primary_spreads_across_live_fleet() {
             while wm_rx.try_recv().is_ok() {}
 
             // ── Mid-run injection: 12 tasks over 18 idle slots ──
-            let batch: Vec<TaskInfo<TestId>> =
-                (0..12).map(|i| ptask(&format!("m{i}"))).collect();
+            let batch: Vec<TaskInfo<TestId>> = (0..12).map(|i| ptask(&format!("m{i}"))).collect();
             inject_and_recheck(&mut primary, &mut wm_rx, batch).await;
 
             let per_secondary: Vec<usize> = ends
@@ -319,10 +321,10 @@ fn phased_task(phase: &str, name: &str) -> TaskInfo<TestId> {
 /// secondaries' TaskRequest re-polls (the 60s backoff cap is the lag).
 ///
 /// The round-2 repro drives the injection by calling
-/// `handle_primary_command` + `drain_worker_signal_batch` DIRECTLY, so
-/// the drain is never raced — and it passes. Production's drain runs as
+/// `handle_primary_command` + the bus-drain helper DIRECTLY, so the
+/// drain is never raced — and it passes. Production's drain runs as
 /// ONE ARM OF THE OPERATIONAL `select!`, racing every other arm. THE
-/// DIVERGENCE IS THE DIAGNOSIS: `drain_worker_signal_batch` consumed
+/// DIVERGENCE IS THE DIAGNOSIS: the pre-fix drain helper consumed
 /// the `TasksAdded` burst off the bus, then awaited a 50ms idle window
 /// HOLDING the consumed signals in a future-local Vec — any competing
 /// arm readying inside that window (a keepalive, a digest, a forwarded
@@ -412,8 +414,9 @@ async fn injection_during_cascade_dispatches_despite_busy_inbox() {
             let cmd_tx = primary.command_sender();
             let on_end: OnPhaseEnd = Box::new(move |p, _c, _f, _outputs| {
                 if p == &PhaseId::from("u") {
-                    let batch: Vec<TaskInfo<TestId>> =
-                        (0..12).map(|i| phased_task("m", &format!("m{i}"))).collect();
+                    let batch: Vec<TaskInfo<TestId>> = (0..12)
+                        .map(|i| phased_task("m", &format!("m{i}")))
+                        .collect();
                     let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
                     cmd_tx
                         .try_send(PrimaryCommand::SpawnTasks {

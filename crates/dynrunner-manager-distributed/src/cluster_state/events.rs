@@ -150,7 +150,7 @@ impl<I: Identifier> ClusterState<I> {
     ///
     /// Called by worker management at wire-up time after building the
     /// (sender, receiver) pair; the receiver is then consumed by
-    /// [`crate::worker_signal::drain_worker_signal_batch`] from inside
+    /// [`crate::worker_signal::recv_worker_signal_batch`] from inside
     /// the `select!` loop. Same re-installation semantics as
     /// [`Self::install_lifecycle_sender`].
     pub fn install_worker_mgmt_sender(
