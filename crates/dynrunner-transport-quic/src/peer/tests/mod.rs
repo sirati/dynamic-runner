@@ -37,5 +37,6 @@ mod log_capture;
 mod primary_link;
 mod reader_exit_disconnect;
 mod recv_lifetime;
+mod recv_tick_closed_spins;
 mod silent_reconnect;
 mod two_peers;
