@@ -667,6 +667,21 @@ where
                 // mid-run roster update (a peer's liveness port changed /
                 // newly advertised) is reflected. Single concern: address
                 // capture for the beacon; no role/CRDT side effect.
+                //
+                // Receipt narration (#362): an operational-phase PeerInfo
+                // was previously handled in TOTAL silence here, while its
+                // real effect — the mesh-pump re-running the peer-dial
+                // sweep off the same frame, re-dialing any missing legs —
+                // happened invisibly. That made a roster re-broadcast an
+                // unnameable rescue: members whose first dials failed were
+                // healed by it, members it never reached stayed dead, and
+                // neither could be seen in the logs. Name the receipt; the
+                // transport's "peer-dial sweep" line names the dials.
+                tracing::info!(
+                    peers = peers.len(),
+                    "peer list received (operational); the mesh-pump re-runs \
+                     the peer-dial sweep off it"
+                );
                 self.ingest_peer_liveness_addrs(&peers);
                 Ok(())
             }

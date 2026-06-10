@@ -116,9 +116,20 @@ where
         let connected = self.alive_secondary_count();
         if connected == self.mesh.peer_dial_count as usize {
             self.mesh.peer_mesh_check_at = None;
-            // Full mesh formed — tell the primary so it can release
-            // its `PrimaryChanged` announcement. Idempotent via
-            // `mesh_ready_sent`.
+            // Full mesh formed — previously a SILENT success (#362):
+            // the watchdog disarmed and nothing named it, so a member
+            // whose mesh "formed" only in the CRDT-liveness sense
+            // (alive_secondary_count counts keepalive-fresh peers over
+            // GLOBAL state, NOT transport legs) left zero trace either
+            // way. Name the success AND its decision inputs.
+            tracing::info!(
+                alive_secondaries = connected,
+                expected = self.mesh.peer_dial_count,
+                "peer mesh formed (every expected secondary alive) before \
+                 the watchdog deadline; disarming the mesh watchdog"
+            );
+            // Tell the primary so it can release its `PrimaryChanged`
+            // announcement. Idempotent via `mesh_ready_sent`.
             self.report_mesh_ready_if_needed().await;
             return;
         }
@@ -222,8 +233,28 @@ where
         let mesh_formed = connected > 0;
         let watchdog_done = self.mesh.peer_dial_count > 0 && self.mesh.peer_mesh_check_at.is_none();
         if !(no_peers_expected || mesh_formed || watchdog_done) {
+            // Not settled yet (peers expected, none alive, watchdog
+            // still pending). Called on every keepalive tick, so this
+            // stays at DEBUG — but it is no longer a silent return:
+            // the inputs that withheld the report are visible.
+            tracing::debug!(
+                alive_secondaries = connected,
+                expected = self.mesh.peer_dial_count,
+                watchdog_pending = self.mesh.peer_mesh_check_at.is_some(),
+                "MeshReady not reportable yet (mesh unsettled)"
+            );
             return;
         }
+        // Which settled condition fired — the reporter's decision input,
+        // named on the send line so the operator can distinguish a real
+        // formed mesh from a watchdog-elapsed (possibly zero-peer) report.
+        let trigger = if no_peers_expected {
+            "no-peers-expected"
+        } else if mesh_formed {
+            "mesh-formed"
+        } else {
+            "watchdog-elapsed"
+        };
         let msg: DistributedMessage<I> = DistributedMessage::MeshReady {
             target: None,
             sender_id: self.config.secondary_id.clone(),
@@ -243,7 +274,21 @@ where
                  mesh-ready timeout before promoting primary"
             );
         } else {
-            tracing::debug!(connected, "MeshReady sent to primary");
+            // INFO, not debug (#362): this send is the member's half of
+            // the pairwise dispatch-readiness confirmation — its absence
+            // on a member is exactly the production "no MeshReady"
+            // symptom, so the send itself must be operator-visible.
+            // `alive_secondaries` counts keepalive-fresh peer
+            // SECONDARIES over global state (the reported peer_count),
+            // NOT transport connections — a discrepancy between this
+            // line and the transport's sweep/registration lines is
+            // itself diagnostic.
+            tracing::info!(
+                alive_secondaries = connected,
+                expected = self.mesh.peer_dial_count,
+                trigger,
+                "MeshReady sent to primary"
+            );
         }
         self.mesh.mesh_ready_sent = true;
     }
