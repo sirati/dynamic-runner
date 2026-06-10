@@ -198,7 +198,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             if print_pid && let Some(pid) = pid {
                 tracing::info!(worker_id = i, pid, "worker PID");
             }
-            let mut handle = WorkerHandle::new(i, transport, self.event_tx.clone());
+            // Generation 0: the slot's first subprocess. Every
+            // replacement edge (`replace_worker_slot`,
+            // `ensure_worker_for_type_async`) bumps this to `old + 1`.
+            let mut handle = WorkerHandle::new(i, 0, transport, self.event_tx.clone());
             handle.pid = pid;
             handle.subcgroup = subcgroup;
             let budget = scheduler.initial_budget(i, max_resources);
@@ -400,8 +403,15 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
 
         let reserved_budgets = self.workers[worker_id as usize].reserved_budgets.clone();
         let failure_count = self.workers[worker_id as usize].assignment_failure_count;
+        // Bump the slot's generation: this is a NEW subprocess. Any
+        // event the prior generation's poll task buffered past the
+        // `abort_poll_task` above carries `old_generation` and the
+        // consumer's generation gate drops it (it can no longer
+        // mis-attribute the fresh subprocess's task).
+        let next_generation = self.workers[worker_id as usize].generation + 1;
 
-        let mut handle = WorkerHandle::new(worker_id, transport, self.event_tx.clone());
+        let mut handle =
+            WorkerHandle::new(worker_id, next_generation, transport, self.event_tx.clone());
         handle.pid = pid;
         handle.subcgroup = subcgroup;
         handle.reserved_budgets = reserved_budgets;
@@ -500,8 +510,12 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
 
         let reserved_budgets = self.workers[idx].reserved_budgets.clone();
         let failure_count = self.workers[idx].assignment_failure_count;
+        // Bump the slot's generation — the type-shift respawn is a NEW
+        // subprocess (same edge as the async variant; see its rustdoc).
+        let next_generation = self.workers[idx].generation + 1;
 
-        let mut handle = WorkerHandle::new(worker_id, transport, self.event_tx.clone());
+        let mut handle =
+            WorkerHandle::new(worker_id, next_generation, transport, self.event_tx.clone());
         handle.pid = pid;
         handle.subcgroup = subcgroup;
         handle.reserved_budgets = reserved_budgets;
@@ -638,8 +652,16 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
 
         let reserved_budgets = self.workers[idx].reserved_budgets.clone();
         let failure_count = self.workers[idx].assignment_failure_count;
+        // Bump the slot's generation — the type-shift respawn is a NEW
+        // subprocess. The prior generation's poll task may have buffered
+        // a terminal the `abort_poll_task` above could not retract; it
+        // carries `old_generation` and the consumer's generation gate
+        // drops it rather than mis-attributing it to the freshly-bound
+        // task. THIS is the root edge of the wedge the gate closes.
+        let next_generation = self.workers[idx].generation + 1;
 
-        let mut handle = WorkerHandle::new(worker_id, transport, self.event_tx.clone());
+        let mut handle =
+            WorkerHandle::new(worker_id, next_generation, transport, self.event_tx.clone());
         handle.pid = pid;
         handle.subcgroup = subcgroup;
         handle.reserved_budgets = reserved_budgets;
@@ -1309,7 +1331,7 @@ mod orphan_poll_task_tests {
                 .expect("watcher must emit a WorkerEvent within the startup window")
                 .expect("event channel must stay open");
                 assert!(
-                    matches!(ev, WorkerEvent::Ready { worker_id: 0 }),
+                    matches!(ev, WorkerEvent::Ready { worker_id: 0, .. }),
                     "the background watcher must emit Ready for the restarted slot; got {ev:?}"
                 );
 
@@ -1319,6 +1341,53 @@ mod orphan_poll_task_tests {
                     "the concurrent ticker (keepalive analog) must keep firing while \
                      the slow worker restarts; a starved ticker means the runtime was \
                      blocked on the worker's Ready"
+                );
+            })
+            .await;
+    }
+
+    /// The slot's generation starts at 0 and a worker-replacement edge
+    /// bumps it: `restart_worker` and `ensure_worker_for_type_async`
+    /// each install a fresh subprocess into the slot, so each is +1.
+    /// This is the monotonic identity the consumer's generation gate
+    /// reads to reject stale-generation events.
+    #[tokio::test(flavor = "current_thread")]
+    async fn replacement_edges_increment_slot_generation() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let spawn_count = Arc::new(AtomicU32::new(0));
+                let mut factory = DelayedDoneFactory {
+                    spawn_count: spawn_count.clone(),
+                };
+                let scheduler = dynrunner_scheduler::ResourceStealingScheduler::memory();
+                let max = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]);
+
+                let mut pool: WorkerPool<ChannelManagerEnd, TestId> = WorkerPool::new();
+                pool.initialize(1, &max, &scheduler, &mut factory, false, None)
+                    .await
+                    .expect("pool init");
+                assert_eq!(
+                    pool.workers[0].generation, 0,
+                    "the initial subprocess is generation 0"
+                );
+
+                pool.restart_worker(0, &mut factory, false)
+                    .await
+                    .expect("restart");
+                assert_eq!(
+                    pool.workers[0].generation, 1,
+                    "restart_worker installs a fresh subprocess: generation 0 → 1"
+                );
+
+                let required = dynrunner_core::TypeId::from("shift");
+                pool.ensure_worker_for_type_async(0, &required, &mut factory, false)
+                    .await
+                    .expect("ensure async");
+                assert_eq!(
+                    pool.workers[0].generation, 2,
+                    "ensure_worker_for_type_async (type-shift respawn) installs a fresh \
+                     subprocess: generation 1 → 2"
                 );
             })
             .await;
