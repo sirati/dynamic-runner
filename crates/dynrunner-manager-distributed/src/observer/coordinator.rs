@@ -566,7 +566,7 @@ where
     /// visibility returns — the request carries no state of its own, the
     /// LATCH (primary-originated, CRDT-replicated) is the durable fact.
     ///
-    /// Triggered by the operator channel (`SIGUSR1` to the observer
+    /// Triggered by the operator channel (`SIGUSR2` to the observer
     /// process — see the run loop's graceful-abort arm); `pub` so an
     /// embedding driver/test can invoke it directly.
     pub async fn request_graceful_abort(&mut self) {
@@ -775,7 +775,7 @@ where
             // a never-firing arm.
             let mut panik_rx = self.panik_signal_rx.take();
 
-            // Operator graceful-abort channel: SIGUSR1 to the observer
+            // Operator graceful-abort channel: SIGUSR2 to the observer
             // process (the cleanest existing operator seam — the sibling of
             // the panik watcher's SIGTERM arm; both ride tokio's unix
             // signal registry). Each delivery sends one
@@ -786,11 +786,11 @@ where
             // arm — the embedding driver can still call
             // `request_graceful_abort` directly.
             let mut graceful_abort_signal =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
                     .map_err(|e| {
                         tracing::warn!(
                             error = %e,
-                            "SIGUSR1 graceful-abort trigger could not be \
+                            "SIGUSR2 graceful-abort trigger could not be \
                              registered; the signal channel is disabled for \
                              this observer"
                         );
@@ -868,7 +868,7 @@ where
                     signal = recv_panik(&mut panik_rx) => {
                         return Ok(self.on_panik(signal).await);
                     }
-                    // Operator graceful-abort trigger (SIGUSR1). Each
+                    // Operator graceful-abort trigger (SIGUSR2). Each
                     // delivery sends one typed GracefulAbortRequest to the
                     // primary. `recv() == None` (signal stream closed) parks
                     // the arm for the rest of the run — never a hot-loop.

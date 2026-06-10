@@ -283,7 +283,7 @@ async fn observer_keeps_observing_until_drain_terminal() {
         .await;
 }
 
-/// `request_graceful_abort` (the operator-trigger seam — the SIGUSR1 arm
+/// `request_graceful_abort` (the operator-trigger seam — the SIGUSR2 arm
 /// calls this) sends ONE typed `GracefulAbortRequest` frame routed to the
 /// recognized primary, stamped `Destination::Primary`.
 #[tokio::test(flavor = "current_thread")]

@@ -357,7 +357,7 @@ def add_framework_arguments(
             "observer restores the snapshot, joins steady-state broadcasts, "
             "and exits when the cluster broadcasts RunComplete. Mutually "
             "exclusive with --secondary (a secondary is not a late-joiner). "
-            "GRACEFUL ABORT: sending SIGUSR1 to an observer process (this "
+            "GRACEFUL ABORT: sending SIGUSR2 to an observer process (this "
             "late-joiner, or the relocated submitter) asks the primary to "
             "stop scheduling new tasks; running tasks finish, each "
             "secondary tears down as it drains, and the run ends with the "
