@@ -715,7 +715,6 @@ impl PyPrimaryCoordinator {
                                 // above), never `Failed`. Defensive: treat as
                                 // the graceful verdict (logged above by the
                                 // `error = %error` line), never a raise.
->>>>>>> handoff/mesh-always
                             }
                             RunError::Other(_) => {
                                 // The PRESERVED stay-local-primary swallow

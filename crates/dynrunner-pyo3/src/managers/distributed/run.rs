@@ -1124,7 +1124,6 @@ impl PyDistributedManager {
                                 // `RunTerminal::GracefulAbort` (handled above),
                                 // never `Failed`. Defensive: treat as the
                                 // graceful verdict, never a raise.
->>>>>>> handoff/mesh-always
                             }
                             RunError::Other(_) => {
                                 // The PRESERVED stay-local-primary swallow
