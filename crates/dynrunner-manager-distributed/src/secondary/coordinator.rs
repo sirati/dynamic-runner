@@ -140,6 +140,11 @@ where
             sampler: None,
             forwarded_argv,
             staging_dispatch_context,
+            // The reporting concern's buffered-terminal-replay queue starts
+            // empty; it only fills when a terminal-bearing report's send is
+            // absorbed on a transient no-route (see the field doc on
+            // `SecondaryCoordinator`).
+            pending_terminal_replays: Vec::new(),
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route

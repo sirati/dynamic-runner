@@ -324,16 +324,38 @@ impl<I: Identifier> PeerTransport<I> for NoPeers {
 /// `peer_count` is configurable so the same recorder serves both the
 /// "healthy mesh, broadcasts go out" and "no peers, broadcasts are
 /// best-effort" branches without two near-identical recorders.
+///
+/// Membership is CONTROLLABLE via a shared `Rc<RefCell<Vec<PeerId>>>`
+/// (`connected`): the default seeds the folded primary `"setup"` plus the
+/// configured `peer-{i}` cardinality (a healthy mesh, primary reachable),
+/// but a test can drive the route to the primary down and back up by
+/// removing / re-adding `"setup"` and re-publishing the view — the unified
+/// "records sends AND controllable membership" stub the buffered-terminal-
+/// replay test needs (record the re-delivery on the wire AND flip the
+/// no-route gate). The egress no-route gate (`send_to`'s `has_peer` on a
+/// resolved `Peer(id)`) reads this through the published `MembershipView`,
+/// so a `Destination::Primary` send no-routes exactly when `"setup"` is
+/// absent from `connected` at the last `publish_membership`.
 pub(super) struct RecordingPeer<I: Identifier> {
     pub(super) broadcasts: Rc<RefCell<Vec<DistributedMessage<I>>>>,
-    pub(super) peer_count: usize,
+    /// The live, controllable membership the published `MembershipView`
+    /// mirrors. The single source of `peer_count()` / `has_peer()` /
+    /// `connected_ids()` — seeded from the `new(peer_count)` cardinality,
+    /// mutable mid-test via [`Self::membership_handle`].
+    pub(super) connected: Rc<RefCell<Vec<PeerId>>>,
 }
 
 impl<I: Identifier> RecordingPeer<I> {
     pub(super) fn new(peer_count: usize) -> Self {
+        // Seed the default healthy-mesh membership: the folded primary
+        // `"setup"` plus the configured `peer-{i}` cardinality. A test that
+        // drives the no-route edge mutates `connected` via `membership_handle`.
+        let connected = std::iter::once(PeerId::from("setup"))
+            .chain((0..peer_count).map(|i| PeerId::from(format!("peer-{i}").as_str())))
+            .collect();
         Self {
             broadcasts: Rc::new(RefCell::new(Vec::new())),
-            peer_count,
+            connected: Rc::new(RefCell::new(connected)),
         }
     }
 
@@ -342,6 +364,14 @@ impl<I: Identifier> RecordingPeer<I> {
     /// before that move.
     pub(super) fn log_handle(&self) -> Rc<RefCell<Vec<DistributedMessage<I>>>> {
         self.broadcasts.clone()
+    }
+
+    /// Clone of the shared membership id-set so a test can flip the
+    /// primary's reachability after the recorder is moved into the
+    /// coordinator (pair each mutation with `publish_membership()` so the
+    /// egress gate reads the change).
+    pub(super) fn membership_handle(&self) -> Rc<RefCell<Vec<PeerId>>> {
+        self.connected.clone()
     }
 }
 
@@ -369,26 +399,18 @@ impl<I: Identifier> PeerTransport<I> for RecordingPeer<I> {
         None
     }
     fn peer_count(&self) -> usize {
-        self.peer_count
+        self.connected.borrow().len()
     }
     fn has_peer(&self, id: &PeerId) -> bool {
-        // Synthetic membership: the recorder models a healthy mesh with the
-        // primary reachable (every recording test drives a node that already
-        // recognises a `"primary"`), plus `peer_count` peers. The egress
-        // no-route gate (`send_to`'s `has_peer` check on a resolved
-        // `Peer(id)`) reads this through the published `MembershipView`, so
-        // a `Destination::Primary` send must NOT be no-routed away here — it
-        // is the very send these tests want to observe in the log.
-        self.connected_ids().iter().any(|c| c == id)
+        // Reads the live (controllable) membership set: the egress no-route
+        // gate reads this through the published `MembershipView`, so a
+        // `Destination::Primary` send routes iff `"setup"` is currently in
+        // `connected`.
+        self.connected.borrow().iter().any(|c| c == id)
     }
     fn connected_ids(&self) -> Vec<PeerId> {
-        // The folded primary is always a member; the configured cardinality
-        // is filled with `peer-{i}` ids. This backs the published view the
-        // coordinator's egress gate reads — `has_peer("primary")` is true so
-        // the recorded primary-bound sends route, and `peer_count()` agrees.
-        std::iter::once(PeerId::from("setup"))
-            .chain((0..self.peer_count).map(|i| PeerId::from(format!("peer-{i}").as_str())))
-            .collect()
+        // The live, controllable membership the published view mirrors.
+        self.connected.borrow().clone()
     }
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
 }
@@ -578,6 +600,39 @@ pub(super) fn make_secondary_recording(
         FixedEstimator(100),
     );
     (harness, log)
+}
+
+/// Construct a secondary over a [`RecordingPeer`] mesh stub, returning the
+/// harness + the shared broadcast log + the shared MEMBERSHIP id-set handle.
+///
+/// The sibling of [`make_secondary_recording`] for tests that need BOTH the
+/// recorded sends AND control over the primary's reachability (the
+/// buffered-terminal-replay test: flip the no-route gate by removing /
+/// re-adding `"setup"` from the membership handle, re-publish via
+/// `drain_egress`/`publish_membership`, and observe the re-delivered
+/// terminal in the broadcast log). `peer_count` configures the recorder's
+/// initial mesh cardinality; the membership starts healthy (primary
+/// reachable). Pair each membership mutation with `publish_membership()` so
+/// the coordinator's `MeshClient::has_peer` reads it.
+#[allow(clippy::type_complexity)]
+pub(super) fn make_secondary_recording_with_membership(
+    config: SecondaryConfig,
+    peer_count: usize,
+) -> (
+    SecondaryHarness<RecordingPeer<TestId>>,
+    Rc<RefCell<Vec<DistributedMessage<TestId>>>>,
+    Rc<RefCell<Vec<PeerId>>>,
+) {
+    let recorder = RecordingPeer::<TestId>::new(peer_count);
+    let log = recorder.log_handle();
+    let membership = recorder.membership_handle();
+    let harness = build_harness(
+        config,
+        recorder,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    (harness, log, membership)
 }
 
 /// Construct a secondary over a [`MembershipControlPeer`] mesh stub seeded

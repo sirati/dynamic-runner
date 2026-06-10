@@ -203,6 +203,47 @@ impl<I> DistributedMessage<I> {
         }
     }
 
+    /// Whether this frame carries a per-task TERMINAL report
+    /// ([`DistributedMessage::TaskComplete`] /
+    /// [`DistributedMessage::TaskFailed`]).
+    ///
+    /// "Terminal-bearing" is the classifier the secondary's reporting
+    /// concern uses to decide whether a primary-bound send is REPLAYABLE
+    /// on a no-route absorb: a `TaskComplete` / `TaskFailed` resolves a
+    /// task's in-flight entry at the authority, so losing it strands the
+    /// task forever (phantom-busy). It is the SINGLE source of that
+    /// classification, owned by the enum so every site that gates by
+    /// "does this report resolve a task?" reads one predicate. The
+    /// backpressure-shaped `TaskFailed` (the deferred-lost reinject) IS
+    /// terminal-bearing here — it too resolves an in-flight slot at the
+    /// authority (a requeue), so it must replay across a no-route.
+    ///
+    /// Everything else through the primary-bound send chokepoint
+    /// (`TaskRequest` capacity hints, `Keepalive`, `MeshReady`) is
+    /// legitimately DROPPABLE — a missed one is re-emitted on the next
+    /// tick — so it is NOT terminal-bearing.
+    pub fn is_terminal_bearing(&self) -> bool {
+        matches!(self, Self::TaskComplete { .. } | Self::TaskFailed { .. })
+    }
+
+    /// The per-task hash this frame resolves, for the
+    /// [`DistributedMessage::TaskComplete`] /
+    /// [`DistributedMessage::TaskFailed`] terminal variants; `None` for
+    /// every other variant.
+    ///
+    /// Pairs with [`Self::is_terminal_bearing`]: the reporting concern
+    /// reads it to LOG which task a retained / re-delivered terminal
+    /// carries (the strand-diagnostic the no-route absorb was previously
+    /// silent about).
+    pub fn task_hash(&self) -> Option<&str> {
+        match self {
+            Self::TaskComplete { task_hash, .. } | Self::TaskFailed { task_hash, .. } => {
+                Some(task_hash)
+            }
+            _ => None,
+        }
+    }
+
     pub fn msg_type(&self) -> MessageType {
         match self {
             Self::SecondaryWelcome { .. } => MessageType::SecondaryWelcome,

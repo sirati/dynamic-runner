@@ -19,7 +19,7 @@
 #![cfg(test)]
 
 use super::super::test_helpers::{
-    FakeWorkerFactory, channel_mesh_no_primary, make_secondary_channel, make_secondary_recording,
+    FakeWorkerFactory, make_secondary_recording, make_secondary_recording_with_membership,
 };
 use super::super::*;
 use super::processing::make_binary;
@@ -801,45 +801,42 @@ async fn post_ready_assigned_swept_then_stale_terminal_is_dropped() {
         .await;
 }
 
-/// (v) NO-ROUTE ABSORB: the swept terminal is GENUINELY LOST when the
-/// primary is unreachable at report time.
+/// (v) NO-ROUTE ABSORB → BUFFERED-TERMINAL-REPLAY: a swept terminal that
+/// hits a no-route is RETAINED and RE-DELIVERED exactly once when the route
+/// recovers (the production fix; formerly the documented strand).
 ///
-/// `send_to_primary` ABSORBS a no-route `Err` into `Ok(())` (resource.rs
-/// ~197-235): a no-route is a failover SIGNAL, not a run-fatal error, so the
-/// secondary must not abort the run — but the comment is explicit that "the
-/// absorbed terminal is genuinely LOST, NOT recovered", and a SURVIVING
-/// holder's dropped terminal strands the task at the (new/old) primary's
-/// in-flight ledger ("the buffered-terminal-replay ... is the proper fix
-/// (owner-deferred)").
+/// `send_to_primary` ABSORBS a no-route `Err` into `Ok(())` (a no-route is a
+/// failover SIGNAL, not a run-fatal error, so the secondary must not abort
+/// the run). Pre-fix the absorbed terminal was genuinely LOST: the sweep
+/// clears `active_tasks[H]` FIRST then reports → the report is swallowed →
+/// the task is gone LOCALLY with NO terminal on the wire, so the primary
+/// keeps the slot in-flight forever (phantom-busy; the phase barrier wedges
+/// exactly as the production "in-flight froze" symptom describes).
 ///
-/// This test pins that documented gap as it applies to the round-2 SWEEP:
-/// the sweep clears `active_tasks[H]` FIRST (resource.rs:318) then calls
-/// `report_deferred_task_lost` → `send_to_primary`. With the primary
-/// unrouteable the report is swallowed (returns Ok), so the task is gone
-/// LOCALLY with NO terminal on the wire — the secondary believes it
-/// reported, the primary keeps the slot in-flight forever. The phase
-/// barrier wedges exactly as the production "in-flight froze" symptom
-/// describes.
+/// The buffered-terminal-replay fix RETAINS the terminal-bearing report on
+/// the absorb and RE-DELIVERS it on the next opportunity. This test drives
+/// the route DOWN (primary absent from the `MembershipView`), sweeps (the
+/// absorb retains the terminal in `pending_terminal_replays` — NOT lost),
+/// asserts the retention, then brings the route back UP and drains, asserting
+/// the terminal is re-delivered EXACTLY ONCE.
 ///
-/// HONEST TAG: this reproduces a real, code-acknowledged strand, but it is
-/// CONDITIONAL on a no-route (primary failover / a mesh-membership blip at
-/// report time). Whether the production nano run hit a no-route window is
-/// what the consumer's secondary-2 log slice must adjudicate (a
-/// "no route to primary" WARN, or a primary changeover near 04:49:17).
+/// Uses the membership-controllable `RecordingPeer`: with `"setup"` removed
+/// from membership the egress `has_peer("setup")` gate surfaces the no-route
+/// the absorb keys on; re-adding `"setup"` + re-publishing lets the drain's
+/// re-send route and land in the recorded log.
 #[tokio::test(flavor = "current_thread")]
-async fn swept_terminal_is_absorbed_and_lost_when_primary_unreachable() {
+async fn swept_terminal_is_retained_and_redelivered_when_route_recovers() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            // `channel_mesh_no_primary` registers `peer-0` but NO "primary"
-            // route; with bootstrap_primary_id "primary" the egress edge
-            // resolves Destination::Primary → Peer("primary"), finds no
-            // member, and surfaces the no-route Err that send_to_primary
-            // absorbs.
-            let transport = channel_mesh_no_primary("sec-2", 1);
-            let mut secondary = make_secondary_channel(one_worker_config("sec-2"), transport);
-            secondary.set_bootstrap_primary_id("primary".to_string());
+            // RecordingPeer seeds membership { "setup", "peer-0" }; the
+            // membership handle lets the test flip the primary's
+            // reachability. bootstrap_primary_id "setup" so the egress edge
+            // resolves Destination::Primary → Peer("setup").
+            let (mut secondary, log, membership) =
+                make_secondary_recording_with_membership(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
 
             let mut factory = FakeWorkerFactory;
             let pool = secondary.initialize_workers(&mut factory).await.unwrap();
@@ -851,10 +848,17 @@ async fn swept_terminal_is_absorbed_and_lost_when_primary_unreachable() {
             let file_hash = "c48ccbf6".to_string();
             drive_to_post_ready_assigned(&mut secondary, &oom, &binary, &file_hash).await;
 
+            // Drive the ROUTE DOWN: remove "setup" from membership and
+            // publish so the egress no-route gate reads the primary as
+            // absent. (drive_to_post_ready_assigned issued no primary-bound
+            // send, so nothing earlier observed the route.)
+            membership.borrow_mut().retain(|id| id.as_str() != "setup");
+            secondary.publish_membership();
+
             // Restart-loop sweep while the primary is unrouteable. The sweep
-            // clears active_tasks[H] then tries to report — the report is
-            // ABSORBED (no-route → Ok), so the call SUCCEEDS despite nothing
-            // reaching the wire.
+            // clears active_tasks[H] then reports — the report's send is
+            // ABSORBED (no-route → Ok) AND the terminal is RETAINED for
+            // replay (the fix).
             secondary.op_mut().pool.workers[0].kill_subprocess();
             let sweep_result = secondary.sweep_replaced_worker_task(0).await;
 
@@ -865,9 +869,334 @@ async fn swept_terminal_is_absorbed_and_lost_when_primary_unreachable() {
             );
             assert!(
                 !secondary.op_mut().active_tasks.contains_key(&file_hash),
-                "the sweep cleared active_tasks LOCALLY — yet the terminal was \
-                 absorbed (lost). The task is now untracked here AND unreported \
-                 to the primary: the documented surviving-holder strand."
+                "the sweep cleared active_tasks LOCALLY"
+            );
+            // RETAINED, not lost: the terminal-bearing report sits in the
+            // replay buffer (the fix). Nothing reached the wire yet.
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                1,
+                "the absorbed terminal must be RETAINED in the replay buffer, \
+                 not dropped"
+            );
+            assert!(
+                log.borrow().is_empty(),
+                "nothing reached the wire while the route was down; got {:?}",
+                log.borrow()
+            );
+
+            // Bring the ROUTE BACK UP and drain: the retained terminal is
+            // re-delivered through the recovered route.
+            membership.borrow_mut().push(
+                dynrunner_protocol_primary_secondary::PeerId::from("setup"),
+            );
+            secondary.publish_membership();
+            secondary.drain_terminal_replays().await;
+            secondary.drain_egress().await;
+
+            // RE-DELIVERED EXACTLY ONCE: the buffer is empty and the wire
+            // log carries exactly one TaskFailed for the hash.
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                0,
+                "the replay buffer must be drained after the route recovers"
+            );
+            let terminals_for_hash = log
+                .borrow()
+                .iter()
+                .filter(|m| matches!(
+                    m,
+                    DistributedMessage::TaskFailed { task_hash, .. }
+                        | DistributedMessage::TaskComplete { task_hash, .. }
+                    if *task_hash == file_hash
+                ))
+                .count();
+            assert_eq!(
+                terminals_for_hash, 1,
+                "the retained terminal must be re-delivered EXACTLY ONCE on \
+                 route recovery (not lost, not duplicated); got {:?}",
+                log.borrow()
+            );
+        })
+        .await;
+}
+
+/// (vi) REPLAY FIFO + re-absorb re-queues: two terminals buffered while the
+/// route is down; on recovery the FIRST drain attempt re-absorbs (route
+/// still down) and the order is preserved, then a second recovery drain
+/// delivers both in arrival order.
+///
+/// Pins the no-drop / no-reorder contract: a re-absorbed frame goes back to
+/// the BACK of an empty-during-drain buffer (FIFO across drains), so a
+/// partial-recovery flap never drops or reorders a retained terminal.
+#[tokio::test(flavor = "current_thread")]
+async fn replay_buffer_is_fifo_and_requeues_on_reabsorb() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log, membership) =
+                make_secondary_recording_with_membership(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            // Route DOWN.
+            membership.borrow_mut().retain(|id| id.as_str() != "setup");
+            secondary.publish_membership();
+
+            // Buffer TWO terminals (distinct hashes) by reporting them while
+            // the route is down — each absorb retains in arrival order.
+            secondary
+                .report_deferred_task_lost(0, "hash-first")
+                .await
+                .unwrap();
+            secondary
+                .report_deferred_task_lost(0, "hash-second")
+                .await
+                .unwrap();
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                2,
+                "both terminals must be retained while the route is down"
+            );
+
+            // First drain attempt with the route STILL down: both re-absorb,
+            // so the buffer length is preserved and order is unchanged.
+            secondary.drain_terminal_replays().await;
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                2,
+                "a drain while still no-route must re-queue both (never drop)"
+            );
+            assert!(
+                log.borrow().is_empty(),
+                "no terminal reaches the wire while the route is still down"
+            );
+
+            // Route UP; drain delivers BOTH in arrival order (first then second).
+            membership.borrow_mut().push(
+                dynrunner_protocol_primary_secondary::PeerId::from("setup"),
+            );
+            secondary.publish_membership();
+            secondary.drain_terminal_replays().await;
+            secondary.drain_egress().await;
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                0,
+                "the buffer must be drained on recovery"
+            );
+            let delivered_hashes: Vec<String> = log
+                .borrow()
+                .iter()
+                .filter_map(|m| match m {
+                    DistributedMessage::TaskFailed { task_hash, .. } => Some(task_hash.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                delivered_hashes,
+                vec!["hash-first".to_string(), "hash-second".to_string()],
+                "the two retained terminals must be re-delivered FIFO (arrival \
+                 order preserved across the re-absorb flap); got {delivered_hashes:?}"
+            );
+        })
+        .await;
+}
+
+/// (vii) NON-TERMINAL messages are NOT buffered: a `TaskRequest` (a capacity
+/// hint, legitimately droppable) absorbed on no-route is dropped, never
+/// retained — only terminal-bearing reports replay.
+#[tokio::test(flavor = "current_thread")]
+async fn non_terminal_send_is_not_buffered_on_no_route() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, _log, membership) =
+                make_secondary_recording_with_membership(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            // Route DOWN.
+            membership.borrow_mut().retain(|id| id.as_str() != "setup");
+            secondary.publish_membership();
+
+            // A capacity TaskRequest for the idle worker hits the no-route and
+            // is absorbed — but it is NOT terminal-bearing, so it must NOT be
+            // retained (a stale capacity hint is re-emitted next tick anyway).
+            secondary.request_task_for_worker(0).await.unwrap();
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                0,
+                "a non-terminal (TaskRequest) send must NOT be buffered for replay"
+            );
+        })
+        .await;
+}
+
+/// (viii) REPLAY SURVIVES A PRIMARY CHANGE: a terminal retained while the
+/// old primary was unreachable is re-delivered to the NEW primary after a
+/// failover — `send_to_primary` re-resolves `Destination::Primary` to
+/// `current_primary()` at the egress edge, so the retained frame follows the
+/// role to whoever holds it now.
+///
+/// Drives the route to the OLD bootstrap primary down, buffers a terminal,
+/// then installs a NEW current_primary (the post-failover holder) reachable
+/// in the membership, and drains — asserting the terminal lands routed to
+/// the new id.
+#[tokio::test(flavor = "current_thread")]
+async fn replay_survives_primary_change_redelivers_to_new_primary() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log, membership) =
+                make_secondary_recording_with_membership(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            // Old bootstrap primary "setup" is UNREACHABLE: remove it from
+            // membership and publish. The egress resolves Destination::Primary
+            // → bootstrap "setup" (no current_primary yet), finds it absent,
+            // and absorbs.
+            membership.borrow_mut().retain(|id| id.as_str() != "setup");
+            secondary.publish_membership();
+            secondary
+                .report_deferred_task_lost(0, "primchg-hash")
+                .await
+                .unwrap();
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                1,
+                "the terminal is retained while the old primary is unreachable"
+            );
+
+            // FAILOVER: a NEW primary "peer-0" takes the role and IS a
+            // reachable member. Apply a PrimaryChanged so `current_primary()`
+            // names the new holder; the egress then resolves
+            // Destination::Primary → "peer-0". ("peer-0" was seeded in
+            // membership by the RecordingPeer's peer_count=1.)
+            secondary
+                .cluster_state
+                .apply(dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
+                    new: "peer-0".into(),
+                    epoch: 1,
+                    reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+                });
+            secondary.publish_membership();
+
+            // Drain: the retained terminal re-resolves to the NEW primary and
+            // is delivered.
+            secondary.drain_terminal_replays().await;
+            secondary.drain_egress().await;
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                0,
+                "the retained terminal must drain to the new primary"
+            );
+            assert_eq!(
+                log.borrow()
+                    .iter()
+                    .filter(|m| matches!(
+                        m,
+                        DistributedMessage::TaskFailed { task_hash, .. }
+                        if *task_hash == "primchg-hash"
+                    ))
+                    .count(),
+                1,
+                "the retained terminal must be re-delivered exactly once to the \
+                 NEW primary after the failover; got {:?}",
+                log.borrow()
+            );
+        })
+        .await;
+}
+
+/// (ix) PRIMARY-LINK-RECOVERY edge drains the replay buffer: a terminal
+/// retained during a primary outage is re-delivered the instant
+/// `record_primary_message` reverts an in-flight election (the "primary
+/// message resumed" edge) — ahead of the periodic loop-tick drain.
+#[tokio::test(flavor = "current_thread")]
+async fn primary_link_recovery_edge_drains_replay_buffer() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log, membership) =
+                make_secondary_recording_with_membership(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            // Route DOWN; buffer a terminal.
+            membership.borrow_mut().retain(|id| id.as_str() != "setup");
+            secondary.publish_membership();
+            secondary
+                .report_deferred_task_lost(0, "recover-hash")
+                .await
+                .unwrap();
+            assert_eq!(secondary.pending_terminal_replays.len(), 1);
+
+            // Drive the election into Suspecting so the recovery edge has
+            // something to revert; "setup" is the current primary so a
+            // primary message from it recognises + reverts.
+            secondary
+                .cluster_state
+                .apply(dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
+                    new: "setup".into(),
+                    epoch: 1,
+                    reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+                });
+            secondary.op_mut().election = super::super::election::ElectionState::Suspecting {
+                since: std::time::Instant::now(),
+                responses: std::collections::HashMap::new(),
+            };
+
+            // Route BACK UP, then the primary-link-recovery edge fires: a
+            // primary message from "setup" reverts Suspecting → Normal and
+            // drains the replay buffer immediately.
+            membership.borrow_mut().push(
+                dynrunner_protocol_primary_secondary::PeerId::from("setup"),
+            );
+            secondary.publish_membership();
+            secondary
+                .record_primary_message_if_from_primary("setup")
+                .await;
+            secondary.drain_egress().await;
+
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                0,
+                "the primary-link-recovery edge must drain the replay buffer"
+            );
+            assert_eq!(
+                log.borrow()
+                    .iter()
+                    .filter(|m| matches!(
+                        m,
+                        DistributedMessage::TaskFailed { task_hash, .. }
+                        if *task_hash == "recover-hash"
+                    ))
+                    .count(),
+                1,
+                "the retained terminal must be re-delivered exactly once on the \
+                 primary-link-recovery edge; got {:?}",
+                log.borrow()
             );
         })
         .await;

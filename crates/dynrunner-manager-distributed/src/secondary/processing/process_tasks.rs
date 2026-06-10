@@ -493,6 +493,16 @@ where
                     .await;
             }
 
+            // Re-deliver any terminal-bearing report whose send was absorbed
+            // on a transient no-route (the buffered-terminal-replay edge).
+            // Every tick re-attempts the buffer FIFO, retrying forever until
+            // delivered; a still-no-route re-absorb re-buffers it. No-op when
+            // the buffer is empty (the steady-state hot path). This is the
+            // PERIODIC re-delivery trigger; the `record_primary_message`
+            // primary-link-recovery edge is the fast complement (drains the
+            // instant a primary message resumes, ahead of the next tick).
+            self.drain_terminal_replays().await;
+
             // Hard-error exit path: a sub-handler (e.g. the peer-mesh
             // watchdog) detected an unrecoverable fault, queued the
             // notification to the primary, and asked us to exit. The

@@ -75,7 +75,8 @@ where
         // the single-survivor election would never converge. The gate keys on
         // `current_primary()` — the same single source every other
         // "is this the primary" decision uses.
-        self.record_primary_message_if_from_primary(msg.sender_id());
+        self.record_primary_message_if_from_primary(msg.sender_id())
+            .await;
 
         match msg {
             DistributedMessage::TaskAssignment {

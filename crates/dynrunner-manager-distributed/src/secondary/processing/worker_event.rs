@@ -245,9 +245,9 @@ where
             }
             WorkerEvent::Disconnected {
                 worker_id,
+                generation,
                 result,
                 binary,
-                ..
             } => {
                 // Reap the subprocess BEFORE reclaim_protocol so the
                 // exit status rides the same log line as the
@@ -283,7 +283,11 @@ where
                 // HERE means the later restart-loop sweep finds nothing
                 // (no double-report). The secondary is never the
                 // authority, so this is the sole own-worker recovery.
-                self.reinject_pending_first_bind(worker_id).await?;
+                // `drained_deferred` records whether this drain resolved a
+                // deferred task, so the no-active-task WARN below stays
+                // silent when the deferred drain is what handled the
+                // disconnect (a swept stash is recovered, not lost).
+                let drained_deferred = self.reinject_pending_first_bind(worker_id).await?;
 
                 // Find and report the task as failed
                 let file_hash = self
@@ -368,6 +372,17 @@ where
                         )
                     };
 
+                    // Found → reporting: make the report attempt visible
+                    // end-to-end so a strand investigation can see the
+                    // terminal was at least ORIGINATED here (the wire-side
+                    // outcome — delivered vs no-route-absorbed-and-retained —
+                    // is logged inside `send_to_primary`).
+                    tracing::info!(
+                        worker_id,
+                        task_hash = %hash,
+                        error_type = ?wire_error_type,
+                        "reporting disconnect terminal for worker's active task"
+                    );
                     let msg = DistributedMessage::TaskFailed {
                         target: None,
                         sender_id: self.config.secondary_id.clone(),
@@ -381,6 +396,31 @@ where
                     // Report to the primary role only; the authority
                     // originates + broadcasts the terminal CRDT mutation.
                     let _ = self.send_to_primary(msg).await;
+                } else if !drained_deferred
+                    && (result.error_type.is_some() || result.error_message.is_some())
+                {
+                    // The `active_tasks` scan found NO task for a worker that
+                    // disconnected WITH AN ERROR, AND the deferred-first-bind
+                    // drain above did NOT resolve it either. This must NEVER be
+                    // silent: a disconnect carrying a fault that resolves to no
+                    // in-flight task is either a prior-terminal/idle slot (a
+                    // benign no-op) OR a tracking gap that strands work. Pre-fix
+                    // the whole `if let Some(hash)` block was skipped with no
+                    // trace, hiding the latter. WARN with the worker +
+                    // generation + error so a strand investigation can see the
+                    // disconnect-with-error reached a no-task resolution. (The
+                    // `drained_deferred` guard suppresses the routine
+                    // worker-died-before-Ready case, which the reinject path
+                    // already recovered + logged.)
+                    tracing::warn!(
+                        worker_id,
+                        generation,
+                        error = ?result.error_message,
+                        error_type = ?result.error_type,
+                        "worker disconnected WITH ERROR but no active task bound to \
+                         it and no deferred stash drained (prior-terminal/idle slot, \
+                         or a tracking gap) — nothing to report"
+                    );
                 }
 
                 let _ = binary; // binary info already reported
