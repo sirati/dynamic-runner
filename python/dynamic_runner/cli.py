@@ -435,6 +435,19 @@ def add_framework_arguments(
         "otherwise.",
     )
     parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Per-secondary output directory — the publish target every "
+        "worker receives as its --output. Spawn paths regenerate it "
+        "per-secondary: the --multi-computer local dispatcher passes its "
+        "resolved --output so all same-host secondaries publish straight "
+        "into the operator's output directory (mirroring the SLURM "
+        "wrapper's user-visible /app/out-network bind-mount). Defaults to "
+        "/app/out-network in container deployments or a per-secondary "
+        "tempdir otherwise.",
+    )
+    parser.add_argument(
         "--gateway",
         type=str,
         help="Gateway for SLURM controller. Use 'local' or 'ssh://user@host[:port]'",

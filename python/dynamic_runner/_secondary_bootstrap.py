@@ -135,9 +135,9 @@ def main(bootstrap_argv: list[str] | None = None) -> None:
     # are EXACTLY as without this handler, but the failure is no longer
     # visible only in container stderr (where the production fire-drill's
     # dial error drowned in podman debug noise while every per-node log
-    # file stayed empty). The policy of what is crash-worthy (clean
-    # `SystemExit` is not) lives with the diagnostics concern in
-    # `_fault_dumps`, not here.
+    # file stayed empty). The policy of what is crash-worthy (a deliberate
+    # `SystemExit`/`KeyboardInterrupt` is not, whatever the code) lives
+    # with the diagnostics concern in `_fault_dumps`, not here.
     try:
         parser = _build_bootstrap_parser()
         args, _passthrough = parser.parse_known_args(raw)

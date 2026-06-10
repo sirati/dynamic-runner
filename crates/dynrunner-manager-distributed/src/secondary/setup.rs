@@ -325,24 +325,23 @@ where
     /// Wait for PeerInfo + InitialAssignment + TransferComplete from primary.
     /// Dispatches any initial task assignments to local workers.
     ///
-    /// Plain serial recv loop. The earlier 1cb8cb8 version wrapped this
-    /// in a `tokio::select!` that ALSO drove a keepalive_interval ticker
-    /// — to keep the primary's heartbeat-monitor seeing fresh
-    /// `last_seen` during the multi-second peer-dial cascade in
-    /// `connect_to_peers`. After c9a7808 made `connect_to_peers`
-    /// non-blocking (per-peer dials run as `spawn_local` tasks),
-    /// `wait_for_setup` itself completes in <50ms in normal cases —
-    /// well inside any reasonable
-    /// `keepalive_miss_threshold * keepalive_interval` budget — and
-    /// the in-loop keepalive is no longer load-bearing. Worse, the
-    /// select! shape introduced cancellation hazards: when the tick
-    /// arm fired between iterations it cancelled an in-flight
-    /// `primary_transport.recv()` future, and partially-decoded
-    /// inbound messages could be lost depending on the transport
-    /// impl's cancellation safety. Reverting to the simple await
-    /// removes that hazard. If a future change reintroduces blocking
-    /// inside this function, prefer spawning a separate keepalive-
-    /// emitter task over racing the recv with select.
+    /// Recv loop with two periodic arms: the 60s stall-warn narration and
+    /// the setup-phase anti-entropy digest broadcast (see the cadence
+    /// comment at the interval's construction below).
+    ///
+    /// History of the select-vs-serial shape: the earlier 1cb8cb8 version
+    /// raced the recv against a keepalive ticker; after c9a7808 made
+    /// `connect_to_peers` non-blocking that keepalive stopped being
+    /// load-bearing and the select was removed because cancelling the OLD
+    /// transport-level `primary_transport.recv()` could lose a partially
+    /// decoded wire frame. That hazard no longer exists: today's recv is
+    /// [`Self::recv_setup_frame`] — a sync backlog pop + `RoleInbox::recv`
+    /// (a plain mpsc recv, documented cancel-safe; the mesh-pump only ever
+    /// delivers WHOLE frames into the slot) — so racing it in a `select!`
+    /// drops no data. The stall-warn deadline is computed OUTSIDE the
+    /// select iteration so the ~20s anti-entropy tick cannot keep
+    /// resetting it (a per-iteration `timeout` would never fire — the
+    /// watchdog-needs-a-fires-under-load law).
     pub(super) async fn wait_for_setup(
         &mut self,
         factory: &mut impl WorkerFactory<M>,
@@ -352,6 +351,29 @@ where
         let mut got_peer_info = false;
         let mut got_assignment = false;
         let mut got_transfer = false;
+
+        // Setup-phase anti-entropy cadence — the EMIT half of the
+        // relocation-handoff heal. The APPLY half (the `StateDigest` /
+        // `ClusterSnapshot` arms below) already lets a mid-setup secondary
+        // pull a missed `PrimaryChanged` once a digest REACHES it; this tick
+        // is what makes that reachable in the demoted-submitter topology.
+        // The submitter's accept loop registers a connection only on its
+        // FIRST frame (`peer_id = first_msg.sender_id()`), and the
+        // bootstrap-redial re-fold (transport-quic `bootstrap_redial`) sends
+        // nothing on the fresh wire — so a trio-waiting secondary that never
+        // speaks leaves its re-dialed wire permanently unregistered, the
+        // observer's digest broadcast fans over an EMPTY writer table, and
+        // the heal deadlocks (the 2026-06 4/4 leaderless wedge). Emitting
+        // this secondary's own digest on the same jittered cadence every
+        // OTHER waiting state already uses (`process_tasks`, the primary's
+        // operational loop, the observer tail) both re-registers the wire
+        // (the digest is the identifying first frame) and advertises this
+        // replica's state, closing the loop. Same `Skip` + dropped-first-tick
+        // shape as the operational arm.
+        let mut anti_entropy_interval =
+            tokio::time::interval(crate::anti_entropy::tick_period(&self.config.secondary_id));
+        anti_entropy_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        anti_entropy_interval.reset();
 
         while !got_peer_info || !got_assignment || !got_transfer {
             // Terminal-exit backstop. A terminal CRDT flag set DURING setup
@@ -403,30 +425,63 @@ where
             // host dials/accepts; the manager addresses peers by id and
             // never sees a transport role split.
             //
-            // Stall heartbeat (#362): the recv is wrapped in a 60s
-            // timeout that logs WHICH trio frames are still missing and
-            // loops back to waiting — narration only, no behavior change
-            // (the unconfigured-deadline still owns the give-up policy).
-            // Cancel-safe: `recv_setup_frame` is a sync backlog pop +
-            // `RoleInbox::recv` (a plain mpsc `UnboundedReceiver::recv`),
-            // so the timeout dropping it mid-wait loses no frame — this
-            // is NOT the historical transport-recv cancellation hazard
-            // documented above (that recv could hold a partially decoded
-            // wire frame; the role inbox receives only whole frames).
-            let received = loop {
-                match tokio::time::timeout(SETUP_STALL_WARN_INTERVAL, self.recv_setup_frame()).await
-                {
-                    Ok(frame) => break frame,
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            got_peer_info,
-                            got_assignment,
-                            got_transfer,
-                            "still waiting for the setup trio from the primary \
-                             (no setup frame for 60s); the missing directed \
-                             frames may indicate the primary has no route to \
-                             this node or proceeded without it"
-                        );
+            // Stall heartbeat (#362): a persistent 60s deadline arm logs
+            // WHICH trio frames are still missing and loops back to
+            // waiting — narration only, no behavior change (the
+            // unconfigured-deadline still owns the give-up policy).
+            let received = 'frame: loop {
+                // One stall window per warn cycle, computed OUT here so the
+                // anti-entropy arm firing cannot reset it: a per-`select!`
+                // `timeout(...)` would be re-armed by every ~20s digest tick
+                // and the 60s stall warn would NEVER fire (the
+                // watchdog-needs-a-fires-under-load law). The deadline
+                // persists across select iterations; only a delivered frame
+                // (which exits this loop entirely) or the warn itself starts
+                // a fresh window — exactly the pre-select semantics.
+                let stall_deadline =
+                    tokio::time::Instant::now() + SETUP_STALL_WARN_INTERVAL;
+                loop {
+                    tokio::select! {
+                        // Cancel-safe: `recv_setup_frame` is a sync backlog
+                        // pop + `RoleInbox::recv` (a plain mpsc recv), so a
+                        // tick winning the race loses no frame.
+                        frame = self.recv_setup_frame() => break 'frame frame,
+                        // Anti-entropy tick: broadcast this secondary's
+                        // digest so every peer can detect divergence and
+                        // pull — and so the submitter's accept loop has a
+                        // first frame to register a re-dialed bootstrap
+                        // wire under. Pure EMIT of the role-agnostic frame
+                        // built by `crate::anti_entropy`; the receive-side
+                        // compare+pull lives in the `StateDigest` arm below.
+                        // `interval.tick` is cancel-safe (tokio docs).
+                        _ = anti_entropy_interval.tick() => {
+                            let digest = self.cluster_state.digest();
+                            let frame = crate::anti_entropy::digest_broadcast(
+                                &self.config.secondary_id,
+                                timestamp_now(),
+                                digest,
+                            );
+                            if let Err(e) = self.send_to(Destination::All, frame).await {
+                                tracing::warn!(
+                                    error = %e,
+                                    "setup-phase anti-entropy digest broadcast \
+                                     failed; the next tick retries"
+                                );
+                            }
+                        }
+                        _ = tokio::time::sleep_until(stall_deadline) => {
+                            tracing::warn!(
+                                got_peer_info,
+                                got_assignment,
+                                got_transfer,
+                                "still waiting for the setup trio from the primary \
+                                 (no setup frame for 60s); the missing directed \
+                                 frames may indicate the primary has no route to \
+                                 this node or proceeded without it"
+                            );
+                            // Restart the stall window; keep waiting.
+                            break;
+                        }
                     }
                 }
             };

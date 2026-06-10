@@ -1,10 +1,19 @@
 """Scenario: network-primary + local-subprocess secondaries (--multi-computer local).
 
-Single concern: pin the regression in which the Python caller of
-``run_primary`` (in ``run.py::_dispatch_multi_computer_local``) forgot
-to thread ``source_dir`` through to the Rust auto-stage pass, leaving
-secondaries to reject every task with ``file_hash X not pre-staged at
-<name>; expected StageFile notification first``.
+Single concern: gate the ``--multi-computer local`` dispatch chain
+end-to-end. Two pinned regressions:
+
+* **source_dir threading** — the Python caller of ``run_primary`` (in
+  ``run.py::_dispatch_multi_computer_local``) forgot to thread
+  ``source_dir`` through to the Rust auto-stage pass, leaving
+  secondaries to reject every task with ``file_hash X not pre-staged
+  at <name>; expected StageFile notification first``.
+* **output delivery** — the spawner emitted no ``--output-dir``, so
+  every secondary's ``SecondaryConfig.output_dir`` (the publish target
+  workers receive as ``--output``) fell back to a per-secondary
+  tempdir and the operator's ``--output`` stayed empty
+  (consumer-validated at 2212c136). The scenario asserts the worker's
+  framework-output artifacts land under the operator's ``--output``.
 
 Mechanic
 --------
@@ -56,7 +65,11 @@ from __future__ import annotations
 import dataclasses
 from pathlib import Path
 
-from ._assertions import assert_files_present, expected_canonical_outputs
+from ._assertions import (
+    assert_files_present,
+    expected_canonical_outputs,
+    expected_framework_outputs,
+)
 from ._base import DispatchEnv, Scenario, ScenarioPlan, ScenarioResult
 from ._dispatch import build_dispatch_argv
 from ._staging import stage_inputs
@@ -72,7 +85,9 @@ class DistributedLocalSubprocessScenario(Scenario):
         "Network primary + local-subprocess secondaries with --jobs 2. "
         "Pins the source_dir-threading regression in "
         "_dispatch_multi_computer_local (asm-tokenizer reported "
-        "484/484 NonRecoverable at 55dbf15; fixed in 04a3aef)."
+        "484/484 NonRecoverable at 55dbf15; fixed in 04a3aef) and the "
+        "output-delivery gap (secondaries published into per-secondary "
+        "tempdirs; operator --output stayed empty at 2212c136)."
     )
     requires = ()
 
@@ -108,10 +123,24 @@ class DistributedLocalSubprocessScenario(Scenario):
                     f"(see {result.log_file})"
                 ],
             )
-        return assert_files_present(
+        ok_env, missing_env = assert_files_present(
             result.plan.paths.publish_dst,
             expected_canonical_outputs(_NUM_TASKS_PER_PHASE),
         )
+        # Output-delivery gate: the worker also delivers one artifact
+        # per produce task under its framework-threaded `--output`
+        # (= SecondaryConfig.output_dir). In local mode that MUST be
+        # the operator's `--output` directory — the same-host mirror
+        # of the SLURM semantic where every secondary publishes into
+        # the one user-visible bind-mounted dir. Pre-fix these files
+        # died in `<TMPDIR>/secondary-<id>-<pid>-out` and the
+        # operator's output dir stayed empty (consumer-validated at
+        # 2212c136).
+        ok_out, missing_out = assert_files_present(
+            result.plan.paths.output,
+            expected_framework_outputs(_NUM_TASKS_PER_PHASE),
+        )
+        return (ok_env and ok_out, missing_env + missing_out)
 
 
 SCENARIO = DistributedLocalSubprocessScenario()

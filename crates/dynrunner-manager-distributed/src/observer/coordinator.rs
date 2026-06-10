@@ -95,6 +95,14 @@ use crate::task_completed::{
     TaskCompletedEvent, TaskCompletedListener, run_collector, run_task_completed_dispatcher,
     windowed_failure_collector,
 };
+use crate::warn_throttle::WarnThrottle;
+
+/// Minimum spacing between two anti-entropy fault WARNs (empty mesh
+/// registry / failed send). The cadence detects the same outage every
+/// ~20s tick; this gate keeps the fault LOUD (never silent — the
+/// run_20260610 wedge) without one WARN per tick for its duration. The
+/// suppressed-occurrence count rides each emitted WARN.
+const AE_FAULT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Configuration for a standalone observer. Carries only the values the
 /// observer's own concerns read: the node identity, the lost-visibility
@@ -256,6 +264,16 @@ where
     /// tick that has a candidate, so a malformed-snapshot responder is not
     /// retried on the immediately-following tick.
     recovery_cursor: usize,
+    /// Rate limit for the digest tick's fault WARNs (empty mesh registry /
+    /// failed broadcast). The tick fires every ~20s; during an outage the
+    /// SAME fault recurs every tick, so the gate emits at most once per
+    /// interval (with a suppressed count) instead of one WARN per tick —
+    /// while guaranteeing the fault is never SILENT (the run_20260610
+    /// heal-never-engages wedge was undiagnosable because the
+    /// empty-registry broadcast "succeeded" and the Err arm logged DEBUG).
+    ae_digest_warn: WarnThrottle,
+    /// Same gate for the AE-3 recovery tick's fault WARNs.
+    ae_recovery_warn: WarnThrottle,
     /// The transport-recovery port (BUG-B reconnect). `Some` on the
     /// relocated submitter→observer path, whose
     /// [`dynrunner_transport_tunnel::TunneledPeerTransport`] reaches the
@@ -382,6 +400,8 @@ where
             task_completed_rx: Some(task_rx),
             peer_digests: std::collections::HashMap::new(),
             recovery_cursor: 0,
+            ae_digest_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
+            ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             reconnector,
         }
     }
@@ -436,6 +456,8 @@ where
             task_completed_rx: Some(task_rx),
             peer_digests: std::collections::HashMap::new(),
             recovery_cursor: 0,
+            ae_digest_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
+            ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             reconnector,
         }
     }
@@ -1304,13 +1326,44 @@ where
     }
 
     /// Anti-entropy tick (item 3): broadcast our digest to the mesh.
+    ///
+    /// FAULTS ARE LOUD (rate-limited via [`Self::ae_digest_warn`]): a
+    /// broadcast over an EMPTY mesh registry returns `Ok` while reaching
+    /// nobody — in the demoted-submitter topology this is exactly the
+    /// heal-never-engages wedge (the secondaries' re-dialed bootstrap
+    /// wires sit unregistered on the accept loop until they speak), and
+    /// it was previously fully silent: no Err, and the Err arm only ever
+    /// logged DEBUG. Both fault shapes now WARN, naming the registry
+    /// state against the replicated roster so the divergence (CRDT knows
+    /// N peers, the wire reaches 0) is visible to the operator.
     async fn on_anti_entropy_tick(&mut self) {
+        if self.client.peer_count() == 0 {
+            // The roster the replicated ledger believes exists — the WARN
+            // names both sides of the divergence.
+            let roster_secondaries = self.cluster_state.alive_secondary_members().count();
+            let roster_primary = self.cluster_state.current_primary().map(str::to_owned);
+            if let Some(suppressed) = self.ae_digest_warn.permit() {
+                tracing::warn!(
+                    roster_secondaries,
+                    roster_primary = ?roster_primary,
+                    suppressed_since_last_warn = suppressed,
+                    "anti-entropy digest has no peers to reach: the mesh \
+                     registry is EMPTY while the replicated roster names the \
+                     peers above — the digest heal cannot engage until a peer \
+                     (re-)registers (a re-dialed bootstrap wire registers on \
+                     its first inbound frame)"
+                );
+            }
+        }
         let digest = self.cluster_state.digest();
         let msg =
             anti_entropy::digest_broadcast::<I>(&self.config.node_id, timestamp_now(), digest);
-        if let Err(e) = self.send_to(Destination::All, msg).await {
-            tracing::debug!(
+        if let Err(e) = self.send_to(Destination::All, msg).await
+            && let Some(suppressed) = self.ae_digest_warn.permit()
+        {
+            tracing::warn!(
                 error = %e,
+                suppressed_since_last_warn = suppressed,
                 "observer anti-entropy digest broadcast failed; next tick retries"
             );
         }
@@ -1363,9 +1416,26 @@ where
             // quiesce, no pull this tick.
             return;
         };
-        if let Err(e) = self.send_to(dst, req).await {
+        // A planned pull over an EMPTY mesh registry can only no-route —
+        // name the registry state (rate-limited; same gate as the Err arm
+        // below, so one tick emits at most one recovery-fault WARN).
+        if self.client.peer_count() == 0
+            && let Some(suppressed) = self.ae_recovery_warn.permit()
+        {
+            tracing::warn!(
+                pull_target = ?dst,
+                suppressed_since_last_warn = suppressed,
+                "AE-3 recovery pull has no peers to reach: the mesh registry \
+                 is EMPTY while a known peer's digest proves this replica \
+                 behind — recovery cannot engage until the peer (re-)registers"
+            );
+        }
+        if let Err(e) = self.send_to(dst, req).await
+            && let Some(suppressed) = self.ae_recovery_warn.permit()
+        {
             tracing::warn!(
                 error = %e,
+                suppressed_since_last_warn = suppressed,
                 "observer AE-3 recovery snapshot pull failed; the next recovery \
                  tick rotates to a different responder"
             );

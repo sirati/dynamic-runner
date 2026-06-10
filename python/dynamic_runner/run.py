@@ -746,6 +746,17 @@ def _dispatch_secondary(task, args, logger) -> None:
         max_resources=_rs.ResourceMap({"memory": max_memory_bytes}),
         src_network=args.src_network,
         src_tmp=args.src_tmp,
+        # `--output-dir`: the publish target this secondary's workers
+        # receive as their `--output`. The `--multi-computer local`
+        # spawner regenerates it per secondary from the dispatcher's
+        # resolved `--output`, so same-host secondaries publish straight
+        # into the operator's output directory (the same-host mirror of
+        # the SLURM wrapper's user-visible /app/out-network bind-mount).
+        # Absent (SLURM wrapper, out-of-tree callers) → None → the
+        # SecondaryConfig auto-resolution (wrapper bind-mount, else a
+        # per-secondary tempdir) applies. `getattr` mirrors the other
+        # optional opt-ins for bare-Namespace callers.
+        output_dir=getattr(args, "output_dir", None),
         distributed_config=distributed_config,
         mem_manager_reserved_bytes=mem_manager_reserved_bytes,
         # `--secondary-quic-port`: the port this secondary's peer mesh

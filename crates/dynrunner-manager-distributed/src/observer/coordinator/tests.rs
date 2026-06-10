@@ -1898,3 +1898,59 @@ async fn observer_answers_snapshot_pull_from_behind_secondary() {
          ahead replica is mute and the wedged fleet cannot heal",
     );
 }
+
+/// #370 fires-under-real-topology: the PRODUCTION observer EMITS its
+/// anti-entropy digest on the wire — through the real `run()` loop, the
+/// real `Mesh`, and a real transport with a registered peer — and KEEPS
+/// emitting (the cadence recurs) while the loop's other periodic arms
+/// (the 50ms visibility-recheck tick, the recovery tick) stay busy.
+///
+/// The prior relocation-heal fix tested only the APPLY/PULL sides with a
+/// synthetic observer pushing digest frames by hand; nobody pinned that
+/// the production observer's `ae_tick` actually puts `StateDigest`
+/// frames onto the wire (the generalized watchdog-needs-a-fires-test
+/// law). The jittered period is 15–25s, so this runs under paused time.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn observer_digest_cadence_emits_on_the_wire() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _inbound, mut peers) = transport_with_peers("obs", 1);
+            let mut peer_rx = peers.pop().expect("one registered peer");
+            // No terminal in the ledger — the observer keeps observing for
+            // the whole assertion window.
+            let cs = ClusterState::<TestId>::new();
+            let (client, inbox, pump) = observer_mesh(transport, "obs");
+            tokio::task::spawn_local(pump);
+            let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
+
+            // TWO digests prove the cadence RECURS (a single emit could be a
+            // one-shot); both must reach the registered peer's wire end.
+            let assertion = async {
+                let mut digests_seen = 0u32;
+                while digests_seen < 2 {
+                    let frame = peer_rx.recv().await.expect("peer wire open");
+                    if matches!(frame, DistributedMessage::StateDigest { ref sender_id, .. } if sender_id == "obs")
+                    {
+                        digests_seen += 1;
+                    }
+                }
+            };
+
+            tokio::select! {
+                run = observer.run() => {
+                    panic!("the observer must keep observing, got {run:?}");
+                }
+                () = assertion => { /* two digest broadcasts reached the wire */ }
+                _ = tokio::time::sleep(Duration::from_secs(120)) => {
+                    panic!(
+                        "SILENT CADENCE: the production observer's anti-entropy \
+                         tick never put a StateDigest on the wire within 120s \
+                         (≥4 jittered periods) — the relocation-handoff heal \
+                         has no emitter"
+                    );
+                }
+            }
+        })
+        .await;
+}

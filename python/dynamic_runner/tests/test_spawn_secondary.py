@@ -86,6 +86,7 @@ def _make_args(**overrides) -> argparse.Namespace:
         source=None,
         cores=None,
         raw_logs=False,
+        resolved_output_root=None,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -107,6 +108,52 @@ def _captured_argv(args: argparse.Namespace) -> list[str]:
         f"spawn_secondary must return SubprocessSpec; got {type(spec).__name__}"
     )
     return list(spec.argv)
+
+
+class TestSpawnSecondaryStdioModeThreadThrough(unittest.TestCase):
+    """Pins the local-mode importance-gate plumbing (2026-06-10): a
+    `--multi-computer local` secondary is spawned with INHERITED stdio —
+    its stdout IS the operator's terminal — so the operator's
+    `--important-stdio-only` must ride its argv. It is stripped from the
+    generic `forwarded_argv` (correct for SLURM, where secondary stdio is
+    a per-node sbatch capture), so the local spawn path must re-emit it
+    explicitly via `logging_setup.stdio_mode_argv`. Pre-fix the secondary
+    subprocess installed an UNGATED subscriber and flooded the operator's
+    importance-only stdout with its full INFO firehose."""
+
+    def test_important_stdio_only_threaded_when_set(self) -> None:
+        argv = _captured_argv(_make_args(important_stdio_only=True))
+        self.assertIn(
+            "--important-stdio-only",
+            argv,
+            f"stdio-inheriting secondary lost the operator's stdio gate: {argv}",
+        )
+
+    def test_important_stdio_only_absent_when_off(self) -> None:
+        argv = _captured_argv(_make_args(important_stdio_only=False))
+        self.assertNotIn("--important-stdio-only", argv)
+
+    def test_important_stdio_only_absent_when_attr_missing(self) -> None:
+        # Programmatic callers may pass a namespace without the attr; never
+        # synthesize the flag from nothing.
+        argv = _captured_argv(_make_args())
+        self.assertNotIn("--important-stdio-only", argv)
+
+    def test_secondary_boot_parse_arms_importance_from_spawn_argv(self) -> None:
+        """Wire-shape mirror: the SECONDARY-side framework parser, fed the
+        verbatim argv this spawn path produced, must come out with
+        `important_stdio_only=True` — the same parsed knob its
+        `setup_logging` hands to the shared `init_logging` seam. This is
+        the cross-process chain the per-layer tests can't see."""
+        cli = _load_module_direct("cli", "cli.py")
+        argv = _captured_argv(_make_args(important_stdio_only=True))
+        # Drop the `python -m <module>` launcher prefix; argparse sees the rest.
+        flags = argv[3:]
+        boot_args = cli.build_arg_parser("test").parse_args(flags)
+        self.assertTrue(
+            boot_args.important_stdio_only,
+            f"secondary boot parse did not arm importance mode from {flags}",
+        )
 
 
 class TestSpawnSecondaryCoresThreadThrough(unittest.TestCase):
@@ -161,6 +208,30 @@ class TestSpawnSecondaryCoresThreadThrough(unittest.TestCase):
         self.assertIn("--cores", argv)
         self.assertEqual(argv[argv.index("--cores") + 1], "4")
         self.assertIn("--raw-logs", argv)
+
+    def test_output_dir_threaded_from_resolved_output_root(self) -> None:
+        """argv MUST include `--output-dir <resolved --output>` so the
+        spawned secondary's `SecondaryConfig.output_dir` — the publish
+        target every worker receives as its own `--output` — IS the
+        operator's output directory. Pre-fix this failed: the argv
+        builder emitted no output flag, the secondary fell back to the
+        `<TMPDIR>/secondary-<id>-<pid>-out` auto-resolution, and every
+        artifact of a `--multi-computer local` run died with the
+        per-secondary temp dir (consumer-validated at 2212c136). On
+        SLURM the wrapper bind-mounts the user-visible dir at
+        /app/out-network; local mode mirrors that semantic by
+        threading the same-host path directly."""
+        argv = _captured_argv(_make_args(resolved_output_root="/runs/out"))
+        self.assertIn("--output-dir", argv, f"--output-dir missing from argv: {argv}")
+        self.assertEqual(argv[argv.index("--output-dir") + 1], "/runs/out")
+
+    def test_output_dir_omitted_when_unresolved(self) -> None:
+        """Programmatic callers that never ran the selection-args
+        resolution carry no `resolved_output_root`; don't synthesize
+        an empty `--output-dir ""` — let the secondary's
+        auto-resolution apply."""
+        argv = _captured_argv(_make_args(resolved_output_root=None))
+        self.assertNotIn("--output-dir", argv, f"--output-dir should be absent: {argv}")
 
     def test_secondary_connection_args_always_present(self) -> None:
         """Sanity: the three secondary-connection flags are still
