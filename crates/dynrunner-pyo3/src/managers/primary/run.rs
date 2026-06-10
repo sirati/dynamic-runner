@@ -157,6 +157,16 @@ impl PyPrimaryCoordinator {
                 self.task_definition.clone_ref(py),
                 phase_hook_raise_latch.clone(),
             ));
+        // The setup peer's own `custom_message_handler` hook ref-bump
+        // (F5): a custom message can land during the pre-relocate
+        // bootstrap window, so the submitter coordinator installs the
+        // SAME hook the promoted primary does (built inside the detached
+        // runtime from its command sender, below).
+        let setup_custom_message_handler_def =
+            crate::custom_message_bridge::has_custom_message_handler(
+                &self.task_definition.bind(py).clone(),
+            )
+            .then(|| self.task_definition.clone_ref(py));
 
         // Take the Python peer-lifecycle listener (if any) out of
         // `self` so it can move into the detached tokio runtime.
@@ -452,6 +462,25 @@ impl PyPrimaryCoordinator {
                 // consumer-hook raise and surfaces `FatalPolicyExit`. Same
                 // pre-run-setter contract as the registrations below.
                 primary.set_phase_hook_raise_latch(phase_hook_raise_latch);
+
+                // Install the consumer custom-message hook (F5) on the
+                // submitter setup peer too — a custom message can land
+                // during the pre-relocate bootstrap window. Built from
+                // THIS coordinator's command sender
+                // (post-`replace_command_channel`).
+                if let Some(def) = setup_custom_message_handler_def {
+                    match crate::custom_message_bridge::make_custom_message_handler(
+                        def,
+                        primary.command_sender(),
+                    ) {
+                        Ok(handler) => primary.set_custom_message_handler(handler),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "custom_message_handler bridge build failed; the \
+                             submitter will consume custom messages unhandled"
+                        ),
+                    }
+                }
 
                 // Register the consumer's `may_be_empty` phase opt-out BEFORE
                 // `run()` enters, so the cold-/relocated-seed originator emits
