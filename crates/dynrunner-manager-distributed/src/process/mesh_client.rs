@@ -46,6 +46,7 @@ use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_protocol_primary_secondary::address::{Destination, PeerId};
 use tokio::sync::mpsc;
 
+use super::ingest_liveness::IngestLiveness;
 use super::membership::MembershipView;
 use super::role::LocalRole;
 
@@ -156,13 +157,36 @@ impl<I: Identifier> MeshClient<I> {
 /// slot's inbound `Sender` is the matching write end.
 pub struct RoleInbox<I: Identifier> {
     rx: mpsc::UnboundedReceiver<DistributedMessage<I>>,
+    /// Read clone of the slot's frame-INGEST freshness view (the write
+    /// side records in `RoleSlot::deliver`, the moment a frame enters
+    /// this inbox's channel). The coordinator's flood-immune liveness
+    /// reads ("when did a frame from X last ARRIVE, processed or not")
+    /// go through [`Self::last_ingest_from`].
+    ingest_liveness: IngestLiveness,
 }
 
 impl<I: Identifier> RoleInbox<I> {
     /// Internal mint — only [`super::Mesh::register_local_role`] calls
-    /// this so the inbox is always paired with its slot's inbound sender.
-    pub(super) fn new(rx: mpsc::UnboundedReceiver<DistributedMessage<I>>) -> Self {
-        Self { rx }
+    /// this so the inbox is always paired with its slot's inbound sender
+    /// AND the slot's ingest-freshness cell.
+    pub(super) fn new(
+        rx: mpsc::UnboundedReceiver<DistributedMessage<I>>,
+        ingest_liveness: IngestLiveness,
+    ) -> Self {
+        Self {
+            rx,
+            ingest_liveness,
+        }
+    }
+
+    /// When did a frame from `node_id` last ENTER this inbox — recorded
+    /// at the slot's delivery choke point, BEFORE the frame waits in the
+    /// channel. `None` if no frame from it ever arrived. The flood-
+    /// immunity read: a death clock that unions this with its
+    /// processing-time view cannot declare a peer silent while that
+    /// peer's frames sit in a backed-up inbox.
+    pub fn last_ingest_from(&self, node_id: &str) -> Option<std::time::Instant> {
+        self.ingest_liveness.last_seen(node_id)
     }
 
     /// Await the next frame addressed to this role. `None` once every

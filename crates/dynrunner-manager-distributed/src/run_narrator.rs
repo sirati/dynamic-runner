@@ -585,6 +585,7 @@ mod tests {
             is_observer: false,
             can_be_primary: true,
             cap_version: Default::default(),
+            member_gen: 0,
         });
         state.apply(ClusterMutation::SecondaryCapacity {
             secondary: id.to_string(),
@@ -601,6 +602,7 @@ mod tests {
         state.apply(ClusterMutation::PeerRemoved {
             id: id.to_string(),
             cause: RemovalCause::KeepaliveMiss,
+            member_gen: 0,
         });
     }
 
@@ -1505,6 +1507,7 @@ mod tests {
                 is_observer: false,
                 can_be_primary: true,
                 cap_version: Default::default(),
+                member_gen: 0,
             });
             set_primary(&mut state, "p", 1);
             join_secondary(&mut state, "w1");

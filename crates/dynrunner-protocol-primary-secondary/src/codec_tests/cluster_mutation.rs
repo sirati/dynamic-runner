@@ -1,5 +1,6 @@
 use super::*;
 use crate::cluster_mutation::{ClusterMutation, PrimaryChangeReason};
+use crate::removal_cause::RemovalCause;
 use dynrunner_core::TaskVersion;
 
 #[test]
@@ -599,6 +600,9 @@ fn roundtrip_peer_joined_with_cap_version() {
             primary_epoch: 7,
             seq: 3,
         },
+        // Pin a NON-DEFAULT generation so the assertion catches a
+        // dropped `member_gen` on the wire (the re-admission lattice).
+        member_gen: 2,
     };
 
     let json = serde_json::to_string(&mutation).unwrap();
@@ -610,6 +614,7 @@ fn roundtrip_peer_joined_with_cap_version() {
             is_observer,
             can_be_primary,
             cap_version,
+            member_gen,
         } => {
             assert_eq!(peer_id, "compute-1");
             assert!(!is_observer);
@@ -621,6 +626,7 @@ fn roundtrip_peer_joined_with_cap_version() {
                     seq: 3
                 }
             );
+            assert_eq!(member_gen, 2);
         }
         _ => panic!("expected PeerJoined"),
     }
@@ -644,12 +650,16 @@ fn legacy_peer_joined_decodes_cap_version_as_default() {
             is_observer,
             can_be_primary,
             cap_version,
+            member_gen,
         } => {
             assert_eq!(peer_id, "legacy-peer");
             assert!(is_observer);
             // can_be_primary also serde(default) → false.
             assert!(!can_be_primary);
             assert_eq!(cap_version, TaskVersion::default());
+            // member_gen serde(default) → 0, the pre-generation cold
+            // sticky semantics.
+            assert_eq!(member_gen, 0);
         }
         _ => panic!("expected PeerJoined"),
     }
@@ -837,5 +847,115 @@ fn custom_message_mutations_decode_literal_sender_bytes() {
             assert_eq!((origin.as_str(), seq), ("sec-1", 3));
         }
         _ => panic!("expected CustomMessageFailed"),
+    }
+}
+
+/// `PeerRemoved` round-trips carrying a NON-DEFAULT `member_gen` (the
+/// re-admission lattice: the removal kills ONE membership incarnation,
+/// so the generation must survive the wire or a stale removal could
+/// re-bury a re-admitted live peer).
+#[test]
+fn roundtrip_peer_removed_with_member_gen() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::PeerRemoved {
+        id: "secondary-2".into(),
+        cause: RemovalCause::KeepaliveMiss,
+        member_gen: 3,
+    };
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::PeerRemoved {
+            id,
+            cause,
+            member_gen,
+        } => {
+            assert_eq!(id, "secondary-2");
+            assert_eq!(cause, RemovalCause::KeepaliveMiss);
+            assert_eq!(member_gen, 3);
+        }
+        _ => panic!("expected PeerRemoved"),
+    }
+}
+
+/// Wire-shape mirror (NOT symmetric-on-the-wrong-shape): decode the EXACT
+/// JSON bytes a generation-stamping sender emits —
+/// `{"PeerRemoved":{"id":"...","cause":"KeepaliveMiss","member_gen":1}}` —
+/// rather than re-encoding our own value, so a field reorder/rename that
+/// still round-trips against itself is caught against the other side's
+/// actual bytes.
+#[test]
+fn peer_removed_decodes_literal_sender_bytes() {
+    let bytes = r#"{"PeerRemoved":{"id":"secondary-1","cause":"KeepaliveMiss","member_gen":1}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
+
+    match decoded {
+        ClusterMutation::PeerRemoved {
+            id,
+            cause,
+            member_gen,
+        } => {
+            assert_eq!(id, "secondary-1");
+            assert_eq!(cause, RemovalCause::KeepaliveMiss);
+            assert_eq!(member_gen, 1);
+        }
+        _ => panic!("expected PeerRemoved"),
+    }
+}
+
+/// Backward-compat: a sender that predates the `member_gen` field emits a
+/// `PeerRemoved` with only `{ id, cause }`. `#[serde(default)]` must
+/// decode `member_gen` as 0 — the pre-generation sticky semantics.
+#[test]
+fn legacy_peer_removed_decodes_member_gen_as_default() {
+    let bytes = r#"{"PeerRemoved":{"id":"old-peer","cause":"KeepaliveMiss"}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
+
+    match decoded {
+        ClusterMutation::PeerRemoved {
+            id,
+            cause,
+            member_gen,
+        } => {
+            assert_eq!(id, "old-peer");
+            assert_eq!(cause, RemovalCause::KeepaliveMiss);
+            assert_eq!(member_gen, 0);
+        }
+        _ => panic!("expected PeerRemoved"),
+    }
+}
+
+/// Wire-shape mirror for the RE-ADMISSION `PeerJoined` (the headline
+/// frame of the membership-readmission fix): decode the EXACT JSON
+/// bytes the primary's frame-ingest re-admission seam emits — a join at
+/// `member_gen: 1` superseding a generation-0 removal — against the
+/// other side's actual bytes.
+#[test]
+fn readmission_peer_joined_decodes_literal_sender_bytes() {
+    let bytes = r#"{"PeerJoined":{"peer_id":"secondary-2","is_observer":false,"can_be_primary":true,"cap_version":{"primary_epoch":1,"seq":4},"member_gen":1}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
+
+    match decoded {
+        ClusterMutation::PeerJoined {
+            peer_id,
+            is_observer,
+            can_be_primary,
+            cap_version,
+            member_gen,
+        } => {
+            assert_eq!(peer_id, "secondary-2");
+            assert!(!is_observer);
+            assert!(can_be_primary);
+            assert_eq!(
+                cap_version,
+                TaskVersion {
+                    primary_epoch: 1,
+                    seq: 4
+                }
+            );
+            assert_eq!(member_gen, 1);
+        }
+        _ => panic!("expected PeerJoined"),
     }
 }

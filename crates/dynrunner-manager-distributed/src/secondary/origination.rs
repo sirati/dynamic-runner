@@ -233,6 +233,8 @@ where
             let mutation = ClusterMutation::PeerRemoved {
                 id: self.config.secondary_id.clone(),
                 cause: RemovalCause::SelfDeparture(BoundedString::from(reason.clone())),
+                // Kills THIS node's current membership incarnation.
+                member_gen: self.cluster_state.peer_member_gen(&self.config.secondary_id),
             };
             if let Err(e) = self.apply_and_broadcast_mutations(vec![mutation]).await {
                 tracing::warn!(

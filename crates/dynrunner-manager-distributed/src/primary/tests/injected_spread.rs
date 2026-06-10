@@ -395,6 +395,7 @@ async fn injection_during_cascade_dispatches_despite_busy_inbox() {
                         is_observer: false,
                         can_be_primary: false,
                         cap_version: Default::default(),
+                        member_gen: 0,
                     });
                     cs.apply(ClusterMutation::SecondaryCapacity {
                         secondary: id.clone(),

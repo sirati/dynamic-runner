@@ -97,6 +97,19 @@ pub(super) struct PrimaryLink {
     /// regardless of `failure_count`. Configurable for the same
     /// reason.
     failure_window: Duration,
+
+    /// When the breach was last REPORTED to a caller (the `true` return
+    /// of [`Self::record_recv_failure`]). `None` while no breach has
+    /// been reported this failure window. The probe-breach accounting
+    /// clock: one suspicion is reported ONCE PER `failure_window`, on
+    /// this field's own schedule — never once per send attempt — so a
+    /// send-loop flood (a replay storm issuing dozens of no-route sends
+    /// per second) cannot turn one breached window into dozens of
+    /// arming evaluations per second. The level-read
+    /// [`Self::should_arm_failover`] (the election tick's input) is
+    /// untouched by this rate: the breach STATE stays continuously
+    /// observable; only the edge REPORT is once-per-window.
+    last_breach_report: Option<Instant>,
 }
 
 impl PrimaryLink {
@@ -116,6 +129,7 @@ impl PrimaryLink {
             failure_count: 0,
             failure_threshold,
             failure_window,
+            last_breach_report: None,
         }
     }
 
@@ -171,8 +185,22 @@ impl PrimaryLink {
     /// Record one observation of "the primary's transport recv()
     /// returned None" (or, equivalently, one failed reconnect probe).
     /// Anchors the failure window on the first call; subsequent calls
-    /// just bump the counter. Returns `true` iff the threshold has
-    /// been breached and the caller should arm failover.
+    /// just bump the counter. Returns `true` iff the threshold has been
+    /// breached AND the breach has not yet been reported this
+    /// `failure_window` — the ONCE-PER-WINDOW breach report, on the
+    /// link's own clock (`last_breach_report`), NEVER once per call.
+    ///
+    /// Why once-per-window: this method is called per FAILED SEND, and
+    /// the send rate is the caller's business (a buffered-report replay
+    /// drain under an outage re-sends dozens of frames per loop tick —
+    /// the run_20260610_221140 storm hit ~60 no-route sends/second).
+    /// Pre-fix every post-breach call returned `true`, so ONE suspicion
+    /// ("the primary is unreachable") became ~60 arming
+    /// evaluations/second at the caller (WARN + `primary_last_seen`
+    /// backdate each). The breach STATE is unchanged and continuously
+    /// observable through the level-read [`Self::should_arm_failover`]
+    /// (the election tick's leg-(A) input); only the edge REPORT this
+    /// return carries is rate-limited to its own window.
     ///
     /// Threshold breach is `failure_count >= failure_threshold` OR
     /// `now - first_failure_at >= failure_window`, whichever fires
@@ -184,7 +212,18 @@ impl PrimaryLink {
             self.first_failure_at = Some(now);
         }
         self.failure_count = self.failure_count.saturating_add(1);
-        self.should_arm_failover()
+        if !self.should_arm_failover() {
+            return false;
+        }
+        // Breached: report once per failure_window on the report clock.
+        let due = match self.last_breach_report {
+            None => true,
+            Some(at) => now.saturating_duration_since(at) >= self.failure_window,
+        };
+        if due {
+            self.last_breach_report = Some(now);
+        }
+        due
     }
 
     /// Reset the health sub-state to the "link is healthy" baseline.
@@ -195,6 +234,9 @@ impl PrimaryLink {
     pub(super) fn record_recv_success(&mut self) {
         self.first_failure_at = None;
         self.failure_count = 0;
+        // A healthy link closes the failure window entirely; the next
+        // breach (a genuinely new suspicion) reports immediately.
+        self.last_breach_report = None;
     }
 
     /// Pure read of the threshold breach predicate. Exposed so the
@@ -287,6 +329,73 @@ mod tests {
         assert!(!link.should_arm_failover());
         // After reset, a single new failure shouldn't arm.
         assert!(!link.record_recv_failure());
+    }
+
+    /// Probe-breach accounting is ONCE-PER-WINDOW, not per send attempt
+    /// (the run_20260610_221140 replay-storm face: ~60 no-route sends/s
+    /// each pre-fix returned `armed=true`, turning ONE suspicion into 60
+    /// arming evaluations per second). N failures inside one window
+    /// must yield exactly ONE breach report; the level-read
+    /// `should_arm_failover` stays continuously true for the election
+    /// tick.
+    #[test]
+    fn breach_report_fires_once_per_window_under_send_flood() {
+        let mut link = PrimaryLink::with_failover_threshold(
+            3,
+            Duration::from_secs(3600), // huge window — one report max
+        );
+        let mut reports = 0;
+        // The flood: many failed sends in one window.
+        for _ in 0..200 {
+            if link.record_recv_failure() {
+                reports += 1;
+            }
+        }
+        assert_eq!(
+            reports, 1,
+            "N send failures in one window must produce exactly ONE              breach report"
+        );
+        // The breach STATE stays continuously observable (the election
+        // tick's leg-(A) level read is unthrottled).
+        assert!(link.should_arm_failover());
+    }
+
+    /// The breach report re-arms on the report's OWN clock: after one
+    /// `failure_window` elapses, a still-breached link reports once
+    /// more (a persistent outage stays operator-visible at window
+    /// cadence, never at send cadence).
+    #[test]
+    fn breach_report_rearms_after_window_elapses() {
+        let mut link = PrimaryLink::with_failover_threshold(1, Duration::from_millis(40));
+        assert!(
+            link.record_recv_failure(),
+            "first breach reports immediately"
+        );
+        assert!(
+            !link.record_recv_failure(),
+            "inside the window: no second report"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            link.record_recv_failure(),
+            "a full window later the persistent breach reports again"
+        );
+        assert!(!link.record_recv_failure());
+    }
+
+    /// A recovery (`record_recv_success`) closes the window entirely:
+    /// the NEXT breach is a genuinely new suspicion and reports
+    /// immediately, not after a stale report-clock residue.
+    #[test]
+    fn breach_report_resets_on_recovery() {
+        let mut link = PrimaryLink::with_failover_threshold(1, Duration::from_secs(3600));
+        assert!(link.record_recv_failure());
+        assert!(!link.record_recv_failure());
+        link.record_recv_success();
+        assert!(
+            link.record_recv_failure(),
+            "a fresh breach after recovery reports immediately"
+        );
     }
 
     /// Boundary: the `should_arm_failover` predicate is a pure read —

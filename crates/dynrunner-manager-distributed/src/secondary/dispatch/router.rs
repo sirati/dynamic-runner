@@ -532,6 +532,12 @@ where
                 // observer correctly populates `RoleTable.observers`.
                 // Only `PeerRemoved` ever clears the observer flag, so
                 // the ratchet never regresses a genuine observer.
+                // The id's CURRENT membership incarnation: a secondary
+                // responder never bumps the generation (the primary's
+                // frame-ingest re-admission seam is the sole authority
+                // for re-admitting a removed id), so a join for a
+                // still-removed id is the sticky NoOp.
+                let member_gen = self.cluster_state.peer_member_gen(&sender_id);
                 let _ = self
                     .apply_and_broadcast_mutations(vec![ClusterMutation::PeerJoined {
                         peer_id: sender_id,
@@ -545,6 +551,7 @@ where
                         // Stamped at the origination choke point
                         // (`apply_and_broadcast_mutations` → `stamp_versions`).
                         cap_version: Default::default(),
+                        member_gen,
                     }])
                     .await;
                 Ok(())

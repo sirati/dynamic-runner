@@ -75,6 +75,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 can_be_primary: false,
                 // Stamped at the origination choke point.
                 cap_version: Default::default(),
+                // The id's current membership incarnation (idempotent
+                // re-emit; see `apply_peer_joined`).
+                member_gen: self.cluster_state.peer_member_gen(s.id()),
             })
             .collect();
 

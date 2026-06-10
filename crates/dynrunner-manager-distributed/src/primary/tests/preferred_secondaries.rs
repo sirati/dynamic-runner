@@ -167,6 +167,7 @@ async fn peer_joined_revalidates_preferred_secondaries() {
                         is_observer: false,
                         can_be_primary: false,
                         cap_version: Default::default(),
+                        member_gen: 0,
                     },
                 ],
             };

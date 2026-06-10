@@ -167,6 +167,7 @@ fn observer_capability_divergence_detected_and_heals() {
         is_observer: true,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
 
     // The digests DIFFER (the capability fold is summarised) and `b` is
@@ -234,6 +235,7 @@ fn residual_liveness_divergence_is_not_behind() {
             is_observer: false,
             can_be_primary: false,
             cap_version: Default::default(),
+            member_gen: 0,
         });
     }
     // `b` locally detected `w1` as dead and buried it: this writes a
@@ -241,6 +243,7 @@ fn residual_liveness_divergence_is_not_behind() {
     b.apply(ClusterMutation::PeerRemoved {
         id: "w1".into(),
         cause: RemovalCause::KeepaliveMiss,
+        member_gen: 0,
     });
     // The capability tombstone is a converging fact, so `a` IS behind `b`
     // until it pulls (detect-WITH-heal).

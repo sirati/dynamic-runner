@@ -67,6 +67,7 @@
 //! `route_incoming` already ACCEPT a role-bearing target so those waves
 //! plug in without reshaping the API.
 
+pub mod ingest_liveness;
 pub mod membership;
 pub mod mesh;
 pub mod mesh_client;
@@ -80,6 +81,7 @@ pub mod run_inputs;
 #[cfg(test)]
 mod tests;
 
+pub use ingest_liveness::IngestLiveness;
 pub use membership::MembershipView;
 pub use mesh::Mesh;
 pub use mesh_client::{LocalDispatch, MeshClient, RoleInbox};

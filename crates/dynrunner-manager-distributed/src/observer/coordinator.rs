@@ -1304,6 +1304,8 @@ where
         let mutation = ClusterMutation::<I>::PeerRemoved {
             id: self.config.node_id.clone(),
             cause: RemovalCause::SelfDeparture(BoundedString::from(reason)),
+            // Kills THIS node's current membership incarnation.
+            member_gen: self.cluster_state.peer_member_gen(&self.config.node_id),
         };
         self.cluster_state.apply(mutation.clone());
         let msg = DistributedMessage::ClusterMutation {

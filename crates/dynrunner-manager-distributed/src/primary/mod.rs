@@ -38,6 +38,7 @@ mod important_events;
 mod ingest;
 mod lifecycle;
 mod peer_setup;
+mod readmission;
 pub mod preferred_secondaries;
 mod reconciliation_probe;
 pub mod respawn;

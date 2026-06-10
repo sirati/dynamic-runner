@@ -136,6 +136,7 @@ fn peer_joined_observer_inserts_into_role_table_and_fires_hooks_on_change() {
             is_observer: true,
             can_be_primary: false,
             cap_version: Default::default(),
+            member_gen: 0,
         }),
         ApplyOutcome::Applied
     );
@@ -152,6 +153,7 @@ fn peer_joined_observer_inserts_into_role_table_and_fires_hooks_on_change() {
             is_observer: true,
             can_be_primary: false,
             cap_version: Default::default(),
+            member_gen: 0,
         }),
         ApplyOutcome::NoOp
     );
@@ -163,6 +165,7 @@ fn peer_joined_observer_inserts_into_role_table_and_fires_hooks_on_change() {
             is_observer: true,
             can_be_primary: false,
             cap_version: Default::default(),
+            member_gen: 0,
         }),
         ApplyOutcome::Applied
     );
@@ -198,6 +201,7 @@ fn peer_joined_non_observer_does_not_remove_existing_observer() {
             is_observer: true,
             can_be_primary: false,
             cap_version: Default::default(),
+            member_gen: 0,
         }),
         ApplyOutcome::Applied
     );
@@ -212,6 +216,7 @@ fn peer_joined_non_observer_does_not_remove_existing_observer() {
             is_observer: false,
             can_be_primary: false,
             cap_version: Default::default(),
+            member_gen: 0,
         }),
         ApplyOutcome::NoOp
     );
@@ -229,6 +234,7 @@ fn peer_joined_non_observer_does_not_remove_existing_observer() {
             is_observer: false,
             can_be_primary: false,
             cap_version: Default::default(),
+            member_gen: 0,
         }),
         ApplyOutcome::Applied
     );
@@ -286,12 +292,14 @@ fn peer_joined_records_can_be_primary_capability() {
         is_observer: false,
         can_be_primary: true,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     s.apply(ClusterMutation::PeerJoined {
         peer_id: "incapable".into(),
         is_observer: false,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
 
     assert!(
@@ -331,6 +339,7 @@ fn set_can_be_primary_updates_capability_at_runtime() {
             primary_epoch: 0,
             seq: 1,
         },
+        member_gen: 0,
     });
     assert!(!s.can_be_primary("p"));
 
@@ -397,6 +406,7 @@ fn snapshot_round_trips_capability_2p_set() {
         is_observer: false,
         can_be_primary: true,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     // compute-b is pre-armed via SetCanBePrimary WITHOUT a join → the
     // capability is held in the 2P-set but it is not alive, so it does NOT
@@ -446,12 +456,14 @@ fn peer_removed_clears_can_be_primary() {
         is_observer: false,
         can_be_primary: true,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     assert!(s.can_be_primary("doomed"));
 
     s.apply(ClusterMutation::PeerRemoved {
         id: "doomed".into(),
         cause: RemovalCause::KeepaliveMiss,
+        member_gen: 0,
     });
     assert!(
         !s.can_be_primary("doomed"),

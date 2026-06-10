@@ -34,6 +34,7 @@ async fn apply_peer_joined_emits_event_through_dispatcher() {
             is_observer: false,
             can_be_primary: false,
             cap_version: Default::default(),
+            member_gen: 0,
         }),
         ApplyOutcome::Applied
     );
@@ -54,6 +55,7 @@ async fn apply_peer_joined_emits_event_through_dispatcher() {
         s.apply(ClusterMutation::PeerRemoved {
             id: "peer-x".into(),
             cause: RemovalCause::KeepaliveMiss,
+            member_gen: 0,
         }),
         ApplyOutcome::Applied
     );

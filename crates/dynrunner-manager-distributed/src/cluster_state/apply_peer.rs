@@ -84,19 +84,24 @@ impl<I: Identifier> ClusterState<I> {
     /// Merge one `Advertised` capability for `peer_id` into the 2P-set via
     /// `merge_capability` and return whether the stored entry actually
     /// changed (the `Applied` signal — it gates re-broadcast and the
-    /// digest fold). A `Departed` tombstone absorbs the advertise (no
-    /// change), so a capability advertise for a removed id is inert.
+    /// digest fold). A SAME-generation `Departed` tombstone absorbs the
+    /// advertise (no change), so a stale capability advertise for a
+    /// removed id is inert; a strictly-higher-generation advertise (a
+    /// re-admission) supersedes the tombstone through the generation-
+    /// first merge.
     fn merge_advertised_capability(
         &mut self,
         peer_id: &str,
         is_observer: bool,
         can_be_primary: bool,
         cap_version: TaskVersion,
+        member_gen: u64,
     ) -> bool {
         let incoming = CapabilityEntry::Advertised {
             is_observer,
             can_be_primary,
             cap_version,
+            member_gen,
         };
         let merged = match self.capabilities.get(peer_id) {
             Some(local) => merge_capability(local, &incoming),
@@ -111,54 +116,99 @@ impl<I: Identifier> ClusterState<I> {
 
     /// Apply a `ClusterMutation::PeerJoined`.
     ///
-    /// Sticky-per-id removal wins: if the id is currently `Dead` in
-    /// `peer_state`, the broadcast is logged at `warn` and dropped
-    /// (NoOp). Otherwise the entry is brought to `Alive` and the join's
-    /// `(is_observer, can_be_primary)` advertisement is merged into the
-    /// `capabilities` 2P-set (cap_version stamped at origination); a
-    /// `Departed` tombstone absorbs it (a removed id never resurrects its
-    /// capability). The `RoleTable` sets are rebuilt by `reproject_roles`
-    /// whenever liveness or capability changed, firing the role-change
-    /// hooks. A `PeerLifecycleEvent::Added` is emitted on every
-    /// state-changing apply; pure-idempotent re-deliveries return NoOp.
+    /// Sticky-per-GENERATION removal wins: if the id is currently `Dead`
+    /// in `peer_state` and the join's `member_gen` is NOT strictly above
+    /// the entry's generation, the broadcast is logged at `warn` and
+    /// dropped (NoOp) — the original sticky rule, scoped to one
+    /// membership incarnation, so a late/reordered stale `PeerJoined`
+    /// still cannot resurrect an authoritative removal. A join whose
+    /// `member_gen` IS strictly above a `Dead` entry's generation
+    /// RE-ADMITS the id (removal at gen N, rejoin at gen N+1 — the
+    /// primary's frame-ingest re-admission seam is the sole originator
+    /// of the bump): the entry returns to `Alive` at the new generation
+    /// and the join's advertisement supersedes the capability tombstone
+    /// through the generation-first `merge_capability`. Otherwise the
+    /// entry is brought to `Alive` and the join's `(is_observer,
+    /// can_be_primary)` advertisement is merged into the `capabilities`
+    /// 2P-set (cap_version stamped at origination). The `RoleTable` sets
+    /// are rebuilt by `reproject_roles` whenever liveness or capability
+    /// changed, firing the role-change hooks. A
+    /// `PeerLifecycleEvent::Added` is emitted on every state-changing
+    /// apply; pure-idempotent re-deliveries return NoOp.
     pub(super) fn apply_peer_joined(
         &mut self,
         peer_id: String,
         is_observer: bool,
         can_be_primary: bool,
         cap_version: TaskVersion,
+        member_gen: u64,
     ) -> ApplyOutcome {
         match self.peer_state.get(&peer_id) {
-            Some(entry) if entry.state == PeerState::Dead => {
+            Some(entry) if entry.state == PeerState::Dead && member_gen <= entry.member_gen => {
                 tracing::warn!(
                     target: "dynrunner_cluster_state",
                     peer_id = %peer_id,
-                    "PeerJoined for dead id ignored",
+                    entry_gen = entry.member_gen,
+                    join_gen = member_gen,
+                    "PeerJoined for dead id at a non-advancing generation ignored \
+                     (sticky removal within the membership incarnation)",
                 );
                 return ApplyOutcome::NoOp;
             }
             _ => {}
         }
-        // Liveness: insert a fresh Alive entry if first-seen. (An already-
-        // Alive entry is unchanged — the liveness bit is idempotent.)
-        let entry_was_new = match self.peer_state.get(&peer_id) {
+        // Liveness: insert a fresh Alive entry if first-seen; RE-ADMIT a
+        // Dead entry whose generation the join strictly advances; adopt a
+        // strictly-higher generation onto an already-Alive entry (a
+        // re-admission echo whose removal this node never observed). An
+        // already-Alive entry at the same-or-higher generation is
+        // unchanged — the liveness bit is idempotent.
+        let liveness_changed = match self.peer_state.get_mut(&peer_id) {
             None => {
                 self.peer_state.insert(
                     peer_id.clone(),
                     PeerEntry {
                         state: PeerState::Alive,
+                        member_gen,
                         pubkey: None,
                         endpoint: None,
                     },
                 );
                 true
             }
-            Some(_) => false,
+            Some(entry) if entry.state == PeerState::Dead => {
+                // member_gen > entry.member_gen here (the sticky gate
+                // above returned NoOp otherwise): the RE-ADMISSION edge.
+                tracing::warn!(
+                    target: "dynrunner_cluster_state",
+                    peer_id = %peer_id,
+                    from_gen = entry.member_gen,
+                    to_gen = member_gen,
+                    "re-admitting removed peer at an advanced membership \
+                     generation (its authenticated frames prove it alive)",
+                );
+                entry.state = PeerState::Alive;
+                entry.member_gen = member_gen;
+                true
+            }
+            Some(entry) => {
+                let advanced = member_gen > entry.member_gen;
+                if advanced {
+                    entry.member_gen = member_gen;
+                }
+                advanced
+            }
         };
-        // Capability: merge the advertisement into the 2P-set.
-        let capability_changed =
-            self.merge_advertised_capability(&peer_id, is_observer, can_be_primary, cap_version);
-        if entry_was_new || capability_changed {
+        // Capability: merge the advertisement into the 2P-set (generation-
+        // first, so a re-admission supersedes the Departed tombstone).
+        let capability_changed = self.merge_advertised_capability(
+            &peer_id,
+            is_observer,
+            can_be_primary,
+            cap_version,
+            member_gen,
+        );
+        if liveness_changed || capability_changed {
             // Either liveness or capability changed → rebuild the role
             // projections (and fire hooks) from the post-mutation state.
             self.reproject_roles();
@@ -200,8 +250,25 @@ impl<I: Identifier> ClusterState<I> {
             Some(CapabilityEntry::Advertised { is_observer, .. }) => *is_observer,
             _ => false,
         };
-        let changed =
-            self.merge_advertised_capability(&peer_id, is_observer, can_be_primary, cap_version);
+        // The update targets the CURRENT membership incarnation: merge at
+        // the existing capability entry's generation (falling back to the
+        // liveness entry's, then 0) so the generation-first merge lands in
+        // the same-generation `Advertised` fold where `cap_version`
+        // arbitrates — a lower stamped generation would be dropped
+        // outright, a higher one would clobber the incarnation key.
+        let member_gen = self
+            .capabilities
+            .get(&peer_id)
+            .map(super::merge::capability_member_gen)
+            .or_else(|| self.peer_state.get(&peer_id).map(|e| e.member_gen))
+            .unwrap_or(0);
+        let changed = self.merge_advertised_capability(
+            &peer_id,
+            is_observer,
+            can_be_primary,
+            cap_version,
+            member_gen,
+        );
         if changed {
             self.reproject_roles();
             ApplyOutcome::Applied
@@ -212,28 +279,61 @@ impl<I: Identifier> ClusterState<I> {
 
     /// Apply a `ClusterMutation::PeerRemoved`.
     ///
-    /// Sticky-per-id: once `peer_state[id]` is `Dead`, any further
-    /// `PeerRemoved` for the same id is a silent NoOp. An `Absent`
-    /// id is inserted as `Dead` so the entry blocks any late
-    /// out-of-order `PeerJoined` for the same id. A `Departed` tombstone
-    /// is written into the `capabilities` 2P-set (genuine departure
-    /// dominates any earlier `Advertised`), and `reproject_roles` drops
-    /// the id from both role sets for free (Departed/Dead projects out).
-    /// A `PeerLifecycleEvent::Removed` is emitted on every state-changing
-    /// apply.
-    pub(super) fn apply_peer_removed(&mut self, id: String, cause: RemovalCause) -> ApplyOutcome {
-        if let Some(entry) = self.peer_state.get(&id)
-            && entry.state == PeerState::Dead
-        {
-            return ApplyOutcome::NoOp;
+    /// Sticky-per-GENERATION: once `peer_state[id]` is `Dead` at
+    /// generation N, any further `PeerRemoved` for the same id at a
+    /// generation `<= N` is a silent NoOp — and so is a removal whose
+    /// generation is strictly BELOW an `Alive` entry's (a stale removal
+    /// of an already-superseded membership incarnation must not re-bury
+    /// the re-admitted live peer). A removal at the `Alive` entry's own
+    /// generation kills that incarnation (the authoritative removal); a
+    /// removal at a generation this node has never seen join is applied
+    /// at that generation so it still blocks the late out-of-order
+    /// `PeerJoined` of the same incarnation. An absent id is inserted as
+    /// `Dead` for the same reason. A `Departed` tombstone PRESERVING the
+    /// advertisement current at departure is merged into the
+    /// `capabilities` 2P-set at the removal's generation (it dominates
+    /// the same-generation `Advertised`; a later re-admission's
+    /// higher-generation advertise supersedes it), and `reproject_roles`
+    /// drops the id from both role sets for free (Departed/Dead projects
+    /// out). A `PeerLifecycleEvent::Removed` is emitted on every
+    /// state-changing apply.
+    pub(super) fn apply_peer_removed(
+        &mut self,
+        id: String,
+        cause: RemovalCause,
+        member_gen: u64,
+    ) -> ApplyOutcome {
+        if let Some(entry) = self.peer_state.get(&id) {
+            if entry.state == PeerState::Dead && member_gen <= entry.member_gen {
+                return ApplyOutcome::NoOp;
+            }
+            if entry.state == PeerState::Alive && member_gen < entry.member_gen {
+                // Stale removal of a superseded incarnation: the peer was
+                // already re-admitted at a higher generation, so this
+                // removal lost. Name the drop (silent-branch rule) — a
+                // swallowed removal is a membership decision.
+                tracing::info!(
+                    target: "dynrunner_cluster_state",
+                    peer_id = %id,
+                    entry_gen = entry.member_gen,
+                    removal_gen = member_gen,
+                    "stale PeerRemoved for a superseded membership \
+                     incarnation ignored (peer was re-admitted at a higher \
+                     generation)",
+                );
+                return ApplyOutcome::NoOp;
+            }
         }
-        // Liveness: mark Dead (sticky) / insert a Dead entry if absent.
+        // Liveness: mark Dead (sticky within the incarnation) / insert a
+        // Dead entry if absent. The entry's generation adopts the
+        // removal's when higher (a removal observed before its join).
         match self.peer_state.get_mut(&id) {
             None => {
                 self.peer_state.insert(
                     id.clone(),
                     PeerEntry {
                         state: PeerState::Dead,
+                        member_gen,
                         pubkey: None,
                         endpoint: None,
                     },
@@ -241,12 +341,40 @@ impl<I: Identifier> ClusterState<I> {
             }
             Some(entry) => {
                 entry.state = PeerState::Dead;
+                entry.member_gen = entry.member_gen.max(member_gen);
             }
         }
-        // Capability: write the 2P-set Departed tombstone (dominates any
-        // Advertised; `merge_capability` keeps it sticky on re-merge).
-        self.capabilities
-            .insert(id.clone(), CapabilityEntry::Departed);
+        // Capability: merge the 2P-set Departed tombstone at the removal's
+        // generation, PRESERVING the advertisement current at departure so
+        // a re-admission can restore the exact capability. Routed through
+        // `merge_capability` so the generation-first rule arbitrates (a
+        // higher-generation Advertised already present keeps winning).
+        let (is_observer, can_be_primary, cap_version) = match self.capabilities.get(&id) {
+            Some(CapabilityEntry::Advertised {
+                is_observer,
+                can_be_primary,
+                cap_version,
+                ..
+            })
+            | Some(CapabilityEntry::Departed {
+                is_observer,
+                can_be_primary,
+                cap_version,
+                ..
+            }) => (*is_observer, *can_be_primary, *cap_version),
+            None => (false, false, TaskVersion::default()),
+        };
+        let tombstone = CapabilityEntry::Departed {
+            member_gen,
+            is_observer,
+            can_be_primary,
+            cap_version,
+        };
+        let merged = match self.capabilities.get(&id) {
+            Some(local) => super::merge::merge_capability(local, &tombstone),
+            None => tombstone,
+        };
+        self.capabilities.insert(id.clone(), merged);
         // Rebuild the role projections (and fire hooks) — the Departed +
         // Dead id projects out of both sets.
         self.reproject_roles();

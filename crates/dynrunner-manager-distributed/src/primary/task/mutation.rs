@@ -113,12 +113,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // role + capability on the request frame; record that truth in
         // the replicated `RoleTable` (idempotent / set-once on re-apply,
         // so a duplicate from a concurrent secondary responder NoOps).
+        // The requester's CURRENT membership incarnation: a frame from a
+        // previously-removed id already routed through the dispatch
+        // preamble's re-admission seam (which bumped the generation), so
+        // this read observes the post-re-admission value; for a fresh
+        // late-joiner it is 0.
+        let member_gen = self.cluster_state.peer_member_gen(&sender_id);
         self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PeerJoined {
             peer_id: sender_id,
             is_observer,
             can_be_primary,
             // Stamped at the origination choke point.
             cap_version: Default::default(),
+            member_gen,
         }])
         .await;
     }

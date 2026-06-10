@@ -330,6 +330,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             can_be_primary: false,
             // Stamped at the origination choke point.
             cap_version: Default::default(),
+            // This node's current membership incarnation (0 cold).
+            member_gen: self.cluster_state.peer_member_gen(&self.config.node_id),
         }])
         .await;
     }
@@ -416,6 +418,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // entirely adopts this baseline and converges the rest via
                 // the digest + snapshot pull.
                 cap_version: Default::default(),
+                // Re-emit at the id's CURRENT incarnation so a receiver
+                // that already converged NoOps and one that missed a
+                // re-admission catches up.
+                member_gen: self.cluster_state.peer_member_gen(conn.id()),
             });
             mutations.push(ClusterMutation::SecondaryCapacity {
                 secondary: conn.id().to_string(),
@@ -427,9 +433,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // catch-up). The receiver's `apply_peer_removed` is sticky/
         // idempotent — a node that already buried the id NoOps it.
         for id in departed_ids {
+            let member_gen = self.cluster_state.peer_member_gen(&id);
             mutations.push(ClusterMutation::PeerRemoved {
                 id,
                 cause: RemovalCause::RosterReemit,
+                // Re-emit at the generation the local tombstone holds: a
+                // receiver that re-admitted the id at a HIGHER generation
+                // correctly drops this stale catch-up.
+                member_gen,
             });
         }
         if mutations.is_empty() {
@@ -556,6 +567,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let mutation = ClusterMutation::PeerRemoved {
             id: self.config.node_id.clone(),
             cause: RemovalCause::SelfDeparture(BoundedString::from(reason.clone())),
+            // Kills THIS node's current membership incarnation.
+            member_gen: self.cluster_state.peer_member_gen(&self.config.node_id),
         };
         self.apply_and_broadcast_cluster_mutations(vec![mutation])
             .await;

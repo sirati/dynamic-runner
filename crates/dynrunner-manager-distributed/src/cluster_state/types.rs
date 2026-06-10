@@ -712,10 +712,13 @@ impl OutcomeSummary {
 /// table; never the pre-mutation snapshot.
 pub type RoleChangeHook = Arc<dyn Fn(&RoleTable) + Send + Sync + 'static>;
 
-/// Liveness bit on a `PeerEntry`. `Dead` is sticky-per-id: once a peer
-/// is `Dead`, no subsequent `PeerJoined`/`PeerRemoved` mutation for the
-/// same id may mutate the entry (re-application is silent). Respawn
-/// requires a fresh id.
+/// Liveness bit on a `PeerEntry`. `Dead` is sticky-per-GENERATION: once
+/// a peer is `Dead` at generation N, no `PeerJoined`/`PeerRemoved`
+/// mutation for the same id at a generation `<= N` may mutate the entry
+/// (re-application is silent) — the original sticky-per-id rule, scoped
+/// to one membership incarnation. A `PeerJoined` at generation `N+1`
+/// re-admits the id (the primary's frame-ingest re-admission seam is the
+/// sole originator of that bump). Respawn still mints a fresh id.
 ///
 /// Internal — the `peer_state` map is module-private and the apply
 /// rules are the only writers, so the variant set need not be `pub`.
@@ -726,6 +729,42 @@ pub type RoleChangeHook = Arc<dyn Fn(&RoleTable) + Send + Sync + 'static>;
 pub(super) enum PeerState {
     Alive,
     Dead,
+}
+
+/// The replicated-membership view of one peer id, projected for
+/// diagnostics consumers (the egress no-route message split). Distinct
+/// from the transport `MembershipView` (the wire view): a peer can be a
+/// LIVE replicated member while this node has no transport wire to it —
+/// the two states an honest "no route" line must distinguish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerMembership {
+    /// `peer_state[id]` is `Alive` — a live replicated member.
+    AliveMember,
+    /// `peer_state[id]` is `Dead` — authoritatively removed
+    /// (`PeerRemoved` ledger) and not (yet) re-admitted.
+    RemovedMember,
+    /// No `peer_state` entry — the id never joined the replicated
+    /// membership (or this node has not yet observed its join).
+    NeverJoined,
+}
+
+/// The re-admission ticket [`ClusterState::removed_peer_readmission`]
+/// returns for a REMOVED peer: the generation a re-admitting
+/// `PeerJoined` must carry (`dead generation + 1`) plus the
+/// advertisement preserved on the capability `Departed` tombstone, so
+/// the primary's frame-ingest re-admission seam restores the exact
+/// capability the member departed with.
+///
+/// [`ClusterState::removed_peer_readmission`]: super::ClusterState::removed_peer_readmission
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerReadmission {
+    /// The generation the re-admitting `PeerJoined` carries — strictly
+    /// above the `Dead` entry's, so the apply rule's sticky gate opens.
+    pub member_gen: u64,
+    /// The `is_observer` bit preserved at departure.
+    pub is_observer: bool,
+    /// The `can_be_primary` bit preserved at departure.
+    pub can_be_primary: bool,
 }
 
 /// One entry in `ClusterState::peer_state`. Holds ONLY the liveness bit
@@ -751,6 +790,13 @@ pub(super) enum PeerState {
 #[derive(Debug, Clone)]
 pub(super) struct PeerEntry {
     pub(super) state: PeerState,
+    /// Membership-incarnation generation (the re-admission lattice).
+    /// `0` is the cold first join. Advanced ONLY by a generation-
+    /// advancing `PeerJoined` (the primary's re-admission seam) or a
+    /// `PeerRemoved` for a generation this node has not yet seen join
+    /// (reorder tolerance). Both apply rules gate on it: a mutation at
+    /// a generation strictly below the entry's is stale and NoOps.
+    pub(super) member_gen: u64,
     /// Populated by a future `PeerInfo`-shaped mutation; today no
     /// mutation writes this and reads never fire. Kept as a stable
     /// field so the future wiring lands as an in-place update rather
@@ -798,7 +844,34 @@ pub enum CapabilityEntry {
         is_observer: bool,
         can_be_primary: bool,
         cap_version: TaskVersion,
+        /// Membership-incarnation generation (the re-admission lattice).
+        /// Dominates FIRST in `merge_capability`: a re-admitted member's
+        /// `Advertised` at gen N+1 beats the gen-N `Departed` tombstone
+        /// on EVERY merge path (apply, snapshot restore, digest heal),
+        /// so a stale replica's snapshot can never re-bury a re-admitted
+        /// peer's capability. `#[serde(default)]` decodes a pre-field
+        /// snapshot entry to generation 0.
+        #[serde(default)]
+        member_gen: u64,
     },
-    /// 2P-set tombstone (genuine departure). Dominates any `Advertised`.
-    Departed,
+    /// 2P-set tombstone (genuine departure). Dominates any `Advertised`
+    /// OF THE SAME GENERATION; a strictly-higher-generation `Advertised`
+    /// (a re-admission) supersedes it. Preserves the advertisement that
+    /// was current at departure so the primary's re-admission seam can
+    /// restore the EXACT capability without guessing (the removed node
+    /// never re-advertises — it does not know it was removed).
+    Departed {
+        #[serde(default)]
+        member_gen: u64,
+        /// The `is_observer` bit current at departure.
+        #[serde(default)]
+        is_observer: bool,
+        /// The `can_be_primary` bit current at departure.
+        #[serde(default)]
+        can_be_primary: bool,
+        /// The capability version current at departure (tie-breaks two
+        /// divergent same-generation tombstones deterministically).
+        #[serde(default)]
+        cap_version: TaskVersion,
+    },
 }
