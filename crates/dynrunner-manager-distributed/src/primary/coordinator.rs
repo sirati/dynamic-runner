@@ -3184,9 +3184,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // relocated compute-peer primary, or an in-process
                 // `--source-already-staged` local primary, that inherited the
                 // empty-ledger + `Owed` marker via its snapshot), originates
-                // `PhaseDepsSet + TaskAdded* + DiscoverySettled` (or, on an
-                // empty corpus, `DiscoverySettled + RunComplete`), and
-                // re-hydrates the pool. INERT on a failover/promotion of an
+                // `PhaseDepsSet + TaskAdded* + DiscoverySettled` (NO
+                // run-terminal — an all-skipped / empty corpus finalizes
+                // through the counter machinery once its trailing re-hydrate
+                // projects the skips into `completed_tasks`, exactly as mode-1),
+                // and re-hydrates the pool. INERT on a failover/promotion of an
                 // already-seeded run (reads `Settled`, so the gate short-
                 // circuits). ORDERING is load-bearing: BEFORE
                 // `fire_initial_phase_starts` + the empty-phase cascade so, by

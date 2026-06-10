@@ -438,6 +438,205 @@ async fn run_producer_zero_dispatch_scenario(
     );
 }
 
+/// MODE-2 end-to-end: the consumer's EXACT premature-complete shape. A
+/// `--source-already-staged` / relocated primary owes discovery (`Owed` +
+/// phase graph, NO seeded tasks), runs `discover_on_promotion` itself, and
+/// resolves a phase-1 (`probe`) corpus with ZERO to-run items (an empty
+/// discovery for that phase). A dependent phase-2 (`build`) is declared but its
+/// real work is injected only via `on_phase_end("probe")` — the lazy-spawn
+/// consumer pattern (`FullPipelineTask.on_phase_end → primary_handle.spawn_tasks`).
+///
+/// The deleted `to_run == 0 → RunComplete` shortcut would have made
+/// `discover_on_promotion` originate a STICKY `RunComplete` from this
+/// single-phase view, finishing the run BEFORE the empty `probe` phase drained
+/// through the cascade and injected `build` — the consumer-reproduced
+/// "run complete: 0 succeeded" bug (the observer exits while the cascade injects
+/// + runs the next phase in an already-"complete" state). POST-FIX the seam
+/// originates no run-terminal: the empty `probe` phase stays Active, the pre-loop
+/// cascade `drain_empty_active_phases` drains it and fires `on_phase_end("probe")`,
+/// the consumer injects the `build` batch inline, and the run completes ONLY
+/// once that injected work terminates.
+///
+/// Asserts: the run exits `Ok`, the injected `build` work all completes
+/// (`completed_count == build_count`), and the
+/// `on_phase_end("probe") → on_phase_start("build")` ordering holds (proof the
+/// injection landed through the cascade, not a premature drain).
+#[tokio::test(flavor = "current_thread")]
+async fn mode2_zero_to_run_phase1_with_lazy_spawn_phase2_does_not_prematurely_complete() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Phase graph: `build` depends on `probe`. `probe` resolves to ZERO
+            // to-run items via discovery; `build`'s real work is injected via
+            // on_phase_end("probe").
+            let mut phase_deps: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
+            phase_deps.insert(PhaseId::from("build"), vec![PhaseId::from("probe")]);
+
+            // Discovery resolves the phase-1 `probe` corpus to ZERO items — the
+            // empty-phase shape a phase-chaining consumer hits when phase-1 has
+            // nothing of its own to run and exists only to gate phase-2 (whose
+            // work is injected from on_phase_end). This is the corpus shape that
+            // tripped the deleted `to_run == 0 → RunComplete` shortcut.
+            let probe_items: Vec<(TaskInfo<TestId>, bool)> = Vec::new();
+            // The phase-2 `build` batch the consumer injects from
+            // on_phase_end("probe") — real to-run work that must dispatch +
+            // complete before the run is allowed to finish.
+            let build_items: Vec<TaskInfo<TestId>> = vec![
+                phased_binary("build_x", "build", 50),
+                phased_binary("build_y", "build", 50),
+                phased_binary("build_z", "build", 50),
+            ];
+            let build_count = build_items.len();
+
+            let max_res = dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                1024 * 1024 * 1024u64,
+            )]);
+            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+            let mut sec_handles = Vec::new();
+            for i in 0..2u32 {
+                let sec_id = format!("sec-{i}");
+                let (pri_to_sec_tx, sec_to_pri_rx, handle) =
+                    spawn_real_secondary(sec_id.clone(), 1, max_res.clone());
+                outgoing.insert(sec_id, pri_to_sec_tx);
+                sec_handles.push(handle);
+                let tx = incoming_tx.clone();
+                tokio::task::spawn_local(async move {
+                    let mut rx = sec_to_pri_rx;
+                    while let Some(msg) = rx.recv().await {
+                        if tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(incoming_tx);
+
+            let transport =
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
+            let config = PrimaryConfig {
+                num_secondaries: 2,
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                ..test_primary_config()
+            };
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // MODE-2 seed (the relocated/pre-staged inherited shape): declare
+            // discovery debt + the phase graph, NO tasks — exactly what
+            // `originate_relocated_seed` stages and a promotion snapshot carries.
+            // The discovery policy resolves the all-skipped `probe` corpus when
+            // `discover_on_promotion` fires (debt is `Owed`).
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: phase_deps.clone(),
+                });
+                cs.apply(ClusterMutation::DiscoveryDebtDeclared);
+            }
+            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            primary.register_setup_discovery(fixed_discovery_marked(
+                probe_items,
+                phase_deps,
+                fires.clone(),
+            ));
+
+            // Event log + the consumer's lazy-spawn on_phase_end (inject `build`
+            // when `probe` ends), reusing the established command-channel pattern.
+            let command_sender = primary.command_sender();
+            let events: Arc<Mutex<Vec<PhaseEvent>>> = Arc::new(Mutex::new(Vec::new()));
+            let starts_cb = events.clone();
+            let on_start: OnPhaseStart = Box::new(move |p: &PhaseId| {
+                starts_cb
+                    .lock()
+                    .unwrap()
+                    .push(PhaseEvent::Start(p.to_string()));
+            });
+            let ends_cb = events.clone();
+            let mut already_spawned = false;
+            let on_end: OnPhaseEnd = Box::new(move |p: &PhaseId, c: u32, f: u32, _outputs| {
+                ends_cb.lock().unwrap().push(PhaseEvent::End {
+                    phase: p.to_string(),
+                    completed: c,
+                    failed: f,
+                });
+                if p.as_str() == "probe" && !already_spawned {
+                    already_spawned = true;
+                    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+                    let _ = command_sender.try_send(PrimaryCommand::SpawnTasks {
+                        tasks: build_items.clone(),
+                        reply: reply_tx,
+                    });
+                }
+            });
+
+            // Drive the FULL run as a `PromotionSnapshot` (⇒ PromotedDestination,
+            // which runs `discover_on_promotion` because debt is `Owed`).
+            let exit = tokio::time::timeout(
+                Duration::from_secs(15),
+                primary.run(SeedSource::PromotionSnapshot, on_start, on_end),
+            )
+            .await
+            .expect(
+                "the mode-2 run must complete promptly — a hang here means the \
+                 zero-to-run phase-1 stranded the counter (the anti-hang failure \
+                 mode) instead of finalizing through it",
+            );
+            exit.expect("the mode-2 run must exit Ok, not error");
+
+            assert_eq!(fires.get(), 1, "discovery runs exactly once");
+            let completed = primary.completed_count();
+            let failed = primary.failed_count();
+            let log = events.lock().unwrap().clone();
+            drop(primary);
+            for h in sec_handles {
+                let _ = h.await;
+            }
+
+            // The injected phase-2 work all completed — the run did NOT
+            // prematurely complete at the zero-to-run phase-1 discovery edge.
+            assert_eq!(
+                completed, build_count,
+                "every injected `build` task must complete; the run must not have \
+                 prematurely completed at the zero-to-run `probe` discovery edge. \
+                 event log: {log:?}"
+            );
+            assert_eq!(failed, 0, "no failures expected; event log: {log:?}");
+            // The injection landed through the cascade: on_phase_end("probe")
+            // fired and on_phase_start("build") followed it.
+            let probe_end = log
+                .iter()
+                .position(|e| matches!(e, PhaseEvent::End { phase, .. } if phase == "probe"));
+            let build_start = log
+                .iter()
+                .position(|e| matches!(e, PhaseEvent::Start(p) if p == "build"));
+            assert!(
+                probe_end.is_some(),
+                "on_phase_end(\"probe\") must fire (the empty phase-1 drains \
+                 through the cascade); event log: {log:?}"
+            );
+            assert!(
+                build_start.is_some(),
+                "on_phase_start(\"build\") must fire (the injected phase-2 work \
+                 activated); event log: {log:?}"
+            );
+            assert!(
+                probe_end < build_start,
+                "on_phase_start(\"build\") must follow on_phase_end(\"probe\") — the \
+                 injected work activates only after the dependency phase ends; \
+                 event log: {log:?}"
+            );
+        })
+        .await;
+}
+
 /// Shared scenario driver. Builds the secondary cluster + primary,
 /// runs the workload to completion, and asserts every
 /// `on_phase_end(phase_id)` firing for a multi-item phase reports a

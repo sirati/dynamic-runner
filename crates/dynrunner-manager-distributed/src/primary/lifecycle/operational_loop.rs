@@ -81,11 +81,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // until `discover_on_promotion` originates `DiscoverySettled`
         // (flipping `Owed → Settled`). On every cold mode-1 / legacy /
         // already-seeded path the marker is `Undeclared`/`Settled` (`!= Owed`),
-        // so these exits run unchanged. The replicated-ledger `RunComplete`
-        // arm below is a real terminal cue and is NOT gated — an external
-        // authority's `RunComplete`, and the empty-corpus terminal
-        // `discover_on_promotion` itself originates, must still exit even
-        // mid-debt.
+        // so these exits run unchanged. Once `discover_on_promotion` settles
+        // the debt and re-hydrates, an all-skipped / empty mode-2 corpus exits
+        // through the SAME counter arm a fully-completed run does (its skips
+        // are projected into `completed_tasks` by hydrate) — there is no
+        // discovery-originated run-terminal to special-case. The
+        // replicated-ledger `RunComplete` arm below is a real terminal cue and
+        // is NOT gated — an external authority's `RunComplete` must still exit
+        // even mid-debt.
         let discovery_owed = self.cluster_state.discovery_debt() == DiscoveryDebt::Owed;
         // Counter-based exit: every task accounted for (completed or
         // failed) and no worker mid-dispatch. Re-read every iteration
