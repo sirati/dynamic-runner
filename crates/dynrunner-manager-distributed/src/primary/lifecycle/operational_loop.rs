@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{ErrorType, Identifier};
+use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{DiscoveryDebt, MessageType};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::primary::PrimaryCoordinator;
-use crate::primary::wire::compute_task_hash;
 
 // ── Operational-loop `select!` arm ids (oploop instrumentation) ──
 //
@@ -26,7 +25,6 @@ const ARM_RESPAWN_REQUEST: usize = 6;
 const ARM_LIVENESS_PING: usize = 7;
 const ARM_RESPAWN_JOIN: usize = 8;
 const ARM_PANIK: usize = 9;
-const ARM_STUCK_WATCHDOG: usize = 10;
 
 /// Arm names, index-aligned with the `ARM_*` ids above. The render order of
 /// the compact stats line.
@@ -41,7 +39,6 @@ const OP_LOOP_ARM_NAMES: &[&str] = &[
     "liveness_ping",
     "respawn_join",
     "panik",
-    "stuck_watchdog",
 ];
 
 /// Render a drain-by-`MessageType` tally as a single diagnostic string:
@@ -80,7 +77,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// naturally absorbed.
     ///
     /// The failure/abort exits (fleet-dead timeout, both-transports-
-    /// closed, panik, setup-promote deadline, stuck-worker watchdog)
+    /// closed, panik, setup-promote deadline)
     /// are a DIFFERENT concern (the run did not complete normally) and
     /// stay inline in the loop — they are not run-completion decisions.
     ///
@@ -327,7 +324,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // concern predicate, byte-for-byte the same conditions
             // that previously lived inline here). The failure/abort
             // exits below (fleet-dead, both-transports-closed, panik,
-            // setup-promote deadline, stuck-worker watchdog) are a
+            // setup-promote deadline) are a
             // different concern and stay in the loop.
             if self.run_complete_check() {
                 // Completion-gate fatal pre-drain. A `RunShouldFail` /
@@ -469,15 +466,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 break;
             }
 
-            // Use a timeout on recv to avoid stalling indefinitely if a
-            // secondary disconnects while processing a task. The timeout
-            // is generous — if no message arrives in 5 minutes and there
-            // are in-flight tasks, something is wrong.
-            //
             // Cancellation safety: `transport.recv_peer` is the
             // mpsc-backed unified inbound demux (cancel-safe — see
             // `TunneledPeerTransport::recv_peer`). The two timer
-            // arms (heartbeat tick + 5-min sleep) are tokio time
+            // arms (heartbeat + anti-entropy ticks) are tokio time
             // primitives which are themselves cancel-safe.
             //
             // There is exactly ONE inbound arm: the unification deleted
@@ -844,80 +836,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             "primary operational loop exiting via panik path"
                         );
                         break;
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_secs(300)),
-                    if !self.single_worker_mode() => {
-                    arm_stats.record(ARM_STUCK_WATCHDOG);
-                    // 5-min stuck-worker watchdog. Disabled while
-                    // the OOM retry bucket is active: a single-
-                    // worker-per-secondary pass on a memory-pressed
-                    // workload can legitimately exceed 5 minutes,
-                    // and the blanket Recoverable re-tag here would
-                    // poison the bucket's hand-tuned dispatch shape
-                    // mid-flight (every in-flight task gets re-
-                    // classified Recoverable, the OOM-bucket
-                    // accounting goes off the rails). The flag
-                    // [`single_worker_mode`] is the gate;
-                    // `try_run_phase_retry_bucket` is its sole
-                    // writer. Outside the OOM bucket the arm runs
-                    // unchanged.
-                    let active = self.workers.iter().filter(|w| !w.is_idle()).count();
-                    if active > 0 {
-                        let outcome = self.outcome_summary();
-                        tracing::warn!(
-                            active_workers = active,
-                            succeeded = outcome.succeeded,
-                            fail_retry = outcome.fail_retry,
-                            fail_oom = outcome.fail_oom,
-                            fail_final = outcome.fail_final,
-                            total = self.total_tasks,
-                            "operational loop timeout; marking in-flight tasks failed"
-                        );
-                        // Mark all in-flight tasks as failed. These
-                        // are workers that didn't ack progress for the
-                        // operational-loop timeout window — typically
-                        // a stuck worker or wedged transport. Classify
-                        // as Recoverable so a later retry gets a chance
-                        // to re-dispatch them; if they wedge the same
-                        // way on retry, the retry-budget exhaustion path
-                        // takes over.
-                        //
-                        // Snapshot every held slot's
-                        // `(secondary, local_worker_id, hash)` first
-                        // (an immutable borrow), then free each through
-                        // the single `free_slot_on_terminal` helper so
-                        // the slot, the `in_flight` ledger entry, and
-                        // the per-type concurrency slot all release
-                        // together — the same terminal path TaskComplete
-                        // / TaskFailed use, keyed by the held hash. The
-                        // re-tag into `failed_tasks` preserves the
-                        // pre-existing "mark Recoverable, don't decrement
-                        // the phase counter at loop-exit" behaviour
-                        // (this arm only fires on the timeout-exit edge).
-                        let held: Vec<(String, u32, String)> = {
-                            let mut out = Vec::new();
-                            for idx in 0..self.workers.len() {
-                                let w = &self.workers[idx];
-                                if let Some(task) = w.held_task() {
-                                    out.push((
-                                        w.secondary_id.clone(),
-                                        self.local_worker_id_in_secondary(idx),
-                                        compute_task_hash(task),
-                                    ));
-                                }
-                            }
-                            out
-                        };
-                        for (secondary_id, local_worker_id, hash) in held {
-                            self.failed_tasks
-                                .insert(hash.clone(), ErrorType::Recoverable);
-                            self.free_slot_on_terminal(
-                                &secondary_id,
-                                local_worker_id,
-                                &hash,
-                            );
-                        }
                     }
                 }
             }

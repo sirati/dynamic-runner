@@ -97,10 +97,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // backpressure-requeue and terminal-failure arms below can
             // recover the binary. A stale TaskFailed for a slot already
             // reassigned to a later task returns `None` — a safe no-op.
-            // All three terminal-shaped paths in this function
+            // Both terminal-shaped paths in this function
             // (backpressure-requeue, terminal TaskFailed) share this
-            // one resolution; the stuck-worker watchdog in
-            // `operational_loop` routes through the same helper.
+            // one resolution.
             let recovered_binary: Option<TaskInfo<I>> = self
                 .free_slot_on_terminal(&secondary_id, worker_id, &task_hash)
                 .map(|entry| entry.task);
