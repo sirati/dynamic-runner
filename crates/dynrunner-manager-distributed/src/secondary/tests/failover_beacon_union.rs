@@ -173,7 +173,7 @@ async fn genuine_death_stale_beacon_still_arms() {
     // The beacon is now stale (no refresh past the ~100ms deadline) and the
     // primary is gone from membership — the genuine-death shape.
     assert!(
-        !sec.primary_beacon_fresh(PRIMARY_ID),
+        !sec.node_beacon_fresh(PRIMARY_ID),
         "precondition: the beacon has gone stale (genuine death)",
     );
 
@@ -201,7 +201,7 @@ async fn never_beaconed_primary_departure_still_arms() {
     let (mut sec, members, _beacon) = operational_with_seen_primary_and_beacon();
     primary_leaves_membership(&mut sec, &members);
     assert!(
-        !sec.primary_beacon_fresh(PRIMARY_ID),
+        !sec.node_beacon_fresh(PRIMARY_ID),
         "a never-recorded beacon is not fresh",
     );
 
@@ -248,7 +248,7 @@ async fn peer_vote_refused_while_primary_beacon_fresh() {
 
     // Now the beacon goes stale (genuine death): the confirm proceeds.
     tokio::time::sleep(Duration::from_millis(140)).await;
-    assert!(!sec.primary_beacon_fresh(PRIMARY_ID), "beacon now stale");
+    assert!(!sec.node_beacon_fresh(PRIMARY_ID), "beacon now stale");
     let reply = sec.record_promotion_vote("sec-a".into(), 1);
     assert!(
         matches!(reply, Some(DistributedMessage::PromotionConfirm { .. })),
