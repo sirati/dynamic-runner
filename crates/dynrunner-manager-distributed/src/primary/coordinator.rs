@@ -1295,6 +1295,27 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         msg: dynrunner_protocol_primary_secondary::DistributedMessage<I>,
     ) -> Result<(), String> {
         use dynrunner_protocol_primary_secondary::resolve_destination;
+        // Role invariant — the primary NEVER addresses `Destination::Primary`:
+        // this coordinator IS the primary (the operational loop's authority
+        // invariant), and the mesh's `Primary` dispatch arm is LOOPBACK-ONLY,
+        // so a primary-addressed egress frame can only land back in this
+        // coordinator's OWN inbox. A handler that re-emits per receipt then
+        // self-sustains a memory-speed inbox cycle whose egress pressure
+        // starves the pump's wire ingress — the run_20260610_121427 ingest
+        // wedge (the deleted `handle_task_request` self-relay). No primary
+        // concern needs a self-send; reject loudly so a future caller cannot
+        // reintroduce the cycle.
+        if matches!(dst, dynrunner_protocol_primary_secondary::Destination::Primary) {
+            tracing::error!(
+                msg_kind = ?msg.msg_type(),
+                "primary egress addressed Destination::Primary — a self-send \
+                 loopback (the inbox-cycle hazard); rejecting the frame"
+            );
+            return Err(
+                "primary egress must not address Destination::Primary (self-send loopback)"
+                    .to_string(),
+            );
+        }
         // Resolvability check (H1 bootstrap fallback = this primary's own
         // node_id). The concrete `SendTarget` is discarded — the mesh
         // resolves loopback-vs-remote off the stamped role-bearing

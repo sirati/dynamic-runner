@@ -872,6 +872,65 @@ async fn completion_burst_survives_unassignable_request_storm() {
         .await;
 }
 
+/// ── ROUND 6 backstop: the primary's egress rejects `Destination::Primary` ──
+///
+/// The structural invariant behind the spin fix: a primary addressing "the
+/// primary" is a self-send (the mesh's `Primary` dispatch arm is
+/// loopback-only), which is at best a wasted hop and at worst the
+/// self-sustaining inbox cycle. `PrimaryCoordinator::send_to` must reject it
+/// loudly so no future caller can reintroduce the cycle; ordinary
+/// destinations still queue.
+#[tokio::test(flavor = "current_thread")]
+async fn primary_send_to_rejects_destination_primary_self_send() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (_incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let transport = ChannelPeerTransport::from_raw_channels(
+                "setup".into(),
+                HashMap::new(),
+                incoming_rx,
+            );
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let frame = |sender: &str| DistributedMessage::<TestId>::Keepalive {
+                target: None,
+                sender_id: sender.to_string(),
+                timestamp: 1.0,
+                secondary_id: sender.to_string(),
+                active_workers: 0,
+                emitter_role: dynrunner_protocol_primary_secondary::KeepaliveRole::Primary,
+            };
+            let self_send = primary
+                .send_to(
+                    dynrunner_protocol_primary_secondary::Destination::Primary,
+                    frame("setup"),
+                )
+                .await;
+            assert!(
+                self_send.is_err(),
+                "the primary's egress must reject Destination::Primary \
+                 (self-send loopback — the inbox-cycle hazard)"
+            );
+            let broadcast = primary
+                .send_to(
+                    dynrunner_protocol_primary_secondary::Destination::All,
+                    frame("setup"),
+                )
+                .await;
+            assert!(
+                broadcast.is_ok(),
+                "ordinary destinations must still queue: {broadcast:?}"
+            );
+        })
+        .await;
+}
+
 /// ── ROUND 6 pin #3 (requirement 1: a dead inbox is loud + terminal) ──
 ///
 /// Drop the mesh-pump (which owns the primary slot's `Arc`) mid-run: every
