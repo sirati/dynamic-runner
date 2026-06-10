@@ -1,5 +1,7 @@
 from .messages import (
     Command,
+    CustomMessageCommand,
+    CustomMessageResponse,
     DoneResponse,
     ErrorResponse,
     ErrorType,
@@ -17,6 +19,8 @@ from .messages import (
 
 __all__ = [
     "Command",
+    "CustomMessageCommand",
+    "CustomMessageResponse",
     "StopCommand",
     "ProcessBinaryCommand",
     "Response",

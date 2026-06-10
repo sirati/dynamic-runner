@@ -334,3 +334,165 @@ fn response_error_with_colons_in_message() {
         _ => panic!("expected Error"),
     }
 }
+
+// ─── custom-message frames (worker↔secondary consumer channel) ───
+
+/// Response::Custom round-trips with a topic and payload that both
+/// contain newlines and colons — the b64-JSON envelope keeps the
+/// line-delimited text format intact (the error:exception: idiom).
+#[test]
+fn response_custom_roundtrip_with_newline_and_colon_payload() {
+    let resp = Response::Custom {
+        topic: "phase4:batch\nline2".into(),
+        data: b"raw\nbytes:with\x00nul and : colons\n".to_vec(),
+    };
+    let bytes = serialize_response(&resp);
+    let line = std::str::from_utf8(&bytes).unwrap();
+    assert!(line.starts_with("custom:"));
+    // Exactly one frame-terminating newline — nothing from the
+    // payload leaks into the framing.
+    assert_eq!(line.matches('\n').count(), 1);
+    assert!(line.ends_with('\n'));
+    let parsed = parse_response(line).unwrap();
+    match parsed {
+        Response::Custom { topic, data } => {
+            assert_eq!(topic, "phase4:batch\nline2");
+            assert_eq!(data, b"raw\nbytes:with\x00nul and : colons\n");
+        }
+        other => panic!("expected Custom, got {other:?}"),
+    }
+}
+
+/// Command::Custom round-trips identically (the two directions share
+/// one frame shape).
+#[test]
+fn command_custom_roundtrip_with_newline_and_colon_payload() {
+    let cmd = Command::Custom {
+        topic: "reply:topic".into(),
+        data: b"data\nwith:everything".to_vec(),
+    };
+    let bytes = serialize_command(&cmd);
+    let line = std::str::from_utf8(&bytes).unwrap();
+    assert!(line.starts_with("custom:"));
+    let parsed = parse_command(line).unwrap();
+    match parsed {
+        Command::Custom { topic, data } => {
+            assert_eq!(topic, "reply:topic");
+            assert_eq!(data, b"data\nwith:everything");
+        }
+        other => panic!("expected Custom, got {other:?}"),
+    }
+}
+
+/// Wire-shape PIN: the frame is `custom:<b64 {"topic": ..,
+/// "data_b64": ..}>\n` with STANDARD-alphabet base64 — asserted
+/// against a verbatim hand-built frame (built from a JSON string
+/// literal, NOT through the codec's own structs), so an
+/// implementation drift on either side of the cross-language seam
+/// fails this test rather than round-tripping invisibly.
+#[test]
+fn custom_frame_wire_shape_pin() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as B64;
+    // topic "t:op\nic", data b"d:a\nta" — adversarial bytes.
+    let json = format!(
+        "{{\"topic\":\"t:op\\nic\",\"data_b64\":\"{}\"}}",
+        B64.encode(b"d:a\nta")
+    );
+    let frame = format!("custom:{}\n", B64.encode(json.as_bytes()));
+
+    // Decode the hand-built frame on BOTH parser sides.
+    match parse_response(&frame).unwrap() {
+        Response::Custom { topic, data } => {
+            assert_eq!(topic, "t:op\nic");
+            assert_eq!(data, b"d:a\nta");
+        }
+        other => panic!("expected Custom, got {other:?}"),
+    }
+    match parse_command(&frame).unwrap() {
+        Command::Custom { topic, data } => {
+            assert_eq!(topic, "t:op\nic");
+            assert_eq!(data, b"d:a\nta");
+        }
+        other => panic!("expected Custom, got {other:?}"),
+    }
+
+    // Encode-side: the serializer must emit a frame whose decoded
+    // JSON matches the pinned keys verbatim (field order is serde's,
+    // so compare the parsed JSON, not the raw string).
+    let bytes = serialize_response(&Response::Custom {
+        topic: "t:op\nic".into(),
+        data: b"d:a\nta".to_vec(),
+    });
+    let line = std::str::from_utf8(&bytes).unwrap();
+    let body = line.strip_prefix("custom:").unwrap().trim_end();
+    let decoded_json = B64.decode(body.as_bytes()).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&decoded_json).unwrap();
+    assert_eq!(value.get("topic").and_then(|v| v.as_str()), Some("t:op\nic"));
+    assert_eq!(
+        value.get("data_b64").and_then(|v| v.as_str()),
+        Some(B64.encode(b"d:a\nta").as_str())
+    );
+}
+
+/// Malformed custom payloads surface LOUDLY (the MalformedException
+/// idiom) instead of mapping to `None` — a `None` would be misread
+/// as a transport disconnect by the manager-side reader.
+#[test]
+fn custom_frame_malformed_payload_is_loud_not_none() {
+    let frame = "custom:!!!not-base64!!!\n";
+    match parse_response(frame).unwrap() {
+        Response::Custom { topic, data } => {
+            assert_eq!(topic, MALFORMED_CUSTOM_TOPIC);
+            assert_eq!(data, b"!!!not-base64!!!");
+        }
+        other => panic!("expected malformed-fallback Custom, got {other:?}"),
+    }
+    match parse_command(frame).unwrap() {
+        Command::Custom { topic, .. } => assert_eq!(topic, MALFORMED_CUSTOM_TOPIC),
+        other => panic!("expected malformed-fallback Custom, got {other:?}"),
+    }
+}
+
+/// A max-size payload (CUSTOM_MESSAGE_MAX_BYTES) frames comfortably
+/// under MAX_RESPONSE_FRAME_BYTES — the wire TOLERATES what the API
+/// caps (size enforcement lives at the call sites, never the codec).
+#[test]
+fn custom_frame_max_payload_is_under_response_frame_cap() {
+    let resp = Response::Custom {
+        topic: "bulk".into(),
+        data: vec![0xAB; crate::command::CUSTOM_MESSAGE_MAX_BYTES],
+    };
+    let bytes = serialize_response(&resp);
+    assert!(bytes.len() < crate::framing::MAX_RESPONSE_FRAME_BYTES);
+    let line = std::str::from_utf8(&bytes).unwrap();
+    let parsed = parse_response(line).unwrap();
+    match parsed {
+        Response::Custom { data, .. } => {
+            assert_eq!(data.len(), crate::command::CUSTOM_MESSAGE_MAX_BYTES);
+        }
+        other => panic!("expected Custom, got {other:?}"),
+    }
+}
+
+/// Old-parser tolerance: a custom RESPONSE frame fed to a parser that
+/// predates it would hit the unknown-prefix fallthrough (None →
+/// ignored line). This test pins the inverse guarantee on the COMMAND
+/// side: the `custom:` prefix is recognised BEFORE the bare-path
+/// fallback, so a custom command can never be misread as a task path.
+#[test]
+fn custom_command_prefix_wins_over_barepath_fallback() {
+    let cmd = Command::Custom {
+        topic: "x".into(),
+        data: b"y".to_vec(),
+    };
+    let bytes = serialize_command(&cmd);
+    let line = std::str::from_utf8(&bytes).unwrap();
+    match parse_command(line).unwrap() {
+        Command::Custom { .. } => {}
+        Command::ProcessTask { relative_path, .. } => {
+            panic!("custom frame misparsed as task path {relative_path:?}")
+        }
+        other => panic!("unexpected parse: {other:?}"),
+    }
+}

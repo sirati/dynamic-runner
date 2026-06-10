@@ -77,6 +77,8 @@ impl dynrunner_manager_local::WorkerFactory<dynrunner_transport_channel::Channel
             loop {
                 match MessageReceiver::<Command>::recv(&mut runner).await {
                     Some(Command::Stop) => break,
+                    // Test fixtures ignore consumer custom messages.
+                    Some(Command::Custom { .. }) => {}
                     Some(Command::ProcessTask { .. }) => {
                         let _ = runner
                             .send(Response::Done {

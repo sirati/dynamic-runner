@@ -75,6 +75,8 @@ pub(super) async fn fake_worker_loop(mut runner: ChannelRunnerEnd, mode: FakeWor
     loop {
         match MessageReceiver::<Command>::recv(&mut runner).await {
             Some(Command::Stop) => break,
+            // Test fixtures ignore consumer custom messages.
+            Some(Command::Custom { .. }) => {}
             Some(Command::ProcessTask { .. }) => {
                 task_count += 1;
                 match &mode {

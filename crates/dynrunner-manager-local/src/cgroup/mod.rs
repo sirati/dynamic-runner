@@ -32,13 +32,21 @@
 //!   parent-side convenience (not async-signal-safe).
 //!
 //! Graceful fallback contract: any of (a) not cgroup-v2, (b) no
-//! `memory` controller exposed on the leaf, (c) leaf not writable
-//! returns `Ok(None)` plus a single-line `tracing::warn!` so an
-//! operator running outside a delegated cgroup environment (host
-//! development, CI, non-Linux) sees one log line and the flat
-//! (pre-nested) layout proceeds unchanged. `Err(_)` is reserved for
-//! unexpected I/O failures (corrupted `/proc`, transient sysfs read
-//! errors); the caller treats it as fatal.
+//! `memory` controller exposed on the leaf, (c) leaf not writable,
+//! (d) a permission/delegation refusal (`EACCES`/`EPERM`/`EROFS`)
+//! surfacing from the subgroup writes themselves (the probe in (c)
+//! can pass on a plain desktop session — the leaf's files are
+//! user-owned under `user@.service` — while the kernel still refuses
+//! the later mkdir / migration / controller writes without
+//! `Delegate=yes`) returns `Ok(None)` plus a single-line
+//! `tracing::warn!` so an operator running outside a delegated
+//! cgroup environment (host development, CI, non-Linux) sees one log
+//! line and the flat (pre-nested) layout proceeds unchanged.
+//! Classification for (d) lives on
+//! [`CgroupSetupError::is_permission_class`] — ONE owner; callers
+//! never re-classify. `Err(_)` is reserved for genuinely unexpected
+//! I/O failures (corrupted `/proc`, transient sysfs read errors);
+//! the caller treats it as fatal.
 
 use std::path::{Path, PathBuf};
 
@@ -121,11 +129,44 @@ pub fn setup_worker_cgroup_default(
 ///      which does the idempotent directory + memory.max + swap
 ///      writes and returns the absolute `workers/` path.
 ///
-/// Returns `Ok(Some(handle))` on success, `Ok(None)` on the three
+/// Returns `Ok(Some(handle))` on success, `Ok(None)` on the
 /// graceful-fallback conditions (each accompanied by a single
 /// `tracing::warn!` line), and `Err(_)` on truly unexpected I/O
 /// errors.
+///
+/// On top of [`try_setup_worker_cgroup`]'s probe-stage fallbacks,
+/// this wrapper owns the permission/delegation classification of the
+/// write phase: an `EACCES`/`EPERM`/`EROFS` escaping the flow (see
+/// [`CgroupSetupError::is_permission_class`]) degrades to `Ok(None)`
+/// plus one warn line instead of propagating — the identical condition the
+/// SLURM-wrapper path already survives via the probe, hit later on a
+/// plain desktop session where the probe passes but the kernel
+/// refuses the writes without `Delegate=yes`.
 pub fn setup_worker_cgroup(
+    cgroup_root: &Path,
+    reserved_bytes: u64,
+) -> Result<Option<NestedCgroupHandle>, CgroupSetupError> {
+    match try_setup_worker_cgroup(cgroup_root, reserved_bytes) {
+        Err(e) if e.is_permission_class() => {
+            tracing::warn!(
+                error = %e,
+                "cgroup-v2 workers subgroup writes were refused (permission/delegation); workers will share the flat cgroup. \
+                 Operator hint: the cgroup tree must be delegated to the runtime user — \
+                 run under a delegated scope (`systemd-run --user --scope -p Delegate=yes ...`), \
+                 or rootless podman with `Delegate=yes` on the user@.service."
+            );
+            Ok(None)
+        }
+        other => other,
+    }
+}
+
+/// Fallible setup flow behind [`setup_worker_cgroup`]'s
+/// permission-classification wrapper. Probe-stage degradations
+/// return `Ok(None)` directly; every other failure propagates as
+/// `Err(_)` UNCLASSIFIED — the public wrapper is the single place
+/// that decides which `Err` shapes degrade.
+fn try_setup_worker_cgroup(
     cgroup_root: &Path,
     reserved_bytes: u64,
 ) -> Result<Option<NestedCgroupHandle>, CgroupSetupError> {
