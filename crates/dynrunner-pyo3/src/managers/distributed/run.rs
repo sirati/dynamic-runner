@@ -324,6 +324,15 @@ impl PyDistributedManager {
         // raises a `PyRuntimeError` so the wrapper does not return
         // exit 0.
         let mut duplicate_task_id_pre_phase: Option<RunError> = None;
+        // Cluster-wide `RunAborted` OBSERVED by the setup node after it
+        // relocated (the promoted authority broadcast the verdict). Carries
+        // the broadcast reason VERBATIM — `RunAborted` is the general abort
+        // verdict (a #3a duplicate, a consumer-hook fatal-exit, an
+        // empty-drain honesty abort, ...), so it must NOT be re-typed as
+        // `DuplicateTaskIdPrePhase` (which appends a fix-your-duplicate-ids
+        // lecture that misdirects the operator for every non-duplicate
+        // abort). Mirrors `PyPrimaryCoordinator::run`'s `relocated_aborted`.
+        let mut relocated_aborted: Option<String> = None;
         // Policy-abort terminal — `Some(RunError::FatalPolicyExit)` iff the
         // node's terminal was a deliberate policy abort (a panicked role task,
         // or an invalid-task fatal-exit). RAISES at the GIL-side tail (never
@@ -1056,12 +1065,13 @@ impl PyDistributedManager {
                 match outcome.terminal {
                     RunTerminal::Done => {}
                     RunTerminal::Aborted { reason } => {
-                        // A cluster-wide `RunAborted` surfaced as the terminal
-                        // (the in-process primary broadcasts it on #3a). Carry
-                        // the reason as a structured duplicate marker so the
-                        // GIL-side tail raises.
-                        duplicate_task_id_pre_phase =
-                            Some(RunError::DuplicateTaskIdPrePhase { reason });
+                        // A cluster-wide `RunAborted` observed by the setup
+                        // node. Carry the broadcast reason VERBATIM — the
+                        // verdict already names its own cause (#3a duplicate,
+                        // consumer-hook fatal-exit, empty-drain abort, ...);
+                        // re-typing it as `DuplicateTaskIdPrePhase` fabricated
+                        // a duplicate-task-id diagnosis for every abort.
+                        relocated_aborted = Some(reason);
                     }
                     RunTerminal::Panik { matched_path } => {
                         panik_shutdown_path = Some(matched_path);
@@ -1137,6 +1147,16 @@ impl PyDistributedManager {
             // primary already broadcast `RunAborted`; raise here so the
             // Python wrapper sees a non-zero exit instead of exit 0.
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
+        }
+
+        if let Some(reason) = relocated_aborted {
+            // The setup node observed a cluster-wide `RunAborted`. Raise the
+            // broadcast reason verbatim (the in-process manager is a library
+            // call, so a PyErr — not the network-submitter's exit(1)); the
+            // reason already names the actual cause.
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "run aborted cluster-wide: {reason}"
+            )));
         }
 
         if let Some(err) = fatal_policy_exit {
