@@ -28,7 +28,7 @@ pub mod version;
 pub use done_payload::DonePayload;
 pub use error::{ErrorType, FailedTask, TaskResult};
 pub use identifiers::{AffinityId, Identifier, PhaseId, ResourceKind, RunnerIdentifier, TypeId};
-pub use outputs::{ResultValue, TaskOutputs, check_soft_caps};
+pub use outputs::{INLINE_VALUE_HARD_CAP_BYTES, ResultValue, TaskOutputs, check_soft_caps};
 pub use resource::{ResourceAmount, ResourceMap, SoftPreferredSecondaries};
 pub use task::{TaskDep, TaskInfo, TaskInput};
 pub use version::TaskVersion;

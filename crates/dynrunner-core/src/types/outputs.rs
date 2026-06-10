@@ -48,6 +48,26 @@ pub enum ResultValue {
 /// a warn for the offending value (still propagates).
 pub const INLINE_VALUE_SOFT_CAP_BYTES: usize = 64 * 1024;
 
+/// Per-value inline HARD cap (16 MiB): the documented API-level limit on
+/// `Task.publish_string` / any inline [`ResultValue::Inline`] a worker
+/// commits. The worker-side publish API rejects larger values up front
+/// (a Python-visible error naming the actual size and this limit), so an
+/// over-limit value never reaches the wire.
+///
+/// Why 16 MiB: inline outputs are metadata-shaped values that ride
+/// EVERY downstream hop in memory — the worker's `done:` frame, the
+/// CRDT-replicated `TaskCompleted` mutation broadcast to every peer,
+/// and the `predecessor_outputs` map embedded into each dependent
+/// task's dispatch frame. 16 MiB is 256× the advisory soft cap
+/// ([`INLINE_VALUE_SOFT_CAP_BYTES`]) — far beyond any sane inline
+/// metadata — while keeping even a multi-key accumulator comfortably
+/// under the wire-frame defense-in-depth guard
+/// (`dynrunner-protocol-manager-worker`'s `MAX_RESPONSE_FRAME_BYTES`)
+/// and typical websocket message limits on the relayed mesh hops.
+/// Bulk artifacts belong on the shared mount via `Task.publish(src,
+/// key=...)` — a `File` output carries only the destination path.
+pub const INLINE_VALUE_HARD_CAP_BYTES: usize = 16 * 1024 * 1024;
+
 /// Per-task total inline soft cap (sum of all `Inline` byte lengths).
 /// Above this, [`check_soft_caps`] emits a separate warn (still propagates).
 pub const PER_TASK_INLINE_SOFT_CAP_BYTES: usize = 1024 * 1024;

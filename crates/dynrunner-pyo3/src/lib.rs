@@ -116,6 +116,15 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(publish::publish_one, m)?)?;
     m.add_function(wrap_pyfunction!(publish::publish_all, m)?)?;
     m.add_function(wrap_pyfunction!(publish::sweep_stale_tmps, m)?)?;
+    // API-level hard cap on one inline published value (#364). The
+    // Python `Task.publish_string` rejects larger values up front with
+    // an error naming this limit; Rust owns the number (see
+    // `dynrunner_core::INLINE_VALUE_HARD_CAP_BYTES` for the
+    // justification), Python only reads it.
+    m.add(
+        "PUBLISH_STRING_MAX_BYTES",
+        dynrunner_core::INLINE_VALUE_HARD_CAP_BYTES,
+    )?;
     m.add_function(wrap_pyfunction!(
         slurm::wrapper_script::generate_wrapper_script,
         m
