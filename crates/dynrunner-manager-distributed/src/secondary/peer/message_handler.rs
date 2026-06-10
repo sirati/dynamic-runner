@@ -281,15 +281,16 @@ where
             // single-concern `apply_cluster_mutations` helper; CRDT
             // idempotency makes any duplicate apply a no-op.
             DistributedMessage::ClusterMutation { mutations, .. } => {
-                // Same revive-on-primary-change contract as the operational
-                // dispatch arm: when the batch genuinely advances the
-                // primary identity (e.g. a failover winner's
-                // `PrimaryChanged` relayed over the peer mesh), reset the
-                // stale per-worker backoff and repoll idle workers so they
-                // re-issue TaskRequests at the new primary promptly.
+                // Same reaction contract as the operational dispatch arm:
+                // when the batch genuinely advances the primary identity
+                // (e.g. a failover winner's `PrimaryChanged` relayed over
+                // the peer mesh), refresh every piece of
+                // per-primary-pointed state (MeshReady re-announce to the
+                // new primary + worker-pull revive + immediate repoll) via
+                // the single-owner reaction —
+                // `react_to_primary_identity_change` documents the pieces.
                 if self.apply_cluster_mutations(mutations) {
-                    self.op_mut().primary_link.reset_all_backoff();
-                    self.repoll_idle_workers().await;
+                    self.react_to_primary_identity_change().await;
                 }
             }
             // Wire-frame / setup / snapshot frames the role-aware base

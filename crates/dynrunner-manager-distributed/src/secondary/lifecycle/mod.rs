@@ -333,9 +333,14 @@ pub(in crate::secondary) struct MeshFormation {
     /// when the peer list is empty.
     pub(in crate::secondary) peer_dial_count: u32,
 
-    /// One-shot guard: has `MeshReady` already been emitted to the primary?
-    /// The primary defers its `PrimaryChanged` announcement until every
-    /// secondary reports, so this enforces "exactly once per secondary".
+    /// One-shot guard: has `MeshReady` already been emitted to the
+    /// CURRENT primary? The primary defers its `PrimaryChanged`
+    /// announcement until every secondary reports, so this enforces
+    /// "exactly once per secondary PER PRIMARY IDENTITY" — mesh-leg
+    /// confirmation is pairwise (member ↔ current primary), so a
+    /// genuinely-applied `PrimaryChanged` re-arms the guard and
+    /// re-announces to the new primary
+    /// (`rearm_mesh_ready_for_new_primary`).
     pub(in crate::secondary) mesh_ready_sent: bool,
 
     /// The `degraded` latch: set true once the watchdog deadline elapsed

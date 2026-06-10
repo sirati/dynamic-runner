@@ -636,20 +636,13 @@ where
                 // hook (Phase-C seam: signal `Process` to build the primary
                 // on a self-named promotion + reset election + observer
                 // guard). It returns whether a primary-identity change was
-                // genuinely applied; when it was, revive the worker-pull
-                // rate-limiter — backoff accrued against the PRIOR primary
-                // is stale the moment the role changes, so without this the
-                // repoll is suppressed by `should_request_now` and idle
-                // workers sit through a stale window before re-issuing at
-                // the new primary (the dispatch-silence symptom). Keyed off
-                // the backoff maps (not the pool) so it fires even before
-                // `initialize_workers`. Then immediate repoll so every idle
-                // worker re-issues its `TaskRequest` against the freshly-
-                // identified primary (`Destination::Primary` re-resolved at
-                // the egress edge) instead of waiting a keepalive interval.
+                // genuinely applied; when it was, refresh every piece of
+                // per-primary-pointed state (MeshReady re-announce to the
+                // new primary + worker-pull revive + immediate repoll) via
+                // the single-owner reaction —
+                // `react_to_primary_identity_change` documents the pieces.
                 if self.apply_cluster_mutations(mutations) {
-                    self.op_mut().primary_link.reset_all_backoff();
-                    self.repoll_idle_workers().await;
+                    self.react_to_primary_identity_change().await;
                 }
                 Ok(())
             }
