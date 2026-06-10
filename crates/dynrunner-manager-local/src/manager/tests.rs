@@ -1191,10 +1191,11 @@ async fn memprofile_run_level_smoke() {
                     &mut factory,
                 )
                 .await;
-            // Cgroup setup may still fail post-detection on hosts whose
-            // user cgroup tree exposes `memory` but is read-only to the
-            // test process (the v2-controllers probe doesn't catch that).
-            // Treat the same way the runtime-probe above does — skip
+            // Permission/delegation refusals post-detection now degrade
+            // to the flat layout inside the cgroup module (Ok(None) +
+            // warn), so they no longer reach this error path. Genuine
+            // I/O anomalies in odd test environments still can; treat
+            // those the same way the runtime-probe above does — skip
             // rather than hard-fail.
             if let Err(e) = &outcome
                 && e.contains("nested workers cgroup setup failed")
