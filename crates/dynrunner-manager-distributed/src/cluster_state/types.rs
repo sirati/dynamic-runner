@@ -183,10 +183,7 @@ pub enum TaskState<I> {
     /// (uniform with the F2 generation accessor). LOAD-BEARING: its
     /// `to_completed_event` is `None` so the skip stays silent on the
     /// completion channel.
-    SkippedAlreadyDone {
-        task: TaskInfo<I>,
-        attempt: u32,
-    },
+    SkippedAlreadyDone { task: TaskInfo<I>, attempt: u32 },
 }
 
 impl<I> TaskState<I> {
@@ -533,6 +530,48 @@ pub struct StateCounts {
     /// skips whose outputs already existed. SUCCESS-LIKE terminal kept in
     /// its OWN category (NOT folded into `completed` nor any `fail_*`).
     pub skipped_already_done: usize,
+}
+
+/// Per-phase task partition over the replicated ledger — the value shape
+/// of [`ClusterState::phase_task_partition`], the SINGLE owner of the
+/// "what is each of this phase's tasks, operationally" classification.
+/// Four mutually-exclusive buckets covering every `TaskState` variant:
+///
+///   - `to_run`: still-live work — `Pending` / `InFlight` / `Blocked`
+///     (`Blocked` is cascade-paused and auto-resumes, so it is honest
+///     remaining work, mirroring [`TaskState::is_terminal`]).
+///   - `done`: `Completed` — work this run actually performed.
+///   - `failed`: the non-success terminals — `Failed` / `Unfulfillable` /
+///     `InvalidTask` (the same fold `OutcomeSummary` applies to its
+///     `fail_*` classes, collapsed to one operator-readable number).
+///   - `skipped`: `SkippedAlreadyDone` — the discovery-time skip kept in
+///     its OWN bucket, exactly as `counts()` / `outcome_counts()` keep it.
+///
+/// `to_run + done + failed + skipped` is the phase's total ledger entries.
+/// At a phase's spawn edge `done == failed == 0`, so `to_run` there equals
+/// the old "every non-skipped entry" reading — but mid-run the partition
+/// keeps telling the truth (a completed task is `done`, never `to_run`).
+///
+/// `Add` so a reader aggregating across phases (the narrator's running
+/// "overall" line) sums partitions without re-spelling the bucket shape.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhaseTaskPartition {
+    pub to_run: usize,
+    pub done: usize,
+    pub failed: usize,
+    pub skipped: usize,
+}
+
+impl std::ops::Add for PhaseTaskPartition {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            to_run: self.to_run + rhs.to_run,
+            done: self.done + rhs.done,
+            failed: self.failed + rhs.failed,
+            skipped: self.skipped + rhs.skipped,
+        }
+    }
 }
 
 /// Per-phase derived view used by every reader that needs the phase

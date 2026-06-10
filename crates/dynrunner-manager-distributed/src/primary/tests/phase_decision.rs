@@ -429,8 +429,15 @@ fn phase_all_skipped_as_existing_proceeds() {
         "success owed to the all-terminal skip ledger, NOT a may_be_empty declaration"
     );
     assert_eq!(
-        primary.cluster_state_for_test().phase_task_partition(&build),
-        (0, 2),
+        primary
+            .cluster_state_for_test()
+            .phase_task_partition(&build),
+        crate::cluster_state::PhaseTaskPartition {
+            to_run: 0,
+            done: 0,
+            failed: 0,
+            skipped: 2,
+        },
         "both build items are SkippedAlreadyDone (0 to-run, 2 skipped)"
     );
     // The phase has tasks and every one is terminal (skipped) ⇒ has_any &&
