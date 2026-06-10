@@ -159,6 +159,9 @@ where
             cause: RemovalCause::SelfDeparture(BoundedString::from(
                 "graceful abort: local work drained".to_string(),
             )),
+            // Kills THIS node's current membership incarnation (same
+            // stamp as the panik self-departure above).
+            member_gen: self.cluster_state.peer_member_gen(&self.config.secondary_id),
         };
         if let Err(e) = self.apply_and_broadcast_mutations(vec![mutation]).await {
             tracing::warn!(

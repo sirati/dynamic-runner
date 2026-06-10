@@ -94,6 +94,7 @@ fn seed_member_with_inflight(
         is_observer: false,
         can_be_primary,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     cs.apply(ClusterMutation::SecondaryCapacity {
         secondary: id.into(),

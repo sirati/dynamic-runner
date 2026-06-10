@@ -213,6 +213,7 @@ async fn drained_secondary_departs_deliberately_without_election() {
                                 dynrunner_protocol_primary_secondary::ClusterMutation::PeerRemoved {
                                     id,
                                     cause: RemovalCause::SelfDeparture(reason),
+                                    ..
                                 } if id == &secondary_id
                                     && reason.as_str().contains("graceful abort")
                             ))
