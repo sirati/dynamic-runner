@@ -131,8 +131,13 @@ pub(crate) struct SecondaryMeshBundle<I: Identifier> {
 /// Inputs to [`dial_secondary_mesh`] — the secondary's mesh-dial
 /// parameters grouped so the backend-construction signature stays tight.
 pub(crate) struct SecondaryDialParams<'a> {
-    /// The resolved bootstrap-primary `SocketAddr` to dial.
-    pub addr: std::net::SocketAddr,
+    /// ALL resolved bootstrap-primary `SocketAddr`s (the full resolver
+    /// output for the primary URL, not just its first entry). The
+    /// factory derives the per-attempt candidate order — v4 first,
+    /// loopback family-completed — via [`dial_candidates`]; see there
+    /// for why a single pre-picked address cannot carry a partial
+    /// `-R` bind.
+    pub addrs: Vec<std::net::SocketAddr>,
     /// Overall dial budget; the retry loop gives up past this.
     pub connect_timeout: std::time::Duration,
     /// Initial delay between dial attempts; doubled per refused attempt,
@@ -154,6 +159,73 @@ pub(crate) struct SecondaryDialParams<'a> {
 /// failure up to this cap, so a slow tunnel keeps a visible WARN
 /// cadence without hammering the port.
 const MAX_DIAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// PURE: the per-attempt dial-candidate list from the resolver's
+/// output — deduplicated, IPv4 before IPv6 (the tunnel's primary
+/// family, resolver order preserved within each family), and, when
+/// the target is loopback, COMPLETED with BOTH loopback families on
+/// the same port.
+///
+/// The completion is the dial-side half of the partial-`-R`-bind
+/// defense: sshd binds the remote forward per address family and
+/// reports success when EITHER lands (OpenSSH
+/// `channel_setup_fwd_listener_tcpip`), so a transient v4 collision
+/// on the worker leaves a `[::1]`-only listener. The container's
+/// `/etc/hosts` may resolve `localhost` to only one family — the
+/// resolver output must never constrain the dial to the family that
+/// happened to lose the bind race, and both loopback addresses always
+/// exist on the host. Non-loopback targets (Standard gateway mode)
+/// get ordering + dedup only — never an invented address.
+fn dial_candidates(resolved: &[std::net::SocketAddr]) -> Vec<std::net::SocketAddr> {
+    let mut all: Vec<std::net::SocketAddr> = resolved.to_vec();
+    if let Some(port) = resolved
+        .iter()
+        .find(|a| a.ip().is_loopback())
+        .map(|a| a.port())
+    {
+        all.push((std::net::Ipv4Addr::LOCALHOST, port).into());
+        all.push((std::net::Ipv6Addr::LOCALHOST, port).into());
+    }
+    let mut out: Vec<std::net::SocketAddr> = Vec::new();
+    for addr in all
+        .iter()
+        .filter(|a| a.is_ipv4())
+        .chain(all.iter().filter(|a| a.is_ipv6()))
+    {
+        if !out.contains(addr) {
+            out.push(*addr);
+        }
+    }
+    out
+}
+
+/// One bring-up dial ATTEMPT across the candidate list: try each
+/// address in order, first success wins — returning WHICH address
+/// connected (the re-dialable bootstrap address
+/// `register_primary_link` retains). When every candidate fails, the
+/// combined per-candidate error string feeds
+/// [`is_transient_dial_error`], whose substring match retries the
+/// attempt iff ANY candidate failed refused/reset-class (that
+/// family's listener may still be coming up) — a v4 squatter's
+/// protocol error therefore cannot mask a v6 listener that is still
+/// establishing.
+async fn dial_candidates_once<T, F, Fut>(
+    candidates: &[std::net::SocketAddr],
+    mut dial_one: F,
+) -> Result<(T, std::net::SocketAddr), String>
+where
+    F: FnMut(std::net::SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut errors: Vec<String> = Vec::new();
+    for &addr in candidates {
+        match dial_one(addr).await {
+            Ok(connected) => return Ok((connected, addr)),
+            Err(e) => errors.push(format!("{addr}: {e}")),
+        }
+    }
+    Err(errors.join("; "))
+}
 
 /// Classify a failed bring-up dial attempt: `true` iff the error is
 /// connection-refused/reset-class — the canonical "the submitter's `-R`
@@ -192,10 +264,13 @@ fn is_transient_dial_error(error: &str) -> bool {
 /// stalled accept could otherwise outlive the budget).
 ///
 /// Generic over the dial future so the retry policy is unit-testable
-/// without a live backend; [`dial_secondary_mesh`] passes the real
-/// `NetworkClient::connect_wss_only`.
+/// without a live backend; [`dial_secondary_mesh`] passes a
+/// [`dial_candidates_once`] sweep over the real
+/// `NetworkClient::connect_wss_only`. `target` is the display label
+/// for logs/errors (the candidate list rendered once at the call
+/// site).
 async fn dial_until_deadline<T, F, Fut>(
-    addr: std::net::SocketAddr,
+    target: &str,
     deadline: std::time::Duration,
     initial_delay: std::time::Duration,
     mut dial: F,
@@ -225,7 +300,7 @@ where
             && let Some(error) = last_error
         {
             tracing::error!(
-                addr = %addr,
+                target = %target,
                 attempts,
                 elapsed_s = start.elapsed().as_secs_f64(),
                 last_error = %error,
@@ -233,7 +308,7 @@ where
                  deadline; the primary tunnel never started listening"
             );
             return Err(format!(
-                "failed to connect to primary at {addr} after {:.0}s ({attempts} attempts; \
+                "failed to connect to primary at {target} after {:.0}s ({attempts} attempts; \
                  every connection-refused/reset failure was retried until the deadline — \
                  the primary's reverse tunnel never started listening): last error: {error}",
                 start.elapsed().as_secs_f64()
@@ -243,7 +318,7 @@ where
         let error = match tokio::time::timeout(budget, dial()).await {
             Ok(Ok(connected)) => {
                 tracing::info!(
-                    addr = %addr,
+                    target = %target,
                     elapsed_s = start.elapsed().as_secs_f64(),
                     attempts,
                     "connected to primary"
@@ -260,13 +335,13 @@ where
                     None => String::new(),
                 };
                 tracing::error!(
-                    addr = %addr,
+                    target = %target,
                     attempts,
                     elapsed_s = start.elapsed().as_secs_f64(),
                     "failed to connect to primary: final dial attempt still pending at the deadline"
                 );
                 return Err(format!(
-                    "failed to connect to primary at {addr} after {:.0}s ({attempts} attempts; \
+                    "failed to connect to primary at {target} after {:.0}s ({attempts} attempts; \
                      the final dial attempt was still pending when the deadline expired{history})",
                     start.elapsed().as_secs_f64()
                 ));
@@ -274,20 +349,20 @@ where
         };
         if !is_transient_dial_error(&error) {
             tracing::error!(
-                addr = %addr,
+                target = %target,
                 attempts,
                 error = %error,
                 "failed to connect to primary (non-transient error; not retrying)"
             );
             return Err(format!(
-                "failed to connect to primary at {addr}: {error} \
+                "failed to connect to primary at {target}: {error} \
                  (non-transient error on attempt {attempts}; not retrying)"
             ));
         }
         let remaining = deadline.saturating_sub(start.elapsed());
         let pause = delay.min(remaining);
         tracing::warn!(
-            addr = %addr,
+            target = %target,
             attempt = attempts,
             error = %error,
             retry_in_s = pause.as_secs_f64(),
@@ -314,7 +389,7 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
     params: SecondaryDialParams<'_>,
 ) -> Result<SecondaryMeshBundle<I>, String> {
     let SecondaryDialParams {
-        addr,
+        addrs,
         connect_timeout,
         retry_delay,
         secondary_id,
@@ -322,14 +397,33 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
         ipv4_address,
         ipv6_address,
     } = params;
+    // Per-attempt candidate order: v4 first, loopback family-completed
+    // (the dial-side half of the partial-`-R`-bind defense — see
+    // `dial_candidates`).
+    let candidates = dial_candidates(&addrs);
+    if candidates.is_empty() {
+        return Err("no resolved address to dial for the bootstrap primary".to_string());
+    }
+    let target = candidates
+        .iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     // Connect to primary via WSS, retrying transient failures until the
     // configured deadline (`connect_timeout`, default 600s — the same
     // window as the submitter's secondary-welcome wait, so both sides
-    // give up together).
-    let client = dial_until_deadline(addr, connect_timeout, retry_delay, || {
-        NetworkClient::connect_wss_only(addr)
-    })
-    .await?;
+    // give up together). Each attempt sweeps the candidate list in
+    // order; the FIRST address that accepts carries the run (a v6-only
+    // partial `-R` bind connects over `[::1]`).
+    let (client, connected_addr) =
+        dial_until_deadline(&target, connect_timeout, retry_delay, || {
+            dial_candidates_once(&candidates, |addr| NetworkClient::connect_wss_only(addr))
+        })
+        .await?;
+    tracing::info!(
+        addr = %connected_addr,
+        "bootstrap primary dial connected"
+    );
 
     // Start the secondary's peer mesh. The identity passed to
     // `PeerNetwork::start` is BOTH the CN baked into this secondary's
@@ -355,13 +449,16 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
     // like every other peer's — there is no separate `uplink` leg. "The
     // tunnel is just a way of joining the mesh."
     //
-    // `addr` is retained (it is `Copy`) so the wire is RE-dialable: when
-    // the `-R` tunnel drops, the bootstrap-redial supervisor re-dials this
-    // same `localhost:<tunnel_port>` address indefinitely and re-folds the
-    // fresh client (defect (b)). It is the FIXED tunnel address — never a
-    // LAN addr — because the submitter is unroutable except through the
-    // tunnel.
-    transport.register_primary_link(bootstrap_primary_id, addr, client);
+    // `connected_addr` — the candidate that actually accepted — is
+    // retained so the wire is RE-dialable: when the `-R` tunnel drops,
+    // the bootstrap-redial supervisor re-dials this same
+    // `localhost:<tunnel_port>` address indefinitely and re-folds the
+    // fresh client (defect (b)). It is the FIXED tunnel address — never
+    // a LAN addr — because the submitter is unroutable except through
+    // the tunnel; retaining the SUCCESSFUL family means the redial
+    // targets the loopback family the worker-side listener provably
+    // bound.
+    transport.register_primary_link(bootstrap_primary_id, connected_addr, client);
 
     let peer_cert_info = PeerCertInfo {
         public_cert_pem: cert_pem,
@@ -450,7 +547,7 @@ mod tests {
         let calls = Rc::new(Cell::new(0u32));
         let counter = calls.clone();
         let result: Result<u32, String> = dial_until_deadline(
-            test_addr(),
+            &test_addr().to_string(),
             Duration::from_secs(600),
             Duration::from_secs(1),
             move || {
@@ -479,7 +576,7 @@ mod tests {
         let calls = Rc::new(Cell::new(0u32));
         let counter = calls.clone();
         let result: Result<u32, String> = dial_until_deadline(
-            test_addr(),
+            &test_addr().to_string(),
             Duration::from_secs(10),
             Duration::from_secs(1),
             move || {
@@ -519,7 +616,7 @@ mod tests {
         let calls = Rc::new(Cell::new(0u32));
         let counter = calls.clone();
         let result: Result<u32, String> = dial_until_deadline(
-            test_addr(),
+            &test_addr().to_string(),
             Duration::from_secs(600),
             Duration::from_secs(1),
             move || {
@@ -581,7 +678,7 @@ mod tests {
                     let _conn = listener.accept().await.expect("test accept");
                 });
                 let client = dial_until_deadline(
-                    addr,
+                    &addr.to_string(),
                     Duration::from_secs(30),
                     Duration::from_millis(50),
                     || NetworkClient::<RunnerIdentifier>::connect_wss_only(addr),
@@ -595,5 +692,210 @@ mod tests {
                 server.await.expect("server task");
             })
             .await;
+    }
+
+    /// `dial_candidates` pure semantics: v4 before v6, dedup, and a
+    /// loopback target is completed with BOTH loopback families on the
+    /// same port — the dial-side half of the partial-`-R`-bind defense.
+    #[test]
+    fn dial_candidates_orders_v4_first_and_completes_loopback_families() {
+        let v4: std::net::SocketAddr = "127.0.0.1:42655".parse().unwrap();
+        let v6: std::net::SocketAddr = "[::1]:42655".parse().unwrap();
+
+        // Resolver handed back only v6 loopback (container /etc/hosts
+        // quirk): the v4 loopback is completed AND ordered first.
+        assert_eq!(dial_candidates(&[v6]), vec![v4, v6]);
+        // v4-only input: v6 completed second.
+        assert_eq!(dial_candidates(&[v4]), vec![v4, v6]);
+        // Both (v6 first from the resolver): reordered v4-first, deduped.
+        assert_eq!(dial_candidates(&[v6, v4]), vec![v4, v6]);
+
+        // Non-loopback targets (Standard gateway mode) are never
+        // augmented with invented addresses — ordering + dedup only.
+        let lan4: std::net::SocketAddr = "10.0.0.5:7000".parse().unwrap();
+        let lan6: std::net::SocketAddr = "[fd00::5]:7000".parse().unwrap();
+        assert_eq!(dial_candidates(&[lan6, lan4, lan6]), vec![lan4, lan6]);
+    }
+
+    /// `dial_candidates_once` sweep semantics: first success wins and
+    /// reports WHICH address connected; an earlier candidate's failure
+    /// (e.g. a v4 squatter's protocol error) does not stop the sweep;
+    /// all-fail joins the per-candidate errors so the transient
+    /// classifier sees every family's failure class.
+    #[tokio::test]
+    async fn dial_candidates_once_sweeps_in_order_and_reports_connected_addr() {
+        let v4: std::net::SocketAddr = "127.0.0.1:42655".parse().unwrap();
+        let v6: std::net::SocketAddr = "[::1]:42655".parse().unwrap();
+        let candidates = vec![v4, v6];
+
+        // v4 refused, v6 accepts: the sweep succeeds via v6 and says so.
+        let (value, connected) = dial_candidates_once(&candidates, |addr| async move {
+            if addr == v6 { Ok(42u32) } else { Err(PRODUCTION_REFUSED.to_string()) }
+        })
+        .await
+        .expect("the v6 fallback must carry the attempt");
+        assert_eq!(value, 42);
+        assert_eq!(connected, v6);
+
+        // Both refused: the combined error carries BOTH candidates and
+        // classifies transient (retry until the tunnel listens).
+        let err = dial_candidates_once(&candidates, |_addr| async move {
+            Err::<u32, _>(PRODUCTION_REFUSED.to_string())
+        })
+        .await
+        .expect_err("all-fail must surface the combined error");
+        assert!(err.contains("127.0.0.1:42655") && err.contains("[::1]:42655"), "{err}");
+        assert!(is_transient_dial_error(&err), "combined refusal stays transient: {err}");
+
+        // v4 squatter (protocol error) + v6 refused (listener still
+        // coming up): the refused half keeps the combined error
+        // transient so the retry loop keeps waiting for the tunnel.
+        let err = dial_candidates_once(&candidates, |addr| async move {
+            if addr == v4 {
+                Err::<u32, _>("WebSocket protocol error: Handshake not finished".to_string())
+            } else {
+                Err(PRODUCTION_REFUSED.to_string())
+            }
+        })
+        .await
+        .expect_err("all-fail must surface the combined error");
+        assert!(
+            is_transient_dial_error(&err),
+            "a v4 squatter must not mask a v6 listener still establishing: {err}"
+        );
+    }
+
+    /// THE production fix, end-to-end through the real backend: a
+    /// listener that exists ONLY on `[::1]` (the partial `-R` bind that
+    /// sshd reports as success) is reached by the candidate sweep —
+    /// pre-fix the v4-only dial spun on Connection refused until the
+    /// 10-minute deadline.
+    #[tokio::test]
+    async fn dual_family_dial_succeeds_against_v6_only_listener() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let listener =
+                    match dynrunner_transport_quic::WssListener::bind("[::1]:0".parse().unwrap())
+                        .await
+                    {
+                        Ok(l) => l,
+                        Err(e) => {
+                            eprintln!("skipping: no IPv6 loopback in this environment ({e})");
+                            return;
+                        }
+                    };
+                let port = listener.local_addr().port();
+                let server = tokio::task::spawn_local(async move {
+                    let _conn = listener.accept().await.expect("test accept");
+                });
+
+                // The resolver shape a worker container produces for
+                // `localhost:<port>` when /etc/hosts maps localhost to
+                // 127.0.0.1 only — the EXACT pre-fix dead end.
+                let resolved: Vec<std::net::SocketAddr> =
+                    vec![format!("127.0.0.1:{port}").parse().unwrap()];
+                let candidates = dial_candidates(&resolved);
+                let target = candidates
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let (_client, connected) = dial_until_deadline(
+                    &target,
+                    Duration::from_secs(30),
+                    Duration::from_millis(50),
+                    || {
+                        dial_candidates_once(&candidates, |addr| {
+                            NetworkClient::<RunnerIdentifier>::connect_wss_only(addr)
+                        })
+                    },
+                )
+                .await
+                .expect("the v6 loopback fallback must reach a v6-only listener");
+                assert!(
+                    connected.is_ipv6(),
+                    "must have connected over [::1], got {connected}"
+                );
+                server.await.expect("server task");
+            })
+            .await;
+    }
+
+    /// Symmetric guard: a v4-only listener (the common healthy shape)
+    /// still connects via the first candidate — the fallback adds v6,
+    /// it never penalises v4.
+    #[tokio::test]
+    async fn dual_family_dial_still_succeeds_against_v4_only_listener() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let listener = dynrunner_transport_quic::WssListener::bind(
+                    "127.0.0.1:0".parse().unwrap(),
+                )
+                .await
+                .expect("v4 loopback bind");
+                let port = listener.local_addr().port();
+                let server = tokio::task::spawn_local(async move {
+                    let _conn = listener.accept().await.expect("test accept");
+                });
+
+                let resolved: Vec<std::net::SocketAddr> =
+                    vec![format!("127.0.0.1:{port}").parse().unwrap()];
+                let candidates = dial_candidates(&resolved);
+                let (_client, connected) = dial_until_deadline(
+                    "test-target",
+                    Duration::from_secs(30),
+                    Duration::from_millis(50),
+                    || {
+                        dial_candidates_once(&candidates, |addr| {
+                            NetworkClient::<RunnerIdentifier>::connect_wss_only(addr)
+                        })
+                    },
+                )
+                .await
+                .expect("the v4 path must be unaffected by the fallback");
+                assert!(connected.is_ipv4(), "v4 candidate dials first: {connected}");
+                server.await.expect("server task");
+            })
+            .await;
+    }
+
+    /// Neither family listening: the candidate sweep keeps the #357
+    /// retry/deadline semantics intact — every all-refused attempt is
+    /// retried until the deadline, and exhaustion reports the attempt
+    /// history with the combined per-candidate error.
+    #[tokio::test(start_paused = true)]
+    async fn dual_family_dial_keeps_retry_deadline_semantics_when_nothing_listens() {
+        let v4: std::net::SocketAddr = "127.0.0.1:42655".parse().unwrap();
+        let v6: std::net::SocketAddr = "[::1]:42655".parse().unwrap();
+        let candidates = vec![v4, v6];
+        // Reference, so the `move` closure (which must own `counter`)
+        // does not move the Vec the returned futures borrow.
+        let candidates = &candidates;
+        let calls = Rc::new(Cell::new(0u32));
+        let counter = calls.clone();
+        let result: Result<(u32, std::net::SocketAddr), String> = dial_until_deadline(
+            "127.0.0.1:42655, [::1]:42655",
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+            move || {
+                counter.set(counter.get() + 1);
+                dial_candidates_once(candidates, |_addr| async move {
+                    Err::<u32, _>(PRODUCTION_REFUSED.to_string())
+                })
+            },
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(calls.get() > 1, "must retry all-refused sweeps: {}", calls.get());
+        assert!(
+            err.contains(&format!("({} attempts", calls.get())),
+            "exhaustion carries the attempt count: {err}"
+        );
+        assert!(
+            err.contains("127.0.0.1:42655") && err.contains("[::1]:42655"),
+            "exhaustion carries the per-candidate failures: {err}"
+        );
     }
 }
