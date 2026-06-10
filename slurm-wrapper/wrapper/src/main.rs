@@ -332,7 +332,7 @@ async fn resolve_network(cfg: &WrapperConfig) -> std::io::Result<Network> {
             tracing::info!(target: LOG_TARGET, "Using tunnel port: {tunnel_port}");
             tracing::info!(target: LOG_TARGET, "Using QUIC port: {quic_port}");
             let hostname = hostname_fqdn();
-            network::write_connection_info(
+            let record = network::write_connection_info(
                 std::path::Path::new(connection_info_dir),
                 &cfg.secondary_id,
                 &hostname,
@@ -345,6 +345,11 @@ async fn resolve_network(cfg: &WrapperConfig) -> std::io::Result<Network> {
                 target: LOG_TARGET,
                 "Connection info written to: {connection_info_dir}/{}.info",
                 cfg.secondary_id
+            );
+            tracing::info!(
+                target: LOG_TARGET,
+                "Connection info record: {}",
+                network::record_log_line(&record)
             );
             secondary_url(&cfg.connection, tunnel_port)
         }
