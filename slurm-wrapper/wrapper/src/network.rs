@@ -99,6 +99,11 @@ pub fn alloc_free_port() -> std::io::Result<u16> {
 ///   5. `ipv6=<v6>`        (only if `ips.ipv6` is `Some`)
 ///   6. `quic_port=<quic_port>`
 ///   7. `is_observer=<true|false>`
+///
+/// Returns the exact record content written, so callers can surface it
+/// (e.g. in the wrapper log) without re-reading the file. The record
+/// holds only addresses/ports/ids — nothing sensitive (cert_pem_b64 is
+/// omitted by design).
 pub fn write_connection_info(
     connection_info_dir: &Path,
     secondary_id: &str,
@@ -107,7 +112,7 @@ pub fn write_connection_info(
     quic_port: u16,
     ips: &PeerIps,
     is_observer: bool,
-) -> std::io::Result<()> {
+) -> std::io::Result<String> {
     fs::create_dir_all(connection_info_dir)?;
 
     let mut out = String::with_capacity(256);
@@ -126,7 +131,13 @@ pub fn write_connection_info(
     let path = connection_info_dir.join(format!("{secondary_id}.info"));
     let mut f = fs::File::create(&path)?;
     f.write_all(out.as_bytes())?;
-    Ok(())
+    Ok(out)
+}
+
+/// Render a peer-info record (as returned by [`write_connection_info`])
+/// as a single ` | `-separated line for log output.
+pub fn record_log_line(record: &str) -> String {
+    record.trim_end_matches('\n').replace('\n', " | ")
 }
 
 #[cfg(test)]
@@ -140,7 +151,7 @@ mod tests {
             ipv4: Some("10.0.0.5".to_owned()),
             ipv6: Some("fe80::1".to_owned()),
         };
-        write_connection_info(
+        let returned = write_connection_info(
             dir.path(),
             "sec-1",
             "node01.cluster",
@@ -159,6 +170,33 @@ mod tests {
             quic_port=50001\n\
             is_observer=false\n";
         assert_eq!(got, expected);
+        assert_eq!(returned, expected);
+    }
+
+    #[test]
+    fn record_log_line_renders_all_fields_on_one_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let ips = PeerIps {
+            ipv4: Some("10.0.0.5".to_owned()),
+            ipv6: Some("fe80::1".to_owned()),
+        };
+        let record = write_connection_info(
+            dir.path(),
+            "sec-1",
+            "node01.cluster",
+            40001,
+            50001,
+            &ips,
+            false,
+        )
+        .unwrap();
+        let line = record_log_line(&record);
+        assert_eq!(
+            line,
+            "tcp://node01.cluster:40001 | version=2 | secondary_id=sec-1 | \
+             ipv4=10.0.0.5 | ipv6=fe80::1 | quic_port=50001 | is_observer=false"
+        );
+        assert!(!line.contains('\n'));
     }
 
     #[test]
@@ -168,7 +206,7 @@ mod tests {
             ipv4: Some("10.0.0.5".to_owned()),
             ipv6: None,
         };
-        write_connection_info(
+        let returned = write_connection_info(
             dir.path(),
             "sec-2",
             "node02.cluster",
@@ -179,6 +217,7 @@ mod tests {
         )
         .unwrap();
         let got = fs::read_to_string(dir.path().join("sec-2.info")).unwrap();
+        assert_eq!(returned, got);
         let expected = "tcp://node02.cluster:40002\n\
             version=2\n\
             secondary_id=sec-2\n\
@@ -195,7 +234,7 @@ mod tests {
             ipv4: None,
             ipv6: None,
         };
-        write_connection_info(
+        let returned = write_connection_info(
             dir.path(),
             "sec-3",
             "node03.cluster",
@@ -206,6 +245,7 @@ mod tests {
         )
         .unwrap();
         let got = fs::read_to_string(dir.path().join("sec-3.info")).unwrap();
+        assert_eq!(returned, got);
         let expected = "tcp://node03.cluster:40003\n\
             version=2\n\
             secondary_id=sec-3\n\
