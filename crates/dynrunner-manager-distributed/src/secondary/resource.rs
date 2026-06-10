@@ -268,26 +268,42 @@ where
         self.send_to_primary(msg).await
     }
 
-    /// Sweep any `active_tasks` entry bound to `worker_id` into the
-    /// reinject path before the slot's subprocess is REPLACED.
+    /// Recover whatever a worker slot held before its subprocess is
+    /// REPLACED — covering BOTH places a slot's work can live: the
+    /// running task in `active_tasks` AND the deferred-awaiting-Ready
+    /// task in `pending_first_bind`.
     ///
     /// A worker-replacement edge installs a fresh subprocess (a new
-    /// generation) into the slot. If the slot still carries an
-    /// `active_tasks` entry, the bound task would otherwise be silently
-    /// abandoned — assigned-never-terminal — and wedge the phase
-    /// barrier. This sweeps that entry through the SAME backpressure-
-    /// shaped reinject contract `report_deferred_task_lost` already
-    /// uses (the authority requeues + re-dispatches without consuming
-    /// retry budget). No-op when the slot has no bound task (the common
-    /// case: replacement of an idle or already-swept slot).
+    /// generation) into the slot and bumps the slot generation. Two
+    /// structures can still reference the OLD slot occupant. The
+    /// `active_tasks` entry is a task the prior subprocess was running:
+    /// if left, it is silently abandoned (assigned-never-terminal) and
+    /// wedges the phase barrier. The `pending_first_bind` entry is a task
+    /// stashed by a first-bind `RespawnInProgress`, deferred until the
+    /// (now-replaced) generation's `Ready`: the replacement bumps the
+    /// generation, so the prior watcher's `Ready` is stale-dropped by the
+    /// generation gate (`handle_worker_event`) — the Ready arm's
+    /// `pending_first_bind.remove` never runs, and with no disconnect
+    /// either the stash would sit forever (never assigned, never terminal
+    /// — the round-2 wedge this sweep closes).
     ///
-    /// The paths that report a SPECIFIC terminal disposition before
-    /// replacing the worker (OOM-kill → `ResourceExhausted`; explicit
-    /// wire-failure → `NonRecoverable`) sweep `active_tasks` themselves
-    /// with that classification and do NOT call this — this is the
-    /// generic reinject for a replacement that carries no other failure
-    /// signal (the type-shift respawn of a slot that drifted to holding
-    /// a stale `active_tasks` entry).
+    /// Both are swept through the SAME backpressure-shaped reinject
+    /// contract `report_deferred_task_lost` uses (the authority requeues
+    /// then re-dispatches without consuming retry budget). No-op for a
+    /// slot holding neither (the common case: replacement of an idle or
+    /// already-swept slot).
+    ///
+    /// INVARIANT this enforces: a slot replacement may never leave a
+    /// `pending_first_bind` entry that no future event will touch. Every
+    /// replacement edge that bumps the generation funnels through this
+    /// chokepoint (the type-shift router edge sweeps the PRIOR stash
+    /// before installing the fresh one; the restart loop sweeps before
+    /// `restart_worker_async`). The OOM path reports its OWN
+    /// `active_tasks` terminal with a resource classification, so it
+    /// does not call this whole sweep — but it still drains the deferred
+    /// stash via [`Self::reinject_pending_first_bind`] (the deferred task
+    /// never ran, so it is backpressure-reinjected, NOT
+    /// ResourceExhausted).
     pub(in crate::secondary) async fn sweep_replaced_worker_task(
         &mut self,
         worker_id: WorkerId,
@@ -308,6 +324,46 @@ where
                  replaced generation cannot strand it"
             );
             self.report_deferred_task_lost(worker_id, &hash).await?;
+        }
+        // Also drain a deferred first-bind stash the replacement would
+        // otherwise strand (the stale-Ready round-2 wedge).
+        self.reinject_pending_first_bind(worker_id).await
+    }
+
+    /// Drain a `pending_first_bind[worker_id]` stash (if any) into the
+    /// backpressure reinject path before the slot is replaced.
+    ///
+    /// A deferred first-bind task NEVER RAN — it was stashed awaiting the
+    /// slot's `Ready` and the replacement bumped the generation out from
+    /// under it. So it is reinjected as backpressure (`Recoverable` +
+    /// the `"worker pipe broken; respawning"` marker the authority's
+    /// `is_backpressure` predicate recognises), the SAME shape the
+    /// `Disconnected` arm's own pre-Ready drain uses — exactly one owner
+    /// of "report a lost deferred task". No-op when the slot has no
+    /// stash.
+    ///
+    /// Drained on every generation-bumping replacement edge:
+    /// `sweep_replaced_worker_task` (type-shift router, restart loop)
+    /// calls it; the OOM path calls it directly. The `Disconnected` arm
+    /// pops the stash itself BEFORE flagging the restart, so by the time
+    /// the restart loop's `sweep_replaced_worker_task` reaches this drain
+    /// the entry is already gone — popped-then-replaced means no
+    /// double-report.
+    pub(in crate::secondary) async fn reinject_pending_first_bind(
+        &mut self,
+        worker_id: WorkerId,
+    ) -> Result<(), String> {
+        if let Some(pending) = self.op_mut().pending_first_bind.remove(&worker_id) {
+            let pending_hash = pending.file_hash.clone();
+            tracing::warn!(
+                worker_id,
+                task_hash = %pending_hash,
+                "worker slot replaced while a first-bind task was deferred \
+                 awaiting Ready; reinjecting it (backpressure) so the \
+                 stale-dropped Ready cannot strand it"
+            );
+            self.report_deferred_task_lost(worker_id, &pending_hash)
+                .await?;
         }
         Ok(())
     }
@@ -406,6 +462,19 @@ where
                     // ordering).
                     let _ = self.send_to_primary(msg).await;
                 }
+
+                // The OOM-kill REPLACES the slot (restart below bumps the
+                // generation), so a first-bind task deferred awaiting the
+                // prior generation's Ready would otherwise be stranded by
+                // the stale-dropped Ready. Reinject it as backpressure —
+                // the deferred task NEVER RAN, so it is NOT classified
+                // ResourceExhausted with the running task above; it rides
+                // the generic deferred-lost reinject. The `active_tasks`
+                // arm above already reported the running task's terminal
+                // with its resource classification, so this drains a
+                // DISJOINT structure (a slot in `pending_first_bind` is
+                // Transitioning, not running) — no double-report.
+                let _ = self.reinject_pending_first_bind(worker_id).await;
 
                 // Restart the worker NON-BLOCKINGLY. This handler runs
                 // inside the operational `select!` (the OOM-decision arm),

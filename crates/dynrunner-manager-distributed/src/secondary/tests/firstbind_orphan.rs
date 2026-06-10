@@ -226,10 +226,18 @@ async fn post_ready_first_bind_disconnect_is_reported_terminal() {
 /// terminal — it sits in the stash forever with no event ever touching
 /// it. Nothing resolves it: the phase barrier wedges with no disconnect.
 ///
-/// `pending_first_bind` is keyed by `WorkerId` and is touched on exactly
-/// two edges: the `Ready` arm (pop+assign) and the `Disconnected` arm
-/// (pop+report). A replacement edge bumps the generation but does NOT
-/// sweep the stash — so a stale-dropped `Ready` strands it permanently.
+/// `pending_first_bind` is keyed by `WorkerId` and was touched on
+/// exactly two ARM edges: the `Ready` arm (pop+assign) and the
+/// `Disconnected` arm (pop+report). The round-2 fix adds the THIRD,
+/// generic edge: every slot-REPLACEMENT funnels through
+/// `sweep_replaced_worker_task` → `reinject_pending_first_bind`, so a
+/// replacement that bumps the generation drains the stash into the
+/// backpressure reinject path BEFORE the stale-dropped `Ready` can
+/// strand it. This test drives the secondary's restart-loop replacement
+/// edge (`kill + sweep_replaced_worker_task`, the production
+/// `process_tasks` sequence — the raw `pool.restart_worker` only models
+/// the POOL half, the generation bump) and asserts the stash is
+/// recovered, not orphaned.
 #[tokio::test(flavor = "current_thread")]
 async fn pending_first_bind_stranded_when_ready_is_stale_dropped() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -269,10 +277,17 @@ async fn pending_first_bind_stranded_when_ready_is_stale_dropped() {
                 .expect("first wait-ready watcher must emit a Ready");
             assert_eq!(stale_ready.generation(), gen_after_stash);
 
-            // Second slot replacement (a restart / OOM-restart / second
-            // first-bind dispatch — all go through replace_worker_slot,
-            // which bumps the generation). The stash is NOT swept by this
-            // edge (sweep_replaced_worker_task only touches active_tasks).
+            // Second slot replacement via the secondary's restart-loop
+            // edge. Production `process_tasks` does, in order:
+            // `kill_subprocess` → `sweep_replaced_worker_task(wid)` →
+            // `restart_worker_async(wid)` (process_tasks.rs:601-616). Here
+            // the raw `pool.restart_worker` stands in for the kill+respawn
+            // (the POOL half — it bumps the generation), and the
+            // `sweep_replaced_worker_task` call is the SECONDARY half that
+            // owns recovery: it drains the deferred stash into the
+            // backpressure reinject path before the stale Ready can strand
+            // it. ORDER matches production: the sweep runs against the
+            // bumped slot.
             secondary
                 .pool_mut()
                 .restart_worker(0, &mut factory, false)
@@ -283,6 +298,7 @@ async fn pending_first_bind_stranded_when_ready_is_stale_dropped() {
                 bumped_gen > gen_after_stash,
                 "the second replacement must bump the slot generation"
             );
+            secondary.sweep_replaced_worker_task(0).await.unwrap();
 
             // The stale (gen-1) Ready now lands. The generation gate drops
             // it — so the Ready arm never pops the stash.
@@ -293,11 +309,11 @@ async fn pending_first_bind_stranded_when_ready_is_stale_dropped() {
                 .unwrap();
             secondary.drain_egress().await;
 
-            // ORPHAN: the task is still stranded in pending_first_bind,
-            // never assigned to active_tasks, and never reported terminal.
-            // SOMETHING must resolve it — either the stash is cleared (the
-            // replacement edge must have swept it into the reinject path)
-            // OR a terminal was reported for the hash. Neither happens.
+            // RECOVERED: the replacement edge's sweep must have resolved
+            // the deferred stash. SOMETHING must resolve it — either the
+            // stash is cleared (swept into the reinject path) OR a terminal
+            // was reported for the hash. Pre-fix NEITHER happened (the
+            // stranding wedge); the round-2 fix makes the sweep drain it.
             let still_stashed = secondary.op_mut().pending_first_bind.contains_key(&0);
             let reported = log.borrow();
             let any_terminal_for_hash = reported.iter().any(|m| {
@@ -314,6 +330,86 @@ async fn pending_first_bind_stranded_when_ready_is_stale_dropped() {
                  task forever: it must be either swept out of pending_first_bind \
                  or reported terminal. still_stashed={still_stashed}, \
                  reported={reported:?}"
+            );
+        })
+        .await;
+}
+
+/// Router replacement-edge drain + no-self-cannibalization ordering.
+///
+/// The type-shift router edge sweeps the slot's PRIOR `pending_first_bind`
+/// stash (router.rs: `sweep_replaced_worker_task` at the
+/// `RespawnInProgress` arm) BEFORE installing the FRESH stash one line
+/// later. This pins both halves: the prior stash is popped + reported as
+/// backpressure, and the fresh stash survives (the sweep must not
+/// cannibalize the just-installed entry — order is sweep-then-insert).
+#[tokio::test(flavor = "current_thread")]
+async fn router_first_bind_sweeps_prior_stash_and_keeps_fresh() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            // Seed a PRIOR first-bind stash for worker 0 — the entry a
+            // previous dispatch left when it hit RespawnInProgress and the
+            // slot has since been replaced (a stash the next replacement
+            // must not strand).
+            let prior_binary = make_binary("prior-task", 50);
+            let prior_hash = "prior01".to_string();
+            secondary.op_mut().pending_first_bind.insert(
+                0,
+                super::super::PendingFirstBind {
+                    binary: prior_binary,
+                    file_hash: prior_hash.clone(),
+                    estimated: dynrunner_core::ResourceMap::new(),
+                    predecessor_outputs: std::collections::BTreeMap::new(),
+                },
+            );
+
+            // A first-bind dispatch on the fresh slot hits RespawnInProgress
+            // (loaded_type_id == None), so the router edge runs:
+            // `sweep_replaced_worker_task(0)` THEN `pending_first_bind.insert`
+            // for the fresh task.
+            let fresh_binary = make_binary("fresh-task", 50);
+            let fresh_hash = "fresh01".to_string();
+            let assignment = task_assignment("setup", "sec-2", 0, &fresh_binary, &fresh_hash);
+            secondary
+                .handle_inbound(assignment, &mut FakeWorkerFactory)
+                .await;
+            secondary.drain_egress().await;
+
+            // The FRESH stash survives (sweep ran before the insert — no
+            // self-cannibalization).
+            let stash = secondary.op_mut().pending_first_bind.get(&0).cloned();
+            assert!(
+                matches!(&stash, Some(p) if p.file_hash == fresh_hash),
+                "the fresh first-bind stash must survive the replacement-edge \
+                 sweep; got {:?}",
+                stash.as_ref().map(|p| &p.file_hash)
+            );
+
+            // The PRIOR stash was popped AND reported as backpressure-shaped
+            // TaskFailed (the reinject contract).
+            let reported = log.borrow();
+            assert!(
+                reported.iter().any(|m| matches!(
+                    m,
+                    DistributedMessage::TaskFailed {
+                        task_hash,
+                        error_type: dynrunner_core::ErrorType::Recoverable,
+                        ..
+                    } if *task_hash == prior_hash
+                )),
+                "the prior first-bind stash must be reported terminal \
+                 (backpressure TaskFailed) by the replacement-edge sweep; \
+                 got {reported:?}"
             );
         })
         .await;

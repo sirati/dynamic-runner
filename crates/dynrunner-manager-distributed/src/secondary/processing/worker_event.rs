@@ -275,22 +275,15 @@ where
                 // worker died between `RespawnInProgress` and the
                 // expected `Ready`, so the task held in
                 // `pending_first_bind` (deferred per the respawn-HOLD
-                // contract) never ran. Report it back to the authority
-                // as a backpressure-shaped TaskFailed so the authority
-                // requeues + re-dispatches it. The secondary is never
-                // the authority, so there is exactly ONE recovery: the
-                // own-worker CLASS-1 report.
-                if let Some(pending) = self.op_mut().pending_first_bind.remove(&worker_id) {
-                    let pending_hash = pending.file_hash.clone();
-                    tracing::warn!(
-                        worker_id,
-                        task_hash = %pending_hash,
-                        "pending first-bind worker disconnected before Ready; \
-                         reporting deferred task back to the authority"
-                    );
-                    self.report_deferred_task_lost(worker_id, &pending_hash)
-                        .await?;
-                }
+                // contract) never ran. The disconnect is itself a
+                // slot-replacement trigger (the restart loop respawns
+                // the slot afterward), so it drains the deferred stash
+                // through the SAME `reinject_pending_first_bind`
+                // chokepoint every replacement edge uses — popping it
+                // HERE means the later restart-loop sweep finds nothing
+                // (no double-report). The secondary is never the
+                // authority, so this is the sole own-worker recovery.
+                self.reinject_pending_first_bind(worker_id).await?;
 
                 // Find and report the task as failed
                 let file_hash = self
