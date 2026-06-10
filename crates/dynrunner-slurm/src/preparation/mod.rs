@@ -39,6 +39,12 @@
 //! - [`store`] — the `TunnelStore` commit/drain seam: the append-only
 //!   `SharedTunnelVec` (cohort + respawn) and the per-secondary
 //!   `PerSecondaryTunnelRegistry` (observer-reconnect liveness gate).
+//! - [`escalation`] — the pure half-dead-tunnel escalation state
+//!   machine: K consecutive alive-noop reconnect ticks without
+//!   recovery force a rebuild past the liveness gate (#342).
+//! - [`summary`] — `TunnelSetupSummary`, the honest established/expected
+//!   outcome every reporter renders (#278), plus the canonical
+//!   `secondary_id` naming helper.
 //! - [`ssh`] — low-level argv construction, `Command::spawn`, liveness
 //!   verification, and SIGTERM/SIGKILL teardown.
 //! - [`io`] — `read_peer_info_file` (late-joiner bootstrap entry
@@ -53,6 +59,7 @@
 //! state); splitting it would just shuffle the lock-acquisition
 //! boilerplate without splitting concerns.
 
+mod escalation;
 mod establish;
 mod io;
 mod options;
@@ -60,6 +67,7 @@ mod pipeline;
 mod policy;
 mod ssh;
 mod store;
+mod summary;
 #[cfg(test)]
 mod tests;
 
@@ -67,3 +75,4 @@ pub use io::read_peer_info_file;
 pub use options::{InfoFileReader, PrepError, PreparationOptions};
 pub use pipeline::SlurmPreparation;
 pub use policy::EstablishmentPolicy;
+pub use summary::{TunnelSetupSummary, secondary_id};

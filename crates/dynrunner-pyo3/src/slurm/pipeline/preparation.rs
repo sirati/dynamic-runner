@@ -5,7 +5,10 @@
 //! calls; the inner `run_preparation` is the Rust-callable signature
 //! the orchestrator uses directly.
 
+use std::collections::HashMap;
+
 use dynrunner_core::IMPORTANT_TARGET;
+use dynrunner_slurm::preparation::TunnelSetupSummary;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
@@ -381,14 +384,27 @@ pub(super) fn run_preparation<'py>(
             .call_method1("setup_ssh_tunnels", (num_secondaries, primary_quic_port))?;
         // Reflect the port map into the outcome shape; values are
         // ints in the original Python dataclass.
+        let mut established: HashMap<String, u16> = HashMap::new();
         for (k, v) in port_map.cast::<PyDict>()?.iter() {
+            let id: String = k.extract()?;
             let port: u16 = v.extract()?;
-            secondary_port_map.set_item(k, port)?;
+            secondary_port_map.set_item(&id, port)?;
+            established.insert(id, port);
         }
-        log.call_method1(
-            "info",
-            (format!("All {num_secondaries} SSH tunnels established"),),
-        )?;
+        // HONEST summary (#278): `setup_ssh_tunnels` allows K-of-N
+        // partial success by design (late-joiners attach via PeerJoined),
+        // so the headline must report what was actually VERIFIED — never
+        // claim "All N" from the requested count. Partial fleets are
+        // WARNed with the missing ids named; the summary type is the
+        // same one the Rust preparation layer renders, so the two
+        // layers cannot drift.
+        let summary = TunnelSetupSummary::new(&established, num_secondaries as usize);
+        let level = if summary.is_complete() {
+            "info"
+        } else {
+            "warning"
+        };
+        log.call_method1(level, (summary.to_string(),))?;
     }
 
     // Random primary entropy. The `secrets` module is the legacy

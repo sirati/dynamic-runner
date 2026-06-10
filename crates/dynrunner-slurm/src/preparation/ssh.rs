@@ -737,6 +737,23 @@ async fn spawn_reverse_tunnel(
 /// "established" gate. The corresponding Python idiom is
 /// `proc.wait(timeout=3)` raising `TimeoutExpired` on success.
 ///
+/// # What the gate proves (and the deliberate residual)
+///
+/// Child survival past 3s, combined with `ExitOnForwardFailure=yes` in
+/// [`build_ssh_argv`], proves the `-R` forward either bound successfully
+/// or the handshake is still in flight — ssh exits (rc=255-class,
+/// caught here) whenever the remote bind FAILS, so there is no silent
+/// non-bind on a completed handshake. The residual is a handshake
+/// slower than the 3s window that later fails, or a forward that dies
+/// AFTER establishment: both are deliberately NOT probed here (a
+/// worker-side `ss` check would cost one extra ssh round-trip per
+/// tunnel per attempt across the whole fleet) because the observer's
+/// lost-visibility reconnect cadence already closes them — a secondary
+/// that never dials in keeps visibility lost, and the reestablish path
+/// (liveness gate + half-dead escalation, see
+/// [`super::pipeline::SlurmPreparation::reestablish_one_tunnel`])
+/// rebuilds the tunnel.
+///
 /// Operates on a `&mut Child` owned by the caller — no shared-Vec
 /// lookup. With ≥2 concurrent watchers this is the only safe shape:
 /// using `last_mut()` on a shared `Vec<Child>` would race watcher A

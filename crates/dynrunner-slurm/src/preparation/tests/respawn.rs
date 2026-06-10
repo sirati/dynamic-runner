@@ -368,6 +368,84 @@ fn reestablish_is_noop_when_tunnel_child_alive() {
     }));
 }
 
+/// #342 ESCALATION through the production seam: K (=3, the default)
+/// consecutive `reestablish_one_tunnel` calls whose liveness gate says
+/// alive-noop FORCE the rebuild on the Kth call — and the force resets
+/// the streak so the following call no-ops again (no tick-after-tick
+/// churn after a failed force).
+///
+/// Structural proof, same trick as
+/// [`reestablish_is_noop_when_tunnel_child_alive`]: the manager is
+/// FRESH (primary-QUIC-port cell UNSET), so reaching the rebuild path
+/// can only surface the "primary QUIC port not yet known"
+/// `TunnelFailed` — it never touches ssh. Calls 1–2 returning `Ok(())`
+/// prove the gate tolerated; call 3 returning THAT error proves the
+/// escalation overrode the gate and entered the rebuild; call 4
+/// returning `Ok(())` again proves the firing reset the streak.
+/// (The successful-force end state — the suspect child REPLACED and
+/// reaped by the fresh commit — is the registry's commit-replace
+/// contract, pinned in `tests/store.rs::commit_replaces_entry_and_reaps_displaced`.)
+#[test]
+fn reestablish_escalates_past_alive_gate_after_consecutive_noops() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    rt.block_on(local.run_until(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let opts = opts_for(&tmp);
+        let prep = SlurmPreparation::new(opts);
+
+        // A LIVE child in the reconnect registry for secondary-0 —
+        // models the half-dead tunnel: local ssh alive, worker-side
+        // forward (unobservable here) dead, visibility never recovering
+        // so the cadence keeps re-firing this call.
+        {
+            let registry = prep.reconnect_tunnels_for_test();
+            registry
+                .lock()
+                .await
+                .insert("secondary-0".to_string(), alive_child());
+        }
+        let reader = CannedUriReader {
+            uri: "tcp://h:1".into(),
+        };
+
+        // Ticks 1 + 2: the gate tolerates (alive-noop, Ok).
+        for tick in 1..=2 {
+            let res = prep.reestablish_one_tunnel("secondary-0", reader.clone()).await;
+            assert!(
+                res.is_ok(),
+                "tick {tick}: below the threshold the gate must still no-op, got {res:?}"
+            );
+        }
+
+        // Tick 3: the escalation forces the rebuild — the call falls
+        // through the gate and hits the unset-QUIC-port precondition,
+        // proving the rebuild path was entered without any ssh.
+        let forced = prep
+            .reestablish_one_tunnel("secondary-0", reader.clone())
+            .await;
+        match forced {
+            Err(PrepError::TunnelFailed { stderr, .. }) => assert!(
+                stderr.contains("primary QUIC port"),
+                "expected the rebuild-path precondition error, got {stderr:?}"
+            ),
+            other => panic!(
+                "tick 3 must force past the alive gate into the rebuild path, got {other:?}"
+            ),
+        }
+
+        // Tick 4: the force reset the streak — back to a tolerated no-op.
+        let res = prep.reestablish_one_tunnel("secondary-0", reader).await;
+        assert!(
+            res.is_ok(),
+            "the tick after a force must start a fresh streak (no churn), got {res:?}"
+        );
+    }));
+}
+
 /// Calling `establish_one_tunnel` on a fresh manager (before
 /// `setup_ssh_tunnels` has stored the primary QUIC port) must
 /// surface `TunnelFailed` rather than panicking on a missing
