@@ -13,7 +13,9 @@ use std::sync::Arc;
 use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, TaskOutputs, WorkerId};
 use dynrunner_protocol_primary_secondary::{DiscoveryDebt, RoleTable, SecondaryCapacityRecord};
 
-use super::{ClusterState, OutcomeSummary, PhaseRollup, StateCounts, TaskState};
+use super::{
+    ClusterState, OutcomeSummary, PhaseRollup, PhaseTaskPartition, StateCounts, TaskState,
+};
 
 impl<I: Identifier> ClusterState<I> {
     pub fn task_state(&self, hash: &str) -> Option<&TaskState<I>> {
@@ -454,33 +456,40 @@ impl<I: Identifier> ClusterState<I> {
             .collect()
     }
 
-    /// Per-phase `(to_run, skipped)` partition over the replicated ledger:
-    /// `skipped` is the count of `SkippedAlreadyDone` entries in `phase`,
-    /// `to_run` is every OTHER task entry of `phase` (in any state). One
-    /// ledger pass matching `task.phase_id == phase`, partitioned on the
-    /// skip discriminant.
+    /// Per-phase [`PhaseTaskPartition`] over the replicated ledger: one
+    /// ledger pass matching `task.phase_id == phase`, every entry placed in
+    /// exactly one of the four buckets (`to_run` = `Pending` / `InFlight` /
+    /// `Blocked`, `done` = `Completed`, `failed` = `Failed` /
+    /// `Unfulfillable` / `InvalidTask`, `skipped` = `SkippedAlreadyDone` —
+    /// see the struct doc for the bucket rationale).
     ///
-    /// The SINGLE owner of the "how many of this phase's tasks are real work
-    /// vs already-done" projection: the operator run-narrator's per-phase
-    /// "<N> to run, <M> skipped (already done)" line and any structural
-    /// reader both read it here, so neither re-walks the ledger with a
-    /// private partition rule. Ledger-derived, so it is failover-consistent
-    /// (every replica converges to the same answer after the same mutation
-    /// set lands).
-    pub fn phase_task_partition(&self, phase: &PhaseId) -> (usize, usize) {
-        let mut to_run = 0usize;
-        let mut skipped = 0usize;
+    /// The SINGLE owner of the "what is each of this phase's tasks,
+    /// operationally" projection: the operator run-narrator's per-phase
+    /// "<N> to run, <M> skipped (already done)" line, its running
+    /// "overall" total (which sums this across started phases — terminal
+    /// tasks read `done`/`failed` there, never inflating "to run"), and
+    /// any structural reader all read it here, so none re-walks the ledger
+    /// with a private partition rule. Ledger-derived, so it is
+    /// failover-consistent (every replica converges to the same answer
+    /// after the same mutation set lands).
+    pub fn phase_task_partition(&self, phase: &PhaseId) -> PhaseTaskPartition {
+        let mut p = PhaseTaskPartition::default();
         for state in self.tasks.values() {
             if &state.task().phase_id != phase {
                 continue;
             }
-            if matches!(state, TaskState::SkippedAlreadyDone { .. }) {
-                skipped += 1;
-            } else {
-                to_run += 1;
+            match state {
+                TaskState::Pending { .. }
+                | TaskState::InFlight { .. }
+                | TaskState::Blocked { .. } => p.to_run += 1,
+                TaskState::Completed { .. } => p.done += 1,
+                TaskState::Failed { .. }
+                | TaskState::Unfulfillable { .. }
+                | TaskState::InvalidTask { .. } => p.failed += 1,
+                TaskState::SkippedAlreadyDone { .. } => p.skipped += 1,
             }
         }
-        (to_run, skipped)
+        p
     }
 
     /// Whether the run has been declared finished by the primary.

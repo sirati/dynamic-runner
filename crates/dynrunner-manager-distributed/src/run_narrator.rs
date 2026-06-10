@@ -209,7 +209,8 @@ impl RunNarrator {
                 // single owner of this projection), NOT a narrator-local
                 // ledger re-walk. On the same once-per-phase `started_phases`
                 // edge, so it fires exactly once per phase.
-                let (to_run, skipped) = state.phase_task_partition(phase);
+                let p = state.phase_task_partition(phase);
+                let (to_run, skipped) = (p.to_run, p.skipped);
                 tracing::info!(
                     target: IMPORTANT_TARGET,
                     phase = %phase,
@@ -225,16 +226,30 @@ impl RunNarrator {
                 // that could desync from the ledger — the exact antipattern
                 // this feature avoids). Emitted on the same once-per-phase
                 // edge; each newly-started phase advances the running total.
-                let (overall_to_run, overall_skipped) = self
+                // Unlike the per-phase line (whose phase just spawned, so it
+                // owns no terminal work yet), the overall spans EARLIER
+                // phases whose tasks have since terminated — the partition's
+                // done / failed buckets keep those honest instead of
+                // re-counting every ever-planned task as still "to run".
+                let overall = self
                     .started_phases
                     .iter()
                     .map(|p| state.phase_task_partition(p))
-                    .fold((0usize, 0usize), |(tr, sk), (t, s)| (tr + t, sk + s));
+                    .fold(
+                        crate::cluster_state::PhaseTaskPartition::default(),
+                        |acc, p| acc + p,
+                    );
                 tracing::info!(
                     target: IMPORTANT_TARGET,
-                    to_run = overall_to_run,
-                    skipped = overall_skipped,
-                    "overall: {overall_to_run} to run, {overall_skipped} skipped (already done)",
+                    to_run = overall.to_run,
+                    done = overall.done,
+                    failed = overall.failed,
+                    skipped = overall.skipped,
+                    "overall: {} to run, {} done, {} failed, {} skipped (already done)",
+                    overall.to_run,
+                    overall.done,
+                    overall.failed,
+                    overall.skipped,
                 );
             }
             if rollup.has_any && !rollup.has_live && self.done_phases.insert(phase.clone()) {
@@ -467,9 +482,7 @@ impl RunNarrator {
         // same id (different epoch) still narrates.
         let current = current_primary.map(|id| (id, state.primary_epoch()));
         if current.is_some() && current != self.last_primary {
-            if operational
-                && let Some((id, epoch)) = current.as_ref()
-            {
+            if operational && let Some((id, epoch)) = current.as_ref() {
                 tracing::warn!(
                     target: IMPORTANT_TARGET,
                     primary = %id,
@@ -863,9 +876,10 @@ mod tests {
     /// #337: a phase with N to-run tasks and M `SkippedAlreadyDone` ledger
     /// entries emits, on the same dispatchable edge, one
     /// "<N> to run, <M> skipped (already done)" per-phase line AND an
-    /// "overall: <N> to run, <M> skipped" running total — the overall derived
-    /// from summing `phase_task_partition` over the started phases (no mutable
-    /// accumulator). A re-observe of the stable ledger emits nothing further.
+    /// "overall: <N> to run, <D> done, <F> failed, <M> skipped" running total
+    /// — the overall derived from summing `phase_task_partition` over the
+    /// started phases (no mutable accumulator). A re-observe of the stable
+    /// ledger emits nothing further.
     #[test]
     fn phase_skip_partition_emits_per_phase_and_overall() {
         let events = capture(|| {
@@ -895,8 +909,14 @@ mod tests {
             1,
             "exactly one per-phase skip-partition line for the build phase: {events:?}"
         );
-        assert_eq!(per_phase[0].fields.get("to_run").map(String::as_str), Some("2"));
-        assert_eq!(per_phase[0].fields.get("skipped").map(String::as_str), Some("3"));
+        assert_eq!(
+            per_phase[0].fields.get("to_run").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            per_phase[0].fields.get("skipped").map(String::as_str),
+            Some("3")
+        );
 
         let overall: Vec<_> = events
             .iter()
@@ -910,12 +930,23 @@ mod tests {
         assert!(
             overall[0]
                 .message
-                .contains("2 to run, 3 skipped (already done)"),
+                .contains("2 to run, 0 done, 0 failed, 3 skipped (already done)"),
             "overall reflects the single phase's partition: {:?}",
             overall[0].message
         );
-        assert_eq!(overall[0].fields.get("to_run").map(String::as_str), Some("2"));
-        assert_eq!(overall[0].fields.get("skipped").map(String::as_str), Some("3"));
+        assert_eq!(
+            overall[0].fields.get("to_run").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(overall[0].fields.get("done").map(String::as_str), Some("0"));
+        assert_eq!(
+            overall[0].fields.get("failed").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            overall[0].fields.get("skipped").map(String::as_str),
+            Some("3")
+        );
     }
 
     /// #337: a phase with no already-done skips emits "<N> to run, 0 skipped"
@@ -950,9 +981,172 @@ mod tests {
         assert!(
             overall[0]
                 .message
-                .contains("2 to run, 0 skipped (already done)"),
+                .contains("2 to run, 0 done, 0 failed, 0 skipped (already done)"),
             "overall mirrors the all-unmarked phase: {:?}",
             overall[0].message
+        );
+    }
+
+    /// The overall running total RECLASSIFIES terminal tasks instead of
+    /// re-counting every ever-planned task as still "to run" (the
+    /// run_20260610_153749 production shape: after matrix_eval's tasks all
+    /// completed and dependency_graph spawned its 1 task, the overall read
+    /// "17 to run" — the 16 completed tasks wore the to-run label). Phase
+    /// A's terminal tasks must read `done` in the overall emitted on phase
+    /// B's start edge, with the skip count unchanged.
+    #[test]
+    fn overall_reclassifies_terminal_tasks_at_phase_transition() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            state.apply(ClusterMutation::PhaseDepsSet {
+                deps: std::collections::HashMap::from([(
+                    PhaseId::from("dependency_graph"),
+                    vec![PhaseId::from("matrix_eval")],
+                )]),
+            });
+            // matrix_eval: 2 to-run + 1 already-done skip.
+            for id in ["m1", "m2"] {
+                add(&mut state, &task("matrix_eval", id, &[]));
+            }
+            add(&mut state, &task("matrix_eval", "ms", &[]));
+            skip(&mut state, "ms");
+            // dependency_graph: 1 task, gated on matrix_eval.
+            add(&mut state, &task("dependency_graph", "d1", &[]));
+
+            let mut narrator = RunNarrator::new();
+            // matrix_eval starts → overall #1.
+            narrator.observe(&state);
+            // matrix_eval fully terminates → dependency_graph starts →
+            // overall #2 on the same observe.
+            complete(&mut state, "m1");
+            complete(&mut state, "m2");
+            narrator.observe(&state);
+        });
+
+        let overall: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.starts_with("overall:"))
+            .collect();
+        assert_eq!(
+            overall.len(),
+            2,
+            "one overall line per started phase: {events:?}"
+        );
+        assert!(
+            overall[0]
+                .message
+                .contains("2 to run, 0 done, 0 failed, 1 skipped (already done)"),
+            "at matrix_eval's start nothing is terminal yet: {:?}",
+            overall[0].message
+        );
+        // The production bug: the completed matrix_eval tasks must NOT
+        // still count as to-run once dependency_graph spawns.
+        assert!(
+            overall[1]
+                .message
+                .contains("1 to run, 2 done, 0 failed, 1 skipped (already done)"),
+            "phase A's terminal tasks read done, the skip count is unchanged: {:?}",
+            overall[1].message
+        );
+        assert_eq!(
+            overall[1].fields.get("to_run").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(overall[1].fields.get("done").map(String::as_str), Some("2"));
+        assert_eq!(
+            overall[1].fields.get("failed").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            overall[1].fields.get("skipped").map(String::as_str),
+            Some("1")
+        );
+        // The per-phase line for the just-spawned phase is unchanged — a
+        // freshly-dispatchable phase owns no terminal work at ITS emit
+        // moment, so its idiom needs no done/failed split.
+        let dep_phase: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.fields.get("phase").map(String::as_str) == Some("dependency_graph")
+                    && e.message.contains("to run")
+            })
+            .collect();
+        assert_eq!(
+            dep_phase.len(),
+            1,
+            "one per-phase partition line: {events:?}"
+        );
+        assert!(
+            dep_phase[0]
+                .message
+                .contains("1 to run, 0 skipped (already done)"),
+            "per-phase line keeps its shape: {:?}",
+            dep_phase[0].message
+        );
+    }
+
+    /// An overall emitted MID-phase (an independent phase spawning while an
+    /// earlier phase is still partially complete) partitions the earlier
+    /// phase's tasks honestly: its completions read `done`, its terminal
+    /// failure reads `failed`, and only the genuinely-live remainder (plus
+    /// the new phase's fresh tasks) reads "to run".
+    #[test]
+    fn overall_mid_phase_partial_completions_read_correctly() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            // Independent phase alpha with 3 tasks.
+            for id in ["a1", "a2", "a3"] {
+                add(&mut state, &task("alpha", id, &[]));
+            }
+            let mut narrator = RunNarrator::new();
+            // alpha starts → overall #1.
+            narrator.observe(&state);
+            // Mid-phase: one completes, one fails terminally, one stays live.
+            complete(&mut state, "a1");
+            state.apply(ClusterMutation::TaskFailed {
+                attempt: 0,
+                hash: "a2".to_string(),
+                kind: ErrorType::NonRecoverable,
+                error: "boom".into(),
+                version: Default::default(),
+            });
+            // An independent phase beta spawns while alpha is mid-flight.
+            add(&mut state, &task("beta", "b1", &[]));
+            add(&mut state, &task("beta", "b2", &[]));
+            // beta starts → overall #2.
+            narrator.observe(&state);
+        });
+
+        let overall: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.starts_with("overall:"))
+            .collect();
+        assert_eq!(
+            overall.len(),
+            2,
+            "one overall line per started phase: {events:?}"
+        );
+        // alpha's live remainder (1) + beta's fresh tasks (2) = 3 to run;
+        // alpha's completion and failure are reclassified, not re-counted.
+        assert!(
+            overall[1]
+                .message
+                .contains("3 to run, 1 done, 1 failed, 0 skipped (already done)"),
+            "mid-phase partial completions partition honestly: {:?}",
+            overall[1].message
+        );
+        assert_eq!(
+            overall[1].fields.get("to_run").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(overall[1].fields.get("done").map(String::as_str), Some("1"));
+        assert_eq!(
+            overall[1].fields.get("failed").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            overall[1].fields.get("skipped").map(String::as_str),
+            Some("0")
         );
     }
 
@@ -1249,7 +1443,10 @@ mod tests {
             .filter(|e| e.message.contains("secondary left the cluster"))
             .collect();
         assert_eq!(lost.len(), 1, "exactly one peer-lost line: {events:?}");
-        assert_eq!(lost[0].fields.get("secondary").map(String::as_str), Some("n2"));
+        assert_eq!(
+            lost[0].fields.get("secondary").map(String::as_str),
+            Some("n2")
+        );
         // One remote secondary (n3) remains live after n2's departure.
         assert_eq!(lost[0].fields.get("live").map(String::as_str), Some("1"));
     }
@@ -1366,7 +1563,10 @@ mod tests {
             changed[0].fields.get("primary").map(String::as_str),
             Some("p2")
         );
-        assert_eq!(changed[0].fields.get("epoch").map(String::as_str), Some("2"));
+        assert_eq!(
+            changed[0].fields.get("epoch").map(String::as_str),
+            Some("2")
+        );
     }
 
     /// No-wall-clock implicit "election stuck": a primary that leaves the mesh
