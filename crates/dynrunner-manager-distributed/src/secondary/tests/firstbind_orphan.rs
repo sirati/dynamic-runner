@@ -822,7 +822,7 @@ async fn post_ready_assigned_swept_then_stale_terminal_is_dropped() {
 /// The buffered-terminal-replay fix RETAINS the terminal-bearing report on
 /// the absorb and RE-DELIVERS it on the next opportunity. This test drives
 /// the route DOWN (primary absent from the `MembershipView`), sweeps (the
-/// absorb retains the terminal in `pending_terminal_replays` — NOT lost),
+/// absorb retains the terminal in `pending_report_replays` — NOT lost),
 /// asserts the retention, then brings the route back UP and drains, asserting
 /// the terminal is re-delivered EXACTLY ONCE.
 ///
@@ -880,7 +880,7 @@ async fn swept_terminal_is_retained_and_redelivered_when_route_recovers() {
             // RETAINED, not lost: the terminal-bearing report sits in the
             // replay buffer (the fix). Nothing reached the wire yet.
             assert_eq!(
-                secondary.pending_terminal_replays.len(),
+                secondary.pending_report_replays.len(),
                 1,
                 "the absorbed terminal must be RETAINED in the replay buffer, \
                  not dropped"
@@ -897,7 +897,7 @@ async fn swept_terminal_is_retained_and_redelivered_when_route_recovers() {
                 .borrow_mut()
                 .push(dynrunner_protocol_primary_secondary::PeerId::from("setup"));
             secondary.publish_membership();
-            secondary.drain_terminal_replays().await;
+            secondary.drain_report_replays().await;
             secondary.drain_egress().await;
 
             // RE-DELIVERED EXACTLY ONCE: the wire log carries exactly one
@@ -906,12 +906,12 @@ async fn swept_terminal_is_retained_and_redelivered_when_route_recovers() {
             // (transport `Ok` proves nothing on a blackholed leg); the ack
             // below is what empties the buffer.
             assert_eq!(
-                secondary.pending_terminal_replays.len(),
+                secondary.pending_report_replays.len(),
                 1,
                 "the re-delivered terminal must stay retained AWAITING ACK"
             );
             assert!(
-                secondary.pending_terminal_replays[0].state.is_awaiting_ack(),
+                secondary.pending_report_replays[0].state.is_awaiting_ack(),
                 "the retention reason must flip NoRoute → AwaitingAck on the \
                  successful re-send"
             );
@@ -938,7 +938,7 @@ async fn swept_terminal_is_retained_and_redelivered_when_route_recovers() {
             // The primary's TerminalAck (matching the stamped seq) is the
             // ONLY drop site: deliver it through the real inbound arm and
             // the buffer empties.
-            let seq = secondary.pending_terminal_replays[0]
+            let seq = secondary.pending_report_replays[0]
                 .frame
                 .delivery_seq()
                 .expect("a sent terminal must carry its delivery_seq stamp");
@@ -954,7 +954,7 @@ async fn swept_terminal_is_retained_and_redelivered_when_route_recovers() {
                 )
                 .await;
             assert_eq!(
-                secondary.pending_terminal_replays.len(),
+                secondary.pending_report_replays.len(),
                 0,
                 "the TerminalAck must release the sent-but-unacked retention"
             );
@@ -1000,16 +1000,16 @@ async fn replay_buffer_is_fifo_and_requeues_on_reabsorb() {
                 .await
                 .unwrap();
             assert_eq!(
-                secondary.pending_terminal_replays.len(),
+                secondary.pending_report_replays.len(),
                 2,
                 "both terminals must be retained while the route is down"
             );
 
             // First drain attempt with the route STILL down: both re-absorb,
             // so the buffer length is preserved and order is unchanged.
-            secondary.drain_terminal_replays().await;
+            secondary.drain_report_replays().await;
             assert_eq!(
-                secondary.pending_terminal_replays.len(),
+                secondary.pending_report_replays.len(),
                 2,
                 "a drain while still no-route must re-queue both (never drop)"
             );
@@ -1023,18 +1023,18 @@ async fn replay_buffer_is_fifo_and_requeues_on_reabsorb() {
                 .borrow_mut()
                 .push(dynrunner_protocol_primary_secondary::PeerId::from("setup"));
             secondary.publish_membership();
-            secondary.drain_terminal_replays().await;
+            secondary.drain_report_replays().await;
             secondary.drain_egress().await;
             // Post-#352 both delivered frames stay retained AWAITING ACK
             // (in order); the wire log is the delivery evidence.
             assert_eq!(
-                secondary.pending_terminal_replays.len(),
+                secondary.pending_report_replays.len(),
                 2,
                 "both re-delivered terminals must stay retained awaiting ack"
             );
             assert!(
                 secondary
-                    .pending_terminal_replays
+                    .pending_report_replays
                     .iter()
                     .all(|e| e.state.is_awaiting_ack()),
                 "both retention reasons must flip NoRoute → AwaitingAck on \
@@ -1059,24 +1059,24 @@ async fn replay_buffer_is_fifo_and_requeues_on_reabsorb() {
             // order — ack the SECOND first to pin the by-seq (not by-head)
             // match, then the first.
             let seqs: Vec<u64> = secondary
-                .pending_terminal_replays
+                .pending_report_replays
                 .iter()
                 .map(|e| e.frame.delivery_seq().expect("stamped"))
                 .collect();
-            secondary.ack_terminal(seqs[1]);
+            secondary.ack_delivery(seqs[1]);
             assert_eq!(
-                secondary.pending_terminal_replays.len(),
+                secondary.pending_report_replays.len(),
                 1,
                 "acking the second seq drops exactly that entry"
             );
             assert_eq!(
-                secondary.pending_terminal_replays[0].frame.delivery_seq(),
+                secondary.pending_report_replays[0].frame.delivery_seq(),
                 Some(seqs[0]),
                 "the unacked first entry stays"
             );
-            secondary.ack_terminal(seqs[0]);
+            secondary.ack_delivery(seqs[0]);
             assert!(
-                secondary.pending_terminal_replays.is_empty(),
+                secondary.pending_report_replays.is_empty(),
                 "both acks together empty the buffer"
             );
         })
@@ -1110,7 +1110,7 @@ async fn non_terminal_send_is_not_buffered_on_no_route() {
             // retained (a stale capacity hint is re-emitted next tick anyway).
             secondary.request_task_for_worker(0).await.unwrap();
             assert_eq!(
-                secondary.pending_terminal_replays.len(),
+                secondary.pending_report_replays.len(),
                 0,
                 "a non-terminal (TaskRequest) send must NOT be buffered for replay"
             );
@@ -1154,7 +1154,7 @@ async fn replay_survives_primary_change_redelivers_to_new_primary() {
                 .await
                 .unwrap();
             assert_eq!(
-                secondary.pending_terminal_replays.len(),
+                secondary.pending_report_replays.len(),
                 1,
                 "the terminal is retained while the old primary is unreachable"
             );
@@ -1176,16 +1176,16 @@ async fn replay_survives_primary_change_redelivers_to_new_primary() {
             // Drain: the retained terminal re-resolves to the NEW primary and
             // is delivered (then stays retained awaiting the new primary's
             // TerminalAck — post-#352 only the ack drops it).
-            secondary.drain_terminal_replays().await;
+            secondary.drain_report_replays().await;
             secondary.drain_egress().await;
             assert_eq!(
-                secondary.pending_terminal_replays.len(),
+                secondary.pending_report_replays.len(),
                 1,
                 "the re-delivered terminal stays retained awaiting the NEW \
                  primary's ack"
             );
             assert!(
-                secondary.pending_terminal_replays[0].state.is_awaiting_ack(),
+                secondary.pending_report_replays[0].state.is_awaiting_ack(),
                 "retention reason flips to AwaitingAck on the successful \
                  re-send to the new primary"
             );
@@ -1233,7 +1233,7 @@ async fn primary_link_recovery_edge_drains_replay_buffer() {
                 .report_deferred_task_lost(0, "recover-hash")
                 .await
                 .unwrap();
-            assert_eq!(secondary.pending_terminal_replays.len(), 1);
+            assert_eq!(secondary.pending_report_replays.len(), 1);
 
             // Drive the election into Suspecting so the recovery edge has
             // something to revert; "setup" is the current primary so a
@@ -1263,13 +1263,13 @@ async fn primary_link_recovery_edge_drains_replay_buffer() {
             secondary.drain_egress().await;
 
             assert_eq!(
-                secondary.pending_terminal_replays.len(),
+                secondary.pending_report_replays.len(),
                 1,
                 "the primary-link-recovery edge must re-send the retained \
                  terminal (which then stays retained awaiting ack, #352)"
             );
             assert!(
-                secondary.pending_terminal_replays[0].state.is_awaiting_ack(),
+                secondary.pending_report_replays[0].state.is_awaiting_ack(),
                 "the recovery-edge re-send flips the retention reason \
                  NoRoute → AwaitingAck"
             );

@@ -201,7 +201,8 @@ where
                 // new authority (which inherited the in-flight ledger)
                 // adjudicates, and an answer it never asked for is
                 // dropped by its prober as unmatched. The frame is
-                // droppable (non-terminal-bearing): a lost answer just
+                // droppable (non-confirmable: `requires_delivery_ack`
+                // is false, so no retention): a lost answer just
                 // means the primary's response window expires and it
                 // re-probes a full window later.
                 let held = self.lifecycle.holds_task(&task_hash);
@@ -247,7 +248,7 @@ where
                 // flowing through the keepalive / dispatch preambles
                 // unchanged, so the failover-arming inputs are untouched
                 // by this feature.
-                self.ack_terminal(seq);
+                self.ack_delivery(seq);
             }
             DistributedMessage::TimeoutDetected {
                 sender_id,

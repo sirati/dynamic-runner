@@ -38,6 +38,7 @@ use self::lifecycle::{MeshFormation, SecondaryLifecycle};
 
 pub mod control;
 mod coordinator;
+pub(crate) mod custom_message;
 mod dispatch;
 mod election;
 mod lifecycle;
@@ -622,7 +623,7 @@ where
     /// Buffered-terminal-replay queue — the reporting concern's retain
     /// buffer for a terminal-bearing primary-bound report that has not
     /// yet been CONFIRMED delivered at the authority, for either of two
-    /// retention reasons ([`resource::TerminalSendState`]):
+    /// retention reasons ([`resource::RetainedSendState`]):
     ///   * `NoRoute` — the send was ABSORBED on a transient no-route
     ///     (nothing was ever queued);
     ///   * `AwaitingAck` — the send returned `Ok` but the primary's
@@ -640,7 +641,7 @@ where
     /// before reporting) but never reached the authority, so the
     /// primary's in-flight entry strands forever (phantom-busy; the phase
     /// barrier wedges). This buffer is that fix: every TERMINAL-bearing
-    /// (`DistributedMessage::is_terminal_bearing`) report is RETAINED
+    /// (`DistributedMessage::requires_delivery_ack`) report is RETAINED
     /// here from the send until its ack.
     ///
     /// Scope: ONLY terminal-bearing reports are buffered — keepalives /
@@ -655,9 +656,9 @@ where
     /// deferred-peer-message flush) AND the primary-link-recovery edge
     /// (`record_primary_message`, where Suspecting/Voting/Candidate →
     /// Normal). A drain re-sends the DUE entries only (`NoRoute` always;
-    /// `AwaitingAck` once `sent_at` ages past `terminal_ack_timeout` —
+    /// `AwaitingAck` once `sent_at` ages past `delivery_ack_timeout` —
     /// the no-route-equivalent edge); the ONLY drop site is
-    /// `ack_terminal` (an inbound `TerminalAck` matching the entry's
+    /// `ack_delivery` (an inbound `TerminalAck` matching the entry's
     /// `delivery_seq` exactly).
     ///
     /// Each re-send carries the SAME `delivery_seq` and re-retains at
@@ -677,47 +678,63 @@ where
     /// buffer is its private mechanism — a drain is a no-op outside an
     /// operational run (no terminal can be produced there), so it needs
     /// no lifecycle gating.
-    pub(in crate::secondary) pending_terminal_replays: Vec<resource::PendingTerminal<I>>,
+    pub(in crate::secondary) pending_report_replays: Vec<resource::RetainedReport<I>>,
 
-    /// Replay-attempt tally per retained terminal (`delivery_seq` →
+    /// Replay-attempt tally per retained confirmable report (`delivery_seq` →
     /// count of timed-out-and-replayed sends), the reporting concern's
     /// PERMANENT-failure detector (#366). The replay loop retries
     /// forever by design — correct for a transient outage, but a
     /// deterministic per-message failure (the canonical case: a frame
     /// over the mesh wire limit, which the transport's egress gate
     /// drops LOUDLY but can never deliver) would otherwise churn every
-    /// `terminal_ack_timeout` with only per-attempt WARNs that never
+    /// `delivery_ack_timeout` with only per-attempt WARNs that never
     /// say "this specific report is never going to make it". Once a
     /// seq's tally reaches
-    /// [`resource::TERMINAL_REPLAY_ESCALATION_ATTEMPTS`] the drain
+    /// [`resource::REPORT_REPLAY_ESCALATION_ATTEMPTS`] the drain
     /// escalates to ERROR naming the task and the likely causes (and
     /// re-escalates on every further multiple, so a long-stuck report
     /// stays visible). Counting keys on the seq because the drain
     /// round-trips each entry through `send_to_primary`'s re-retention
-    /// (a FRESH `PendingTerminal` each time) — the seq is the one
-    /// sticky identity. Entries are dropped on `ack_terminal` (the
+    /// (a FRESH `RetainedReport` each time) — the seq is the one
+    /// sticky identity. Entries are dropped on `ack_delivery` (the
     /// only delivery-confirmed site). Diagnostic bookkeeping only:
     /// never read by routing, liveness, or the replay decision itself.
-    pub(in crate::secondary) terminal_replay_attempts: std::collections::HashMap<u64, u32>,
+    pub(in crate::secondary) report_replay_attempts: std::collections::HashMap<u64, u32>,
 
     /// Per-secondary monotonic `delivery_seq` counter (#352), owned by
-    /// the `send_to_primary` stamping chokepoint: every terminal-bearing
-    /// primary-bound report is stamped with the next value on its first
+    /// the `send_to_primary` stamping chokepoint: every confirmable
+    /// primary-bound report (terminal-bearing, or an IMPORTANT custom
+    /// message — F5) is stamped with the next value on its first
     /// send (replays keep their original stamp). Matched by the
     /// primary's echoed `TerminalAck { seq }` to drop the corresponding
-    /// `pending_terminal_replays` entry. Starts at 1 so a `0` never
+    /// `pending_report_replays` entry. Starts at 1 so a `0` never
     /// appears on the wire (`Some(0)` would be valid but a non-zero
     /// floor makes a default-initialised stamp visibly distinct in
     /// logs).
-    pub(in crate::secondary) next_terminal_seq: u64,
+    pub(in crate::secondary) next_delivery_seq: u64,
+
+    /// Per-origin monotonic custom-message sequence (F5), owned by the
+    /// [`custom_message`] send seam: every consumer custom message this
+    /// secondary ORIGINATES — droppable and important alike — is stamped
+    /// with the next value, so `(secondary_id, msg_seq)` is the
+    /// cluster-wide idempotency key the primary's CRDT inbox dedups
+    /// transport replays by. Distinct from `next_delivery_seq` (the
+    /// #352 retention/ack key): `msg_seq` identifies the MESSAGE,
+    /// `delivery_seq` one retention-buffer entry. Starts at 1 so the
+    /// per-origin handled watermark's "all of `1..=w` handled"
+    /// contiguous-prefix walk has a fixed base.
+    // F2-merge seam twin of `custom_message::send_custom_to_primary`
+    // (its sole reader/writer besides the constructor).
+    #[allow(dead_code)]
+    pub(in crate::secondary) next_custom_msg_seq: u64,
 
     /// How long a sent terminal waits for its `TerminalAck` before the
     /// drain treats it as no-route-equivalent and replays it. Seeded
-    /// from [`resource::DEFAULT_TERMINAL_ACK_TIMEOUT`] (see its doc for
+    /// from [`resource::DEFAULT_DELIVERY_ACK_TIMEOUT`] (see its doc for
     /// the 15s justification against the 60s QUIC idle timeout); tests
     /// drive it sub-second directly. Delivery bookkeeping only — never
     /// an input to the failover-health probe.
-    pub(in crate::secondary) terminal_ack_timeout: std::time::Duration,
+    pub(in crate::secondary) delivery_ack_timeout: std::time::Duration,
 
     /// Per-iteration `select!`-arm accounting for the secondary's
     /// `process_tasks` operational loop. The co-located topology runs the

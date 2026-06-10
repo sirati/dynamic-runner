@@ -13,7 +13,7 @@
 //! `delivery_seq`-stamped at the `send_to_primary` chokepoint and stays
 //! RETAINED (`AwaitingAck`) after a transport-`Ok` send; the primary's
 //! ingest echoes a `TerminalAck { seq }` per landing, which is the ONLY
-//! drop site; an un-acked send ages past `terminal_ack_timeout` and is
+//! drop site; an un-acked send ages past `delivery_ack_timeout` and is
 //! treated as no-route-equivalent — replayed (same seq) through the
 //! EXISTING absorb→replay machinery.
 //!
@@ -64,8 +64,8 @@ async fn blackholed_leg_unacked_terminal_replays_with_same_seq_until_acked() {
             *secondary.pool_mut() = pool;
             // Sub-second ack deadline so the test drives the timeout edge
             // without wall-clock cost; production default is 15s (see
-            // `DEFAULT_TERMINAL_ACK_TIMEOUT`).
-            secondary.terminal_ack_timeout = Duration::from_millis(50);
+            // `DEFAULT_DELIVERY_ACK_TIMEOUT`).
+            secondary.delivery_ack_timeout = Duration::from_millis(50);
 
             // The send SUCCEEDS (route up, membership healthy — the
             // blackholed leg looks exactly like this) …
@@ -84,15 +84,15 @@ async fn blackholed_leg_unacked_terminal_replays_with_same_seq_until_acked() {
 
             // … and the frame is RETAINED awaiting the ack, not dropped.
             assert_eq!(
-                secondary.pending_terminal_replays.len(),
+                secondary.pending_report_replays.len(),
                 1,
                 "a transport-Ok terminal send must stay retained until acked"
             );
-            assert!(secondary.pending_terminal_replays[0].state.is_awaiting_ack());
+            assert!(secondary.pending_report_replays[0].state.is_awaiting_ack());
 
             // Inside the ack window a drain re-sends NOTHING (the ack may
             // simply still be in flight — no spurious replays).
-            secondary.drain_terminal_replays().await;
+            secondary.drain_report_replays().await;
             secondary.drain_egress().await;
             assert_eq!(
                 sent_seqs_for_hash(&log, "bh-hash").len(),
@@ -104,7 +104,7 @@ async fn blackholed_leg_unacked_terminal_replays_with_same_seq_until_acked() {
             // drain treats the send as no-route-equivalent and replays —
             // with the SAME seq.
             tokio::time::sleep(Duration::from_millis(60)).await;
-            secondary.drain_terminal_replays().await;
+            secondary.drain_report_replays().await;
             secondary.drain_egress().await;
             let after_replay = sent_seqs_for_hash(&log, "bh-hash");
             assert_eq!(
@@ -119,7 +119,7 @@ async fn blackholed_leg_unacked_terminal_replays_with_same_seq_until_acked() {
                  hash-keyed idempotence + per-landing ack key on it)"
             );
             assert_eq!(
-                secondary.pending_terminal_replays.len(),
+                secondary.pending_report_replays.len(),
                 1,
                 "still exactly one retained entry across the replay"
             );
@@ -138,14 +138,14 @@ async fn blackholed_leg_unacked_terminal_replays_with_same_seq_until_acked() {
                 )
                 .await;
             assert!(
-                secondary.pending_terminal_replays.is_empty(),
+                secondary.pending_report_replays.is_empty(),
                 "the TerminalAck is the (only) drop site"
             );
 
             // And the replay machinery goes quiet: another full timeout +
             // drain produces no further wire traffic.
             tokio::time::sleep(Duration::from_millis(60)).await;
-            secondary.drain_terminal_replays().await;
+            secondary.drain_report_replays().await;
             secondary.drain_egress().await;
             assert_eq!(
                 sent_seqs_for_hash(&log, "bh-hash").len(),
@@ -172,14 +172,14 @@ async fn acked_terminal_leaves_buffer_and_never_replays() {
             let pool = secondary.initialize_workers(&mut factory).await.unwrap();
             secondary.enter_operational_for_test();
             *secondary.pool_mut() = pool;
-            secondary.terminal_ack_timeout = Duration::from_millis(50);
+            secondary.delivery_ack_timeout = Duration::from_millis(50);
 
             secondary
                 .report_deferred_task_lost(0, "acked-hash")
                 .await
                 .unwrap();
             secondary.drain_egress().await;
-            let seq = secondary.pending_terminal_replays[0]
+            let seq = secondary.pending_report_replays[0]
                 .frame
                 .delivery_seq()
                 .expect("stamped");
@@ -196,15 +196,15 @@ async fn acked_terminal_leaves_buffer_and_never_replays() {
                     &mut factory,
                 )
                 .await;
-            assert!(secondary.pending_terminal_replays.is_empty());
+            assert!(secondary.pending_report_replays.is_empty());
 
             // A duplicate ack (re-acked replay landing whose first ack
             // already cleared the entry) is a benign no-op.
-            secondary.ack_terminal(seq);
-            assert!(secondary.pending_terminal_replays.is_empty());
+            secondary.ack_delivery(seq);
+            assert!(secondary.pending_report_replays.is_empty());
 
             tokio::time::sleep(Duration::from_millis(60)).await;
-            secondary.drain_terminal_replays().await;
+            secondary.drain_report_replays().await;
             secondary.drain_egress().await;
             assert_eq!(
                 sent_seqs_for_hash(&log, "acked-hash").len(),
@@ -234,7 +234,7 @@ async fn successful_non_terminal_send_is_not_stamped_or_retained() {
             secondary.request_task_for_worker(0).await.unwrap();
             secondary.drain_egress().await;
             assert!(
-                secondary.pending_terminal_replays.is_empty(),
+                secondary.pending_report_replays.is_empty(),
                 "a non-terminal send must not be retained on success"
             );
             let requests: Vec<_> = log
@@ -271,7 +271,7 @@ async fn ack_timeout_replay_never_feeds_failover_arming() {
             let pool = secondary.initialize_workers(&mut factory).await.unwrap();
             secondary.enter_operational_for_test();
             *secondary.pool_mut() = pool;
-            secondary.terminal_ack_timeout = Duration::from_millis(20);
+            secondary.delivery_ack_timeout = Duration::from_millis(20);
 
             secondary
                 .report_deferred_task_lost(0, "liveness-hash")
@@ -280,11 +280,11 @@ async fn ack_timeout_replay_never_feeds_failover_arming() {
             // Three full timeout+replay cycles on the blackholed leg.
             for _ in 0..3 {
                 tokio::time::sleep(Duration::from_millis(25)).await;
-                secondary.drain_terminal_replays().await;
+                secondary.drain_report_replays().await;
                 secondary.drain_egress().await;
             }
             assert_eq!(
-                secondary.pending_terminal_replays.len(),
+                secondary.pending_report_replays.len(),
                 1,
                 "the un-acked terminal stays retained across the cycles"
             );
@@ -309,7 +309,7 @@ async fn ack_timeout_replay_never_feeds_failover_arming() {
 }
 
 /// The permanent-failure detector (#366): each timed-out replay of one
-/// seq bumps its `terminal_replay_attempts` tally (the entry itself is
+/// seq bumps its `report_replay_attempts` tally (the entry itself is
 /// recreated per re-retention, so the seq-keyed tally is what survives
 /// to cross the escalation threshold), and the ack clears the tally
 /// along with the retention.
@@ -326,19 +326,19 @@ async fn timed_out_replays_tally_per_seq_and_ack_clears_the_tally() {
             let pool = secondary.initialize_workers(&mut factory).await.unwrap();
             secondary.enter_operational_for_test();
             *secondary.pool_mut() = pool;
-            secondary.terminal_ack_timeout = Duration::from_millis(20);
+            secondary.delivery_ack_timeout = Duration::from_millis(20);
 
             secondary
                 .report_deferred_task_lost(0, "tally-hash")
                 .await
                 .unwrap();
             secondary.drain_egress().await;
-            let seq = secondary.pending_terminal_replays[0]
+            let seq = secondary.pending_report_replays[0]
                 .frame
                 .delivery_seq()
                 .expect("stamped");
             assert!(
-                secondary.terminal_replay_attempts.is_empty(),
+                secondary.report_replay_attempts.is_empty(),
                 "the first SEND is not a replay; the tally starts on the \
                  first timed-out re-send"
             );
@@ -346,10 +346,10 @@ async fn timed_out_replays_tally_per_seq_and_ack_clears_the_tally() {
             // Three timed-out replay rounds → tally 3 for this seq.
             for round in 1..=3u32 {
                 tokio::time::sleep(Duration::from_millis(30)).await;
-                secondary.drain_terminal_replays().await;
+                secondary.drain_report_replays().await;
                 secondary.drain_egress().await;
                 assert_eq!(
-                    secondary.terminal_replay_attempts.get(&seq),
+                    secondary.report_replay_attempts.get(&seq),
                     Some(&round),
                     "each timed-out replay must bump the seq's tally"
                 );
@@ -372,9 +372,9 @@ async fn timed_out_replays_tally_per_seq_and_ack_clears_the_tally() {
                     &mut factory,
                 )
                 .await;
-            assert!(secondary.pending_terminal_replays.is_empty());
+            assert!(secondary.pending_report_replays.is_empty());
             assert!(
-                secondary.terminal_replay_attempts.is_empty(),
+                secondary.report_replay_attempts.is_empty(),
                 "a confirmed delivery must clear the permanent-failure tally"
             );
         })

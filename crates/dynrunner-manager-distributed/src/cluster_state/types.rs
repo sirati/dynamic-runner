@@ -391,6 +391,46 @@ pub struct RespawnEventRecord {
     pub at: std::time::SystemTime,
 }
 
+/// Per-message state in the replicated custom-message inbox (F5),
+/// keyed by the per-origin `(origin, seq)` idempotency pair.
+///
+/// A sticky lattice `Unhandled ⊑ {Handled, Failed}` (the implicit
+/// BOTTOM — "unposted" — is map ABSENCE; the `DiscoveryDebt`
+/// precedent's bottom erased to absence because, unlike
+/// `DiscoveryDebt`, the key space is unbounded and an explicit bottom
+/// would never be stored). BOTH terminals are LATCHES that win
+/// regardless of arrival order — each terminal's apply rule inserts it
+/// directly into an absent slot so a late `Posted` NoOps. The two
+/// terminals are siblings, not ordered by the lattice; their
+/// theoretical join is deterministic Handled-wins (`Failed → Handled`
+/// Applied, `Handled → Failed` NoOp), documented-but-never-exercised:
+/// the primary originates exactly ONE terminal per message. (Under
+/// watermark compaction the Handled/Failed label is erased entirely —
+/// a compacted key reads as "terminal" — so a label-divergent replica
+/// pair still converges physically: same pruned entries, same
+/// watermark.) The payload lives ONLY on `Unhandled`; either terminal
+/// transition DROPS it (tombstone, a few bytes), and the per-origin
+/// contiguous-prefix watermark (`custom_terminal_watermarks`)
+/// physically prunes terminal tombstones of both kinds (the GC story —
+/// the ≤100 KB bodies never accumulate).
+///
+/// Derives `Serialize`/`Deserialize` because it crosses the wire as the
+/// snapshot map VALUE; `Hash`/`Eq` so the digest can fold the
+/// `((origin, seq), state)` PAIR.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CustomMsgState {
+    /// Posted at the authority but not yet consumed by a
+    /// `custom_message_handler` — the promoted-primary hydrate replays
+    /// every entry in this state (and ONLY this state).
+    Unhandled { topic: String, data: Vec<u8> },
+    /// Consumed by a clean handler return — payload dropped; sticky.
+    Handled,
+    /// The handler RAISED — a terminal USER ERROR, never retried, the
+    /// handler's partial effect discarded; payload dropped; sticky. A
+    /// promoted primary never re-dispatches a `Failed` entry.
+    Failed,
+}
+
 /// Coarse convergence band. The band dominates FIRST in the
 /// [`TaskJoinKey`] ordering, so any terminal beats any non-terminal
 /// regardless of version (C3 req-a: a worker outcome that raced a reset

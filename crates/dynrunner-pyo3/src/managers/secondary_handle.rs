@@ -15,11 +15,19 @@
 //! `worker_message_listener(worker_id, type_id, topic, data,
 //! secondary_handle)` — consumers never construct one.
 
-use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use dynrunner_manager_distributed::secondary::SecondaryControlCommand;
 use dynrunner_protocol_manager_worker::CUSTOM_MESSAGE_MAX_BYTES;
+
+// The worker-IPC and mesh custom-message limits are deliberately ONE
+// consumer-facing number (both gates in this file quote it as "the
+// 100 KiB custom-message limit"); a divergence would make this file's
+// pre-checks lie to one of the two downstream defensive re-checks.
+const _: () = assert!(
+    CUSTOM_MESSAGE_MAX_BYTES == dynrunner_protocol_primary_secondary::CUSTOM_MESSAGE_MAX_BYTES
+);
 
 /// Python-facing `SecondaryHandle`.
 #[pyclass(name = "SecondaryHandle")]
@@ -77,22 +85,42 @@ impl PySecondaryHandle {
     }
 
     /// Relay a custom message to the CURRENT PRIMARY (droppable, or
-    /// retained + CRDT-resident when `important=True`).
+    /// retained + CRDT-resident when `important=True`). Non-blocking:
+    /// the message rides the control channel to the operational loop,
+    /// whose send seam stamps the per-origin idempotency key and hands
+    /// the frame to the primary-send chokepoint — `important=False` is
+    /// droppable (at-most-once; lost on failover/no-route by design),
+    /// `important=True` is retained and replayed until the primary
+    /// confirms the landing, then ledger-recorded until the consumer's
+    /// `custom_message_handler` resolves it (see the
+    /// `CustomMessageHandler` contract in `task_protocol.py`).
     ///
-    /// TODO(F5): stub — the secondary→primary custom-message channel
-    /// (DistributedMessage::CustomMessage + the #352 retention reuse +
-    /// the CustomMessagePosted/Handled CRDT lattice) is feature 5's
-    /// surface and is implemented by its owning change; this method
-    /// signature is the frozen seam it fills in. Until then it raises
-    /// `NotImplementedError` so a consumer wiring against it fails
-    /// loudly rather than silently dropping.
+    /// Raises `ValueError` (naming size + limit) when `data` exceeds
+    /// `CUSTOM_MESSAGE_MAX_BYTES` (100 KiB); `RuntimeError` when the
+    /// secondary's operational loop is gone (run torn down).
     #[pyo3(signature = (topic, data, important = false))]
-    #[allow(unused_variables)]
     fn send_to_primary(&self, topic: &str, data: &[u8], important: bool) -> PyResult<()> {
-        Err(PyNotImplementedError::new_err(
-            "SecondaryHandle.send_to_primary is not wired yet: the \
-             secondary→primary custom-message channel (feature 5) ships \
-             separately. send_to_worker is live.",
-        ))
+        if data.len() > CUSTOM_MESSAGE_MAX_BYTES {
+            return Err(PyValueError::new_err(format!(
+                "send_to_primary data for topic {topic:?} is {} bytes, exceeding the \
+                 CUSTOM_MESSAGE_MAX_BYTES limit of {CUSTOM_MESSAGE_MAX_BYTES} bytes \
+                 (100 KiB). Custom messages are for signal-sized consumer payloads; \
+                 split bulk data into multiple messages or publish it through the \
+                 task-output channels.",
+                data.len(),
+            )));
+        }
+        self.control_tx
+            .send(SecondaryControlCommand::SendToPrimary {
+                topic: topic.to_owned(),
+                data: data.to_vec(),
+                important,
+            })
+            .map_err(|_| {
+                PyRuntimeError::new_err(
+                    "send_to_primary failed: the secondary's operational loop has \
+                     shut down (run torn down)",
+                )
+            })
     }
 }

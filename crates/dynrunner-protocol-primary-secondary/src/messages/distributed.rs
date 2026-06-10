@@ -553,6 +553,71 @@ pub enum DistributedMessage<I> {
         /// The confirmed report's `delivery_seq`, echoed verbatim.
         seq: u64,
     },
+    /// Secondary -> Primary consumer-defined message (F5). The framework
+    /// never interprets `topic` or `data` — they are the consumer's
+    /// routing key + payload, delivered to the primary-side
+    /// `custom_message_handler` hook.
+    ///
+    /// Two delivery classes, selected by `important`:
+    ///   * `important = false` (DROPPABLE): fire-and-forget through the
+    ///     secondary's `send_to_primary` chokepoint — no retention, no
+    ///     CRDT residency, at-most-once. Lost on failover by design.
+    ///   * `important = true`: stamped with `delivery_seq` at the
+    ///     chokepoint and RETAINED exactly like a terminal report (the
+    ///     #352 machinery): unacked frames replay with the SAME seq
+    ///     through the re-resolving [`Destination::Primary`], so a
+    ///     failover mid-flight re-lands at the NEW primary. The primary
+    ///     acks per landing with the existing
+    ///     [`DistributedMessage::TerminalAck`] and originates the
+    ///     `CustomMessagePosted` / `CustomMessageHandled` CRDT mutations
+    ///     (see `ClusterMutation`) so a promoted primary replays every
+    ///     not-yet-handled message at hydrate.
+    CustomMessage {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// ORIGINATOR identity (NOT the wire `sender_id` — a relayed /
+        /// peer-forwarded landing carries a forwarder's `sender_id`
+        /// while the originator's retention buffer still waits). The
+        /// `(origin_secondary_id, msg_seq)` pair is the message's
+        /// cluster-wide IDEMPOTENCY KEY: a transport replay re-posts
+        /// the same key and the CRDT apply NoOps it.
+        origin_secondary_id: String,
+        /// Per-origin monotonic message sequence, stamped by the
+        /// originating secondary's custom-message send entry point.
+        /// With `origin_secondary_id` it forms the idempotency key.
+        /// Distinct from `delivery_seq` (the #352 retention/ack key):
+        /// `msg_seq` identifies the MESSAGE across the cluster;
+        /// `delivery_seq` identifies one retention-buffer entry on the
+        /// originator.
+        msg_seq: u64,
+        /// Consumer routing key — the framework never interprets it.
+        topic: String,
+        /// Consumer payload, ≤ [`crate::CUSTOM_MESSAGE_MAX_BYTES`]
+        /// (enforced at the send entry points, tolerated by the wire).
+        data: Vec<u8>,
+        /// Delivery class — see the variant doc.
+        important: bool,
+        /// App-level delivery-confirmation sequence id (#352),
+        /// IMPORTANT-only: stamped at the secondary's `send_to_primary`
+        /// chokepoint (the same per-secondary monotonic counter the
+        /// terminal reports use); the primary's ingest answers each
+        /// landing with a [`DistributedMessage::TerminalAck`] carrying
+        /// it back. A replay re-sends the SAME seq. Always `None` on a
+        /// droppable frame (never stamped — droppables are not
+        /// retained). `#[serde(default, skip_serializing_if)]` keeps
+        /// the wire bytes byte-identical while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_seq: Option<u64>,
+    },
     /// Primary -> holder secondary: per-task reconciliation probe
     /// (#308). Asks "do you still hold `task_hash` in any live
     /// bookkeeping?" — emitted by the primary's per-task deadline

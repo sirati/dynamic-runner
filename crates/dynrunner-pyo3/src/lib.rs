@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod config;
+mod custom_message_bridge;
 mod discovery;
 mod driver;
 mod estimator;

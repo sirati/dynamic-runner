@@ -41,13 +41,26 @@ use super::types::{PhaseTally, RespawnEventRecord};
 
 /// Grow-only-MAX merge of an `incoming` map into `local` (the restore-in
 /// merge loop). For each incoming `(k, v)` the local entry ratchets up to
-/// `max(local, v)`; a key only in `incoming` is inserted at its value (an
-/// `or_insert(0)` then `max` = the incoming value). NEVER replaces,
-/// `or_insert`s, or `+=`s — the merge is idempotent and order-independent.
-pub(super) fn merge_grow_max<K: Eq + Hash>(local: &mut HashMap<K, u32>, incoming: HashMap<K, u32>) {
+/// `max(local, v)`; a key only in `incoming` is inserted at its value.
+/// NEVER replaces downward or `+=`s — the merge is idempotent and
+/// order-independent. Generic over the monotone value (`u32` event/used
+/// counts; the F5 `u64` per-origin watermark) — ONE merge rule, one
+/// place.
+pub(super) fn merge_grow_max<K: Eq + Hash, V: Ord>(
+    local: &mut HashMap<K, V>,
+    incoming: HashMap<K, V>,
+) {
     for (k, v) in incoming {
-        let e = local.entry(k).or_insert(0);
-        *e = (*e).max(v);
+        match local.entry(k) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if v > *e.get() {
+                    e.insert(v);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(v);
+            }
+        }
     }
 }
 
@@ -57,7 +70,7 @@ pub(super) fn merge_grow_max<K: Eq + Hash>(local: &mut HashMap<K, u32>, incoming
 /// divergent-count entry is detected by `field_behind` and pulled. The
 /// per-entry hash is XOR-folded so the result is invariant under iteration
 /// order.
-pub(super) fn fold_grow_max<K: Hash>(map: &HashMap<K, u32>) -> u64 {
+pub(super) fn fold_grow_max<K: Hash, V: Hash>(map: &HashMap<K, V>) -> u64 {
     let mut h = 0u64;
     for (k, v) in map {
         let mut hasher = DefaultHasher::new();

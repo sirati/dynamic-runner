@@ -160,6 +160,52 @@ TaskCompletedListener = Callable[
 ]
 
 
+# Type alias for the optional ``custom_message_handler`` task attribute
+# (F5 -- secondary->primary custom messages). Fired ON THE PRIMARY only,
+# once per delivered message, with
+# ``(origin, topic, data, important, primary_handle)``:
+#   - ``origin``: the originating secondary's id (the message's
+#     idempotency-key half; transport replays are deduped by the
+#     framework before the handler ever fires).
+#   - ``topic``: the consumer routing key the sender supplied -- the
+#     framework never interprets it.
+#   - ``data``: the opaque payload bytes (<= 100 KiB, enforced at the
+#     send API).
+#   - ``important``: the sender's delivery class. ``False`` = droppable
+#     (at-most-once; lost on failover/no-route by design). ``True`` =
+#     important: delivered at-least-once -- retained and replayed by the
+#     sending secondary until the primary confirms the landing, recorded
+#     in the replicated ledger until this handler RETURNS CLEANLY, and
+#     replayed to the promoted primary's handler after a failover that
+#     interrupted handling.
+#   - ``primary_handle``: the live in-flight ``PrimaryHandle`` of THE
+#     primary the handler runs on -- the streamed-spawn site
+#     (``primary_handle.spawn_tasks(batch)``).
+# Error contract: a raise is a USER ERROR and is TERMINAL -- the
+# message transitions to ``Failed`` in the replicated ledger (payload
+# dropped), is NEVER retried (not on this primary, not on a promoted
+# one), and the framework logs a structured ERROR carrying
+# origin/seq/topic and the exception. The handler is all-or-nothing:
+# every ``primary_handle`` command it issued before raising (e.g. a
+# ``spawn_tasks`` batch) is DISCARDED unexecuted -- a raising handler
+# produces NO effect anywhere in the cluster. A clean return is atomic
+# the other way: the handler's effects and the handled-fact replicate
+# in one batch, so no replica can ever observe one without the other.
+# Per-origin send order is preserved: message N+1 from one origin is
+# never handled before message N resolves (handled or failed). The
+# unhandled backlog is never capped; if the handler cannot keep up the
+# primary logs a rate-limited WARN naming the backlog size and the
+# oldest entry's age. Absent or ``None`` opts out (important messages
+# are then consumed unhandled with a WARN).
+#
+# Spawn-anytime note (F4) for handlers that spawn: spawning into a phase
+# that already ENDED re-opens it and re-fires its ``on_phase_end`` at
+# the re-drain -- ``on_phase_end`` must be idempotent for phases that
+# can be late-spawned into. Duplicate task identities (content hash) in
+# a re-streamed batch are dropped idempotently by ``spawn_tasks``.
+CustomMessageHandler = Callable[[str, str, bytes, bool, "PrimaryHandle"], None]
+
+
 # Type alias for the optional `worker_message_listener` task attribute.
 # Fired ON THE SECONDARY hosting the sending worker, once per
 # `Task.send_message(topic, data)` frame, with
@@ -173,9 +219,10 @@ TaskCompletedListener = Callable[
 #     (≤ `CUSTOM_MESSAGE_MAX_BYTES`, 100 KiB).
 #   - `secondary_handle`: a `SecondaryHandle` — the listener replies
 #     via `secondary_handle.send_to_worker(worker_id, topic, data)`
-#     (the worker drains replies via `Task.poll_messages()`), and —
-#     once feature 5 lands — relays cluster-wide via
-#     `send_to_primary(topic, data, important=...)`.
+#     (the worker drains replies via `Task.poll_messages()`), and
+#     relays cluster-wide via
+#     `send_to_primary(topic, data, important=...)` (see
+#     :data:`CustomMessageHandler` for the primary-side contract).
 # Messages from one worker arrive in send order. The listener runs on
 # the secondary's worker-message dispatcher task (off the operational
 # loop) with panic + `PyErr` isolation — the `task_completed_listener`
@@ -336,6 +383,16 @@ class TaskDefinition(Protocol):
     # listener can never stall the apply path or tear the dispatcher
     # task down. Absent or ``None`` opts out.
     task_completed_listener: Optional[TaskCompletedListener]
+
+    # Optional custom-message handler attribute (F5).
+    #
+    # When the task exposes ``custom_message_handler`` as a callable
+    # matching :data:`CustomMessageHandler`, the framework invokes it ON
+    # THE PRIMARY for every secondary->primary custom message
+    # (``SecondaryHandle.send_to_primary``). See the alias doc for the
+    # full delivery/ordering/error contract. Absent or ``None`` opts
+    # out.
+    custom_message_handler: Optional[CustomMessageHandler]
 
     # Optional worker custom-message listener attribute.
     #

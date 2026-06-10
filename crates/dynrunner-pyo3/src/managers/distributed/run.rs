@@ -178,6 +178,16 @@ impl PyDistributedManager {
                 self.task_definition.clone_ref(py),
                 phase_hook_raise_latch.clone(),
             ));
+        // The setup peer's own `custom_message_handler` hook ref-bump
+        // (F5): a custom message can land during the pre-relocate
+        // bootstrap window, so the setup-peer coordinator installs the
+        // SAME hook the promoted primary does (built inside the detached
+        // runtime from its command sender, below).
+        let setup_custom_message_handler_def =
+            crate::custom_message_bridge::has_custom_message_handler(
+                &self.task_definition.bind(py).clone(),
+            )
+            .then(|| self.task_definition.clone_ref(py));
 
         // Per-secondary PROMOTE-recipe inputs, built on the GIL thread so each
         // captures its own `Py<PyAny>` ref-bumps. Under mesh-always the
@@ -207,6 +217,10 @@ impl PyDistributedManager {
         type SecDiscoveryHandle = (Py<PyAny>, Py<PyAny>, PathBuf);
         let mut sec_discovery_handles: Vec<Option<SecDiscoveryHandle>> =
             Vec::with_capacity(num_secondaries as usize);
+        // Per-secondary `custom_message_handler` ref-bumps (F5) for the
+        // promote recipes — `None` when the consumer exposes no hook.
+        let mut sec_custom_message_handler_defs: Vec<Option<Py<PyAny>>> =
+            Vec::with_capacity(num_secondaries as usize);
         for _ in 0..num_secondaries {
             let on_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
                 crate::managers::lifecycle::make_on_phase_start(self.task_definition.clone_ref(py)),
@@ -222,6 +236,17 @@ impl PyDistributedManager {
                     raise_latch.clone(),
                 ));
             sec_phase_lifecycle_callbacks.push((on_start, on_end, raise_latch));
+            // The promoted in-process primary's `custom_message_handler`
+            // hook ref-bump (F5), captured per secondary (any one may be
+            // the relocate target) IFF the duck-typed attribute exists.
+            // The recipe builds the closure at fire time from the
+            // promoted coordinator's own internal command sender.
+            sec_custom_message_handler_defs.push(
+                crate::custom_message_bridge::has_custom_message_handler(
+                    &self.task_definition.bind(py).clone(),
+                )
+                .then(|| self.task_definition.clone_ref(py)),
+            );
             // Pre-staged: capture this secondary's own discovery Py-handle
             // clones (the corpus root IS `source_pre_staged_root` — in-process
             // shares one fs). The relocate target inherits `DiscoveryDebt=Owed`
@@ -346,14 +371,18 @@ impl PyDistributedManager {
 
                 for (
                     (
-                        (secondary_id, sec_log),
-                        (sec_on_phase_start, sec_on_phase_end, sec_phase_hook_raise_latch),
+                        (
+                            (secondary_id, sec_log),
+                            (sec_on_phase_start, sec_on_phase_end, sec_phase_hook_raise_latch),
+                        ),
+                        sec_discovery_handle,
                     ),
-                    sec_discovery_handle,
+                    sec_custom_message_handler_def,
                 ) in sec_log_dirs
                     .into_iter()
                     .zip(sec_phase_lifecycle_callbacks)
                     .zip(sec_discovery_handles)
+                    .zip(sec_custom_message_handler_defs)
                 {
                     // This secondary's pre-wired all-to-all mesh transport (its
                     // `outgoing` table already reaches the setup peer + every
@@ -672,6 +701,7 @@ impl PyDistributedManager {
                         // handle does not re-route to the relocated primary).
                         let promote = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
                             secondary_id: sec_id_for_slot.clone(),
+                            custom_message_handler_def: sec_custom_message_handler_def,
                             keepalive_interval: dist_keepalive,
                             peer_timeout: dist_peer_timeout,
                             keepalive_miss_threshold: dist_keepalive_miss_threshold,
@@ -843,6 +873,25 @@ impl PyDistributedManager {
                 // coordinator so a consumer-hook raise surfaces
                 // `FatalPolicyExit`. Same pre-`run()` setter contract.
                 primary.set_phase_hook_raise_latch(phase_hook_raise_latch);
+
+                // Install the consumer custom-message hook (F5) on the
+                // setup peer too — a custom message can land during the
+                // pre-relocate bootstrap window. Built from THIS
+                // coordinator's command sender (post-`replace_command_channel`,
+                // so the handler's spawn_tasks reaches its loop).
+                if let Some(def) = setup_custom_message_handler_def {
+                    match crate::custom_message_bridge::make_custom_message_handler(
+                        def,
+                        primary.command_sender(),
+                    ) {
+                        Ok(handler) => primary.set_custom_message_handler(handler),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "custom_message_handler bridge build failed; the \
+                             setup peer will consume custom messages unhandled"
+                        ),
+                    }
+                }
 
                 // Register the consumer's `may_be_empty` phase opt-out BEFORE
                 // `run()` enters, so the cold-/relocated-seed originator emits

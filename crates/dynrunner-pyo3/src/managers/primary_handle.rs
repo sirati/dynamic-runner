@@ -404,6 +404,26 @@ impl PyPrimaryHandle {
     /// Raises `PyRuntimeError` for vec-wide failure modes (command
     /// channel closed, oneshot dropped).
     ///
+    /// # Spawn-anytime contract notes (F4)
+    ///
+    /// * **Spawning into a phase that already ENDED re-opens it**: the
+    ///   pool reinject flips `Draining|Drained|Done → Active`, the
+    ///   phase re-drains, and its `on_phase_end` fires AGAIN at the
+    ///   re-drain edge (the cascade has no once-guard; the replicated
+    ///   `PhaseEnded` fact only gates failover hydration). This is
+    ///   deliberate (a re-discovery pass wants the re-open); the
+    ///   consumer's `on_phase_end` must therefore be IDEMPOTENT for
+    ///   phases it can late-spawn into.
+    /// * **Per-task validation errors on the in-runtime path are not
+    ///   returned**: the `try_send` fire-and-forget shape (context 2
+    ///   below) drops the reply oneshot, so duplicate-hash /
+    ///   unknown-dep rejections surface via tracing + the
+    ///   `spawn_rejected_task_ids` loud-fail backstop on the
+    ///   coordinator, NOT through this call's return value. Duplicate
+    ///   content hashes are dropped idempotently (never escalated) —
+    ///   the failover-replay and re-stream dedup the streamed-spawn
+    ///   composition relies on.
+    ///
     /// Item extraction goes through `crate::pytypes::extract_binaries`
     /// — the same duck-typed `getattr` walker every other framework
     /// entry point uses (`run_local`, `run_distributed`,

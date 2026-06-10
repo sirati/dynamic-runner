@@ -140,7 +140,7 @@ where
                 // Primary-link-recovery edge: re-deliver any retained
                 // terminal reports immediately. No-op when nothing was
                 // buffered (the steady-state case).
-                self.drain_terminal_replays().await;
+                self.drain_report_replays().await;
             }
         }
     }

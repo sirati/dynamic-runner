@@ -90,6 +90,8 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
         unfulfillable_reinject_used: HashMap::new(),
         respawn_events: HashMap::new(),
         phases_ended: HashSet::new(),
+        custom_messages: HashMap::new(),
+        custom_terminal_watermarks: HashMap::new(),
     }
 }
 

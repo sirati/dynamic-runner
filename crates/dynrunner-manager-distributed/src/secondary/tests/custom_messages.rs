@@ -1,152 +1,253 @@
-//! Worker→secondary custom-message bridge tests (feature 2).
+//! F5 secondary-side custom-message send seam + retention contract.
 //!
-//! Pins the secondary side of the channel:
-//!   1. a CURRENT-generation `WorkerEvent::CustomMessage` is enqueued
-//!      for the worker-message dispatcher, in order, carrying the
-//!      sending task's `type_id`;
-//!   2. a STALE-generation custom (buffered by a replaced subprocess)
-//!      rides the SAME generation gate as every other worker event
-//!      and is dropped before any listener can observe it;
-//!   3. customs are node-local: handling one reports NOTHING to the
-//!      primary (no CRDT origination, no wire frame — the
-//!      no-observer-only-CRDT law);
-//!   4. the `SecondaryHandle` reply ingress
-//!      (`secondary_control_sender`) reaches the receiver the
-//!      operational loop's drain arm owns.
+//! Pins:
+//!   * an IMPORTANT custom message sent through a no-route window is
+//!     RETAINED (the #352 machinery, generalized) and re-delivered to a
+//!     NEW primary once one is named — with the SAME `delivery_seq` AND
+//!     the SAME `(origin, msg_seq)` idempotency key — and the
+//!     `TerminalAck` releases it;
+//!   * a DROPPABLE custom message is never retained: lost on the
+//!     no-route window (the failover-loss-by-design negative), never
+//!     `delivery_seq`-stamped on the healthy path;
+//!   * the 100 KiB size gate rejects at the seam, naming size + limit,
+//!     before any seq is burned or frame built.
 
-use super::super::test_helpers::{FakeWorkerFactory, make_secondary_recording};
-use super::super::*;
-use super::generation_gate::{one_worker_config, test_oom_watcher};
-use super::processing::make_binary;
-use dynrunner_manager_local::WorkerEvent;
+#![cfg(test)]
 
-/// Current-generation customs dispatch in order with the running
-/// task's `type_id`; stale-generation customs are dropped; nothing is
-/// ever reported to the primary.
+use super::super::test_helpers::{
+    FakeWorkerFactory, election_config, make_secondary_recording_with_membership,
+};
+use dynrunner_protocol_primary_secondary::{
+    CUSTOM_MESSAGE_MAX_BYTES, ClusterMutation, DistributedMessage,
+};
+
+/// The custom-message frames in the recorded wire log, as
+/// `(origin, msg_seq, important, delivery_seq)` tuples.
+fn sent_customs(
+    log: &std::rc::Rc<
+        std::cell::RefCell<Vec<DistributedMessage<super::super::test_helpers::TestId>>>,
+    >,
+) -> Vec<(String, u64, bool, Option<u64>)> {
+    log.borrow()
+        .iter()
+        .filter_map(|m| match m {
+            DistributedMessage::CustomMessage {
+                origin_secondary_id,
+                msg_seq,
+                important,
+                delivery_seq,
+                ..
+            } => Some((
+                origin_secondary_id.clone(),
+                *msg_seq,
+                *important,
+                *delivery_seq,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// THE F5 failover-safety repro: an important custom message sent while
+/// NO primary is routable is retained, then re-delivered — same
+/// `delivery_seq`, same `(origin, msg_seq)` — to the NEW primary the
+/// role table names after failover; the new primary's `TerminalAck`
+/// releases the retention.
 #[tokio::test(flavor = "current_thread")]
-async fn customs_dispatch_in_order_and_stale_generation_drops() {
+async fn important_custom_through_no_route_window_redelivers_to_new_primary() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (mut secondary, log) = make_secondary_recording(one_worker_config("sec-1"), 1);
+            let (mut secondary, log, membership) =
+                make_secondary_recording_with_membership(election_config("sec-2"), 1);
             secondary.set_bootstrap_primary_id("setup".to_string());
-
             let mut factory = FakeWorkerFactory;
             let pool = secondary.initialize_workers(&mut factory).await.unwrap();
             secondary.enter_operational_for_test();
             *secondary.pool_mut() = pool;
 
-            // Take the dispatcher receiver the run boundary would
-            // normally hand to `run_worker_message_dispatcher`; the
-            // test observes the enqueued events directly.
-            let mut worker_message_rx = secondary
-                .worker_message_rx
-                .take()
-                .expect("dispatcher rx present pre-run");
+            // ROUTE DOWN: the old primary "setup" leaves the mesh before
+            // the consumer's send fires.
+            membership.borrow_mut().retain(|id| id.as_str() != "setup");
+            secondary.publish_membership();
 
-            // Bind a running task so the bridge can resolve the
-            // sending task's type identity.
-            let binary = make_binary("streaming-task", 50);
-            let expected_type = binary.type_id.to_string();
-            secondary.pool_mut().workers[0].current_binary = Some(binary);
-            let current_gen = secondary.pool_mut().workers[0].generation;
-
-            let oom = test_oom_watcher();
-
-            // Two in-order customs at the CURRENT generation.
-            for i in 0..2u8 {
-                secondary
-                    .handle_worker_event(
-                        WorkerEvent::CustomMessage {
-                            worker_id: 0,
-                            generation: current_gen,
-                            topic: format!("batch-{i}"),
-                            data: vec![i; 3],
-                        },
-                        &oom,
-                    )
-                    .await
-                    .unwrap();
-            }
-            // One STALE custom (generation bumped past the event's):
-            // simulate the replaced-subprocess buffer by bumping the
-            // slot's generation through a real replacement edge.
-            secondary
-                .pool_mut()
-                .restart_worker(0, &mut factory, false)
-                .await
-                .unwrap();
-            secondary
-                .handle_worker_event(
-                    WorkerEvent::CustomMessage {
-                        worker_id: 0,
-                        generation: current_gen, // now stale (slot is gen+1)
-                        topic: "stale".into(),
-                        data: b"dead".to_vec(),
-                    },
-                    &oom,
-                )
-                .await
-                .unwrap();
-
-            // Exactly the two current-generation events, in order,
-            // with the running task's type identity.
-            let first = worker_message_rx.try_recv().expect("first custom");
-            assert_eq!(first.worker_id, 0);
-            assert_eq!(first.type_id, expected_type);
-            assert_eq!(first.topic, "batch-0");
-            assert_eq!(first.data, vec![0u8; 3]);
-            let second = worker_message_rx.try_recv().expect("second custom");
-            assert_eq!(second.topic, "batch-1");
+            let send = secondary
+                .send_custom_to_primary("phase4-batch".into(), b"batch-1".to_vec(), true)
+                .await;
             assert!(
-                worker_message_rx.try_recv().is_err(),
-                "the stale-generation custom must be dropped by the gate"
+                send.is_ok(),
+                "a no-route is absorbed (failover signal, not an error): {send:?}"
+            );
+            assert_eq!(
+                secondary.pending_report_replays.len(),
+                1,
+                "the important custom must be RETAINED on the no-route absorb"
+            );
+            let retained_seq = secondary.pending_report_replays[0]
+                .frame
+                .delivery_seq()
+                .expect("the chokepoint stamps delivery_seq on an important custom");
+            assert!(
+                sent_customs(&log).is_empty(),
+                "nothing reached the wire while no primary was routable"
             );
 
-            // Node-local by law: NOTHING was reported to the primary.
+            // FAILOVER: a NEW primary is named in the role table and joins
+            // the mesh. The retention drain must re-resolve
+            // `Destination::Primary` to it.
+            secondary.cluster_state.apply(ClusterMutation::<
+                super::super::test_helpers::TestId,
+            >::PrimaryChanged {
+                new: "new-primary".into(),
+                epoch: 1,
+                reason: Default::default(),
+            });
+            membership
+                .borrow_mut()
+                .push(dynrunner_protocol_primary_secondary::PeerId::from(
+                    "new-primary",
+                ));
+            secondary.publish_membership();
+            secondary.drain_report_replays().await;
             secondary.drain_egress().await;
+
+            let sent = sent_customs(&log);
+            assert_eq!(
+                sent,
+                vec![("sec-2".to_string(), 1, true, Some(retained_seq))],
+                "re-delivered EXACTLY ONCE with the SAME (origin, msg_seq) \
+                 idempotency key and the SAME delivery_seq — the only \
+                 routable member is the NEW primary, so the frame landed \
+                 there"
+            );
             assert!(
-                log.borrow().is_empty(),
-                "customs must not produce primary-bound frames; got {:?}",
-                log.borrow()
+                secondary.pending_report_replays[0].state.is_awaiting_ack(),
+                "the re-delivered custom stays retained AWAITING ACK \
+                 (transport Ok proves nothing on a blackholed leg)"
+            );
+
+            // The new primary's per-landing ack is the only drop site.
+            secondary
+                .handle_inbound(
+                    DistributedMessage::TerminalAck {
+                        target: None,
+                        sender_id: "new-primary".into(),
+                        timestamp: 0.0,
+                        seq: retained_seq,
+                    },
+                    &mut factory,
+                )
+                .await;
+            assert!(
+                secondary.pending_report_replays.is_empty(),
+                "the TerminalAck releases the retention"
             );
         })
         .await;
 }
 
-/// The `SecondaryHandle` ingress: a command queued through
-/// `secondary_control_sender()` lands on the receiver the
-/// operational loop's drain arm takes at entry.
+/// The droppable NEGATIVE: a droppable custom is never retained — sent
+/// through the same no-route window it is simply LOST (at-most-once by
+/// contract; lost on failover by design) — and on the healthy path it
+/// rides the wire un-stamped (no `delivery_seq`, no retention entry).
 #[tokio::test(flavor = "current_thread")]
-async fn secondary_control_sender_reaches_loop_receiver() {
+async fn droppable_custom_is_lost_on_no_route_and_never_retained() {
+    let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (mut secondary, _log) = make_secondary_recording(one_worker_config("sec-1"), 1);
-            let tx = secondary.secondary_control_sender();
-            tx.send(SecondaryControlCommand::SendToWorker {
-                worker_id: 0,
-                topic: "reply".into(),
-                data: b"pong".to_vec(),
-            })
-            .expect("queue control command");
+            let (mut secondary, log, membership) =
+                make_secondary_recording_with_membership(election_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
 
-            let mut rx = secondary
-                .secondary_control_rx
-                .take()
-                .expect("control rx present pre-run");
-            match rx.try_recv().expect("command delivered") {
-                SecondaryControlCommand::SendToWorker {
-                    worker_id,
-                    topic,
-                    data,
-                } => {
-                    assert_eq!(worker_id, 0);
-                    assert_eq!(topic, "reply");
-                    assert_eq!(data, b"pong");
-                }
-            }
+            // No-route window: the droppable send is absorbed AND dropped.
+            membership.borrow_mut().retain(|id| id.as_str() != "setup");
+            secondary.publish_membership();
+            secondary
+                .send_custom_to_primary("progress".into(), b"p1".to_vec(), false)
+                .await
+                .unwrap();
+            assert!(
+                secondary.pending_report_replays.is_empty(),
+                "a droppable custom is NEVER retained"
+            );
+
+            // Route recovery + drain: the lost droppable does NOT reappear.
+            membership
+                .borrow_mut()
+                .push(dynrunner_protocol_primary_secondary::PeerId::from("setup"));
+            secondary.publish_membership();
+            secondary.drain_report_replays().await;
+            secondary.drain_egress().await;
+            assert!(
+                sent_customs(&log).is_empty(),
+                "the droppable sent into the no-route window is lost by design"
+            );
+
+            // Healthy path: the droppable rides the wire un-stamped, still
+            // with its own (next) per-origin msg_seq, and leaves no
+            // retention entry.
+            secondary
+                .send_custom_to_primary("progress".into(), b"p2".to_vec(), false)
+                .await
+                .unwrap();
+            secondary.drain_egress().await;
+            assert_eq!(
+                sent_customs(&log),
+                vec![("sec-2".to_string(), 2, false, None)],
+                "droppable: delivered once, msg_seq advanced past the lost \
+                 one, no delivery_seq stamp"
+            );
+            assert!(secondary.pending_report_replays.is_empty());
+        })
+        .await;
+}
+
+/// The size gate rejects an over-limit payload AT the seam, naming size
+/// + limit, before any frame is built or seq burned.
+#[tokio::test(flavor = "current_thread")]
+async fn oversize_custom_is_rejected_naming_size_and_limit() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log, _membership) =
+                make_secondary_recording_with_membership(election_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            let oversize = vec![0u8; CUSTOM_MESSAGE_MAX_BYTES + 1];
+            let err = secondary
+                .send_custom_to_primary("big".into(), oversize, true)
+                .await
+                .expect_err("an over-limit payload must be rejected");
+            assert!(
+                err.contains(&(CUSTOM_MESSAGE_MAX_BYTES + 1).to_string())
+                    && err.contains(&CUSTOM_MESSAGE_MAX_BYTES.to_string()),
+                "the rejection names size + limit: {err}"
+            );
+            assert!(secondary.pending_report_replays.is_empty());
+
+            // The rejected send burned NO msg_seq: the next message is 1.
+            secondary
+                .send_custom_to_primary("ok".into(), b"fits".to_vec(), true)
+                .await
+                .unwrap();
+            secondary.drain_egress().await;
+            let sent = sent_customs(&log);
+            assert_eq!(sent.len(), 1);
+            assert_eq!(
+                sent[0].1, 1,
+                "the size rejection happens before the seq stamp"
+            );
         })
         .await;
 }

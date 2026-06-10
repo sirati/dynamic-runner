@@ -159,6 +159,16 @@ impl PySecondaryCoordinator {
         let on_run_start_handle = self.control_plane.to_handle()?;
         let on_run_start_source_dir = self.source_dir.to_string_lossy().into_owned();
         let on_run_start_task_definition_py = self.task_definition_py.clone_ref(py);
+        // The promoted primary's `custom_message_handler` hook (F5):
+        // capture the TaskDefinition ref-bump IFF the duck-typed
+        // attribute exists (checked here, on the GIL thread); the
+        // promote recipe builds the closure at fire time from the
+        // promoted coordinator's own command sender.
+        let promote_custom_message_handler_def =
+            crate::custom_message_bridge::has_custom_message_handler(
+                &self.task_definition_py.bind(py).clone(),
+            )
+            .then(|| self.task_definition_py.clone_ref(py));
 
         // The finalize closure's per-type `build_worker_command_args`
         // rebuild captures a `Py<PyAny>` reference bump of the task
@@ -839,6 +849,7 @@ impl PySecondaryCoordinator {
                     .map(|_| secondary.peer_liveness_addrs());
                 let promote = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
                     secondary_id: secondary_id.clone(),
+                    custom_message_handler_def: promote_custom_message_handler_def,
                     keepalive_interval: dist_keepalive,
                     peer_timeout: dist_peer_timeout,
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
@@ -1156,6 +1167,17 @@ pub(crate) struct PromotedPrimaryRecipeInputs {
     /// [`dynrunner_manager_distributed::oploop_instrumentation`].
     pub op_loop_arm_stats_cell:
         dynrunner_manager_distributed::oploop_instrumentation::OpLoopArmStatsCell,
+    /// The consumer `TaskDefinition` ref-bump for the promoted primary's
+    /// `custom_message_handler` hook (F5), present IFF the duck-typed
+    /// attribute exists (checked GIL-side at input-build time via
+    /// `custom_message_bridge::has_custom_message_handler`). The recipe
+    /// builds the `OnCustomMessage` closure AT FIRE TIME from the
+    /// promoted coordinator's OWN `command_sender()` — after any
+    /// `replace_command_channel` — so the handler's `spawn_tasks`
+    /// reaches THIS primary's command loop on BOTH paths (the SLURM
+    /// per-process channel and the in-process internal one). Single-use
+    /// (taken on the one fire).
+    pub custom_message_handler_def: Option<Py<PyAny>>,
 }
 
 /// Read the run's two staging-dispatch flags from this node's OWN LOCAL
@@ -1221,6 +1243,7 @@ pub(crate) fn build_promoted_primary_recipe(
 > {
     let PromotedPrimaryRecipeInputs {
         secondary_id,
+        custom_message_handler_def,
         keepalive_interval,
         peer_timeout,
         keepalive_miss_threshold,
@@ -1269,6 +1292,10 @@ pub(crate) fn build_promoted_primary_recipe(
     // The discovery policy is already `Option`-wrapped (it carries an `FnMut`
     // `discover` closure that is not `Clone`); take it on the single fire.
     let mut setup_discovery = setup_discovery;
+    // The consumer hook ref-bump for the custom-message handler (F5):
+    // single-use, taken on the one fire (the closure is built there,
+    // from the promoted coordinator's live command sender).
+    let mut custom_message_handler_def = custom_message_handler_def;
     // The run-config handle is shared (not single-use): the recipe READS it at
     // promotion, leaving the secondary's copy intact. No `Option`/`take` — it
     // is cloned-in and read by value at the promotion instant. The two staging
@@ -1382,6 +1409,27 @@ pub(crate) fn build_promoted_primary_recipe(
                          back to mesh-frame liveness legs alone for this primary"
                     );
                 }
+            }
+        }
+        // Install the consumer custom-message hook (F5) BEFORE `run`
+        // enters (pre-run setter contract). Built HERE — after
+        // `replace_command_channel` above — from the promoted
+        // coordinator's OWN live command sender, so the handler's
+        // `primary_handle.spawn_tasks(batch)` lands on THIS primary's
+        // command loop (the streamed-spawn site). A consumer without
+        // the attribute installs nothing: the dispatch decision then
+        // consumes important messages unhandled with a WARN.
+        if let Some(def) = custom_message_handler_def.take() {
+            match crate::custom_message_bridge::make_custom_message_handler(
+                def,
+                primary.command_sender(),
+            ) {
+                Ok(handler) => primary.set_custom_message_handler(handler),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "custom_message_handler bridge build failed; the promoted \
+                     primary will consume custom messages unhandled"
+                ),
             }
         }
         // Install the phase-hook raise-latch BEFORE `run` enters (pre-run
@@ -2404,6 +2452,8 @@ task = Task()
 
             let mut recipe = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
                 secondary_id: "primary".to_string(),
+                // The tests' Task fixtures expose no custom_message_handler.
+                custom_message_handler_def: None,
                 keepalive_interval: std::time::Duration::from_secs(5),
                 peer_timeout: std::time::Duration::from_secs(30),
                 keepalive_miss_threshold: 3,
@@ -2500,6 +2550,8 @@ task = Task()
 
             let mut recipe = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
                 secondary_id: "primary".to_string(),
+                // The tests' Task fixtures expose no custom_message_handler.
+                custom_message_handler_def: None,
                 keepalive_interval: std::time::Duration::from_secs(5),
                 peer_timeout: std::time::Duration::from_secs(30),
                 keepalive_miss_threshold: 3,

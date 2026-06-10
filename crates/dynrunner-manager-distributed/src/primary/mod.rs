@@ -28,6 +28,7 @@ mod command_channel;
 mod config;
 mod connect;
 mod coordinator;
+mod custom_message;
 mod discovery;
 mod error;
 mod fulfillability_matcher;
@@ -56,8 +57,8 @@ pub use command_channel::{
     COMMAND_CHANNEL_CAPACITY, PrimaryCommand, SpawnError, validate_spawn_tasks,
 };
 pub use config::{
-    DEFAULT_TASK_RECONCILIATION_TIMEOUT, OnPhaseEnd, OnPhaseStart, PhaseHookRaiseLatch,
-    PrimaryConfig,
+    DEFAULT_TASK_RECONCILIATION_TIMEOUT, OnCustomMessage, OnPhaseEnd, OnPhaseStart,
+    PhaseHookRaiseLatch, PrimaryConfig,
 };
 pub use coordinator::{PrimaryCoordinator, PrimaryRunOutcome};
 pub use error::RunError;

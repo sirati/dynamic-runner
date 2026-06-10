@@ -578,6 +578,24 @@ where
                                 }
                             }
                         }
+                        Some(super::super::control::SecondaryControlCommand::SendToPrimary {
+                            topic,
+                            data,
+                            important,
+                        }) => {
+                            // The only Err class is the size gate, which
+                            // the API call site already rejected with a
+                            // ValueError — this is the defensive re-check.
+                            if let Err(e) =
+                                self.send_custom_to_primary(topic, data, important).await
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    "send_to_primary custom message rejected at \
+                                     the send seam; dropping"
+                                );
+                            }
+                        }
                         None => {
                             // All senders dropped (no SecondaryHandle
                             // alive). Benign — re-park on `pending()`.
@@ -618,7 +636,7 @@ where
             // Re-deliver any terminal-bearing report not yet CONFIRMED at
             // the authority (the buffered-terminal-replay edge): a no-route
             // absorb re-sends every tick, and a sent-but-unacked report
-            // replays once its `terminal_ack_timeout` elapses (#352 — the
+            // replays once its `delivery_ack_timeout` elapses (#352 — the
             // blackholed-but-live-leg detection); only the primary's
             // `TerminalAck` drops an entry. FIFO, retrying forever; a
             // still-no-route re-absorb re-buffers. No-op when the buffer is
@@ -627,7 +645,7 @@ where
             // trigger; the `record_primary_message` primary-link-recovery
             // edge is the fast complement (drains the instant a primary
             // message resumes, ahead of the next tick).
-            self.drain_terminal_replays().await;
+            self.drain_report_replays().await;
 
             // Hard-error exit path: a sub-handler (e.g. the peer-mesh
             // watchdog) detected an unrecoverable fault, queued the

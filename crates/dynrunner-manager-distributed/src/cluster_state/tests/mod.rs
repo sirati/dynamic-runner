@@ -19,6 +19,7 @@ use std::sync::Arc;
 mod apply_basics;
 mod cascade_and_reinject;
 mod convergence;
+mod custom_messages;
 mod digest;
 mod discovery_debt;
 mod dispatchers;

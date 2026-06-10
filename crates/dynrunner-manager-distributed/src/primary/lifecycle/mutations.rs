@@ -97,20 +97,79 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         if capacity_grew {
             self.react_to_capacity_growth();
         }
+        // CAPTURE seam (F5 atomic effect+terminal batching): while a
+        // mutation capture is armed (`begin_mutation_capture`), every
+        // locally-applied batch is DIVERTED off the wire into the
+        // capture buffer instead of broadcasting per-call — the local
+        // apply (and every local side effect above: pool re-injection,
+        // capacity reaction, buffered worker-mgmt emits) already
+        // happened identically to the uncaptured path, so the captured
+        // batch is exactly "what would have been broadcast", already
+        // origination-stamped and NoOp-filtered. The capture owner
+        // flushes the accumulated batch as ONE wire frame via
+        // [`Self::broadcast_applied_mutations`], so every replica
+        // applies the whole batch or none of it (the replica-side
+        // batch apply is a synchronous per-frame loop).
+        if let Some(capture) = self.mutation_capture.as_mut() {
+            capture.extend(applied);
+            return;
+        }
+        self.broadcast_applied_mutations(applied).await;
+    }
+
+    /// Arm the mutation-capture sink: until [`Self::take_mutation_capture`],
+    /// every `apply_and_broadcast_cluster_mutations` call applies locally
+    /// as usual but appends its NoOp-filtered batch to the capture buffer
+    /// instead of broadcasting. NOT re-entrant — there is exactly one
+    /// capture owner at a time (the F5 atomic effect+terminal flush).
+    pub(crate) fn begin_mutation_capture(&mut self) {
+        debug_assert!(
+            self.mutation_capture.is_none(),
+            "mutation capture is not re-entrant"
+        );
+        self.mutation_capture = Some(Vec::new());
+    }
+
+    /// Disarm the capture sink and return everything captured since
+    /// [`Self::begin_mutation_capture`], in apply order. The caller owns
+    /// flushing the batch (via [`Self::broadcast_applied_mutations`]) —
+    /// or dropping it, in which case the mutations were still applied
+    /// LOCALLY (capture only diverts the wire leg), so dropping is only
+    /// sound for batches that never contained anything (the F5 discard
+    /// path never opens a capture window at all for exactly this
+    /// reason: discarded commands are rejected UNEXECUTED).
+    pub(crate) fn take_mutation_capture(&mut self) -> Vec<ClusterMutation<I>> {
+        self.mutation_capture
+            .take()
+            .expect("take_mutation_capture without begin_mutation_capture")
+    }
+
+    /// THE single wire egress for primary-originated, already-locally-
+    /// applied mutation batches: ship the batch as ONE
+    /// `DistributedMessage::ClusterMutation` frame over the
+    /// `Destination::All` egress edge, matching the primary keepalive
+    /// path (`broadcast_primary_keepalive`) — one mesh broadcast to
+    /// every member. Callers: the uncaptured tail of
+    /// `apply_and_broadcast_cluster_mutations`, and the F5 atomic
+    /// effect+terminal flush (a captured batch). The single mesh
+    /// transport collapses per-secondary delivery failures into one
+    /// `String` (the per-secondary signal is the heartbeat monitor, not
+    /// this log line). The CRDT is idempotent, so a missed mutation is
+    /// recoverable from the next snapshot RPC; we never block dispatch
+    /// on universal delivery.
+    pub(crate) async fn broadcast_applied_mutations(
+        &mut self,
+        mutations: Vec<ClusterMutation<I>>,
+    ) {
+        if mutations.is_empty() {
+            return;
+        }
         let msg = DistributedMessage::ClusterMutation {
             target: None,
             sender_id: self.config.node_id.clone(),
             timestamp: timestamp_now(),
-            mutations: applied,
+            mutations,
         };
-        // Route through the `Destination::All` egress edge, matching the
-        // primary keepalive path (`broadcast_primary_keepalive`) — one
-        // mesh broadcast to every member. The single mesh transport
-        // collapses per-secondary delivery failures into one `String`
-        // (the per-secondary signal is the heartbeat monitor, not this
-        // log line). The CRDT is idempotent, so a missed mutation is
-        // recoverable from the next snapshot RPC; we never block dispatch
-        // on universal delivery.
         if let Err(error) = self.send_to(Destination::All, msg).await {
             tracing::warn!(
                 error = %error,

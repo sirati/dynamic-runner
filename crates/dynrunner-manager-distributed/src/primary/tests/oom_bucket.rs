@@ -504,4 +504,3 @@ async fn flag_clears_on_oom_bucket_with_no_candidates() {
         })
         .await;
 }
-

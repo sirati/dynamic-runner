@@ -91,6 +91,10 @@ fn roundtrip_state_digest_payload() {
         respawn_events_hash: 0xDEAD_C0DE,
         phases_ended_count: 2,
         phases_ended_hash: 0xFEED_FACE,
+        custom_messages_count: 3,
+        custom_messages_hash: 0xC0FF_EE00,
+        custom_terminal_watermarks_count: 1,
+        custom_terminal_watermarks_hash: 0xBEEF_0001,
     };
     let msg: DistributedMessage<TestId> = DistributedMessage::StateDigest {
         target: None,
@@ -658,7 +662,7 @@ fn roundtrip_task_complete_with_delivery_seq() {
     assert_eq!(msg.delivery_seq(), None);
     msg.set_delivery_seq(11);
     assert_eq!(msg.delivery_seq(), Some(11));
-    assert_eq!(msg.terminal_reporter(), Some("sec-1"));
+    assert_eq!(msg.delivery_reporter(), Some("sec-1"));
 
     let bytes = serialize_message(&msg).unwrap();
     let (decoded, _) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
@@ -687,7 +691,7 @@ fn task_failed_with_delivery_seq_decodes_literal_sender_bytes() {
         }
         _ => panic!("expected TaskFailed"),
     }
-    assert_eq!(decoded.terminal_reporter(), Some("sec-2"));
+    assert_eq!(decoded.delivery_reporter(), Some("sec-2"));
 }
 
 /// Backcompat both ways for the additive `delivery_seq` field:
@@ -716,4 +720,108 @@ fn delivery_seq_is_wire_additive() {
         !json.contains("delivery_seq"),
         "a None delivery_seq must be elided from the wire bytes; got {json}"
     );
+}
+
+/// F5 `CustomMessage` round-trip: every field — the `(origin, msg_seq)`
+/// idempotency key, the opaque `(topic, data)` payload, the delivery
+/// class, and the #352 `delivery_seq` stamp — survives the wire.
+#[test]
+fn roundtrip_custom_message_important() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::CustomMessage {
+        target: None,
+        sender_id: "relay-2".into(),
+        timestamp: 12.5,
+        origin_secondary_id: "sec-1".into(),
+        msg_seq: 7,
+        topic: "phase4-batch".into(),
+        data: b"descriptor batch".to_vec(),
+        important: true,
+        delivery_seq: Some(42),
+    };
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+    assert_eq!(decoded.msg_type(), MessageType::CustomMessage);
+    // The confirmable classifiers see the important custom message.
+    assert!(decoded.requires_delivery_ack());
+    assert_eq!(decoded.delivery_seq(), Some(42));
+    // The ack must address the ORIGINATOR, not the wire sender (relay).
+    assert_eq!(decoded.delivery_reporter(), Some("sec-1"));
+    assert_eq!(decoded.sender_id(), "relay-2");
+    match decoded {
+        DistributedMessage::CustomMessage {
+            origin_secondary_id,
+            msg_seq,
+            topic,
+            data,
+            important,
+            ..
+        } => {
+            assert_eq!(origin_secondary_id, "sec-1");
+            assert_eq!(msg_seq, 7);
+            assert_eq!(topic, "phase4-batch");
+            assert_eq!(data, b"descriptor batch".to_vec());
+            assert!(important);
+        }
+        _ => panic!("expected CustomMessage"),
+    }
+}
+
+/// A DROPPABLE custom message is NOT confirmable: never
+/// `delivery_seq`-stamped (the field is elided from the wire bytes),
+/// never retained, never acked.
+#[test]
+fn droppable_custom_message_is_not_confirmable_and_elides_delivery_seq() {
+    let mut msg: DistributedMessage<TestId> = DistributedMessage::CustomMessage {
+        target: None,
+        sender_id: "sec-1".into(),
+        timestamp: 0.0,
+        origin_secondary_id: "sec-1".into(),
+        msg_seq: 1,
+        topic: "progress".into(),
+        data: vec![0xFF],
+        important: false,
+        delivery_seq: None,
+    };
+    assert!(!msg.requires_delivery_ack());
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(
+        !json.contains("delivery_seq"),
+        "a None delivery_seq must be elided from the wire bytes; got {json}"
+    );
+    // The stamping accessor itself is variant-shaped (the gate is the
+    // chokepoint's `requires_delivery_ack` check, upstream).
+    msg.set_delivery_seq(9);
+    assert_eq!(msg.delivery_seq(), Some(9));
+}
+
+/// Literal-bytes pin for the F5 `CustomMessage` wire shape: decode the
+/// exact JSON a current sender emits (internally tagged
+/// `msg_type: "custom_message"`, snake_case fields, `data` as a JSON
+/// byte array). Pinning the sender bytes catches a silent tag /
+/// field-name divergence that a symmetric encode→decode round-trip
+/// cannot see (the wire-shape mirror discipline).
+#[test]
+fn custom_message_decodes_literal_sender_bytes() {
+    let literal = r#"{"msg_type":"custom_message","sender_id":"sec-1","timestamp":1.0,"origin_secondary_id":"sec-1","msg_seq":2,"topic":"phase4-batch","data":[104,105],"important":true,"delivery_seq":5}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(literal).unwrap();
+    match decoded {
+        DistributedMessage::CustomMessage {
+            origin_secondary_id,
+            msg_seq,
+            topic,
+            data,
+            important,
+            delivery_seq,
+            ..
+        } => {
+            assert_eq!(origin_secondary_id, "sec-1");
+            assert_eq!(msg_seq, 2);
+            assert_eq!(topic, "phase4-batch");
+            assert_eq!(data, b"hi".to_vec());
+            assert!(important);
+            assert_eq!(delivery_seq, Some(5));
+        }
+        _ => panic!("expected CustomMessage"),
+    }
 }

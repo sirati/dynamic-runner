@@ -315,3 +315,37 @@ pub enum PrimaryCommand<I: Identifier> {
         reply: oneshot::Sender<Result<Vec<(usize, SpawnError)>, String>>,
     },
 }
+
+impl<I: Identifier> PrimaryCommand<I> {
+    /// Reject this command UNEXECUTED: consume it and send `Err(reason)`
+    /// on its reply oneshot (best-effort — a dropped receiver, e.g. the
+    /// in-runtime fire-and-forget `spawn_tasks` path, just ignores it).
+    ///
+    /// The all-or-nothing discard primitive: a backend that must drop a
+    /// queued command WITHOUT running it (the F5 raise-discard — a
+    /// raising `custom_message_handler`'s queued commands must produce
+    /// NO effect) rejects through here so a caller blocked on the reply
+    /// learns the command was discarded instead of seeing a silent
+    /// channel drop. Owned by the enum because rejection is pure
+    /// variant knowledge (which field is the reply), shared by every
+    /// backend.
+    pub fn reject(self, reason: &str) {
+        match self {
+            PrimaryCommand::FailPermanent { reply, .. } => {
+                let _ = reply.send(Err(reason.to_string()));
+            }
+            PrimaryCommand::ReinjectTask { reply, .. } => {
+                let _ = reply.send(Err(reason.to_string()));
+            }
+            PrimaryCommand::UpdatePreferredSecondaries { reply, .. } => {
+                let _ = reply.send(Err(reason.to_string()));
+            }
+            PrimaryCommand::SetCanBePrimary { reply, .. } => {
+                let _ = reply.send(Err(reason.to_string()));
+            }
+            PrimaryCommand::SpawnTasks { reply, .. } => {
+                let _ = reply.send(Err(reason.to_string()));
+            }
+        }
+    }
+}
