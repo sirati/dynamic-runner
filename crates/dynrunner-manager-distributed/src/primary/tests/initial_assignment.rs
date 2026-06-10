@@ -28,7 +28,14 @@ fn make_remote_worker(worker_id: u32, secondary_id: &str, busy: bool) -> RemoteW
 }
 
 #[test]
-fn dispatch_order_equal_load_preserves_worker_id_order() {
+fn dispatch_order_equal_load_interleaves_across_secondaries() {
+    // Roster laid out GROUPED per secondary (A's workers, then B's).
+    // The pre-fix `(static_load, worker_id)` key returned [0, 1, 2, 3]
+    // here — both of A's workers ahead of both of B's, i.e. spread was
+    // an accident of the roster's interleaved layout, not a property
+    // of the ordering policy. The projected-load key interleaves
+    // regardless of layout: wave 0 is each secondary's first free
+    // worker (tie-broken by worker_id), wave 1 the second.
     let workers = vec![
         make_remote_worker(0, "A", false),
         make_remote_worker(1, "A", false),
@@ -36,7 +43,7 @@ fn dispatch_order_equal_load_preserves_worker_id_order() {
         make_remote_worker(3, "B", false),
     ];
     let order = super::lifecycle::dispatch_order(&workers);
-    assert_eq!(order, vec![0, 1, 2, 3]);
+    assert_eq!(order, vec![0, 2, 1, 3]);
 }
 
 #[test]
@@ -84,6 +91,97 @@ fn dispatch_order_no_idle_workers() {
     ];
     let order = super::lifecycle::dispatch_order(&workers);
     assert!(order.is_empty());
+}
+
+/// The fill-to-capacity-then-spill regression at the ordering level:
+/// under UNEQUAL load the pre-fix `(static_load, worker_id)` key
+/// grouped WHOLE secondaries — every free worker of the least-loaded
+/// secondary sorted ahead of every free worker of the next, so a
+/// batch of T grants drained one secondary to capacity before the
+/// other saw a single task. RED against the old key: granting the
+/// first 14 order slots gave A all 14 and B zero. The projected-load
+/// key interleaves: a consumer granting down the order behaves like
+/// always-pick-the-lowest-projected-load, so after 14 grants the
+/// per-secondary PROJECTED loads (busy-at-tick-start + granted)
+/// differ by at most 1.
+#[test]
+fn dispatch_order_unequal_load_interleaves_not_fills() {
+    // A: 14 free, load 0. B: 1 busy + 13 free, load 1.
+    let mut workers = Vec::new();
+    for i in 0..14 {
+        workers.push(make_remote_worker(i, "A", false));
+    }
+    workers.push(make_remote_worker(14, "B", true));
+    for i in 15..28 {
+        workers.push(make_remote_worker(i, "B", false));
+    }
+    let order = super::lifecycle::dispatch_order(&workers);
+    assert_eq!(order.len(), 27);
+
+    // Simulate a 14-task batch granting down the order.
+    let mut granted: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for &idx in order.iter().take(14) {
+        *granted
+            .entry(workers[idx].secondary_id.as_str())
+            .or_default() += 1;
+    }
+    let projected_a = granted.get("A").copied().unwrap_or(0); // load 0 + grants
+    let projected_b = 1 + granted.get("B").copied().unwrap_or(0); // load 1 + grants
+    assert!(
+        granted.get("B").copied().unwrap_or(0) > 0,
+        "the loaded secondary must still receive grants (old key gave it zero); \
+         granted: {granted:?}"
+    );
+    assert!(
+        projected_a.abs_diff(projected_b) <= 1,
+        "projected per-secondary loads must balance to within 1 \
+         (A: {projected_a}, B: {projected_b}, granted: {granted:?})"
+    );
+}
+
+/// The asm-tokenizer production shape (run_20260610_121427): 15
+/// secondaries × 14 workers, 28 tasks. Captured distribution was one
+/// secondary at its FULL worker set (14), three more at 7/5/2, and
+/// ELEVEN at zero — fill-to-capacity-then-spill. With the shared
+/// projected-load ordering, a 28-grant batch over the all-idle fleet
+/// must give every secondary at least 1 and none more than
+/// ceil(28/15) = 2.
+///
+/// Worker ids mirror `reconstruct_workers_from_cluster_state`'s
+/// round-robin construction (round-major), but the assertion holds
+/// for any layout — the policy no longer depends on it.
+#[test]
+fn dispatch_order_production_shape_28_tasks_15_secondaries() {
+    let secondaries: Vec<String> = (0..15).map(|s| format!("secondary-{s}")).collect();
+    let mut workers = Vec::new();
+    let mut worker_id = 0u32;
+    for _round in 0..14 {
+        for sec in &secondaries {
+            workers.push(make_remote_worker(worker_id, sec, false));
+            worker_id += 1;
+        }
+    }
+    let order = super::lifecycle::dispatch_order(&workers);
+    assert_eq!(order.len(), 15 * 14);
+
+    let mut granted: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for &idx in order.iter().take(28) {
+        *granted
+            .entry(workers[idx].secondary_id.as_str())
+            .or_default() += 1;
+    }
+    assert_eq!(
+        granted.len(),
+        15,
+        "every secondary must appear in a 28-grant batch; granted: {granted:?}"
+    );
+    let max = granted.values().copied().max().unwrap();
+    let min = granted.values().copied().min().unwrap();
+    assert!(
+        min >= 1 && max <= 2,
+        "28 grants over 15 idle secondaries must spread to 1..=2 each \
+         (production shape was 14/7/5/2 + eleven zeros); granted: {granted:?}"
+    );
 }
 
 /// T-#33: initial assignment is round-robin across secondaries AND

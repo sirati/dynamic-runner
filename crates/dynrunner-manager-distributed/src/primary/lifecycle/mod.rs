@@ -40,15 +40,30 @@ mod worker_mgmt;
 #[cfg(test)]
 mod tests;
 
-/// Order FREE worker indices for a single dispatch tick, biasing
-/// toward secondaries with fewer currently-running tasks. Stable
-/// tie-break by `worker_id` so equal-loaded secondaries fall through
-/// to the existing iteration order.
+/// Order FREE worker indices for a single dispatch tick so that
+/// consecutive grants INTERLEAVE across secondaries instead of
+/// exhausting one secondary's workers before touching the next.
+///
+/// This is the SOLE owner of the dispatch-target ordering policy: the
+/// batched initial assignment (`perform_initial_assignment`) and the
+/// idle-worker recheck (`dispatch_to_idle_workers`) both consume it,
+/// so spread-across-secondaries can never diverge between the two
+/// batch paths. (The demand path, `handle_task_request`, performs no
+/// selection — the requesting worker IS the target.)
+///
+/// Sort key: `(projected_load, worker_id)` where `projected_load` =
+/// the secondary's busy-worker count at tick start PLUS this worker's
+/// rank within its own secondary's free list. A whole-batch consumer
+/// that grants down the returned order therefore behaves exactly like
+/// a greedy "always pick the secondary with the lowest projected
+/// in-flight count" loop — least-loaded-secondary-first ROUND-ROBIN —
+/// without recomputing loads per grant. Stable tie-break by
+/// `worker_id` keeps equal-wave ordering deterministic.
 ///
 /// Selection authority vs. advisory load: a worker is a dispatch
 /// CANDIDATE iff `held_task().is_none()` — the authoritative free
 /// predicate (a slot holds a task or it doesn't). The
-/// `(busy-workers-on-secondary)` sort key is ADVISORY load info that
+/// `(busy-workers-on-secondary)` load component is ADVISORY info that
 /// reads the `is_idle()` slot-state view; per the dispatch-decoupling
 /// law `is_idle` ("we tried to assign and could not") must never be
 /// the dispatch gate. (In R1's `SlotState` typestate the two coincide
@@ -56,13 +71,22 @@ mod tests;
 /// predicates are kept distinct so selection authority can never drift
 /// onto the advisory name.)
 ///
-/// Pre-fix the flat `0..workers.len()` scan iterated workers grouped
-/// by secondary (the order initial-assignment populates them), giving
-/// the first-iterated secondary's free workers systematic priority
-/// when both sides had capacity. Tail-of-phase dispatches — where the
-/// pool has fewer items than there are free workers — then
-/// concentrated remaining work on the already-loaded secondary
-/// instead of spreading across the fleet.
+/// Two pre-fix generations of this ordering both packed:
+/// * the flat `0..workers.len()` scan gave the first-iterated
+///   secondary's free workers systematic priority (tail-of-phase
+///   concentration);
+/// * the `(static_load, worker_id)` sort that replaced it still
+///   grouped WHOLE secondaries — the load key never advanced as
+///   grants committed within the tick, so the least-loaded
+///   secondary's entire free set drained before the next secondary
+///   saw a single task (production capture: one secondary's 14
+///   workers filled to capacity, eleven idle secondaries at zero).
+///   It also left the equal-load case's spread an accident of the
+///   roster's interleaved `worker_id` layout rather than a property
+///   of the policy.
+///
+/// The per-worker rank component fixes both: ordering interleaves by
+/// construction, independent of roster layout and of load skew.
 pub(crate) fn dispatch_order<I: Identifier>(workers: &[RemoteWorkerState<I>]) -> Vec<usize> {
     let mut load_per_secondary: HashMap<&str, usize> = HashMap::new();
     for w in workers {
@@ -82,14 +106,21 @@ pub(crate) fn dispatch_order<I: Identifier>(workers: &[RemoteWorkerState<I>]) ->
         .filter(|(_, w)| w.held_task().is_none())
         .map(|(i, _)| i)
         .collect();
-    idle.sort_by_key(|&i| {
-        (
-            load_per_secondary
-                .get(workers[i].secondary_id.as_str())
-                .copied()
-                .unwrap_or(0),
-            workers[i].worker_id,
-        )
-    });
-    idle
+    // Rank free workers within their own secondary in `worker_id`
+    // order, so the projected-load key below is deterministic even if
+    // the roster Vec is not id-sorted.
+    idle.sort_by_key(|&i| workers[i].worker_id);
+    let mut rank_within_secondary: HashMap<&str, usize> = HashMap::new();
+    let mut keyed: Vec<(usize, u32, usize)> = idle
+        .into_iter()
+        .map(|i| {
+            let secondary = workers[i].secondary_id.as_str();
+            let rank = rank_within_secondary.entry(secondary).or_default();
+            let projected_load = load_per_secondary.get(secondary).copied().unwrap_or(0) + *rank;
+            *rank += 1;
+            (projected_load, workers[i].worker_id, i)
+        })
+        .collect();
+    keyed.sort_unstable();
+    keyed.into_iter().map(|(_, _, i)| i).collect()
 }
