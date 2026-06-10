@@ -61,6 +61,11 @@
 //!   exactly once (reaching the meshed primary once, not twice), fires
 //!   even when the mesh is degraded, and is suppressed for observers.
 //! - [`late_joiner_observer`] — late-joiner observer-mode scenario.
+//! - [`mesh_ready_reannounce`] — pairwise mesh confirmation: a
+//!   genuinely-applied `PrimaryChanged` (either receive arm, either
+//!   reason) re-announces `MeshReady` to the NEW primary; a stale-epoch
+//!   NoOp re-announces nothing; an unsettled mesh defers to the
+//!   watchdog's terminal report.
 //! - [`late_joiner_accept_emits_peer_joined`] — receive-side
 //!   PeerJoined emission contract for the late-joiner accept path,
 //!   carrying the joiner's ACTUAL role.
@@ -85,6 +90,7 @@ mod keepalive_recognition;
 mod late_joiner_accept_emits_peer_joined;
 mod late_joiner_observer;
 mod memprofile_hook;
+mod mesh_ready_reannounce;
 mod observer_announcer_wireup;
 mod panik_integration;
 mod peer_mesh_watchdog;

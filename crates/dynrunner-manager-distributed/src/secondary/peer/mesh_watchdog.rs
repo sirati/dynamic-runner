@@ -247,4 +247,38 @@ where
         }
         self.mesh.mesh_ready_sent = true;
     }
+
+    /// Re-arm the one-shot reporter for a NEW primary identity and
+    /// re-announce immediately if the mesh state is reportable.
+    ///
+    /// "Mesh-leg confirmed" is PAIRWISE — member ↔ CURRENT primary. The
+    /// `mesh_ready_sent` latch records "the primary has been told", so
+    /// its scope is the primary IDENTITY, not the process lifetime: a
+    /// promoted/relocated primary starts with an EMPTY node-local
+    /// confirmed set (`mesh_ready_secondaries` is deliberately not
+    /// CRDT-inherited — the predecessor's ledger proves legs to the OLD
+    /// node), and without a re-send this member is structurally
+    /// unrecoverable into it. The dispatch-readiness gate
+    /// (`member_mesh_confirmed`) then withholds the member from every
+    /// proactive dispatch — production run_20260610_130116: 10 of 15
+    /// members at zero tasks while an injected batch packed onto the
+    /// confirmed stragglers.
+    ///
+    /// Called from the primary-identity-change reaction
+    /// (`react_to_primary_identity_change`), i.e. only after a GENUINELY
+    /// applied `PrimaryChanged` — stale-epoch NoOps never reach here, so
+    /// the unchanged pair is never spammed. The re-send rides
+    /// [`Self::report_mesh_ready_if_needed`] unchanged: a settled mesh
+    /// (formed, watchdog-terminal, or no-peers-expected) reports
+    /// immediately to `Destination::Primary` (re-resolved at the egress
+    /// edge — the NEW primary); an UNSETTLED mesh reports nothing now,
+    /// and the watchdog's terminal report (latch now clear) reaches
+    /// whoever then holds the role — the bring-up announcement flow is
+    /// unchanged, just re-pointed. The primary-side `handle_mesh_ready`
+    /// insert is unconditional and duplicate-tolerant, so the
+    /// re-announce rides the existing late-MeshReady recovery.
+    pub(in crate::secondary) async fn rearm_mesh_ready_for_new_primary(&mut self) {
+        self.mesh.mesh_ready_sent = false;
+        self.report_mesh_ready_if_needed().await;
+    }
 }

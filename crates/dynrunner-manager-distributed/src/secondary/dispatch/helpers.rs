@@ -58,13 +58,11 @@ where
     /// Returns `true` iff a `PrimaryChanged` genuinely advanced the
     /// primary identity (an `Applied`, not a stale-epoch NoOp or an
     /// observer rejection). The async operational receive arms react to
-    /// that signal by reviving the worker-pull rate-limiter (backoff
-    /// accrued against the PRIOR primary is stale the moment the role
-    /// changes) and immediately re-polling idle workers so a freshly-
-    /// identified primary gets TaskRequests without a keepalive-interval
-    /// delay. Reviving the pull semantic touches the worker pool, so it
-    /// is the caller's (async, operational) concern — this sync hook only
-    /// reports that the identity moved.
+    /// that signal with [`Self::react_to_primary_identity_change`] — the
+    /// single owner of the per-primary state refresh. The reaction sends
+    /// and touches the worker pool, so it is the caller's (async,
+    /// operational) concern — this sync hook only reports that the
+    /// identity moved.
     pub(in crate::secondary) fn apply_cluster_mutations(
         &mut self,
         mutations: Vec<ClusterMutation<I>>,
@@ -92,6 +90,41 @@ where
             "mirrored cluster mutations into local CRDT"
         );
         primary_changed
+    }
+
+    /// React to a GENUINELY applied primary-identity change (the `true`
+    /// return of [`Self::apply_cluster_mutations`]): refresh every piece
+    /// of per-primary-pointed state this secondary holds, so the new
+    /// primary is treated as the fresh pair it is. ONE owner for the
+    /// reaction — both operational receive arms (the primary-link
+    /// dispatcher's `ClusterMutation` arm and the peer-mesh relay's)
+    /// call this instead of each knowing the pieces:
+    ///
+    ///   1. **Pairwise mesh re-announce.** The one-shot `MeshReady`
+    ///      reporter is re-armed and re-announces to the NEW primary
+    ///      ([`Self::rearm_mesh_ready_for_new_primary`]): the primary's
+    ///      mesh-confirmation set is node-local and starts EMPTY at
+    ///      promotion/relocation, and without the re-send this member is
+    ///      structurally unrecoverable into it — the dispatch-readiness
+    ///      gate (`member_mesh_confirmed`) then withholds the member
+    ///      from every proactive dispatch (the production
+    ///      run_20260610_130116 injected-batch pack).
+    ///   2. **Worker-pull revive.** Backoff accrued against the PRIOR
+    ///      primary is stale the moment the role flips
+    ///      (`reset_all_backoff` — keyed off the backoff maps, not the
+    ///      pool, so it fires even before `initialize_workers`), and
+    ///      every idle worker re-issues its `TaskRequest` immediately
+    ///      (`repoll_idle_workers`, `Destination::Primary` re-resolved
+    ///      at the egress edge) instead of sitting out a stale window
+    ///      (the dispatch-silence symptom).
+    ///
+    /// The re-announce is queued BEFORE the repoll so the new primary
+    /// hears this member's confirmation ahead of its first
+    /// request-driven pulls.
+    pub(in crate::secondary) async fn react_to_primary_identity_change(&mut self) {
+        self.rearm_mesh_ready_for_new_primary().await;
+        self.op_mut().primary_link.reset_all_backoff();
+        self.repoll_idle_workers().await;
     }
 
     /// The unified primary-activation apply hook for a
