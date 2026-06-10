@@ -33,6 +33,7 @@ mod phase_decision;
 mod phase_end_raise;
 mod phase_ordering;
 mod preferred_secondaries;
+mod producer_backstop;
 mod promotion;
 mod relocate_staging;
 mod result_data_plumbing;
@@ -50,10 +51,11 @@ mod worker_lifecycle;
 #[allow(unused_imports)]
 pub(super) use super::test_helpers::{
     FakeWorkerFactory, FixedEstimator, PrimaryMeshKeepalive, ProducerStagingFlags,
-    SlowFakeWorkerFactory, TestId, build_test_primary, build_test_promote_recipe,
-    build_test_promote_recipe_from_producer, build_test_promote_recipe_with_config, fake_secondary,
-    fake_secondary_transport_only_no_meshready, fake_secondary_with_addrs, make_binary,
-    make_relative_binary, seed_operational_ledger, setup_test,
+    PromoteHooksFactory, ScriptedWorkerFactory, SlowFakeWorkerFactory, TestId, WorkerScript,
+    build_test_primary, build_test_promote_recipe, build_test_promote_recipe_from_producer,
+    build_test_promote_recipe_with_config, build_test_promote_recipe_with_config_and_hooks,
+    fake_secondary, fake_secondary_transport_only_no_meshready, fake_secondary_with_addrs,
+    make_binary, make_relative_binary, seed_operational_ledger, setup_test,
 };
 #[allow(unused_imports)]
 pub(super) use super::*;
@@ -102,6 +104,23 @@ pub(super) fn noop_phase_args() -> (
     OnPhaseEnd,
 ) {
     (HashMap::new(), Box::new(|_| {}), Box::new(|_, _, _, _| {}))
+}
+
+/// Build a `TaskInfo` placed in `phase` with `type_id` — the general
+/// phase+type fixture builder (delegates to [`make_binary`] for the shared
+/// path/identifier shape). The phase-chaining scenarios use the phase
+/// dimension; the worker-churn scenarios use the type dimension (distinct
+/// `type_id`s on few-worker secondaries force the type-shift respawn path).
+pub(super) fn make_phased_typed_binary(
+    name: &str,
+    phase: &str,
+    type_id: &str,
+    size: u64,
+) -> TaskInfo<TestId> {
+    let mut b = make_binary(name, size);
+    b.phase_id = dynrunner_core::PhaseId::from(phase);
+    b.type_id = dynrunner_core::TypeId::from(type_id);
+    b
 }
 
 /// Build a [`crate::discovery::SetupDiscovery`] whose policy yields a FIXED
