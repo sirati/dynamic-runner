@@ -103,7 +103,8 @@ where
                         // false-alarm election; a stray one from a
                         // demoted/zombie ex-primary (whose id no longer matches
                         // `current_primary()`) is a no-op for primary liveness.
-                        self.record_primary_message_if_from_primary(&secondary_id);
+                        self.record_primary_message_if_from_primary(&secondary_id)
+                            .await;
                         tracing::trace!(
                             primary = %secondary_id,
                             active_workers,

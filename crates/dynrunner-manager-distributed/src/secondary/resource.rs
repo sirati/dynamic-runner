@@ -165,6 +165,18 @@ where
         &mut self,
         msg: DistributedMessage<I>,
     ) -> Result<(), String> {
+        // The frame is consumed by `send_to`; classify it FIRST so a
+        // no-route absorb can decide whether to retain it for replay
+        // (terminal-bearing reports must never be lost — see the absorb
+        // branch below). The classifier lives on the enum
+        // (`is_terminal_bearing`), so this site owns NO message-shape
+        // knowledge beyond "is this a task-resolving report?".
+        let is_terminal = msg.is_terminal_bearing();
+        let terminal_hash = msg.task_hash().map(str::to_owned);
+        let msg_kind = msg.msg_type();
+        // Clone ONLY when the frame is terminal-bearing and might need
+        // retaining; the common (droppable) path never clones.
+        let replay_copy = if is_terminal { Some(msg.clone()) } else { None };
         let result = self.send_to(Destination::Primary, msg).await;
         if let Err(ref e) = result {
             // No route to the primary — feed the failover-health
@@ -207,19 +219,29 @@ where
             // election (already armed) runs; the secondary holds no
             // authority and owns no requeue.
             //
-            // ACCOUNTING HONESTY: the absorbed terminal is genuinely LOST,
-            // NOT recovered. The post-failover authority's recovery paths
-            // (`recover_inflight_for_dead_secondary`,
-            // `maybe_requeue_silent_held_work`) fire ONLY for DEAD / SILENT
-            // holders — a holder the new primary believes is gone. This
-            // secondary SURVIVES the failover gap, so the new primary keeps
-            // its in-flight slot live and waits for a `TaskComplete` that was
-            // dropped here and will never come; the completed task is then
-            // STRANDED by the primary's final accounting. That is an
-            // honest-PESSIMISTIC over-strand (the work really did finish, but
-            // the run reports it as un-terminal), NOT a false-green — the
-            // buffered-terminal-replay that would let a surviving holder re-
-            // deliver across the gap is the proper fix (owner-deferred).
+            // BUFFERED-TERMINAL-REPLAY (the recovery): a TERMINAL-bearing
+            // report (`TaskComplete` / `TaskFailed`, incl. the
+            // backpressure-shaped deferred-lost reinject) resolves a task's
+            // in-flight entry at the authority, so absorbing it without
+            // retention strands that task forever — the new/old primary keeps
+            // the slot live and waits for a terminal that was dropped here and
+            // will never come (phantom-busy; the phase barrier wedges). So
+            // when the absorbed send was terminal-bearing we RETAIN the frame
+            // in the reporting concern's replay buffer instead of dropping it;
+            // the next drain (loop tick / primary-link recovery edge) re-sends
+            // it FIFO, retrying forever until delivered — including to a NEW
+            // primary after failover, since `send_to_primary` re-resolves
+            // `Destination::Primary` to the current holder at the egress edge.
+            // The authority is idempotent on a duplicate landing (hash-keyed
+            // `completed_tasks`/`failed_tasks` dedup; backpressure requeue
+            // gated on `free_slot_on_terminal`'s held-hash match), so a
+            // re-delivery that races an original is at-most-once-effective.
+            //
+            // Non-terminal primary-bound sends (keepalives, capacity
+            // `TaskRequest`s, `MeshReady`) are NOT retained: a missed one is
+            // re-emitted on the next tick, so buffering them would only grow
+            // a queue of stale capacity hints. The gate is `is_terminal`,
+            // computed above off the enum classifier.
             //
             // This is the NO-ROUTE abort — DISTINCT from the
             // `mesh_degraded` split-brain guard in `run_election_tick`,
@@ -232,9 +254,96 @@ where
             // so absorbing the `Err` discards no other error class. The
             // `Result` return is retained for a future genuinely-fatal
             // primary-bound send class, should one ever exist.
+            if let Some(retained) = replay_copy {
+                // RETAIN the terminal-bearing report FIFO (push at the back
+                // so the buffer stays in arrival order; a re-absorbed drain
+                // re-appends at the back, never reorders).
+                self.pending_terminal_replays.push(retained);
+                let buffered = self.pending_terminal_replays.len();
+                tracing::warn!(
+                    error = %e,
+                    msg_kind = ?msg_kind,
+                    task_hash = ?terminal_hash,
+                    buffered,
+                    "primary-bound TERMINAL report absorbed on no-route; \
+                     retained for replay ({buffered} buffered)"
+                );
+            } else {
+                tracing::debug!(
+                    error = %e,
+                    msg_kind = ?msg_kind,
+                    "primary-bound non-terminal send absorbed on no-route \
+                     (droppable; re-emitted next tick)"
+                );
+            }
             return Ok(());
         }
         result
+    }
+
+    /// Drain the buffered-terminal-replay queue: re-send every retained
+    /// terminal-bearing report FIFO, retrying forever until delivered.
+    ///
+    /// The reporting concern's RE-DELIVERY edge. A frame retained by
+    /// [`Self::send_to_primary`]'s no-route absorb is re-sent here through
+    /// the SAME `send_to_primary` chokepoint, so it re-resolves
+    /// `Destination::Primary` to whoever holds the role NOW (a NEW primary
+    /// after failover routes automatically). Each attempt is one of:
+    ///   - DELIVERED (`send_to` returned `Ok` — the route resolved): the
+    ///     frame is dropped from the buffer; an INFO records the
+    ///     re-delivery.
+    ///   - RE-ABSORBED (still no route): `send_to_primary` pushes the
+    ///     frame back onto `pending_terminal_replays`, so it stays queued
+    ///     for the next drain. Never dropped, never reordered.
+    ///
+    /// FIFO + no-reorder is enforced by draining the WHOLE buffer into an
+    /// owned `Vec` first (`std::mem::take`), then re-sending each in order:
+    /// a re-absorb appends to the now-EMPTY live buffer, so the surviving
+    /// frames keep their relative order and a delivered frame simply never
+    /// re-appears. Re-borrowing the buffer per-send (rather than holding it)
+    /// is required anyway — `send_to_primary` takes `&mut self`.
+    ///
+    /// Called from the two re-delivery triggers (the operational loop tick
+    /// and the `record_primary_message` primary-link-recovery edge). A
+    /// no-op when the buffer is empty (the steady-state hot path).
+    pub(in crate::secondary) async fn drain_terminal_replays(&mut self) {
+        if self.pending_terminal_replays.is_empty() {
+            return;
+        }
+        // Take the whole buffer; a re-absorb during the loop re-appends to
+        // the now-empty live buffer, preserving FIFO order across drains.
+        let pending = std::mem::take(&mut self.pending_terminal_replays);
+        let attempted = pending.len();
+        tracing::info!(
+            attempted,
+            "draining buffered-terminal-replay queue (re-delivering absorbed terminals)"
+        );
+        for frame in pending {
+            let task_hash = frame.task_hash().map(str::to_owned);
+            // Snapshot the buffer length BEFORE the re-send so we can tell a
+            // delivery (buffer unchanged) from a re-absorb (buffer grew by
+            // one — the frame went back via `send_to_primary`'s retain).
+            let buffered_before = self.pending_terminal_replays.len();
+            // `send_to_primary` absorbs a re-absorb into `Ok(())` and
+            // re-buffers the frame, so this never errors here; the delivery
+            // outcome is read from whether the buffer grew.
+            let _ = self.send_to_primary(frame).await;
+            let re_absorbed = self.pending_terminal_replays.len() > buffered_before;
+            if re_absorbed {
+                // Still no route — the frame is back on the buffer for the
+                // next drain. The absorb site already WARNed; stay quiet here
+                // to avoid double-logging the same no-route.
+                tracing::debug!(
+                    task_hash = ?task_hash,
+                    "buffered terminal re-absorbed (still no route); kept for next drain"
+                );
+            } else {
+                tracing::info!(
+                    task_hash = ?task_hash,
+                    "re-delivered absorbed terminal to the primary"
+                );
+            }
+        }
     }
 
     /// Report a respawn-HOLD-deferred task whose worker died before it
@@ -326,8 +435,11 @@ where
             self.report_deferred_task_lost(worker_id, &hash).await?;
         }
         // Also drain a deferred first-bind stash the replacement would
-        // otherwise strand (the stale-Ready round-2 wedge).
-        self.reinject_pending_first_bind(worker_id).await
+        // otherwise strand (the stale-Ready round-2 wedge). The drained
+        // flag is irrelevant to this sweep's `()` contract — both halves
+        // are recovery, not a decision input here.
+        self.reinject_pending_first_bind(worker_id).await?;
+        Ok(())
     }
 
     /// Drain a `pending_first_bind[worker_id]` stash (if any) into the
@@ -349,10 +461,16 @@ where
     /// the restart loop's `sweep_replaced_worker_task` reaches this drain
     /// the entry is already gone — popped-then-replaced means no
     /// double-report.
+    ///
+    /// Returns `true` iff a stash WAS drained (a deferred task was found +
+    /// reinjected). The `Disconnected` arm reads this to suppress its
+    /// "disconnect-with-error resolved to no active task" WARN when the
+    /// deferred-stash drain is what resolved the worker — a swept stash is
+    /// a recovered task, not a silent loss.
     pub(in crate::secondary) async fn reinject_pending_first_bind(
         &mut self,
         worker_id: WorkerId,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if let Some(pending) = self.op_mut().pending_first_bind.remove(&worker_id) {
             let pending_hash = pending.file_hash.clone();
             tracing::warn!(
@@ -364,8 +482,9 @@ where
             );
             self.report_deferred_task_lost(worker_id, &pending_hash)
                 .await?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Route the resource-pressure decision tick through the OOM

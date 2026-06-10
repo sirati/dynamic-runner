@@ -18,13 +18,15 @@
 
 #![cfg(test)]
 
-use super::super::test_helpers::{FakeWorkerFactory, make_secondary_recording};
+use super::super::test_helpers::{
+    FakeWorkerFactory, make_secondary_recording, make_secondary_recording_with_membership,
+};
 use super::super::*;
 use super::processing::make_binary;
 use dynrunner_core::{ErrorType, TaskResult};
 use dynrunner_manager_local::WorkerEvent;
 use dynrunner_manager_local::oom::{OomWatcher, OomWatcherConfig};
-use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, DistributedMessage};
+use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, DistributedMessage, PeerTransport};
 use std::time::Duration;
 
 /// Disabled OOM watcher (flat layout, no workers cgroup) — the repro
@@ -410,6 +412,791 @@ async fn router_first_bind_sweeps_prior_stash_and_keeps_fresh() {
                 "the prior first-bind stash must be reported terminal \
                  (backpressure TaskFailed) by the replacement-edge sweep; \
                  got {reported:?}"
+            );
+        })
+        .await;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// ROUND-3: post-Ready-ASSIGNED + tail-churn replacement interleavings.
+//
+// The round-2 wedge stranded a task that was STILL IN `pending_first_bind`
+// (stash never drained). Round 3 targets a DIFFERENT shape the production
+// recurrence (consumer nano run_20260610_064528 on 405f21b9) exhibited:
+// the first-bind WAS assigned post-Ready (the "pending first-bind assigned
+// post-Ready" INFO logged — so `active_tasks[H]=wid` was set and the slot
+// was BUSY), and THEN "tail churn replaced their workers". This is no
+// longer a stash strand: it is a task in `active_tasks` whose worker is
+// replaced. Every replacement edge that can hit a BUSY worker must sweep
+// `active_tasks[H]` into the reinject path so the replaced generation
+// cannot strand it. These tests drive the post-Ready-assigned state and
+// then each replacement edge, asserting the assigned task IS resolved
+// (cleared + reported terminal), not orphaned.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Drive a single-worker secondary to the post-Ready-ASSIGNED state: a
+/// first-bind dispatch stashes the binary, the fresh subprocess's `Ready`
+/// is consumed (the Ready arm pops the stash and `assign_task` succeeds),
+/// so `active_tasks[file_hash] = 0` and the slot is BUSY (Transitioning).
+/// Returns the live slot generation at the post-assign point so the caller
+/// can stamp a same-generation terminal. This is the EXACT state the
+/// production INFO "pending first-bind assigned post-Ready" marks.
+async fn drive_to_post_ready_assigned<P: PeerTransport<test_helpers::TestId>>(
+    secondary: &mut super::super::test_helpers::SecondaryHarness<P>,
+    oom: &OomWatcher,
+    binary: &dynrunner_core::TaskInfo<test_helpers::TestId>,
+    file_hash: &str,
+) -> u64 {
+    let assignment = task_assignment("setup", "sec-2", 0, binary, file_hash);
+    secondary
+        .handle_inbound(assignment, &mut FakeWorkerFactory)
+        .await;
+    assert!(
+        secondary.op_mut().pending_first_bind.contains_key(&0),
+        "first-bind must stash the binary in pending_first_bind"
+    );
+
+    let ready = secondary
+        .op_mut()
+        .pool
+        .recv_event()
+        .await
+        .expect("fresh subprocess must emit a Ready event");
+    assert!(
+        matches!(ready, WorkerEvent::Ready { worker_id: 0, .. }),
+        "expected Ready for worker 0; got {ready:?}"
+    );
+    secondary.handle_worker_event(ready, oom).await.unwrap();
+
+    assert!(
+        secondary.op_mut().active_tasks.contains_key(file_hash),
+        "Ready arm must bind the deferred task into active_tasks \
+         (the 'pending first-bind assigned post-Ready' state)"
+    );
+    assert!(
+        !secondary.op_mut().pool.workers[0].is_idle_state(),
+        "a post-Ready-assigned slot is BUSY (Transitioning), not idle"
+    );
+    secondary.op_mut().pool.workers[0].generation
+}
+
+/// Assert the hash was reported terminal (TaskFailed of any error_type) to
+/// the primary at least once. Backpressure (Recoverable) and at-fault
+/// (NonRecoverable / ResourceExhausted) both count — the wedge is a
+/// MISSING terminal, so any terminal resolves the phase barrier.
+fn assert_reported_terminal(
+    log: &std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<test_helpers::TestId>>>>,
+    file_hash: &str,
+) {
+    let reported = log.borrow();
+    assert!(
+        reported.iter().any(|m| matches!(
+            m,
+            DistributedMessage::TaskFailed { task_hash, .. }
+                | DistributedMessage::TaskComplete { task_hash, .. }
+            if *task_hash == file_hash
+        )),
+        "the post-Ready-assigned task MUST be reported terminal for the \
+         hash so the phase barrier releases; got {reported:?}"
+    );
+}
+
+/// (i) RESTART-LOOP replacement of a post-Ready-ASSIGNED worker.
+///
+/// The post-Ready-assigned task lives in `active_tasks`; the slot is then
+/// replaced by the restart-loop edge — the production `process_tasks`
+/// sequence `kill_subprocess` → `sweep_replaced_worker_task(wid)` →
+/// `restart_worker_async(wid)` (process_tasks.rs:601-616). The middle call
+/// is the SECONDARY-half recovery: it must pop `active_tasks[H]` and report
+/// it as backpressure before the restart bumps the generation. This is the
+/// "tail churn replaced their workers" edge for a flagged
+/// `pending_worker_restarts` slot.
+#[tokio::test(flavor = "current_thread")]
+async fn post_ready_assigned_restart_loop_replacement_is_reported_terminal() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            let oom = test_oom_watcher();
+            let binary = make_binary("clang20-O0-ltothin", 50);
+            let file_hash = "c48ccbf6".to_string();
+            let assigned_gen =
+                drive_to_post_ready_assigned(&mut secondary, &oom, &binary, &file_hash).await;
+
+            // Restart-loop edge, production sequence. kill → SWEEP → respawn.
+            secondary.op_mut().pool.workers[0].kill_subprocess();
+            secondary.sweep_replaced_worker_task(0).await.unwrap();
+            secondary
+                .pool_mut()
+                .restart_worker_async(0, &mut factory, false)
+                .await
+                .unwrap();
+            secondary.drain_egress().await;
+
+            let bumped_gen = secondary.op_mut().pool.workers[0].generation;
+            assert!(
+                bumped_gen > assigned_gen,
+                "the restart must bump the slot generation"
+            );
+            assert!(
+                !secondary.op_mut().active_tasks.contains_key(&file_hash),
+                "the restart-loop sweep must clear the post-Ready-assigned task \
+                 from active_tasks (else it is stranded by the new generation)"
+            );
+            assert_reported_terminal(&log, &file_hash);
+        })
+        .await;
+}
+
+/// (ii) BINARY-LESS pipe-EOF Disconnect of a post-Ready-ASSIGNED worker.
+///
+/// The companion round-2 test covers a NonRecoverable-WITH-binary
+/// disconnect (the nix-build-failure shape). This covers the OTHER
+/// disconnect shape hypothesis B calls out: the just-Ready worker dies
+/// BEFORE it can run the assigned task — a pure transport EOF synthesised
+/// as `Recoverable + "transport disconnected"` with `binary: None` (the
+/// protocol layer's pre-pickup synthesis at state.rs / worker.rs). The
+/// Disconnected arm's `active_tasks` scan must still find + report the
+/// assigned task regardless of the absent `binary`.
+#[tokio::test(flavor = "current_thread")]
+async fn post_ready_assigned_binaryless_pipe_eof_disconnect_is_reported_terminal() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            let oom = test_oom_watcher();
+            let binary = make_binary("clang21-O0-ltothin", 50);
+            let file_hash = "9ec1e342".to_string();
+            let assigned_gen =
+                drive_to_post_ready_assigned(&mut secondary, &oom, &binary, &file_hash).await;
+
+            // Pure transport EOF before the worker picked up the task:
+            // Recoverable + no binary. Same (current) generation, so the
+            // gen-gate passes it through to the Disconnected arm.
+            secondary
+                .handle_worker_event(
+                    WorkerEvent::Disconnected {
+                        worker_id: 0,
+                        generation: assigned_gen,
+                        result: TaskResult::error(
+                            ErrorType::Recoverable,
+                            "transport disconnected".to_string(),
+                        ),
+                        binary: None,
+                    },
+                    &oom,
+                )
+                .await
+                .unwrap();
+            secondary.drain_egress().await;
+
+            assert!(
+                !secondary.op_mut().active_tasks.contains_key(&file_hash),
+                "the binary-less disconnect must clear the post-Ready-assigned \
+                 task from active_tasks"
+            );
+            assert_reported_terminal(&log, &file_hash);
+        })
+        .await;
+}
+
+/// (iii) A SECOND TaskAssignment arrives while the worker is BUSY with a
+/// post-Ready-assigned task.
+///
+/// "The tail churn then hits that worker with ANOTHER type-shift dispatch."
+/// The router selects ONLY idle workers (router.rs:162-173 `is_idle_state`
+/// filter). A post-Ready-assigned slot is Transitioning (BUSY), and this
+/// fixture has a single worker, so the new dispatch finds NO idle target
+/// and reports the NEW task as backpressure — it must NOT touch / cannibalize
+/// the ORIGINAL active task. This pins that a router dispatch can never
+/// strand a busy worker's in-flight task: the original stays tracked (and a
+/// later real terminal resolves it), and only the new task is bounced.
+#[tokio::test(flavor = "current_thread")]
+async fn second_assignment_while_busy_does_not_strand_original_task() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            let oom = test_oom_watcher();
+            let orig_binary = make_binary("clang20-O0-ltothin", 50);
+            let orig_hash = "c48ccbf6".to_string();
+            let assigned_gen =
+                drive_to_post_ready_assigned(&mut secondary, &oom, &orig_binary, &orig_hash).await;
+
+            // A SECOND TaskAssignment for the same worker_id 0 arrives while
+            // the slot is BUSY. No idle worker exists, so the router bounces
+            // the NEW task and leaves the ORIGINAL active task untouched.
+            let new_binary = make_binary("clang21-O0-ltothin", 50);
+            let new_hash = "deadbeef".to_string();
+            let assignment2 = task_assignment("setup", "sec-2", 0, &new_binary, &new_hash);
+            secondary
+                .handle_inbound(assignment2, &mut FakeWorkerFactory)
+                .await;
+            secondary.drain_egress().await;
+
+            // The ORIGINAL task is NOT cannibalized: still tracked, slot
+            // generation unchanged (no replacement happened).
+            assert_eq!(
+                secondary.op_mut().active_tasks.get(&orig_hash),
+                Some(&0u32),
+                "the busy worker's original active task must survive a second \
+                 assignment that found no idle slot"
+            );
+            assert_eq!(
+                secondary.op_mut().pool.workers[0].generation,
+                assigned_gen,
+                "a no-idle-target dispatch must not replace the busy slot"
+            );
+
+            // The NEW task is reported back as backpressure (Recoverable),
+            // keyed by the NEW hash — never the original's.
+            let reported = log.borrow();
+            assert!(
+                reported.iter().any(|m| matches!(
+                    m,
+                    DistributedMessage::TaskFailed {
+                        task_hash,
+                        error_type: dynrunner_core::ErrorType::Recoverable,
+                        ..
+                    } if *task_hash == new_hash
+                )),
+                "the second (un-takeable) assignment must be reported as \
+                 backpressure for its OWN hash; got {reported:?}"
+            );
+            assert!(
+                !reported.iter().any(|m| matches!(
+                    m,
+                    DistributedMessage::TaskFailed { task_hash, .. }
+                    if *task_hash == orig_hash
+                )),
+                "the original task must NOT be reported terminal by the second \
+                 assignment (it is still running); got {reported:?}"
+            );
+        })
+        .await;
+}
+
+/// (iv) DOUBLE-REPLACEMENT: the sweep resolves the post-Ready-assigned
+/// task, THEN the OLD subprocess's buffered terminal arrives stale.
+///
+/// The dangerous "tail churn" shape: a post-Ready-assigned task lives in
+/// `active_tasks` (gen G). The restart-loop sweep resolves it (clears
+/// active_tasks + reports backpressure, bumps to gen G+1). THEN the
+/// REPLACED generation's poll task — which `abort_poll_task` could not
+/// retract — delivers a buffered terminal stamped gen G. The generation
+/// gate (pool.rs `is_stale_event`) MUST drop it: processing it would
+/// re-report the (already-swept) hash a SECOND time (double-terminal at
+/// the primary → over-count / wrong outcome class) OR, worse, mis-attribute
+/// it to whatever task the fresh gen-G+1 subprocess was since bound to.
+/// This is the post-Ready-ASSIGNED analogue of the gen-gate's stale-Ready
+/// case; it pins exactly-one terminal across the replacement.
+#[tokio::test(flavor = "current_thread")]
+async fn post_ready_assigned_swept_then_stale_terminal_is_dropped() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            let oom = test_oom_watcher();
+            let binary = make_binary("clang20-O0-ltothin", 50);
+            let file_hash = "c48ccbf6".to_string();
+            let assigned_gen =
+                drive_to_post_ready_assigned(&mut secondary, &oom, &binary, &file_hash).await;
+
+            // Restart-loop replacement resolves the assigned task and bumps
+            // the generation (G → G+1).
+            secondary.op_mut().pool.workers[0].kill_subprocess();
+            secondary.sweep_replaced_worker_task(0).await.unwrap();
+            secondary
+                .pool_mut()
+                .restart_worker_async(0, &mut factory, false)
+                .await
+                .unwrap();
+            secondary.drain_egress().await;
+            let bumped_gen = secondary.op_mut().pool.workers[0].generation;
+            assert!(bumped_gen > assigned_gen);
+
+            // Exactly ONE terminal for the hash after the sweep.
+            let terminals_after_sweep = log
+                .borrow()
+                .iter()
+                .filter(|m| matches!(
+                    m,
+                    DistributedMessage::TaskFailed { task_hash, .. }
+                        | DistributedMessage::TaskComplete { task_hash, .. }
+                    if *task_hash == file_hash
+                ))
+                .count();
+            assert_eq!(
+                terminals_after_sweep, 1,
+                "the sweep must report the assigned task terminal EXACTLY once"
+            );
+
+            // The REPLACED generation's buffered terminal arrives stale
+            // (stamped the OLD generation). It must be gen-gated out: no
+            // bookkeeping change, no second report, no panic.
+            secondary
+                .handle_worker_event(
+                    WorkerEvent::TaskCompleted {
+                        worker_id: 0,
+                        generation: assigned_gen,
+                        result: TaskResult::ok(),
+                        result_data: None,
+                        binary: Some(binary.clone()),
+                        estimated_resources: dynrunner_core::ResourceMap::new(),
+                    },
+                    &oom,
+                )
+                .await
+                .unwrap();
+            secondary.drain_egress().await;
+
+            let terminals_after_stale = log
+                .borrow()
+                .iter()
+                .filter(|m| matches!(
+                    m,
+                    DistributedMessage::TaskFailed { task_hash, .. }
+                        | DistributedMessage::TaskComplete { task_hash, .. }
+                    if *task_hash == file_hash
+                ))
+                .count();
+            assert_eq!(
+                terminals_after_stale, 1,
+                "the stale-generation buffered terminal must be DROPPED — the \
+                 hash must still have exactly one terminal, not two"
+            );
+        })
+        .await;
+}
+
+/// (v) NO-ROUTE ABSORB → BUFFERED-TERMINAL-REPLAY: a swept terminal that
+/// hits a no-route is RETAINED and RE-DELIVERED exactly once when the route
+/// recovers (the production fix; formerly the documented strand).
+///
+/// `send_to_primary` ABSORBS a no-route `Err` into `Ok(())` (a no-route is a
+/// failover SIGNAL, not a run-fatal error, so the secondary must not abort
+/// the run). Pre-fix the absorbed terminal was genuinely LOST: the sweep
+/// clears `active_tasks[H]` FIRST then reports → the report is swallowed →
+/// the task is gone LOCALLY with NO terminal on the wire, so the primary
+/// keeps the slot in-flight forever (phantom-busy; the phase barrier wedges
+/// exactly as the production "in-flight froze" symptom describes).
+///
+/// The buffered-terminal-replay fix RETAINS the terminal-bearing report on
+/// the absorb and RE-DELIVERS it on the next opportunity. This test drives
+/// the route DOWN (primary absent from the `MembershipView`), sweeps (the
+/// absorb retains the terminal in `pending_terminal_replays` — NOT lost),
+/// asserts the retention, then brings the route back UP and drains, asserting
+/// the terminal is re-delivered EXACTLY ONCE.
+///
+/// Uses the membership-controllable `RecordingPeer`: with `"setup"` removed
+/// from membership the egress `has_peer("setup")` gate surfaces the no-route
+/// the absorb keys on; re-adding `"setup"` + re-publishing lets the drain's
+/// re-send route and land in the recorded log.
+#[tokio::test(flavor = "current_thread")]
+async fn swept_terminal_is_retained_and_redelivered_when_route_recovers() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // RecordingPeer seeds membership { "setup", "peer-0" }; the
+            // membership handle lets the test flip the primary's
+            // reachability. bootstrap_primary_id "setup" so the egress edge
+            // resolves Destination::Primary → Peer("setup").
+            let (mut secondary, log, membership) =
+                make_secondary_recording_with_membership(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            let oom = test_oom_watcher();
+            let binary = make_binary("clang20-O0-ltothin", 50);
+            let file_hash = "c48ccbf6".to_string();
+            drive_to_post_ready_assigned(&mut secondary, &oom, &binary, &file_hash).await;
+
+            // Drive the ROUTE DOWN: remove "setup" from membership and
+            // publish so the egress no-route gate reads the primary as
+            // absent. (drive_to_post_ready_assigned issued no primary-bound
+            // send, so nothing earlier observed the route.)
+            membership.borrow_mut().retain(|id| id.as_str() != "setup");
+            secondary.publish_membership();
+
+            // Restart-loop sweep while the primary is unrouteable. The sweep
+            // clears active_tasks[H] then reports — the report's send is
+            // ABSORBED (no-route → Ok) AND the terminal is RETAINED for
+            // replay (the fix).
+            secondary.op_mut().pool.workers[0].kill_subprocess();
+            let sweep_result = secondary.sweep_replaced_worker_task(0).await;
+
+            assert!(
+                sweep_result.is_ok(),
+                "the sweep absorbs the no-route into Ok (a no-route is a \
+                 failover signal, not a run-fatal error); got {sweep_result:?}"
+            );
+            assert!(
+                !secondary.op_mut().active_tasks.contains_key(&file_hash),
+                "the sweep cleared active_tasks LOCALLY"
+            );
+            // RETAINED, not lost: the terminal-bearing report sits in the
+            // replay buffer (the fix). Nothing reached the wire yet.
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                1,
+                "the absorbed terminal must be RETAINED in the replay buffer, \
+                 not dropped"
+            );
+            assert!(
+                log.borrow().is_empty(),
+                "nothing reached the wire while the route was down; got {:?}",
+                log.borrow()
+            );
+
+            // Bring the ROUTE BACK UP and drain: the retained terminal is
+            // re-delivered through the recovered route.
+            membership.borrow_mut().push(
+                dynrunner_protocol_primary_secondary::PeerId::from("setup"),
+            );
+            secondary.publish_membership();
+            secondary.drain_terminal_replays().await;
+            secondary.drain_egress().await;
+
+            // RE-DELIVERED EXACTLY ONCE: the buffer is empty and the wire
+            // log carries exactly one TaskFailed for the hash.
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                0,
+                "the replay buffer must be drained after the route recovers"
+            );
+            let terminals_for_hash = log
+                .borrow()
+                .iter()
+                .filter(|m| matches!(
+                    m,
+                    DistributedMessage::TaskFailed { task_hash, .. }
+                        | DistributedMessage::TaskComplete { task_hash, .. }
+                    if *task_hash == file_hash
+                ))
+                .count();
+            assert_eq!(
+                terminals_for_hash, 1,
+                "the retained terminal must be re-delivered EXACTLY ONCE on \
+                 route recovery (not lost, not duplicated); got {:?}",
+                log.borrow()
+            );
+        })
+        .await;
+}
+
+/// (vi) REPLAY FIFO + re-absorb re-queues: two terminals buffered while the
+/// route is down; on recovery the FIRST drain attempt re-absorbs (route
+/// still down) and the order is preserved, then a second recovery drain
+/// delivers both in arrival order.
+///
+/// Pins the no-drop / no-reorder contract: a re-absorbed frame goes back to
+/// the BACK of an empty-during-drain buffer (FIFO across drains), so a
+/// partial-recovery flap never drops or reorders a retained terminal.
+#[tokio::test(flavor = "current_thread")]
+async fn replay_buffer_is_fifo_and_requeues_on_reabsorb() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log, membership) =
+                make_secondary_recording_with_membership(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            // Route DOWN.
+            membership.borrow_mut().retain(|id| id.as_str() != "setup");
+            secondary.publish_membership();
+
+            // Buffer TWO terminals (distinct hashes) by reporting them while
+            // the route is down — each absorb retains in arrival order.
+            secondary
+                .report_deferred_task_lost(0, "hash-first")
+                .await
+                .unwrap();
+            secondary
+                .report_deferred_task_lost(0, "hash-second")
+                .await
+                .unwrap();
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                2,
+                "both terminals must be retained while the route is down"
+            );
+
+            // First drain attempt with the route STILL down: both re-absorb,
+            // so the buffer length is preserved and order is unchanged.
+            secondary.drain_terminal_replays().await;
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                2,
+                "a drain while still no-route must re-queue both (never drop)"
+            );
+            assert!(
+                log.borrow().is_empty(),
+                "no terminal reaches the wire while the route is still down"
+            );
+
+            // Route UP; drain delivers BOTH in arrival order (first then second).
+            membership.borrow_mut().push(
+                dynrunner_protocol_primary_secondary::PeerId::from("setup"),
+            );
+            secondary.publish_membership();
+            secondary.drain_terminal_replays().await;
+            secondary.drain_egress().await;
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                0,
+                "the buffer must be drained on recovery"
+            );
+            let delivered_hashes: Vec<String> = log
+                .borrow()
+                .iter()
+                .filter_map(|m| match m {
+                    DistributedMessage::TaskFailed { task_hash, .. } => Some(task_hash.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                delivered_hashes,
+                vec!["hash-first".to_string(), "hash-second".to_string()],
+                "the two retained terminals must be re-delivered FIFO (arrival \
+                 order preserved across the re-absorb flap); got {delivered_hashes:?}"
+            );
+        })
+        .await;
+}
+
+/// (vii) NON-TERMINAL messages are NOT buffered: a `TaskRequest` (a capacity
+/// hint, legitimately droppable) absorbed on no-route is dropped, never
+/// retained — only terminal-bearing reports replay.
+#[tokio::test(flavor = "current_thread")]
+async fn non_terminal_send_is_not_buffered_on_no_route() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, _log, membership) =
+                make_secondary_recording_with_membership(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            // Route DOWN.
+            membership.borrow_mut().retain(|id| id.as_str() != "setup");
+            secondary.publish_membership();
+
+            // A capacity TaskRequest for the idle worker hits the no-route and
+            // is absorbed — but it is NOT terminal-bearing, so it must NOT be
+            // retained (a stale capacity hint is re-emitted next tick anyway).
+            secondary.request_task_for_worker(0).await.unwrap();
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                0,
+                "a non-terminal (TaskRequest) send must NOT be buffered for replay"
+            );
+        })
+        .await;
+}
+
+/// (viii) REPLAY SURVIVES A PRIMARY CHANGE: a terminal retained while the
+/// old primary was unreachable is re-delivered to the NEW primary after a
+/// failover — `send_to_primary` re-resolves `Destination::Primary` to
+/// `current_primary()` at the egress edge, so the retained frame follows the
+/// role to whoever holds it now.
+///
+/// Drives the route to the OLD bootstrap primary down, buffers a terminal,
+/// then installs a NEW current_primary (the post-failover holder) reachable
+/// in the membership, and drains — asserting the terminal lands routed to
+/// the new id.
+#[tokio::test(flavor = "current_thread")]
+async fn replay_survives_primary_change_redelivers_to_new_primary() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log, membership) =
+                make_secondary_recording_with_membership(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            // Old bootstrap primary "setup" is UNREACHABLE: remove it from
+            // membership and publish. The egress resolves Destination::Primary
+            // → bootstrap "setup" (no current_primary yet), finds it absent,
+            // and absorbs.
+            membership.borrow_mut().retain(|id| id.as_str() != "setup");
+            secondary.publish_membership();
+            secondary
+                .report_deferred_task_lost(0, "primchg-hash")
+                .await
+                .unwrap();
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                1,
+                "the terminal is retained while the old primary is unreachable"
+            );
+
+            // FAILOVER: a NEW primary "peer-0" takes the role and IS a
+            // reachable member. Apply a PrimaryChanged so `current_primary()`
+            // names the new holder; the egress then resolves
+            // Destination::Primary → "peer-0". ("peer-0" was seeded in
+            // membership by the RecordingPeer's peer_count=1.)
+            secondary
+                .cluster_state
+                .apply(dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
+                    new: "peer-0".into(),
+                    epoch: 1,
+                    reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+                });
+            secondary.publish_membership();
+
+            // Drain: the retained terminal re-resolves to the NEW primary and
+            // is delivered.
+            secondary.drain_terminal_replays().await;
+            secondary.drain_egress().await;
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                0,
+                "the retained terminal must drain to the new primary"
+            );
+            assert_eq!(
+                log.borrow()
+                    .iter()
+                    .filter(|m| matches!(
+                        m,
+                        DistributedMessage::TaskFailed { task_hash, .. }
+                        if *task_hash == "primchg-hash"
+                    ))
+                    .count(),
+                1,
+                "the retained terminal must be re-delivered exactly once to the \
+                 NEW primary after the failover; got {:?}",
+                log.borrow()
+            );
+        })
+        .await;
+}
+
+/// (ix) PRIMARY-LINK-RECOVERY edge drains the replay buffer: a terminal
+/// retained during a primary outage is re-delivered the instant
+/// `record_primary_message` reverts an in-flight election (the "primary
+/// message resumed" edge) — ahead of the periodic loop-tick drain.
+#[tokio::test(flavor = "current_thread")]
+async fn primary_link_recovery_edge_drains_replay_buffer() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log, membership) =
+                make_secondary_recording_with_membership(one_worker_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            // Route DOWN; buffer a terminal.
+            membership.borrow_mut().retain(|id| id.as_str() != "setup");
+            secondary.publish_membership();
+            secondary
+                .report_deferred_task_lost(0, "recover-hash")
+                .await
+                .unwrap();
+            assert_eq!(secondary.pending_terminal_replays.len(), 1);
+
+            // Drive the election into Suspecting so the recovery edge has
+            // something to revert; "setup" is the current primary so a
+            // primary message from it recognises + reverts.
+            secondary
+                .cluster_state
+                .apply(dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
+                    new: "setup".into(),
+                    epoch: 1,
+                    reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+                });
+            secondary.op_mut().election = super::super::election::ElectionState::Suspecting {
+                since: std::time::Instant::now(),
+                responses: std::collections::HashMap::new(),
+            };
+
+            // Route BACK UP, then the primary-link-recovery edge fires: a
+            // primary message from "setup" reverts Suspecting → Normal and
+            // drains the replay buffer immediately.
+            membership.borrow_mut().push(
+                dynrunner_protocol_primary_secondary::PeerId::from("setup"),
+            );
+            secondary.publish_membership();
+            secondary
+                .record_primary_message_if_from_primary("setup")
+                .await;
+            secondary.drain_egress().await;
+
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                0,
+                "the primary-link-recovery edge must drain the replay buffer"
+            );
+            assert_eq!(
+                log.borrow()
+                    .iter()
+                    .filter(|m| matches!(
+                        m,
+                        DistributedMessage::TaskFailed { task_hash, .. }
+                        if *task_hash == "recover-hash"
+                    ))
+                    .count(),
+                1,
+                "the retained terminal must be re-delivered exactly once on the \
+                 primary-link-recovery edge; got {:?}",
+                log.borrow()
             );
         })
         .await;

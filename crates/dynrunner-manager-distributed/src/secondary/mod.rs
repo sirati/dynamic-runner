@@ -573,4 +573,51 @@ where
     /// contract — until the handler overwrites it.
     pub(super) staging_dispatch_context:
         std::sync::Arc<std::sync::Mutex<types::StagingDispatchContext>>,
+
+    /// Buffered-terminal-replay queue — the reporting concern's retain
+    /// buffer for a terminal-bearing primary-bound report whose send was
+    /// ABSORBED on a transient no-route.
+    ///
+    /// `send_to_primary` absorbs a no-route `Err` into `Ok(())` so a
+    /// primary-loss never fatals / false-failovers a voter (the absorb is
+    /// a failover SIGNAL, not a run-fatal error). Pre-replay the absorbed
+    /// frame was genuinely LOST: a `TaskComplete` / `TaskFailed` cleared
+    /// here LOCALLY (e.g. the replacement sweep clears `active_tasks`
+    /// before reporting) but never reached the authority, so the
+    /// primary's in-flight entry strands forever (phantom-busy; the phase
+    /// barrier wedges). This buffer is that fix: when a TERMINAL-bearing
+    /// (`DistributedMessage::is_terminal_bearing`) report is absorbed on
+    /// no-route, the frame is RETAINED here instead of dropped.
+    ///
+    /// Scope: ONLY terminal-bearing reports are buffered — keepalives /
+    /// stats / capacity `TaskRequest`s are legitimately droppable (a
+    /// missed one is re-emitted next tick) and never land here. The gate
+    /// is at the absorb site in `send_to_primary` (see
+    /// `resource.rs::send_to_primary`); every other primary-bound send
+    /// kind flows through unchanged.
+    ///
+    /// Drained FIFO, retrying FOREVER until delivered, on TWO triggers:
+    /// the top of the operational loop tick (`process_tasks`, beside the
+    /// deferred-peer-message flush) AND the primary-link-recovery edge
+    /// (`record_primary_message`, where Suspecting/Voting/Candidate →
+    /// Normal).
+    ///
+    /// Each drain attempt re-sends FIFO; a re-absorb re-buffers the frame
+    /// at the back (never drop, never reorder within a single drain). A
+    /// re-delivery to a NEW primary after failover works automatically —
+    /// `send_to_primary` routes `Destination::Primary` to
+    /// `current_primary()` at the egress edge, so the retained frame
+    /// follows the role. The authority dedupes a duplicate landing
+    /// (hash-keyed `completed_tasks` / `failed_tasks`; idempotent
+    /// backpressure requeue gated on `free_slot_on_terminal`'s held-hash
+    /// match), so an at-most-once-effective re-delivery is safe even if
+    /// the original send had in fact reached an old primary.
+    ///
+    /// Lives on the coordinator (NOT `OperationalState`) because the
+    /// reporting concern that owns `send_to_primary` lives here, and the
+    /// buffer is its private mechanism — a drain is a no-op outside an
+    /// operational run (no terminal can be produced there), so it needs
+    /// no lifecycle gating.
+    pub(in crate::secondary) pending_terminal_replays:
+        Vec<DistributedMessage<I>>,
 }

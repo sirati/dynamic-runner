@@ -34,7 +34,16 @@ where
     /// mutation is the only re-point. This method records liveness and
     /// cancels a false-alarm election; it writes no routing target,
     /// because there is no transitional routing target anymore (P2).
-    pub(in crate::secondary) fn record_primary_message(&mut self) {
+    ///
+    /// Returns `true` iff this call RECOVERED an in-flight failover
+    /// election (reverted Suspecting/Voting/Candidate → Normal) — the
+    /// "primary message resumed" edge. The async
+    /// [`Self::record_primary_message_if_from_primary`] wrapper keys the
+    /// buffered-terminal-replay drain off this edge: a resumed primary
+    /// link is the moment the route is most likely back, so any terminal
+    /// retained during the outage is re-delivered immediately rather than
+    /// waiting for the next loop tick.
+    pub(in crate::secondary) fn record_primary_message(&mut self) -> bool {
         let secondary_id = self.config.secondary_id.clone();
         let op = self.op_mut();
         op.primary_last_seen = Some(Instant::now());
@@ -75,7 +84,9 @@ where
                 "election recovered: primary message resumed, reverting to Normal"
             );
             op.election = ElectionState::Normal;
+            return true;
         }
+        false
     }
 
     /// Identity-gated wrapper over [`Self::record_primary_message`]: refresh
@@ -109,9 +120,28 @@ where
     /// `self_named_primary_resets_election_to_normal` contract — because the
     /// predicate is "origin == current primary", and a self-named primary IS
     /// the current primary.
-    pub(in crate::secondary) fn record_primary_message_if_from_primary(&mut self, sender_id: &str) {
+    ///
+    /// `async` because it owns the buffered-terminal-replay drain on the
+    /// primary-link-recovery edge: when this call reverts an in-flight
+    /// failover election (the "primary message resumed" edge that
+    /// [`Self::record_primary_message`] returns `true` on), the route to the
+    /// primary is most likely back, so any terminal-bearing report retained
+    /// during the outage is re-delivered RIGHT NOW (ahead of the periodic
+    /// loop-tick drain). The drain is FIFO + retry-forever; a frame that
+    /// re-absorbs (route not actually back yet) simply re-buffers and the
+    /// next trigger retries it.
+    pub(in crate::secondary) async fn record_primary_message_if_from_primary(
+        &mut self,
+        sender_id: &str,
+    ) {
         if self.cluster_state.current_primary() == Some(sender_id) {
-            self.record_primary_message();
+            let link_recovered = self.record_primary_message();
+            if link_recovered {
+                // Primary-link-recovery edge: re-deliver any retained
+                // terminal reports immediately. No-op when nothing was
+                // buffered (the steady-state case).
+                self.drain_terminal_replays().await;
+            }
         }
     }
 
