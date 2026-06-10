@@ -16,10 +16,12 @@ use tokio::process::Child;
 use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::task::JoinSet;
 
+use super::escalation::{EscalationVerdict, ReconnectEscalation};
 use super::establish::establish_one_tunnel_inner;
 use super::options::{InfoFileReader, PrepError, PreparationOptions};
 use super::ssh::{LingerRestoreMap, production_spawner, reconnect_spawner, restore_linger};
 use super::store::{PerSecondaryTunnelRegistry, SharedTunnelVec, TunnelStore};
+use super::summary::{TunnelSetupSummary, secondary_id};
 
 /// Lifecycle for the SLURM preparation phase. Owns spawned `ssh -N -R`
 /// subprocess handles and tears them down on cleanup().
@@ -82,6 +84,13 @@ pub struct SlurmPreparation {
     /// so the whole run's linger lifecycle is one map. See
     /// [`LingerRestoreMap`].
     linger_restore: LingerRestoreMap,
+    /// Half-dead-tunnel escalation (#342): per-secondary consecutive
+    /// alive-noop reconnect-tick streaks. Consulted by
+    /// [`Self::reestablish_one_tunnel`] whenever the liveness gate
+    /// no-ops; after K consecutive no-op ticks without recovery the
+    /// gate is overridden and the rebuild forced. `StdMutex` — held
+    /// only for the synchronous verdict, never across an await.
+    reconnect_escalation: StdMutex<ReconnectEscalation>,
 }
 
 impl SlurmPreparation {
@@ -95,6 +104,7 @@ impl SlurmPreparation {
             establish_pool,
             primary_quic_port: StdMutex::new(None),
             linger_restore: Arc::new(StdMutex::new(HashMap::new())),
+            reconnect_escalation: StdMutex::new(ReconnectEscalation::default()),
         }
     }
 
@@ -170,7 +180,7 @@ impl SlurmPreparation {
             Vec::with_capacity(num_secondaries);
 
         for i in 0..num_secondaries {
-            let secondary_id = format!("secondary-{i}");
+            let secondary_id = secondary_id(i);
             let (tx, rx) = oneshot::channel();
             receivers.push(rx);
 
@@ -240,13 +250,28 @@ impl SlurmPreparation {
                 // to extend here. The returned `map` is the per-call
                 // snapshot built from oneshot outcomes — by construction
                 // it equals what the inner wrote. May be partial when
-                // setup-deadline fired before all watchers reported;
-                // the warn! above carries the partial-fleet headline.
-                tracing::info!(
-                    ready = map.len(),
-                    total = num_secondaries,
-                    "ssh tunnel setup done"
-                );
+                // setup-deadline fired before all watchers reported.
+                //
+                // HONEST summary (#278): report established/expected from
+                // what was actually VERIFIED, never a count of spawns.
+                // Partial fleets are WARNed with the missing ids named —
+                // the same `TunnelSetupSummary` the pyo3 operator-log
+                // emit renders, so the two layers cannot drift.
+                let summary = TunnelSetupSummary::new(map, num_secondaries);
+                if summary.is_complete() {
+                    tracing::info!(
+                        ready = summary.established,
+                        total = summary.expected,
+                        "ssh tunnel setup done: {summary}"
+                    );
+                } else {
+                    tracing::warn!(
+                        ready = summary.established,
+                        total = summary.expected,
+                        missing = ?summary.missing,
+                        "ssh tunnel setup done with failures: {summary}"
+                    );
+                }
             }
             Err(e) => tracing::error!(error = %e, "ssh tunnel setup failed"),
         }
@@ -357,6 +382,17 @@ impl SlurmPreparation {
     /// (defect (b)), a separate concern in the transport — not this
     /// tunnel's job.
     ///
+    /// # The half-dead escalation (#342)
+    ///
+    /// The gate's probe is LOCAL (`Child::try_wait`); a tunnel whose local
+    /// ssh + master TCP survive while the WORKER-side forward is dead reads
+    /// alive forever and would never be rebuilt. So every gate no-op is
+    /// fed to the per-secondary [`escalation`](super::escalation) tracker;
+    /// after K consecutive alive-noop reconnect ticks without visibility
+    /// recovering (the cadence only re-fires while lost), the gate is
+    /// overridden and the rebuild forced — see the escalation module doc
+    /// for why this cannot regress into the healthy-forward churn.
+    ///
     /// Why a distinct entry point rather than a flag on
     /// `establish_one_tunnel`: the two paths cross the SAME
     /// establishment seam ([`establish_one_tunnel_inner`]) and differ
@@ -382,13 +418,43 @@ impl SlurmPreparation {
         // running, the `-R` forward is healthy — the rebuild is a NO-OP.
         // Returning Ok here is the success signal the cadence was blind to:
         // it stops the release+rebind churn against the observer's own
-        // healthy listener. Only an EXITED/absent child warrants a rebuild.
+        // healthy listener. Only an EXITED/absent child warrants a rebuild —
+        // EXCEPT when the half-dead escalation (#342) overrides: the local
+        // child can outlive its WORKER-side forward (master TCP up, forward
+        // dead), in which case the gate no-ops forever while visibility
+        // never recovers. Each gate no-op is recorded as one alive-noop
+        // tick; after K consecutive ticks without recovery (the cadence
+        // only re-fires while visibility stays lost) the tunnel is presumed
+        // half-dead and the rebuild proceeds anyway: release the worker-side
+        // binding, respawn, and let the registry commit replace (and reap)
+        // the suspect child. See `escalation` for why this cannot
+        // re-introduce the healthy-forward churn the gate exists to stop.
         if store.is_alive(secondary_id).await {
-            tracing::debug!(
-                secondary_id,
-                "observer-reconnect: tunnel child still alive — skipping rebuild (no-op)"
-            );
-            return Ok(());
+            let verdict = self
+                .reconnect_escalation
+                .lock()
+                .expect("reconnect_escalation mutex poisoned")
+                .on_alive_noop(secondary_id, std::time::Instant::now());
+            match verdict {
+                EscalationVerdict::Tolerate { streak } => {
+                    tracing::debug!(
+                        secondary_id,
+                        alive_noop_streak = streak,
+                        "observer-reconnect: tunnel child still alive — skipping rebuild (no-op)"
+                    );
+                    return Ok(());
+                }
+                EscalationVerdict::ForceRebuild => {
+                    tracing::warn!(
+                        secondary_id,
+                        "observer-reconnect ESCALATION: tunnel child alive but visibility \
+                         did not recover across consecutive reconnect ticks — presuming the \
+                         worker-side forward half-dead; forcing release + rebuild (the \
+                         suspect child is replaced and reaped on commit)"
+                    );
+                    // Fall through to the rebuild below.
+                }
+            }
         }
 
         let primary_quic_port = self
@@ -432,6 +498,13 @@ impl SlurmPreparation {
             spawner,
         )
         .await?;
+        // A completed rebuild (gate-found-dead or escalation-forced alike)
+        // resets the escalation streak: the fresh child gets the full
+        // K-tick benefit of the doubt before any future force.
+        self.reconnect_escalation
+            .lock()
+            .expect("reconnect_escalation mutex poisoned")
+            .on_rebuilt(&id_owned);
         Ok(())
     }
 

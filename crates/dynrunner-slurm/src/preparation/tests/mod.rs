@@ -10,12 +10,14 @@ use tempfile::TempDir;
 
 use super::options::PreparationOptions;
 
+mod escalation;
 mod establish;
 mod gather;
 mod pipeline;
 mod respawn;
 mod ssh;
 mod store;
+mod summary;
 mod uri_parsing;
 
 /// Construct a `PreparationOptions` with `setup_timeout` / `poll_interval`
