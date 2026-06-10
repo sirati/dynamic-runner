@@ -219,9 +219,10 @@ CustomMessageHandler = Callable[[str, str, bytes, bool, "PrimaryHandle"], None]
 #     (≤ `CUSTOM_MESSAGE_MAX_BYTES`, 100 KiB).
 #   - `secondary_handle`: a `SecondaryHandle` — the listener replies
 #     via `secondary_handle.send_to_worker(worker_id, topic, data)`
-#     (the worker drains replies via `Task.poll_messages()`), and —
-#     once feature 5 lands — relays cluster-wide via
-#     `send_to_primary(topic, data, important=...)`.
+#     (the worker drains replies via `Task.poll_messages()`), and
+#     relays cluster-wide via
+#     `send_to_primary(topic, data, important=...)` (see
+#     :data:`CustomMessageHandler` for the primary-side contract).
 # Messages from one worker arrive in send order. The listener runs on
 # the secondary's worker-message dispatcher task (off the operational
 # loop) with panic + `PyErr` isolation — the `task_completed_listener`

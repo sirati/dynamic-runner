@@ -10,10 +10,10 @@
 //! NO custom-message shape knowledge.
 //!
 //! Callers: the consumer-facing `SecondaryHandle.send_to_primary`
-//! (PyO3) reaches this through the secondary's operational loop — the
-//! F2 (`custom-worker-messages`) branch owns the `SecondaryHandle`
-//! pyclass + its channel into the loop; its arm's hookup is the single
-//! line `coordinator.send_custom_to_primary(topic, data, important)`.
+//! (PyO3) reaches this through the secondary's operational loop — a
+//! queued `SecondaryControlCommand::SendToPrimary` drained by the
+//! loop's control arm (`processing/process_tasks.rs`), per the
+//! dispatch-decoupling law.
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
@@ -57,10 +57,6 @@ where
     /// The `Err` surfaces ONLY the size rejection: route-level outcomes
     /// are the chokepoint's concern (a no-route is absorbed there into
     /// the retention/probe machinery, never bubbled).
-    // F2-merge seam: the production caller is the `SecondaryHandle`
-    // loop arm the `custom-worker-messages` branch adds; until that
-    // merge the only callers are the secondary's tests.
-    #[allow(dead_code)]
     pub(crate) async fn send_custom_to_primary(
         &mut self,
         topic: String,
