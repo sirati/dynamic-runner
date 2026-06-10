@@ -307,10 +307,13 @@ impl LingerVerb {
 ///
 /// The `WAS_LINGER` probe runs for BOTH verbs but is only consumed on
 /// `Enable` (the setup captures it so the matching `Disable` restore knows
-/// whether the user was already lingering). loginctl errors are silenced
-/// (`2>/dev/null`) — the structured markers, not the raw stderr, carry the
-/// outcome the setup keys off; a polkit-restricted cluster surfaces as a
-/// `fail` marker which the caller WARNs on and proceeds.
+/// whether the user was already lingering). The mutation's own error output
+/// is CAPTURED onto the fail marker line (`{marker}=fail <reason>`) — the
+/// structured markers, NOT the ssh exit code, carry the outcome: the forced
+/// PTY (`-tt`) masks the remote exit status (ssh reports the PTY session's
+/// exit — observed `0` for a FAILED `enable-linger`), so the marker line is
+/// the only reliable channel for both the verdict and the reason (e.g. a
+/// polkit-restricted node's "Could not enable linger: Access denied").
 fn build_linger_remote_cmd(verb: LingerVerb) -> String {
     let sub = verb.subcommand();
     let marker = match verb {
@@ -320,8 +323,8 @@ fn build_linger_remote_cmd(verb: LingerVerb) -> String {
     format!(
         "W=$(loginctl show-user --value -p Linger 2>/dev/null); \
          printf 'WAS_LINGER=%s\\n' \"$W\"; \
-         if loginctl {sub} 2>/dev/null; then printf '{marker}=ok\\n'; \
-         else printf '{marker}=fail\\n'; fi",
+         if E=$(loginctl {sub} 2>&1); then printf '{marker}=ok\\n'; \
+         else printf '{marker}=fail %s\\n' \"$E\"; fi",
     )
 }
 
@@ -383,7 +386,7 @@ pub(super) fn parse_was_linger(stdout: &str) -> Option<String> {
 
 /// PURE: did the requested mutation report success? Scans for the
 /// `<MARKER>=ok` line (`ENABLE=ok` / `DISABLE=ok`) the remote command
-/// prints, CR-trimming for the `-tt` PTY. Absent or `=fail` ⇒ `false`.
+/// prints, CR-trimming for the `-tt` PTY. Absent or `=fail …` ⇒ `false`.
 pub(super) fn linger_succeeded(stdout: &str, verb: LingerVerb) -> bool {
     let ok = match verb {
         LingerVerb::Enable => "ENABLE=ok",
@@ -392,6 +395,25 @@ pub(super) fn linger_succeeded(stdout: &str, verb: LingerVerb) -> bool {
     stdout
         .lines()
         .any(|line| line.trim_end_matches('\r').trim() == ok)
+}
+
+/// PURE: the remote `loginctl` error captured on the `<MARKER>=fail <reason>`
+/// line — e.g. "Could not enable linger: Access denied". `None` when no fail
+/// marker is present (the ssh itself failed before the printf ran) or the
+/// captured reason is empty. This — NOT the ssh exit code — is the failure
+/// detail: the forced PTY masks the remote exit status (see
+/// [`build_linger_remote_cmd`]).
+pub(super) fn linger_fail_reason(stdout: &str, verb: LingerVerb) -> Option<String> {
+    let fail = match verb {
+        LingerVerb::Enable => "ENABLE=fail",
+        LingerVerb::Disable => "DISABLE=fail",
+    };
+    stdout
+        .lines()
+        .filter_map(|line| line.trim_end_matches('\r').strip_prefix(fail))
+        .next_back()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
 }
 
 /// ENABLE linger for the run user on `remote_host` over a forced-PTY ssh,
@@ -443,13 +465,20 @@ async fn enable_linger_for_node(
                      (transient: restored at run-end unless it was already on)"
                 );
             } else {
+                // NO `rc` field: the forced PTY masks the remote exit status
+                // (ssh reports the PTY session's exit — observed `0` for a
+                // FAILED enable), so the status code would actively mislead.
+                // The fail marker's captured reason is the real loginctl
+                // error; local ssh stderr covers transport-level failures.
                 let stderr = String::from_utf8_lossy(&out.stderr);
+                let reason = linger_fail_reason(&stdout, LingerVerb::Enable)
+                    .unwrap_or_else(|| "no fail marker (ssh died before loginctl ran)".into());
                 tracing::warn!(
                     secondary_id,
                     remote_host,
                     was_linger,
-                    rc = ?out.status.code(),
-                    stderr = %stderr.trim(),
+                    reason = %reason,
+                    ssh_stderr = %stderr.trim(),
                     "could not enable linger on this node — workers are NOT decoupled from the \
                      submitter -R session; a session drop may fan-kill them. Consequence: \
                      reduced resilience only. Remediation: pre-set `loginctl enable-linger` for \
@@ -495,11 +524,16 @@ async fn disable_linger_for_node(remote_host: &str, opts: &PreparationOptions) {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             if !linger_succeeded(&stdout, LingerVerb::Disable) {
+                // No `rc`: the `-tt` PTY masks the remote exit status (see
+                // build_linger_remote_cmd) — the fail marker's reason is the
+                // real loginctl error.
                 let stderr = String::from_utf8_lossy(&out.stderr);
+                let reason = linger_fail_reason(&stdout, LingerVerb::Disable)
+                    .unwrap_or_else(|| "no fail marker (ssh died before loginctl ran)".into());
                 tracing::warn!(
                     remote_host,
-                    rc = ?out.status.code(),
-                    stderr = %stderr.trim(),
+                    reason = %reason,
+                    ssh_stderr = %stderr.trim(),
                     "could not restore linger to off on this node; leaving it enabled (best-effort)"
                 );
             }

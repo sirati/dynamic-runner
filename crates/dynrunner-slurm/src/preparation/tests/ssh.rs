@@ -8,8 +8,8 @@ use tokio::task::JoinSet;
 
 use crate::preparation::options::{PrepError, PreparationOptions};
 use crate::preparation::ssh::{
-    LingerVerb, build_linger_argv, build_release_argv, build_ssh_argv, linger_succeeded,
-    parse_was_linger, verify_tunnel_alive,
+    LingerVerb, build_linger_argv, build_release_argv, build_ssh_argv, linger_fail_reason,
+    linger_succeeded, parse_was_linger, verify_tunnel_alive,
 };
 
 /// Ssh spawn argv shape (no auth-options): -J jump_target form,
@@ -285,14 +285,44 @@ fn parse_was_linger_reads_marker_crlf_tolerant() {
 }
 
 /// `linger_succeeded` keys off the per-verb `=ok` marker, CR-tolerant, and
-/// never confuses `ENABLE` with `DISABLE`.
+/// never confuses `ENABLE` with `DISABLE`. A `=fail <reason>` line (the
+/// captured-loginctl-error shape) is failure too.
 #[test]
 fn linger_succeeded_keys_off_per_verb_marker() {
     assert!(linger_succeeded("WAS_LINGER=no\r\nENABLE=ok\r\n", LingerVerb::Enable));
     assert!(!linger_succeeded("WAS_LINGER=no\r\nENABLE=fail\r\n", LingerVerb::Enable));
+    assert!(!linger_succeeded(
+        "WAS_LINGER=no\r\nENABLE=fail Could not enable linger: Access denied\r\n",
+        LingerVerb::Enable
+    ));
     assert!(linger_succeeded("WAS_LINGER=yes\r\nDISABLE=ok\r\n", LingerVerb::Disable));
     // An ENABLE=ok line must NOT satisfy a DISABLE query.
     assert!(!linger_succeeded("ENABLE=ok\r\n", LingerVerb::Disable));
+}
+
+/// `linger_fail_reason` surfaces the remote loginctl error captured on the
+/// fail marker line — the ONLY reliable failure detail, since the forced
+/// PTY masks the remote exit status (observed: ssh reported rc=0 for a
+/// failed enable). CR-tolerant; per-verb; `None` when the marker is absent
+/// (ssh died first) or the reason is empty (legacy bare `=fail`).
+#[test]
+fn linger_fail_reason_surfaces_remote_error() {
+    let out = "WAS_LINGER=no\r\nENABLE=fail Could not enable linger: Access denied\r\n";
+    assert_eq!(
+        linger_fail_reason(out, LingerVerb::Enable).as_deref(),
+        Some("Could not enable linger: Access denied")
+    );
+    // Bare fail marker (no captured reason) → None.
+    assert_eq!(linger_fail_reason("ENABLE=fail\r\n", LingerVerb::Enable), None);
+    // Absent marker (ssh failed before loginctl ran) → None.
+    assert_eq!(linger_fail_reason("Permission denied\r\n", LingerVerb::Enable), None);
+    // Per-verb: an ENABLE fail must not satisfy a DISABLE query.
+    assert_eq!(linger_fail_reason(out, LingerVerb::Disable), None);
+    // Success output has no fail marker.
+    assert_eq!(
+        linger_fail_reason("WAS_LINGER=no\r\nENABLE=ok\r\n", LingerVerb::Enable),
+        None
+    );
 }
 
 /// Multi-watcher race regression: with ≥2 watchers calling
