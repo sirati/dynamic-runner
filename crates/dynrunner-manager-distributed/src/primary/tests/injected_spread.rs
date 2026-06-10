@@ -300,6 +300,230 @@ async fn injected_batch_on_promoted_primary_spreads_across_live_fleet() {
         .await;
 }
 
+/// A task in `phase`, type "default", distinct `task_id` (the
+/// round-3 two-phase shape: the prior phase's aggregation task in "u",
+/// the injected batch in "m" with `phase_deps: m → [u]`).
+fn phased_task(phase: &str, name: &str) -> TaskInfo<TestId> {
+    let mut t = make_binary(name, 50);
+    t.phase_id = PhaseId::from(phase);
+    t.type_id = TypeId::from("default");
+    t.task_id = name.into();
+    t
+}
+
+/// THE round-3 production composition (asm-tokenizer
+/// run_20260610_145529): mesh-ready gate FULL (the round-2 re-announce
+/// fix is in and exonerated), projected-load ordering in place — and a
+/// 28-task mid-run injection STILL sat unassigned 60-90s, then rolled
+/// out in a per-secondary burst (14/12/2, twelve zeros) via the
+/// secondaries' TaskRequest re-polls (the 60s backoff cap is the lag).
+///
+/// The round-2 repro drives the injection by calling
+/// `handle_primary_command` + `drain_worker_signal_batch` DIRECTLY, so
+/// the drain is never raced — and it passes. Production's drain runs as
+/// ONE ARM OF THE OPERATIONAL `select!`, racing every other arm. THE
+/// DIVERGENCE IS THE DIAGNOSIS: `drain_worker_signal_batch` consumed
+/// the `TasksAdded` burst off the bus, then awaited a 50ms idle window
+/// HOLDING the consumed signals in a future-local Vec — any competing
+/// arm readying inside that window (a keepalive, a digest, a forwarded
+/// terminal; production's 15-member mesh never goes 50ms quiet) won the
+/// `select!`, cancelled the drain future, and DESTROYED the consumed
+/// signals. The recheck never ran; the request-driven fallback (one
+/// grant per `TaskRequest`, requester IS the target, per-secondary
+/// `repoll_idle_workers` walks fire all of a secondary's workers in one
+/// tick) drained the pool by full secondary capacity — the exact
+/// 14/12/2 pack.
+///
+/// This test replays the production sequence END-TO-END through the
+/// REAL operational loop: the prior phase's terminal arrives through
+/// the real inbound, the real cascade fires the consumer's
+/// `on_phase_end`, the hook injects through the real command channel
+/// (the `PrimaryHandle.spawn_tasks` path), the real waker chain emits
+/// `TasksAdded`, and the worker-management arm must dispatch the batch
+/// — while keepalive frames land every 10ms (denser than the 50ms
+/// window, the busy-mesh condition). Contract: the WHOLE batch
+/// dispatches proactively (no `TaskRequest` is ever sent — the fakes
+/// here never re-poll), interleaved across the live fleet (#349).
+/// Pre-fix this deterministically starves: the consumed `TasksAdded`
+/// is cancelled away, the bus is empty forever after, zero
+/// assignments.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn injection_during_cascade_dispatches_despite_busy_inbox() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(6);
+            let config = PrimaryConfig {
+                num_secondaries: 6,
+                // The fleet stays alive throughout (keepalives every
+                // 10ms); a fleet-dead trip mid-test would drain the
+                // pool and fake a pass/fail unrelated to dispatch.
+                fleet_dead_timeout: Duration::from_secs(3600),
+                ..test_primary_config()
+            };
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let ids: Vec<String> = ends.iter().map(|(id, _, _)| id.clone()).collect();
+
+            // ── Roster + two-phase ledger: u (1 task) → m (injected) ──
+            let utask = phased_task("u", "u0");
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([
+                        (PhaseId::from("u"), vec![]),
+                        (PhaseId::from("m"), vec![PhaseId::from("u")]),
+                    ]),
+                });
+                for id in &ids {
+                    cs.apply(ClusterMutation::PeerJoined {
+                        peer_id: id.clone(),
+                        is_observer: false,
+                        can_be_primary: false,
+                        cap_version: Default::default(),
+                    });
+                    cs.apply(ClusterMutation::SecondaryCapacity {
+                        secondary: id.clone(),
+                        worker_count: 3,
+                        resources: vec![ResourceAmount {
+                            kind: ResourceKind::memory(),
+                            amount: 8 * 1024 * 1024 * 1024,
+                        }],
+                    });
+                }
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: compute_task_hash(&utask),
+                    task: utask.clone(),
+                });
+            }
+            primary.hydrate_from_cluster_state();
+            primary.reconstruct_workers_from_cluster_state();
+            primary.reconstruct_secondaries_from_cluster_state();
+            primary.total_tasks = 1;
+
+            // ── The consumer's on_phase_end: when "u" drains, inject the
+            // m-batch through the REAL command channel (the
+            // PrimaryHandle.spawn_tasks path the cascade's
+            // `drain_callback_queued_commands` services inline). ──
+            let cmd_tx = primary.command_sender();
+            let on_end: OnPhaseEnd = Box::new(move |p, _c, _f, _outputs| {
+                if p == &PhaseId::from("u") {
+                    let batch: Vec<TaskInfo<TestId>> =
+                        (0..12).map(|i| phased_task("m", &format!("m{i}"))).collect();
+                    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+                    cmd_tx
+                        .try_send(PrimaryCommand::SpawnTasks {
+                            tasks: batch,
+                            reply: reply_tx,
+                        })
+                        .expect("command channel must accept the hook's spawn");
+                }
+            });
+            primary.register_phase_lifecycle_callbacks(Box::new(|_| {}), on_end);
+
+            // ── Run the REAL operational loop against a driver that plays
+            // the fleet: gate-filling MeshReady frames, the u0 terminal,
+            // and a continuous 10ms keepalive storm (the busy mesh). ──
+            let incoming = ends[0].2.clone();
+            let per_secondary: Vec<usize> = {
+                let loop_fut = primary.operational_loop();
+                tokio::pin!(loop_fut);
+                let driver = async {
+                    // The loop's entry sweep dispatches u0 (first-dispatch
+                    // exemption: no MeshReady needed for a never-
+                    // dispatched member). Find who got it.
+                    let mut u_member: Option<(usize, u32)> = None;
+                    for _ in 0..500 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        for (idx, (_, rx, _)) in ends.iter_mut().enumerate() {
+                            for (task_id, worker_id) in drain_assignments(rx) {
+                                assert_eq!(task_id, "u0", "only u0 exists pre-injection");
+                                assert!(u_member.is_none(), "u0 must dispatch exactly once");
+                                u_member = Some((idx, worker_id));
+                            }
+                        }
+                        if u_member.is_some() {
+                            break;
+                        }
+                    }
+                    let (u_idx, u_worker) = u_member.expect("entry sweep must dispatch u0");
+
+                    // Gate FULL: every member's MeshReady arrives through
+                    // the real inbound (the production +15s state).
+                    for id in &ids {
+                        incoming.send(mesh_ready_from(id)).expect("inbound open");
+                    }
+
+                    // u0's terminal through the real inbound → the cascade
+                    // fires on_phase_end("u") → the hook injects → the
+                    // waker chain emits TasksAdded.
+                    incoming
+                        .send(DistributedMessage::TaskComplete {
+                            target: None,
+                            sender_id: ids[u_idx].clone(),
+                            timestamp: 0.0,
+                            secondary_id: ids[u_idx].clone(),
+                            worker_id: u_worker,
+                            task_hash: compute_task_hash(&utask),
+                            result_data: None,
+                        })
+                        .expect("inbound open");
+
+                    // Busy mesh: keepalives every 10ms from all members —
+                    // denser than the 50ms idle window, so the inbox arm
+                    // is never quiet. Collect assignments until the whole
+                    // batch dispatched or 5 (virtual) seconds elapsed.
+                    let mut per: Vec<usize> = vec![0; ends.len()];
+                    for _ in 0..500 {
+                        for id in &ids {
+                            incoming.send(keepalive_from(id)).expect("inbound open");
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        for (idx, (_, rx, _)) in ends.iter_mut().enumerate() {
+                            per[idx] += drain_assignments(rx).len();
+                        }
+                        if per.iter().sum::<usize>() >= 12 {
+                            break;
+                        }
+                    }
+                    per
+                };
+                tokio::select! {
+                    _ = &mut loop_fut => panic!(
+                        "operational loop must not exit mid-run (work outstanding)"
+                    ),
+                    per = driver => per,
+                }
+            };
+
+            let total: usize = per_secondary.iter().sum();
+            assert_eq!(
+                total, 12,
+                "the injected batch must dispatch PROACTIVELY off the \
+                 TasksAdded recheck — the fakes never send a TaskRequest, so \
+                 anything short of the full batch means the worker-management \
+                 arm lost the signal (the production 60-90s starve→pack); \
+                 per-secondary: {per_secondary:?}"
+            );
+            assert!(
+                per_secondary.iter().all(|&n| n == 2),
+                "the injected batch must interleave across the live fleet \
+                 (12 tasks / 6 members = exactly 2 each, the #349 spread \
+                 contract); got {per_secondary:?}"
+            );
+            assert_eq!(
+                primary.pool().iter().count(),
+                0,
+                "no injected task may strand QUEUED in the pool while workers idle"
+            );
+        })
+        .await;
+}
+
 /// Gate-purpose preservation (the eda0f216 contract under the pairwise
 /// design): a member that already got work and whose `MeshReady`
 /// (re-)announce NEVER arrived must still receive NO proactive work —
