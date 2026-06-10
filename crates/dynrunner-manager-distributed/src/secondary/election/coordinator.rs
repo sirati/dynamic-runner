@@ -300,6 +300,16 @@ where
         &self,
         query_node_id: &str,
     ) -> Option<f64> {
+        // SELF-QUERY: first-hand liveness. A node asked about ITSELF is the
+        // one responder with direct evidence, and that evidence is "alive
+        // RIGHT NOW" (age 0). Without this arm the lookup below read the
+        // node's own id out of `peer_keepalives` — structurally absent (a
+        // node does not receive its own broadcasts) — and reported `None`,
+        // which the querier's Suspecting tally counts as AGREEMENT: the
+        // suspected node itself lent a death-quorum vote AGAINST ITSELF.
+        if query_node_id == self.config.secondary_id {
+            return Some(0.0);
+        }
         let age = self
             .op_ref()
             .and_then(|op| op.peer_keepalives.get(query_node_id))
@@ -396,6 +406,16 @@ where
     /// The intersection means a freshly-departed-but-not-yet-reaped peer
     /// (the live wedge: gone from membership, still in `peer_keepalives`
     /// because the 300s reaper has not fired) is correctly excluded NOW.
+    ///
+    /// SCOPE — candidate/voter ELIGIBILITY, not the quorum DENOMINATOR.
+    /// This set answers "who could vote for or become a candidate", so the
+    /// current primary is role-excluded unconditionally. The failover-quorum
+    /// DENOMINATOR is the SEPARATE [`Self::failover_quorum_peer_count`],
+    /// which adds the current primary back while the mesh membership still
+    /// lists it: a member-listed primary is not GONE, merely role-excluded,
+    /// and treating its exclusion as fleet shrinkage is what let a deposed
+    /// half-partitioned ex-primary compute `failover_quorum(0) == 1` and
+    /// metronomically self-promote (the asm-dataset primary ping-pong).
     pub(in crate::secondary) fn live_peer_ids(&self) -> impl Iterator<Item = &String> {
         let current_primary = self.cluster_state.current_primary();
         // `peer_keepalives` now lives in `OperationalState`; outside
@@ -413,6 +433,53 @@ where
             // single-source seam (`is_mesh_member`) leg (C) and the
             // deferrer-side death-evidence sites use.
             .filter(move |id| self.is_mesh_member(id))
+    }
+
+    /// Does the CURRENT primary still count toward the failover-quorum
+    /// DENOMINATOR? `true` iff `current_primary()` names a REMOTE peer
+    /// that is still a connected mesh member (`is_mesh_member` — the same
+    /// single-source membership seam every death-evidence site reads).
+    ///
+    /// The distinction this draws (the fix for the asm-dataset election
+    /// ping-pong): a peer can be ABSENT from [`Self::live_peer_ids`] for
+    /// two very different reasons —
+    ///   (a) it is GONE (membership-departed / death-observed): genuine
+    ///       fleet shrinkage, and the quorum correctly adapts down; or
+    ///   (b) it is the current primary, ROLE-excluded by the
+    ///       minus-current-primary rule while the mesh membership still
+    ///       lists it: NOT fleet shrinkage — the node is alive and merely
+    ///       ineligible to vote/be a candidate about its own death.
+    /// Treating (b) as shrinkage let a deposed ex-primary whose only OTHER
+    /// peer sat behind an asymmetric dead leg compute an empty live set,
+    /// take `failover_quorum(0) == 1`, and self-promote with zero peer
+    /// agreement. Counting the member-listed primary keeps the quorum at
+    /// `failover_quorum(1) == 2` there — unreachable without real
+    /// agreement — while a primary that GENUINELY died still drops out
+    /// within one mesh-pump cycle of its QUIC teardown (membership
+    /// departure), so #317/#332 lone-/below-majority-survivor convergence
+    /// is untouched.
+    ///
+    /// SELF-EXCLUSION mirrors [`Self::primary_departed_membership`]: a
+    /// `current_primary` naming THIS node is structurally absent from its
+    /// own membership view, and a node never quorum-counts itself through
+    /// this path (the tallies add self separately).
+    pub(in crate::secondary) fn current_primary_in_quorum(&self) -> bool {
+        self.cluster_state
+            .current_primary()
+            .filter(|id| *id != self.config.secondary_id.as_str())
+            .map(|id| self.is_mesh_member(id))
+            .unwrap_or(false)
+    }
+
+    /// The failover-quorum DENOMINATOR: the candidate/voter-eligible live
+    /// peers ([`Self::live_peer_ids`]) PLUS the current primary while the
+    /// mesh membership still lists it ([`Self::current_primary_in_quorum`]).
+    /// SINGLE SOURCE for both tally sites (the Suspecting agreement tally
+    /// and the `PromotionConfirm` tally in [`Self::record_promotion_confirm`])
+    /// so the two cannot desync; both feed it to the single-source
+    /// [`super::failover_quorum`] rule.
+    pub(in crate::secondary) fn failover_quorum_peer_count(&self) -> usize {
+        self.live_peer_ids().count() + usize::from(self.current_primary_in_quorum())
     }
 
     /// The role-aware "alive secondaries" set — the single coordinator
@@ -542,6 +609,17 @@ where
             _ => false,
         };
         let live_peers: Vec<String> = self.live_peer_ids().cloned().collect();
+        // The quorum DENOMINATOR + its primary-inclusion evidence,
+        // snapshotted as `&self` reads alongside `live_peers`. The
+        // denominator differs from `live_peers.len()` exactly when the
+        // current primary is still a connected mesh member: role-excluded
+        // from candidacy, but NOT gone — see `current_primary_in_quorum`.
+        let quorum_peer_count = self.failover_quorum_peer_count();
+        let primary_counted_in_quorum = self.current_primary_in_quorum();
+        // Leg-3 gate (deposed-primary re-assertion): a deposed ex-primary
+        // may not take the lone-survivor in-tick self-quorum. A plain
+        // coordinator-field read, snapshotted with the rest.
+        let deposed_primary = self.deposed_primary;
         let observers: std::collections::HashSet<String> = self
             .cluster_state
             .role_table()
@@ -720,10 +798,15 @@ where
                 if since.elapsed() < self.config.keepalive_interval {
                     return actions;
                 }
-                // `live_peers` was snapshotted from `live_peer_ids`, which
-                // already excludes the current primary, so its length IS
-                // the live-peer count.
-                let peer_count = live_peers.len();
+                // The quorum DENOMINATOR (`failover_quorum_peer_count`,
+                // snapshotted above): the candidate-eligible `live_peers`
+                // PLUS the current primary while the mesh membership still
+                // lists it. A member-listed primary is role-excluded from
+                // candidacy but NOT gone, so it must not shrink the
+                // denominator — that shrinkage is what let a deposed
+                // ex-primary behind an asymmetric dead leg reach
+                // `failover_quorum(0) == 1` and self-promote solo.
+                let peer_count = quorum_peer_count;
                 // Each `TimeoutResponse.last_keepalive` is now a monotonic AGE
                 // (seconds since the responder last saw the queried node, on the
                 // responder's own monotonic clock — see the `TimeoutQuery` arm),
@@ -773,9 +856,18 @@ where
                     // (`push_timeout_query`) the entering-Suspecting emit uses
                     // so the two sites cannot drift.
                     push_timeout_query(&mut actions.broadcast, &secondary_id, current_primary_id);
+                    // Names the denominator evidence (silent-branch rule):
+                    // `primary_counted_in_quorum == true` says the refusal
+                    // to proceed is (at least partly) because the suspected
+                    // primary is still a connected mesh member —
+                    // membership-says-alive, so unilateral progress is
+                    // forbidden — as opposed to genuinely missing peer
+                    // agreement on a death-observed primary.
                     tracing::info!(
                         agreeing,
                         quorum,
+                        live_peers = live_peers.len(),
+                        primary_counted_in_quorum,
                         "no quorum on primary death; re-polling peers"
                     );
                     return actions;
@@ -832,7 +924,7 @@ where
                     // departed, which is exactly the relocation-completeness
                     // case a single survivor must win.
                     let self_confirm: HashSet<String> = HashSet::from([secondary_id.clone()]);
-                    if self_confirm.len() >= quorum {
+                    if self_confirm.len() >= quorum && !deposed_primary {
                         tracing::info!(
                             round,
                             quorum,
@@ -842,7 +934,29 @@ where
                         op.election = ElectionState::Promoted;
                         actions.promoted = true;
                     } else {
-                        tracing::info!(round, "self-promoting");
+                        if self_confirm.len() >= quorum {
+                            // The self-quorum WAS met but this node is a
+                            // DEPOSED ex-primary (leg 3): the fleet elected
+                            // around it once, so its lone-survivor view is
+                            // suspect (the production ping-pong was exactly
+                            // this node behind an asymmetric dead leg).
+                            // Refuse the in-tick commit and campaign as a
+                            // Candidate instead — promotion then requires a
+                            // real peer `PromotionConfirm` (positive
+                            // agreement), which `record_promotion_confirm`
+                            // grants on the first one at this quorum.
+                            tracing::warn!(
+                                round,
+                                quorum,
+                                live_peers = live_peers.len(),
+                                primary_counted_in_quorum,
+                                "refusing lone-survivor self-promotion: this \
+                                 node is a DEPOSED ex-primary; campaigning as \
+                                 Candidate and awaiting positive peer agreement"
+                            );
+                        } else {
+                            tracing::info!(round, "self-promoting");
+                        }
                         op.election = ElectionState::Candidate {
                             round,
                             confirms: self_confirm,
@@ -1014,6 +1128,28 @@ where
         if !primary_silent {
             return None;
         }
+        // FIRST-HAND REACHABILITY VETO: never lend a confirm to a candidate
+        // THIS node currently has no route to (absent from the live
+        // transport `MembershipView` — the same single-source membership
+        // seam every death-evidence site reads). A vote for an unreachable
+        // candidate is a vote for a primary this voter could never follow.
+        // Structurally the lowest-live-id check below already implies this
+        // (`live_peer_ids` ⊆ membership, so a non-member can never be the
+        // computed lowest) — this names the decision and its evidence
+        // instead of rejecting through a silent id mismatch (and keeps the
+        // veto in force even if candidate selection evolves). `candidate ==
+        // self` is exempt: a node is structurally absent from its OWN
+        // membership view, and reaching itself needs no route.
+        if candidate != self.config.secondary_id && !self.is_mesh_member(&candidate) {
+            tracing::warn!(
+                secondary = %self.config.secondary_id,
+                candidate = %candidate,
+                round,
+                "vetoing PromotionVote: no route to the candidate (absent \
+                 from this voter's live transport membership)"
+            );
+            return None;
+        }
         // `live_peer_ids` is a `&self` read (cluster_state + op_ref); take
         // the `lowest` owned value here, then borrow `op` mutably below
         // for the election write — the two borrows don't overlap.
@@ -1063,9 +1199,12 @@ where
         if target != self.config.secondary_id {
             return false;
         }
-        // `live_peer_ids` is a `&self` read; take the owned count before
+        // The quorum DENOMINATOR (`failover_quorum_peer_count` — the same
+        // single source the Suspecting tally reads, so the two sites cannot
+        // desync): candidate-eligible live peers PLUS a still-member-listed
+        // current primary. A `&self` read; take the owned count before
         // borrowing `op` mutably for the confirm tally + transition.
-        let peer_count = self.live_peer_ids().count();
+        let peer_count = self.failover_quorum_peer_count();
         // Same single-source quorum rule as the Suspecting tally
         // (`election::failover_quorum`) — the two sites read ONE function so
         // the majority arithmetic cannot desync on a live failover.

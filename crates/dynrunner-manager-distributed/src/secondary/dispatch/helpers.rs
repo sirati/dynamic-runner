@@ -186,6 +186,14 @@ where
             return false;
         }
 
+        // Deposition observation, captured BEFORE the apply moves
+        // `current_primary`: did THIS node hold the primary role going
+        // into this advance? Consumed by `on_primary_identity_advanced`
+        // to latch `deposed_primary` (see the field doc in
+        // `secondary/mod.rs`).
+        let was_primary_before =
+            self.cluster_state.current_primary() == Some(self.config.secondary_id.as_str());
+
         // (2) Epoch-LWW apply. Side effects below only on a genuine
         // identity advance.
         let outcome = self.cluster_state.apply(ClusterMutation::PrimaryChanged {
@@ -204,7 +212,7 @@ where
             return false;
         }
 
-        self.on_primary_identity_advanced(&new, epoch, reason);
+        self.on_primary_identity_advanced(&new, epoch, reason, was_primary_before);
         true
     }
 
@@ -217,13 +225,27 @@ where
     /// relocation announcement RECOVERABLE: a secondary that missed the
     /// one-shot broadcast still promotes / follows when the fact reaches
     /// it through a snapshot pull.
+    ///
+    /// `was_primary_before` is the caller's pre-advance observation of
+    /// `current_primary() == self` (both advance paths capture it BEFORE
+    /// their apply/restore moves the identity): it drives the
+    /// `deposed_primary` latch — set when this node is deposed (it WAS the
+    /// primary and the advance names a peer), cleared whenever an advance
+    /// names this node again. The latch gates the election's lone-survivor
+    /// fast path (see the field doc in `secondary/mod.rs`).
     fn on_primary_identity_advanced(
         &mut self,
         new: &str,
         epoch: u64,
         reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason,
+        was_primary_before: bool,
     ) {
         if new == self.config.secondary_id {
+            // Named primary again through an applied advance: any earlier
+            // deposition is superseded — this node holds the role
+            // legitimately (an election win carries peer agreement; a
+            // relocation carries the submitter's authority).
+            self.deposed_primary = false;
             // (3) This node is the new primary.
             //
             // C4 promotion/transfer signal. The build of the
@@ -279,6 +301,23 @@ where
         } else {
             // (4) A peer is the new primary, so any in-flight election on
             // this node is stale: a primary now exists. Reset it.
+            if was_primary_before {
+                // THIS node just got DEPOSED: it held the primary role and
+                // the fleet advanced the identity onto a peer. Latch it —
+                // the election's lone-survivor fast path is forbidden to a
+                // deposed ex-primary (its mesh view is suspect; the fleet
+                // elected around it), so any re-candidacy must gather
+                // positive peer agreement.
+                self.deposed_primary = true;
+                tracing::warn!(
+                    secondary = %self.config.secondary_id,
+                    new_primary = %new,
+                    epoch,
+                    "this node was DEPOSED as primary; lone-survivor \
+                     self-promotion is disabled until a peer-agreed \
+                     re-election (deposed_primary latched)"
+                );
+            }
             self.reset_election_to_normal();
         }
         tracing::info!(
@@ -340,6 +379,9 @@ where
             self.cluster_state.current_primary().map(str::to_owned),
             self.cluster_state.primary_epoch(),
         );
+        // Same pre-advance deposition observation the live apply captures.
+        let was_primary_before =
+            before.0.as_deref() == Some(self.config.secondary_id.as_str());
         self.cluster_state.restore(snap);
         let after_primary = self.cluster_state.current_primary().map(str::to_owned);
         let after = (after_primary.clone(), self.cluster_state.primary_epoch());
@@ -351,6 +393,7 @@ where
                 &new,
                 epoch,
                 dynrunner_protocol_primary_secondary::PrimaryChangeReason::default(),
+                was_primary_before,
             );
             return true;
         }
