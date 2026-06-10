@@ -622,18 +622,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             self.dispatch_message(m, &mut command_rx).await?;
                         }
                         None => {
-                            // The transport's inbound closed (every
-                            // writer/connection gone). Gate the arm so
-                            // subsequent select! iterations don't
-                            // hot-poll a permanently-resolved future; the
-                            // top-of-loop `transport_closed` guard then
-                            // breaks the loop (the timer arms still drive
-                            // the run_complete / counter exit checks until
-                            // the next iteration).
+                            // The operational inbox closed: every sender —
+                            // i.e. the role slot the mesh-pump delivers
+                            // through — is gone. On a PRIMARY this is
+                            // fatal-worthy, never routine: the mesh pump is
+                            // the ONLY router into this inbox, so no task
+                            // terminal, request, or mutation can ever
+                            // arrive again. Gate the arm so subsequent
+                            // select! iterations don't hot-poll a
+                            // permanently-resolved future (the closed-mpsc
+                            // hazard); the top-of-loop `transport_closed`
+                            // guard then BREAKS the loop into the run's
+                            // final accounting, where unresolved work is
+                            // classified stranded and surfaces as
+                            // `RunError::ClusterCollapsed` (non-zero exit)
+                            // — loud and terminal, never a silently
+                            // disabled arm that zombies the run.
                             transport_closed = true;
-                            tracing::debug!(
-                                "transport.recv_peer() returned None; \
-                                 disabling the inbound arm for the remainder of the loop"
+                            tracing::error!(
+                                "operational inbox closed — the mesh pump is \
+                                 gone; the primary cannot ingest any further \
+                                 frames. Exiting the operational loop into \
+                                 final accounting (outstanding work will be \
+                                 classified stranded)"
                             );
                         }
                     }

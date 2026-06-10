@@ -198,10 +198,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             // the pool, the slot is open again,
                             // and the requesting secondary will
                             // retry the TaskRequest on its next
-                            // tick. Falling through to the
-                            // relay-to-primary arm would re-send
-                            // the same TaskRequest we just failed
-                            // to handle, looping work back.
+                            // tick.
                             return Ok(());
                         }
 
@@ -237,29 +234,43 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 }
             }
 
-            // No local assignment was made. The `Destination::Primary`
-            // relay exists ONLY for the DEMOTED-primary case: a node that
-            // used to be primary but whose authority has moved must
-            // forward the request on to the REAL (remote) current primary.
-            // Addressing `Destination::Primary` resolves at the egress
-            // edge (`Self::send_to`) through
-            // `cluster_state.current_primary()` — which every
-            // `PrimaryChanged` apply updates — and rides the mesh-level
-            // peer link, alive across promotion per
-            // `feedback_mesh_independent_of_role_and_membership.md`.
+            // No local assignment was made: DROP the request. A
+            // `TaskRequest` is a pure capacity hint (R1) — the requesting
+            // worker re-polls on its own backoff tick
+            // (`request_task_for_worker` / `repoll_idle_workers`), and
+            // `dispatch_to_idle_workers` re-nudges idle workers when work
+            // actually arrives (`WorkerMgmtSignal::TasksAdded` / a
+            // completion) — so nothing strands.
             //
-            // When this node IS the current primary the relay is a benign
-            // in-process loopback (no re-demux cycle): the request simply
-            // re-addresses self and is dropped. The worker re-attempts on
-            // its next backoff-throttled `request_task_for_worker` tick,
-            // and `dispatch_to_idle_workers` re-nudges idle workers when
-            // work actually arrives (`WorkerMgmtSignal::TasksAdded` / a
-            // completion), so nothing strands.
-            if !assigned && let Err(e) = self.send_to(Destination::Primary, msg).await {
+            // A "relay to the real primary" arm used to live here
+            // (`send_to(Destination::Primary, msg)` on `!assigned`),
+            // claiming to forward a demoted node's requests to the new
+            // authority. It was wrong twice over. (1) A node running this
+            // handler IS the authoritative primary by construction (the
+            // operational loop's authority invariant; a demoted primary is
+            // torn down into an observer handoff, it never keeps serving
+            // requests). (2) The primary's egress stamps `Destination::
+            // Primary` unresolved and `Mesh::dispatch`'s `Primary` arm is
+            // LOOPBACK-ONLY, so the relayed frame landed back in this
+            // coordinator's OWN inbox — `RoleSlot::deliver` clears the
+            // routing stamp, the frame re-matched `target: None`, was
+            // still unassignable, and was relayed again: a self-sustaining
+            // memory-speed inbox cycle (the run_20260610_121427 ingest
+            // wedge — ~600K inbox-arm wins/s — and the lifetime ~97% CPU
+            // heat on every relocated primary in its milder small-cycle
+            // form). With ≥2 frames circulating, the mesh-pump's biased
+            // select (egress before ingress) never drained the egress
+            // queue empty, so WIRE ingress — the fleet's completions —
+            // starved and ingest froze. `PrimaryCoordinator::send_to`
+            // now rejects `Destination::Primary` outright as the
+            // structural backstop; this site simply has nothing to send.
+            if !assigned {
                 tracing::debug!(
-                    error = %e,
-                    "primary-bound relay via Destination::Primary dropped; \
-                     secondary will retry on its next backoff tick"
+                    secondary = %secondary_id,
+                    worker_id,
+                    "TaskRequest not assignable (no roster slot / no \
+                     dispatchable work); dropped — the worker re-polls on \
+                     its backoff tick"
                 );
             }
         }
