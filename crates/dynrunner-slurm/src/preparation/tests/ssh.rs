@@ -114,7 +114,10 @@ fn release_argv_reuses_jump_and_targets_same_port() {
     assert!(argv.iter().any(|s| s == "alice@compute01"));
     // It is NOT a reverse tunnel: no -R, no -N, no ExitOnForwardFailure.
     assert!(!argv.iter().any(|s| s == "-R"), "release must not forward");
-    assert!(!argv.iter().any(|s| s == "-N"), "release must run a command");
+    assert!(
+        !argv.iter().any(|s| s == "-N"),
+        "release must run a command"
+    );
     assert!(!argv.iter().any(|s| s == "ExitOnForwardFailure=yes"));
     // The trailing remote command is a targeted release of EXACTLY
     // port 40000 (the same tunnel_port), via fuser then an ss/kill
@@ -192,7 +195,10 @@ fn linger_enable_argv_forces_pty_jumps_and_self_targets() {
     // Same compute-node target.
     assert!(argv.iter().any(|s| s == "alice@compute01"));
     // Forced PTY.
-    assert!(argv.iter().any(|s| s == "-tt"), "must force a PTY: {argv:?}");
+    assert!(
+        argv.iter().any(|s| s == "-tt"),
+        "must force a PTY: {argv:?}"
+    );
     // Not a reverse tunnel.
     assert!(!argv.iter().any(|s| s == "-R"), "linger must not forward");
     assert!(!argv.iter().any(|s| s == "-N"), "linger must run a command");
@@ -287,10 +293,19 @@ fn linger_argv_with_auth_uses_proxycommand() {
 /// safe "assume already on" default.
 #[test]
 fn parse_was_linger_reads_marker_crlf_tolerant() {
-    assert_eq!(parse_was_linger("WAS_LINGER=yes\r\nENABLE=ok\r\n").as_deref(), Some("yes"));
-    assert_eq!(parse_was_linger("WAS_LINGER=no\nENABLE=ok\n").as_deref(), Some("no"));
+    assert_eq!(
+        parse_was_linger("WAS_LINGER=yes\r\nENABLE=ok\r\n").as_deref(),
+        Some("yes")
+    );
+    assert_eq!(
+        parse_was_linger("WAS_LINGER=no\nENABLE=ok\n").as_deref(),
+        Some("no")
+    );
     // Empty value: no logind record yet.
-    assert_eq!(parse_was_linger("WAS_LINGER=\r\nENABLE=fail\r\n").as_deref(), Some(""));
+    assert_eq!(
+        parse_was_linger("WAS_LINGER=\r\nENABLE=fail\r\n").as_deref(),
+        Some("")
+    );
     // Absent marker (e.g. ssh failed before the printf ran).
     assert_eq!(parse_was_linger("Permission denied\r\n"), None);
 }
@@ -304,14 +319,29 @@ fn parse_was_linger_reads_marker_crlf_tolerant() {
 /// as "already on" (restore skipped).
 #[test]
 fn only_explicit_no_permits_restore() {
-    assert!(!was_linger_from_probe("WAS_LINGER=no\r\nENABLE=ok\r\n"), "explicit no → restore");
-    assert!(was_linger_from_probe("WAS_LINGER=yes\r\nENABLE=ok\r\n"), "yes → skip restore");
+    assert!(
+        !was_linger_from_probe("WAS_LINGER=no\r\nENABLE=ok\r\n"),
+        "explicit no → restore"
+    );
+    assert!(
+        was_linger_from_probe("WAS_LINGER=yes\r\nENABLE=ok\r\n"),
+        "yes → skip restore"
+    );
     // THE regression: empty value must NOT be read as "was off".
-    assert!(was_linger_from_probe("WAS_LINGER=\r\nENABLE=ok\r\n"), "empty → skip restore");
+    assert!(
+        was_linger_from_probe("WAS_LINGER=\r\nENABLE=ok\r\n"),
+        "empty → skip restore"
+    );
     // Absent marker (ssh died before the printf) → skip restore.
-    assert!(was_linger_from_probe("Permission denied\r\n"), "absent → skip restore");
+    assert!(
+        was_linger_from_probe("Permission denied\r\n"),
+        "absent → skip restore"
+    );
     // Garbage value → skip restore.
-    assert!(was_linger_from_probe("WAS_LINGER=maybe\r\n"), "garbage → skip restore");
+    assert!(
+        was_linger_from_probe("WAS_LINGER=maybe\r\n"),
+        "garbage → skip restore"
+    );
 }
 
 /// `linger_succeeded` keys off the per-verb `=ok` marker, CR-tolerant, and
@@ -319,13 +349,22 @@ fn only_explicit_no_permits_restore() {
 /// captured-loginctl-error shape) is failure too.
 #[test]
 fn linger_succeeded_keys_off_per_verb_marker() {
-    assert!(linger_succeeded("WAS_LINGER=no\r\nENABLE=ok\r\n", LingerVerb::Enable));
-    assert!(!linger_succeeded("WAS_LINGER=no\r\nENABLE=fail\r\n", LingerVerb::Enable));
+    assert!(linger_succeeded(
+        "WAS_LINGER=no\r\nENABLE=ok\r\n",
+        LingerVerb::Enable
+    ));
+    assert!(!linger_succeeded(
+        "WAS_LINGER=no\r\nENABLE=fail\r\n",
+        LingerVerb::Enable
+    ));
     assert!(!linger_succeeded(
         "WAS_LINGER=no\r\nENABLE=fail Could not enable linger: Access denied\r\n",
         LingerVerb::Enable
     ));
-    assert!(linger_succeeded("WAS_LINGER=yes\r\nDISABLE=ok\r\n", LingerVerb::Disable));
+    assert!(linger_succeeded(
+        "WAS_LINGER=yes\r\nDISABLE=ok\r\n",
+        LingerVerb::Disable
+    ));
     // An ENABLE=ok line must NOT satisfy a DISABLE query.
     assert!(!linger_succeeded("ENABLE=ok\r\n", LingerVerb::Disable));
 }
@@ -343,9 +382,15 @@ fn linger_fail_reason_surfaces_remote_error() {
         Some("Could not enable linger: Access denied")
     );
     // Bare fail marker (no captured reason) → None.
-    assert_eq!(linger_fail_reason("ENABLE=fail\r\n", LingerVerb::Enable), None);
+    assert_eq!(
+        linger_fail_reason("ENABLE=fail\r\n", LingerVerb::Enable),
+        None
+    );
     // Absent marker (ssh failed before loginctl ran) → None.
-    assert_eq!(linger_fail_reason("Permission denied\r\n", LingerVerb::Enable), None);
+    assert_eq!(
+        linger_fail_reason("Permission denied\r\n", LingerVerb::Enable),
+        None
+    );
     // Per-verb: an ENABLE fail must not satisfy a DISABLE query.
     assert_eq!(linger_fail_reason(out, LingerVerb::Disable), None);
     // Success output has no fail marker.
@@ -437,5 +482,52 @@ fn verify_tunnel_alive_attributes_per_child_under_concurrency() {
             }
             other => panic!("expected TunnelFailed, got {other}"),
         }
+    }
+}
+
+/// Defect (c): a child that writes its decisive line to stderr
+/// IMMEDIATELY before exiting must have those bytes captured. The
+/// pre-fix shape read stderr only AFTER `child.wait()` returned — a
+/// post-reap re-read that races ssh's final
+/// "remote port forwarding failed for listen port NNN" flush and can
+/// drop it (the OS pipe buffer may already be drained-and-closed by the
+/// time the reader looks). The concurrent drain runs the `read_to_end`
+/// ALONGSIDE the wait, so every pre-exit byte lands in `TunnelFailed.stderr`.
+///
+/// We model the worst case directly: the child writes the exact ssh
+/// failure line to stderr and exits rc=255 in the SAME shell statement,
+/// with no delay — the tightest write-then-exit window.
+#[test]
+fn verify_tunnel_alive_captures_stderr_written_just_before_exit() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let err: PrepError = rt.block_on(local.run_until(async {
+        // Real ssh-shaped failure line; written to stderr then an
+        // immediate exit 255 — the decisive line the operator needs.
+        let line = "Warning: remote port forwarding failed for listen port 40000";
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!("printf '%s\\n' '{line}' >&2; exit 255"));
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
+        let mut child = cmd.spawn().expect("spawn /bin/sh");
+        verify_tunnel_alive("secondary-0", &mut child)
+            .await
+            .expect_err("a child exiting 255 must surface TunnelFailed")
+    }));
+    match err {
+        PrepError::TunnelFailed { rc, stderr, .. } => {
+            assert_eq!(rc, Some(255), "exit code must be captured");
+            assert!(
+                stderr.contains("remote port forwarding failed for listen port 40000"),
+                "the decisive pre-exit stderr line must be captured, got {stderr:?}"
+            );
+        }
+        other => panic!("expected TunnelFailed, got {other}"),
     }
 }

@@ -318,7 +318,7 @@ async fn e2e_primary_secondary_over_wss() {
                 let mut peer_network = PeerNetwork::<TestId>::start(&config.secondary_id)
                     .await
                     .expect("peer network start");
-                peer_network.register_primary_link("setup".to_string(), client);
+                peer_network.register_primary_link("setup".to_string(), server_addr, client);
                 // Drive the real secondary over the real network transport
                 // against the production mesh-pump (the cold-primary
                 // resolution + bootstrap-link fold these tests pin happen
@@ -443,7 +443,7 @@ async fn e2e_primary_secondary_over_quic() {
                 let mut peer_network = PeerNetwork::<TestId>::start(&config.secondary_id)
                     .await
                     .expect("peer network start");
-                peer_network.register_primary_link("setup".to_string(), client);
+                peer_network.register_primary_link("setup".to_string(), server_addr, client);
                 // Drive the real secondary over the real network transport
                 // against the production mesh-pump (the cold-primary
                 // resolution + bootstrap-link fold these tests pin happen

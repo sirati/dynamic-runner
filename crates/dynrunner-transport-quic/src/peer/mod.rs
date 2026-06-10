@@ -18,6 +18,7 @@ use crate::transport::QuicListener;
 use crate::wss::WssListener;
 
 mod accept;
+mod bootstrap_redial;
 mod dial;
 mod handler;
 mod mesh_send;
@@ -160,6 +161,25 @@ pub struct PeerNetwork<I: Identifier> {
     /// dropped — e.g. a host that is never promoted, so no same-host
     /// primary is ever constructed — without closing the drain).
     mesh_send_tx: mpsc::UnboundedSender<MeshSend<I>>,
+
+    /// Re-dialed bootstrap-wire handoff (defect (b)). When a folded
+    /// submitter-bootstrap wire closes (the `-R` tunnel dropped), an
+    /// off-loop supervisor re-dials it INDEFINITELY and sends the fresh
+    /// client here; `recv_peer`'s drain arm re-folds it via
+    /// [`Self::register_primary_link`] under `&mut self`. This restores
+    /// ONLY the transport pipe — it feeds NO failover input (the
+    /// secondary→primary app-layer liveness window stays the sole
+    /// failover signal; see [`bootstrap_redial`]). `None`-yielding is
+    /// impossible while the network lives (the held `bootstrap_redial_tx`
+    /// clone keeps the channel open), so the arm only fires on real
+    /// re-dials.
+    bootstrap_redial_rx: mpsc::UnboundedReceiver<bootstrap_redial::BootstrapRedial<I>>,
+    /// Network-held clone of the bootstrap-redial sender, handed to each
+    /// folded wire's redial supervisor. Kept on the struct so
+    /// `bootstrap_redial_rx` never observes a spurious close on the path
+    /// where no bootstrap wire was ever folded (an observer/late-joiner
+    /// that has no submitter bootstrap link).
+    bootstrap_redial_tx: mpsc::UnboundedSender<bootstrap_redial::BootstrapRedial<I>>,
 }
 
 impl<I: Identifier> PeerNetwork<I> {
@@ -240,6 +260,7 @@ impl<I: Identifier> PeerNetwork<I> {
         tracing::info!(peer_id, port, "peer network listening (QUIC/UDP + WSS/TCP)");
 
         let (mesh_send_tx, proxy_rx) = mpsc::unbounded_channel();
+        let (bootstrap_redial_tx, bootstrap_redial_rx) = mpsc::unbounded_channel();
         Ok(Self {
             peer_id: peer_id.to_string(),
             cert,
@@ -259,6 +280,8 @@ impl<I: Identifier> PeerNetwork<I> {
             reconnect_tracker: reconnect::ReconnectTracker::new(),
             proxy_rx,
             mesh_send_tx,
+            bootstrap_redial_rx,
+            bootstrap_redial_tx,
         })
     }
 
@@ -292,13 +315,38 @@ impl<I: Identifier> PeerNetwork<I> {
     /// peer here, indistinguishable from any other. Any "exclude the
     /// primary" policy (quorum, mesh-health) is a role concern resolved
     /// at the coordinator edge, not in the transport.
-    pub fn register_primary_link(&mut self, primary_id: String, client: crate::NetworkClient<I>) {
+    pub fn register_primary_link(
+        &mut self,
+        primary_id: String,
+        dial_addr: std::net::SocketAddr,
+        client: crate::NetworkClient<I>,
+    ) {
+        let target = bootstrap_redial::BootstrapDialTarget {
+            addr: dial_addr,
+            primary_id,
+        };
+        self.fold_primary_link(target, client);
+    }
+
+    /// Fold (or RE-fold) a bootstrap wire into the mesh and arm its
+    /// re-dial. Shared by the initial [`Self::register_primary_link`] and
+    /// the `recv_peer` re-fold of a re-dialed wire (defect (b)), so the
+    /// mesh-install + redial-arming logic lives in exactly one place.
+    ///
+    /// `target` is the FIXED `localhost:<tunnel_port>` dial address +
+    /// primary id, retained so the inbound forwarder can re-dial through
+    /// the (rebuilt) tunnel after a drop.
+    pub(in crate::peer) fn fold_primary_link(
+        &mut self,
+        target: bootstrap_redial::BootstrapDialTarget,
+        client: crate::NetworkClient<I>,
+    ) {
         use dynrunner_core::MessageReceiver;
 
-        tracing::info!(primary = %primary_id, "folded primary bootstrap wire into the mesh");
+        tracing::info!(primary = %target.primary_id, "folded primary bootstrap wire into the mesh");
         // Outbound: fan-in send handle into the existing wire.
         self.connections
-            .insert(primary_id.clone(), client.mesh_writer());
+            .insert(target.primary_id.clone(), client.mesh_writer());
 
         // Inbound: drive the wire's inbound into the mesh's single
         // fan-in, so the primary's frames arrive via `recv_peer` like
@@ -323,15 +371,42 @@ impl<I: Identifier> PeerNetwork<I> {
         // under the app layer. The two liveness detectors are
         // orthogonal by construction; do not couple them by routing the
         // forwarder's exit through `handle_peer_disconnect`.
+        //
+        // Defect (b): when the forwarder exits because the WIRE CLOSED
+        // (`recv()` → None — the `-R` tunnel dropped), arm the bootstrap
+        // re-dial supervisor so the link is restored after the tunnel is
+        // rebuilt. This restores ONLY the transport pipe; it feeds no
+        // failover input, preserving the honest-liveness decoupling
+        // above. When the forwarder exits because `incoming_tx` closed
+        // (the network is tearing down), do NOT re-dial.
         let incoming_tx = self.incoming_tx.clone();
+        let redial_tx = self.bootstrap_redial_tx.clone();
         tokio::task::spawn_local(async move {
             let mut client = client;
-            while let Some(msg) = client.recv().await {
-                if incoming_tx.send(msg).is_err() {
-                    break;
+            let mut wire_closed = false;
+            loop {
+                match client.recv().await {
+                    Some(msg) => {
+                        if incoming_tx.send(msg).is_err() {
+                            // Network tearing down — not a wire drop.
+                            break;
+                        }
+                    }
+                    None => {
+                        // The bootstrap wire itself closed (tunnel down).
+                        wire_closed = true;
+                        break;
+                    }
                 }
             }
             tracing::debug!("primary bootstrap-wire inbound forwarder done");
+            if wire_closed {
+                // Re-dial INDEFINITELY off-loop; the fresh client comes
+                // back through `redial_tx` for re-fold under `&mut self`.
+                tokio::task::spawn_local(bootstrap_redial::redial_bootstrap_wire(
+                    target, redial_tx,
+                ));
+            }
         });
     }
 

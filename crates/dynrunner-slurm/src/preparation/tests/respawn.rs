@@ -18,6 +18,7 @@ use tokio::task::JoinSet;
 use crate::preparation::SlurmPreparation;
 use crate::preparation::establish::establish_one_tunnel_inner;
 use crate::preparation::options::{InfoFileReader, PrepError};
+use crate::preparation::store::SharedTunnelVec;
 
 use super::establish::{alive_child, fail_child};
 use super::opts_for;
@@ -58,6 +59,7 @@ fn establish_one_tunnel_pushes_child_handle() {
         let tmp = tempfile::tempdir().unwrap();
         let opts = opts_for(&tmp);
         let tunnels: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
+        let store = SharedTunnelVec::new(Arc::clone(&tunnels));
         let port_map: Arc<StdMutex<HashMap<String, u16>>> = Arc::new(StdMutex::new(HashMap::new()));
         let establish_pool = Arc::new(Semaphore::new(1));
         let reader = CannedUriReader {
@@ -72,7 +74,7 @@ fn establish_one_tunnel_pushes_child_handle() {
             /* primary_quic_port */ 51000,
             &opts,
             reader,
-            &tunnels,
+            &store,
             &port_map,
             &establish_pool,
             |_host, _tunnel_port| async move { Ok(alive_child()) },
@@ -125,7 +127,7 @@ fn establish_one_tunnel_applies_rate_limiter() {
         let mut set: JoinSet<Result<u16, PrepError>> = JoinSet::new();
         for i in 0..N {
             let opts = opts.clone();
-            let tunnels = Arc::clone(&tunnels);
+            let store = SharedTunnelVec::new(Arc::clone(&tunnels));
             let port_map = Arc::clone(&port_map);
             let pool = Arc::clone(&establish_pool);
             let in_flight = Arc::clone(&in_flight);
@@ -141,7 +143,7 @@ fn establish_one_tunnel_applies_rate_limiter() {
                     51000,
                     &opts,
                     reader,
-                    &tunnels,
+                    &store,
                     &port_map,
                     &pool,
                     move |_host, _tunnel_port| {
@@ -216,7 +218,10 @@ fn reconnect_release_then_rebind_same_port_succeeds_vs_reuse_fails() {
     // `reconnect_spawner` clearing the stale binding before the spawn.
     fn spawn_for(port_in_use: &Arc<AtomicBool>) -> Child {
         if port_in_use.load(Ordering::SeqCst) {
-            fail_child("Warning: remote port forwarding failed for listen port", 255)
+            fail_child(
+                "Warning: remote port forwarding failed for listen port",
+                255,
+            )
         } else {
             alive_child()
         }
@@ -230,6 +235,7 @@ fn reconnect_release_then_rebind_same_port_succeeds_vs_reuse_fails() {
             // ---- ARM 1: reconnect spawner (release THEN rebind) ----
             let port_in_use = Arc::new(AtomicBool::new(true)); // stale binding present
             let tunnels: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
+            let store = SharedTunnelVec::new(Arc::clone(&tunnels));
             let port_map: Arc<StdMutex<HashMap<String, u16>>> =
                 Arc::new(StdMutex::new(HashMap::new()));
             let pool = Arc::new(Semaphore::new(1));
@@ -243,7 +249,7 @@ fn reconnect_release_then_rebind_same_port_succeeds_vs_reuse_fails() {
                 51000,
                 &opts,
                 reader,
-                &tunnels,
+                &store,
                 &port_map,
                 &pool,
                 move |_host, _port| {
@@ -261,6 +267,7 @@ fn reconnect_release_then_rebind_same_port_succeeds_vs_reuse_fails() {
             // ---- ARM 2: plain spawner (reuse, NO release) ----
             let port_in_use2 = Arc::new(AtomicBool::new(true)); // stale binding present
             let tunnels2: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
+            let store2 = SharedTunnelVec::new(Arc::clone(&tunnels2));
             let port_map2: Arc<StdMutex<HashMap<String, u16>>> =
                 Arc::new(StdMutex::new(HashMap::new()));
             let pool2 = Arc::new(Semaphore::new(1));
@@ -274,7 +281,7 @@ fn reconnect_release_then_rebind_same_port_succeeds_vs_reuse_fails() {
                 51000,
                 &opts,
                 reader2,
-                &tunnels2,
+                &store2,
                 &port_map2,
                 &pool2,
                 move |_host, _port| {
@@ -306,6 +313,59 @@ fn reconnect_release_then_rebind_same_port_succeeds_vs_reuse_fails() {
         }
         other => panic!("expected reuse-without-release to fail rc=255, got {other:?}"),
     }
+}
+
+/// Defect (a) GATE: `reestablish_one_tunnel` NO-OPs (returns Ok WITHOUT
+/// touching ssh) when the secondary's prior tunnel child is still alive —
+/// the fix for the rc=255 release+rebind loop that re-fired every ~60s
+/// cadence tick against the observer's OWN healthy listener.
+///
+/// The proof is structural: we seed a LIVE child into the per-secondary
+/// registry on a FRESH manager (one that never ran `setup_ssh_tunnels`,
+/// so the primary-QUIC-port cell is UNSET). If the gate did NOT fire, the
+/// method would fall through to the precondition check and return the
+/// "primary QUIC port not yet known" `TunnelFailed`. It returning `Ok(())`
+/// instead can ONLY mean the liveness gate short-circuited before any
+/// release/rebind — exactly the no-op the cadence needs.
+#[test]
+fn reestablish_is_noop_when_tunnel_child_alive() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    rt.block_on(local.run_until(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let opts = opts_for(&tmp);
+        let prep = SlurmPreparation::new(opts);
+
+        // Seed a live (long-running) child into the reconnect registry
+        // for secondary-0 — models a HEALTHY `-R` forward whose ssh
+        // subprocess is still running.
+        {
+            let registry = prep.reconnect_tunnels_for_test();
+            registry
+                .lock()
+                .await
+                .insert("secondary-0".to_string(), alive_child());
+        }
+
+        // No `setup_ssh_tunnels` ran ⇒ primary QUIC port is UNSET. The
+        // gate must fire first and return Ok — never reaching the
+        // precondition error, never spawning ssh.
+        let res = prep
+            .reestablish_one_tunnel(
+                "secondary-0",
+                CannedUriReader {
+                    uri: "tcp://h:1".into(),
+                },
+            )
+            .await;
+        assert!(
+            res.is_ok(),
+            "a live tunnel child must make reestablish a no-op (gate before any rebuild), got {res:?}"
+        );
+    }));
 }
 
 /// Calling `establish_one_tunnel` on a fresh manager (before
