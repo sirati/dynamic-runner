@@ -59,9 +59,14 @@ use std::sync::Arc;
 /// owns only WHEN (lost visibility) and WHO (its roster). The call MUST
 /// be non-blocking for the observer loop — a production impl spawns the
 /// per-id rebuild work detached and returns immediately, so the observer
-/// keeps observing/narrating while the rebuild proceeds and its
-/// visibility flips back once a compute peer re-dials over the rebuilt
-/// tunnel.
+/// keeps observing/narrating while the rebuild proceeds. Visibility flips
+/// back because the SECONDARY's bootstrap-redial supervisor
+/// (`dynrunner-transport-quic::peer::bootstrap_redial`) actively re-dials
+/// `localhost:<tunnel_port>` with indefinite backoff and re-folds the wire
+/// once the rebuilt forward carries it — the re-dial is a real owned
+/// mechanism, not an assumed side effect. (The implementation also gates
+/// on per-id tunnel liveness: a still-alive tunnel child is a no-op, never
+/// a release+rebind against its own healthy forward.)
 #[async_trait::async_trait(?Send)]
 pub trait TunnelReconnector: Send + Sync {
     /// Attempt to restore the transport path to each id in `peer_ids`.

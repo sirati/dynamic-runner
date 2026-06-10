@@ -753,8 +753,10 @@ where
                 // ~60s recurrence) actively trigger a `-R` tunnel rebuild
                 // for the roster the observer expects to reach. The reporter
                 // owns the cadence; the coordinator owns the action (the
-                // reconnect port). Visibility flips back to Visible on its
-                // own once a compute peer re-dials over the rebuilt tunnel.
+                // reconnect port). Visibility flips back to Visible once the
+                // SECONDARY's bootstrap-redial supervisor re-dials through
+                // the rebuilt tunnel and re-folds the wire (an owned
+                // mechanism in transport-quic, not an assumed side effect).
                 let directive =
                     visibility_reporter.observe(&self.current_visibility(primary_last_seen));
                 if directive == RetryDirective::ReconnectDue {
@@ -974,10 +976,13 @@ where
     /// observer's link to the run. The port call is SPAWNED detached on the
     /// LocalSet so the observer loop never blocks on the (info-file-polling,
     /// ssh-handshaking) rebuild; the observer keeps observing + narrating,
-    /// and its visibility flips back to `Visible` on its own once a compute
-    /// peer re-dials over the rebuilt tunnel (the pump republishes
-    /// membership). A failed rebuild is simply retried on the next
-    /// lost-visibility cadence tick.
+    /// and its visibility flips back to `Visible` once the SECONDARY's
+    /// bootstrap-redial supervisor re-dials over the rebuilt tunnel and the
+    /// pump republishes membership (the re-dial is an owned transport-quic
+    /// mechanism, not an assumed side effect). A failed rebuild is retried
+    /// on the next lost-visibility cadence tick — but a tunnel whose child
+    /// is still ALIVE is a no-op (the liveness gate), never a rebuild
+    /// against its own healthy forward.
     fn trigger_reconnect(&self) {
         let Some(reconnector) = self.reconnector.clone() else {
             return;
