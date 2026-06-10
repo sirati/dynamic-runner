@@ -20,7 +20,8 @@ use super::escalation::{EscalationVerdict, ReconnectEscalation};
 use super::establish::establish_one_tunnel_inner;
 use super::options::{InfoFileReader, PrepError, PreparationOptions};
 use super::ssh::{
-    LingerLedger, production_spawner, reconnect_spawner, restore_linger, summarize_linger_enables,
+    LingerLedger, production_bind_verifier, production_spawner, reconnect_spawner, restore_linger,
+    summarize_linger_enables,
 };
 use super::store::{PerSecondaryTunnelRegistry, SharedTunnelVec, TunnelStore};
 use super::summary::{TunnelSetupSummary, secondary_id};
@@ -212,6 +213,7 @@ impl SlurmPreparation {
                     primary_quic_port,
                     linger_ledger,
                 );
+                let verifier = production_bind_verifier(id_for_task.clone(), opts.clone());
                 let res = establish_one_tunnel_inner(
                     &id_for_task,
                     &info_path,
@@ -222,6 +224,7 @@ impl SlurmPreparation {
                     &port_map,
                     &establish_pool,
                     spawner,
+                    verifier,
                 )
                 .await;
                 let outcome = res.map(|port| (id_for_task.clone(), port));
@@ -348,6 +351,7 @@ impl SlurmPreparation {
             primary_quic_port,
             linger_ledger,
         );
+        let verifier = production_bind_verifier(id_owned.clone(), opts.clone());
         let _port = establish_one_tunnel_inner(
             &id_owned,
             &info_path,
@@ -358,6 +362,7 @@ impl SlurmPreparation {
             &port_map,
             &establish_pool,
             spawner,
+            verifier,
         )
         .await?;
         Ok(())
@@ -495,6 +500,7 @@ impl SlurmPreparation {
             primary_quic_port,
             linger_ledger,
         );
+        let verifier = production_bind_verifier(id_owned.clone(), opts.clone());
         let _port = establish_one_tunnel_inner(
             &id_owned,
             &info_path,
@@ -505,6 +511,7 @@ impl SlurmPreparation {
             &port_map,
             &establish_pool,
             spawner,
+            verifier,
         )
         .await?;
         // A completed rebuild (gate-found-dead or escalation-forced alike)

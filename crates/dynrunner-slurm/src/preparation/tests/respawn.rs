@@ -20,7 +20,7 @@ use crate::preparation::establish::establish_one_tunnel_inner;
 use crate::preparation::options::{InfoFileReader, PrepError};
 use crate::preparation::store::SharedTunnelVec;
 
-use super::establish::{alive_child, fail_child};
+use super::establish::{alive_child, fail_child, listening_inner_verifier};
 use super::opts_for;
 
 /// Stubbed `InfoFileReader` returning a fixed URI immediately.
@@ -78,6 +78,7 @@ fn establish_one_tunnel_pushes_child_handle() {
             &port_map,
             &establish_pool,
             |_host, _tunnel_port| async move { Ok(alive_child()) },
+            listening_inner_verifier(),
         )
         .await
         .expect("establish_one_tunnel_inner must succeed");
@@ -160,6 +161,7 @@ fn establish_one_tunnel_applies_rate_limiter() {
                             Ok(alive_child())
                         }
                     },
+                    listening_inner_verifier(),
                 )
                 .await
             });
@@ -261,6 +263,7 @@ fn reconnect_release_then_rebind_same_port_succeeds_vs_reuse_fails() {
                         Ok(spawn_for(&piu))
                     }
                 },
+                listening_inner_verifier(),
             )
             .await;
 
@@ -290,6 +293,7 @@ fn reconnect_release_then_rebind_same_port_succeeds_vs_reuse_fails() {
                     // binding stays, every attempt collides.
                     async move { Ok(spawn_for(&piu2)) }
                 },
+                listening_inner_verifier(),
             )
             .await;
 
@@ -485,4 +489,68 @@ fn establish_one_tunnel_errors_without_prior_setup() {
         }
         other => panic!("expected TunnelFailed, got {other}"),
     }
+}
+
+/// HONEST-SUMMARY guarantee at the establishment seam: a tunnel whose
+/// bind verification never passes is NEVER committed to the tunnel
+/// store and NEVER recorded in the port map — so the #278
+/// `TunnelSetupSummary` (derived from the port map) counts only
+/// VERIFIED tunnels and the production "All N SSH tunnels established"
+/// headline can no longer cover a listener-less fleet.
+#[test]
+fn unverified_tunnel_is_never_committed_or_counted() {
+    use crate::preparation::ssh::BindProbe;
+    use crate::preparation::summary::TunnelSetupSummary;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    rt.block_on(local.run_until(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut opts = opts_for(&tmp);
+        // Fast policy: the persistent-miss path must not pay the
+        // production backoffs.
+        opts.establishment.attempts = 2;
+        opts.establishment.backoff = vec![Duration::from_millis(10)];
+
+        let tunnels: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
+        let store = SharedTunnelVec::new(Arc::clone(&tunnels));
+        let port_map: Arc<StdMutex<HashMap<String, u16>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
+        let pool = Arc::new(Semaphore::new(1));
+        let reader = CannedUriReader {
+            uri: "tcp://compute-3:42655".into(),
+        };
+
+        let res = establish_one_tunnel_inner(
+            "secondary-0",
+            "/unused",
+            51000,
+            &opts,
+            reader,
+            &store,
+            &port_map,
+            &pool,
+            // Gate-surviving spawns: the failure is bind-level only.
+            |_host, _port| async move { Ok(alive_child()) },
+            |_host, _port| std::future::ready(BindProbe::NotListening),
+        )
+        .await;
+        assert!(res.is_err(), "a never-verifying tunnel must surface an error");
+
+        // NOT committed: cleanup() has nothing to reap from this id.
+        assert!(
+            tunnels.lock().await.is_empty(),
+            "an unverified tunnel must never reach the store"
+        );
+        // NOT counted: the port map is the summary's ground truth.
+        let map = port_map.lock().unwrap().clone();
+        assert!(map.is_empty(), "an unverified tunnel must never enter the port map");
+        let summary = TunnelSetupSummary::new(&map, 1);
+        assert!(!summary.is_complete());
+        assert_eq!(summary.established, 0, "the K/N summary counts only verified tunnels");
+        assert_eq!(summary.missing, vec!["secondary-0".to_string()]);
+    }));
 }

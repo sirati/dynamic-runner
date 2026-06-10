@@ -19,7 +19,7 @@ use crate::peer_info::parse as parse_peer_info;
 
 use super::options::{InfoFileReader, PrepError, PreparationOptions};
 use super::policy::EstablishmentPolicy;
-use super::ssh::verify_tunnel_alive;
+use super::ssh::{BindProbe, terminate_child, verify_tunnel_alive};
 use super::store::TunnelStore;
 
 /// Per-tunnel work shared by `setup_ssh_tunnels` (run in parallel
@@ -46,6 +46,14 @@ use super::store::TunnelStore;
 /// touching ssh. `String` (not `&str`) so the closure's returned
 /// future can own its inputs without borrow-lifetime contortions.
 ///
+/// Verifier DI: the `verifier` closure (same `(host, tunnel_port)`
+/// parameterisation) answers "does the WORKER-side listener for this
+/// tunnel actually exist?" after the local alive-gate passes —
+/// production-bound to
+/// [`production_bind_verifier`](super::ssh::production_bind_verifier),
+/// canned in tests. See [`establish_tunnel`] for how each
+/// [`BindProbe`] verdict steers the retry loop.
+///
 /// Cancel-safety: the `Command::spawn` inside the spawner sets
 /// `kill_on_drop(true)`, so an outer abort drops the in-progress Child
 /// and SIGKILL fires. The Semaphore permit acquired inside
@@ -57,7 +65,7 @@ use super::store::TunnelStore;
 // state into a struct would just shift the verbosity to the
 // call-site without changing the parameter count.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn establish_one_tunnel_inner<R, S, F, Fut>(
+pub(super) async fn establish_one_tunnel_inner<R, S, F, Fut, V, VFut>(
     secondary_id: &str,
     info_path: &str,
     primary_quic_port: u16,
@@ -67,12 +75,15 @@ pub(super) async fn establish_one_tunnel_inner<R, S, F, Fut>(
     port_map: &Arc<StdMutex<HashMap<String, u16>>>,
     establish_pool: &Arc<Semaphore>,
     mut spawner: F,
+    mut verifier: V,
 ) -> Result<u16, PrepError>
 where
     R: InfoFileReader,
     S: TunnelStore,
     F: FnMut(String, u16) -> Fut,
     Fut: Future<Output = Result<Child, PrepError>>,
+    V: FnMut(String, u16) -> VFut,
+    VFut: Future<Output = BindProbe>,
 {
     // Poll until the info file appears. The outer timeout (when
     // called from `setup_ssh_tunnels`) guards total runtime; this
@@ -124,11 +135,16 @@ where
     // Delegate spawn + verify + rate-limit + retry to a single
     // helper that owns the establishment concern (see
     // `EstablishmentPolicy` doc-comment). Returns the verified Child
-    // already past the 3s alive-gate; this function then commits it
-    // to the caller's store for cleanup() to reap.
-    let child = establish_tunnel(secondary_id, &opts.establishment, establish_pool, || {
-        spawner(host.clone(), tunnel_port)
-    })
+    // already past the 3s alive-gate AND the worker-side bind
+    // verification; this function then commits it to the caller's
+    // store for cleanup() to reap.
+    let child = establish_tunnel(
+        secondary_id,
+        &opts.establishment,
+        establish_pool,
+        || spawner(host.clone(), tunnel_port),
+        || verifier(host.clone(), tunnel_port),
+    )
     .await?;
 
     // Commit to the caller's tunnel store only after verification —
@@ -149,8 +165,10 @@ where
 
 /// Establish a single SSH reverse tunnel: acquire a semaphore permit,
 /// spawn (via the caller-supplied spawner), verify the resulting
-/// child survives the 3s alive-gate. On
-/// `PrepError::TunnelFailed` (rc=255-class handshake failure), retry
+/// child survives the 3s alive-gate, then verify the WORKER-side
+/// listener actually exists (via the caller-supplied verifier). On
+/// `PrepError::TunnelFailed` (rc=255-class handshake failure) or a
+/// definite bind-verification miss, retry
 /// up to [`EstablishmentPolicy::attempts`] total times with
 /// [`EstablishmentPolicy::backoff`] sleeps in between. The overall
 /// per-tunnel deadline is bounded by
@@ -166,6 +184,31 @@ where
 /// success/failure sequence, exercising the rate-limit and retry
 /// control flow without ever touching ssh.
 ///
+/// # Bind verification (the honest closer for the partial-`-R` bind)
+///
+/// Child survival past the 3s gate plus `ExitOnForwardFailure=yes`
+/// does NOT prove the worker-side listener exists: sshd binds the
+/// remote forward per address family and reports SUCCESS when at
+/// least one family binds (OpenSSH `channel_setup_fwd_listener_tcpip`
+/// — a transient v4 collision on the ephemeral tunnel port leaves a
+/// v6-only listener while the client survives). So after the gate the
+/// `verifier` asks the worker what is actually bound, and each
+/// [`BindProbe`] verdict steers the loop:
+///
+/// * `Listening` — done; only NOW is the tunnel "established" (the
+///   caller's store commit, the port map, and therefore the #278 K/N
+///   summary all sit downstream of this verdict — they count only
+///   VERIFIED tunnels).
+/// * `NotListening` — definite miss: the child is terminated and the
+///   attempt counts as failed; the retry respawns on the SAME port
+///   (the worker's dial target is fixed at worker startup) after the
+///   spawner's retry-release reclaims it — see
+///   `ReleaseBeforeSpawn::OnRetry` in [`super::ssh`].
+/// * `Inconclusive` — probe infrastructure failure (`ss` missing,
+///   probe ssh died): WARN and KEEP the gate-verified tunnel; the
+///   probe's own availability must never kill tunnels that met the
+///   pre-probe standard.
+///
 /// Permit lifetime: acquired before each spawn attempt, released
 /// when the per-attempt `_permit` binding drops at the end of each
 /// loop iteration (success path: just after verify returns Ok;
@@ -175,15 +218,18 @@ where
 /// sequence of failing handshakes would each free their permit
 /// instantly and the rate cap would only limit `Command::spawn`
 /// turnover, not actual sshd-facing handshake concurrency.
-pub(super) async fn establish_tunnel<F, Fut>(
+pub(super) async fn establish_tunnel<F, Fut, V, VFut>(
     secondary_id: &str,
     policy: &EstablishmentPolicy,
     establish_pool: &Arc<Semaphore>,
     mut spawner: F,
+    mut verifier: V,
 ) -> Result<Child, PrepError>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<Child, PrepError>>,
+    V: FnMut() -> VFut,
+    VFut: Future<Output = BindProbe>,
 {
     let attempts = policy.attempts.max(1);
 
@@ -221,7 +267,57 @@ where
             };
 
             match verify_tunnel_alive(secondary_id, &mut child).await {
-                Ok(()) => return Ok(child),
+                Ok(()) => match verifier().await {
+                    BindProbe::Listening { listeners } => {
+                        tracing::info!(
+                            secondary_id,
+                            listeners = ?listeners,
+                            "worker-side tunnel listener verified"
+                        );
+                        return Ok(child);
+                    }
+                    BindProbe::Inconclusive { reason } => {
+                        tracing::warn!(
+                            secondary_id,
+                            reason = %reason,
+                            "could not verify the worker-side tunnel listener; keeping the \
+                             gate-verified tunnel (a probe-infrastructure failure must not \
+                             kill it). If the listener is genuinely absent the secondary's \
+                             dial will keep failing and the lost-visibility reconnect path \
+                             rebuilds the tunnel."
+                        );
+                        return Ok(child);
+                    }
+                    BindProbe::NotListening => {
+                        // Definite miss: ssh survived (so sshd accepted
+                        // the forward request) but no loopback listener
+                        // exists on the worker — the partial-bind /
+                        // wrong-host class. Kill the useless child and
+                        // retry: the spawner's retry-release reclaims
+                        // the same fixed port before the respawn.
+                        tracing::warn!(
+                            secondary_id,
+                            attempt = attempt + 1,
+                            total = attempts,
+                            "ssh survived the alive-gate but NO worker-side listener exists \
+                             on the tunnel port (sshd reports a -R bind as success when \
+                             EITHER address family binds; a transient port collision can eat \
+                             the v4 side) — terminating the tunnel and retrying with a \
+                             pre-spawn port release"
+                        );
+                        terminate_child(&mut child).await;
+                        last_err = Some(PrepError::TunnelFailed {
+                            secondary_id: secondary_id.to_owned(),
+                            rc: None,
+                            stderr: format!(
+                                "ssh tunnel survived the alive-gate but the worker-side \
+                                 listener never appeared on the tunnel port (partial -R \
+                                 bind); attempt {}/{attempts}",
+                                attempt + 1
+                            ),
+                        });
+                    }
+                },
                 Err(e @ PrepError::TunnelFailed { .. }) => {
                     // Retryable: log + record, fall through to next
                     // iteration's pre-sleep (if any).
@@ -240,8 +336,8 @@ where
             // _permit dropped here → release before backoff sleep.
         }
         // Exhausted attempts. last_err is Some(TunnelFailed{..}) by
-        // construction (the only path that loops back is the retryable
-        // branch above).
+        // construction (the only paths that loop back — the retryable
+        // verify branch and the bind-verification miss — both set it).
         Err(last_err.expect("retry loop ran at least once with TunnelFailed"))
     };
 
