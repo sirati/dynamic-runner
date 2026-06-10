@@ -62,12 +62,11 @@ impl MessageSender<Command> for SocketpairManagerEnd {
 
 impl MessageReceiver<Response> for SocketpairManagerEnd {
     async fn recv(&mut self) -> Option<Response> {
-        let mut line = String::new();
-        match self.reader.read_line(&mut line).await {
-            Ok(0) => None, // EOF
-            Ok(_) => codec::parse_response(&line),
-            Err(_) => None,
-        }
+        // Bounded framing (#364): an over-limit frame is drained and
+        // surfaced as the protocol's loud NonRecoverable error instead
+        // of being consumed replylessly. See
+        // `dynrunner_protocol_manager_worker::framing`.
+        dynrunner_protocol_manager_worker::recv_response_bounded(&mut self.reader).await
     }
 }
 

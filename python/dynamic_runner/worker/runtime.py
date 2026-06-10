@@ -71,6 +71,7 @@ from typing import Any, Callable, Optional
 # the `--log-file` argument.
 _LOG = logging.getLogger(__name__)
 
+from .._native import PUBLISH_STRING_MAX_BYTES as _PUBLISH_STRING_MAX_BYTES
 from ..comm import (
     CommunicationInterface,
     DoneResponse,
@@ -224,7 +225,33 @@ class Task:
         See :class:`Task` docstring for the merged-with-WorkerOutput
         wire shape. Consumers reach the value via the dependent task's
         ``predecessor_outputs[my_task_id][key]["value"]``.
+
+        Size limit: ``value`` must encode to at most
+        ``PUBLISH_STRING_MAX_BYTES`` (16 MiB, exported from
+        ``dynamic_runner._native``) UTF-8 bytes. Inline outputs ride
+        every downstream hop in memory — the worker's ``done:`` wire
+        frame, the cluster-replicated completion record, and the
+        ``predecessor_outputs`` map embedded into each dependent
+        task's dispatch — so the framework rejects bulk data here,
+        at the call site, with a visible error instead of letting an
+        oversize frame wedge the worker IPC (#364). Raises
+        :class:`NonRecoverableError` (the violation is deterministic;
+        retrying the task cannot succeed) naming the actual size and
+        the limit. For bulk artifacts, write the data to a file under
+        the staging dir and use ``task.publish(src, key=key)`` — the
+        published value is then just the destination path on the
+        shared mount.
         """
+        value_bytes = len(value.encode("utf-8"))
+        if value_bytes > _PUBLISH_STRING_MAX_BYTES:
+            raise NonRecoverableError(
+                f"publish_string value for key {key!r} is {value_bytes} bytes, "
+                f"exceeding the PUBLISH_STRING_MAX_BYTES limit of "
+                f"{_PUBLISH_STRING_MAX_BYTES} bytes (16 MiB). Inline outputs are "
+                f"for metadata-sized values; write bulk artifacts to the staging "
+                f"dir and use task.publish(src, key=...) instead — the published "
+                f"value is then the destination path on the shared mount."
+            )
         self._outputs_accumulator[key] = {"kind": "inline", "value": value}
 
     def publish_all(self, *srcs) -> None:

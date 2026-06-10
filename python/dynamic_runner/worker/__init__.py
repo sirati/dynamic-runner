@@ -9,6 +9,7 @@ Re-exports the names every consumer needs to write a worker module:
 
 See ``runtime.py`` for the full contract and exception → wire mapping.
 """
+from .._native import PUBLISH_STRING_MAX_BYTES
 from .logging_setup import setup_worker_logging
 from .publish import (
     PublishError,
@@ -26,6 +27,7 @@ from .runtime import (
 
 __all__ = [
     "NonRecoverableError",
+    "PUBLISH_STRING_MAX_BYTES",
     "PublishError",
     "RecoverableError",
     "Task",
