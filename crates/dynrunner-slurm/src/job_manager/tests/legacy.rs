@@ -32,8 +32,31 @@ impl<G: Gateway> PodmanPackaging<G> for RecordingPackaging {
     }
 }
 
+/// A thread-local default subscriber for tests that drive
+/// `build_and_transfer_images` WITHOUT asserting on tracing.
+///
+/// Load-bearing, not cosmetic: those tests share `images.rs`'s
+/// important-target callsites with
+/// `important_events::build_and_transfer_emits_building_and_uploading_important_events`,
+/// which captures them through a thread-local `set_default` subscriber.
+/// `tracing`'s per-callsite Interest cache is GLOBAL: a first hit of a
+/// shared callsite from a thread with NO dispatcher can race the capture
+/// test's `set_default` interest-cache rebuild and stamp
+/// `Interest::never` AFTER the rebuild stamped `always` — permanently
+/// muting that callsite for the capture (observed: the capture saw only
+/// the first of the two events, ~5% of parallel full-suite runs;
+/// reproduced 3/40 on a tight `build_and_transfer` filter loop).
+/// Installing a plain `Registry` here means every interest computation
+/// this thread can ever contribute is "interested", so the poisoned
+/// state is unreachable. Events go to the `Registry` sink (dropped) —
+/// these tests assert on the packager boundary, not on tracing.
+fn tracing_interest_guard() -> tracing::subscriber::DefaultGuard {
+    tracing::subscriber::set_default(tracing_subscriber::registry())
+}
+
 #[tokio::test]
 async fn build_and_transfer_images_forwards_to_packager() {
+    let _tracing_guard = tracing_interest_guard();
     let gw = LocalGateway::new();
     let config = SlurmConfig {
         root_folder: "/srv/slurm".into(),
@@ -95,6 +118,7 @@ async fn build_and_transfer_images_propagates_packager_failure() {
         }
     }
 
+    let _tracing_guard = tracing_interest_guard();
     let gw = LocalGateway::new();
     let manager = SlurmJobManager::new(SlurmConfig::default(), gw);
     let err = manager
