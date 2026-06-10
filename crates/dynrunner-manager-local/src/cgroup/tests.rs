@@ -7,7 +7,8 @@
 //!   * Happy path: creates `workers/`, enables controllers, writes
 //!     tightened `memory.max`, resets `memory.swap.max` to "max".
 //!   * Graceful fallback: cgroup-v1 host, missing memory controller,
-//!     non-writable subtree_control. Each returns `Ok(None)`.
+//!     non-writable subtree_control, and any write-phase error. Each
+//!     returns `None` (the orchestrator is infallible).
 //!   * Per-worker leaf attach: `SubcgroupHandle::attach_pid` writes
 //!     the pid as decimal to `<worker-N>/cgroup.procs` (the old
 //!     `workers/cgroup.procs` path is forbidden once subtree_control
@@ -16,18 +17,25 @@
 //!     does not error and ends with the same on-disk shape.
 //!
 //! `cgroup_v2_leaf` reads the REAL `/proc/self/cgroup` (we don't
-//! mock /proc), so the tests below DON'T exercise [`super::setup_worker_cgroup`]
+//! mock /proc), so most tests below DON'T exercise [`super::setup_worker_cgroup`]
 //! end-to-end. Instead they call the lower-level
 //! [`super::writer::write_workers_subgroup`] (re-exported into the
 //! test module via `use super::writer`) for the happy-path /
 //! idempotence assertions and exercise the graceful-fallback gates
 //! by directly invoking the predicates.
 //!
-//! Conscious-trade-off: dropping the `/proc/self/cgroup` mock means
-//! the warn-line plumbing in the orchestrator isn't exercised in
-//! unit tests. The orchestrator is six straightforward branches over
-//! the predicate helpers, each itself unit-tested below; the
-//! integration risk is bounded.
+//! Exception: the degrade-on-error tests
+//! (`setup_worker_cgroup_degrades_on_permission_denied`,
+//! `setup_worker_cgroup_degrades_on_missing_controllers_file`) DO
+//! drive the public orchestrator end-to-end. `cgroup_v2_leaf` joins
+//! the real `/proc/self/cgroup` relative path onto the injected
+//! root, so a fixture materialised at exactly
+//! `<tempdir>/<real-rel-path>` is what the orchestrator resolves —
+//! no /proc mock needed. They skip (eprintln + return) on hosts
+//! without a cgroup-v2 line or when running as a user that chmod
+//! cannot lock out (root). Errnos a tempdir filesystem cannot
+//! produce (EOPNOTSUPP, EBUSY) are pinned against the policy seam
+//! [`super::degrade_setup_failure_to_flat`] directly.
 
 use super::*;
 use std::path::Path;
@@ -137,7 +145,14 @@ fn leaf_has_memory_controller_io_error_on_missing_file() {
     let leaf = root.path().join("absent_leaf");
     std::fs::create_dir_all(&leaf).unwrap();
     let err = super::leaf_has_memory_controller(&leaf).unwrap_err();
-    assert!(matches!(err, super::CgroupSetupError::Io(_)));
+    assert!(matches!(err, super::CgroupSetupError::Io { .. }));
+    // The Display must name the operation and path — it's the only
+    // diagnostic that reaches the operator via the degrade warn line.
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("read") && rendered.contains("cgroup.controllers"),
+        "Io Display must carry op + path; got: {rendered}"
+    );
 }
 
 #[test]
@@ -154,6 +169,147 @@ fn leaf_subtree_writable_false_when_missing() {
     std::fs::create_dir_all(&leaf).unwrap();
     // No subtree_control file → open fails → returns false.
     assert!(!super::leaf_subtree_writable(&leaf));
+}
+
+/// Materialise a fixture leaf at the path the REAL
+/// `/proc/self/cgroup` relative path resolves to under the injected
+/// `root`, so [`super::setup_worker_cgroup`] (whose first step is
+/// `cgroup_v2_leaf(root)`) finds it end-to-end. Returns `None` on
+/// hosts without a cgroup-v2 (`0::`) line, in which case the caller
+/// should skip.
+fn make_fake_leaf_at_real_rel_path(root: &Path) -> Option<std::path::PathBuf> {
+    let leaf = super::cgroup_v2_leaf(root)?;
+    std::fs::create_dir_all(&leaf).unwrap();
+    Some(leaf)
+}
+
+#[test]
+fn setup_worker_cgroup_degrades_on_permission_denied() {
+    // The #371 repro shape: every PROBE passes (memory controller
+    // listed, subtree_control file opens for write — file perms allow
+    // it even under a chmod-555 dir), but the WRITE phase hits a real
+    // kernel EACCES (here: `create_dir_all(<leaf>/workers)` against a
+    // read-only directory). The orchestrator must degrade to the flat
+    // layout (`None`) exactly like the probe-stage conditions — NOT
+    // abort the run the way the pre-fix code did with "nested workers
+    // cgroup setup failed: cgroup I/O error: Permission denied".
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let Some(leaf) = make_fake_leaf_at_real_rel_path(root.path()) else {
+        eprintln!(
+            "skipping setup_worker_cgroup_degrades_on_permission_denied: \
+             no cgroup-v2 line in /proc/self/cgroup"
+        );
+        return;
+    };
+    write_fixture(&leaf.join("cgroup.controllers"), "cpu memory pids\n");
+    write_fixture(&leaf.join("cgroup.subtree_control"), "");
+    write_fixture(&leaf.join("memory.max"), "1073741824\n");
+
+    // Lock the leaf directory: r-x only, so mkdir inside it returns
+    // EACCES. (Probe files inside stay openable — directory +x allows
+    // traversal and the files' own modes allow the write-open.)
+    std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Root (or CAP_DAC_OVERRIDE) bypasses directory modes; the EACCES
+    // this test depends on never fires there. Detect and skip.
+    if std::fs::create_dir(leaf.join(".dac-override-probe")).is_ok() {
+        std::fs::remove_dir(leaf.join(".dac-override-probe")).unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!(
+            "skipping setup_worker_cgroup_degrades_on_permission_denied: \
+             chmod 555 does not lock this user out (root / CAP_DAC_OVERRIDE)"
+        );
+        return;
+    }
+
+    let handle = super::setup_worker_cgroup(root.path(), 0);
+
+    // Restore perms BEFORE asserting so the tempdir cleans up even on
+    // assertion failure.
+    std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        handle.is_none(),
+        "write-phase EACCES must degrade to the flat layout (None handle)"
+    );
+    assert!(
+        !leaf.join("workers").exists(),
+        "no workers/ subgroup should have been materialised"
+    );
+}
+
+#[test]
+fn setup_worker_cgroup_degrades_on_missing_controllers_file() {
+    // The round-2 #371 contract: a NON-permission errno (here ENOENT
+    // from a leaf missing `cgroup.controllers`) must ALSO degrade to
+    // the flat layout. Pre-fix this was classified "genuinely fatal"
+    // and aborted the run — exactly the errno whack-a-mole the
+    // consumer then hit with EOPNOTSUPP/EBUSY on a plain desktop
+    // session. The flat layout serves every run, so no setup failure
+    // is worth aborting over.
+    let root = tempfile::tempdir().unwrap();
+    let Some(_leaf) = make_fake_leaf_at_real_rel_path(root.path()) else {
+        eprintln!(
+            "skipping setup_worker_cgroup_degrades_on_missing_controllers_file: \
+             no cgroup-v2 line in /proc/self/cgroup"
+        );
+        return;
+    };
+    // No fixtures: the bare directory lacks cgroup.controllers.
+
+    let handle = super::setup_worker_cgroup(root.path(), 0);
+    assert!(
+        handle.is_none(),
+        "missing cgroup.controllers (ENOENT) must degrade to the flat layout"
+    );
+}
+
+/// Construct an `Io`-shaped setup error around the given raw OS errno,
+/// as the write phase would surface it.
+fn io_setup_error(raw_os_errno: i32) -> CgroupSetupError {
+    CgroupSetupError::Io {
+        op: "write",
+        path: "/sys/fs/cgroup/leaf/cgroup.subtree_control".into(),
+        source: std::io::Error::from_raw_os_error(raw_os_errno),
+    }
+}
+
+#[test]
+fn any_setup_error_degrades_to_flat() {
+    // The degrade policy seam: EVERY `Err` shape maps to `None`
+    // (flat layout), with NO errno family enumeration. The errnos
+    // pinned here are the ones field reports actually produced —
+    // EACCES (round 1), EOPNOTSUPP and EBUSY (round 2, subtree
+    // _control writes on a plain desktop session) — plus a generic
+    // I/O error standing in for "whatever the kernel says next".
+    // A tempdir filesystem cannot fabricate EOPNOTSUPP/EBUSY, so
+    // these drive the policy seam directly rather than the
+    // orchestrator end-to-end (the e2e degrade paths are covered by
+    // the two tests above).
+    const EACCES: i32 = 13;
+    const EBUSY: i32 = 16;
+    const EOPNOTSUPP: i32 = 95;
+    for errno in [EACCES, EBUSY, EOPNOTSUPP] {
+        assert!(
+            super::degrade_setup_failure_to_flat(Err(io_setup_error(errno))).is_none(),
+            "os error {errno} must degrade to the flat layout, not stay fatal"
+        );
+    }
+    assert!(
+        super::degrade_setup_failure_to_flat(Err(CgroupSetupError::Io {
+            op: "read",
+            path: "/sys/fs/cgroup/leaf/memory.max".into(),
+            source: std::io::Error::other("transient sysfs failure"),
+        }))
+        .is_none(),
+        "a generic io::Error must degrade to the flat layout"
+    );
+
+    // Pass-through: `Ok` outcomes are untouched in both directions.
+    let handle = NestedCgroupHandle::from_workers_path_for_test("/fake/workers".into());
+    assert!(super::degrade_setup_failure_to_flat(Ok(Some(handle))).is_some());
+    assert!(super::degrade_setup_failure_to_flat(Ok(None)).is_none());
 }
 
 #[test]

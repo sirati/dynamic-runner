@@ -346,3 +346,39 @@ async fn route_incoming_none_fans_safely_never_drops() {
         "unstamped"
     );
 }
+
+/// `route_incoming` must NOT silently drop a DIRECTED frame whose named
+/// role has no live slot on this host: the frame already crossed the wire
+/// to the CORRECT host — the role tag is only the SENDER's (possibly
+/// stale) belief of which role lives here. The production shape: a behind
+/// secondary addresses the relocated submitter as
+/// `Destination::Secondary("setup")` (the digest sender's id), but the
+/// submitter swapped its primary into a standalone OBSERVER — pre-fix the
+/// `RequestClusterSnapshot` died at the absent-secondary demux and the
+/// only ahead replica was unreachable. The no-drop fallback fans to every
+/// live local slot (the same documented safe default as the unstamped
+/// arm); the role's own handler decides relevance.
+#[tokio::test]
+async fn route_incoming_directed_role_miss_falls_back_to_live_slots() {
+    let (transport, _r) = transport_with_remotes("setup", &[]);
+    let mut mesh = Mesh::<TestId, _>::new(transport);
+
+    // The relocated submitter hosts ONLY an observer.
+    let (_o_slot, _o_client, mut observer_inbox) =
+        mesh.register_local_role(LocalRole::Observer, PeerId::from("setup"));
+
+    // An inbound frame addressed to this host under a role it no longer
+    // (or never) hosts.
+    mesh.route_incoming(frame_to(
+        "sec-1",
+        Destination::Secondary(PeerId::from("setup")),
+    ));
+
+    assert_eq!(
+        sender_of(&observer_inbox.try_recv().expect(
+            "REVERT-CHECK: a directed frame for an absent local role must fall \
+             back to the live slots, never silently drop"
+        )),
+        "sec-1"
+    );
+}

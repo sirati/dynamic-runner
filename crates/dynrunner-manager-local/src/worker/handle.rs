@@ -14,7 +14,8 @@ use dynrunner_core::{
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_manager_worker::state::{
-    AssignResult, PollResult, Processing, RunnerProtocol, RunnerProtocolState, WaitReadyResult,
+    AssignResult, Idle, PollResult, Processing, RunnerProtocol, RunnerProtocolState,
+    WaitReadyResult,
 };
 use dynrunner_scheduler_api::WorkerBudgetInfo;
 use tokio::sync::mpsc;
@@ -25,6 +26,18 @@ use crate::monitor::{ProcStatmMonitor, ResourceMonitor};
 
 use super::event::WorkerEvent;
 use super::exit_status::{WorkerExitStatus, try_reap_subprocess};
+
+/// One queued secondary→worker custom message: `(topic, data)`.
+pub type CustomOutboxItem = (String, Vec<u8>);
+
+/// What the per-slot background task returns when it resolves: the
+/// recovered protocol state plus — for the per-task poll loop — the
+/// custom-message outbox receiver it borrowed for the task's
+/// lifetime (`None` for the ready-watcher, which never takes it).
+type PollTaskOutput<M> = (
+    RunnerProtocolState<M>,
+    Option<mpsc::UnboundedReceiver<CustomOutboxItem>>,
+);
 
 /// Manager-side handle for one worker.
 ///
@@ -101,7 +114,21 @@ pub struct WorkerHandle<M: ManagerEndpoint, I: Identifier> {
     /// Shared channel for sending worker events to the manager.
     event_tx: mpsc::UnboundedSender<WorkerEvent<I>>,
     /// Handle to the background poll task (set while Processing).
-    poll_task: Option<JoinHandle<RunnerProtocolState<M>>>,
+    poll_task: Option<JoinHandle<PollTaskOutput<M>>>,
+    /// Sender half of the per-subprocess custom-message outbox
+    /// ([`Self::send_custom`] queues here). One channel per handle —
+    /// i.e. per subprocess generation — so customs queued for a dead
+    /// subprocess die with its handle instead of leaking onto the
+    /// replacement.
+    custom_outbox_tx: mpsc::UnboundedSender<CustomOutboxItem>,
+    /// Receiver half. Held here while the slot is Idle /
+    /// WaitingForReady (the Idle flush in [`Self::send_custom`] and
+    /// [`Self::assign_task`] drains it inline through the typed
+    /// `RunnerProtocol::send_custom` allowance); moved into the
+    /// per-task poll loop while Processing (the loop's biased select
+    /// drains it onto the full-duplex socket mid-task) and recovered
+    /// by [`Self::reclaim_protocol`].
+    custom_outbox_rx: Option<mpsc::UnboundedReceiver<CustomOutboxItem>>,
 }
 
 impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
@@ -112,6 +139,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         event_tx: mpsc::UnboundedSender<WorkerEvent<I>>,
     ) -> Self {
         let waiting = RunnerProtocol::connect(transport);
+        let (custom_outbox_tx, custom_outbox_rx) = mpsc::unbounded_channel();
         Self {
             worker_id,
             generation,
@@ -133,6 +161,8 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
             protocol: RunnerProtocolState::WaitingForReady(waiting),
             event_tx,
             poll_task: None,
+            custom_outbox_tx,
+            custom_outbox_rx: Some(custom_outbox_rx),
         }
     }
 
@@ -472,7 +502,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         let generation = self.generation;
         let tx = self.event_tx.clone();
         let handle = tokio::task::spawn_local(async move {
-            match waiting.wait_ready().await {
+            let state = match waiting.wait_ready().await {
                 WaitReadyResult::Ready(idle) => {
                     // Send first so the operational loop can react
                     // immediately on the next select! iteration even
@@ -526,7 +556,9 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                     });
                     RunnerProtocolState::Stopped(stopped)
                 }
-            }
+            };
+            // The ready-watcher never borrows the custom outbox.
+            (state, None)
         });
         self.poll_task = Some(handle);
         // Protocol is now owned by the spawned task; mark as
@@ -536,6 +568,76 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         // assignable" until the Ready event arrives and
         // `reclaim_protocol` installs the Idle protocol.
         self.protocol = RunnerProtocolState::Transitioning;
+        Ok(())
+    }
+
+    /// Queue a secondary→worker custom message for this subprocess.
+    ///
+    /// Single chokepoint for the `Command::Custom` egress on a slot:
+    /// the message lands on the per-subprocess outbox and is
+    /// delivered through whichever typed `RunnerProtocol::send_custom`
+    /// allowance currently applies —
+    ///   * slot Idle → flushed inline here, immediately;
+    ///   * slot Processing → the per-task poll loop's biased select
+    ///     drains it onto the full-duplex socket mid-task;
+    ///   * slot WaitingForReady / Transitioning → queued; flushed at
+    ///     the next assign (BEFORE the ProcessTask frame) or the next
+    ///     Idle-time send.
+    ///
+    /// The outbox is per-handle (per subprocess generation): customs
+    /// queued for a dead subprocess die with its replaced handle —
+    /// the secondary-side stale-generation semantics, applied to the
+    /// reply direction.
+    ///
+    /// Size enforcement lives at the API call sites
+    /// (`SecondaryHandle.send_to_worker` / `Task.send_message`); this
+    /// chokepoint additionally rejects over-limit payloads
+    /// defensively so no internal caller can bypass the contract.
+    pub async fn send_custom(&mut self, topic: String, data: Vec<u8>) -> Result<(), String> {
+        let limit = dynrunner_protocol_manager_worker::CUSTOM_MESSAGE_MAX_BYTES;
+        if data.len() > limit {
+            return Err(format!(
+                "custom message payload is {} bytes, exceeding the \
+                 CUSTOM_MESSAGE_MAX_BYTES limit of {} bytes",
+                data.len(),
+                limit
+            ));
+        }
+        self.custom_outbox_tx
+            .send((topic, data))
+            .map_err(|_| "custom outbox closed (worker slot torn down)".to_string())?;
+        // Idle slots have no poll task draining the outbox — flush
+        // inline through the typed Idle allowance.
+        if let Some(mut idle) = self.protocol.take_idle() {
+            match self.flush_customs_through(&mut idle).await {
+                Ok(()) => {
+                    self.protocol = RunnerProtocolState::Idle(idle);
+                }
+                Err(e) => {
+                    // Dead transport: same disposition as a failed
+                    // assign send — Stopped, caller restarts.
+                    self.protocol = RunnerProtocolState::Stopped(idle.stop().await);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drain every queued custom message through an Idle protocol.
+    /// Shared by the Idle-time [`Self::send_custom`] flush and the
+    /// pre-dispatch flush in [`Self::assign_task`].
+    async fn flush_customs_through(
+        &mut self,
+        idle: &mut RunnerProtocol<Idle, M>,
+    ) -> Result<(), String> {
+        let rx = self
+            .custom_outbox_rx
+            .as_mut()
+            .expect("custom_outbox_rx present whenever the slot is Idle");
+        while let Ok((topic, data)) = rx.try_recv() {
+            idle.send_custom(topic, data).await?;
+        }
         Ok(())
     }
 
@@ -560,10 +662,24 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         opportunistic: bool,
         predecessor_outputs: BTreeMap<String, TaskOutputs>,
     ) -> Result<(), String> {
-        let idle = self
+        let mut idle = self
             .protocol
             .take_idle()
             .ok_or_else(|| "worker not in Idle state".to_string())?;
+
+        // Flush any queued custom messages BEFORE the ProcessTask
+        // frame so a custom queued while the slot was between tasks
+        // reaches the worker's pre-task read (the `@message_handler`
+        // delivery point) instead of being reordered after the
+        // dispatch. Errors surface like an assign-send failure: the
+        // transport is dead, the slot goes Stopped.
+        if let Err(error) = self.flush_customs_through(&mut idle).await {
+            // Same disposition as AssignResult::SendFailed: the
+            // transport is dead, the slot goes Stopped and the caller
+            // routes it through the standard restart machinery.
+            self.protocol = RunnerProtocolState::Stopped(idle.stop().await);
+            return Err(error);
+        }
 
         let relative_path = binary.path.to_string_lossy().into_owned();
         // Forward the consumer's per-task payload (TaskInfo.payload,
@@ -605,9 +721,28 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                 let tx = self.event_tx.clone();
 
                 let est_clone = estimated_resources.clone();
+                // Move the custom-outbox receiver into the poll task
+                // for the task's lifetime: the loop's biased select
+                // drains queued secondary→worker customs onto the
+                // full-duplex socket while the worker runs.
+                // `reclaim_protocol` recovers it at the terminal.
+                // The expect is sound: the rx is absent ONLY while a
+                // poll task holds it, and the slot can't be Idle then.
+                let custom_rx = self
+                    .custom_outbox_rx
+                    .take()
+                    .expect("custom_outbox_rx present whenever the slot is Idle");
                 let handle = tokio::task::spawn_local(async move {
-                    Self::poll_loop(processing, worker_id, generation, binary_clone, est_clone, tx)
-                        .await
+                    Self::poll_loop(
+                        processing,
+                        worker_id,
+                        generation,
+                        binary_clone,
+                        est_clone,
+                        tx,
+                        custom_rx,
+                    )
+                    .await
                 });
 
                 self.poll_task = Some(handle);
@@ -629,7 +764,9 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     }
 
     /// Background poll loop: reads responses from the transport, sends events
-    /// to the shared channel, returns the final protocol state.
+    /// to the shared channel, returns the final protocol state (plus the
+    /// custom-outbox receiver it borrowed for the task's lifetime).
+    #[allow(clippy::too_many_arguments)] // per-task poll context; see assign_task
     async fn poll_loop(
         mut processing: RunnerProtocol<Processing, M>,
         worker_id: WorkerId,
@@ -637,9 +774,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         binary: TaskInfo<I>,
         estimated_resources: ResourceMap,
         tx: mpsc::UnboundedSender<WorkerEvent<I>>,
-    ) -> RunnerProtocolState<M> {
+        mut custom_rx: mpsc::UnboundedReceiver<CustomOutboxItem>,
+    ) -> PollTaskOutput<M> {
         loop {
-            match processing.poll_status().await {
+            match processing.poll_status_with_custom_outbox(&mut custom_rx).await {
                 PollResult::Completed {
                     result,
                     result_data,
@@ -653,12 +791,13 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                         binary: Some(binary),
                         estimated_resources,
                     });
-                    return RunnerProtocolState::Idle(protocol);
+                    return (RunnerProtocolState::Idle(protocol), Some(custom_rx));
                 }
                 PollResult::StillRunning {
                     protocol,
                     phase_update,
                     got_keepalive,
+                    custom_message,
                 } => {
                     processing = protocol;
                     if let Some(phase) = phase_update {
@@ -672,6 +811,13 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                             worker_id,
                             generation,
                         });
+                    } else if let Some((topic, data)) = custom_message {
+                        let _ = tx.send(WorkerEvent::CustomMessage {
+                            worker_id,
+                            generation,
+                            topic,
+                            data,
+                        });
                     }
                     // Loop to read the next response
                 }
@@ -682,7 +828,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                         result,
                         binary: Some(binary),
                     });
-                    return RunnerProtocolState::Stopped(protocol);
+                    return (RunnerProtocolState::Stopped(protocol), Some(custom_rx));
                 }
             }
         }
@@ -695,8 +841,14 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     pub async fn reclaim_protocol(&mut self) {
         if let Some(handle) = self.poll_task.take() {
             match handle.await {
-                Ok(state) => {
+                Ok((state, custom_rx)) => {
                     self.protocol = state;
+                    // Recover the custom-outbox receiver the per-task
+                    // poll loop borrowed (None from the ready-watcher,
+                    // which never takes it — keep the existing rx).
+                    if let Some(rx) = custom_rx {
+                        self.custom_outbox_rx = Some(rx);
+                    }
                 }
                 Err(e) => {
                     tracing::error!(

@@ -141,10 +141,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
     pub fn is_stale_event(&self, event: &WorkerEvent<I>) -> bool {
         let event_generation = event.generation();
         let worker_id = event.worker_id();
-        let current_generation = self
-            .workers
-            .get(worker_id as usize)
-            .map(|w| w.generation);
+        let current_generation = self.workers.get(worker_id as usize).map(|w| w.generation);
         let stale = current_generation != Some(event_generation);
         if stale {
             tracing::warn!(
@@ -201,11 +198,12 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
     ///     side memory blow-up trips kernel-OOM on the workers
     ///     subgroup, leaving the secondary alive.
     ///
-    /// On graceful-fallback conditions (not under cgroup-v2, missing
-    /// memory controller, leaf not writable) the function logs a
-    /// `tracing::warn!` line via the [`crate::cgroup`] orchestrator
-    /// and proceeds with the flat layout (`workers_cgroup = None`).
-    /// Genuine I/O errors propagate as `Err(...)`.
+    /// Nested-cgroup setup is best-effort by contract: on ANY setup
+    /// failure (not under cgroup-v2, missing memory controller, leaf
+    /// not writable, whatever errno the subgroup writes return) the
+    /// [`crate::cgroup`] orchestrator logs one `tracing::warn!` line
+    /// and this function proceeds with the flat layout
+    /// (`workers_cgroup = None`). Setup cannot fail this call.
     pub async fn initialize<S: Scheduler<I>>(
         &mut self,
         num_workers: u32,
@@ -216,16 +214,14 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         mem_manager_reserved_bytes: Option<u64>,
     ) -> Result<(), String> {
         // Set up the nested workers cgroup once per pool, BEFORE the
-        // spawn loop. If the caller opted out (`None`) or the
-        // environment doesn't support nesting (graceful fallback),
+        // spawn loop. If the caller opted out (`None`) or setup fails
+        // for ANY reason (the cgroup module degrades every failure to
+        // `None` + one warn line — see its infallibility contract),
         // the per-spawn leaf-creation helper returns `None` and the
-        // factory leaves the child in the inherited cgroup (pre-
-        // nested layout, unchanged behaviour). Errors here are I/O-
-        // level (corrupted /proc or sysfs) and bubble up so the
-        // caller can abort the run with a clear cause.
+        // factory leaves the child in the inherited cgroup
+        // (pre-nested layout, unchanged behaviour).
         if let Some(reserved) = mem_manager_reserved_bytes {
-            self.workers_cgroup = cgroup::setup_worker_cgroup_default(reserved)
-                .map_err(|e| format!("nested workers cgroup setup failed: {e}"))?;
+            self.workers_cgroup = cgroup::setup_worker_cgroup_default(reserved);
         }
 
         for i in 0..num_workers {
@@ -916,6 +912,8 @@ mod orphan_poll_task_tests {
                 loop {
                     match MessageReceiver::<Command>::recv(&mut runner).await {
                         Some(Command::Stop) => break,
+                        // Test fixtures ignore consumer custom messages.
+                        Some(Command::Custom { .. }) => {}
                         Some(Command::ProcessTask { .. }) => {
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                             let _ = runner.send(Response::Done { result_data: None }).await;
@@ -1240,6 +1238,8 @@ mod orphan_poll_task_tests {
                 loop {
                     match MessageReceiver::<Command>::recv(&mut runner).await {
                         Some(Command::Stop) => break,
+                        // Test fixtures ignore consumer custom messages.
+                        Some(Command::Custom { .. }) => {}
                         Some(Command::ProcessTask { .. }) => {
                             let _ = runner.send(Response::Done { result_data: None }).await;
                         }

@@ -40,7 +40,7 @@ fn enable_controller(leaf: &Path, controller: &str) -> Result<(), CgroupSetupErr
             // across versions is to surface one of the two; both mean
             // "no-op succeeded".
             std::io::ErrorKind::ResourceBusy | std::io::ErrorKind::InvalidInput => Ok(()),
-            _ => Err(CgroupSetupError::Io(e)),
+            _ => Err(CgroupSetupError::io_at("write", &path)(e)),
         },
     }
 }
@@ -74,7 +74,8 @@ fn compute_workers_memory_max(
     leaf: &Path,
     reserved_bytes: u64,
 ) -> Result<Option<u64>, CgroupSetupError> {
-    let content = std::fs::read_to_string(leaf.join("memory.max")).map_err(CgroupSetupError::Io)?;
+    let path = leaf.join("memory.max");
+    let content = std::fs::read_to_string(&path).map_err(CgroupSetupError::io_at("read", &path))?;
     match parse_memory_max(&content) {
         None => Ok(None),
         Some(container_max) => Ok(Some(container_max.saturating_sub(reserved_bytes))),
@@ -137,7 +138,8 @@ pub(super) fn write_workers_subgroup(
     self_move_into_secondary_if_needed(leaf)?;
 
     let workers_path = leaf.join("workers");
-    std::fs::create_dir_all(&workers_path).map_err(CgroupSetupError::Io)?;
+    std::fs::create_dir_all(&workers_path)
+        .map_err(CgroupSetupError::io_at("mkdir", &workers_path))?;
 
     for controller in CONTROLLERS {
         enable_controller(leaf, controller)?;
@@ -152,8 +154,9 @@ pub(super) fn write_workers_subgroup(
             );
         }
         Some(tightened) => {
-            std::fs::write(workers_path.join("memory.max"), tightened.to_string())
-                .map_err(CgroupSetupError::Io)?;
+            let path = workers_path.join("memory.max");
+            std::fs::write(&path, tightened.to_string())
+                .map_err(CgroupSetupError::io_at("write", &path))?;
         }
     }
 
@@ -162,7 +165,8 @@ pub(super) fn write_workers_subgroup(
     // `"max"` explicitly so the workers see whatever swap the
     // kernel exposes to the parent — the secondary's own
     // `--memory-swap=-1` is otherwise silently overridden.
-    std::fs::write(workers_path.join("memory.swap.max"), "max").map_err(CgroupSetupError::Io)?;
+    let swap_path = workers_path.join("memory.swap.max");
+    std::fs::write(&swap_path, "max").map_err(CgroupSetupError::io_at("write", &swap_path))?;
 
     if workers_cgroup_procs_has_pids(&workers_path)? {
         tracing::warn!(
@@ -203,8 +207,10 @@ pub(super) fn write_worker_subgroup(
     worker_id: u32,
 ) -> Result<PathBuf, CgroupSetupError> {
     let worker_path = workers_path.join(format!("worker-{worker_id}"));
-    std::fs::create_dir_all(&worker_path).map_err(CgroupSetupError::Io)?;
-    std::fs::write(worker_path.join("memory.swap.max"), "max").map_err(CgroupSetupError::Io)?;
+    std::fs::create_dir_all(&worker_path)
+        .map_err(CgroupSetupError::io_at("mkdir", &worker_path))?;
+    let swap_path = worker_path.join("memory.swap.max");
+    std::fs::write(&swap_path, "max").map_err(CgroupSetupError::io_at("write", &swap_path))?;
     Ok(worker_path)
 }
 
@@ -238,7 +244,7 @@ fn self_move_into_secondary_if_needed(leaf: &Path) -> Result<(), CgroupSetupErro
     let content = match std::fs::read_to_string(&leaf_procs) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(CgroupSetupError::Io(e)),
+        Err(e) => return Err(CgroupSetupError::io_at("read", &leaf_procs)(e)),
     };
 
     let pids: Vec<u32> = content
@@ -263,9 +269,11 @@ fn self_move_into_secondary_if_needed(leaf: &Path) -> Result<(), CgroupSetupErro
     }
 
     let secondary_path = leaf.join("secondary");
-    std::fs::create_dir_all(&secondary_path).map_err(CgroupSetupError::Io)?;
-    std::fs::write(secondary_path.join("cgroup.procs"), self_pid.to_string())
-        .map_err(CgroupSetupError::Io)?;
+    std::fs::create_dir_all(&secondary_path)
+        .map_err(CgroupSetupError::io_at("mkdir", &secondary_path))?;
+    let procs_path = secondary_path.join("cgroup.procs");
+    std::fs::write(&procs_path, self_pid.to_string())
+        .map_err(CgroupSetupError::io_at("write", &procs_path))?;
     tracing::info!(
         leaf = %leaf.display(),
         self_pid,
@@ -287,10 +295,11 @@ fn self_move_into_secondary_if_needed(leaf: &Path) -> Result<(), CgroupSetupErro
 /// Any other I/O error propagates so callers see kernel/mountpoint
 /// anomalies loudly.
 fn workers_cgroup_procs_has_pids(workers_path: &Path) -> Result<bool, CgroupSetupError> {
-    match std::fs::read_to_string(workers_path.join("cgroup.procs")) {
+    let path = workers_path.join("cgroup.procs");
+    match std::fs::read_to_string(&path) {
         Ok(content) => Ok(!content.trim().is_empty()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(CgroupSetupError::Io(e)),
+        Err(e) => Err(CgroupSetupError::io_at("read", &path)(e)),
     }
 }
 

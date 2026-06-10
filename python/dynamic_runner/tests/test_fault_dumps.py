@@ -218,5 +218,88 @@ class FaultDumpSmokeTests(unittest.TestCase):
             self.assertIn('File "', body)
 
 
+# Worker-shaped child program (#365): register the handler against an
+# EXPLICIT per-worker dump file (the `dump_path` keyword the worker
+# runtime derives from its `--log-file`), raise SIGUSR1 at itself,
+# keep running (no exit), then exit 0. Exercises the
+# explicit-target→register path the worker subprocess entry uses.
+_WORKER_CHILD_PROGRAM = textwrap.dedent(
+    """
+    import importlib.util, os, pathlib, signal, sys
+
+    pkg_root = pathlib.Path(sys.argv[1])
+    spec = importlib.util.spec_from_file_location(
+        "fault_dumps_under_test", pkg_root / "_fault_dumps.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    dump_path = sys.argv[2]
+    # The worker runtime's path: explicit per-worker dump file, no argv
+    # resolution.
+    mod.enable_fault_dumps(dump_path=dump_path)
+
+    os.kill(os.getpid(), signal.SIGUSR1)
+    sys.exit(0)
+    """
+)
+
+
+@unittest.skipUnless(
+    hasattr(signal, "SIGUSR1"), "SIGUSR1 not available on this platform"
+)
+class WorkerFaultDumpSmokeTests(unittest.TestCase):
+    """#365: the worker-subprocess shape — an explicit per-worker
+    `worker_<id>-faulthandler.log` dump target — receives the SIGUSR1
+    all-thread dump, and the process keeps running (no exit)."""
+
+    def test_sigusr1_writes_traceback_to_explicit_worker_dump_path(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dump_path = pathlib.Path(tmp) / "logs" / "worker_3-faulthandler.log"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    _WORKER_CHILD_PROGRAM,
+                    str(_PACKAGE_ROOT),
+                    str(dump_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"child exited non-zero (USR1 must dump WITHOUT exiting); "
+                f"stderr:\n{proc.stderr}",
+            )
+            self.assertTrue(
+                dump_path.exists(),
+                f"per-worker faulthandler dump not created at {dump_path}",
+            )
+            body = dump_path.read_text()
+            self.assertIn("Current thread", body)
+            self.assertIn('File "', body)
+
+    def test_runtime_derives_worker_dump_sibling(self) -> None:
+        """The worker runtime derives `<stem>-faulthandler.log` from
+        its `--log-file` — the documented worker_N-faulthandler shape
+        (`worker/runtime._derive_fault_dump_path`). Skipped in a bare
+        shell: importing the runtime module requires the maturin-built
+        `dynamic_runner._native`.
+        """
+        try:
+            from dynamic_runner.worker.runtime import _derive_fault_dump_path
+        except Exception:
+            self.skipTest("dynamic_runner._native not built in this environment")
+        self.assertEqual(
+            _derive_fault_dump_path("/log/dir/worker_3.log"),
+            "/log/dir/worker_3-faulthandler.log",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -40,6 +40,7 @@ const ARM_OOM_DECISION: usize = 5;
 const ARM_PANIK: usize = 6;
 const ARM_FATAL_EXIT: usize = 7;
 const ARM_ANTI_ENTROPY: usize = 8;
+const ARM_SECONDARY_CONTROL: usize = 9;
 
 /// Arm names, index-aligned with the `ARM_*` ids above (render order of the
 /// compact stats line).
@@ -53,6 +54,7 @@ const PROCESS_TASKS_ARM_NAMES: &[&str] = &[
     "panik",
     "fatal_exit",
     "anti_entropy",
+    "secondary_control",
 ];
 
 impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
@@ -128,6 +130,12 @@ where
         // second `&mut self` for the panik arm would conflict. `None` when no
         // panik paths were configured (the arm parks on `pending()`).
         let mut panik_signal_rx = self.panik_signal_rx.take();
+        // Take the secondary control-plane ingress receiver into a
+        // loop-local for the same partial-borrow reason as
+        // `panik_signal_rx`. `None` only if a previous `process_tasks`
+        // entry already took it (the loop runs once per operational
+        // span) — the arm then parks on `pending()`.
+        let mut secondary_control_rx = self.secondary_control_rx.take();
 
         let mut keepalive_interval = tokio::time::interval(self.config.keepalive_interval);
         // Skip (not Burst) missed ticks: after a host suspend/resume the
@@ -521,6 +529,59 @@ where
                             // by dropping the rx, exactly like the panik
                             // Err arm.
                             fatal_exit_signal_rx = None;
+                        }
+                    }
+                }
+                // Secondary control-plane ingress: externally-issued
+                // commands against this node's own workers (today the
+                // PyO3 `SecondaryHandle.send_to_worker` reply path of
+                // the worker↔secondary custom-message channel). The
+                // listener side never touches the pool — it queues
+                // here and THIS loop (which owns the pool) acts.
+                //
+                // Cancel-safety: `mpsc::UnboundedReceiver::recv` is
+                // documented cancel-safe; parking on `pending()` when
+                // the receiver was never installed mirrors the
+                // announcer / fatal-exit arms.
+                control = async {
+                    match secondary_control_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    arm_stats.record(ARM_SECONDARY_CONTROL);
+                    match control {
+                        Some(super::super::control::SecondaryControlCommand::SendToWorker {
+                            worker_id,
+                            topic,
+                            data,
+                        }) => {
+                            let pool = &mut self.op_mut().pool;
+                            match pool.workers.get_mut(worker_id as usize) {
+                                Some(worker) => {
+                                    if let Err(e) = worker.send_custom(topic, data).await {
+                                        tracing::warn!(
+                                            worker_id,
+                                            error = %e,
+                                            "send_to_worker custom message failed; \
+                                             dropping (the worker slot's restart \
+                                             machinery owns recovery)"
+                                        );
+                                    }
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        worker_id,
+                                        "send_to_worker named a worker id with no \
+                                         pool slot; dropping custom message"
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            // All senders dropped (no SecondaryHandle
+                            // alive). Benign — re-park on `pending()`.
+                            secondary_control_rx = None;
                         }
                     }
                 }

@@ -1,14 +1,14 @@
 //! Error shape for the nested-cgroup setup flow.
 //!
-//! Single concern: discriminator types the caller can branch on. The
-//! happy path returns `Ok(Some(handle))`; recoverable degradations
-//! (cgroup v1 host, no memory controller, leaf not writable) return
-//! `Ok(None)` from [`super::setup_worker_cgroup`] WITH a `tracing::warn!`
-//! line emitted there. The error variants below cover unexpected I/O
-//! failures only — corrupted `/proc/self/cgroup` shape, transient
-//! sysfs read failures, etc. — so a caller that wants to discriminate
-//! "fallback to flat layout" from "something is structurally wrong"
-//! can match on `Err(CgroupSetupError::Io(_))` vs `Ok(None)`.
+//! Single concern: discriminator types the caller can branch on.
+//! [`super::setup_worker_cgroup`] itself is INFALLIBLE — every
+//! internal failure degrades to the flat layout (`None`) with a
+//! `tracing::warn!` line — so the variants below surface only through
+//! the per-worker leaf factory ([`super::prepare_worker_subgroup`])
+//! and the module-internal flow that feeds the orchestrator's
+//! degrade-on-error policy. Because that warn line is the ONLY
+//! diagnostic an operator gets, the `Io` variant carries the
+//! operation and path that failed alongside the raw `io::Error`.
 //!
 //! `NotCgroupV2`, `NoMemoryController`, and `NotWritable` are
 //! preserved as enum variants (rather than collapsed into "any
@@ -25,9 +25,10 @@ use thiserror::Error;
 /// Reasons the nested-cgroup setup could not complete.
 ///
 /// Constructed only when the caller wants to surface a structured
-/// reason directly. [`super::setup_worker_cgroup`] uses
-/// `tracing::warn!` + `Ok(None)` for the three "graceful degrade"
-/// variants and reserves the `Err(_)` path for `Io` only.
+/// reason directly. [`super::setup_worker_cgroup`] never propagates
+/// these — it degrades every failure to `None` + one warn line —
+/// so the public surface they escape through is
+/// [`super::prepare_worker_subgroup`].
 #[derive(Debug, Error)]
 pub enum CgroupSetupError {
     /// `/proc/self/cgroup` was readable but did not contain a v2
@@ -56,10 +57,33 @@ pub enum CgroupSetupError {
         leaf: std::path::PathBuf,
     },
 
-    /// An unexpected I/O error reading or writing the cgroup tree.
-    /// Surfaces a corrupted `/proc` view, a partially-mounted
-    /// `/sys/fs/cgroup`, or transient kernel failures. Not used for
-    /// the three "fallback" variants above.
-    #[error("cgroup I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    /// An I/O error reading or writing the cgroup tree. Carries the
+    /// operation verb and the path it targeted because the degrade
+    /// warn line in [`super::setup_worker_cgroup`] is the only place
+    /// the failure surfaces — without them an errno like
+    /// `EOPNOTSUPP` gives the operator nothing to act on.
+    #[error("cgroup I/O error: {op} {path}: {source}")]
+    Io {
+        /// Short operation verb ("read", "write", "mkdir") naming
+        /// what was attempted on `path`.
+        op: &'static str,
+        /// The file or directory the operation targeted.
+        path: std::path::PathBuf,
+        /// The raw OS error the operation returned.
+        source: std::io::Error,
+    },
+}
+
+impl CgroupSetupError {
+    /// Constructor adaptor for `map_err`: capture the operation verb
+    /// and target path up front, absorb the `io::Error` when (if) it
+    /// happens. Keeps the ~dozen writer call sites at one line each:
+    /// `.map_err(CgroupSetupError::io_at("write", &path))`.
+    pub(super) fn io_at(
+        op: &'static str,
+        path: impl AsRef<std::path::Path>,
+    ) -> impl FnOnce(std::io::Error) -> Self {
+        let path = path.as_ref().to_path_buf();
+        move |source| Self::Io { op, path, source }
+    }
 }

@@ -236,6 +236,24 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 tracing::trace!(worker_id, "keepalive");
                 self.pool.workers[worker_id as usize].last_keepalive = Some(Instant::now());
             }
+            WorkerEvent::CustomMessage {
+                worker_id, topic, ..
+            } => {
+                // Worker↔secondary custom messages are a DISTRIBUTED
+                // feature (the consumer hook lives on the secondary's
+                // `worker_message_listener`). The single-process
+                // LocalManager has no listener surface, so a custom
+                // landing here is observable-but-inert. A worker is
+                // still alive when it streams customs, so refresh the
+                // keepalive clock like the other non-terminal signals.
+                tracing::debug!(
+                    worker_id,
+                    topic = %topic,
+                    "custom worker message received by LocalManager (no listener \
+                     surface in single-process mode; dropped)"
+                );
+                self.pool.workers[worker_id as usize].last_keepalive = Some(Instant::now());
+            }
         }
     }
 

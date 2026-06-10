@@ -4,6 +4,7 @@ from pathlib import Path
 
 from ..proto import Command, Response, parse_command, parse_response
 from .base_interface import CommunicationInterface
+from .line_reader import SocketLineReader
 
 
 class NamedSocketInterface(CommunicationInterface):
@@ -20,7 +21,11 @@ class NamedSocketInterface(CommunicationInterface):
         self.is_server = is_server
         self.socket: socket.socket | None = None
         self.connection: socket.socket | None = None
-        self.socket_file = None
+        # ONE buffered line reader for both blocking and non-blocking
+        # command reads, lazily bound to `self.connection` on first
+        # read (the server side has no connection until accept). See
+        # `line_reader.SocketLineReader`.
+        self._line_reader: SocketLineReader | None = None
 
         if is_server:
             self._setup_server()
@@ -102,38 +107,22 @@ class NamedSocketInterface(CommunicationInterface):
             return (False, str(e))
 
     def receive_command(self, blocking: bool = True) -> Command | None:
-        """Receive a command from the socket."""
+        """Receive ONE command from the socket.
+
+        Same contract as ``UnixSocketInterface.receive_command``:
+        blocking waits for the next complete line; non-blocking
+        returns the next already-buffered complete line or ``None``
+        (the ``Task.poll_messages()`` drain). Both modes share the one
+        line buffer so framing survives interleaving.
+        """
         if self.connection is None:
             return None
-
-        try:
-            if blocking:
-                # Use buffered file object for blocking reads (worker side)
-                if self.socket_file is None:
-                    self.socket_file = self.connection.makefile("r")
-
-                line = self.socket_file.readline()
-                if not line:
-                    return None
-                return parse_command(line)
-            else:
-                # Non-blocking for manager side
-                self.connection.setblocking(False)
-                data = self.connection.recv(1024)
-                if not data:
-                    return None
-                line = data.decode("utf-8").strip()
-                return parse_command(line)
-        except BlockingIOError:
+        if self._line_reader is None:
+            self._line_reader = SocketLineReader(self.connection)
+        line = self._line_reader.read_line(blocking=blocking)
+        if not line:
             return None
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            return None
-        finally:
-            if not blocking:
-                try:
-                    self.connection.setblocking(True)
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    pass
+        return parse_command(line)
 
     def receive_responses(self) -> list[Response]:
         """Receive and parse all available responses from the socket."""
@@ -174,8 +163,6 @@ class NamedSocketInterface(CommunicationInterface):
     def close(self) -> None:
         """Close the socket and cleanup."""
         try:
-            if self.socket_file:
-                self.socket_file.close()
             if self.connection and self.connection != self.socket:
                 self.connection.close()
             if self.socket:

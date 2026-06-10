@@ -12,11 +12,12 @@ use dynrunner_protocol_manager_worker::{Command as RustCommand, Response as Rust
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use super::commands::{PyCommand, PyProcessBinaryCommand, PyStopCommand};
+use super::commands::{PyCommand, PyCustomMessageCommand, PyProcessBinaryCommand, PyStopCommand};
 use super::error_type::PyErrorType;
 use super::responses::{
-    PyDoneResponse, PyErrorResponse, PyKeepaliveResponse, PyPhaseUpdateResponse,
-    PyPickledErrorResponse, PyReadyResponse, PyResponse, PyWorkerExceptionResponse,
+    PyCustomMessageResponse, PyDoneResponse, PyErrorResponse, PyKeepaliveResponse,
+    PyPhaseUpdateResponse, PyPickledErrorResponse, PyReadyResponse, PyResponse,
+    PyWorkerExceptionResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -56,6 +57,11 @@ fn command_into_py(py: Python<'_>, cmd: RustCommand) -> PyResult<Py<PyAny>> {
             )?
             .into_any())
         }
+        RustCommand::Custom { topic, data } => Ok(Py::new(
+            py,
+            (PyCustomMessageCommand { topic, data }, PyCommand),
+        )?
+        .into_any()),
     }
 }
 
@@ -126,6 +132,11 @@ fn response_into_py(py: Python<'_>, resp: RustResponse) -> PyResult<Py<PyAny>> {
         RustResponse::PhaseUpdate { phase_name } => {
             Ok(Py::new(py, (PyPhaseUpdateResponse { phase_name }, PyResponse))?.into_any())
         }
+        RustResponse::Custom { topic, data } => Ok(Py::new(
+            py,
+            (PyCustomMessageResponse { topic, data }, PyResponse),
+        )?
+        .into_any()),
     }
 }
 

@@ -47,6 +47,8 @@ impl dynrunner_manager_local::WorkerFactory<ChannelManagerEnd> for OrderingFacto
             loop {
                 match MessageReceiver::<Command>::recv(&mut runner).await {
                     Some(Command::Stop) | None => break,
+                    // Test fixtures ignore consumer custom messages.
+                    Some(Command::Custom { .. }) => {}
                     Some(Command::ProcessTask { .. }) => {
                         let _ = runner.send(Response::Done { result_data: None }).await;
                     }

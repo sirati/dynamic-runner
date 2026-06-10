@@ -2,6 +2,22 @@ use std::collections::BTreeMap;
 
 use dynrunner_core::{ErrorType, TaskOutputs};
 
+/// API-level hard cap on one custom-message payload (`data`), in
+/// bytes — 100 KiB, both directions (`Response::Custom` worker →
+/// secondary and `Command::Custom` secondary → worker).
+///
+/// Enforced at BOTH consumer call sites with an error naming the
+/// actual size and this limit (Python `Task.send_message` and
+/// `SecondaryHandle.send_to_worker` raise `ValueError`; the Rust
+/// send chokepoints reject before framing) and merely TOLERATED by
+/// the wire: the framed b64-JSON line for a max-size payload is
+/// well under [`crate::framing::MAX_RESPONSE_FRAME_BYTES`], so a
+/// frame that slips past the API check can never wedge the
+/// manager-side reader (#364 class). Exported to Python through
+/// `dynamic_runner._native.CUSTOM_MESSAGE_MAX_BYTES`, mirroring
+/// `PUBLISH_STRING_MAX_BYTES`.
+pub const CUSTOM_MESSAGE_MAX_BYTES: usize = 100 * 1024;
+
 #[derive(Debug, Clone)]
 pub enum Command {
     Stop,
@@ -45,6 +61,19 @@ pub enum Command {
         resolved_path: Option<String>,
         predecessor_outputs: BTreeMap<String, TaskOutputs>,
     },
+    /// Secondary → worker consumer custom message.
+    ///
+    /// `topic` is a consumer routing key the framework never
+    /// interprets; `data` is the opaque payload (≤
+    /// [`CUSTOM_MESSAGE_MAX_BYTES`], enforced at the API call sites,
+    /// tolerated by the wire). Legal while the worker is `Idle` AND
+    /// while it is `Processing` (the unix socket is full-duplex;
+    /// bytes buffer until the worker polls) — a typed allowance on
+    /// `RunnerProtocol`, see `state.rs::send_custom`. Delivery to
+    /// consumer code is explicit-poll: `Task.poll_messages()` drains
+    /// buffered frames mid-task; between tasks queued customs route
+    /// to the optional module-level `@message_handler`.
+    Custom { topic: String, data: Vec<u8> },
 }
 
 #[derive(Debug, Clone)]
@@ -83,4 +112,16 @@ pub enum Response {
         phase_name: String,
     },
     Keepalive,
+    /// Worker → secondary consumer custom message (the streamed-spawn
+    /// hot path: a worker streams descriptor batches / progress pings
+    /// mid-task without waiting for the terminal `done`).
+    ///
+    /// `topic` is a consumer routing key the framework never
+    /// interprets; `data` is the opaque payload (≤
+    /// [`CUSTOM_MESSAGE_MAX_BYTES`], enforced at `Task.send_message`,
+    /// tolerated by the wire). A NON-TERMINAL response: the manager
+    /// FSM classifies it alongside `Keepalive`/`PhaseUpdate`
+    /// (`PollResult::StillRunning`), so mid-task emission can never
+    /// perturb terminal attribution (#364 class).
+    Custom { topic: String, data: Vec<u8> },
 }

@@ -357,6 +357,8 @@ async fn default_restart_respawns_after_success() {
                 loop {
                     match MessageReceiver::<Command>::recv(&mut runner).await {
                         Some(Command::Stop) => break,
+                        // Test fixtures ignore consumer custom messages.
+                        Some(Command::Custom { .. }) => {}
                         Some(Command::ProcessTask { .. }) => {
                             let _ = runner.send(Response::Done { result_data: None }).await;
                         }
@@ -450,6 +452,8 @@ async fn reuse_workers_keeps_slot_across_successes() {
                 loop {
                     match MessageReceiver::<Command>::recv(&mut runner).await {
                         Some(Command::Stop) => break,
+                        // Test fixtures ignore consumer custom messages.
+                        Some(Command::Custom { .. }) => {}
                         Some(Command::ProcessTask { .. }) => {
                             let _ = runner.send(Response::Done { result_data: None }).await;
                         }
@@ -620,6 +624,8 @@ async fn non_recoverable_error_restarts_worker_and_continues() {
                 loop {
                     match MessageReceiver::<Command>::recv(&mut runner).await {
                         Some(Command::Stop) => break,
+                        // Test fixtures ignore consumer custom messages.
+                        Some(Command::Custom { .. }) => {}
                         Some(Command::ProcessTask { .. }) => {
                             if count == 0 {
                                 // First spawn: send NonRecoverable error (triggers disconnect)
@@ -797,6 +803,8 @@ async fn ensure_worker_for_type_respawns_on_type_shift_and_is_idempotent_on_matc
         loop {
             match MessageReceiver::<Command>::recv(&mut runner).await {
                 Some(Command::Stop) => break,
+                // Test fixtures ignore consumer custom messages.
+                Some(Command::Custom { .. }) => {}
                 Some(Command::ProcessTask { .. }) => {
                     let _ = runner.send(Response::Done { result_data: None }).await;
                 }
@@ -1191,20 +1199,12 @@ async fn memprofile_run_level_smoke() {
                     &mut factory,
                 )
                 .await;
-            // Cgroup setup may still fail post-detection on hosts whose
-            // user cgroup tree exposes `memory` but is read-only to the
-            // test process (the v2-controllers probe doesn't catch that).
-            // Treat the same way the runtime-probe above does — skip
-            // rather than hard-fail.
-            if let Err(e) = &outcome
-                && e.contains("nested workers cgroup setup failed")
-            {
-                eprintln!(
-                    "skipping memprofile_run_level_smoke: nested cgroup setup not \
-                 supported in this test env ({e})"
-                );
-                return;
-            }
+            // Workers-cgroup setup failures post-detection no longer
+            // reach this error path at all: the cgroup module degrades
+            // EVERY setup failure to the flat layout (None + warn), so
+            // `pool.initialize` cannot fail on setup. Remaining `Err`s
+            // here are real (spawn / per-worker leaf) failures and
+            // must hard-fail the test.
             outcome.unwrap();
 
             // Sampler torn down by the teardown path (start of run) so
