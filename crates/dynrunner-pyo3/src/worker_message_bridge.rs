@@ -243,6 +243,7 @@ mod tests {
                 assert_eq!(topic, "reply:ping");
                 assert_eq!(data, b"abc");
             }
+            other => panic!("expected the listener's SendToWorker reply, got {other:?}"),
         }
     }
 
