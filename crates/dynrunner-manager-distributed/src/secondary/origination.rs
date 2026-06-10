@@ -137,6 +137,40 @@ where
         Ok(())
     }
 
+    /// Announce this secondary's DELIBERATE graceful-abort drain departure:
+    /// a self-authored `ClusterMutation::PeerRemoved { id: <self>, cause:
+    /// SelfDeparture("graceful abort: local work drained") }`, applied
+    /// locally and fanned out — the SAME graceful-leave path the
+    /// file-source panik uses ([`Self::handle_panik_signal`] step 1), so
+    /// peers LOG the departure and mark this node Dead-deliberately instead
+    /// of the keepalive watchdog later declaring an unexplained death.
+    /// Observability + membership only: it does NOT cancel cluster work,
+    /// does NOT terminate the run on peers, and never touches the failover
+    /// machinery (elections key on PRIMARY silence, which a departing
+    /// worker-secondary never is — the co-resident-primary case is excluded
+    /// by the caller's drain gate). On the primary the resulting
+    /// lifecycle `Removed` event's respawn request is suppressed by the
+    /// graceful-abort admission gate, so no replacement is spawned for a
+    /// drain departure. Best-effort: a broadcast failure is logged and the
+    /// local exit proceeds (mirroring the panik departure).
+    pub(in crate::secondary) async fn announce_graceful_drain_departure(&mut self) {
+        let mutation = ClusterMutation::PeerRemoved {
+            id: self.config.secondary_id.clone(),
+            cause: RemovalCause::SelfDeparture(BoundedString::from(
+                "graceful abort: local work drained".to_string(),
+            )),
+        };
+        if let Err(e) = self.apply_and_broadcast_mutations(vec![mutation]).await {
+            tracing::warn!(
+                error = %e,
+                "graceful-drain self-departure apply+broadcast failed; \
+                 exiting anyway (the primary's keepalive watchdog reaps the \
+                 membership entry, and its requeue path finds nothing in \
+                 flight on a drained secondary)"
+            );
+        }
+    }
+
     /// React to a panik-watcher signal on this secondary.
     ///
     /// Single concern: turn the watcher's panik event into the side
@@ -233,6 +267,8 @@ where
             let mutation = ClusterMutation::PeerRemoved {
                 id: self.config.secondary_id.clone(),
                 cause: RemovalCause::SelfDeparture(BoundedString::from(reason.clone())),
+                // Kills THIS node's current membership incarnation.
+                member_gen: self.cluster_state.peer_member_gen(&self.config.secondary_id),
             };
             if let Err(e) = self.apply_and_broadcast_mutations(vec![mutation]).await {
                 tracing::warn!(

@@ -307,6 +307,18 @@ impl<I: Identifier> ClusterState<I> {
                 self.run_aborted = Some(reason);
                 ApplyOutcome::Applied
             }
+            ClusterMutation::GracefulAbortRequested => {
+                // Sticky monotonic dispatch-freeze latch: `false → true`
+                // exactly once; a re-applied / duplicate request (operator
+                // re-trigger, at-least-once delivery, snapshot re-broadcast)
+                // is a NoOp. Mirror of the `RunComplete` arm above — the
+                // graceful sibling of the two run latches.
+                if self.graceful_abort_requested {
+                    return ApplyOutcome::NoOp;
+                }
+                self.graceful_abort_requested = true;
+                ApplyOutcome::Applied
+            }
             ClusterMutation::DiscoveryDebtDeclared => {
                 // Declare the per-run discovery debt: `Undeclared → Owed`.
                 // Sticky-monotone: the declare is Applied ONLY from the
@@ -563,13 +575,16 @@ impl<I: Identifier> ClusterState<I> {
                 is_observer,
                 can_be_primary,
                 cap_version,
-            } => self.apply_peer_joined(peer_id, is_observer, can_be_primary, cap_version),
+                member_gen,
+            } => self.apply_peer_joined(peer_id, is_observer, can_be_primary, cap_version, member_gen),
             ClusterMutation::SetCanBePrimary {
                 peer_id,
                 can_be_primary,
                 cap_version,
             } => self.apply_set_can_be_primary(peer_id, can_be_primary, cap_version),
-            ClusterMutation::PeerRemoved { id, cause } => self.apply_peer_removed(id, cause),
+            ClusterMutation::PeerRemoved { id, cause, member_gen } => {
+                self.apply_peer_removed(id, cause, member_gen)
+            }
             ClusterMutation::PeerResourceHoldingsUpdated {
                 peer_id,
                 holdings,

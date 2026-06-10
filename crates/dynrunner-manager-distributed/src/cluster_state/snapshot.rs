@@ -256,6 +256,21 @@ pub struct ClusterStateSnapshot<I> {
     /// the pre-field shape).
     #[serde(default)]
     pub alive_members: HashSet<String>,
+    /// Membership-incarnation generations of the ALIVE members (the
+    /// re-admission lattice) — `id → member_gen` for exactly the ids in
+    /// `alive_members`. Carried so a snapshot pull can RE-ADMIT a peer
+    /// the puller still holds `Dead` at a LOWER generation (the
+    /// snapshotting node observed the generation-advancing `PeerJoined`
+    /// the puller missed): without the generation the Dead-wins merge
+    /// would keep the stale tombstone forever. Merge rule on `restore`:
+    /// per-id, an incoming alive id at a STRICTLY higher generation than
+    /// the local entry re-admits/advances it; at or below, the local
+    /// entry (Dead-wins within an incarnation) is kept. An id absent
+    /// from this map (a pre-field snapshot) defaults to generation 0 —
+    /// exactly the pre-generation vacant-insert-only semantics.
+    /// `#[serde(default)]` keeps wire compat with pre-field senders.
+    #[serde(default)]
+    pub member_generations: HashMap<String, u64>,
     /// Sticky-monotonic run-completion flag (the replicated `RunComplete`
     /// latch). Merge rule on `restore`: ratchets `false → true` only,
     /// never regresses — mirroring the `RunComplete` apply arm.
@@ -271,6 +286,15 @@ pub struct ClusterStateSnapshot<I> {
     /// pre-field shape).
     #[serde(default)]
     pub run_aborted: Option<String>,
+    /// Sticky-monotonic graceful-abort latch (the replicated
+    /// `GracefulAbortRequested` dispatch freeze). Merge rule on `restore`:
+    /// ratchets `false → true` only, never regresses — mirroring the
+    /// `GracefulAbortRequested` apply arm — so a failover-promoted primary
+    /// restoring a frozen snapshot INHERITS the freeze (the no-redo law).
+    /// `#[serde(default)]` keeps wire compat with pre-field senders
+    /// (missing field decodes as `false`, the pre-field shape).
+    #[serde(default)]
+    pub graceful_abort_requested: bool,
     /// Sticky-monotonic discovery-debt latch (the replicated discovery
     /// lattice). Merge rule on `restore`: join = `max` over
     /// `Undeclared ⊑ Owed ⊑ Settled` (a replica only moves UP; a `Settled`
@@ -395,6 +419,7 @@ impl<I: Identifier> ClusterState<I> {
             phase_may_be_empty,
             run_complete,
             run_aborted,
+            graceful_abort_requested,
             discovery_debt,
             role_table: _role_table,
             peer_state,
@@ -468,10 +493,22 @@ impl<I: Identifier> ClusterState<I> {
                 .filter(|(_, entry)| entry.state == PeerState::Alive)
                 .map(|(id, _)| id.clone())
                 .collect(),
+            // Pair each ALIVE member with its membership-incarnation
+            // generation so a restoring node can RE-ADMIT a peer it
+            // still holds `Dead` at a lower generation (it missed the
+            // generation-advancing re-admission `PeerJoined`).
+            member_generations: peer_state
+                .iter()
+                .filter(|(_, entry)| entry.state == PeerState::Alive)
+                .map(|(id, entry)| (id.clone(), entry.member_gen))
+                .collect(),
             // Sticky-monotonic run latches — carried so a node seeded
             // from a snapshot learns the run is already over / aborted.
             run_complete: *run_complete,
             run_aborted: run_aborted.clone(),
+            // Sticky-monotonic graceful-abort latch — carried so a
+            // failover-promoted primary inherits the dispatch freeze.
+            graceful_abort_requested: *graceful_abort_requested,
             // Sticky-monotonic discovery-debt latch — carried so a promoted
             // primary inherits "discovery already settled" and does NOT
             // re-run discovery on failover.
@@ -574,8 +611,10 @@ impl<I: Identifier> ClusterState<I> {
             task_outputs,
             secondary_capacities,
             alive_members,
+            member_generations,
             run_complete,
             run_aborted,
+            graceful_abort_requested,
             discovery_debt,
             phase_event_tallies,
             retry_passes_used,
@@ -730,27 +769,47 @@ impl<I: Identifier> ClusterState<I> {
         for (secondary, record) in secondary_capacities {
             self.secondary_capacities.entry(secondary).or_insert(record);
         }
-        // Alive-membership merge: Dead-wins / sticky-removal, mirroring
-        // the `PeerJoined`/`PeerRemoved` apply rules in `apply_peer.rs`.
-        // For each incoming alive id insert a fresh `Alive` entry ONLY
-        // IF the local `peer_state` has no entry for it — never
-        // overwriting a local `Dead` (sticky removal wins, exactly as
-        // `apply_peer_joined` drops a join for a `Dead` id, and as a
-        // never-restore on an already-`Alive` local entry is a no-op).
-        // The `Entry::Vacant` guard makes this idempotent + order-
-        // insensitive. The entry holds ONLY liveness (C6); the role
-        // capabilities ride the separate `capabilities` 2P-set merged
-        // above, and the `RoleTable` projections are rebuilt from
-        // `capability × alive` by `reproject_roles` below.
+        // Alive-membership merge: Dead-wins WITHIN one membership
+        // incarnation / generation-advances re-admit, mirroring the
+        // `PeerJoined`/`PeerRemoved` apply rules in `apply_peer.rs`.
+        // For each incoming alive id (its incarnation generation read
+        // from `member_generations`, defaulting 0 for a pre-field
+        // snapshot — the pre-generation semantics):
+        //   - no local entry → insert a fresh `Alive` at that generation;
+        //   - local entry at a STRICTLY LOWER generation → re-admit /
+        //     advance it (the snapshotting node observed the generation-
+        //     advancing `PeerJoined` this node missed — keeping the
+        //     stale `Dead` would bury the re-admitted live peer forever);
+        //   - local entry at the same-or-higher generation → keep it
+        //     (sticky removal wins within the incarnation, exactly as
+        //     `apply_peer_joined` drops a non-advancing join for a
+        //     `Dead` id; an already-`Alive` local entry is a no-op).
+        // Idempotent + order-insensitive (the generation pick is a max).
+        // The entry holds ONLY liveness (C6); the role capabilities ride
+        // the separate `capabilities` 2P-set merged above, and the
+        // `RoleTable` projections are rebuilt from `capability × alive`
+        // by `reproject_roles` below.
         let mut alive_changed = false;
         for id in alive_members {
-            if let std::collections::hash_map::Entry::Vacant(e) = self.peer_state.entry(id) {
-                e.insert(PeerEntry {
-                    state: PeerState::Alive,
-                    pubkey: None,
-                    endpoint: None,
-                });
-                alive_changed = true;
+            let incoming_gen = member_generations.get(&id).copied().unwrap_or(0);
+            match self.peer_state.entry(id) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(PeerEntry {
+                        state: PeerState::Alive,
+                        member_gen: incoming_gen,
+                        pubkey: None,
+                        endpoint: None,
+                    });
+                    alive_changed = true;
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let entry = e.get_mut();
+                    if incoming_gen > entry.member_gen {
+                        entry.state = PeerState::Alive;
+                        entry.member_gen = incoming_gen;
+                        alive_changed = true;
+                    }
+                }
             }
         }
         // Rebuild the role projections from the post-merge capability
@@ -773,6 +832,10 @@ impl<I: Identifier> ClusterState<I> {
         {
             self.run_aborted = Some(reason);
         }
+        // Graceful-abort latch: the same false→true ratchet as
+        // `run_complete` — a promoted primary restoring a frozen snapshot
+        // inherits the dispatch freeze and refuses to schedule (no-redo).
+        self.graceful_abort_requested |= graceful_abort_requested;
         // Discovery-debt latch: sticky-monotonic join = `max` over the
         // total order `Undeclared ⊑ Owed ⊑ Settled` (the derived `Ord`).
         // A replica only moves UP: an incoming `Settled` ratchets a local

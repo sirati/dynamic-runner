@@ -108,6 +108,40 @@ pub(super) struct DeadSecondary {
     pub(super) last_keepalive: Instant,
 }
 
+/// How many keepalive intervals the heartbeat tick's OWN inter-tick gap
+/// may stretch before the sweep is judged locally starved (see
+/// [`local_sweep_starved`]). 3× sits meaningfully above scheduler/timer
+/// jitter on a healthy loop (the tick is an `Interval` on the keepalive
+/// cadence) and far below the hard death backstop (`silence_hard_multiple`,
+/// 24× by default), so a single deferred sweep delays a GENUINE death
+/// declaration by one tick at most.
+pub(super) const SWEEP_STARVATION_TICK_MULTIPLE: u32 = 3;
+
+/// PURE: was THIS node's heartbeat sweep starved — did the inter-tick gap
+/// (`now - prev_tick`) stretch beyond [`SWEEP_STARVATION_TICK_MULTIPLE`] ×
+/// `keepalive_interval`? A frozen/starved runtime (the wake-from-freeze
+/// face) fires its deferred timers in a burst the moment it unfreezes,
+/// BEFORE the mesh pump has drained the backlog into the ingest clocks —
+/// a sweep taken at that instant measures this node's own stall as every
+/// peer's silence. `true` defers the hard dead-secondary declarations to
+/// the next on-cadence tick (~one keepalive interval later), by which
+/// time the clocks are honest again. `prev_tick == None` (the first
+/// sweep) is never starved — the keepalives were seeded at welcome /
+/// hydrate, so the first sweep's ages are honest.
+pub(super) fn local_sweep_starved(
+    prev_tick: Option<Instant>,
+    now: Instant,
+    keepalive_interval: Duration,
+) -> bool {
+    match prev_tick {
+        Some(prev) => {
+            now.saturating_duration_since(prev)
+                > keepalive_interval.saturating_mul(SWEEP_STARVATION_TICK_MULTIPLE)
+        }
+        None => false,
+    }
+}
+
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Update the keepalive timestamp for a known secondary. No-op if the
     /// secondary id isn't registered (e.g. a stray message after death).
@@ -160,6 +194,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// tunnel, and handshake would be dropped immediately on the first
     /// heartbeat tick, despite being healthy and processing tasks. The gate
     /// is preserved verbatim from the binary-clock version.
+    ///
+    /// FLOOD IMMUNITY — the INGEST-clock union: each secondary's
+    /// last-evidence-of-life is the LATER of (a) its last PROCESSED
+    /// frame (`secondary_keepalives`, refreshed at dispatch + by the
+    /// liveness-beacon arm) and (b) its last frame to ENTER this
+    /// primary's inbox (`RoleInbox::last_ingest_from`, recorded at the
+    /// slot's delivery choke point BEFORE the frame waits in the
+    /// channel). Under inbox starvation (the run_20260610_221140 face:
+    /// depth 52654, keepalive arm starved) the processed clock inflates
+    /// while the peers' keepalives sit QUEUED — pre-union the sweep
+    /// declared LIVE peers dead off this node's own busyness. The ingest
+    /// clock keeps the silence age honest: it measures the PEER's
+    /// silence, never our backlog.
     pub(super) fn collect_heartbeat_report(&self) -> SecondaryHeartbeatReport {
         let now = Instant::now();
         let mut silences = Vec::new();
@@ -174,10 +221,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             ) {
                 continue;
             }
+            let last_evidence = match self.inbox.last_ingest_from(id) {
+                Some(ingested) => (*last).max(ingested),
+                None => *last,
+            };
             silences.push(SecondarySilence {
                 secondary_id: id.clone(),
-                last_keepalive: *last,
-                silence: now.saturating_duration_since(*last),
+                last_keepalive: last_evidence,
+                silence: now.saturating_duration_since(last_evidence),
             });
         }
         SecondaryHeartbeatReport { silences }
@@ -345,6 +396,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         recovery_mutations.push(ClusterMutation::PeerRemoved {
             id: secondary_id.clone(),
             cause,
+            // Kill the id's CURRENT membership incarnation: a removal
+            // that was already superseded by a re-admission (a stale
+            // lower generation) loses at every receiver instead of
+            // re-burying the re-admitted live peer.
+            member_gen: self.cluster_state.peer_member_gen(&secondary_id),
         });
         self.apply_and_broadcast_cluster_mutations(recovery_mutations)
             .await;
@@ -419,8 +475,34 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     }
 
     /// Drive one heartbeat-tick cycle: collect the fresh silence sweep
-    /// and hand it to the staged dead-secondary declaration policy.
+    /// and hand it to the staged dead-secondary declaration policy —
+    /// UNLESS this very sweep is locally starved (the tick's own
+    /// inter-tick gap stretched far past the keepalive cadence: the
+    /// runtime was frozen/starved and every age it would measure is
+    /// inflated by our own stall, not the peers' silence). A starved
+    /// sweep is SKIPPED — named, never silent — and the next on-cadence
+    /// tick (~one keepalive interval later, after the pump has drained
+    /// the backlog into the ingest clocks) decides honestly. A genuine
+    /// death is thereby delayed by at most one tick; a false mass-
+    /// removal of live peers off a wake-from-freeze burst is impossible.
     pub(super) async fn process_heartbeat_tick(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        let starved = local_sweep_starved(
+            self.last_heartbeat_tick_at,
+            now,
+            self.config.keepalive_interval,
+        );
+        self.last_heartbeat_tick_at = Some(now);
+        if starved {
+            tracing::warn!(
+                "heartbeat sweep skipped: this node's own tick lagged far \
+                 past the keepalive cadence (local runtime starvation/freeze) \
+                 — the measured silences would reflect OUR stall, not peer \
+                 silence; deferring dead-secondary declarations to the next \
+                 on-cadence tick"
+            );
+            return Ok(());
+        }
         let report = self.collect_heartbeat_report();
         self.decide_dead_secondaries(report).await
     }

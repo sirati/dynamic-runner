@@ -107,6 +107,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // (paired with the reserve in `commit_assignment`), so the
             // cascade below only runs the per-phase counter; `type_id`
             // is carried purely for the diagnostic DEBUG line.
+            //
+            // Requeue-raced fallback (run_20260610_221140): a hash absent
+            // from the in-flight ledger may instead sit QUEUED in the pool
+            // — an earlier failover-recovery requeue (inherited-slot
+            // reconciliation / dead-secondary recovery) returned it to
+            // `Pending` before this lost terminal's late delivery. Reclaim
+            // the queued copy so the completed work is never re-dispatched;
+            // the reclaim's `mark_in_flight` compensation lets the SAME
+            // `note_item_completed` cascade below account it.
             let completed_meta: Option<(dynrunner_core::PhaseId, dynrunner_core::TypeId, String)> =
                 self.free_slot_on_terminal(&secondary_id, worker_id, task_hash)
                     .map(|entry| {
@@ -115,6 +124,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             entry.task.type_id.clone(),
                             entry.task.task_id.clone(),
                         )
+                    })
+                    .or_else(|| {
+                        self.reclaim_requeued_on_terminal(task_hash)
+                            .map(|t| (t.phase_id.clone(), t.type_id.clone(), t.task_id.clone()))
                     });
 
             // Operator-facing INFO: enough to grep "did task X

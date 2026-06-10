@@ -14,7 +14,8 @@ use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, TaskOutputs, Work
 use dynrunner_protocol_primary_secondary::{DiscoveryDebt, RoleTable, SecondaryCapacityRecord};
 
 use super::{
-    ClusterState, OutcomeSummary, PhaseRollup, PhaseTaskPartition, StateCounts, TaskState,
+    ClusterState, OutcomeSummary, PeerReadmission, PhaseRollup, PhaseTaskPartition, StateCounts,
+    TaskState,
 };
 
 impl<I: Identifier> ClusterState<I> {
@@ -197,6 +198,62 @@ impl<I: Identifier> ClusterState<I> {
             .is_some_and(|entry| entry.state == super::types::PeerState::Alive)
     }
 
+    /// The replicated-membership view of `peer_id`, projected for
+    /// diagnostics consumers (the egress no-route message split): a live
+    /// member, an authoritatively-removed one (`PeerRemoved` ledger), or
+    /// an id that never joined. Distinct from the transport
+    /// `MembershipView` — a peer can be a live replicated member while
+    /// this node has no transport wire to it, and an honest "no route"
+    /// line must say which of those two states it is in.
+    pub fn peer_membership(&self, peer_id: &str) -> super::types::PeerMembership {
+        match self.peer_state.get(peer_id).map(|e| &e.state) {
+            Some(super::types::PeerState::Alive) => super::types::PeerMembership::AliveMember,
+            Some(super::types::PeerState::Dead) => super::types::PeerMembership::RemovedMember,
+            None => super::types::PeerMembership::NeverJoined,
+        }
+    }
+
+    /// The membership-incarnation generation recorded for `peer_id` —
+    /// `0` for a never-seen id (the cold generation). The originators of
+    /// `PeerJoined`/`PeerRemoved` stamp this onto the mutation (the
+    /// generation is read-derived, never version-stamped): a removal
+    /// kills the CURRENT incarnation; a re-emit re-joins it.
+    pub fn peer_member_gen(&self, peer_id: &str) -> u64 {
+        self.peer_state.get(peer_id).map_or(0, |e| e.member_gen)
+    }
+
+    /// The re-admission ticket for a REMOVED peer (`peer_state` `Dead`),
+    /// or `None` for a live / never-seen id: the generation a
+    /// re-admitting `PeerJoined` must carry (`dead generation + 1`) plus
+    /// the advertisement preserved on the capability tombstone, so the
+    /// primary's frame-ingest re-admission seam restores the EXACT
+    /// capability the member departed with (the removed node never
+    /// re-advertises — it does not know it was removed).
+    pub fn removed_peer_readmission(&self, peer_id: &str) -> Option<PeerReadmission> {
+        let entry = self.peer_state.get(peer_id)?;
+        if entry.state != super::types::PeerState::Dead {
+            return None;
+        }
+        let (is_observer, can_be_primary) = match self.capabilities.get(peer_id) {
+            Some(super::types::CapabilityEntry::Departed {
+                is_observer,
+                can_be_primary,
+                ..
+            })
+            | Some(super::types::CapabilityEntry::Advertised {
+                is_observer,
+                can_be_primary,
+                ..
+            }) => (*is_observer, *can_be_primary),
+            None => (false, false),
+        };
+        Some(PeerReadmission {
+            member_gen: entry.member_gen + 1,
+            is_observer,
+            can_be_primary,
+        })
+    }
+
     pub fn primary_epoch(&self) -> u64 {
         self.primary_epoch
     }
@@ -356,7 +413,7 @@ impl<I: Identifier> ClusterState<I> {
     /// 2P-set + the digest's `capabilities_hash`.
     pub fn departed_capability_ids(&self) -> impl Iterator<Item = &str> {
         self.capabilities.iter().filter_map(|(id, entry)| {
-            matches!(entry, super::types::CapabilityEntry::Departed).then_some(id.as_str())
+            matches!(entry, super::types::CapabilityEntry::Departed { .. }).then_some(id.as_str())
         })
     }
 
@@ -509,6 +566,35 @@ impl<I: Identifier> ClusterState<I> {
     /// the `mesh_watchdog` disarms on it too.
     pub fn run_aborted(&self) -> Option<&str> {
         self.run_aborted.as_deref()
+    }
+
+    /// Whether a GRACEFUL abort has been requested
+    /// (`ClusterMutation::GracefulAbortRequested`) — the replicated
+    /// dispatch-freeze latch. Sticky monotonic, like
+    /// [`Self::run_complete`]: once set, never clears. Consumed by the
+    /// primary's dispatch-view gate (no new work leaves the ready pool),
+    /// the respawn-admission gate, and the drain/relocate/terminal
+    /// decisions; by each secondary's drain-exit decision; and by the
+    /// observer's verdict derivation (`run_complete ∧ graceful_abort` =
+    /// the graceful-abort verdict).
+    pub fn graceful_abort_requested(&self) -> bool {
+        self.graceful_abort_requested
+    }
+
+    /// Count of `InFlight` ledger entries currently assigned to
+    /// `secondary` — the CRDT-derived "active workers" occupancy of one
+    /// secondary. Pure projection of the replicated `tasks` ledger, so
+    /// every replica (live primary, promoted primary, observer) reads
+    /// the same answer. Consumed by the graceful-abort relocation
+    /// policy (`RelocationPolicy::MostActiveWorkers`) and its drain
+    /// decisions.
+    pub fn inflight_count_for_secondary(&self, secondary: &str) -> usize {
+        self.tasks
+            .values()
+            .filter(|state| {
+                matches!(state, TaskState::InFlight { secondary: s, .. } if s == secondary)
+            })
+            .count()
     }
 
     /// The replicated per-run discovery-debt latch (V6). `Undeclared` (the

@@ -38,6 +38,7 @@ async fn non_observer_filters_observer_from_lowest_alive() {
         is_observer: true,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     sec.record_primary_message();
 
@@ -97,6 +98,7 @@ async fn primary_changed_naming_observer_is_rejected() {
         is_observer: true,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
 
     let promote = DistributedMessage::ClusterMutation::<super::super::test_helpers::TestId> {
@@ -166,6 +168,7 @@ async fn role_table_observers_drives_filter_and_promote_rejection() {
         is_observer: true,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     sec.op_mut()
         .peer_keepalives

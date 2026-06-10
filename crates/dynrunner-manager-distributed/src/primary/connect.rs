@@ -181,6 +181,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         msg: DistributedMessage<I>,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<(), String> {
+        // RE-ADMISSION seam (BEFORE the heartbeat bump, so a re-admitted
+        // sender's triggering frame lands in its restored death clock): a
+        // frame from a member the replicated ledger holds REMOVED is
+        // proof of life — re-admit it at the next membership generation.
+        // No-op for live / never-joined / self senders. See
+        // `primary::readmission`.
+        self.maybe_readmit_sender(&msg).await;
+
         // Every cross-secondary message bumps the per-secondary heartbeat,
         // not just `Keepalive`. A secondary that's actively processing
         // tasks shouldn't be falsely declared dead just because keepalives
@@ -199,7 +207,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         match msg.msg_type() {
             MessageType::SecondaryWelcome => self.handle_welcome(msg).await,
             MessageType::CertExchange => self.handle_cert_exchange(msg),
-            MessageType::TaskRequest => self.handle_task_request(msg).await?,
+            MessageType::TaskRequest => self.handle_task_request(msg, command_rx).await?,
             MessageType::TaskComplete => self.handle_task_complete(msg, command_rx).await,
             MessageType::TaskFailed => self.handle_task_failed(msg, command_rx).await,
             // Consumer custom message (F5): droppable → direct handler
@@ -217,6 +225,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `primary::reconciliation_probe`.
             MessageType::TaskHoldResponse => self.handle_task_hold_response(msg, command_rx).await,
             MessageType::MeshReady => self.handle_mesh_ready(msg),
+            // Observer-requested graceful abort: the ONE management command
+            // a zero-authority observer may send. The handler originates the
+            // replicated `GracefulAbortRequested` sticky latch (idempotent —
+            // a re-sent request against an already-latched freeze NoOps).
+            // See `lifecycle::graceful_abort`.
+            MessageType::GracefulAbortRequest => self.handle_graceful_abort_request(msg).await,
             MessageType::Keepalive => { /* tracked above, no further action */ }
             MessageType::SecondaryFatalError => self.handle_secondary_fatal_error(msg).await?,
             // Replicated cluster ledger maintenance. Without this arm
@@ -225,7 +239,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // case after promotion); see `handle_cluster_mutation`
             // for the full rationale and the asm-dataset-nix R2 / T3
             // hang it pins.
-            MessageType::ClusterMutation => self.handle_cluster_mutation(msg).await,
+            MessageType::ClusterMutation => self.handle_cluster_mutation(msg, command_rx).await,
             // Snapshot-RPC responder. A late-joiner / re-bootstrapping
             // peer (or a recovering observer) unicasts
             // `RequestClusterSnapshot` to `Destination::Primary`; the
@@ -246,6 +260,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // only if it is somehow behind (almost always a NoOp on the
             // authoritative primary). See `handle_state_digest`.
             MessageType::StateDigest => self.handle_state_digest(msg).await,
+            // Anti-entropy pull-reply arm. The snapshot this primary's own
+            // `handle_state_digest` requested from a proven-ahead peer.
+            // Pre-fix this fell through the catch-all and the pull never
+            // converged — the deposed-zombie starvation (see
+            // `handle_cluster_snapshot`).
+            MessageType::ClusterSnapshot => self.handle_cluster_snapshot(msg),
             other => {
                 tracing::debug!(?other, "unhandled message type");
             }
@@ -517,6 +537,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     // Stamped at the origination choke point
                     // (`apply_locally_for_broadcast` → `stamp_versions`).
                     cap_version: Default::default(),
+                    // The id's CURRENT membership incarnation (0 for a
+                    // fresh id; a welcome from a just-re-admitted id
+                    // carries the bumped generation the dispatch
+                    // preamble's re-admission seam already applied, so
+                    // this join is the idempotent NoOp echo).
+                    member_gen: self.cluster_state.peer_member_gen(&secondary_id),
                 },
                 ClusterMutation::SecondaryCapacity {
                     secondary: secondary_id.clone(),

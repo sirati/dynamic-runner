@@ -181,12 +181,14 @@ fn snapshot_round_trip_preserves_observers() {
         is_observer: true,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     s.apply(ClusterMutation::PeerJoined {
         peer_id: "obs-2".into(),
         is_observer: true,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
 
     let snap = s.snapshot();
@@ -215,6 +217,7 @@ fn restore_merges_capability_2p_set_unioning_observers() {
         is_observer: true,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
 
     let mut peer = ClusterState::<RunnerIdentifier>::new();
@@ -223,6 +226,7 @@ fn restore_merges_capability_2p_set_unioning_observers() {
         is_observer: true,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
 
     joiner.restore(peer.snapshot());
@@ -494,12 +498,14 @@ fn consumer_invariants_survive_snapshot_restore() {
         is_observer: false,
         can_be_primary: true,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     s.apply(ClusterMutation::PeerJoined {
         peer_id: "sec-remote".into(),
         is_observer: false,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     s.apply(ClusterMutation::SecondaryCapacity {
         secondary: "sec-remote".into(),
@@ -562,12 +568,14 @@ fn restore_alive_members_dead_wins_and_idempotent() {
         is_observer: false,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     source.apply(ClusterMutation::PeerJoined {
         peer_id: "obs-b".into(),
         is_observer: true,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     let snap = source.snapshot();
 
@@ -579,10 +587,12 @@ fn restore_alive_members_dead_wins_and_idempotent() {
         is_observer: false,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     local.apply(ClusterMutation::PeerRemoved {
         id: "sec-a".into(),
         cause: RemovalCause::KeepaliveMiss,
+        member_gen: 0,
     });
 
     local.restore(snap.clone());
@@ -624,6 +634,7 @@ fn snapshot_wire_round_trips_capabilities_2p_set() {
             primary_epoch: 1,
             seq: 2,
         },
+        member_gen: 0,
     });
     origin.apply(ClusterMutation::PeerJoined {
         peer_id: "gone".into(),
@@ -633,10 +644,12 @@ fn snapshot_wire_round_trips_capabilities_2p_set() {
             primary_epoch: 1,
             seq: 1,
         },
+        member_gen: 0,
     });
     origin.apply(ClusterMutation::PeerRemoved {
         id: "gone".into(),
         cause: RemovalCause::KeepaliveMiss,
+        member_gen: 0,
     });
 
     // Encode → decode the snapshot exactly as the wire path does.
@@ -654,11 +667,22 @@ fn snapshot_wire_round_trips_capabilities_2p_set() {
                 primary_epoch: 1,
                 seq: 2
             },
+            member_gen: 0,
         })
     );
     assert_eq!(
         decoded.capabilities.get("gone"),
-        Some(&crate::cluster_state::CapabilityEntry::Departed),
+        Some(&CapabilityEntry::Departed {
+            member_gen: 0,
+            // The tombstone PRESERVES the advertisement current at
+            // departure (the re-admission lattice restores it).
+            is_observer: false,
+            can_be_primary: true,
+            cap_version: TaskVersion {
+                primary_epoch: 1,
+                seq: 1
+            },
+        }),
         "the Departed tombstone must survive the snapshot wire round-trip"
     );
 }
@@ -750,4 +774,76 @@ fn legacy_snapshot_without_capabilities_decodes_empty() {
     // otherwise the current one).
     assert_eq!(decoded.current_primary.as_deref(), Some("primary-x"));
     assert_eq!(decoded.primary_epoch, 4);
+}
+
+/// Snapshot-pull RE-ADMISSION heal: a replica still holding a peer
+/// `Dead` at generation 0 (it missed the re-admitting `PeerJoined`)
+/// restores a snapshot from a healed node holding the peer `Alive` at
+/// generation 1 — the strictly-higher generation re-admits the peer on
+/// the puller too (pre-fix the Dead-wins vacant-only merge kept the
+/// stale tombstone forever). The reverse direction stays sticky: a
+/// stale snapshot (gen-0 Alive) cannot re-bury OR resurrect anything on
+/// the healed node.
+#[test]
+fn snapshot_restore_readmits_lower_generation_dead_entry() {
+    let join = |generation: u64| ClusterMutation::<RunnerIdentifier>::PeerJoined {
+        peer_id: "sec-2".into(),
+        is_observer: false,
+        can_be_primary: true,
+        cap_version: Default::default(),
+        member_gen: generation,
+    };
+
+    // The HEALED node: removed at gen 0, re-admitted at gen 1.
+    let mut healed = ClusterState::<RunnerIdentifier>::new();
+    healed.apply(join(0));
+    healed.apply(ClusterMutation::PeerRemoved {
+        id: "sec-2".into(),
+        cause: RemovalCause::KeepaliveMiss,
+        member_gen: 0,
+    });
+    healed.apply(join(1));
+    assert!(healed.is_peer_alive("sec-2"));
+    assert_eq!(healed.peer_member_gen("sec-2"), 1);
+
+    // The STALE replica: observed the removal, missed the re-admission.
+    let mut stale = ClusterState::<RunnerIdentifier>::new();
+    stale.apply(join(0));
+    stale.apply(ClusterMutation::PeerRemoved {
+        id: "sec-2".into(),
+        cause: RemovalCause::KeepaliveMiss,
+        member_gen: 0,
+    });
+    assert!(!stale.is_peer_alive("sec-2"));
+
+    // Heal pull: the stale replica restores the healed node's snapshot
+    // (through the wire encode→decode, the same path the snapshot RPC
+    // uses).
+    let json = serde_json::to_string(&healed.snapshot()).unwrap();
+    let snap: crate::cluster_state::ClusterStateSnapshot<RunnerIdentifier> =
+        serde_json::from_str(&json).unwrap();
+    stale.restore(snap);
+    assert!(
+        stale.is_peer_alive("sec-2"),
+        "the strictly-higher-generation Alive must re-admit the stale Dead"
+    );
+    assert_eq!(stale.peer_member_gen("sec-2"), 1);
+    assert!(
+        stale.role_table().can_be_primary.contains("sec-2"),
+        "the capability must heal through the generation-first 2P-set merge"
+    );
+
+    // Reverse direction: a stale replica's snapshot (now taken from a
+    // replica that ONLY saw the gen-0 join) cannot regress the healed
+    // node — same-or-lower generation keeps the local entry.
+    let mut never_saw_removal = ClusterState::<RunnerIdentifier>::new();
+    never_saw_removal.apply(join(0));
+    let stale_snap = never_saw_removal.snapshot();
+    healed.restore(stale_snap);
+    assert!(healed.is_peer_alive("sec-2"));
+    assert_eq!(
+        healed.peer_member_gen("sec-2"),
+        1,
+        "a lower-generation snapshot never regresses the incarnation"
+    );
 }

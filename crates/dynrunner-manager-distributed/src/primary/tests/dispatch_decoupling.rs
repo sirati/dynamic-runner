@@ -170,7 +170,7 @@ async fn tasks_added_recheck_dispatches_dependent_phase_after_predecessor_comple
             // Worker requests work; only phase A is Active (B is Blocked
             // on A), so it takes A.
             primary
-                .handle_task_request(task_request("sec-0", 0))
+                .handle_task_request(task_request("sec-0", 0), &mut None)
                 .await
                 .unwrap();
             assert!(
@@ -251,7 +251,7 @@ async fn negative_control_suppressed_tasks_added_never_dispatches_dependent() {
             let (mut primary, mut ends, hash_a, _hash_b, _mesh) = primary_two_phase_one_worker();
 
             primary
-                .handle_task_request(task_request("sec-0", 0))
+                .handle_task_request(task_request("sec-0", 0), &mut None)
                 .await
                 .unwrap();
             assert!(primary.slot_holds_hash_for_test("sec-0", 0, &hash_a));
@@ -348,7 +348,7 @@ async fn dispatch_selects_on_authoritative_free_predicate_not_advisory_is_idle()
             // scheduler picks one of the two same-phase tasks; record
             // which so the remaining-task assertion is order-independent.
             primary
-                .handle_task_request(task_request("sec-0", 0))
+                .handle_task_request(task_request("sec-0", 0), &mut None)
                 .await
                 .unwrap();
             let (held_first, expect_second) =
@@ -417,7 +417,7 @@ async fn coalesce_multiple_tasks_added_into_one_recheck() {
         .run_until(async {
             let (mut primary, mut ends, hash_a, _hash_b, _mesh) = primary_two_phase_one_worker();
             primary
-                .handle_task_request(task_request("sec-0", 0))
+                .handle_task_request(task_request("sec-0", 0), &mut None)
                 .await
                 .unwrap();
             // Settle the queued A assignment onto the wire and discard it so

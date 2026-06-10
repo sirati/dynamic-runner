@@ -213,6 +213,7 @@ fn seed_secondary(
         is_observer: false,
         can_be_primary: true,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     cs.apply(ClusterMutation::SecondaryCapacity {
         secondary: secondary_id.into(),
@@ -884,6 +885,7 @@ fn seed_cluster_secondary(
         is_observer: false,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     let _ = state.apply(ClusterMutation::SecondaryCapacity {
         secondary: id.to_string(),
@@ -919,6 +921,7 @@ fn kill_cluster_secondary(
         .apply(ClusterMutation::PeerRemoved {
             id: id.to_string(),
             cause: RemovalCause::KeepaliveMiss,
+            member_gen: 0,
         });
 }
 

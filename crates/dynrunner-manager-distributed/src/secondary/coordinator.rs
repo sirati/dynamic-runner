@@ -129,6 +129,7 @@ where
             // (it begins forming on the unconfigured peer).
             mesh: super::lifecycle::MeshFormation::default(),
             fatal_exit: None,
+            deposed_primary: false,
             cluster_state: ClusterState::new(),
             lifecycle_rx: Some(lifecycle_rx),
             peer_lifecycle_listeners: Vec::new(),

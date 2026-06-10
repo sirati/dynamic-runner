@@ -33,6 +33,7 @@ impl<I> DistributedMessage<I> {
             | Self::RunConfig { target, .. }
             | Self::StateDigest { target, .. }
             | Self::MeshReady { target, .. }
+            | Self::GracefulAbortRequest { target, .. }
             | Self::TaskComplete { target, .. }
             | Self::TaskFailed { target, .. }
             | Self::TerminalAck { target, .. }
@@ -76,6 +77,7 @@ impl<I> DistributedMessage<I> {
             | Self::RunConfig { target, .. }
             | Self::StateDigest { target, .. }
             | Self::MeshReady { target, .. }
+            | Self::GracefulAbortRequest { target, .. }
             | Self::TaskComplete { target, .. }
             | Self::TaskFailed { target, .. }
             | Self::TerminalAck { target, .. }
@@ -133,6 +135,7 @@ impl<I> DistributedMessage<I> {
             | Self::RunConfig { target, .. }
             | Self::StateDigest { target, .. }
             | Self::MeshReady { target, .. }
+            | Self::GracefulAbortRequest { target, .. }
             | Self::TaskComplete { target, .. }
             | Self::TaskFailed { target, .. }
             | Self::TerminalAck { target, .. }
@@ -171,6 +174,7 @@ impl<I> DistributedMessage<I> {
             | Self::RunConfig { sender_id, .. }
             | Self::StateDigest { sender_id, .. }
             | Self::MeshReady { sender_id, .. }
+            | Self::GracefulAbortRequest { sender_id, .. }
             | Self::TaskComplete { sender_id, .. }
             | Self::TaskFailed { sender_id, .. }
             | Self::TerminalAck { sender_id, .. }
@@ -208,6 +212,7 @@ impl<I> DistributedMessage<I> {
             | Self::RunConfig { timestamp, .. }
             | Self::StateDigest { timestamp, .. }
             | Self::MeshReady { timestamp, .. }
+            | Self::GracefulAbortRequest { timestamp, .. }
             | Self::TaskComplete { timestamp, .. }
             | Self::TaskFailed { timestamp, .. }
             | Self::TerminalAck { timestamp, .. }
@@ -364,6 +369,7 @@ impl<I> DistributedMessage<I> {
             Self::RunConfig { .. } => MessageType::RunConfig,
             Self::StateDigest { .. } => MessageType::StateDigest,
             Self::MeshReady { .. } => MessageType::MeshReady,
+            Self::GracefulAbortRequest { .. } => MessageType::GracefulAbortRequest,
             Self::TaskComplete { .. } => MessageType::TaskComplete,
             Self::TaskFailed { .. } => MessageType::TaskFailed,
             Self::TerminalAck { .. } => MessageType::TerminalAck,

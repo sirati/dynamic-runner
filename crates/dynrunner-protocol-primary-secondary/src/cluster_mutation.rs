@@ -255,6 +255,30 @@ pub enum ClusterMutation<I> {
     RunAborted {
         reason: String,
     },
+    /// "STOP scheduling new work — let the running work finish and let
+    /// the fleet drain." The graceful sibling of [`Self::RunAborted`]:
+    /// a hard abort tears the run down NOW; a graceful abort freezes
+    /// dispatch (no new assignments leave the ready pool) while every
+    /// in-flight task runs to completion, each secondary tears down as
+    /// its own work drains, and the run finally terminates with the
+    /// graceful-abort verdict (`RunComplete` broadcast WITH this latch
+    /// set — the verdict is the COMPOSITION of the two sticky facts;
+    /// there is deliberately NO third terminal mutation).
+    ///
+    /// Originated ONLY by the authoritative primary, on receipt of an
+    /// observer's `DistributedMessage::GracefulAbortRequest` (the ONE
+    /// management command a zero-authority observer may send). Broadcast
+    /// over the canonical `apply_and_broadcast_cluster_mutations` path so
+    /// every replica's mirror latches it; replicated (snapshot + AE
+    /// digest) so a failover-promoted primary INHERITS the freeze and
+    /// also refuses to schedule (the no-redo law).
+    ///
+    /// Payload-free latch-SET, NOT a `Set(bool)` toggle — the
+    /// monotonicity lives in the apply rule (sticky `false → true`,
+    /// NoOp on re-application), exactly the [`Self::RunComplete`]
+    /// shape. There is no un-abort: once requested, the freeze holds
+    /// for the rest of the run.
+    GracefulAbortRequested,
     /// "This run still OWES discovery." Sets the replicated
     /// `discovery_debt` lattice to `Owed`.
     ///
@@ -552,6 +576,21 @@ pub enum ClusterMutation<I> {
         /// legacy re-emit never regresses a converged capability).
         #[serde(default)]
         cap_version: TaskVersion,
+        /// Membership-incarnation generation (the re-admission lattice).
+        /// `0` is the cold first join. A join whose `member_gen` is
+        /// STRICTLY ABOVE a `Dead` entry's generation RE-ADMITS the id
+        /// (removal at gen N, rejoin at gen N+1 — originated by the
+        /// primary's frame-ingest re-admission seam when a removed
+        /// member's authenticated frames keep arriving); a join at or
+        /// below the `Dead` generation stays the sticky NoOp that blocks
+        /// a late/reordered stale `PeerJoined` from resurrecting an
+        /// authoritative removal. Read-derived by the ORIGINATOR (current
+        /// ledger generation, `+1` only at the re-admission seam) — never
+        /// stamped at the version choke point. `#[serde(default)]`
+        /// decodes a pre-field sender's frame to generation 0 (exactly
+        /// the pre-generation sticky semantics).
+        #[serde(default)]
+        member_gen: u64,
     },
     /// Runtime update of a peer's primary-capability — the dedicated
     /// mutation that lets a CLIENT permit/forbid a specific peer from ever
@@ -585,11 +624,16 @@ pub enum ClusterMutation<I> {
     /// observation by the primary; `cause` carries the reason — see
     /// [`RemovalCause`]).
     ///
-    /// Sticky-per-id semantics: once a peer's `peer_state` entry is
-    /// `Dead`, every subsequent mutation for the same id is a NoOp
-    /// (re-`PeerRemoved` and any later `PeerJoined`). Respawning a
-    /// secondary requires a fresh id; this prevents a late-arriving
-    /// stale `PeerJoined` from undoing an authoritative removal.
+    /// Sticky-per-GENERATION semantics: once a peer's `peer_state` entry
+    /// is `Dead` at generation N, every mutation for the same id at a
+    /// generation `<= N` is a NoOp (re-`PeerRemoved` and any
+    /// late/reordered stale `PeerJoined`) — exactly the original
+    /// sticky-per-id rule, scoped to one membership incarnation. A
+    /// `PeerJoined` at generation `N+1` RE-ADMITS the id (originated
+    /// ONLY by the primary's frame-ingest re-admission seam, on proof of
+    /// life: the removed member's authenticated frames keep arriving).
+    /// Respawning a secondary still mints a fresh id; re-admission is
+    /// for the SAME process that was falsely removed and never knew it.
     ///
     /// When the removed peer was an observer the entry is dropped
     /// from `RoleTable.observers` and role-change hooks fire. The
@@ -598,6 +642,15 @@ pub enum ClusterMutation<I> {
     PeerRemoved {
         id: String,
         cause: RemovalCause,
+        /// The membership incarnation this removal kills — the
+        /// originator reads the id's CURRENT ledger generation and
+        /// stamps it here, so a removal that was already superseded by
+        /// a re-admission (`member_gen` strictly below the receiver's
+        /// entry) loses instead of re-burying the live peer.
+        /// `#[serde(default)]` decodes a pre-field sender's frame to
+        /// generation 0 (the pre-generation semantics).
+        #[serde(default)]
+        member_gen: u64,
     },
     /// A peer announces the current set of opaque resource strings it
     /// holds locally. The framework does NOT interpret the strings —

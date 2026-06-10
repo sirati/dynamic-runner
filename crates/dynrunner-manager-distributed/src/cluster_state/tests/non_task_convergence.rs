@@ -410,6 +410,7 @@ fn peer_removed_role_heals_across_failover() {
             primary_epoch: 1,
             seq: 1,
         },
+        member_gen: 0,
     });
     assert!(n.can_be_primary("obs-1"));
 
@@ -429,6 +430,7 @@ fn peer_removed_role_heals_across_failover() {
             primary_epoch: 1,
             seq: 1,
         },
+        member_gen: 0,
     });
     promoted.apply(ClusterMutation::SetCanBePrimary {
         peer_id: "obs-1".into(),
@@ -441,6 +443,7 @@ fn peer_removed_role_heals_across_failover() {
     promoted.apply(ClusterMutation::PeerRemoved {
         id: "obs-1".into(),
         cause: RemovalCause::KeepaliveMiss,
+        member_gen: 0,
     });
     assert!(!promoted.can_be_primary("obs-1"));
 
@@ -482,6 +485,7 @@ fn adv(is_observer: bool, can_be_primary: bool, epoch: u64, seq: u32) -> Capabil
             primary_epoch: epoch,
             seq,
         },
+        member_gen: 0,
     }
 }
 
@@ -516,7 +520,7 @@ fn merge_capability_is_commutative_associative_idempotent() {
     // free dimension. Versions span (0,0) < (1,0) < (2,0) < (2,5) so the
     // higher-version `can_be_primary`-pick and `max(version)` arms fire.
     let cbp_of = |epoch: u64, seq: u32| (epoch + u64::from(seq)) % 2 == 1;
-    let mut variants = vec![CapabilityEntry::Departed];
+    let mut variants = vec![CapabilityEntry::Departed { member_gen: 0, is_observer: false, can_be_primary: false, cap_version: Default::default() }];
     for (epoch, seq) in [(0u64, 0u32), (1, 0), (2, 0), (2, 5)] {
         for is_observer in [false, true] {
             variants.push(adv(is_observer, cbp_of(epoch, seq), epoch, seq));
@@ -567,18 +571,18 @@ fn merge_capability_pins_each_lattice_arm() {
 
     // 1. Departed is an absorbing element on BOTH sides.
     assert_eq!(
-        merge_capability(&CapabilityEntry::Departed, &adv(true, true, 9, 9)),
-        CapabilityEntry::Departed,
+        merge_capability(&CapabilityEntry::Departed { member_gen: 0, is_observer: false, can_be_primary: false, cap_version: Default::default() }, &adv(true, true, 9, 9)),
+        CapabilityEntry::Departed { member_gen: 0, is_observer: false, can_be_primary: false, cap_version: Default::default() },
         "Departed ∨ Advertised = Departed"
     );
     assert_eq!(
-        merge_capability(&adv(true, true, 9, 9), &CapabilityEntry::Departed),
-        CapabilityEntry::Departed,
+        merge_capability(&adv(true, true, 9, 9), &CapabilityEntry::Departed { member_gen: 0, is_observer: false, can_be_primary: false, cap_version: Default::default() }),
+        CapabilityEntry::Departed { member_gen: 0, is_observer: false, can_be_primary: false, cap_version: Default::default() },
         "Advertised ∨ Departed = Departed"
     );
     assert_eq!(
-        merge_capability(&CapabilityEntry::Departed, &CapabilityEntry::Departed),
-        CapabilityEntry::Departed,
+        merge_capability(&CapabilityEntry::Departed { member_gen: 0, is_observer: false, can_be_primary: false, cap_version: Default::default() }, &CapabilityEntry::Departed { member_gen: 0, is_observer: false, can_be_primary: false, cap_version: Default::default() }),
+        CapabilityEntry::Departed { member_gen: 0, is_observer: false, can_be_primary: false, cap_version: Default::default() },
     );
 
     // 2. is_observer is a pure upward OR-ratchet (version-independent).

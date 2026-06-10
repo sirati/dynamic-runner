@@ -420,74 +420,172 @@ pub(super) fn canonical_phase_deps_hash(deps: &HashMap<PhaseId, Vec<PhaseId>>) -
 
 // === capabilities ===
 
-/// 2P-set merge of one peer's role capability (C6). The SINGLE place the
-/// capability lattice join order is spelled, consumed by apply's peer
-/// arms (against the local entry) and restore's per-id loop:
-///   * `Departed ∨ _ = Departed` (the tombstone dominates — a genuine
-///     departure is monotone and cannot be undone by a stale advertise);
-///   * `Advertised ∨ Advertised = Advertised { is_observer: a || b
-///     (upward ratchet — an observer never un-observes), can_be_primary:
-///     <bit of the higher cap_version> (a newer `SetCanBePrimary(false)`
-///     beats an older `true`), cap_version: max(a, b) }`.
+/// 2P-set merge of one peer's role capability (C6), GENERATION-FIRST
+/// (the re-admission lattice). The SINGLE place the capability lattice
+/// join order is spelled, consumed by apply's peer arms (against the
+/// local entry) and restore's per-id loop:
+///   * `member_gen` dominates FIRST: the strictly-higher-generation
+///     entry wins outright, whichever variant it is — a re-admitted
+///     member's gen-(N+1) `Advertised` beats the gen-N `Departed`
+///     tombstone on EVERY merge path (apply, snapshot restore, digest
+///     heal), so a stale replica's snapshot can never re-bury a
+///     re-admitted peer's capability; symmetrically a gen-(N+1)
+///     tombstone beats a stale gen-N advertise.
+///   * AT EQUAL GENERATION (one membership incarnation), the original
+///     rules: `Departed ∨ _ = Departed` (the tombstone dominates — a
+///     departure cannot be undone by a stale same-generation
+///     advertise); `Advertised ∨ Advertised = Advertised { is_observer:
+///     a || b (upward ratchet — an observer never un-observes),
+///     can_be_primary: <bit of the higher cap_version> (a newer
+///     `SetCanBePrimary(false)` beats an older `true`), cap_version:
+///     max(a, b) }`. Two same-generation tombstones fold their
+///     PRESERVED advertisements by the same `Advertised` rule so
+///     divergent tombstones converge deterministically.
 ///
-/// Commutative / associative / idempotent: `Departed` is an absorbing
-/// element; the `Advertised` fold is field-wise OR + a max-versioned
-/// pick, all of which are order-independent. Returns the merged entry so
-/// the caller writes it back into the `capabilities` map.
+/// Commutative / associative / idempotent: the generation pick is a
+/// max, `Departed` absorbs within a generation, and the advertisement
+/// fold is field-wise OR + a max-versioned pick — all order-
+/// independent. Returns the merged entry so the caller writes it back
+/// into the `capabilities` map.
 pub(super) fn merge_capability(
     local: &CapabilityEntry,
     incoming: &CapabilityEntry,
 ) -> CapabilityEntry {
+    // Generation dominates first: the strictly-newer membership
+    // incarnation's entry wins outright; equal generations fall through
+    // to the within-incarnation rules.
+    match capability_member_gen(local).cmp(&capability_member_gen(incoming)) {
+        std::cmp::Ordering::Less => return incoming.clone(),
+        std::cmp::Ordering::Greater => return local.clone(),
+        std::cmp::Ordering::Equal => {}
+    }
     match (local, incoming) {
-        // The tombstone absorbs everything (genuine departure dominates).
-        (CapabilityEntry::Departed, _) | (_, CapabilityEntry::Departed) => {
-            CapabilityEntry::Departed
+        // Same generation, both tombstones: fold the PRESERVED
+        // advertisements (same rule as the Advertised arm below) so two
+        // divergent tombstones converge deterministically.
+        (
+            CapabilityEntry::Departed {
+                member_gen,
+                is_observer: lo,
+                can_be_primary: lc,
+                cap_version: lv,
+            },
+            CapabilityEntry::Departed {
+                is_observer: io,
+                can_be_primary: ic,
+                cap_version: iv,
+                ..
+            },
+        ) => {
+            let (is_observer, can_be_primary, cap_version) =
+                fold_advertisement(*lo, *lc, *lv, *io, *ic, *iv);
+            CapabilityEntry::Departed {
+                member_gen: *member_gen,
+                is_observer,
+                can_be_primary,
+                cap_version,
+            }
+        }
+        // Same generation, exactly one tombstone: it absorbs (genuine
+        // departure dominates within one membership incarnation).
+        (dep @ CapabilityEntry::Departed { .. }, CapabilityEntry::Advertised { .. })
+        | (CapabilityEntry::Advertised { .. }, dep @ CapabilityEntry::Departed { .. }) => {
+            dep.clone()
         }
         (
             CapabilityEntry::Advertised {
                 is_observer: lo,
                 can_be_primary: lc,
                 cap_version: lv,
+                member_gen,
             },
             CapabilityEntry::Advertised {
                 is_observer: io,
                 can_be_primary: ic,
                 cap_version: iv,
+                ..
             },
         ) => {
-            // `can_be_primary` follows the higher cap_version; a TOTAL tie
-            // keeps `local` (idempotent — the same advertisement
-            // redelivered). `is_observer` ratchets up (OR), so it needs no
-            // version.
-            let can_be_primary = if iv > lv { *ic } else { *lc };
+            let (is_observer, can_be_primary, cap_version) =
+                fold_advertisement(*lo, *lc, *lv, *io, *ic, *iv);
             CapabilityEntry::Advertised {
-                is_observer: *lo || *io,
+                is_observer,
                 can_be_primary,
-                cap_version: (*lv).max(*iv),
+                cap_version,
+                member_gen: *member_gen,
             }
         }
     }
 }
 
+/// The membership-incarnation generation a capability entry carries —
+/// the FIRST-dominating key of [`merge_capability`], read uniformly off
+/// either variant.
+pub(super) fn capability_member_gen(entry: &CapabilityEntry) -> u64 {
+    match entry {
+        CapabilityEntry::Advertised { member_gen, .. }
+        | CapabilityEntry::Departed { member_gen, .. } => *member_gen,
+    }
+}
+
+/// The same-generation advertisement fold — the pre-generation
+/// `Advertised ∨ Advertised` rule, shared by the live-advertise arm and
+/// the tombstone-payload arm of [`merge_capability`] so the two cannot
+/// drift: `is_observer` ratchets up (OR — an observer never un-observes,
+/// so it needs no version); `can_be_primary` follows the higher
+/// `cap_version` (a TOTAL tie keeps `local` — idempotent on the same
+/// advertisement redelivered); `cap_version` is the max.
+fn fold_advertisement(
+    lo: bool,
+    lc: bool,
+    lv: TaskVersion,
+    io: bool,
+    ic: bool,
+    iv: TaskVersion,
+) -> (bool, bool, TaskVersion) {
+    let can_be_primary = if iv > lv { ic } else { lc };
+    (lo || io, can_be_primary, lv.max(iv))
+}
+
 /// Order-independent digest fold over the `capabilities` 2P-set (C6 — the
 /// snapshot-healable CRDT, so folding it is detect-WITH-heal, not the R2
 /// no-op pull loop). Per-entry hash of `(id, is_observer, can_be_primary,
-/// cap_version, is_departed)`; the caller XOR-folds these so the result is
-/// invariant under iteration order. A `Departed` tombstone folds with its
-/// distinct `is_departed` flag so a node that converged the tombstone
-/// differs from one that still holds the `Advertised`.
+/// cap_version, is_departed, member_gen)`; the caller XOR-folds these so
+/// the result is invariant under iteration order. A `Departed` tombstone
+/// folds with its distinct `is_departed` flag AND its preserved
+/// advertisement so a node that converged the tombstone differs from one
+/// that still holds the `Advertised`, and two divergent same-generation
+/// tombstones differ until the merge converges them. `member_gen` is in
+/// the fold so a re-admitted (generation-advanced) entry differs from a
+/// stale lower-generation one — the heal pull then converges the stale
+/// replica through the generation-first [`merge_capability`].
 pub(super) fn capability_fold(id: &str, entry: &CapabilityEntry) -> u64 {
     match entry {
         CapabilityEntry::Advertised {
             is_observer,
             can_be_primary,
             cap_version,
-        } => hash_one((id, *is_observer, *can_be_primary, *cap_version, false)),
-        CapabilityEntry::Departed => {
-            // `(false, false, default version, is_departed=true)` — the
-            // payload bits are inert under the tombstone; the `true`
-            // departed flag is what distinguishes it from any Advertised.
-            hash_one((id, false, false, TaskVersion::default(), true))
-        }
+            member_gen,
+        } => hash_one((
+            id,
+            *is_observer,
+            *can_be_primary,
+            *cap_version,
+            false,
+            *member_gen,
+        )),
+        CapabilityEntry::Departed {
+            member_gen,
+            is_observer,
+            can_be_primary,
+            cap_version,
+        } => hash_one((
+            id,
+            *is_observer,
+            *can_be_primary,
+            *cap_version,
+            true,
+            *member_gen,
+        )),
     }
 }

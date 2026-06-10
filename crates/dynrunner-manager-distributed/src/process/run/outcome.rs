@@ -36,6 +36,17 @@ pub enum RunTerminal {
     Done,
     /// Cluster-wide `RunAborted` (#3a pre-phase duplicate) — exit 1.
     Aborted { reason: String },
+    /// The operator's GRACEFUL abort ran its drain protocol to the end:
+    /// dispatch was frozen, running tasks completed, the fleet drained,
+    /// and the run terminated with the composed verdict
+    /// (`run_complete ∧ graceful_abort_requested`). DISTINCT from
+    /// [`Self::Done`] (work was deliberately left unscheduled — the
+    /// boundary reports the verdict loudly) and from [`Self::Aborted`]
+    /// (nothing failed; the wind-down was requested and clean) — the
+    /// boundary exits 0 with the verdict line. `reason` carries the
+    /// role's human-readable verdict render (the primary's per-class
+    /// breakdown; the observer's derived line).
+    GracefulAbort { reason: String },
     /// Operator panik — exit 137 (pgids already killed by the role teardown).
     Panik { matched_path: std::path::PathBuf },
     /// A strand backstop / structured-error / generic run failure — the
@@ -148,6 +159,15 @@ fn observer_terminal(run_result: Result<ObserverTerminal, RunError>) -> RunTermi
     match run_result {
         Ok(ObserverTerminal::Done) => RunTerminal::Done,
         Ok(ObserverTerminal::Aborted { reason }) => RunTerminal::Aborted { reason },
+        // The composed graceful-abort verdict the observer derived from
+        // the two replicated sticky facts (`run_complete ∧
+        // graceful_abort`) — relayed, like the other observed verdicts.
+        Ok(ObserverTerminal::GracefulAbort) => RunTerminal::GracefulAbort {
+            reason: "run gracefully aborted by operator request — dispatch was \
+                     frozen, running tasks completed, and the fleet drained \
+                     (see the narrator's terminal summary for the counts)"
+                .to_string(),
+        },
         Ok(ObserverTerminal::Panik { matched_path }) => RunTerminal::Panik { matched_path },
         // A genuine LOCAL policy abort (the invalid-task monitor) surfaces
         // non-zero as itself.

@@ -3,8 +3,10 @@ use dynrunner_protocol_primary_secondary::{
     ClusterMutation, Destination, DistributedMessage, PeerId,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::PrimaryCoordinator;
+use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::wire::timestamp_now;
 use crate::worker_signal::WorkerMgmtSignal;
 
@@ -113,12 +115,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // role + capability on the request frame; record that truth in
         // the replicated `RoleTable` (idempotent / set-once on re-apply,
         // so a duplicate from a concurrent secondary responder NoOps).
+        // The requester's CURRENT membership incarnation: a frame from a
+        // previously-removed id already routed through the dispatch
+        // preamble's re-admission seam (which bumped the generation), so
+        // this read observes the post-re-admission value; for a fresh
+        // late-joiner it is 0.
+        let member_gen = self.cluster_state.peer_member_gen(&sender_id);
         self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PeerJoined {
             peer_id: sender_id,
             is_observer,
             can_be_primary,
             // Stamped at the origination choke point.
             cap_version: Default::default(),
+            member_gen,
         }])
         .await;
     }
@@ -267,7 +276,177 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
     }
 
-    pub(crate) async fn handle_cluster_mutation(&mut self, msg: DistributedMessage<I>) {
+    /// Settle the primary's LOCAL execution caches with a terminal fact
+    /// the replicated ledger has accepted for `task_hash` — the single
+    /// CRDT-terminal convergence path shared by the received-mutation
+    /// ingest below and the inherited-slot reconciliation's terminal veto
+    /// (`handle_task_request`).
+    ///
+    /// A terminal normally arrives as a WIRE frame (`TaskComplete` /
+    /// `TaskFailed`), whose handler frees the holding slot and runs the
+    /// phase cascade itself. A terminal that arrives ONLY through the
+    /// replicated ledger (a peer's `TaskCompleted`/`TaskFailed`
+    /// ClusterMutation — e.g. a concurrent/deposed primary's broadcast —
+    /// or snapshot-restore residue) used to leave every local cache
+    /// stale: the slot stayed phantom-busy, the in-flight ledger entry
+    /// survived, the pool's phase counter never drained, and the
+    /// accounting mirrors never recorded the outcome. The
+    /// run_20260610_221140 requeue-vs-complete race is the production
+    /// blast: the stale inherited slot was later "reconciled" and the
+    /// COMPLETED task re-executed.
+    ///
+    /// What settles, in order:
+    /// 1. The local execution residue — EITHER the holding slot + ledger
+    ///    entry + type slot ([`Self::free_slot_on_terminal_by_hash`]) OR
+    ///    a queued pool copy left by an earlier failover-recovery requeue
+    ///    ([`Self::reclaim_requeued_on_terminal`]).
+    /// 2. The accounting mirrors (`completed_tasks` / `failed_tasks`),
+    ///    classified exactly as the hydrate-time projection: `Completed`/
+    ///    `SkippedAlreadyDone`/`Unfulfillable`/`InvalidTask` → completed
+    ///    (counter), `Failed { kind }` → failed (unless already
+    ///    completed — completion supersedes). Unconditional + idempotent.
+    /// 3. IFF step 1 found residue: the phase cascade — `note_item_completed`
+    ///    (with the task id, resolving dependents) for a success-like
+    ///    terminal, `note_item_failed` for a failure-like one — plus the
+    ///    decoupled `TasksAdded` emit (a slot freed / a phase may have
+    ///    advanced). Gating the cascade on found-residue keeps a
+    ///    re-delivered or higher-version re-failure apply (B1) from
+    ///    double-firing the phase machine.
+    ///
+    /// Returns `true` iff step 1 found residue (the caller's signal that
+    /// the terminal was locally accounted by THIS call).
+    pub(crate) async fn settle_local_state_on_crdt_terminal(
+        &mut self,
+        task_hash: &str,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) -> bool {
+        use crate::cluster_state::TaskState;
+        // Classify off the post-apply authoritative state. (Owned copies so
+        // the `&self.cluster_state` borrow drops before the mutations.)
+        // `success_like` drives the cascade (dependents resolve only on a
+        // genuinely-done prereq); `counter_completed` follows the
+        // hydrate-time projection (`Unfulfillable`/`InvalidTask` count in
+        // the completed mirror — disjoint from `failed_tasks`).
+        let (counter_completed, failed_kind, success_like) =
+            match self.cluster_state.task_state(task_hash) {
+                Some(TaskState::Completed { .. }) | Some(TaskState::SkippedAlreadyDone { .. }) => {
+                    (true, None, true)
+                }
+                Some(TaskState::Failed { kind, .. }) => (false, Some(kind.clone()), false),
+                Some(TaskState::Unfulfillable { .. }) | Some(TaskState::InvalidTask { .. }) => {
+                    (true, None, false)
+                }
+                // Not terminal (or unknown hash): nothing to settle.
+                _ => return false,
+            };
+
+        // 1. Local execution residue: a held slot, or a queued requeue copy.
+        let residue: Option<(dynrunner_core::PhaseId, String)> = self
+            .free_slot_on_terminal_by_hash(task_hash)
+            .map(|entry| (entry.phase, entry.task.task_id.clone()))
+            .or_else(|| {
+                self.reclaim_requeued_on_terminal(task_hash)
+                    .map(|t| (t.phase_id.clone(), t.task_id.clone()))
+            });
+
+        // 2. Accounting mirrors (idempotent; completion supersedes failure,
+        // mirroring `handle_task_complete` / the hydrate projection).
+        if counter_completed {
+            self.failed_tasks.remove(task_hash);
+            self.completed_tasks.insert(task_hash.to_string());
+        } else if let Some(kind) = failed_kind
+            && !self.completed_tasks.contains(task_hash)
+        {
+            self.failed_tasks.insert(task_hash.to_string(), kind);
+        }
+
+        // 3. Phase cascade — only when THIS call actually released local
+        // residue (otherwise the wire handler already ran it).
+        let Some((phase, task_id)) = residue else {
+            return false;
+        };
+        if success_like {
+            self.note_item_completed(&phase, Some(task_id.as_str()), command_rx)
+                .await;
+        } else {
+            self.note_item_failed(&phase, None, command_rx).await;
+        }
+        // A slot freed / a phase may have advanced: decoupled recheck emit,
+        // never a direct dispatch call (the dispatch-decoupling law).
+        self.cluster_state
+            .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
+        true
+    }
+
+    /// Ingest the anti-entropy `ClusterSnapshot` pull-reply on the
+    /// primary.
+    ///
+    /// Single concern: the snapshot-restore edge of the primary's
+    /// anti-entropy receive side. [`Self::handle_state_digest`] REQUESTS a
+    /// snapshot whenever a peer's digest proves this node behind (a higher
+    /// `primary_epoch`, a latched run verdict, missing task terminals, …);
+    /// this arm ingests the reply. Pre-fix the primary's
+    /// `dispatch_message` had NO arm for it — the reply fell through the
+    /// unhandled-type catch-all, so the pull could never converge: a
+    /// DEPOSED primary starved of direct `PrimaryChanged` announcements
+    /// (the dead-leg topology) kept authoring forever even when a peer's
+    /// digest told it the cluster had moved on (the run_20260610_221140
+    /// zombie split-brain).
+    ///
+    /// `restore` is the idempotent lattice merge: it adopts a
+    /// higher-epoch `(current_primary, primary_epoch)` register (firing
+    /// the role-change hooks — the BUG-6 displaced hook is what demotes a
+    /// zombie out of `run_consuming`), latches the sticky
+    /// `run_complete`/`run_aborted` verdicts (the operational loop's
+    /// stand-down check reads the latter), and union-merges every
+    /// snapshot-healable ledger field. Pool/slot coherence for restored
+    /// task terminals is NOT re-derived here wholesale — the live
+    /// convergence seams (`settle_local_state_on_crdt_terminal` via the
+    /// mutation ingest + the inherited-slot terminal veto) cover the
+    /// per-task residue, and a restore that deposes this primary drops
+    /// the whole pipeline anyway.
+    ///
+    /// Mirrors the secondary's `restore_cluster_snapshot_frame` decode
+    /// shape: a malformed snapshot is WARN-dropped (the next digest round
+    /// re-triggers the pull).
+    pub(crate) fn handle_cluster_snapshot(&mut self, msg: DistributedMessage<I>) {
+        let DistributedMessage::ClusterSnapshot {
+            target: None,
+            sender_id,
+            snapshot_json,
+            ..
+        } = msg
+        else {
+            return;
+        };
+        match serde_json::from_str::<crate::cluster_state::ClusterStateSnapshot<I>>(&snapshot_json)
+        {
+            Ok(snap) => {
+                self.cluster_state.restore(snap);
+                tracing::info!(
+                    peer = %sender_id,
+                    primary_epoch = self.cluster_state.primary_epoch(),
+                    run_aborted = self.cluster_state.run_aborted().is_some(),
+                    "anti-entropy: restored ClusterSnapshot pulled from peer"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    peer = %sender_id,
+                    error = %e,
+                    "ClusterSnapshot decode failed on the primary's \
+                     anti-entropy sink; dropped a malformed snapshot (the \
+                     next digest round re-triggers the pull)"
+                );
+            }
+        }
+    }
+
+    pub(crate) async fn handle_cluster_mutation(
+        &mut self,
+        msg: DistributedMessage<I>,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) {
         if let DistributedMessage::ClusterMutation {
             target: None,
             mutations,
@@ -349,14 +528,41 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // secondary. Acted on post-loop, after the roster source
             // (`cluster_state.secondary_capacities`) has grown.
             let mut capacity_grew = false;
+            // Terminal-ingest surface: every TaskCompleted/TaskFailed this
+            // batch GENUINELY applied (the CRDT transitioned — a duplicate
+            // delivery NoOps and is skipped) must settle the primary's
+            // local execution caches (slot / in-flight ledger / pool /
+            // accounting mirrors) exactly like a wire-delivered terminal.
+            // Collected during the apply loop, settled after it (the
+            // settle's cascade takes `&mut self`).
+            let mut applied_terminal_hashes: Vec<String> = Vec::new();
             for m in mutations {
                 let is_capacity = matches!(m, ClusterMutation::SecondaryCapacity { .. });
+                let terminal_hash = match &m {
+                    ClusterMutation::TaskCompleted { hash, .. }
+                    | ClusterMutation::TaskFailed { hash, .. } => Some(hash.clone()),
+                    _ => None,
+                };
                 let outcome =
                     self.cluster_state
                         .apply_with_resumed_blocked(m, &mut resumed, &mut newly_pending);
-                if is_capacity && outcome == crate::cluster_state::ApplyOutcome::Applied {
-                    capacity_grew = true;
+                if outcome == crate::cluster_state::ApplyOutcome::Applied {
+                    if is_capacity {
+                        capacity_grew = true;
+                    }
+                    if let Some(hash) = terminal_hash {
+                        applied_terminal_hashes.push(hash);
+                    }
                 }
+            }
+            // Settle each genuinely-applied terminal against the local
+            // execution state (the run_20260610_221140 requeue-vs-complete
+            // race: a CRDT-delivered terminal must free a phantom-busy
+            // inherited slot / reclaim an erroneously-requeued pool copy,
+            // never leave the completed work re-dispatchable).
+            for hash in applied_terminal_hashes {
+                self.settle_local_state_on_crdt_terminal(&hash, command_rx)
+                    .await;
             }
             // Pool-coherence after a ledger-growing apply. Two
             // mutually-exclusive surfaces, both gated on this node still

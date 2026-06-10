@@ -112,6 +112,7 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
                         is_observer: false,
                         can_be_primary: false,
                         cap_version: Default::default(),
+                        member_gen: 0,
                     });
                     cs.apply(ClusterMutation::SecondaryCapacity {
                         secondary: id.into(),
@@ -160,6 +161,7 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
                     is_observer: false,
                     can_be_primary: true,
                     cap_version: Default::default(),
+                    member_gen: 0,
                 });
                 cs.apply(ClusterMutation::SecondaryCapacity {
                     secondary: "sec-0".into(),
@@ -192,12 +194,15 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
             // the heal. The idempotent lattice absorbs sec-0's own
             // already-present records (NoOp) and adds sec-1's.
             promoted
-                .handle_cluster_mutation(DistributedMessage::ClusterMutation {
-                    target: None,
-                    sender_id: "setup".into(),
-                    timestamp: 0.0,
-                    mutations: batch,
-                })
+                .handle_cluster_mutation(
+                    DistributedMessage::ClusterMutation {
+                        target: None,
+                        sender_id: "setup".into(),
+                        timestamp: 0.0,
+                        mutations: batch,
+                    },
+                    &mut None,
+                )
                 .await;
 
             // Post-heal: a fresh promotion reconstructs the FULL roster
@@ -258,16 +263,19 @@ async fn rebroadcast_full_roster_reemits_departed_tombstones() {
                     is_observer: false,
                     can_be_primary: false,
                     cap_version: Default::default(),
+                    member_gen: 0,
                 });
                 cs.apply(ClusterMutation::PeerJoined {
                     peer_id: "sec-gone".into(),
                     is_observer: false,
                     can_be_primary: false,
                     cap_version: Default::default(),
+                    member_gen: 0,
                 });
                 cs.apply(ClusterMutation::PeerRemoved {
                     id: "sec-gone".into(),
                     cause: RemovalCause::KeepaliveMiss,
+                    member_gen: 0,
                 });
             }
             // Precondition: the 2P-set holds sec-gone as the ONLY Departed
@@ -294,6 +302,7 @@ async fn rebroadcast_full_roster_reemits_departed_tombstones() {
                     ClusterMutation::PeerRemoved {
                         id,
                         cause: RemovalCause::RosterReemit,
+                        member_gen: _,
                     } => Some(id.as_str()),
                     _ => None,
                 })

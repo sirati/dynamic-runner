@@ -95,6 +95,7 @@ fn peer_removed_is_sticky() {
             is_observer: false,
             can_be_primary: false,
             cap_version: Default::default(),
+            member_gen: 0,
         }),
         ApplyOutcome::Applied
     );
@@ -102,6 +103,7 @@ fn peer_removed_is_sticky() {
         s.apply(ClusterMutation::PeerRemoved {
             id: "p1".into(),
             cause: RemovalCause::KeepaliveMiss,
+            member_gen: 0,
         }),
         ApplyOutcome::Applied
     );
@@ -111,6 +113,7 @@ fn peer_removed_is_sticky() {
         s.apply(ClusterMutation::PeerRemoved {
             id: "p1".into(),
             cause: RemovalCause::KeepaliveMiss,
+            member_gen: 0,
         }),
         ApplyOutcome::NoOp
     );
@@ -119,41 +122,291 @@ fn peer_removed_is_sticky() {
 /// Sticky-per-id under the cross-direction race: once a peer is
 /// Dead, a late `PeerJoined` for the same id is a NoOp and emits
 /// a warn log. Respawn requires a fresh id.
+///
+/// The warn-capture half retries a few times: sibling tests in this
+/// module hit the SAME warn callsite concurrently (the generation-gate
+/// tests apply non-advancing joins too), and tracing's callsite-interest
+/// cache rebuild on a fresh `with_default` dispatch can race a
+/// concurrent hit, dropping a single emission. The semantics assertions
+/// (NoOp + projection) run on every attempt; only the log-capture is
+/// retried, and the assertion itself stays strict — the warn MUST be
+/// observed under the capture.
 #[test]
 fn peer_joined_dead_is_noop() {
-    let ((), records) = with_warn_capture(|| {
-        let mut s = ClusterState::<RunnerIdentifier>::new();
+    let run_once = || {
+        with_warn_capture(|| {
+            let mut s = ClusterState::<RunnerIdentifier>::new();
+            s.apply(ClusterMutation::PeerJoined {
+                peer_id: "p1".into(),
+                is_observer: false,
+                can_be_primary: false,
+                cap_version: Default::default(),
+                member_gen: 0,
+            });
+            s.apply(ClusterMutation::PeerRemoved {
+                id: "p1".into(),
+                cause: RemovalCause::KeepaliveMiss,
+                member_gen: 0,
+            });
+            assert_eq!(
+                s.apply(ClusterMutation::PeerJoined {
+                    peer_id: "p1".into(),
+                    is_observer: true,
+                    can_be_primary: false,
+                    cap_version: Default::default(),
+                    member_gen: 0,
+                }),
+                ApplyOutcome::NoOp,
+                "PeerJoined for a Dead id must be NoOp"
+            );
+            assert!(
+                !s.role_table().observers.contains("p1"),
+                "Dead peer must not appear in the observer projection",
+            );
+        })
+        .1
+    };
+    let mut records = Vec::new();
+    for _ in 0..5 {
+        records = run_once();
+        if records
+            .iter()
+            .any(|m| m.contains("PeerJoined for dead id at a non-advancing generation ignored"))
+        {
+            break;
+        }
+    }
+    assert!(
+        records
+            .iter()
+            .any(|m| m.contains("PeerJoined for dead id at a non-advancing generation ignored")),
+        "expected warn log on PeerJoined for dead id, captured: {records:?}",
+    );
+}
+
+// ── RE-ADMISSION lattice (the membership-generation rules) ──
+//
+// Production face (asm-dataset run_20260610_221140): a flood-starved
+// primary authored false `PeerRemoved`s for LIVE peers; the sticky
+// tombstone then blocked every later `PeerJoined`, so the cluster could
+// never heal. The fix is sticky-per-GENERATION: removal at gen N,
+// rejoin at gen N+1 (originated only by the primary's frame-ingest
+// re-admission seam, on proof of life).
+
+/// RED→GREEN headline: a `PeerJoined` at a STRICTLY higher generation
+/// RE-ADMITS a removed id — liveness returns `Alive`, the role
+/// projection includes the peer again, and the capability tombstone is
+/// superseded. (Pre-fix this apply was the sticky NoOp forever.)
+#[test]
+fn peer_joined_at_next_gen_readmits_removed_id() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::PeerJoined {
+        peer_id: "p1".into(),
+        is_observer: false,
+        can_be_primary: true,
+        cap_version: Default::default(),
+        member_gen: 0,
+    });
+    s.apply(ClusterMutation::PeerRemoved {
+        id: "p1".into(),
+        cause: RemovalCause::KeepaliveMiss,
+        member_gen: 0,
+    });
+    assert!(!s.is_peer_alive("p1"));
+    // The re-admission ticket carries gen+1 and the PRESERVED
+    // advertisement from the tombstone.
+    let ticket = s
+        .removed_peer_readmission("p1")
+        .expect("a Dead id must yield a re-admission ticket");
+    assert_eq!(ticket.member_gen, 1);
+    assert!(!ticket.is_observer);
+    assert!(
+        ticket.can_be_primary,
+        "the tombstone must preserve the departed advertisement"
+    );
+    // The generation-advancing join re-admits.
+    assert_eq!(
+        s.apply(ClusterMutation::PeerJoined {
+            peer_id: "p1".into(),
+            is_observer: ticket.is_observer,
+            can_be_primary: ticket.can_be_primary,
+            cap_version: Default::default(),
+            member_gen: ticket.member_gen,
+        }),
+        ApplyOutcome::Applied,
+        "a generation-advancing PeerJoined must re-admit the removed id"
+    );
+    assert!(s.is_peer_alive("p1"), "the re-admitted peer is Alive again");
+    assert_eq!(s.peer_member_gen("p1"), 1);
+    assert!(
+        s.role_table().can_be_primary.contains("p1"),
+        "the preserved capability must re-project after re-admission"
+    );
+    assert!(
+        s.removed_peer_readmission("p1").is_none(),
+        "a live peer yields no re-admission ticket"
+    );
+}
+
+/// A STALE removal (generation strictly below the re-admitted entry's)
+/// must NOT re-bury the live peer — the removal targeted a superseded
+/// membership incarnation.
+#[test]
+fn stale_removal_loses_to_readmitted_alive_entry() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::PeerJoined {
+        peer_id: "p1".into(),
+        is_observer: false,
+        can_be_primary: false,
+        cap_version: Default::default(),
+        member_gen: 0,
+    });
+    s.apply(ClusterMutation::PeerRemoved {
+        id: "p1".into(),
+        cause: RemovalCause::KeepaliveMiss,
+        member_gen: 0,
+    });
+    s.apply(ClusterMutation::PeerJoined {
+        peer_id: "p1".into(),
+        is_observer: false,
+        can_be_primary: false,
+        cap_version: Default::default(),
+        member_gen: 1,
+    });
+    assert!(s.is_peer_alive("p1"));
+    // A delayed/duplicated gen-0 removal (e.g. the roster re-emit of an
+    // already-superseded tombstone) loses.
+    assert_eq!(
+        s.apply(ClusterMutation::PeerRemoved {
+            id: "p1".into(),
+            cause: RemovalCause::KeepaliveMiss,
+            member_gen: 0,
+        }),
+        ApplyOutcome::NoOp,
+        "a stale removal of a superseded incarnation must lose"
+    );
+    assert!(s.is_peer_alive("p1"), "the re-admitted peer stays Alive");
+    // A removal AT the current incarnation still kills it (the genuine-
+    // death path is intact).
+    assert_eq!(
+        s.apply(ClusterMutation::PeerRemoved {
+            id: "p1".into(),
+            cause: RemovalCause::KeepaliveMiss,
+            member_gen: 1,
+        }),
+        ApplyOutcome::Applied,
+        "a same-generation removal still kills the incarnation"
+    );
+    assert!(!s.is_peer_alive("p1"));
+}
+
+/// Reorder tolerance: a `PeerRemoved` observed BEFORE its incarnation's
+/// `PeerJoined` still blocks that join (the sticky rule, per
+/// generation), while the NEXT generation's join re-admits.
+#[test]
+fn removal_observed_before_join_blocks_same_generation_join() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    // Removal of gen 1 arrives first (never saw the gen-1 join).
+    assert_eq!(
+        s.apply(ClusterMutation::PeerRemoved {
+            id: "p1".into(),
+            cause: RemovalCause::KeepaliveMiss,
+            member_gen: 1,
+        }),
+        ApplyOutcome::Applied
+    );
+    // The late gen-1 join is blocked (sticky within the incarnation).
+    assert_eq!(
         s.apply(ClusterMutation::PeerJoined {
             peer_id: "p1".into(),
             is_observer: false,
             can_be_primary: false,
             cap_version: Default::default(),
-        });
-        s.apply(ClusterMutation::PeerRemoved {
-            id: "p1".into(),
-            cause: RemovalCause::KeepaliveMiss,
-        });
-        assert_eq!(
-            s.apply(ClusterMutation::PeerJoined {
-                peer_id: "p1".into(),
-                is_observer: true,
-                can_be_primary: false,
-                cap_version: Default::default(),
-            }),
-            ApplyOutcome::NoOp,
-            "PeerJoined for a Dead id must be NoOp"
-        );
-        assert!(
-            !s.role_table().observers.contains("p1"),
-            "Dead peer must not appear in the observer projection",
-        );
-    });
-    assert!(
-        records
-            .iter()
-            .any(|m| m.contains("PeerJoined for dead id ignored")),
-        "expected warn log on PeerJoined for dead id, captured: {records:?}",
+            member_gen: 1,
+        }),
+        ApplyOutcome::NoOp,
+        "the same-generation late join must stay buried"
     );
+    assert!(!s.is_peer_alive("p1"));
+    // The next incarnation's join re-admits.
+    assert_eq!(
+        s.apply(ClusterMutation::PeerJoined {
+            peer_id: "p1".into(),
+            is_observer: false,
+            can_be_primary: false,
+            cap_version: Default::default(),
+            member_gen: 2,
+        }),
+        ApplyOutcome::Applied
+    );
+    assert!(s.is_peer_alive("p1"));
+}
+
+/// Apply-order convergence: `Removed(gen 0)` and the re-admitting
+/// `Joined(gen 1)` land in EITHER order and both replicas converge to
+/// Alive at generation 1 (the lattice property the broadcast path
+/// relies on).
+#[test]
+fn readmission_converges_under_reorder() {
+    let seed = |s: &mut ClusterState<RunnerIdentifier>| {
+        s.apply(ClusterMutation::PeerJoined {
+            peer_id: "p1".into(),
+            is_observer: false,
+            can_be_primary: false,
+            cap_version: Default::default(),
+            member_gen: 0,
+        });
+    };
+    let removed = ClusterMutation::<RunnerIdentifier>::PeerRemoved {
+        id: "p1".into(),
+        cause: RemovalCause::KeepaliveMiss,
+        member_gen: 0,
+    };
+    let rejoined = ClusterMutation::<RunnerIdentifier>::PeerJoined {
+        peer_id: "p1".into(),
+        is_observer: false,
+        can_be_primary: false,
+        cap_version: Default::default(),
+        member_gen: 1,
+    };
+
+    let mut a = ClusterState::<RunnerIdentifier>::new();
+    seed(&mut a);
+    a.apply(removed.clone());
+    a.apply(rejoined.clone());
+
+    let mut b = ClusterState::<RunnerIdentifier>::new();
+    seed(&mut b);
+    b.apply(rejoined);
+    b.apply(removed);
+
+    for (name, s) in [("removed-then-rejoined", &a), ("rejoined-then-removed", &b)] {
+        assert!(s.is_peer_alive("p1"), "{name}: converges Alive");
+        assert_eq!(s.peer_member_gen("p1"), 1, "{name}: converges to gen 1");
+    }
+}
+
+/// `peer_membership` projects the three diagnostics states honestly —
+/// the read the egress no-route message split consumes.
+#[test]
+fn peer_membership_projection_names_the_three_states() {
+    use crate::cluster_state::PeerMembership;
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    assert_eq!(s.peer_membership("p1"), PeerMembership::NeverJoined);
+    s.apply(ClusterMutation::PeerJoined {
+        peer_id: "p1".into(),
+        is_observer: false,
+        can_be_primary: false,
+        cap_version: Default::default(),
+        member_gen: 0,
+    });
+    assert_eq!(s.peer_membership("p1"), PeerMembership::AliveMember);
+    s.apply(ClusterMutation::PeerRemoved {
+        id: "p1".into(),
+        cause: RemovalCause::KeepaliveMiss,
+        member_gen: 0,
+    });
+    assert_eq!(s.peer_membership("p1"), PeerMembership::RemovedMember);
 }
 
 /// The widened `PeerJoined` apply rule preserves the observer-set
@@ -169,6 +422,7 @@ fn peer_joined_alive_extends_observer_set() {
             is_observer: true,
             can_be_primary: false,
             cap_version: Default::default(),
+            member_gen: 0,
         }),
         ApplyOutcome::Applied
     );
@@ -178,6 +432,7 @@ fn peer_joined_alive_extends_observer_set() {
             is_observer: true,
             can_be_primary: false,
             cap_version: Default::default(),
+            member_gen: 0,
         }),
         ApplyOutcome::NoOp,
         "re-applying the same PeerJoined is idempotent NoOp"
@@ -188,6 +443,7 @@ fn peer_joined_alive_extends_observer_set() {
             is_observer: true,
             can_be_primary: false,
             cap_version: Default::default(),
+            member_gen: 0,
         }),
         ApplyOutcome::Applied
     );
@@ -208,6 +464,7 @@ fn peer_removed_observer_drops_from_role_table() {
         is_observer: true,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     assert!(s.role_table().observers.contains("obs-1"));
 
@@ -223,6 +480,7 @@ fn peer_removed_observer_drops_from_role_table() {
         s.apply(ClusterMutation::PeerRemoved {
             id: "obs-1".into(),
             cause: RemovalCause::KeepaliveMiss,
+            member_gen: 0,
         }),
         ApplyOutcome::Applied
     );

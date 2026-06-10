@@ -42,6 +42,7 @@ async fn self_authored_departure_marks_peer_dead_and_emits_removed_event() {
         is_observer: false,
         can_be_primary: false,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     // Drain the Added event.
     let _ = rx.try_recv();
@@ -50,6 +51,7 @@ async fn self_authored_departure_marks_peer_dead_and_emits_removed_event() {
     let outcome = s.apply(ClusterMutation::PeerRemoved {
         id: "self-node".into(),
         cause: RemovalCause::SelfDeparture(BoundedString::from(reason.clone())),
+        member_gen: 0,
     });
     assert_eq!(outcome, ApplyOutcome::Applied);
 
@@ -101,6 +103,7 @@ async fn peer_departure_does_not_touch_task_ledger() {
     let outcome = s.apply(ClusterMutation::PeerRemoved {
         id: "departing".into(),
         cause: RemovalCause::SelfDeparture(BoundedString::from("panik file: /var/run/panik")),
+        member_gen: 0,
     });
     assert_eq!(outcome, ApplyOutcome::Applied);
 
@@ -135,6 +138,7 @@ fn self_departure_for_unseen_id_inserts_dead_and_preserves_ledger() {
     let outcome = s.apply(ClusterMutation::PeerRemoved {
         id: "never-joined".into(),
         cause: RemovalCause::SelfDeparture(BoundedString::from("panik file: /x")),
+        member_gen: 0,
     });
     assert_eq!(outcome, ApplyOutcome::Applied);
     // Ledger untouched.
@@ -150,6 +154,7 @@ fn self_departure_for_unseen_id_inserts_dead_and_preserves_ledger() {
             is_observer: false,
             can_be_primary: false,
             cap_version: Default::default(),
+            member_gen: 0,
         }),
         ApplyOutcome::NoOp,
     );

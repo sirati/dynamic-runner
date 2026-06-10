@@ -126,7 +126,16 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
         peer_id: PeerId,
     ) -> (Arc<RoleSlot<I>>, MeshClient<I>, RoleInbox<I>) {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
-        let slot = Arc::new(RoleSlot::new(role, peer_id, inbound_tx));
+        // One ingest-freshness cell per trio: the slot records at its
+        // delivery choke point; the inbox reads. Minted here so the pair
+        // cannot mismatch (the M3 trio rule).
+        let ingest_liveness = super::ingest_liveness::IngestLiveness::new();
+        let slot = Arc::new(RoleSlot::with_ingest_liveness(
+            role,
+            peer_id,
+            inbound_tx,
+            ingest_liveness.clone(),
+        ));
         let weak = Arc::downgrade(&slot);
         match role {
             LocalRole::Primary => self.primary = Some(weak),
@@ -138,7 +147,7 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
             self.local_dispatch_tx.clone(),
             self.membership.clone(),
         );
-        let inbox = RoleInbox::new(inbound_rx);
+        let inbox = RoleInbox::new(inbound_rx, ingest_liveness);
         (slot, client, inbox)
     }
 

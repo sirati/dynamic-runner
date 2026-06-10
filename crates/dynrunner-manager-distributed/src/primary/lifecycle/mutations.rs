@@ -222,7 +222,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// - `NoRelocationTarget` → `RunAborted` (`run_pipeline`'s SetupPeer
     ///   arm): NO peer advertised `can_be_primary`, so an election can
     ///   never produce a primary — without the verdict the connected
-    ///   non-promotable fleet idles into its timeouts.
+    ///   non-promotable fleet idles into its timeouts;
+    /// - graceful-abort full drain → `RunComplete` WITH the replicated
+    ///   `graceful_abort_requested` latch already set
+    ///   (`finalize_terminal_accounting`'s graceful branch): the COMPOSED
+    ///   pair of sticky facts is the graceful-abort verdict every node
+    ///   derives — deliberately NO third terminal mutation, and never
+    ///   `RunAborted` (nothing failed; the frozen pool residue is not a
+    ///   strand).
     ///
     /// NO VERDICT (failover's jurisdiction, or unreachable):
     /// - panik (`PanikShutdown`): operator killed THIS node, not the run —
@@ -330,6 +337,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             can_be_primary: false,
             // Stamped at the origination choke point.
             cap_version: Default::default(),
+            // This node's current membership incarnation (0 cold).
+            member_gen: self.cluster_state.peer_member_gen(&self.config.node_id),
         }])
         .await;
     }
@@ -416,6 +425,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // entirely adopts this baseline and converges the rest via
                 // the digest + snapshot pull.
                 cap_version: Default::default(),
+                // Re-emit at the id's CURRENT incarnation so a receiver
+                // that already converged NoOps and one that missed a
+                // re-admission catches up.
+                member_gen: self.cluster_state.peer_member_gen(conn.id()),
             });
             mutations.push(ClusterMutation::SecondaryCapacity {
                 secondary: conn.id().to_string(),
@@ -427,9 +440,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // catch-up). The receiver's `apply_peer_removed` is sticky/
         // idempotent — a node that already buried the id NoOps it.
         for id in departed_ids {
+            let member_gen = self.cluster_state.peer_member_gen(&id);
             mutations.push(ClusterMutation::PeerRemoved {
                 id,
                 cause: RemovalCause::RosterReemit,
+                // Re-emit at the generation the local tombstone holds: a
+                // receiver that re-admitted the id at a HIGHER generation
+                // correctly drops this stale catch-up.
+                member_gen,
             });
         }
         if mutations.is_empty() {
@@ -556,6 +574,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let mutation = ClusterMutation::PeerRemoved {
             id: self.config.node_id.clone(),
             cause: RemovalCause::SelfDeparture(BoundedString::from(reason.clone())),
+            // Kills THIS node's current membership incarnation.
+            member_gen: self.cluster_state.peer_member_gen(&self.config.node_id),
         };
         self.apply_and_broadcast_cluster_mutations(vec![mutation])
             .await;

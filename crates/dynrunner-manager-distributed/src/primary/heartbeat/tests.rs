@@ -391,7 +391,7 @@ fn collect_peer_removed(
         } = msg
         {
             for m in mutations {
-                if let ClusterMutation::PeerRemoved { id, cause } = m {
+                if let ClusterMutation::PeerRemoved { id, cause, .. } = m {
                     out.push((id, cause));
                 }
             }
@@ -1577,4 +1577,260 @@ fn peer_info(id: &str, ipv4: &str, port: u16) -> dynrunner_protocol_primary_seco
         is_observer: false,
         liveness_port: Some(port),
     }
+}
+
+// ======================================================================
+// Flood-immune removal + re-admission (run_20260610_221140 repro)
+// ======================================================================
+
+/// A `Secondary`-role keepalive frame from `id`, as the peer's keepalive
+/// tick emits it — the proof-of-life frame the flood-immunity and
+/// re-admission tests replay.
+fn keepalive_from(id: &str) -> DistributedMessage<TestId> {
+    DistributedMessage::Keepalive {
+        target: None,
+        sender_id: id.to_string(),
+        timestamp: 0.0,
+        secondary_id: id.to_string(),
+        active_workers: 0,
+        emitter_role: dynrunner_protocol_primary_secondary::KeepaliveRole::Secondary,
+    }
+}
+
+/// REPRO (face a of run_20260610_221140): a starved node must NOT author
+/// a removal for a peer whose frames are sitting in its BACKED-UP inbox.
+///
+/// The production sequence, replayed: the peer's keepalives kept
+/// ARRIVING (they entered the primary's inbox) but the flooded loop
+/// never processed them, so the processing-time death clock
+/// (`secondary_keepalives`) inflated past the hard backstop and the
+/// primary declared a LIVE peer dead ("inbox depth 52654, keepalive arm
+/// running but starved"). Pre-fix this test removed `live-sec`; the
+/// ingest-clock union in `collect_heartbeat_report` keeps it alive
+/// because the queued frame was recorded at the slot's delivery choke
+/// point. The genuine-death path is then proven intact: with NO frame
+/// arriving (an empty inbox — a truly silent peer), the very same
+/// schedule still removes it.
+#[tokio::test(flavor = "current_thread")]
+async fn starved_primary_does_not_remove_peer_whose_frames_are_queued() {
+    let (transport, _sec_rx, _kept) = empty_transport();
+    // Hard backstop at 2x the 50ms interval = 100ms.
+    let (mut primary, keep) = build_primary(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+    register_operational_secondary(&mut primary, "live-sec", 0, "victim");
+
+    // The "starved loop" window: the processing clock goes stale far
+    // past the hard backstop while the loop is busy elsewhere...
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // ...but the peer's keepalive ARRIVES at the inbox (the slot's
+    // delivery choke point records it at INGEST) and is never processed
+    // — exactly the backed-up-inbox face.
+    keep._slot
+        .as_ref()
+        .expect("no-pump build parks the slot")
+        .deliver(keepalive_from("live-sec"))
+        .expect("inbox live");
+
+    // First tick after process start: the lag gate's None arm admits it.
+    primary.process_heartbeat_tick().await.unwrap();
+    assert!(
+        primary.secondaries.contains_key("live-sec"),
+        "a peer whose frames are QUEUED in the inbox is provably alive — \
+         the starved node must not author its removal (the false-removal \
+         face of run_20260610_221140)"
+    );
+
+    // GENUINE death is intact: the peer now sends NOTHING. The next
+    // sweep after a full silence window removes it. (The first tick
+    // after the sleep is itself deferred by the local-starvation gate —
+    // the test genuinely stalled the runtime — and the follow-up
+    // on-cadence tick performs the honest removal.)
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    primary.process_heartbeat_tick().await.unwrap();
+    assert!(
+        primary.secondaries.contains_key("live-sec"),
+        "the lagged sweep right after a local stall is deferred (its ages \
+         reflect OUR stall)"
+    );
+    primary.process_heartbeat_tick().await.unwrap();
+    assert!(
+        !primary.secondaries.contains_key("live-sec"),
+        "a truly silent peer (empty inbox, stale clocks) is still removed \
+         — the genuine-death backstop is intact"
+    );
+}
+
+/// PURE `local_sweep_starved`: the sweep's own inter-tick gap judges
+/// local starvation — `None` (first sweep) is never starved; a gap at or
+/// under the multiple is healthy; a gap beyond it defers. The gate must
+/// FIRE under a genuine stall (the watchdog fires-under-load law: this
+/// deadline is a stored Instant compared per tick, not a resettable
+/// select-arm sleep).
+#[test]
+fn local_sweep_starved_judges_inter_tick_gap() {
+    use super::{SWEEP_STARVATION_TICK_MULTIPLE, local_sweep_starved};
+    let interval = Duration::from_millis(50);
+    let now = Instant::now();
+    // First sweep: never starved.
+    assert!(!local_sweep_starved(None, now, interval));
+    // On-cadence gap: healthy.
+    assert!(!local_sweep_starved(
+        Some(now - Duration::from_millis(60)),
+        now,
+        interval
+    ));
+    // Exactly at the threshold: healthy (strictly-greater fires).
+    assert!(!local_sweep_starved(
+        Some(now - interval * SWEEP_STARVATION_TICK_MULTIPLE),
+        now,
+        interval
+    ));
+    // A genuine stall (gap far beyond the cadence): starved → defer.
+    assert!(local_sweep_starved(
+        Some(now - Duration::from_millis(400)),
+        now,
+        interval
+    ));
+}
+
+/// REPRO (face b — the headline): a member REMOVED from the replicated
+/// membership whose authenticated frames keep arriving is RE-ADMITTED
+/// automatically, within ONE frame, without the member acting (it never
+/// knows it was removed).
+///
+/// Replays the production sequence: the primary removes `sec-x`
+/// (keepalive-timeout removal → sticky `PeerRemoved`, roster dropped),
+/// then one of `sec-x`'s keepalives lands. Pre-fix the frame hit the
+/// stale-ignore path (`record_keepalive` no-ops for an unknown id) and
+/// the member stayed buried forever — "a 'removed' peer whose
+/// authenticated frames kept ARRIVING was never re-admitted". Post-fix
+/// the dispatch preamble re-admits: the replicated entry returns Alive
+/// at generation 1, the roster + keepalive clock + worker slots are
+/// restored, and a LATER genuine death still removes it (no permanent
+/// immunity).
+#[tokio::test(flavor = "current_thread")]
+async fn removed_but_sending_peer_is_readmitted_on_next_frame() {
+    let (transport, _sec_rx, _kept) = empty_transport();
+    let (mut primary, _mesh) = build_primary(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+    register_operational_secondary(&mut primary, "sec-x", 0, "victim");
+    // The welcome-time replicated facts: membership + the static
+    // capacity record (what the re-admission rebuilds the roster from).
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PeerJoined {
+            peer_id: "sec-x".into(),
+            is_observer: false,
+            can_be_primary: true,
+            cap_version: Default::default(),
+            member_gen: 0,
+        });
+        cs.apply(ClusterMutation::SecondaryCapacity {
+            secondary: "sec-x".into(),
+            worker_count: 1,
+            resources: vec![],
+        });
+    }
+
+    // The (false) removal: the keepalive-timeout declaration path.
+    primary
+        .requeue_dead_secondary(
+            super::DeadSecondary {
+                secondary_id: "sec-x".into(),
+                last_keepalive: Instant::now(),
+            },
+            RemovalCause::KeepaliveMiss,
+        )
+        .await
+        .unwrap();
+    assert!(!primary.secondaries.contains_key("sec-x"));
+    assert!(!primary.cluster_state_for_test().is_peer_alive("sec-x"));
+
+    // ONE authenticated frame from the removed-but-alive member arrives.
+    primary
+        .dispatch_message(keepalive_from("sec-x"), &mut None)
+        .await
+        .unwrap();
+
+    // RE-ADMITTED, without the member acting:
+    assert!(
+        primary.cluster_state_for_test().is_peer_alive("sec-x"),
+        "the replicated membership re-admits the provably-alive member"
+    );
+    assert_eq!(
+        primary.cluster_state_for_test().peer_member_gen("sec-x"),
+        1,
+        "re-admission advances the membership incarnation (removal at \
+         gen 0, rejoin at gen 1)"
+    );
+    assert!(
+        primary
+            .cluster_state_for_test()
+            .role_table()
+            .can_be_primary
+            .contains("sec-x"),
+        "the capability preserved on the tombstone is restored"
+    );
+    assert!(
+        primary.secondaries.contains_key("sec-x"),
+        "the primary-local roster entry is restored (metadata-only \
+         Operational seed from the replicated capacity)"
+    );
+    assert!(
+        primary.secondary_keepalives.contains_key("sec-x"),
+        "the death clock is re-seeded at re-admission"
+    );
+    assert!(
+        primary
+            .workers
+            .iter()
+            .any(|w| w.secondary_id == "sec-x"),
+        "the worker roster is rebuilt from the replicated capacity"
+    );
+
+    // No permanent immunity: the re-admitted member then goes GENUINELY
+    // silent — the same schedule removes it again, at the advanced
+    // generation. (The first post-stall tick is deferred by the local-
+    // starvation gate; the follow-up tick removes.)
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    primary.process_heartbeat_tick().await.unwrap();
+    primary.process_heartbeat_tick().await.unwrap();
+    assert!(
+        !primary.secondaries.contains_key("sec-x"),
+        "a genuinely-dead re-admitted member is removed again"
+    );
+    assert!(
+        !primary.cluster_state_for_test().is_peer_alive("sec-x"),
+        "the gen-1 incarnation is killed by a gen-1 removal"
+    );
+    assert_eq!(
+        primary.cluster_state_for_test().peer_member_gen("sec-x"),
+        1,
+        "the second removal kills the CURRENT incarnation"
+    );
+
+    // And a SecondaryFatalError from a removed id must NOT re-admit
+    // (its own meaning is "I am dying").
+    let fatal = DistributedMessage::<TestId>::SecondaryFatalError {
+        target: None,
+        sender_id: "sec-x".into(),
+        timestamp: 0.0,
+        secondary_id: "sec-x".into(),
+        error: "dying".into(),
+    };
+    primary.dispatch_message(fatal, &mut None).await.unwrap();
+    assert!(
+        !primary.cluster_state_for_test().is_peer_alive("sec-x"),
+        "a fatal-error frame is not proof of ongoing life"
+    );
 }

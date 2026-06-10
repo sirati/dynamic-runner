@@ -1064,6 +1064,13 @@ impl PyDistributedManager {
                 // (uniform with `PyPrimaryCoordinator::run`).
                 match outcome.terminal {
                     RunTerminal::Done => {}
+                    RunTerminal::GracefulAbort { reason } => {
+                        // Operator-requested graceful abort ran its drain
+                        // protocol to the end. A DELIBERATE clean wind-down:
+                        // reported loudly (distinct from a silent success),
+                        // exits 0 (distinct from the hard-abort raise).
+                        tracing::warn!(verdict = %reason, "run gracefully aborted");
+                    }
                     RunTerminal::Aborted { reason } => {
                         // A cluster-wide `RunAborted` observed by the setup
                         // node. Carry the broadcast reason VERBATIM — the
@@ -1100,6 +1107,23 @@ impl PyDistributedManager {
                                 // compute secondary surfaces this. RAISE rather
                                 // than silently swallow.
                                 no_relocation_target = Some(e);
+                            }
+                            e @ (RunError::AbortedByClusterVerdict { .. }
+                            | RunError::Deposed { .. }) => {
+                                // Run-authority terminals (zombie split-brain
+                                // fix): an adopted cluster RunAborted verdict,
+                                // or a deposed primary that authored no
+                                // verdict. RAISE — never the `Other` swallow's
+                                // false rc=0 (uniform with
+                                // `PyPrimaryCoordinator::run`).
+                                fatal_policy_exit = Some(e);
+                            }
+                            RunError::GracefulAbort { .. } => {
+                                // Unreachable in practice: `Node::run` maps a
+                                // primary's GracefulAbort onto its OWN
+                                // `RunTerminal::GracefulAbort` (handled above),
+                                // never `Failed`. Defensive: treat as the
+                                // graceful verdict, never a raise.
                             }
                             RunError::Other(_) => {
                                 // The PRESERVED stay-local-primary swallow

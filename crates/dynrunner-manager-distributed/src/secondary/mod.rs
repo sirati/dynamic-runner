@@ -285,6 +285,25 @@ where
     /// condition.
     pub(super) fatal_exit: Option<String>,
 
+    /// THIS node held the primary role and was DEPOSED — a later applied
+    /// `PrimaryChanged` named a DIFFERENT peer while `current_primary()`
+    /// still named this node. Written ONLY by the primary-identity apply
+    /// seam (`on_primary_identity_advanced`): latched `true` on the
+    /// deposing advance, cleared the moment any applied `PrimaryChanged`
+    /// names this node again (a re-election with peer agreement, or a
+    /// relocation back).
+    ///
+    /// Read by the failover election's lone-survivor fast path
+    /// (`run_election_tick`): a deposed ex-primary may NOT take the
+    /// in-tick `failover_quorum(0) == 1` self-promotion — its own
+    /// deposition is evidence the fleet elected around it (its view of
+    /// the mesh is suspect, e.g. an asymmetric dead leg), so re-candidacy
+    /// requires POSITIVE peer agreement (a real `PromotionConfirm`). The
+    /// production primary ping-pong (asm-dataset @2212c136) was a deposed
+    /// half-partitioned ex-primary metronomically re-asserting itself
+    /// through exactly that fast path.
+    pub(super) deposed_primary: bool,
+
     /// "Peer mesh did not form" sentinel. Set true by
     /// `check_peer_mesh_watchdog` when the 30s deadline elapses with
     /// zero connected peers. The watchdog used to make this fatal,

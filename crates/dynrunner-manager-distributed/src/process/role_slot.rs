@@ -45,6 +45,7 @@ use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_protocol_primary_secondary::address::PeerId;
 use tokio::sync::mpsc;
 
+use super::ingest_liveness::IngestLiveness;
 use super::role::LocalRole;
 
 /// The mesh-addressable inbound endpoint + identity of one local role.
@@ -65,6 +66,12 @@ pub struct RoleSlot<I: Identifier> {
     /// role's [`super::RoleInbox`]; this is the "stable channel" that
     /// survives a retag.
     inbound: mpsc::UnboundedSender<DistributedMessage<I>>,
+    /// Per-peer frame-INGEST freshness, recorded at this delivery choke
+    /// point (the moment a frame ENTERS the inbox — before it waits in
+    /// the channel). The matching [`super::RoleInbox`] holds a clone for
+    /// the coordinator's flood-immune liveness reads; the trio mint
+    /// pairs them. See [`IngestLiveness`].
+    ingest_liveness: IngestLiveness,
 }
 
 impl<I: Identifier> RoleSlot<I> {
@@ -79,10 +86,23 @@ impl<I: Identifier> RoleSlot<I> {
         peer_id: PeerId,
         inbound: mpsc::UnboundedSender<DistributedMessage<I>>,
     ) -> Self {
+        Self::with_ingest_liveness(role, peer_id, inbound, IngestLiveness::new())
+    }
+
+    /// As [`Self::new`], pairing the slot with an EXISTING ingest-
+    /// freshness cell — the trio mint passes the cell it also hands the
+    /// matching [`super::RoleInbox`], so slot and inbox share one view.
+    pub fn with_ingest_liveness(
+        role: LocalRole,
+        peer_id: PeerId,
+        inbound: mpsc::UnboundedSender<DistributedMessage<I>>,
+        ingest_liveness: IngestLiveness,
+    ) -> Self {
         Self {
             role: AtomicU8::new(role.as_u8()),
             peer_id,
             inbound,
+            ingest_liveness,
         }
     }
 
@@ -136,6 +156,11 @@ impl<I: Identifier> RoleSlot<I> {
     /// reason string — the mesh only inspects `is_err`.
     pub fn deliver(&self, mut frame: DistributedMessage<I>) -> Result<(), String> {
         frame.clear_target();
+        // INGEST-time freshness: record the sender the moment the frame
+        // ENTERS the inbox — before it waits in the channel — so a
+        // flood-starved coordinator's death clocks still see the peer's
+        // queued frames as proof of life (see `IngestLiveness`).
+        self.ingest_liveness.record(frame.sender_id());
         self.inbound
             .send(frame)
             .map_err(|_| "role inbound receiver dropped".to_string())

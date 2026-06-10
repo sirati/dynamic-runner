@@ -67,6 +67,7 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
             is_observer: true,
             can_be_primary: false,
             cap_version: Default::default(),
+            member_gen: 0,
         },
     );
     let mut alive_members = HashSet::new();
@@ -84,6 +85,7 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
         alive_members,
         run_complete: false,
         run_aborted: None,
+        graceful_abort_requested: false,
         discovery_debt: crate::cluster_state::DiscoveryDebt::Undeclared,
         phase_event_tallies: HashMap::new(),
         retry_passes_used: HashMap::new(),
@@ -92,6 +94,7 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
         phases_ended: HashSet::new(),
         custom_messages: HashMap::new(),
         custom_terminal_watermarks: HashMap::new(),
+        member_generations: HashMap::new(),
     }
 }
 

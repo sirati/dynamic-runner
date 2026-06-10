@@ -23,6 +23,7 @@ mod custom_messages;
 mod digest;
 mod discovery_debt;
 mod dispatchers;
+mod graceful_abort;
 mod grow_max;
 mod non_task_convergence;
 mod panik;

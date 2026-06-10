@@ -136,6 +136,7 @@ mod tests {
                     is_observer: true,
                     can_be_primary: false,
                     cap_version: Default::default(),
+                    member_gen: 0,
                 }),
                 ApplyOutcome::Applied
             );

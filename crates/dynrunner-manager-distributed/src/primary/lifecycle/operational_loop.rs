@@ -375,6 +375,43 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 break;
             }
 
+            // Replicated run-terminal STAND-DOWN. `run_aborted` is the
+            // CRDT-resident terminal verdict (#313): sticky, carried by
+            // mutation broadcasts, anti-entropy digests, and snapshots. A
+            // latched verdict on THIS node's mirror was authored by
+            // another authority (this primary's own abort paths return
+            // their structured errors without re-entering the loop), so
+            // the run is over cluster-wide and continuing to author —
+            // dispatch, retries, a later contradictory verdict — is the
+            // zombie split-brain (run_20260610_221140: the deposed
+            // epoch-2 primary ran 2 minutes past the epoch-9 RunAborted
+            // and exited rc=0 with divergent totals). Break into the
+            // finalize tail, whose verdict gate adopts the abort as a
+            // structured non-zero exit.
+            if let Some(reason) = self.cluster_state.run_aborted() {
+                tracing::error!(
+                    reason = %reason,
+                    "replicated RunAborted verdict observed: the run is \
+                     over cluster-wide — standing down out of the \
+                     operational loop"
+                );
+                break;
+            }
+
+            // Graceful-abort drain decision (ONE seam in the loop; the
+            // whole protocol lives in `lifecycle::graceful_abort`). A
+            // steady-state run pays one latched-bool read. Under the latch
+            // it breaks on full fleet drain (→ the finalize tail's
+            // graceful-abort verdict) or relocates the primary role to the
+            // busiest secondary when this node's own work has drained
+            // while others still run (the demote arm then cancels this
+            // loop). Placed BEFORE the fleet-dead arming below: a frozen
+            // pool with a drained fleet is the graceful terminal, never a
+            // strand.
+            if self.graceful_abort_tick().await {
+                break;
+            }
+
             // Fleet-dead detection. The arming quantity is the count of
             // alive worker-secondaries OTHER than the host this node
             // recognizes as primary
@@ -403,7 +440,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // Tokenizer surfaced the original failure on cohort-3 where
             // SSH-tunnel blips killed all 5 secondaries at once and the
             // run sat idle until manually killed.
-            if self.cluster_state.alive_remote_secondary_count() == 0 && !self.pool().is_empty() {
+            // Gated on the graceful-abort latch: under the freeze the
+            // queued pool is DELIBERATELY un-dispatchable (nothing will
+            // ever dispatch it again, by design) and the remote
+            // secondaries legitimately drain away one by one, so the
+            // "no living secondary can dispatch the queued tasks" premise
+            // is vacuous — arming fleet-dead here would misclassify the
+            // graceful tail as a strand. The graceful tick above owns the
+            // drain terminal.
+            if !self.cluster_state.graceful_abort_requested()
+                && self.cluster_state.alive_remote_secondary_count() == 0
+                && !self.pool().is_empty()
+            {
                 let now = Instant::now();
                 let since = *self.fleet_dead_since.get_or_insert(now);
                 let elapsed = now.duration_since(since);

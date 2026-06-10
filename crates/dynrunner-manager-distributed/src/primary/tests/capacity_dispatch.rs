@@ -78,6 +78,7 @@ fn capacity_batch(secondary: &str, n: u32) -> DistributedMessage<TestId> {
                 is_observer: false,
                 can_be_primary: true,
                 cap_version: Default::default(),
+                member_gen: 0,
             },
             ClusterMutation::SecondaryCapacity {
                 secondary: secondary.into(),
@@ -197,7 +198,7 @@ async fn late_capacity_over_wire_grows_roster_and_dispatches_ready_task() {
             // The late worker-ready event: sec-0's capacity arrives over
             // the mesh well after the assigned=0 assignment snapshot.
             primary
-                .handle_cluster_mutation(capacity_batch("sec-0", 1))
+                .handle_cluster_mutation(capacity_batch("sec-0", 1), &mut None)
                 .await;
 
             // (1) The roster grew from the now-applied capacity record.
@@ -258,7 +259,7 @@ async fn redundant_capacity_reemit_is_a_noop() {
 
             // First apply: roster grows, one TasksAdded.
             primary
-                .handle_cluster_mutation(capacity_batch("sec-0", 1))
+                .handle_cluster_mutation(capacity_batch("sec-0", 1), &mut None)
                 .await;
             assert_eq!(primary.alive_worker_count_for_test(), 1);
             let first = recv_worker_signal_batch(&mut wm_rx)
@@ -269,7 +270,7 @@ async fn redundant_capacity_reemit_is_a_noop() {
             // Redundant re-emit: set-once apply ⇒ NoOp ⇒ no growth, no
             // emit. The bus is empty; a non-blocking drain yields None.
             primary
-                .handle_cluster_mutation(capacity_batch("sec-0", 1))
+                .handle_cluster_mutation(capacity_batch("sec-0", 1), &mut None)
                 .await;
             assert_eq!(
                 primary.alive_worker_count_for_test(),
@@ -306,6 +307,7 @@ async fn locally_originated_capacity_growth_grows_roster_and_dispatches() {
                         is_observer: false,
                         can_be_primary: true,
                         cap_version: Default::default(),
+                        member_gen: 0,
                     },
                     ClusterMutation::SecondaryCapacity {
                         secondary: "sec-0".into(),
@@ -371,7 +373,7 @@ async fn wait_inline_drain_services_queued_capacity_signal() {
             // operational loop, the usual drain, has not started. This is
             // the in-wait state.
             primary
-                .handle_cluster_mutation(capacity_batch("sec-0", 1))
+                .handle_cluster_mutation(capacity_batch("sec-0", 1), &mut None)
                 .await;
             assert_eq!(primary.alive_worker_count_for_test(), 1);
             primary.handle_mesh_ready(mesh_ready_from("sec-0"));
@@ -410,7 +412,7 @@ async fn without_inline_drain_queued_capacity_signal_strands() {
             let (mut primary, mut ends, _hash, _mesh) = primary_one_task_no_worker();
 
             primary
-                .handle_cluster_mutation(capacity_batch("sec-0", 1))
+                .handle_cluster_mutation(capacity_batch("sec-0", 1), &mut None)
                 .await;
             assert_eq!(primary.alive_worker_count_for_test(), 1);
             primary.handle_mesh_ready(mesh_ready_from("sec-0"));

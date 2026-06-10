@@ -269,13 +269,37 @@ where
         // can deliver — exactly the state in which no inbound can arrive
         // either, so the two liveness readers agree by construction (one
         // state owner: the transport's Router).
+        //
+        // DIAGNOSTIC SPLIT (resolution honesty): "not a connected mesh
+        // member" conflates two very different states an operator must
+        // distinguish at the next incident — the host being ABSENT FROM
+        // THE REPLICATED MEMBERSHIP (we believe it removed / never
+        // joined: a membership decision) vs the host being a LIVE
+        // REPLICATED MEMBER this node merely has NO TRANSPORT WIRE to
+        // right now (a transport gap: redial/idle-timeout/blackhole —
+        // NOT a removal). The probe semantics are identical (no route
+        // either way); only the named cause differs.
         if let SendTarget::Peer(id) = &target
             && !self.client.has_route(id)
         {
+            let membership = match self.cluster_state.peer_membership(id.as_str()) {
+                crate::cluster_state::PeerMembership::AliveMember => {
+                    "host IS a live replicated cluster member but this node \
+                     has no transport wire to it right now (transport gap — \
+                     redial/relay pending; NOT a membership removal)"
+                }
+                crate::cluster_state::PeerMembership::RemovedMember => {
+                    "host was REMOVED from the replicated membership \
+                     (PeerRemoved ledger) and is not wired"
+                }
+                crate::cluster_state::PeerMembership::NeverJoined => {
+                    "host is not in the replicated membership (never joined \
+                     / join not yet observed) and is not wired"
+                }
+            };
             return Err(format!(
-                "no route to {id}: not a connected mesh member and no relay \
-                 path through any connected peer (queued-mesh no-route — \
-                 failover-health probe)"
+                "no route to {id}: {membership}; no relay path through any \
+                 connected peer (queued-mesh no-route — failover-health probe)"
             ));
         }
         // The C3 stamp is ALWAYS the role-bearing intent `dst` — it is what
