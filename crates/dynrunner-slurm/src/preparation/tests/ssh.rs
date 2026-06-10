@@ -8,8 +8,9 @@ use tokio::task::JoinSet;
 
 use crate::preparation::options::{PrepError, PreparationOptions};
 use crate::preparation::ssh::{
-    LingerVerb, build_linger_argv, build_release_argv, build_ssh_argv, linger_fail_reason,
-    linger_succeeded, parse_was_linger, verify_tunnel_alive, was_linger_from_probe,
+    LingerLedger, LingerVerb, build_linger_argv, build_release_argv, build_ssh_argv,
+    linger_fail_reason, linger_succeeded, parse_was_linger, verify_tunnel_alive,
+    was_linger_from_probe,
 };
 
 /// Ssh spawn argv shape (no auth-options): -J jump_target form,
@@ -530,4 +531,52 @@ fn verify_tunnel_alive_captures_stderr_written_just_before_exit() {
         }
         other => panic!("expected TunnelFailed, got {other}"),
     }
+}
+
+/// [`LingerLedger`] original-state semantics: FIRST-writer-wins per host.
+/// A multi-secondary node's first probe captures the genuine pre-run
+/// state; a later (post-our-enable) `yes` must not overwrite it, so the
+/// run-end restore still disables what the run enabled.
+#[test]
+fn ledger_original_state_is_first_writer_wins() {
+    let ledger = LingerLedger::default();
+    // First probe on nodeA: was OFF (this run enables it).
+    ledger.record_enable("nodeA", false, true);
+    // Second secondary on the same node reads the now-enabled state.
+    ledger.record_enable("nodeA", true, true);
+    // nodeB was already lingering before the run.
+    ledger.record_enable("nodeB", true, true);
+
+    let restore = ledger.drain_restore_hosts();
+    assert_eq!(
+        restore,
+        vec!["nodeA".to_string()],
+        "only the node whose linger this run enabled is restored"
+    );
+    // Drained: a second call is a no-op (idempotent teardown).
+    assert!(ledger.drain_restore_hosts().is_empty());
+}
+
+/// [`LingerLedger`] enable-verdict semantics: ANY-success-wins per host
+/// (a retried attempt that eventually lands clears an earlier failure),
+/// failures are reported sorted, and the drain is consuming.
+#[test]
+fn ledger_enable_verdict_is_any_success_wins_and_drains() {
+    let ledger = LingerLedger::default();
+    // nodeC: first attempt failed, retry succeeded → ok.
+    ledger.record_enable("nodeC", false, false);
+    ledger.record_enable("nodeC", false, true);
+    // nodeA, nodeB: never succeeded → failed.
+    ledger.record_enable("nodeB", true, false);
+    ledger.record_enable("nodeA", true, false);
+
+    let (ok, failed) = ledger.drain_enable_verdicts();
+    assert_eq!(ok, 1, "any-success-wins: nodeC counts as ok");
+    assert_eq!(
+        failed,
+        vec!["nodeA".to_string(), "nodeB".to_string()],
+        "failed hosts are reported sorted"
+    );
+    // Drained: a later cohort summarises only its own attempts.
+    assert_eq!(ledger.drain_enable_verdicts(), (0, Vec::new()));
 }
