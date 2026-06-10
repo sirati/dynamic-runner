@@ -52,7 +52,7 @@ import argparse
 import runpy
 import sys
 
-from ._fault_dumps import enable_fault_dumps
+from ._fault_dumps import enable_fault_dumps, write_crash_traceback
 
 
 def _build_bootstrap_parser() -> argparse.ArgumentParser:
@@ -128,17 +128,31 @@ def main(bootstrap_argv: list[str] | None = None) -> None:
     # to resolve the durable dump target's `--full-log-dir`.
     enable_fault_dumps(raw)
 
-    parser = _build_bootstrap_parser()
-    args, _passthrough = parser.parse_known_args(raw)
+    # Last-gasp crash visibility: any exception escaping the bootstrap (the
+    # shim's own parse OR the consumer module run) is durably recorded to
+    # `<full-log-dir>/bootstrap-crash.log` by the diagnostics module before
+    # the bare re-raise — so the container's exit code and stderr traceback
+    # are EXACTLY as without this handler, but the failure is no longer
+    # visible only in container stderr (where the production fire-drill's
+    # dial error drowned in podman debug noise while every per-node log
+    # file stayed empty). The policy of what is crash-worthy (clean
+    # `SystemExit` is not) lives with the diagnostics concern in
+    # `_fault_dumps`, not here.
+    try:
+        parser = _build_bootstrap_parser()
+        args, _passthrough = parser.parse_known_args(raw)
 
-    sys.argv = ["__main__", *_strip_secondary_module(raw)]
+        sys.argv = ["__main__", *_strip_secondary_module(raw)]
 
-    # Run the consumer module exactly as `python -m <module>` does today:
-    # `alter_sys=True` installs the module as `__main__` and restores
-    # `sys.argv[0]` to the module's file, so the consumer's
-    # `if __name__ == "__main__":` / `cli_main(argv=sys.argv[1:])` path
-    # parses the stripped argv identically to a full command-line launch.
-    runpy.run_module(args.secondary_module, run_name="__main__", alter_sys=True)
+        # Run the consumer module exactly as `python -m <module>` does today:
+        # `alter_sys=True` installs the module as `__main__` and restores
+        # `sys.argv[0]` to the module's file, so the consumer's
+        # `if __name__ == "__main__":` / `cli_main(argv=sys.argv[1:])` path
+        # parses the stripped argv identically to a full command-line launch.
+        runpy.run_module(args.secondary_module, run_name="__main__", alter_sys=True)
+    except BaseException:
+        write_crash_traceback(raw)
+        raise
 
 
 if __name__ == "__main__":

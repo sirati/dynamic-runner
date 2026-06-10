@@ -1,8 +1,10 @@
-"""Per-process Python frame-dump wiring for a mesh-launched secondary.
+"""Per-process Python crash/frame-dump diagnostics for a mesh-launched secondary.
 
 ==============================================================================
-Single concern: install ``faulthandler`` so EVERY thread's Python stack can be
-dumped — on a fatal signal AND on demand via ``SIGUSR1`` — to a durable file.
+Single concern: durable process-crash diagnostics — ``faulthandler`` frame
+dumps (fatal signals + on-demand ``SIGUSR1``) and the last-gasp traceback of
+a clean Python exception escaping the bootstrap — written under the per-node
+``--full-log-dir``.
 ==============================================================================
 
 This is the Python half of the livelock instrumentation. The Rust
@@ -32,16 +34,20 @@ Module boundary
   does NOT run the framework's argparse — that stays the consumer's concern).
 * OUT — a registered ``faulthandler`` (fatal-signal + ``SIGUSR1``), writing to
   ``<full-log-dir>/faulthandler.log`` when a per-node log dir is present, else
-  ``sys.stderr`` (captured by conmon, so it survives either way). Idempotent
-  and best-effort: any failure is swallowed so diagnostics-wiring can never
-  break the secondary's cold start.
+  ``sys.stderr`` (captured by conmon, so it survives either way); and, via
+  :func:`write_crash_traceback`, ``<full-log-dir>/bootstrap-crash.log`` for a
+  clean Python exception escaping the bootstrap shim. Idempotent and
+  best-effort: any failure is swallowed so diagnostics-wiring can never break
+  the secondary's cold start.
 """
 
 from __future__ import annotations
 
+import datetime
 import faulthandler
 import signal
 import sys
+import traceback
 from pathlib import Path
 from typing import IO
 
@@ -49,6 +55,14 @@ from typing import IO
 #: Separate from the busy full.log so a frame dump is not interleaved with
 #: (and lost in) the ordinary log stream.
 _DUMP_BASENAME = "faulthandler.log"
+
+#: Basename of the last-gasp crash-traceback file under the per-node
+#: ``--full-log-dir``. Separate from ``faulthandler.log`` (which only ever
+#: carries signal/fault frame dumps): a CLEAN Python exception escaping the
+#: bootstrap is a different failure shape, and the production fire-drill
+#: (run_20260610_130030) showed that when it lands only on container stderr
+#: it drowns in podman debug noise while every per-node log file stays empty.
+_CRASH_BASENAME = "bootstrap-crash.log"
 
 #: Module-level reference to the open dump file. ``faulthandler.register`` /
 #: ``faulthandler.enable`` retain the underlying fd, so the object MUST stay
@@ -137,4 +151,55 @@ def enable_fault_dumps(argv: list[str] | None = None) -> None:
             faulthandler.register(sigusr1, file=target, all_threads=True, chain=False)
     except (OSError, RuntimeError, ValueError):
         # Diagnostics wiring must never break the secondary's cold start.
+        pass
+
+
+def write_crash_traceback(argv: list[str] | None = None) -> None:
+    """Last-gasp crash visibility: durably record the in-flight exception.
+
+    Called from an ``except`` block (the bootstrap shim's re-raise handler).
+    Appends the full traceback of the CURRENT exception to
+    ``<full-log-dir>/bootstrap-crash.log`` — the same per-node directory
+    (and the same argv-based resolution) the ``faulthandler`` dump target
+    uses, which provably exists before any crash this guards against.
+
+    Why this exists: a Python exception that escapes the bootstrap before
+    (or outside) the Rust tracing subscriber's file sinks otherwise prints
+    ONLY to container stderr, where it is buried in podman debug noise
+    while ``secondary.log``/the full log stay 0 bytes — the operator sees a
+    "totally silent" dead secondary (production fire-drill,
+    run_20260610_130030).
+
+    Strictly best-effort and side-effect-only:
+      * never raises (any failure here would mask the original error);
+      * never swallows — the caller re-raises, so the process exit code and
+        the stderr traceback are unchanged;
+      * a no-op when there is no current exception, when the exception is a
+        clean ``SystemExit`` (code 0/None — a normal exit, not a crash), or
+        when the argv carries no usable ``--full-log-dir`` (the traceback
+        already reaches stderr via the caller's re-raise; duplicating it
+        there would only add noise).
+    """
+    try:
+        exc = sys.exception()
+        if exc is None:
+            return
+        if isinstance(exc, SystemExit) and exc.code in (0, None):
+            return
+        raw = list(sys.argv[1:] if argv is None else argv)
+        full_log_dir = _full_log_dir_from_argv(raw)
+        if not full_log_dir:
+            return
+        dir_path = Path(full_log_dir)
+        dir_path.mkdir(parents=True, exist_ok=True)
+        # Append so respawn cycles accumulate instead of clobbering the
+        # previous crash; one timestamped header per entry.
+        with (dir_path / _CRASH_BASENAME).open("a") as handle:
+            stamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            handle.write(f"==== bootstrap crash at {stamp} ====\n")
+            traceback.print_exception(exc, file=handle)
+            handle.flush()
+    except BaseException:
+        # Best-effort by contract: the handler must never mask the
+        # original error with one of its own.
         pass
