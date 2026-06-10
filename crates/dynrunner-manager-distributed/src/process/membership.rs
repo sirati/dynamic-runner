@@ -53,6 +53,22 @@ struct MembershipSnapshot {
     /// The connected peer-ids at publish time. `has_peer` reads this so a
     /// per-id answer is as honest as the cardinality.
     connected: Vec<PeerId>,
+    /// `transport.unroutable_ids()` at publish time: the ids the
+    /// transport KNOWS it cannot deliver to by any path (no direct
+    /// connection AND every connected forwarder blacklisted for them).
+    /// `has_route` reads this — an id outside the set is routable iff
+    /// `connected` contains it or any OTHER peer (a relay candidate);
+    /// the transport owns the underlying predicate
+    /// (`Router::has_route`), this snapshot only carries its published
+    /// projection so the two can never drift in kind, only in the
+    /// bounded one-pump-cycle staleness every field here shares.
+    unroutable: Vec<PeerId>,
+    /// `transport.relay_capable()` at publish time: whether `has_route`
+    /// may exceed `has_peer` at all. A stub/direct-only transport
+    /// publishes `false` and the view's `has_route` collapses to
+    /// `has_peer` — the trait-default semantics — instead of inferring
+    /// a relay layer the transport does not have.
+    relay_capable: bool,
 }
 
 /// A cloneable, pump-published live-read view of mesh membership.
@@ -81,10 +97,18 @@ impl MembershipView {
     /// writer; the value is never derived from a delta. `connected` is
     /// taken by value to keep the snapshot self-owned (no borrow of the
     /// transport's `connections` table escapes the mesh).
-    pub fn publish(&self, count: usize, connected: Vec<PeerId>) {
+    pub fn publish(
+        &self,
+        count: usize,
+        connected: Vec<PeerId>,
+        unroutable: Vec<PeerId>,
+        relay_capable: bool,
+    ) {
         let mut guard = self.inner.lock().expect("membership view poisoned");
         guard.count = count;
         guard.connected = connected;
+        guard.unroutable = unroutable;
+        guard.relay_capable = relay_capable;
     }
 
     /// The last-published peer count (live read as of the last pump
@@ -101,6 +125,29 @@ impl MembershipView {
             .connected
             .iter()
             .any(|p| p == id)
+    }
+
+    /// Whether the transport could DELIVER a directed frame to `id` as
+    /// of the last publish — direct connection, or a relay through some
+    /// other connected peer the transport has not blacklisted for `id`.
+    ///
+    /// `has_route ⊇ has_peer`: a direct member is always routable; a
+    /// peer whose direct wire died may STILL be routable via relay.
+    /// Consumers asking "can my frames reach it" (the egress no-route
+    /// gate, the death-evidence membership reads) take this; consumers
+    /// asking about the DIRECT wire keep [`Self::has_peer`]. The
+    /// formula mirrors the transport's `Router::has_route` over the
+    /// published projection: direct, OR (the transport is relay-capable
+    /// AND some other peer is connected AND the transport has not
+    /// decided `id` unroutable — see the `unroutable` field). For a
+    /// non-relay transport this collapses to `has_peer`, the
+    /// trait-default semantics.
+    pub fn has_route(&self, id: &PeerId) -> bool {
+        let guard = self.inner.lock().expect("membership view poisoned");
+        guard.connected.iter().any(|p| p == id)
+            || (guard.relay_capable
+                && guard.connected.iter().any(|p| p != id)
+                && !guard.unroutable.iter().any(|p| p == id))
     }
 }
 
@@ -123,7 +170,12 @@ mod tests {
         assert!(!view.has_peer(&PeerId::from("a")));
 
         let reader = view.clone();
-        view.publish(2, vec![PeerId::from("a"), PeerId::from("b")]);
+        view.publish(
+            2,
+            vec![PeerId::from("a"), PeerId::from("b")],
+            Vec::new(),
+            true,
+        );
 
         assert_eq!(reader.peer_count(), 2);
         assert!(reader.has_peer(&PeerId::from("a")));
@@ -139,12 +191,19 @@ mod tests {
         view.publish(
             3,
             vec![PeerId::from("a"), PeerId::from("b"), PeerId::from("c")],
+            Vec::new(),
+            true,
         );
         assert_eq!(view.peer_count(), 3);
 
         // Peer "b" left; the mesh re-reads the live transport (count 2,
         // set {a,c}) and republishes the whole snapshot.
-        view.publish(2, vec![PeerId::from("a"), PeerId::from("c")]);
+        view.publish(
+            2,
+            vec![PeerId::from("a"), PeerId::from("c")],
+            Vec::new(),
+            true,
+        );
         assert_eq!(view.peer_count(), 2);
         assert!(view.has_peer(&PeerId::from("a")));
         assert!(
@@ -152,5 +211,52 @@ mod tests {
             "departed peer is gone, not decremented"
         );
         assert!(view.has_peer(&PeerId::from("c")));
+    }
+
+    /// `has_route` semantics over the published projection:
+    /// - a CONNECTED id is routable (direct);
+    /// - a NON-connected id is routable while some OTHER peer is
+    ///   connected (relay candidate) and the transport has not decided
+    ///   it unroutable;
+    /// - a published-unroutable id is NOT routable despite live relay
+    ///   candidates (every forwarder blacklisted at the transport);
+    /// - with NO connections at all, nothing is routable — exactly the
+    ///   state in which no inbound can arrive either, so the
+    ///   no-route-for-sends and recovered-for-liveness readers agree
+    ///   by construction (the BUG 3.3 coherence).
+    #[test]
+    fn has_route_direct_relay_unroutable_and_empty() {
+        let view = MembershipView::new();
+        // Empty mesh: nothing routable.
+        assert!(!view.has_route(&PeerId::from("p")));
+
+        // p's direct wire is down but b is connected: p is routable via
+        // relay; b is routable directly.
+        view.publish(1, vec![PeerId::from("b")], Vec::new(), true);
+        assert!(view.has_route(&PeerId::from("b")));
+        assert!(
+            view.has_route(&PeerId::from("p")),
+            "relay candidate exists; p must read routable"
+        );
+        assert!(!view.has_peer(&PeerId::from("p")), "but NOT direct");
+
+        // The transport decided p unroutable (all forwarders
+        // blacklisted): the projection flips.
+        view.publish(1, vec![PeerId::from("b")], vec![PeerId::from("p")], true);
+        assert!(!view.has_route(&PeerId::from("p")));
+        assert!(view.has_route(&PeerId::from("b")));
+
+        // The ONLY connection being the asked-about id itself is direct
+        // (routable); a DIFFERENT id with no other candidates is not.
+        view.publish(1, vec![PeerId::from("p")], Vec::new(), true);
+        assert!(view.has_route(&PeerId::from("p")));
+
+        // A NON-relay-capable transport collapses has_route to
+        // has_peer: a live "relay candidate" must NOT make a
+        // disconnected id read routable on a transport with no relay
+        // layer (the stub/direct-only honesty).
+        view.publish(1, vec![PeerId::from("b")], Vec::new(), false);
+        assert!(view.has_route(&PeerId::from("b")));
+        assert!(!view.has_route(&PeerId::from("p")));
     }
 }

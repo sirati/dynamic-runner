@@ -164,6 +164,53 @@ pub trait PeerTransport<I: Identifier> {
     /// impl answers from its own real connection/writer table.
     fn has_peer(&self, id: &PeerId) -> bool;
 
+    /// Deliverability, as opposed to direct membership: can this
+    /// transport deliver a directed frame to `id` by ANY path right now
+    /// — a direct connection, OR a relay through a connected forwarder
+    /// it has not blacklisted for `id`?
+    ///
+    /// `has_route(id)` ⊇ `has_peer(id)`: a direct member is always
+    /// routable; a peer whose direct wire died may STILL be routable via
+    /// relay. The distinction is load-bearing (BUG 3.3): reading
+    /// [`Self::has_peer`] where the question is "can my frames reach
+    /// it / can its frames reach me" declares a relay-covered link dead
+    /// — the no-route-for-sends vs recovered-for-liveness flip-flop.
+    /// Consumers asking about DELIVERY (the egress no-route gate, the
+    /// death-evidence membership reads) take this; consumers asking
+    /// about the DIRECT wire (redial decisions, broadcast fan-out
+    /// honesty) keep `has_peer`.
+    ///
+    /// Default: `has_peer` — exact for transports with no relay layer
+    /// (every connection is the only path). Relay-capable transports
+    /// (`PeerNetwork`) override with the Router-backed predicate.
+    fn has_route(&self, id: &PeerId) -> bool {
+        self.has_peer(id)
+    }
+
+    /// Whether this transport can DELIVER beyond its direct connections
+    /// — i.e. whether [`Self::has_route`] can exceed [`Self::has_peer`]
+    /// (a Router-backed relay layer). Published alongside the
+    /// connected/unroutable sets so a detached membership-view reader
+    /// answers `has_route` with THIS transport's real semantics instead
+    /// of inferring relay capability that a stub/direct-only transport
+    /// does not have. Default: `false` (has_route == has_peer);
+    /// Router-backed transports override to `true`.
+    fn relay_capable(&self) -> bool {
+        false
+    }
+
+    /// The finite set of peer ids this transport currently KNOWS it
+    /// cannot deliver to by any path (no direct connection AND every
+    /// connected forwarder blacklisted for them). The published
+    /// projection of [`Self::has_route`] for detached membership-view
+    /// readers: when [`Self::relay_capable`] is `true`, an id outside
+    /// this set is routable iff the connected set contains it or any
+    /// other peer. Default: empty — exact for transports with no relay
+    /// blacklist.
+    fn unroutable_ids(&self) -> Vec<PeerId> {
+        Vec::new()
+    }
+
     /// Enumerate the currently-connected peer ids — the live id-set
     /// behind [`Self::peer_count`] (the cardinality) and [`Self::has_peer`]
     /// (the per-id predicate). Role-agnostic (transport ⊥ roles): it

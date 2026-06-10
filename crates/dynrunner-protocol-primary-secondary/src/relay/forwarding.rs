@@ -35,6 +35,50 @@ pub fn pick_relay<'a, V>(
         .cloned()
 }
 
+/// The originator-side forwarder pick: lowest-id connection that is
+/// neither the target, nor self, nor blacklisted for this target.
+/// SINGLE OWNER of the originator's candidate-exclusion rule — shared
+/// by [`route_send`] (which relays through the pick) and
+/// [`route_exists`] (the pure deliverability predicate), so the
+/// "would a send route?" answer can never drift from what a send
+/// actually does.
+fn originator_candidate<V>(
+    connections: &HashMap<String, V>,
+    my_peer_id: &str,
+    target: &str,
+    blacklist: &HashSet<String>,
+) -> Option<String> {
+    let mut excluded: HashSet<&str> = HashSet::new();
+    excluded.insert(target);
+    excluded.insert(my_peer_id);
+    for b in blacklist {
+        excluded.insert(b.as_str());
+    }
+    pick_relay(connections, excluded.iter().copied())
+}
+
+/// Pure deliverability predicate: would a `send_to_peer(target)`
+/// originated here find ANY path right now — direct, or via at least
+/// one non-blacklisted forwarder? `false` is exactly the
+/// [`RouteDecision::NoRoute`] condition of [`route_send`], without
+/// constructing a message.
+///
+/// This is the ONE owner of "is the link to `target` routable": the
+/// egress no-route gate and the transport-membership death-evidence
+/// reads derive from it (directly, or via the transport's published
+/// projection), so a leg that still delivers via relay can never
+/// simultaneously read as no-route for sends and recovered for
+/// liveness — the BUG 3.3 incoherence.
+pub fn route_exists<V>(
+    connections: &HashMap<String, V>,
+    my_peer_id: &str,
+    target: &str,
+    blacklist: &HashSet<String>,
+) -> bool {
+    connections.contains_key(target)
+        || originator_candidate(connections, my_peer_id, target, blacklist).is_some()
+}
+
 /// Build the routing decision for a fresh `send_to_peer(target,
 /// msg)` call by the originator.
 ///
@@ -65,16 +109,11 @@ pub fn route_send<I: Identifier, V>(
     }
     // Forwarder candidates exclude target, self, and any peer the
     // transport has marked as a known-bad forwarder for this target
-    // within the TTL window. The originator's `path` is `[self]`, so
+    // within the TTL window (the shared `originator_candidate` rule —
+    // see `route_exists`). The originator's `path` is `[self]`, so
     // a future picked forwarder F sees self already in path and
     // won't try to bounce back through us.
-    let mut excluded: HashSet<&str> = HashSet::new();
-    excluded.insert(target);
-    excluded.insert(my_peer_id);
-    for b in blacklist {
-        excluded.insert(b.as_str());
-    }
-    let via = match pick_relay(connections, excluded.iter().copied()) {
+    let via = match originator_candidate(connections, my_peer_id, target, blacklist) {
         Some(v) => v,
         None => return RouteDecision::NoRoute,
     };

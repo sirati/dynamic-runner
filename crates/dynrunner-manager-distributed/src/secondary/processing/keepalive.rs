@@ -29,8 +29,9 @@ where
     ///
     /// The failover-health window is opened by the send-side no-route
     /// probe in [`Self::send_to_primary`]: when a primary-bound send
-    /// returns a no-route `Err` (no peer in the mesh resolves the
-    /// `Primary` destination), `record_recv_failure` anchors the window
+    /// returns a no-route `Err` (no primary resolves, or the resolved
+    /// host is unreachable by ANY transport path — the `has_route`
+    /// deliverability gate), `record_recv_failure` anchors the window
     /// and bumps the count axis. The COUNT axis can saturate (e.g. an idle worker's
     /// backoff suppresses further `TaskRequest` sends, so no further
     /// probes accrue); this method covers the TIME axis by polling

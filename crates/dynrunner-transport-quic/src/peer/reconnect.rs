@@ -103,8 +103,8 @@ impl PeerReconnectState {
     /// dial addresses.
     fn dial_summary_due(&self) -> bool {
         match self.attempts.checked_sub(DIAL_SUMMARY_THRESHOLD) {
-            None => false,                                // below the first threshold
-            Some(0) => true,                             // exactly the first threshold
+            None => false,                                     // below the first threshold
+            Some(0) => true,                                   // exactly the first threshold
             Some(over) => over % DIAL_SUMMARY_RECURRENCE == 0, // recurrence windows
         }
     }
@@ -183,6 +183,25 @@ impl ReconnectTracker {
                 attempts = state.attempts,
                 elapsed_secs = state.disconnect_at.elapsed().as_secs(),
                 "peer reconnected"
+            );
+        }
+    }
+
+    /// Forget tracker state for `peer_id` WITHOUT a heal: the peer left
+    /// the authoritative roster (genuine membership departure), so the
+    /// outage lifecycle ends here — no further redials, milestone WARNs,
+    /// or redial-request nudges fire for it. Idempotent on absence; the
+    /// state transition logs (the silent-branch rule). Re-admission
+    /// later starts a FRESH lifecycle (the next reconciliation tick
+    /// re-tracks it if its leg is still missing).
+    pub fn forget_departed(&mut self, peer_id: &str) {
+        if let Some(state) = self.state.remove(peer_id) {
+            tracing::info!(
+                peer = %peer_id,
+                attempts = state.attempts,
+                elapsed_secs = state.disconnect_at.elapsed().as_secs(),
+                "peer left the authoritative roster; redial tracking stopped \
+                 (genuine departure, not a heal)"
             );
         }
     }

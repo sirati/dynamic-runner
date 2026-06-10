@@ -33,6 +33,49 @@ pub use mesh_send::MeshSendHandle;
 
 use mesh_send::MeshSend;
 
+/// Log-message constants for the member-leg redial-request handshake,
+/// exposed (crate-visible) so the regression tests pin the literal
+/// production strings instead of substring copies that would silently
+/// drift on rephrase (same pattern as the relay-path `MSG_*` consts in
+/// the protocol crate).
+///
+/// Requester side (the NON-dial-owner): first nudge of an outage logs
+/// at INFO with this message; subsequent nudges are DEBUG (the
+/// reconnect tracker's milestone WARNs carry the long-outage
+/// narration).
+pub(crate) const MSG_REDIAL_REQUEST_SENT: &str = "member leg dead and this node never dials it (lower-id-dials rule); \
+     requesting a re-dial from the dial owner";
+/// Dial-owner side: a `RedialRequest` arrived and this node pruned its
+/// stale entry (if any) and kicked the re-dial.
+pub(crate) const MSG_REDIAL_REQUEST_HONORED: &str =
+    "peer reports our wire to it is dead; honoring its redial request";
+
+/// Grace threshold for honoring a `RedialRequest` while this node holds
+/// a LIVE connection entry for the requester: prune + re-dial only when
+/// the requester has been tracking the dead leg for at least this many
+/// reconnect ticks (~2 × 5s). Below it, the request may be the
+/// mesh-forming first-frame-identification window — the wire is healthy
+/// and THIS node's next regular frame (keepalive / anti-entropy digest,
+/// both ≤ one tick period) identifies it at the requester's accept loop
+/// without killing a good wire mid-traffic (force-pruning a young wire
+/// drops every frame queued on its writer — the arm-hunt burst
+/// regression shape). A request that PERSISTS past the grace window
+/// proves the wire dead from the requester's side despite our traffic,
+/// i.e. the genuine half-open. When this node holds NO entry the gate
+/// does not apply (there is no wire to protect) and the re-dial fires
+/// immediately.
+pub(super) const REDIAL_REQUEST_PRUNE_AFTER: u32 = 2;
+
+/// One redial-request nudge the reconnect tick asks the transport to
+/// send: the tracked-disconnected peer this node structurally never
+/// dials (the peer owns the dial side), plus the running
+/// ticks-disconnected count that picks the log level (first nudge
+/// INFO, later nudges DEBUG).
+pub(super) struct RedialNudge {
+    pub(super) peer_id: String,
+    pub(super) attempts: u32,
+}
+
 /// What one `connect_to_peers` sweep decided, per disposition — the
 /// single source for the sweep-summary log line and the unit tests
 /// that pin the dispositions. A sweep that spawns ZERO dials is a
@@ -210,6 +253,18 @@ pub struct PeerNetwork<I: Identifier> {
     /// the tracker stays an implementation detail; callers don't
     /// see (or depend on) the milestone schedule directly.
     pub(super) reconnect_tracker: reconnect::ReconnectTracker,
+    /// Peers whose member leg has EVER been registered in
+    /// `connections` on this node. The redial-request nudge keys on
+    /// this: only a leg that EXISTED and then DIED earns a nudge to
+    /// its dial owner (the production half-open shape). A leg that
+    /// has never formed is the mesh-FORMING window — the dial owner
+    /// is already dialing (or about to identify via its first frame),
+    /// and nudging there made every slow-forming all-to-all mesh
+    /// prune-storm its own healthy wires (the arm-hunt burst
+    /// regression). Never cleared: "ever" is the point — re-formation
+    /// after a death re-inserts idempotently, departure removes the
+    /// roster entry that gates the nudge path anyway.
+    pub(super) ever_connected: std::collections::HashSet<String>,
 
     /// Receiver for the cloneable mesh-send proxy (see
     /// [`MeshSendHandle`]). An on-demand same-host `PrimaryCoordinator`
@@ -360,6 +415,7 @@ impl<I: Identifier> PeerNetwork<I> {
             #[cfg(test)]
             reconnect_tick_tx_for_test,
             reconnect_tracker: reconnect::ReconnectTracker::new(),
+            ever_connected: std::collections::HashSet::new(),
             proxy_rx,
             mesh_send_tx,
             bootstrap_redial_rx,
@@ -564,15 +620,24 @@ impl<I: Identifier> PeerNetwork<I> {
         );
         if !summary.dropped_from_list.is_empty() {
             // Membership shrink is operator-significant: every dropped
-            // peer's redial tracking stops NOW, silently, forever — if
-            // the new list is wrong (e.g. a freshly promoted primary
-            // broadcast a partial roster), this is the only trace.
+            // peer's redial tracking stops NOW, forever — if the new
+            // list is wrong (e.g. a freshly promoted primary broadcast
+            // a partial roster), this is the trace.
             tracing::warn!(
                 dropped = ?summary.dropped_from_list,
                 "authoritative peer list no longer contains previously \
                  tracked peers; their cached dial info and redial \
                  tracking stop here"
             );
+            // Make the documented semantics TRUE: end the tracker
+            // lifecycle for each departed peer at this membership-
+            // replacement edge (the ONLY path that removes entries
+            // from `peer_dial_info`), so a retired peer stops costing
+            // ticks, milestone WARNs, and redial-request nudges. The
+            // per-peer state transition logs inside `forget_departed`.
+            for peer_id in &summary.dropped_from_list {
+                self.reconnect_tracker.forget_departed(peer_id);
+            }
         }
     }
 
@@ -693,6 +758,7 @@ impl<I: Identifier> PeerNetwork<I> {
                 // disposition the operator was tracking).
                 self.reconnect_tracker.observe_reconnect(&accepted.peer_id);
                 tracing::info!(peer = %accepted.peer_id, "incoming peer registered");
+                self.ever_connected.insert(accepted.peer_id.clone());
                 self.connections
                     .insert(accepted.peer_id, accepted.outgoing_tx);
             }
@@ -714,7 +780,16 @@ impl<I: Identifier> PeerNetwork<I> {
     /// `spawn_redial` itself deduplicates against `connections`,
     /// so this method is safe even if a redial from a prior tick
     /// is still in flight when the next tick fires.
-    fn process_reconnect_tick(&mut self) {
+    ///
+    /// Returns the [`RedialNudge`]s for the tracked peers this node
+    /// structurally NEVER dials (the lower-id-dials rule — the peer
+    /// owns the dial side): the caller (the tick arm in `recv_peer`)
+    /// sends each peer a wire `RedialRequest` through the relay-capable
+    /// send path, closing the half-open hole where the dial owner's
+    /// side of the wire still looks healthy and it never re-dials on
+    /// its own. Returned (not sent here) because sending is async and
+    /// this method is the synchronous tracker step.
+    fn process_reconnect_tick(&mut self) -> Vec<RedialNudge> {
         let cluster_peers: Vec<String> = self.peer_dial_info.keys().cloned().collect();
         for peer_id in &cluster_peers {
             if self.connections.contains_key(peer_id) {
@@ -769,9 +844,116 @@ impl<I: Identifier> PeerNetwork<I> {
             }
         }
 
+        let mut nudges = Vec::new();
         for peer_id in outcome.to_dial {
-            self.spawn_redial(&peer_id);
+            if self.dials_outbound_to(&peer_id) {
+                self.spawn_redial(&peer_id);
+            } else if self.ever_connected.contains(&peer_id) {
+                // The peer owns the dial side of this leg, the leg
+                // EXISTED here and died (never-formed legs are the
+                // mesh-forming window — the owner is already dialing;
+                // see `ever_connected`): this node's only lever is
+                // asking the owner to re-dial. Collected for the async
+                // tick arm; the attempt count picks the log level there
+                // (first nudge INFO, later DEBUG).
+                nudges.push(RedialNudge {
+                    attempts: self.reconnect_tracker.attempts_for(&peer_id).unwrap_or(0),
+                    peer_id,
+                });
+            } else {
+                // Never-formed leg this node doesn't dial: the
+                // throttled "peer leg missing" summary above is the
+                // operator narration; nothing to nudge.
+                tracing::debug!(
+                    peer = %peer_id,
+                    "no redial nudge: leg has never formed on this node \
+                     (mesh-forming window; the dial owner drives it)"
+                );
+            }
         }
+        nudges
+    }
+
+    /// Honor an inbound [`DistributedMessage::RedialRequest`] from
+    /// `from`: the OTHER end of the leg reports the wire dead from its
+    /// side. This node is the leg's dial owner (lower-id-dials), so:
+    /// force-prune any connection entry for `from` — the entry is stale
+    /// by the peer's authoritative evidence, even if it looks healthy
+    /// here (the half-open shape), and leaving it would make
+    /// `drain_new_connections`' dedup DROP the fresh dial's
+    /// registration — then track the disconnect and dial immediately.
+    ///
+    /// Restores the TRANSPORT PIPE only: no liveness/failover input is
+    /// fed (the requester's own tracker narrates the outage); the prune
+    /// deliberately bypasses `handle_peer_disconnect`'s generation check
+    /// because the evidence is external — there is no dead local channel
+    /// to compare against.
+    ///
+    /// Guards:
+    /// - dial-direction: a request from a peer whose leg WE don't own
+    ///   is mis-addressed (the sender owns the dial) — WARN + ignore,
+    ///   never cross-dial.
+    /// - roster: a request from a peer no longer in the authoritative
+    ///   dial list is a genuine departure racing its own nudge — skip
+    ///   (`spawn_redial` would no-op anyway; named here for the log).
+    pub(super) fn handle_redial_request(&mut self, from: &str, attempts: u32) {
+        if !self.dials_outbound_to(from) {
+            tracing::warn!(
+                peer = %from,
+                "ignoring redial request from a peer whose leg this node \
+                 does not dial (lower-id-dials rule says THEY own the dial); \
+                 mis-addressed request"
+            );
+            return;
+        }
+        if !self.peer_dial_info.contains_key(from) {
+            tracing::debug!(
+                peer = %from,
+                "ignoring redial request: peer not in the authoritative \
+                 dial list (departed roster)"
+            );
+            return;
+        }
+        if self.connections.contains_key(from) {
+            // GRACE gate (see `REDIAL_REQUEST_PRUNE_AFTER`): with a live
+            // entry, an early request is likely the mesh-forming
+            // first-frame-identification window — our own next regular
+            // frame identifies the healthy wire at the requester's
+            // accept loop. Pruning here would kill a good wire and the
+            // frames queued on it.
+            if attempts < REDIAL_REQUEST_PRUNE_AFTER {
+                tracing::debug!(
+                    peer = %from,
+                    requester_ticks = attempts,
+                    "redial request inside the grace window while our \
+                     entry is live; relying on regular traffic to \
+                     identify the existing wire"
+                );
+                return;
+            }
+            // The request persisted past the grace window: the wire is
+            // dead from the requester's side despite our traffic — the
+            // genuine half-open. State transition — log at INFO.
+            self.connections.remove(from);
+            tracing::info!(
+                peer = %from,
+                requester_ticks = attempts,
+                pruned_stale_entry = true,
+                "{MSG_REDIAL_REQUEST_HONORED}"
+            );
+        } else {
+            tracing::debug!(
+                peer = %from,
+                requester_ticks = attempts,
+                pruned_stale_entry = false,
+                "{MSG_REDIAL_REQUEST_HONORED}"
+            );
+        }
+        // Track the outage (idempotent if already tracked) and dial now;
+        // `spawn_redial` dedups against `connections` (pruned/absent) and
+        // the roster (checked above).
+        self.reconnect_tracker.observe_disconnect(from);
+        self.spawn_redial(from);
     }
 
     /// Background-dial `peer_id` if we have its cached connection

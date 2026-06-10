@@ -182,18 +182,46 @@ where
     /// Is `id` currently a connected member of the transport mesh
     /// (`MeshClient::has_peer` over the published `MembershipView`)?
     ///
-    /// SINGLE SOURCE for the transport-membership read every
-    /// death/liveness seam takes (the `live_peer_ids` quorum
-    /// intersection, the leg-(C) arming observation in
-    /// [`Self::primary_departed_membership`], the deferrer-side
-    /// death-evidence sites): the mesh-pump republishes the view on every
-    /// peer connect/disconnect (`handle_peer_disconnect` → live
-    /// `transport.connected_ids()` re-read), so this flips `false` within
-    /// one pump cycle of a peer's QUIC teardown — the fast,
-    /// idle-independent, role-independent transport signal (mesh ⊥ role).
+    /// SINGLE SOURCE for the DIRECT-wire transport-membership read (the
+    /// `live_peer_ids` quorum intersection): the mesh-pump republishes
+    /// the view on every peer connect/disconnect
+    /// (`handle_peer_disconnect` → live `transport.connected_ids()`
+    /// re-read), so this flips `false` within one pump cycle of a peer's
+    /// QUIC teardown — the fast, idle-independent, role-independent
+    /// transport signal (mesh ⊥ role). The death-evidence seams (the
+    /// leg-(C) arming observation in
+    /// [`Self::primary_departed_membership`], the deferrer-side sites in
+    /// [`Self::peer_death_observed`]) read the DELIVERABILITY companion
+    /// [`Self::is_mesh_routable`] instead — a direct-wire teardown with
+    /// a live relay path is a transport-heal concern, not death
+    /// evidence.
     pub(in crate::secondary) fn is_mesh_member(&self, id: &str) -> bool {
         self.client
             .has_peer(&dynrunner_protocol_primary_secondary::address::PeerId::from(id))
+    }
+
+    /// Is `id` DELIVERABLE over the transport mesh — directly connected,
+    /// OR reachable via a relay through some connected peer the
+    /// transport has not blacklisted for it (`MeshClient::has_route`
+    /// over the published `MembershipView`)?
+    ///
+    /// SINGLE SOURCE for the transport-DELIVERABILITY read the
+    /// death-evidence seams take ([`Self::primary_departed_membership`],
+    /// [`Self::peer_death_observed`]), as opposed to the DIRECT-wire
+    /// membership read [`Self::is_mesh_member`] keeps for the
+    /// `live_peer_ids` quorum intersection. The split is load-bearing
+    /// (BUG 3.3): a peer whose direct wire died but whose frames still
+    /// flow over the relay is NOT death-evidence — reading direct
+    /// membership there declared a reachable, actively-messaging primary
+    /// "departed" on every tick while each relayed primary message
+    /// reverted the election, the production "death suspected → message
+    /// resumed" flip-flop. Deliverability and the message-arrival
+    /// liveness reset share one state owner (the transport's routing
+    /// layer): when NOTHING can deliver, nothing arrives either, so the
+    /// two readers agree in both directions.
+    pub(in crate::secondary) fn is_mesh_routable(&self, id: &str) -> bool {
+        self.client
+            .has_route(&dynrunner_protocol_primary_secondary::address::PeerId::from(id))
     }
 
     /// Leg (C) of the primary-death evidence: has the CURRENT PRIMARY
@@ -217,11 +245,16 @@ where
     /// ledger): a dead primary cannot originate its own `PeerRemoved`, and
     /// no surviving secondary originates one for it — the CRDT membership
     /// stays stale on primary death, while the transport view is the
-    /// direct, role-independent death observation (mesh ⊥ role). The
-    /// mesh-pump republishes the view on the primary's QUIC teardown
-    /// (`handle_peer_disconnect`), so `has_peer` flips `false` within one
-    /// pump cycle — regardless of whether THIS node ever issued a
-    /// primary-bound send.
+    /// direct, role-independent death observation (mesh ⊥ role). The read
+    /// is the DELIVERABILITY one (`is_mesh_routable` / `has_route`, NOT
+    /// bare `has_peer`): the primary has "departed" only when the
+    /// transport can no longer deliver to it by ANY path — direct gone
+    /// AND every relay forwarder blacklisted — so a direct-wire-only
+    /// outage with a live relay path does not arm this leg (BUG 3.3).
+    /// The mesh-pump republishes the view on the primary's QUIC teardown
+    /// (`handle_peer_disconnect`) and per drain cycle, so the flip lands
+    /// within one pump cycle of the transport's no-path decision —
+    /// regardless of whether THIS node ever issued a primary-bound send.
     ///
     /// SELF-EXCLUSION: a `current_primary` naming THIS node (a same-peer /
     /// self-promoted primary co-located with the secondary role) is NEVER
@@ -263,7 +296,16 @@ where
             .cluster_state
             .current_primary()
             .filter(|id| *id != self.config.secondary_id.as_str())
-            .map(|id| !self.is_mesh_member(id))
+            // DELIVERABILITY, not direct membership (see
+            // `is_mesh_routable`): a primary whose direct wire died but
+            // who still reaches us via relay has NOT departed — reading
+            // `is_mesh_member` here armed leg (C) on a healthy,
+            // relay-covered link (the BUG 3.3 flip-flop). A genuinely
+            // dead primary flips this too: its wire is gone everywhere,
+            // relays to it bounce, and the transport blacklists every
+            // forwarder for it — `has_route` then reads `false` without
+            // any direct-wire special case.
+            .map(|id| !self.is_mesh_routable(id))
             .unwrap_or(false)
     }
 
@@ -367,7 +409,12 @@ where
             .map(|op| op.peer_keepalives.contains_key(id))
             .unwrap_or(false);
         seen && id != self.config.secondary_id
-            && !self.is_mesh_member(id)
+            // DELIVERABILITY, not direct membership (see
+            // `is_mesh_routable`): a peer still reachable via relay is
+            // not death-evidence — lending agreement to a peer's
+            // election off a direct-wire-only outage is how a single
+            // flapped link gathered a false quorum.
+            && !self.is_mesh_routable(id)
             && !self.node_beacon_fresh(id)
     }
 
@@ -645,8 +692,12 @@ where
         //   (A) genuine-dead-link (fast, SEND-driven): `primary_link.should_arm_failover()`.
         //       The primary-link health window arms ONLY when a
         //       primary-bound send returns a no-route `Err` via
-        //       `send_to_primary` (the connection is closed / no primary
-        //       resolves). A live-but-app-quiet QUIC connection still
+        //       `send_to_primary` — no primary resolves, OR the resolved
+        //       host is unreachable by ANY transport path (no direct
+        //       connection AND no non-blacklisted relay forwarder — the
+        //       `has_route` deliverability gate; a direct-wire-only
+        //       outage with a live relay path queues the send instead,
+        //       BUG 3.3). A live-but-app-quiet QUIC connection still
         //       enqueues sends `Ok` (mpsc to a live writer task), so this
         //       leg stays SILENT during a blip and fires only on a genuine
         //       link death — the honest fast signal, identical to the one

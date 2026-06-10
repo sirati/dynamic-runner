@@ -102,6 +102,53 @@ impl<I: Identifier> Router<I> {
         prune_blacklist(&mut self.failed_forwarders, now);
     }
 
+    /// Deliverability read for one target: would a `send_to_peer(target)`
+    /// find ANY path right now — direct, or via at least one
+    /// non-blacklisted forwarder? Exactly [`crate::relay::route_exists`]
+    /// over this Router's live blacklist, so the answer can never drift
+    /// from what [`Self::send_to_peer`] would actually do.
+    ///
+    /// THE single owner of the link's routability state (BUG 3.3): the
+    /// transport's `PeerTransport::has_route` delegates here, and the
+    /// pump-published membership projection ([`Self::unroutable_ids`])
+    /// is derived from the same predicate.
+    pub fn has_route<C: OutboundChannel<I>>(
+        &self,
+        target: &str,
+        connections: &HashMap<String, C>,
+        now: Instant,
+    ) -> bool {
+        let blacklist = blacklist_for(&self.failed_forwarders, target, now);
+        crate::relay::route_exists(connections, &self.self_id, target, &blacklist)
+    }
+
+    /// The finite set of peer ids this Router can currently DECIDE are
+    /// unroutable: targets with active (within-TTL) blacklist state for
+    /// which [`Self::has_route`] is `false`. Ids with no blacklist
+    /// state are routable iff any other connection exists — a fact a
+    /// reader can derive from the connected id-set alone, which is why
+    /// this projection only needs to name the exceptions. Published by
+    /// the mesh-pump alongside the connected set so detached
+    /// membership-view readers answer `has_route` honestly.
+    pub fn unroutable_ids<C: OutboundChannel<I>>(
+        &self,
+        connections: &HashMap<String, C>,
+        now: Instant,
+    ) -> Vec<String> {
+        let mut targets: Vec<&String> = self
+            .failed_forwarders
+            .keys()
+            .map(|(target, _)| target)
+            .collect();
+        targets.sort();
+        targets.dedup();
+        targets
+            .into_iter()
+            .filter(|t| !self.has_route(t, connections, now))
+            .cloned()
+            .collect()
+    }
+
     /// Originate a send to `target`. Routes via direct or relay,
     /// dispatches via `connections`, commits state on success, and
     /// emits the redial signal when the cooldown gate trips.
@@ -349,5 +396,17 @@ impl<I: Identifier> Router<I> {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn route_state(&self) -> &HashMap<String, PeerRouteState> {
         &self.route_state
+    }
+
+    /// Test-only blacklist injection: record `via` as a bounced
+    /// forwarder for `target`, as if a `RelayBackoff` chain had already
+    /// run. Lets fixtures represent the post-bounce steady state of a
+    /// genuinely unreachable target ("the transport has already learned
+    /// nobody reaches it") without scripting the full backoff exchange.
+    /// Same gating as [`Self::route_state`] — never a production API.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn blacklist_forwarder_for_test(&mut self, target: &str, via: &str) {
+        self.failed_forwarders
+            .insert((target.to_string(), via.to_string()), Instant::now());
     }
 }

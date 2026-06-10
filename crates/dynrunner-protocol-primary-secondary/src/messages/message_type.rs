@@ -99,4 +99,9 @@ pub enum MessageType {
     /// "I couldn't forward your relay; mark me tried and pick
     /// another." Identified by `(original_sender, relay_id)`.
     RelayBackoff,
+    /// Wire-only signal from the non-dial-owning side of a
+    /// member↔member leg to the leg's dial owner: "my end of our wire
+    /// is dead — prune your entry for me and re-dial." Consumed by the
+    /// transport's recv path; the application layer never observes it.
+    RedialRequest,
 }

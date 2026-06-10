@@ -31,6 +31,11 @@
 //!   scenario (~450 lines, intentionally one file: the multi-phase
 //!   setup/partition/drain/heal pump cannot be cleanly chopped
 //!   without scattering the test's invariants).
+//! - [`member_leg_redial`]: the half-open member↔member leg heal
+//!   (run_20260610_221140 / BUG 3.3) — the non-dial-owner's
+//!   `RedialRequest` nudges the dial owner to force-prune + re-dial,
+//!   relay covers directed sends meanwhile; plus the
+//!   genuine-departure stop (roster replacement forgets tracking).
 //!
 //! The shared [`TestId`] is defined here so every sub-module gets
 //! the same `Identifier` impl via `super::TestId`.
@@ -47,6 +52,7 @@ mod cert_parsing;
 mod dial_failure_summary;
 mod dial_sweep;
 mod log_capture;
+mod member_leg_redial;
 mod primary_link;
 mod reader_exit_disconnect;
 mod recv_lifetime;

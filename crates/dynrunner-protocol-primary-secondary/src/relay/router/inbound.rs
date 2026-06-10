@@ -150,6 +150,23 @@ impl<I: Identifier> Router<I> {
         self.failed_forwarders
             .insert((state.target.clone(), failed_via.clone()), clocks.now);
         let blacklist = blacklist_for(&self.failed_forwarders, &state.target, clocks.now);
+        // Routability state transition (the silent-branch rule): if THIS
+        // blacklist entry exhausted the last candidate path to the
+        // target, the link just flipped no-route — the condition the
+        // egress no-route gate and the death-evidence reads key on via
+        // `has_route`. Name it once at the flip; the restore side is
+        // narrated by the existing "peer direct link restored" /
+        // blacklist-TTL expiry (entries age out silently into a re-try).
+        if !crate::relay::route_exists(connections, &self.self_id, &state.target, &blacklist) {
+            tracing::warn!(
+                target: RELAY_LOG_TARGET,
+                target_peer = %state.target,
+                exhausted_forwarder = %failed_via,
+                "peer unroutable: no direct link and every connected \
+                 forwarder is blacklisted for it — sends will no-route \
+                 until a path or the blacklist TTL recovers"
+            );
+        }
         let decision = handle_backoff(
             state,
             connections,

@@ -49,7 +49,8 @@ impl<I> DistributedMessage<I> {
             | Self::SecondaryFatalError { target, .. }
             | Self::ClusterMutation { target, .. }
             | Self::Relay { target, .. }
-            | Self::RelayBackoff { target, .. } => target.as_ref(),
+            | Self::RelayBackoff { target, .. }
+            | Self::RedialRequest { target, .. } => target.as_ref(),
         }
     }
 
@@ -92,7 +93,8 @@ impl<I> DistributedMessage<I> {
             | Self::SecondaryFatalError { target, .. }
             | Self::ClusterMutation { target, .. }
             | Self::Relay { target, .. }
-            | Self::RelayBackoff { target, .. } => target,
+            | Self::RelayBackoff { target, .. }
+            | Self::RedialRequest { target, .. } => target,
         };
         *slot = Some(dst);
     }
@@ -149,7 +151,8 @@ impl<I> DistributedMessage<I> {
             | Self::SecondaryFatalError { target, .. }
             | Self::ClusterMutation { target, .. }
             | Self::Relay { target, .. }
-            | Self::RelayBackoff { target, .. } => target,
+            | Self::RelayBackoff { target, .. }
+            | Self::RedialRequest { target, .. } => target,
         };
         *slot = None;
     }
@@ -187,7 +190,8 @@ impl<I> DistributedMessage<I> {
             | Self::SecondaryFatalError { sender_id, .. }
             | Self::ClusterMutation { sender_id, .. }
             | Self::Relay { sender_id, .. }
-            | Self::RelayBackoff { sender_id, .. } => sender_id,
+            | Self::RelayBackoff { sender_id, .. }
+            | Self::RedialRequest { sender_id, .. } => sender_id,
         }
     }
 
@@ -224,7 +228,8 @@ impl<I> DistributedMessage<I> {
             | Self::SecondaryFatalError { timestamp, .. }
             | Self::ClusterMutation { timestamp, .. }
             | Self::Relay { timestamp, .. }
-            | Self::RelayBackoff { timestamp, .. } => *timestamp,
+            | Self::RelayBackoff { timestamp, .. }
+            | Self::RedialRequest { timestamp, .. } => *timestamp,
         }
     }
 
@@ -381,6 +386,7 @@ impl<I> DistributedMessage<I> {
             Self::ClusterMutation { .. } => MessageType::ClusterMutation,
             Self::Relay { .. } => MessageType::RelayMessage,
             Self::RelayBackoff { .. } => MessageType::RelayBackoff,
+            Self::RedialRequest { .. } => MessageType::RedialRequest,
         }
     }
 }
