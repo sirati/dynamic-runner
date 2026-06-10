@@ -16,6 +16,8 @@ pub mod exit_status;
 pub mod handle;
 
 #[cfg(test)]
+mod custom_message_tests;
+#[cfg(test)]
 mod exit_status_tests;
 
 pub use event::WorkerEvent;

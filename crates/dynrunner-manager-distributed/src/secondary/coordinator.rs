@@ -59,6 +59,18 @@ where
         // Task-completion dispatcher channel; same construction-time
         // installation rationale as `lifecycle_tx`.
         let (task_completed_tx, task_completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Worker custom-message dispatcher channel; built at
+        // construction (like the two above) so the worker-event
+        // bridge has a sender from the first frame — events emitted
+        // before the dispatcher spawns queue on the unbounded channel
+        // and drain on first poll.
+        let (worker_message_tx, worker_message_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Secondary control-plane ingress (the PyO3 `SecondaryHandle`
+        // → operational loop direction). Unbounded for the same
+        // reason as the dispatcher channels: the producing listener
+        // must never block, and the volume is bounded by real
+        // consumer replies (≤ 100 KiB each, API-capped).
+        let (secondary_control_tx, secondary_control_rx) = tokio::sync::mpsc::unbounded_channel();
         // Command channel for the PyO3 `PrimaryHandle` surface.
         // Mirrors `PrimaryCoordinator::new` exactly: bounded capacity
         // sized so a noisy caller can't OOM the secondary, but with
@@ -124,6 +136,12 @@ where
             task_completed_rx: Some(task_completed_rx),
             task_completed_listeners: Vec::new(),
             task_completed_dispatcher_handle: None,
+            worker_message_tx,
+            worker_message_rx: Some(worker_message_rx),
+            worker_message_listeners: Vec::new(),
+            worker_message_dispatcher_handle: None,
+            secondary_control_tx,
+            secondary_control_rx: Some(secondary_control_rx),
             announcer_outbox_tx: None,
             announcer_outbox_rx: None,
             panik_signal_rx: None,
@@ -406,6 +424,30 @@ where
         self.task_completed_listeners.push(listener);
     }
 
+    /// Register a [`crate::worker_messages::WorkerMessageListener`]
+    /// (the consumer's duck-typed `worker_message_listener`
+    /// TaskDefinition hook, bridged through PyO3). Same single-shot,
+    /// pre-`run_until_setup_or_done`-only contract as
+    /// [`Self::register_task_completed_listener`].
+    pub fn register_worker_message_listener(
+        &mut self,
+        listener: Box<dyn crate::worker_messages::WorkerMessageListener>,
+    ) {
+        self.worker_message_listeners.push(listener);
+    }
+
+    /// Clone of the secondary control-plane ingress sender. External
+    /// surfaces (the PyO3 `SecondaryHandle`) queue
+    /// [`super::control::SecondaryControlCommand`]s here; the
+    /// `process_tasks` select drains them on the operational loop's
+    /// own thread (the dispatch-decoupling law — no foreign task ever
+    /// touches the pool).
+    pub fn secondary_control_sender(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedSender<super::control::SecondaryControlCommand> {
+        self.secondary_control_tx.clone()
+    }
+
     /// Accept the per-phase lifecycle hooks for the post-promotion path.
     /// Mirrors the shape `PrimaryCoordinator::run` accepts:
     /// `on_phase_start(&PhaseId)` fires when a phase flips Blocked →
@@ -470,6 +512,16 @@ where
     /// design rationale.
     pub(in crate::secondary) async fn cleanup_task_completed_dispatcher(&mut self) {
         if let Some(handle) = self.task_completed_dispatcher_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    /// Abort + join the worker-message dispatcher task. Mirrors
+    /// [`Self::cleanup_task_completed_dispatcher`] — same
+    /// Drop-vs-explicit cleanup rationale.
+    pub(in crate::secondary) async fn cleanup_worker_message_dispatcher(&mut self) {
+        if let Some(handle) = self.worker_message_dispatcher_handle.take() {
             handle.abort();
             let _ = handle.await;
         }
@@ -1051,6 +1103,8 @@ where
             self.cleanup_lifecycle_dispatcher().await;
             // Independent of `cleanup_lifecycle_dispatcher`.
             self.cleanup_task_completed_dispatcher().await;
+            // Independent of both — same abort-on-exit contract.
+            self.cleanup_worker_message_dispatcher().await;
             result
         }
         .instrument(span)
@@ -1103,6 +1157,18 @@ where
                     .instrument(tracing::Span::current()),
             );
             self.task_completed_dispatcher_handle = Some(handle);
+        }
+        // Same shape for the worker custom-message dispatcher: the
+        // worker-event bridge only `tx.send()`s; the consumer's
+        // `worker_message_listener` (Python, GIL-bound) fires on this
+        // dispatcher task, strictly off the operational loop.
+        if let Some(rx) = self.worker_message_rx.take() {
+            let listeners = std::mem::take(&mut self.worker_message_listeners);
+            let handle = tokio::task::spawn_local(
+                crate::worker_messages::run_worker_message_dispatcher(rx, listeners)
+                    .instrument(tracing::Span::current()),
+            );
+            self.worker_message_dispatcher_handle = Some(handle);
         }
         // Enter `AwaitingPrimary` (`Connecting → AwaitingPrimary`): the
         // secondary is now actively trying to reach a primary, but none

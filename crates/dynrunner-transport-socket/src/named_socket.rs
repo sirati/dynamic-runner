@@ -25,6 +25,10 @@ pub struct NamedSocketManagerEnd {
 struct AcceptedConnection {
     reader: BufReader<tokio::io::ReadHalf<UnixStream>>,
     writer: tokio::io::WriteHalf<UnixStream>,
+    /// Partial-frame state held OUTSIDE the recv future so `recv` is
+    /// cancellation-safe (the `MessageReceiver` contract). See the
+    /// matching field on `SocketpairManagerEnd`.
+    frame_state: dynrunner_protocol_manager_worker::FrameReadState,
 }
 
 impl NamedSocketManagerEnd {
@@ -113,6 +117,7 @@ impl NamedSocketManagerEnd {
         self.connection = Some(AcceptedConnection {
             reader: BufReader::new(read_half),
             writer: write_half,
+            frame_state: dynrunner_protocol_manager_worker::FrameReadState::default(),
         });
         Ok(())
     }
@@ -150,9 +155,14 @@ impl MessageReceiver<Response> for NamedSocketManagerEnd {
         let conn = self.connection.as_mut()?;
         // Bounded framing (#364): an over-limit frame is drained and
         // surfaced as the protocol's loud NonRecoverable error instead
-        // of being consumed replylessly. See
+        // of being consumed replylessly. Cancel-safe via the
+        // connection-held partial-frame state. See
         // `dynrunner_protocol_manager_worker::framing`.
-        dynrunner_protocol_manager_worker::recv_response_bounded(&mut conn.reader).await
+        dynrunner_protocol_manager_worker::ResponseFrameReader {
+            state: &mut conn.frame_state,
+        }
+        .recv(&mut conn.reader)
+        .await
     }
 }
 

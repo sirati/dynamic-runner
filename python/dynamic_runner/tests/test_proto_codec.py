@@ -15,6 +15,8 @@ import unittest
 
 from dynamic_runner.comm import (
     Command,
+    CustomMessageCommand,
+    CustomMessageResponse,
     DoneResponse,
     ErrorResponse,
     ErrorType,
@@ -192,6 +194,86 @@ class ErrorTypeShimTests(unittest.TestCase):
         self.assertEqual(ErrorType.OUT_OF_MEMORY.value, "oom")
         self.assertEqual(ErrorType.NON_RECOVERABLE.value, "non_recoverable")
         self.assertEqual(ErrorType.RECOVERABLE.value, "recoverable")
+
+
+class CustomMessageCodecTests(unittest.TestCase):
+    """Custom-message frames (worker↔secondary consumer channel).
+
+    Round-trips through the shared Rust codec, plus the WIRE-SHAPE
+    MIRROR tests: one side's bytes are built/decoded with PURE PYTHON
+    ``base64`` + ``json`` (never the codec under test), so a frame-
+    shape drift on either side of the cross-language seam fails here
+    instead of round-tripping invisibly. House law: mirror the OTHER
+    side's bytes verbatim.
+    """
+
+    def test_response_roundtrip_with_newline_and_colon_payload(self):
+        resp = CustomMessageResponse("topic:with\ncolons", b"data\nbytes:\x00etc")
+        wire = resp.serialize()
+        self.assertTrue(wire.startswith(b"custom:"))
+        # Exactly one frame-terminating newline — payload newlines are
+        # enveloped, never leak into the framing.
+        self.assertEqual(wire.count(b"\n"), 1)
+        parsed = parse_response(wire.decode())
+        self.assertIsInstance(parsed, CustomMessageResponse)
+        self.assertIsInstance(parsed, Response)
+        self.assertEqual(parsed.topic, "topic:with\ncolons")
+        self.assertEqual(parsed.data, b"data\nbytes:\x00etc")
+
+    def test_command_roundtrip(self):
+        cmd = CustomMessageCommand("reply", b"\xff\xfe payload")
+        wire = cmd.serialize()
+        self.assertTrue(wire.startswith(b"custom:"))
+        parsed = parse_command(wire.decode())
+        self.assertIsInstance(parsed, CustomMessageCommand)
+        self.assertIsInstance(parsed, Command)
+        self.assertEqual(parsed.topic, "reply")
+        self.assertEqual(parsed.data, b"\xff\xfe payload")
+
+    def test_mirror_pure_python_frame_decodes_in_rust(self):
+        """Build the frame with PURE python json+base64 (the documented
+        wire shape: custom:<b64 {"topic", "data_b64"}>\n) and decode it
+        through the Rust parser — the cross-language ingest mirror."""
+        import base64 as _b64
+        import json as _json
+
+        data = b"d:a\nta\x00"
+        body = _json.dumps(
+            {"topic": "t:op\nic", "data_b64": _b64.b64encode(data).decode("ascii")}
+        )
+        frame = "custom:" + _b64.b64encode(body.encode("utf-8")).decode("ascii") + "\n"
+
+        parsed_resp = parse_response(frame)
+        self.assertIsInstance(parsed_resp, CustomMessageResponse)
+        self.assertEqual(parsed_resp.topic, "t:op\nic")
+        self.assertEqual(parsed_resp.data, data)
+
+        parsed_cmd = parse_command(frame)
+        self.assertIsInstance(parsed_cmd, CustomMessageCommand)
+        self.assertEqual(parsed_cmd.topic, "t:op\nic")
+        self.assertEqual(parsed_cmd.data, data)
+
+    def test_mirror_rust_frame_decodes_with_pure_python(self):
+        """Serialize through the Rust codec and decode the bytes with
+        PURE python json+base64 — the cross-language egress mirror."""
+        import base64 as _b64
+        import json as _json
+
+        data = b"raw \xde\xad bytes"
+        wire = CustomMessageResponse("phase4-batch", data).serialize()
+        self.assertTrue(wire.startswith(b"custom:"))
+        self.assertTrue(wire.endswith(b"\n"))
+        body = _b64.b64decode(wire[len(b"custom:"):-1])
+        obj = _json.loads(body)
+        self.assertEqual(set(obj.keys()), {"topic", "data_b64"})
+        self.assertEqual(obj["topic"], "phase4-batch")
+        self.assertEqual(_b64.b64decode(obj["data_b64"]), data)
+
+    def test_malformed_custom_frame_is_loud(self):
+        parsed = parse_response("custom:!!!not-base64!!!\n")
+        self.assertIsInstance(parsed, CustomMessageResponse)
+        self.assertEqual(parsed.topic, "__malformed_custom__")
+
 
 
 if __name__ == "__main__":

@@ -128,6 +128,15 @@ impl<M: ManagerEndpoint> RunnerProtocol<Idle, M> {
             transport: self.transport,
         }
     }
+
+    /// Send a `Command::Custom` to the worker. NOT a state
+    /// transition: custom messages are legal while the worker is
+    /// `Idle` (this impl) AND while it is `Processing` (the sibling
+    /// impl below) — the typed allowance that makes the FSM, not the
+    /// transport, the arbiter of when a custom frame may flow.
+    pub async fn send_custom(&mut self, topic: String, data: Vec<u8>) -> Result<(), String> {
+        self.transport.send(Command::Custom { topic, data }).await
+    }
 }
 
 pub enum AssignResult<M: ManagerEndpoint> {
@@ -139,12 +148,96 @@ pub enum AssignResult<M: ManagerEndpoint> {
 }
 
 impl<M: ManagerEndpoint> RunnerProtocol<Processing, M> {
+    /// Send a `Command::Custom` to the mid-task worker. The
+    /// Processing-state half of the typed custom-message allowance
+    /// (see the `Idle` impl): the unix socket is full-duplex, so the
+    /// write is legal while a task runs — the bytes buffer until the
+    /// worker's `Task.poll_messages()` drains them. Not a state
+    /// transition.
+    pub async fn send_custom(&mut self, topic: String, data: Vec<u8>) -> Result<(), String> {
+        self.transport.send(Command::Custom { topic, data }).await
+    }
+
     /// Poll for the next response from the runner.
     ///
-    /// Returns Completed on done/error, StillRunning on phase/keepalive
-    /// updates, or Disconnected if the connection closed.
+    /// Returns Completed on done/error, StillRunning on
+    /// phase/keepalive/custom updates, or Disconnected if the
+    /// connection closed.
     pub async fn poll_status(mut self) -> PollResult<M> {
-        match self.transport.recv().await {
+        let response = self.transport.recv().await;
+        self.classify_response(response)
+    }
+
+    /// Poll for the next response WHILE ALSO draining a
+    /// secondary→worker custom-message outbox onto the transport.
+    ///
+    /// The unix socket is full-duplex: the manager may write a
+    /// `Command::Custom` while the worker is mid-task (the bytes
+    /// buffer until the worker's `Task.poll_messages()` reads them).
+    /// This is the Processing-state half of the typed `send_custom`
+    /// allowance — the protocol object lives inside the per-task
+    /// poll task while Processing, so outbound customs ride a
+    /// channel the poll task drains here, racing the transport read.
+    ///
+    /// # Cancellation safety
+    ///
+    /// The `select!` drops the losing future before the winning
+    /// arm's body runs. `outbox.recv` is `mpsc` (documented
+    /// cancel-safe). `transport.recv` MUST be cancel-safe per the
+    /// `MessageReceiver` contract — the manager-side socket
+    /// transports satisfy it by holding their partial-frame state
+    /// outside the recv future (`framing::ResponseFrameReader`), so
+    /// a custom send landing mid-frame resumes the same frame on the
+    /// next poll instead of corrupting it.
+    ///
+    /// A send failure on the custom path is logged and swallowed:
+    /// the read side observes the same dead transport on its next
+    /// poll and routes the task through the normal `Disconnected`
+    /// classification — one failure path, not two.
+    pub async fn poll_status_with_custom_outbox(
+        mut self,
+        outbox: &mut tokio::sync::mpsc::UnboundedReceiver<(String, Vec<u8>)>,
+    ) -> PollResult<M> {
+        loop {
+            // Decide-then-act: the select only CHOOSES a step; both
+            // borrowed futures are dropped before the step body
+            // touches the transport again.
+            enum Step {
+                Custom(Option<(String, Vec<u8>)>),
+                Response(Option<Response>),
+            }
+            let step = tokio::select! {
+                biased;
+                custom = outbox.recv() => Step::Custom(custom),
+                response = self.transport.recv() => Step::Response(response),
+            };
+            match step {
+                Step::Custom(Some((topic, data))) => {
+                    if let Err(e) = self.send_custom(topic, data).await {
+                        tracing::warn!(
+                            error = %e,
+                            "custom-message send to mid-task worker failed; the \
+                             read side will classify the dead transport"
+                        );
+                    }
+                }
+                Step::Custom(None) => {
+                    // Outbox sender dropped (slot replacement in
+                    // flight). No more customs can arrive; fall back
+                    // to the plain poll for the remaining lifetime of
+                    // this protocol value.
+                    return self.poll_status().await;
+                }
+                Step::Response(response) => return self.classify_response(response),
+            }
+        }
+    }
+
+    /// Map one received response (or transport close) onto the
+    /// typed [`PollResult`]. The single classification authority for
+    /// both poll entry points above.
+    fn classify_response(self, response: Option<Response>) -> PollResult<M> {
+        match response {
             None => {
                 // Phase D: a worker process dying mid-task without
                 // sending a final Error response is most likely an
@@ -250,18 +343,33 @@ impl<M: ManagerEndpoint> RunnerProtocol<Processing, M> {
                     protocol: self,
                     phase_update: Some(phase_name),
                     got_keepalive: false,
+                    custom_message: None,
                 },
                 Response::Keepalive => PollResult::StillRunning {
                     protocol: self,
                     phase_update: None,
                     got_keepalive: true,
+                    custom_message: None,
                 },
+                Response::Custom { topic, data } => {
+                    // NON-TERMINAL by construction (the #364 lesson):
+                    // a worker streaming custom messages mid-task can
+                    // never perturb the eventual done/error
+                    // attribution — the task stays Processing.
+                    PollResult::StillRunning {
+                        protocol: self,
+                        phase_update: None,
+                        got_keepalive: false,
+                        custom_message: Some((topic, data)),
+                    }
+                }
                 Response::Ready => {
                     // Spurious ready during processing — ignore
                     PollResult::StillRunning {
                         protocol: self,
                         phase_update: None,
                         got_keepalive: false,
+                        custom_message: None,
                     }
                 }
             },
@@ -281,6 +389,10 @@ pub enum PollResult<M: ManagerEndpoint> {
         protocol: RunnerProtocol<Processing, M>,
         phase_update: Option<String>,
         got_keepalive: bool,
+        /// `Some((topic, data))` when the non-terminal response was a
+        /// worker→secondary `Response::Custom`. Surfaced by the pool's
+        /// poll loop as `WorkerEvent::CustomMessage`.
+        custom_message: Option<(String, Vec<u8>)>,
     },
     Disconnected {
         result: TaskResult,

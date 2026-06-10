@@ -160,6 +160,29 @@ TaskCompletedListener = Callable[
 ]
 
 
+# Type alias for the optional `worker_message_listener` task attribute.
+# Fired ON THE SECONDARY hosting the sending worker, once per
+# `Task.send_message(topic, data)` frame, with
+# `(worker_id, type_id, topic, data, secondary_handle)`:
+#   - `worker_id`: the pool slot of the sending worker (an `int`).
+#   - `type_id`: the `TypeId` of the task the worker was running when
+#     it sent the message (which worker *kind* is talking).
+#   - `topic`: the consumer routing key, verbatim — the framework
+#     never interprets it.
+#   - `data`: the opaque payload `bytes`
+#     (≤ `CUSTOM_MESSAGE_MAX_BYTES`, 100 KiB).
+#   - `secondary_handle`: a `SecondaryHandle` — the listener replies
+#     via `secondary_handle.send_to_worker(worker_id, topic, data)`
+#     (the worker drains replies via `Task.poll_messages()`), and —
+#     once feature 5 lands — relays cluster-wide via
+#     `send_to_primary(topic, data, important=...)`.
+# Messages from one worker arrive in send order. The listener runs on
+# the secondary's worker-message dispatcher task (off the operational
+# loop) with panic + `PyErr` isolation — the `task_completed_listener`
+# idiom.
+WorkerMessageListener = Callable[[int, str, str, bytes, object], None]
+
+
 PhaseId = str
 TypeId = str
 AffinityId = str
@@ -313,3 +336,14 @@ class TaskDefinition(Protocol):
     # listener can never stall the apply path or tear the dispatcher
     # task down. Absent or ``None`` opts out.
     task_completed_listener: Optional[TaskCompletedListener]
+
+    # Optional worker custom-message listener attribute.
+    #
+    # When the task exposes ``worker_message_listener`` as a callable
+    # matching :data:`WorkerMessageListener`, the framework registers
+    # it on each SECONDARY's worker-message dispatcher. The listener
+    # fires once per ``Task.send_message`` frame from that secondary's
+    # own workers (in per-worker send order), off the operational
+    # loop, with panic + ``PyErr`` isolation — same contract as
+    # ``task_completed_listener``. Absent or non-callable opts out.
+    worker_message_listener: Optional[WorkerMessageListener]

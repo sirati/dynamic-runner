@@ -15,6 +15,7 @@ pub mod runtime_watchdog;
 pub mod secondary;
 pub mod state;
 pub mod task_completed;
+pub mod worker_messages;
 pub mod worker_signal;
 pub mod zip_extract;
 

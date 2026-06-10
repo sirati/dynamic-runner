@@ -88,6 +88,7 @@
 #![cfg(test)]
 
 mod anti_entropy_heal;
+mod custom_messages;
 mod deferrer_membership_death;
 mod failover_beacon_union;
 mod failover_lone_survivor;

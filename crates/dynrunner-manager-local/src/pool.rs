@@ -919,6 +919,8 @@ mod orphan_poll_task_tests {
                 loop {
                     match MessageReceiver::<Command>::recv(&mut runner).await {
                         Some(Command::Stop) => break,
+                        // Test fixtures ignore consumer custom messages.
+                        Some(Command::Custom { .. }) => {}
                         Some(Command::ProcessTask { .. }) => {
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                             let _ = runner.send(Response::Done { result_data: None }).await;
@@ -1243,6 +1245,8 @@ mod orphan_poll_task_tests {
                 loop {
                     match MessageReceiver::<Command>::recv(&mut runner).await {
                         Some(Command::Stop) => break,
+                        // Test fixtures ignore consumer custom messages.
+                        Some(Command::Custom { .. }) => {}
                         Some(Command::ProcessTask { .. }) => {
                             let _ = runner.send(Response::Done { result_data: None }).await;
                         }
