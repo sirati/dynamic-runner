@@ -255,6 +255,23 @@ where
         .await
     }
 
+    /// Re-arm the pre-`Operational` setup deadline iff `sender` is the
+    /// primary (the warm `current_primary` or, while the role table is
+    /// cold, the bootstrap-dialled primary id — the SAME resolution the
+    /// egress edge uses). A frame from any OTHER peer (a sibling's digest
+    /// beacon, a relayed snapshot) is NOT primary liveness and must not
+    /// keep a primary-less secondary alive past its deadline — the
+    /// "setup deadline elapsed despite peers reachable" exit stays honest.
+    fn note_setup_primary_liveness(&self, sender: &str) {
+        let is_primary = match self.cluster_state.current_primary() {
+            Some(p) => p == sender,
+            None => self.bootstrap_primary_id.as_deref() == Some(sender),
+        };
+        if is_primary {
+            self.setup_deadline.extend();
+        }
+    }
+
     /// Receive the next setup frame, draining the run-config backstop's
     /// backlog first. The backstop (see
     /// [`Self::finalize_run_config_before_workers`]) may have pulled
@@ -645,6 +662,18 @@ where
             };
             match received {
                 Some(msg) => {
+                    // Primary-liveness evidence FIRST, for EVERY frame shape
+                    // (directed or broadcast — any frame from the primary
+                    // proves it alive): re-arm the pre-`Operational`
+                    // deadline so it measures PRIMARY SILENCE, never
+                    // slow-fleet assembly. Deliberately a DIFFERENT
+                    // predicate from the welcome-receipt proof above (which
+                    // requires a DIRECTED frame): a broadcast cannot prove
+                    // the welcome landed, but it absolutely proves the
+                    // primary is alive and assembling — exactly what the
+                    // deadline exists to detect the absence of. See
+                    // `setup_deadline.rs` for the LMU fleet-death replay.
+                    self.note_setup_primary_liveness(msg.sender_id());
                     // Run-config PUSH is PRE-ANNOUNCE config delivery: it
                     // fires from the primary's welcome handler, BEFORE the
                     // PeerInfo/InitialAssignment/TransferComplete announce

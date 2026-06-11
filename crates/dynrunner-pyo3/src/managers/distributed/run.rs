@@ -108,7 +108,17 @@ impl PyDistributedManager {
         }
         let dist_keepalive = self.distributed_config.keepalive_interval();
         let dist_peer_timeout = self.distributed_config.peer_timeout();
-        let dist_connect_timeout = self.distributed_config.connect_timeout();
+        // The PRIMARY's quorum-proceed (straggler) window is DERIVED (unset
+        // → scale-aware `max(60, n*15)`; explicit → honored; both capped
+        // strictly below the secondaries' `unconfigured_deadline`). The
+        // in-process mesh has no bootstrap dial, so this is the knob's only
+        // consumer here. See
+        // `dynrunner_manager_distributed::derive_connect_timeout`.
+        let dist_connect_timeout = dynrunner_manager_distributed::derive_connect_timeout(
+            self.distributed_config.connect_timeout_override(),
+            num_secondaries,
+            self.distributed_config.unconfigured_deadline(),
+        );
         let dist_keepalive_miss_threshold = self.distributed_config.keepalive_miss_threshold();
         let dist_retry_max_passes = self.distributed_config.retry_max_passes();
         let dist_oom_retry_max_passes = self.distributed_config.oom_retry_max_passes();
