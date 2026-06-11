@@ -35,7 +35,7 @@ use std::time::Duration;
 /// never exercises the kernel-OOM reclassifier, so `kernel_oom_recent`
 /// always reads false and the NonRecoverable disconnect classification
 /// is untouched.
-fn test_oom_watcher() -> OomWatcher {
+pub(super) fn test_oom_watcher() -> OomWatcher {
     OomWatcher::new_with_workers_cgroup(
         OomWatcherConfig {
             sample_interval: Duration::from_millis(50),
@@ -48,7 +48,7 @@ fn test_oom_watcher() -> OomWatcher {
 }
 
 /// Single-worker production-shaped config (mirrors generation_gate.rs).
-fn one_worker_config(secondary_id: &str) -> SecondaryConfig {
+pub(super) fn one_worker_config(secondary_id: &str) -> SecondaryConfig {
     SecondaryConfig {
         secondary_id: secondary_id.into(),
         num_workers: 1,
@@ -83,7 +83,7 @@ fn one_worker_config(secondary_id: &str) -> SecondaryConfig {
 /// Build a wire `TaskAssignment` for `binary`, keyed by `file_hash`,
 /// targeting `worker_id` on `sec_id`. The `sender_id` is the (bootstrap)
 /// primary so the inbound-message liveness pre-amble is satisfied.
-fn task_assignment(
+pub(super) fn task_assignment(
     sender_id: &str,
     sec_id: &str,
     worker_id: u32,

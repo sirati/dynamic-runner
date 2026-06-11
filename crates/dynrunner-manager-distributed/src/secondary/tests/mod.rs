@@ -92,6 +92,7 @@
 
 #![cfg(test)]
 
+mod abort_gates;
 mod anti_entropy_heal;
 mod custom_messages;
 mod dead_worker_spin;
