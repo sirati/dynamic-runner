@@ -77,6 +77,26 @@
 //! `TaskHoldResponse` has is the same one EVERY inbound frame has — the
 //! `dispatch_message` preamble's `record_keepalive` — which is the
 //! generic ingest concern, not this module's.
+//!
+//! # One INFO line per sweep, not per task
+//!
+//! On a big cluster one sweep can launch hundreds of probes whose
+//! verdicts land moments later — per-task INFO lines flooded the
+//! operator log (~200 lines in one observed production second). The
+//! prober therefore aggregates logging per SWEEP COHORT: the probes
+//! launched by one poll tick form a cohort (per-task launch detail at
+//! DEBUG), verdicts are tallied against it, and ONE INFO summary line
+//! is emitted when the cohort fully resolves OR at the next due poll
+//! tick, whichever comes first. Stragglers are counted as "no answer
+//! (left to the silence machinery)" at emission; a verdict landing
+//! after the flush is logged as a DEBUG late correction
+//! (`late_after_sweep_summary`). The state-changing outcomes stay
+//! attributable at INFO: the not-held (failed + requeued) and
+//! no-answer task hashes ride inline in the aggregate line itself,
+//! capped with a "+K more" tail; full per-task detail rides DEBUG.
+//! Cohort accounting is LOG BOOKKEEPING ONLY — probe timing, verdict
+//! adjudication, and the response-window semantics are untouched by
+//! it.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -134,6 +154,80 @@ pub(crate) enum ProbeVerdict {
     Ignored,
 }
 
+/// One sweep cohort's resolved tallies — the payload of the single
+/// per-sweep INFO summary line (see the module doc's "One INFO line
+/// per sweep" section).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SweepSummary {
+    /// How many probes the sweep launched (tasks past the deadline).
+    pub(crate) total: usize,
+    /// How many holders confirmed (deadline re-armed).
+    pub(crate) held: usize,
+    /// Task hashes whose holder denied holding them (failed +
+    /// requeued) — the state-changing outcome, attributable at INFO.
+    pub(crate) lost: Vec<String>,
+    /// Task hashes with no verdict by emission time — left to the
+    /// silence machinery; a verdict that still arrives is reported as
+    /// a DEBUG late correction.
+    pub(crate) no_answer: Vec<String>,
+}
+
+/// What one due poll tick produced: the probes to send, plus the
+/// PREVIOUS sweep's summary when this tick flushed it (the cohort had
+/// not fully resolved by the time the next tick arrived).
+#[derive(Debug)]
+pub(crate) struct SweepTick {
+    pub(crate) probes: Vec<ProbeRequest>,
+    pub(crate) flushed: Option<SweepSummary>,
+}
+
+/// One adjudicated `TaskHoldResponse`, plus its sweep-cohort log
+/// bookkeeping (aggregation only — never probe semantics).
+#[derive(Debug)]
+pub(crate) struct VerdictOutcome {
+    pub(crate) verdict: ProbeVerdict,
+    /// `true` when the verdict's cohort summary was already emitted
+    /// (the task was counted as no-answer there); the caller logs the
+    /// verdict as a late DEBUG correction.
+    pub(crate) late: bool,
+    /// `Some` when this verdict resolved the LAST outstanding member
+    /// of the live cohort — the caller emits the summary now instead
+    /// of waiting for the next tick's flush.
+    pub(crate) completed: Option<SweepSummary>,
+}
+
+impl VerdictOutcome {
+    fn ignored() -> Self {
+        Self {
+            verdict: ProbeVerdict::Ignored,
+            late: false,
+            completed: None,
+        }
+    }
+}
+
+/// The live (not yet emitted) sweep cohort: tallies accumulate as
+/// verdicts land; `pending` empties toward completion.
+struct SweepCohort {
+    total: usize,
+    held: usize,
+    lost: Vec<String>,
+    pending: Vec<String>,
+}
+
+impl SweepCohort {
+    /// Close the cohort: anything still pending is "no answer" as of
+    /// emission time.
+    fn into_summary(self) -> SweepSummary {
+        SweepSummary {
+            total: self.total,
+            held: self.held,
+            lost: self.lost,
+            no_answer: self.pending,
+        }
+    }
+}
+
 /// Per-task tracking state. One entry per in-flight ledger entry,
 /// synced from the ledger on every full poll.
 struct TrackedTask {
@@ -176,6 +270,10 @@ pub(crate) struct ReconciliationProber {
     /// `None` until the first poll (the first poll is always due).
     next_poll: Option<Instant>,
     tracked: HashMap<String, TrackedTask>,
+    /// The most recent sweep's cohort, while it is still collecting
+    /// verdicts toward its one summary line. LOG BOOKKEEPING ONLY —
+    /// never consulted by the probe-timing or verdict logic.
+    cohort: Option<SweepCohort>,
 }
 
 impl ReconciliationProber {
@@ -185,6 +283,7 @@ impl ReconciliationProber {
             response_window,
             next_poll: None,
             tracked: HashMap::new(),
+            cohort: None,
         }
     }
 
@@ -209,11 +308,24 @@ impl ReconciliationProber {
     /// outstanding probe) is dropped here. A task whose HOLDER changed
     /// (requeued + re-dispatched between polls) is reset to a fresh
     /// deadline against the new holder.
-    pub(crate) fn poll(&mut self, now: Instant, view: &[(&str, &str)]) -> Vec<ProbeRequest> {
+    pub(crate) fn poll(&mut self, now: Instant, view: &[(&str, &str)]) -> SweepTick {
         if !self.poll_due(now) {
-            return Vec::new();
+            return SweepTick {
+                probes: Vec::new(),
+                flushed: None,
+            };
         }
         self.next_poll = Some(now + POLL_CADENCE);
+
+        // Flush the previous sweep's cohort, if it did not fully
+        // resolve before this tick: its summary is emitted now, with
+        // the still-pending members counted as no-answer. A verdict
+        // that lands after this flush is reported late at DEBUG by the
+        // caller. (A task that left the view in between — terminal
+        // raced in — also lands in no-answer: it never answered the
+        // probe before emission; its real outcome is attributed by the
+        // terminal path's own logs.)
+        let flushed = self.cohort.take().map(SweepCohort::into_summary);
 
         // Drop tracking for tasks no longer in flight (terminal landed,
         // dead-secondary requeue, etc. — every removal from the ledger
@@ -273,28 +385,46 @@ impl ReconciliationProber {
                 }
             }
         }
-        fired
+        // The probes launched by THIS tick form the new sweep cohort
+        // (none exists here: completion emits eagerly via
+        // `on_response`, and an unresolved one was flushed above).
+        if !fired.is_empty() {
+            self.cohort = Some(SweepCohort {
+                total: fired.len(),
+                held: 0,
+                lost: Vec::new(),
+                pending: fired.iter().map(|p| p.task_hash.clone()).collect(),
+            });
+        }
+        SweepTick {
+            probes: fired,
+            flushed,
+        }
     }
 
     /// Adjudicate one `TaskHoldResponse`. Only a response that matches
     /// an OUTSTANDING probe from the SAME holder counts; everything
     /// else is [`ProbeVerdict::Ignored`] (stale answers from a previous
     /// holder, duplicates after the verdict already landed, responses
-    /// to a prior primary's probes after failover).
+    /// to a prior primary's probes after failover). A counted verdict
+    /// is additionally tallied against the live sweep cohort (log
+    /// aggregation only): resolving its last pending member returns
+    /// the completed [`SweepSummary`] for immediate emission, and a
+    /// verdict for an already-flushed cohort is flagged `late`.
     pub(crate) fn on_response(
         &mut self,
         task_hash: &str,
         responder: &str,
         held: bool,
         now: Instant,
-    ) -> ProbeVerdict {
+    ) -> VerdictOutcome {
         let Some(entry) = self.tracked.get_mut(task_hash) else {
-            return ProbeVerdict::Ignored;
+            return VerdictOutcome::ignored();
         };
         if entry.outstanding.is_none() || entry.holder != responder {
-            return ProbeVerdict::Ignored;
+            return VerdictOutcome::ignored();
         }
-        if held {
+        let verdict = if held {
             // Long build: confirmed alive-and-held. Re-arm a full
             // window; the task survives any number of these.
             entry.outstanding = None;
@@ -306,8 +436,80 @@ impl ReconciliationProber {
             // re-dispatch re-enters tracking fresh via view sync.
             self.tracked.remove(task_hash);
             ProbeVerdict::Lost
+        };
+
+        // Sweep-cohort tally (log bookkeeping only). A verdict whose
+        // cohort was already flushed (counted there as no-answer) is
+        // `late`; the caller logs the correction at DEBUG.
+        let mut late = true;
+        let mut completed = None;
+        if let Some(cohort) = self.cohort.as_mut()
+            && let Some(idx) = cohort.pending.iter().position(|h| h == task_hash)
+        {
+            cohort.pending.swap_remove(idx);
+            late = false;
+            match verdict {
+                ProbeVerdict::Rearmed => cohort.held += 1,
+                ProbeVerdict::Lost => cohort.lost.push(task_hash.to_string()),
+                ProbeVerdict::Ignored => unreachable!("ignored returns early above"),
+            }
+            if cohort.pending.is_empty() {
+                completed = self.cohort.take().map(SweepCohort::into_summary);
+            }
+        }
+        VerdictOutcome {
+            verdict,
+            late,
+            completed,
         }
     }
+}
+
+/// This module's tracing target — the log-shape tests scope their
+/// capture to it.
+#[cfg(test)]
+pub(crate) const LOG_TARGET: &str = module_path!();
+
+/// How many task hashes the per-sweep summary line carries inline per
+/// category before collapsing into a "+K more" tail — keeps the line
+/// bounded on big clusters while a state-changing verdict stays
+/// attributable at INFO (full detail is at DEBUG).
+const SUMMARY_HASH_CAP: usize = 8;
+
+/// Render up to [`SUMMARY_HASH_CAP`] hashes (`"-"` when empty,
+/// `"+K more"` past the cap) for the per-sweep summary line.
+fn capped_hashes(hashes: &[String]) -> String {
+    if hashes.is_empty() {
+        return "-".into();
+    }
+    let mut rendered = hashes
+        .iter()
+        .take(SUMMARY_HASH_CAP)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if hashes.len() > SUMMARY_HASH_CAP {
+        rendered.push_str(&format!(" (+{} more)", hashes.len() - SUMMARY_HASH_CAP));
+    }
+    rendered
+}
+
+/// Emit ONE sweep's aggregate — the only INFO line this module ever
+/// logs (per-task launch + verdict detail is DEBUG). Called from both
+/// emission sites: the tick that flushed an unresolved cohort, and the
+/// verdict that resolved a cohort's last pending member.
+fn log_sweep_summary(summary: &SweepSummary) {
+    tracing::info!(
+        not_held_tasks = %capped_hashes(&summary.lost),
+        no_answer_tasks = %capped_hashes(&summary.no_answer),
+        "{} tasks past the reconciliation deadline; {} holders confirmed \
+         (re-armed), {} not held (failed + requeued), {} no answer (left \
+         to the silence machinery)",
+        summary.total,
+        summary.held,
+        summary.lost.len(),
+        summary.no_answer.len(),
+    );
 }
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
@@ -317,7 +519,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// best-effort: the response window expires with silence and the
     /// task's deadline re-arms, so an undeliverable probe is naturally
     /// retried a full window later (an UNREACHABLE holder is the
-    /// silence machinery's concern, not this one's).
+    /// silence machinery's concern, not this one's). The tick is also
+    /// one of the two per-sweep summary emission points: a previous
+    /// sweep that did not fully resolve is flushed here as the one
+    /// INFO aggregate line (see the module doc).
     pub(crate) async fn reconciliation_probe_tick(&mut self) {
         let now = Instant::now();
         // Cheap early-out BEFORE building the view — the operational
@@ -325,7 +530,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         if !self.recon_prober.poll_due(now) {
             return;
         }
-        let probes = {
+        let tick = {
             let view: Vec<(&str, &str)> = self
                 .in_flight
                 .iter()
@@ -333,8 +538,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 .collect();
             self.recon_prober.poll(now, &view)
         };
-        for probe in probes {
-            tracing::info!(
+        // The previous sweep did not fully resolve before this tick:
+        // emit its one INFO summary now (stragglers as no-answer).
+        if let Some(summary) = tick.flushed {
+            log_sweep_summary(&summary);
+        }
+        for probe in tick.probes {
+            tracing::debug!(
                 task_hash = %probe.task_hash,
                 holder = %probe.holder,
                 timeout_s = self.config.task_reconciliation_timeout.as_secs_f64(),
@@ -379,6 +589,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// re-consulted at verdict time so a terminal that raced the
     /// response in (or a re-dispatch to a different holder) makes the
     /// verdict a safe no-op.
+    ///
+    /// Per-task verdict detail logs at DEBUG; the verdict that resolves
+    /// the sweep cohort's last pending member emits the one INFO
+    /// aggregate line here (the other emission point is the next
+    /// tick's flush — see the module doc).
     pub(super) async fn handle_task_hold_response(
         &mut self,
         msg: DistributedMessage<I>,
@@ -394,14 +609,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         else {
             return;
         };
-        let verdict = self
+        let outcome = self
             .recon_prober
             .on_response(&task_hash, &sender_id, held, Instant::now());
-        match verdict {
+        // This verdict resolved the sweep cohort's last pending member:
+        // emit the one INFO summary now (regardless of how the verdict
+        // body below plays out — the tally already counted it).
+        if let Some(summary) = outcome.completed {
+            log_sweep_summary(&summary);
+        }
+        match outcome.verdict {
             ProbeVerdict::Rearmed => {
-                tracing::info!(
+                tracing::debug!(
                     task_hash = %task_hash,
                     holder = %sender_id,
+                    late_after_sweep_summary = outcome.late,
                     "reconciliation probe verdict: HELD — the holder confirms \
                      the task is still in its bookkeeping (a long task); \
                      deadline re-armed"
@@ -442,10 +664,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 }
                 let worker_id = entry.local_worker_id.unwrap_or(0);
                 let secondary_id = entry.secondary_id.clone();
-                tracing::error!(
+                tracing::debug!(
                     task_hash = %task_hash,
                     holder = %secondary_id,
                     worker_id,
+                    late_after_sweep_summary = outcome.late,
                     "reconciliation probe verdict: NOT HELD — the holder \
                      denies holding the task; its terminal will never come \
                      (lost terminal / sweep bug / stranded bookkeeping). \
@@ -501,7 +724,7 @@ mod tests {
         let step = Duration::from_secs(5);
         let mut fired = Vec::new();
         while t.duration_since(start) <= TIMEOUT + step {
-            fired.extend(p.poll(t, &view));
+            fired.extend(p.poll(t, &view).probes);
             if t.duration_since(start) < TIMEOUT {
                 assert!(
                     fired.is_empty(),
@@ -530,16 +753,16 @@ mod tests {
         let start = Instant::now();
         let mut p = prober();
 
-        assert!(p.poll(start, &[("hash-a", "sec-0")]).is_empty());
+        assert!(p.poll(start, &[("hash-a", "sec-0")]).probes.is_empty());
         // Terminal lands well before the deadline: the task leaves the
         // view.
         let t1 = start + Duration::from_secs(60);
-        assert!(p.poll(t1, &[]).is_empty());
+        assert!(p.poll(t1, &[]).probes.is_empty());
         // Far beyond the original deadline: still nothing (the entry
         // was dropped at sync, not left to rot).
         let t2 = start + 3 * TIMEOUT;
         assert!(
-            p.poll(t2, &[]).is_empty(),
+            p.poll(t2, &[]).probes.is_empty(),
             "a completed task must never be probed"
         );
     }
@@ -553,28 +776,30 @@ mod tests {
         let start = Instant::now();
         let mut p = prober();
         let view = [("hash-a", "sec-0")];
-        assert!(p.poll(start, &view).is_empty());
+        assert!(p.poll(start, &view).probes.is_empty());
 
         let mut probe_at = start + TIMEOUT;
         for round in 0..3 {
             // Just before this round's deadline: no fire.
             let near = probe_at - Duration::from_secs(1);
             assert!(
-                p.poll(near, &view).is_empty(),
+                p.poll(near, &view).probes.is_empty(),
                 "round {round}: must not fire before the re-armed deadline"
             );
             // At the deadline: exactly one probe.
-            let fired = p.poll(probe_at, &view);
+            let fired = p.poll(probe_at, &view).probes;
             assert_eq!(fired.len(), 1, "round {round}: one probe at the deadline");
             // While outstanding, no duplicate probe.
             assert!(
-                p.poll(probe_at + Duration::from_secs(2), &view).is_empty(),
+                p.poll(probe_at + Duration::from_secs(2), &view)
+                    .probes
+                    .is_empty(),
                 "round {round}: no duplicate probe while one is outstanding"
             );
             // The holder confirms: re-arm.
             let answered = probe_at + Duration::from_secs(5);
             assert_eq!(
-                p.on_response("hash-a", "sec-0", true, answered),
+                p.on_response("hash-a", "sec-0", true, answered).verdict,
                 ProbeVerdict::Rearmed,
                 "round {round}: held => re-arm, never a verdict"
             );
@@ -591,7 +816,7 @@ mod tests {
         let mut p = prober();
         let view = [("hash-a", "sec-0")];
         p.poll(start, &view);
-        let fired = p.poll(start + TIMEOUT, &view);
+        let fired = p.poll(start + TIMEOUT, &view).probes;
         assert_eq!(fired.len(), 1);
         assert_eq!(
             p.on_response(
@@ -599,7 +824,8 @@ mod tests {
                 "sec-0",
                 false,
                 start + TIMEOUT + Duration::from_secs(1)
-            ),
+            )
+            .verdict,
             ProbeVerdict::Lost
         );
         // The verdict already landed; a duplicate response is ignored.
@@ -609,7 +835,8 @@ mod tests {
                 "sec-0",
                 false,
                 start + TIMEOUT + Duration::from_secs(2)
-            ),
+            )
+            .verdict,
             ProbeVerdict::Ignored
         );
     }
@@ -626,26 +853,28 @@ mod tests {
         let view = [("hash-a", "sec-0")];
         p.poll(start, &view);
         let t_fire = start + TIMEOUT;
-        assert_eq!(p.poll(t_fire, &view).len(), 1);
+        assert_eq!(p.poll(t_fire, &view).probes.len(), 1);
 
         // The response window expires with silence: no probe, no
         // verdict — and the deadline re-arms from the expiry.
         let t_expire = t_fire + RESPONSE_WINDOW;
-        assert!(p.poll(t_expire, &view).is_empty());
+        assert!(p.poll(t_expire, &view).probes.is_empty());
         // A response arriving AFTER the window closed is ignored (no
         // outstanding probe any more).
         assert_eq!(
-            p.on_response("hash-a", "sec-0", false, t_expire + Duration::from_secs(1)),
+            p.on_response("hash-a", "sec-0", false, t_expire + Duration::from_secs(1))
+                .verdict,
             ProbeVerdict::Ignored,
             "late response after the window must not produce a verdict"
         );
         // Just before the re-armed deadline: nothing.
         assert!(
             p.poll(t_expire + TIMEOUT - Duration::from_secs(1), &view)
+                .probes
                 .is_empty()
         );
         // A full window after the expiry: probed again.
-        assert_eq!(p.poll(t_expire + TIMEOUT, &view).len(), 1);
+        assert_eq!(p.poll(t_expire + TIMEOUT, &view).probes.len(), 1);
     }
 
     /// A holder CHANGE between polls (requeue → re-dispatch elsewhere)
@@ -657,14 +886,15 @@ mod tests {
         let mut p = prober();
         p.poll(start, &[("hash-a", "sec-0")]);
         let t_fire = start + TIMEOUT;
-        assert_eq!(p.poll(t_fire, &[("hash-a", "sec-0")]).len(), 1);
+        assert_eq!(p.poll(t_fire, &[("hash-a", "sec-0")]).probes.len(), 1);
 
         // Re-dispatched to sec-1 before sec-0 answered.
         let t_moved = t_fire + Duration::from_secs(2);
-        assert!(p.poll(t_moved, &[("hash-a", "sec-1")]).is_empty());
+        assert!(p.poll(t_moved, &[("hash-a", "sec-1")]).probes.is_empty());
         // sec-0's late answer must not adjudicate sec-1's assignment.
         assert_eq!(
-            p.on_response("hash-a", "sec-0", false, t_moved + Duration::from_secs(1)),
+            p.on_response("hash-a", "sec-0", false, t_moved + Duration::from_secs(1))
+                .verdict,
             ProbeVerdict::Ignored,
             "a previous holder's stale denial must never fail the \
              re-dispatched assignment"
@@ -675,9 +905,10 @@ mod tests {
                 t_moved + TIMEOUT - Duration::from_secs(1),
                 &[("hash-a", "sec-1")]
             )
+            .probes
             .is_empty()
         );
-        let fired = p.poll(t_moved + TIMEOUT, &[("hash-a", "sec-1")]);
+        let fired = p.poll(t_moved + TIMEOUT, &[("hash-a", "sec-1")]).probes;
         assert_eq!(
             fired,
             vec![ProbeRequest {
@@ -695,13 +926,14 @@ mod tests {
         let start = Instant::now();
         let mut p = prober();
         assert_eq!(
-            p.on_response("hash-x", "sec-0", false, start),
+            p.on_response("hash-x", "sec-0", false, start).verdict,
             ProbeVerdict::Ignored
         );
         // Tracked but no probe outstanding: also ignored.
         p.poll(start, &[("hash-a", "sec-0")]);
         assert_eq!(
-            p.on_response("hash-a", "sec-0", false, start + Duration::from_secs(5)),
+            p.on_response("hash-a", "sec-0", false, start + Duration::from_secs(5))
+                .verdict,
             ProbeVerdict::Ignored
         );
     }
@@ -721,7 +953,170 @@ mod tests {
         assert!(p.poll_due(start + POLL_CADENCE));
         // Deadline at TIMEOUT, polled slightly late by the cadence: the
         // probe still fires on the first due poll past it.
-        let fired = p.poll(start + TIMEOUT + POLL_CADENCE, &[("hash-a", "sec-0")]);
+        let fired = p
+            .poll(start + TIMEOUT + POLL_CADENCE, &[("hash-a", "sec-0")])
+            .probes;
         assert_eq!(fired.len(), 1);
+    }
+
+    /// Sweep-cohort aggregation, all-held: the LAST verdict of the
+    /// cohort returns the completed summary (emitted immediately, not
+    /// at the next tick); earlier verdicts return nothing.
+    #[test]
+    fn all_held_cohort_completes_on_last_verdict() {
+        let start = Instant::now();
+        let mut p = prober();
+        let view = [("hash-a", "sec-0"), ("hash-b", "sec-1")];
+        let armed = p.poll(start, &view);
+        assert!(armed.probes.is_empty() && armed.flushed.is_none());
+
+        let tick = p.poll(start + TIMEOUT, &view);
+        assert_eq!(tick.probes.len(), 2, "both tasks past the deadline");
+        assert!(tick.flushed.is_none(), "no previous cohort to flush");
+
+        let t = start + TIMEOUT + Duration::from_secs(1);
+        let first = p.on_response("hash-a", "sec-0", true, t);
+        assert_eq!(first.verdict, ProbeVerdict::Rearmed);
+        assert!(!first.late, "counted into the live cohort");
+        assert!(
+            first.completed.is_none(),
+            "cohort still has a pending member"
+        );
+
+        let second = p.on_response("hash-b", "sec-1", true, t);
+        assert_eq!(second.verdict, ProbeVerdict::Rearmed);
+        assert!(!second.late);
+        assert_eq!(
+            second.completed.expect("last verdict completes the cohort"),
+            SweepSummary {
+                total: 2,
+                held: 2,
+                lost: vec![],
+                no_answer: vec![],
+            }
+        );
+    }
+
+    /// Mixed sweep with a straggler: the cohort does not complete, so
+    /// the NEXT due tick flushes it — held and lost tallied from their
+    /// verdicts, the straggler counted as no-answer at emission.
+    #[test]
+    fn unresolved_cohort_flushes_at_next_tick_with_straggler_as_no_answer() {
+        let start = Instant::now();
+        let mut p = prober();
+        let view = [
+            ("hash-a", "sec-0"),
+            ("hash-b", "sec-0"),
+            ("hash-c", "sec-0"),
+        ];
+        p.poll(start, &view);
+        let tick = p.poll(start + TIMEOUT, &view);
+        assert_eq!(tick.probes.len(), 3);
+
+        let t = start + TIMEOUT + Duration::from_millis(100);
+        assert!(p.on_response("hash-a", "sec-0", true, t).completed.is_none());
+        let lost = p.on_response("hash-b", "sec-0", false, t);
+        assert_eq!(lost.verdict, ProbeVerdict::Lost);
+        assert!(lost.completed.is_none(), "hash-c is still pending");
+
+        // Next due tick (hash-b left the view via the fail+requeue):
+        // the unresolved cohort is flushed.
+        let t_next = start + TIMEOUT + POLL_CADENCE;
+        let next = p.poll(t_next, &[("hash-a", "sec-0"), ("hash-c", "sec-0")]);
+        assert!(next.probes.is_empty(), "nothing re-fires inside the window");
+        assert_eq!(
+            next.flushed.expect("the unresolved cohort flushes here"),
+            SweepSummary {
+                total: 3,
+                held: 1,
+                lost: vec!["hash-b".into()],
+                no_answer: vec!["hash-c".into()],
+            }
+        );
+    }
+
+    /// A verdict arriving AFTER its cohort was flushed (it was counted
+    /// there as no-answer) is flagged `late` and completes nothing —
+    /// the caller logs a DEBUG correction, never a second summary.
+    #[test]
+    fn verdict_after_flush_is_flagged_late() {
+        let start = Instant::now();
+        let mut p = prober();
+        let view = [("hash-a", "sec-0")];
+        p.poll(start, &view);
+        assert_eq!(p.poll(start + TIMEOUT, &view).probes.len(), 1);
+
+        // Flushed unresolved at the next tick.
+        let t_next = start + TIMEOUT + POLL_CADENCE;
+        let flushed = p.poll(t_next, &view).flushed.expect("flush");
+        assert_eq!(flushed.no_answer, vec!["hash-a".to_string()]);
+
+        // The probe is still outstanding (window > cadence): the
+        // verdict still re-arms — semantics untouched — but the log
+        // bookkeeping marks it late.
+        let outcome = p.on_response("hash-a", "sec-0", true, t_next + Duration::from_secs(1));
+        assert_eq!(outcome.verdict, ProbeVerdict::Rearmed);
+        assert!(outcome.late, "cohort already emitted: late correction");
+        assert!(outcome.completed.is_none());
+    }
+
+    /// Ticks that launch nothing flush nothing (no empty summaries on
+    /// quiet clusters), and a tick that launches a NEW sweep while the
+    /// previous one is unresolved flushes the old cohort in the same
+    /// tick that opens the new one.
+    #[test]
+    fn quiet_ticks_flush_nothing_and_new_sweep_flushes_previous() {
+        let start = Instant::now();
+        let mut p = prober();
+        // hash-a first seen now; hash-b one cadence later — their
+        // deadlines (and thus their sweeps) are offset by one tick.
+        p.poll(start, &[("hash-a", "sec-0")]);
+        let quiet = p.poll(start + POLL_CADENCE, &[("hash-a", "sec-0"), ("hash-b", "sec-0")]);
+        assert!(quiet.probes.is_empty() && quiet.flushed.is_none());
+
+        let first = p.poll(
+            start + TIMEOUT,
+            &[("hash-a", "sec-0"), ("hash-b", "sec-0")],
+        );
+        assert_eq!(first.probes.len(), 1, "only hash-a is past its deadline");
+        assert!(first.flushed.is_none());
+
+        // hash-b's deadline elapses one cadence later: the new sweep's
+        // tick flushes hash-a's unresolved cohort.
+        let second = p.poll(
+            start + TIMEOUT + POLL_CADENCE,
+            &[("hash-a", "sec-0"), ("hash-b", "sec-0")],
+        );
+        assert_eq!(
+            second.probes,
+            vec![ProbeRequest {
+                task_hash: "hash-b".into(),
+                holder: "sec-0".into(),
+            }]
+        );
+        assert_eq!(
+            second.flushed.expect("previous sweep flushed"),
+            SweepSummary {
+                total: 1,
+                held: 0,
+                lost: vec![],
+                no_answer: vec!["hash-a".into()],
+            }
+        );
+    }
+
+    /// The summary line's hash list is bounded: up to the cap inline,
+    /// then a "+K more" tail; empty renders as "-".
+    #[test]
+    fn capped_hashes_renders_bounded_lists() {
+        assert_eq!(capped_hashes(&[]), "-");
+        let two: Vec<String> = vec!["a".into(), "b".into()];
+        assert_eq!(capped_hashes(&two), "a, b");
+        let many: Vec<String> = (0..11).map(|i| format!("h{i}")).collect();
+        let rendered = capped_hashes(&many);
+        assert!(rendered.starts_with("h0, h1"));
+        assert!(rendered.contains("h7"));
+        assert!(!rendered.contains("h8,"), "past the cap is collapsed");
+        assert!(rendered.ends_with("(+3 more)"), "{rendered}");
     }
 }
