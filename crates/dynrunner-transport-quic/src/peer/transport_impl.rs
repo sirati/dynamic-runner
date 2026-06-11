@@ -258,23 +258,18 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                     }
                 }
                 accepted = self.new_conn_rx.recv() => {
-                    if let Some(accepted) = accepted
-                        && !self.connections.contains_key(&accepted.peer_id)
-                    {
-                        // Same observe_reconnect-before-register
-                        // ordering as drain_new_connections so
-                        // operator log shows resolution
-                        // (with attempts+elapsed) immediately
-                        // before "incoming peer registered".
-                        self.reconnect_tracker
-                            .observe_reconnect(&accepted.peer_id);
-                        tracing::info!(
-                            peer = %accepted.peer_id,
-                            "incoming peer registered (during recv)"
-                        );
-                        self.ever_connected.insert(accepted.peer_id.clone());
-                        self.connections
-                            .insert(accepted.peer_id, accepted.outgoing_tx);
+                    // Route through the SINGLE registration disposition
+                    // (`register_accepted`) — the SAME replace-vs-drop rule
+                    // `drain_new_connections` uses, so a fresh authenticated
+                    // inbound that arrives on THIS select arm (rather than a
+                    // synchronous drain) replaces a stale half-open entry
+                    // too. Hand-rolling a second `contains_key`-drop here
+                    // was the #416 second-instance: the rejoin-exile's
+                    // primary manifestation path (the operational loop is
+                    // `recv_peer`, so the redialer's inbound usually lands
+                    // here) silently dropped the heal.
+                    if let Some(accepted) = accepted {
+                        self.register_accepted(accepted);
                     }
                     None
                 }

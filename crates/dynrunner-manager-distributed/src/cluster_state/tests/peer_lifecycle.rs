@@ -84,6 +84,25 @@ where
     (out, captured)
 }
 
+/// Install a `dynrunner_cluster_state` warn-capture subscriber as the
+/// thread-local default for the lifetime of the returned guard, exposing
+/// the live record buffer. The async-test analog of `with_warn_capture`:
+/// a test that must `await` (e.g. `tokio::time::advance`) between
+/// synchronous `apply` bursts holds the guard across the awaits rather
+/// than confining capture to one closure.
+fn warn_capture_guard() -> (
+    tracing::subscriber::DefaultGuard,
+    Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use tracing_subscriber::layer::SubscriberExt;
+    let records: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let layer = WarnCapture {
+        records: Arc::clone(&records),
+    };
+    let subscriber = tracing_subscriber::Registry::default().with(layer);
+    (tracing::subscriber::set_default(subscriber), records)
+}
+
 /// Idempotent removal: a second `PeerRemoved` for the same id is
 /// a silent NoOp under sticky-per-id semantics.
 #[test]
@@ -181,6 +200,116 @@ fn peer_joined_dead_is_noop() {
             .iter()
             .any(|m| m.contains("PeerJoined for dead id at a non-advancing generation ignored")),
         "expected warn log on PeerJoined for dead id, captured: {records:?}",
+    );
+}
+
+/// Per-peer WARN throttle (#416): a removed-but-alive peer re-applies the
+/// SAME non-advancing `PeerJoined` on every authenticated frame. The WARN
+/// must stay (it names a real re-admission stall) but be quiet — once per
+/// peer per minute, the suppressed count carried on the next emit, never
+/// one line per frame (the 45+ min untrottled spam in
+/// run_20260611_123632). Two distinct dead peers each get their OWN
+/// throttle window (the gate is keyed by peer id).
+///
+/// `start_paused` so `tokio::time::advance` drives the `WarnThrottle`
+/// interval deterministically; the synchronous `apply` calls read
+/// `tokio::time::Instant::now()` against the paused clock.
+#[tokio::test(start_paused = true)]
+async fn peer_joined_dead_warn_is_throttled_per_peer() {
+    let (_, records) = with_warn_capture(|| {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        // Two peers go Dead at gen 0.
+        for id in ["p1", "p2"] {
+            s.apply(ClusterMutation::PeerJoined {
+                peer_id: id.into(),
+                is_observer: false,
+                can_be_primary: false,
+                cap_version: Default::default(),
+                member_gen: 0,
+            });
+            s.apply(ClusterMutation::PeerRemoved {
+                id: id.into(),
+                cause: RemovalCause::KeepaliveMiss,
+                member_gen: 0,
+            });
+        }
+        // Burst of non-advancing rejoins for p1 (the redial-forever
+        // shape): every one is a NoOp; only the FIRST trips the WARN,
+        // the rest are suppressed within the 60s window.
+        for _ in 0..50 {
+            assert_eq!(
+                s.apply(ClusterMutation::PeerJoined {
+                    peer_id: "p1".into(),
+                    is_observer: false,
+                    can_be_primary: false,
+                    cap_version: Default::default(),
+                    member_gen: 0,
+                }),
+                ApplyOutcome::NoOp,
+            );
+        }
+        // p2's first rejoin trips its OWN window (distinct peer key),
+        // not suppressed by p1's recent emit.
+        s.apply(ClusterMutation::PeerJoined {
+            peer_id: "p2".into(),
+            is_observer: false,
+            can_be_primary: false,
+            cap_version: Default::default(),
+            member_gen: 0,
+        });
+    });
+    let dead_warns: Vec<&String> = records
+        .iter()
+        .filter(|m| m.contains("PeerJoined for dead id at a non-advancing generation ignored"))
+        .collect();
+    assert_eq!(
+        dead_warns.len(),
+        2,
+        "exactly one dead-rejoin WARN per peer in the first window (p1 + p2), \
+         NOT one per frame; captured: {records:?}"
+    );
+}
+
+/// The throttle re-opens after the interval, carrying the suppressed
+/// count — the within-episode stall stays narrated minute by minute.
+#[tokio::test(start_paused = true)]
+async fn peer_joined_dead_warn_reopens_after_interval() {
+    let (_guard, records) = warn_capture_guard();
+    let rejoin = |s: &mut ClusterState<RunnerIdentifier>| {
+        s.apply(ClusterMutation::PeerJoined {
+            peer_id: "p1".into(),
+            is_observer: false,
+            can_be_primary: false,
+            cap_version: Default::default(),
+            member_gen: 0,
+        });
+    };
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    rejoin(&mut s);
+    s.apply(ClusterMutation::PeerRemoved {
+        id: "p1".into(),
+        cause: RemovalCause::KeepaliveMiss,
+        member_gen: 0,
+    });
+    // First window: emit + suppress.
+    for _ in 0..5 {
+        rejoin(&mut s);
+    }
+    // Cross the 60s interval, then one more rejoin emits again carrying
+    // the suppressed count from the first window.
+    tokio::time::advance(std::time::Duration::from_secs(61)).await;
+    rejoin(&mut s);
+
+    let captured = records.lock().unwrap().clone();
+    let dead_warns: Vec<&String> = captured
+        .iter()
+        .filter(|m| m.contains("PeerJoined for dead id at a non-advancing generation ignored"))
+        .collect();
+    assert_eq!(
+        dead_warns.len(),
+        2,
+        "one WARN in the first window + one after the interval re-opens; \
+         captured: {captured:?}"
     );
 }
 
