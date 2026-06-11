@@ -563,6 +563,8 @@ dependencies = [
  "dynrunner-gateway",
  "dynrunner-manager-distributed",
  "dynrunner-slurm-wrapper-config",
+ "libc",
+ "nix",
  "serde",
  "serde_json",
  "tempfile",

@@ -1090,7 +1090,13 @@ async fn spawn_reverse_tunnel(
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    // Layered reaping: `kill_on_drop` covers the orderly drop (the
+    // registry teardown / same-port rebuild), but a SIGKILL or unhandled
+    // SIGTERM of the submitter runs no `Drop`; the kernel parent-death
+    // -signal keeps this long-lived `ssh -N -R` leg from orphaning when
+    // the submitter is signalled (same class as the `-L` leak, #425).
     cmd.kill_on_drop(true);
+    crate::child_reaping::link_child_death_to_parent(&mut cmd);
     let child = cmd.spawn().map_err(PrepError::Io)?;
     Ok(child)
 }
