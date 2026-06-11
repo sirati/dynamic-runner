@@ -111,20 +111,38 @@ pub(super) fn should_upload_source_binaries(
 /// BEFORE `run_preparation` begins (the sbatch submit-loop and the
 /// reverse-tunnel setup both run inside it — arming only on its return
 /// left a tunnel-establishment failure orphaning the whole
-/// just-submitted cohort); [`Self::disarm_job_cancel`] is called the
-/// instant the run is handed to `coord.run()` (the coordinator now owns
-/// the lifecycle — its teardown, not this setup guard, governs the jobs
-/// from here, and that runtime path is a separate, owner-gated
-/// concern). While armed, the `Drop` scancels via the job manager's
-/// `cancel_all_jobs`, which drains ONLY this run's own tracked
-/// `job_ids` AT DROP TIME — never a broad `scancel` pattern that could
-/// reach a co-tenant's jobs on a shared host. Pre-submission arming is
-/// therefore safe by construction (no ids tracked → the drop is a
-/// no-op) and a mid-submit-loop abort cancels exactly the
-/// already-submitted subset. A healthy fleet is NEVER scancelled: by
-/// the time `coord.run()` runs (success path), the guard is disarmed,
-/// and a normal return drops a disarmed guard. Only an abort *before*
-/// the hand-off finds the guard still armed.
+/// just-submitted cohort); [`Self::disarm_job_cancel`] is called only
+/// after `coord.run()` RETURNS SUCCESSFULLY (see below for why not at
+/// the `run()`-entry boundary). While armed, the `Drop` scancels via
+/// the job manager's `cancel_all_jobs`, which drains ONLY this run's
+/// own tracked `job_ids` AT DROP TIME — never a broad `scancel` pattern
+/// that could reach a co-tenant's jobs on a shared host. Pre-submission
+/// arming is therefore safe by construction (no ids tracked → the drop
+/// is a no-op) and a mid-submit-loop abort cancels exactly the
+/// already-submitted subset.
+///
+/// ## Why disarm on `coord.run()` SUCCESS, not at `run()` entry
+///
+/// The hand-off to fleet self-termination is proven ONLY by the run
+/// reaching a verdict-broadcast terminal — the welcomed fleet observes
+/// the replicated CRDT terminal (RunComplete / graceful drain) and
+/// exits on its own, so the SLURM allocation self-terminates. At the
+/// pyo3 boundary that terminal-reached proof IS a SUCCESSFUL
+/// `coord.run()` return: every `Ok` terminal is such a wind-down. A
+/// `run()` raise is always an abnormal terminal where the fleet did NOT
+/// self-terminate — most acutely `RunError::BringUpFailed` (0/N
+/// welcomes inside the quorum-proceed window), which assembles no fleet
+/// and broadcasts no verdict, leaving the just-submitted secondaries
+/// stranded in setup with SLURM holding the whole cohort. Disarming at
+/// `run()` ENTRY (the old point) dropped those ids on the floor —
+/// asm-tokenizer run_161034 exited non-zero on BringUpFailed with all
+/// 11 sbatch jobs left RUNNING. Keeping the guard armed across `run()`
+/// and disarming only after a confirmed-`Ok` return fixes that: a
+/// healthy fleet still rides a disarmed-guard drop (the `Ok` path
+/// disarms), while every raise leaves the guard armed so the
+/// `drop(guard)` scancels exactly this run's tracked ids. There is no
+/// `run()` raise where the fleet is healthy-and-mid-work — a healthy
+/// run returns `Ok` — so this never scancels a self-terminating fleet.
 ///
 /// The scancel runs FIRST in `Drop` — before tunnel cleanup and the
 /// gateway disconnect — because `cancel_all_jobs` issues `scancel` over
@@ -169,13 +187,37 @@ impl CleanupGuard {
         self.job_cancel_armed = true;
     }
 
-    /// Disarm setup-abort job rollback. Called the instant the run is
-    /// handed to `coord.run()` — the coordinator now owns the job
-    /// lifecycle, so a later failure is a runtime concern (separately,
-    /// owner-gated) rather than a setup abort. After this a `Drop` (on
-    /// success OR on a runtime error) leaves the submitted jobs alone.
+    /// Disarm job rollback. Called only after `coord.run()` RETURNS
+    /// SUCCESSFULLY — the proof that the run reached a verdict-broadcast
+    /// terminal and the welcomed fleet is winding itself down on the
+    /// observed CRDT terminal, so the SLURM allocation self-terminates.
+    /// After this a `Drop` leaves the submitted jobs alone. A `run()`
+    /// raise (BringUpFailed, cluster-collapse strand, pre-phase abort,
+    /// …) is reached BEFORE this call, so it drops a STILL-ARMED guard
+    /// and scancels this run's tracked ids — the fleet never
+    /// self-terminated. See the struct doc's "Why disarm on `coord.run()`
+    /// SUCCESS" section.
     pub(super) fn disarm_job_cancel(&mut self) {
         self.job_cancel_armed = false;
+    }
+
+    /// Apply the run-boundary hand-off rule: disarm IFF `coord.run()`
+    /// returned successfully. This is the single source of truth for
+    /// "when does the setup guard hand the cohort off to fleet
+    /// self-termination" — `run_ok` is the verdict-broadcast proof.
+    ///
+    /// Encapsulating the rule (rather than an inline
+    /// `run_outcome?; disarm_job_cancel()`) makes the ORDERING explicit
+    /// and impossible to regress: the bug it fixes was a disarm sequenced
+    /// BEFORE `run()`, which dropped the still-allocated cohort on a
+    /// bring-up fatal. A `false` here is a no-op — the guard stays armed
+    /// so its `Drop` scancels the stranded ids. Mirrors the in-process
+    /// `fire_on_run_end(task, run_outcome.is_ok())` discriminator the
+    /// caller already computes for the consumer hook.
+    pub(super) fn disarm_on_run_success(&mut self, run_ok: bool) {
+        if run_ok {
+            self.disarm_job_cancel();
+        }
     }
 }
 
@@ -355,18 +397,30 @@ mod tests {
 #[cfg(test)]
 #[cfg(feature = "test-with-python")]
 mod cleanup_guard_tests {
-    //! Pins the setup-abort job-rollback contract on [`CleanupGuard`]:
+    //! Pins the job-rollback contract on [`CleanupGuard`]:
     //!   1. ARMED (sbatch submitted, run not yet handed off) → `Drop`
     //!      scancels via `job_manager.cancel_all_jobs`, targeting only
     //!      this run's own tracked `job_ids`.
-    //!   2. DISARMED (the run reached `coord.run()`) → `Drop` leaves the
-    //!      submitted jobs alone: a healthy fleet is never scancelled.
+    //!   2. DISARMED (an explicit `disarm_job_cancel`) → `Drop` leaves the
+    //!      submitted jobs alone: a self-terminating fleet is never
+    //!      scancelled.
     //!   3. NEVER ARMED (no sbatch — e.g. remote-podman, or a failure
     //!      before submission) → `Drop` never touches a job manager.
     //!
+    //! Run-boundary hand-off rule (`disarm_on_run_success`), pinned by
+    //! [`run_success_disarms_fleet_self_terminates`] and
+    //! [`bringup_fatal_after_preparation_scancels_cohort`]:
+    //!   4. `coord.run()` returned Ok → disarm → `Drop` no-cancel (the
+    //!      verdict-broadcast fleet self-terminates).
+    //!   5. `coord.run()` RAISED (BringUpFailed-shaped, after preparation
+    //!      succeeded) → guard stays ARMED → `Drop` scancels the cohort.
+    //!      This is the run_161034 orphan repro: RED if the disarm is
+    //!      sequenced UNCONDITIONALLY (the old pre-`run()` disarm).
+    //!
     //! Revert-check: case (1) fails if the arm/disarm + Drop step-0 is
     //! removed — an un-armed guard never calls `cancel_all_jobs`, so the
-    //! orphaned-fleet defect resurfaces.
+    //! orphaned-fleet defect resurfaces. Case (5) fails if the disarm
+    //! moves back ahead of (or off the success-conditional of) `run()`.
     //!
     //! Tests require an embedded CPython interpreter; gated behind the
     //! `test-with-python` feature. Invoke as:
@@ -468,22 +522,22 @@ mod cleanup_guard_tests {
         });
     }
 
-    /// DISARMED: once the run is handed to `coord.run()`, the guard is
-    /// disarmed and a `Drop` (success path OR runtime failure) leaves
-    /// the running fleet untouched.
+    /// DISARMED: an explicit `disarm_job_cancel` (the hand-off to fleet
+    /// self-termination) means a subsequent `Drop` leaves the running
+    /// fleet untouched.
     #[test]
     fn disarmed_handoff_leaves_fleet_running() {
         let (gateway, job_manager, globals) = make_doubles(&["201", "202"]);
         Python::attach(|py| {
             let mut guard = CleanupGuard::new(gateway.clone_ref(py));
             guard.arm_job_cancel(job_manager.clone_ref(py));
-            // Hand-off point reached: coordinator owns the run.
+            // Hand-off point reached: the run wound down with a verdict.
             guard.disarm_job_cancel();
             drop(guard);
 
             assert!(
                 cancelled_ids(py, &globals).is_empty(),
-                "a disarmed guard must NEVER scancel a healthy fleet",
+                "a disarmed guard must NEVER scancel a self-terminating fleet",
             );
         });
     }
@@ -554,6 +608,87 @@ mod cleanup_guard_tests {
             assert!(
                 cancelled_ids(py, &globals).is_empty(),
                 "a guard with no armed job manager must not scancel",
+            );
+        });
+    }
+
+    /// RUN-BOUNDARY, SUCCESS: preparation succeeded, the cohort is armed,
+    /// and `coord.run()` returned Ok (a verdict-broadcast terminal — the
+    /// welcomed fleet observes the CRDT terminal and exits on its own).
+    /// `disarm_on_run_success(true)` hands the cohort off, so the
+    /// subsequent `Drop` leaves the self-terminating jobs alone. Pins the
+    /// no-spurious-cancel side of the rule.
+    #[test]
+    fn run_success_disarms_fleet_self_terminates() {
+        let (gateway, job_manager, globals) = make_doubles(&["501", "502"]);
+        Python::attach(|py| {
+            let mut guard = CleanupGuard::new(gateway.clone_ref(py));
+            // Armed across `run()` (preparation succeeded, cohort live).
+            guard.arm_job_cancel(job_manager.clone_ref(py));
+            // `coord.run()` returned Ok → the run-boundary hand-off rule
+            // disarms (mirrors `drive_rust_primary`'s
+            // `guard.disarm_on_run_success(run_outcome.is_ok())`).
+            guard.disarm_on_run_success(true);
+            drop(guard);
+
+            assert!(
+                cancelled_ids(py, &globals).is_empty(),
+                "a run that reached a verdict-broadcast terminal must NOT \
+                 be scancelled — the fleet self-terminates",
+            );
+        });
+    }
+
+    /// RUN-BOUNDARY, BRING-UP FATAL: the run_161034 orphan repro. The
+    /// cohort is armed, preparation SUCCEEDED, and then `coord.run()`
+    /// RAISED a BringUpFailed-shaped fatal (0/N welcomes — no fleet
+    /// assembled, no verdict broadcast, secondaries stranded in setup
+    /// with SLURM holding the whole allocation). The run-boundary
+    /// hand-off rule sees `run_ok=false`, so it leaves the guard ARMED;
+    /// the `Drop` then scancels exactly this run's submitted ids.
+    ///
+    /// RED against the old code, which disarmed UNCONDITIONALLY ahead of
+    /// `run()` — that path left the guard disarmed, dropped, and the 11
+    /// sbatch jobs RUNNING. (Reproduced inline below as `old_disarm`.)
+    #[test]
+    fn bringup_fatal_after_preparation_scancels_cohort() {
+        let (gateway, job_manager, globals) = make_doubles(&["601", "602", "603"]);
+        Python::attach(|py| {
+            let mut guard = CleanupGuard::new(gateway.clone_ref(py));
+            // Preparation succeeded → cohort submitted + armed.
+            guard.arm_job_cancel(job_manager.clone_ref(py));
+            // `coord.run()` raised BringUpFailed: run_ok=false. The rule
+            // is a no-op (stays armed); the `?`-propagated raise short-
+            // circuits to the `Drop` below.
+            guard.disarm_on_run_success(false);
+            drop(guard);
+
+            assert_eq!(
+                cancelled_ids(py, &globals),
+                vec!["601", "602", "603"],
+                "a post-preparation bring-up fatal must scancel the \
+                 stranded cohort — not leave it RUNNING",
+            );
+        });
+
+        // Revert-check: the OLD ordering disarmed unconditionally BEFORE
+        // `run()`. Reproduce that boolean to prove the bug was real — an
+        // unconditional disarm followed by a raise drops a disarmed guard
+        // and scancels NOTHING.
+        let (gateway, job_manager, globals) = make_doubles(&["601", "602", "603"]);
+        Python::attach(|py| {
+            let mut guard = CleanupGuard::new(gateway.clone_ref(py));
+            guard.arm_job_cancel(job_manager.clone_ref(py));
+            // OLD behaviour: disarm at `run()` ENTRY, irrespective of how
+            // `run()` ends.
+            guard.disarm_job_cancel();
+            // `run()` then raised BringUpFailed → drop a DISARMED guard.
+            drop(guard);
+
+            assert!(
+                cancelled_ids(py, &globals).is_empty(),
+                "the OLD unconditional pre-run disarm orphaned the cohort \
+                 on a bring-up fatal (this is the bug the fix closes)",
             );
         });
     }

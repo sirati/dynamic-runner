@@ -341,20 +341,35 @@ pub(super) fn drive_rust_primary<'py>(
         Some(primary_handle),
     )?;
 
-    // Disarm setup-abort job rollback: everything above this line
-    // (coordinator construction, staging queue, the consumer's
-    // on_run_start hook) is still setup — an abort there leaves the
-    // guard armed and scancels the submitted cohort. `coord.run()` below
-    // hands the job lifecycle to the coordinator, whose own teardown
-    // (a separate, owner-gated concern) governs the jobs from here. A
-    // healthy fleet that reaches `run()` is therefore never scancelled
-    // by this setup guard — on success it returns to a disarmed-guard
-    // drop, and a runtime failure inside `run()` is no longer a setup
-    // abort. See `CleanupGuard`'s arm/disarm doc.
-    guard.disarm_job_cancel();
-
+    // Job-rollback stays ARMED across `coord.run()`. The earlier
+    // pre-run disarm point was wrong: it handed the cohort to "the
+    // coordinator's teardown" the instant `run()` was about to take
+    // over, but `run()` can itself terminate WITHOUT the fleet ever
+    // self-terminating — a bring-up fatal (`RunError::BringUpFailed`:
+    // 0/N welcomes inside the quorum-proceed window) assembles no fleet
+    // and broadcasts no verdict, so the just-submitted secondaries sit
+    // stranded in setup and SLURM keeps the whole cohort allocated. A
+    // disarmed guard then dropped those ids on the floor (asm-tokenizer
+    // run_161034: the BringUpFailed submitter exited non-zero with all
+    // 11 sbatch jobs left RUNNING). The hand-off to fleet
+    // self-termination is proven ONLY by a SUCCESSFUL `coord.run()`
+    // return: every `Ok` terminal is a verdict-broadcast wind-down
+    // (RunComplete / graceful drain), so the welcomed fleet observes the
+    // CRDT terminal and exits on its own — disarming there leaves it
+    // alone. Every abnormal terminal RAISES (BringUpFailed, the cluster-
+    // collapse strand, the pre-phase abort, …); leaving the guard armed
+    // across the raise lets `run_pipeline`'s `drop(guard)` scancel
+    // exactly this run's tracked ids. The disarm therefore moves BELOW
+    // `run_outcome?`. See `CleanupGuard`'s arm/disarm doc.
     let run_outcome = coord.call_method1("run", (binaries,));
-    crate::managers::lifecycle::fire_on_run_end(task, run_outcome.is_ok());
+    let run_ok = run_outcome.is_ok();
+    crate::managers::lifecycle::fire_on_run_end(task, run_ok);
+    // Apply the run-boundary hand-off rule BEFORE `?`-propagating a
+    // raise: disarm IFF the run succeeded (a verdict-broadcast terminal
+    // whose welcomed fleet self-terminates). A raise leaves the guard
+    // armed so `run_pipeline`'s `drop(guard)` scancels the stranded
+    // cohort — the BringUpFailed orphan fix. See `CleanupGuard`.
+    guard.disarm_on_run_success(run_ok);
     run_outcome?;
     let completed = coord.getattr("completed")?;
     let failed = coord.getattr("failed")?;
