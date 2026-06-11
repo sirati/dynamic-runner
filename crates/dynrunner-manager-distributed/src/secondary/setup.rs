@@ -462,9 +462,18 @@ where
         //   * WELCOME LOST on a dying wire — the frame was queued onto a
         //     wire that died before delivery; the redial restores the
         //     pipe but nothing else would re-enroll this node. The
-        //     primary's first frame (the announce) is the receipt proof
-        //     that stops the retries (`enter_configuring` leaves
-        //     `AwaitingPrimary`, disabling the arm).
+        //     receipt proof that stops the retries is a DIRECTED setup
+        //     frame from the primary (`InitialAssignment` /
+        //     `TransferComplete` — the trio members the primary only
+        //     sends to a secondary it has WELCOMED). A BROADCAST frame
+        //     is NOT proof: the asm-dataset LMU bring-up (15
+        //     secondaries) lost 5 welcomes exactly because the primary's
+        //     `PeerJoined` broadcasts (originated by the OTHER 10
+        //     welcomes) flipped the receivers out of `AwaitingPrimary`
+        //     and the old lifecycle-gated arm disarmed before the first
+        //     post-wire retry — the primary never learned of them and
+        //     proceeded with quorum into a fleet their setup deadlines
+        //     had already killed.
         // Re-sends are safe: the primary's welcome handling is idempotent
         // (CRDT re-applies NoOp; the run-config re-push delivers the same
         // value; PeerInfo re-broadcasts are receiver-idempotent).
@@ -545,16 +554,25 @@ where
                 // a fresh window — exactly the pre-select semantics.
                 let stall_deadline =
                     tokio::time::Instant::now() + SETUP_STALL_WARN_INTERVAL;
-                // Handshake retries are an `AwaitingPrimary`-only concern:
-                // the primary's first frame is the delivery proof that
-                // disables the arm. The lifecycle can only change between
-                // `'frame` iterations (the `enter_configuring` transition
-                // fires on a received frame, which exits this loop), so
-                // sampling it here is exact.
-                let awaiting_primary = matches!(
-                    self.lifecycle,
-                    super::lifecycle::SecondaryLifecycle::AwaitingPrimary { .. }
-                );
+                // Handshake retries persist until the primary PROVES it
+                // received the welcome — and the only proof is a DIRECTED
+                // setup frame to THIS secondary: `InitialAssignment` or
+                // `TransferComplete`, the trio members the primary sends
+                // only to secondaries in its welcomed registry. The
+                // lifecycle state is deliberately NOT the gate: the
+                // `AwaitingPrimary → Configuring` announce fires on ANY
+                // primary-originated frame, including BROADCASTS
+                // (`PeerJoined` / `PeerInfo` / cold-seed `ClusterMutation`
+                // batches), and receiving a broadcast proves nothing about
+                // the welcome having landed (the asm-dataset LMU 5-of-15
+                // welcome loss). `got_assignment` / `got_transfer` can only
+                // change between `'frame` iterations (they flip on a
+                // received frame, which exits this loop), so sampling here
+                // is exact. Re-sends stay safe past `Configuring`: the
+                // primary's welcome handling is idempotent and the
+                // immediately-following cert-exchange restores the
+                // connection record the re-welcome resets.
+                let welcome_unproven = !got_assignment && !got_transfer;
                 loop {
                     tokio::select! {
                         // Cancel-safe: `recv_setup_frame` is a sync backlog
@@ -564,9 +582,9 @@ where
                         // Welcome/cert handshake retry (see the arming
                         // comment above the trio loop): persistent
                         // deadline, capped exponential backoff, disabled
-                        // once the primary has spoken. `sleep_until` is
-                        // cancel-safe (tokio docs).
-                        _ = tokio::time::sleep_until(handshake_at), if awaiting_primary => {
+                        // once a DIRECTED setup frame proves the welcome
+                        // landed. `sleep_until` is cancel-safe (tokio docs).
+                        _ = tokio::time::sleep_until(handshake_at), if welcome_unproven => {
                             handshake_attempts += 1;
                             let delivered =
                                 self.try_send_handshake(handshake_attempts).await;

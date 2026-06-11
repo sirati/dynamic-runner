@@ -213,3 +213,184 @@ async fn lost_welcome_retried_until_primary_responds() {
         })
         .await;
 }
+
+/// THE asm-dataset LMU 5-of-15 welcome-loss replay: the secondary's first
+/// welcome NEVER reaches the primary, and BEFORE its first retry can fire
+/// it receives a BROADCAST from the primary (the `PeerJoined`
+/// ClusterMutation the primary originates when it accepts some OTHER
+/// secondary's welcome — production 11:06:15, "primary announced (first
+/// setup frame)"). Receiving a broadcast proves NOTHING about this
+/// node's welcome having landed, so the retry must stay armed and the
+/// welcome must be RE-SENT.
+///
+/// REVERT-CHECK (the production bug): pre-fix the retry arm was gated on
+/// the lifecycle still being `AwaitingPrimary`, and the broadcast fires
+/// the `AwaitingPrimary → Configuring` announce — the arm disarmed off a
+/// broadcast, the welcome was never re-sent, the primary never learned of
+/// this node, and 600s later it proceeded with quorum
+/// (missing_no_welcome=[0,1,2,4,10]) into a fleet whose setup deadlines
+/// had already killed it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn broadcast_announce_does_not_disarm_welcome_retry() {
+    use dynrunner_protocol_primary_secondary::cluster_mutation::ClusterMutation as CM;
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (sec_to_pri_tx, mut sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+
+            let config = resilience_config("sec-bcast-disarm");
+            let unified =
+                channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
+            let mut harness = make_secondary_channel(config, unified);
+            harness.set_bootstrap_primary_id("setup".to_string());
+            let (mut secondary, _guard) = start_secondary_pump(harness);
+
+            let driver = async {
+                // The first welcome reaches the wire (and is "lost" — this
+                // fake primary never acts on it).
+                loop {
+                    let frame = sec_to_pri_rx.recv().await.expect("wire open");
+                    if matches!(frame.msg_type(), MessageType::SecondaryWelcome) {
+                        break;
+                    }
+                }
+                // The primary's broadcast announce: a `PeerJoined` for a
+                // SIBLING secondary (originated by the sibling's accepted
+                // welcome) fanned to All. It reaches this secondary at
+                // virtual t≈0 — strictly BEFORE its first retry (the
+                // keepalive-derived 100ms backoff floor) can fire, the
+                // exact production interleaving.
+                pri_to_sec_tx
+                    .send(DistributedMessage::ClusterMutation {
+                        target: None,
+                        sender_id: "setup".into(),
+                        timestamp: 0.0,
+                        mutations: vec![CM::PeerJoined {
+                            peer_id: "sec-other".into(),
+                            is_observer: false,
+                            can_be_primary: true,
+                            cap_version: Default::default(),
+                            member_gen: 0,
+                        }],
+                    })
+                    .expect("inbound open");
+
+                // The discriminator: a SECOND welcome must still reach the
+                // wire (the retry survived the broadcast). The wedge
+                // deadline is PERSISTENT (fires-under-load law).
+                let wedge_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+                loop {
+                    let frame = tokio::select! {
+                        f = sec_to_pri_rx.recv() => f.expect("wire open"),
+                        _ = tokio::time::sleep_until(wedge_deadline) => panic!(
+                            "BROADCAST-DISARM (the asm-dataset LMU 5-of-15 \
+                             welcome loss): receiving the primary's broadcast \
+                             announce disarmed the welcome retry — the \
+                             welcome was never re-sent and the primary can \
+                             never learn of this node"
+                        ),
+                    };
+                    if matches!(frame.msg_type(), MessageType::SecondaryWelcome) {
+                        break; // the retry survived the broadcast
+                    }
+                }
+            };
+
+            let mut factory = FakeWorkerFactory;
+            tokio::select! {
+                res = secondary.run_until_setup_or_done(&mut factory) => {
+                    panic!("setup wait must keep waiting for the trio, got {res:?}");
+                }
+                () = driver => { /* post-broadcast welcome observed */ }
+            }
+        })
+        .await;
+}
+
+/// The disarm pin (the GREEN half's other edge): a DIRECTED setup frame
+/// from the primary — `InitialAssignment`, which the primary only sends
+/// to a secondary in its welcomed registry — IS receipt proof, and the
+/// welcome retry must STOP on it (no churn against a primary that has
+/// provably enrolled this node).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn directed_setup_frame_stops_welcome_retry() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (sec_to_pri_tx, mut sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+
+            let config = resilience_config("sec-directed-stop");
+            let secondary_id = config.secondary_id.clone();
+            let unified =
+                channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
+            let mut harness = make_secondary_channel(config, unified);
+            harness.set_bootstrap_primary_id("setup".to_string());
+            let (mut secondary, _guard) = start_secondary_pump(harness);
+
+            let driver = async {
+                // Welcome observed → answer with the DIRECTED half of the
+                // trio (an empty InitialAssignment — the shape
+                // `perform_initial_assignment` sends every known
+                // secondary).
+                loop {
+                    let frame = sec_to_pri_rx.recv().await.expect("wire open");
+                    if matches!(frame.msg_type(), MessageType::SecondaryWelcome) {
+                        break;
+                    }
+                }
+                pri_to_sec_tx
+                    .send(DistributedMessage::InitialAssignment {
+                        target: None,
+                        sender_id: "setup".into(),
+                        timestamp: 0.0,
+                        secondary_id: secondary_id.clone(),
+                        zip_files: Vec::new(),
+                        workers_ready: Vec::new(),
+                        staged_files: Vec::new(),
+                        pre_staged_mode: false,
+                        uses_file_based_items: true,
+                    })
+                    .expect("inbound open");
+
+                // Drain the wire for many retry-cap periods of virtual
+                // time: NO further welcome may appear once the directed
+                // frame proved receipt. (Digest beacons keep flowing —
+                // only the welcome is the assertion subject.)
+                let quiet_until = tokio::time::Instant::now() + Duration::from_secs(120);
+                loop {
+                    tokio::select! {
+                        f = sec_to_pri_rx.recv() => {
+                            let frame = f.expect("wire open");
+                            // A welcome ALREADY IN FLIGHT when the directed
+                            // frame landed is indistinguishable from churn
+                            // only within the first backoff period; anything
+                            // beyond one period after the proof is churn.
+                            if matches!(frame.msg_type(), MessageType::SecondaryWelcome)
+                                && tokio::time::Instant::now()
+                                    > quiet_until - Duration::from_secs(119)
+                            {
+                                panic!(
+                                    "welcome retry churned on AFTER a directed \
+                                     setup frame proved receipt"
+                                );
+                            }
+                        }
+                        _ = tokio::time::sleep_until(quiet_until) => break,
+                    }
+                }
+            };
+
+            let mut factory = FakeWorkerFactory;
+            tokio::select! {
+                res = secondary.run_until_setup_or_done(&mut factory) => {
+                    panic!("setup wait must keep waiting for the trio, got {res:?}");
+                }
+                () = driver => { /* quiet window held */ }
+            }
+        })
+        .await;
+}
