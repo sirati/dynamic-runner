@@ -93,6 +93,11 @@ where
         let staging_dispatch_context = std::sync::Arc::new(std::sync::Mutex::new(
             super::StagingDispatchContext::default(),
         ));
+        // The pre-`Operational` deadline horizon, read off the config
+        // before it moves into `this.config`. Un-armed here (`new` may run
+        // outside a tokio runtime); the orchestration arms it at setup
+        // entry and `wait_for_setup` re-arms it on primary liveness.
+        let setup_deadline = super::setup_deadline::SetupDeadline::new(config.unconfigured_deadline);
         let mut this = Self {
             config,
             client,
@@ -152,6 +157,7 @@ where
             finalize_run_config: None,
             forwarded_argv_was_pushed: false,
             setup_frame_backlog: std::collections::VecDeque::new(),
+            setup_deadline,
             command_rx: Some(command_rx),
             command_tx,
             // Lazily constructed in `run_until_setup_or_done_inner`
@@ -1224,43 +1230,85 @@ where
             // announcement; the SHORT election deadline is a property of
             // `Operational` and physically cannot fire here. The deadline
             // is applied at the orchestration boundary, NOT inside
-            // `wait_for_setup`, because the recv loop is documented as
-            // cancellation-unsafe under inner select! racing. Cancelling
-            // the whole setup future on timeout is safe because we never
-            // re-enter any of these phases — we go straight to
-            // cleanup-and-exit.
+            // `wait_for_setup` (cancelling the whole setup future on
+            // expiry is safe because we never re-enter any of these
+            // phases — we go straight to cleanup-and-exit), but it is the
+            // RE-ARMABLE primary-liveness deadline (`setup_deadline.rs`),
+            // not a fixed `timeout`: `wait_for_setup` EXTENDS it on every
+            // frame whose sender is the primary, so it elapses only after
+            // a full horizon of PRIMARY SILENCE. A live primary still
+            // assembling its fleet (its setup-liveness digest beacon, the
+            // welcome-driven `PeerJoined` broadcasts, the directed setup
+            // frames) keeps this secondary waiting indefinitely — the
+            // asm-dataset LMU fleet death (15 welcomed/announce-received
+            // secondaries killed by a FIXED deadline while the primary was
+            // alive in its equal-length quorum-proceed window) cannot
+            // recur. The deadline detects a DEAD primary; a slow fleet is
+            // not a dead primary.
             let deadline = self.config.unconfigured_deadline;
-            let setup = async {
-                // The welcome / cert-exchange handshake is OWNED by
-                // `wait_for_setup` (its entry attempt + the capped-backoff
-                // retry arm): a no-route at boot — the background bring-up
-                // dial has not folded the bootstrap wire yet — or a welcome
-                // lost on a dying wire is absorbed and re-offered there,
-                // rather than aborting the run here. The
-                // `unconfigured_deadline` wrapping this future stays the
-                // single give-up policy.
-                //
-                // `wait_for_setup` returns `Some(RunOutcome::Terminal)` when a
-                // terminal CRDT flag (RunComplete / RunAborted) landed DURING
-                // setup before the trio completed — it has already recorded
-                // the matching lifecycle terminal. `None` is the normal
-                // trio-completion success (proceed to the operational
-                // handoff). Propagate the signal so the orchestration can
-                // skip `process_tasks` and route straight to teardown.
-                let setup_terminal = self.wait_for_setup(factory).await?;
-                Ok::<Option<RunOutcome>, String>(setup_terminal)
+            self.setup_deadline.arm();
+            // Reader clone taken BEFORE the setup future mutably borrows
+            // `self`; both clones share the one deadline cell.
+            let setup_deadline = self.setup_deadline.clone();
+            // The pin + select live in their own block so the setup future
+            // (which mutably borrows `self`) is DROPPED at the block's end
+            // — before the outcome match below re-borrows `self` for the
+            // teardown paths. A `None` break is exactly the cancellation
+            // the old fixed `timeout` performed.
+            let setup_outcome = {
+                let setup = async {
+                    // The welcome / cert-exchange handshake is OWNED by
+                    // `wait_for_setup` (its entry attempt + the capped-backoff
+                    // retry arm): a no-route at boot — the background bring-up
+                    // dial has not folded the bootstrap wire yet — or a welcome
+                    // lost on a dying wire is absorbed and re-offered there,
+                    // rather than aborting the run here. The
+                    // `unconfigured_deadline` wrapping this future stays the
+                    // single give-up policy.
+                    //
+                    // `wait_for_setup` returns `Some(RunOutcome::Terminal)` when a
+                    // terminal CRDT flag (RunComplete / RunAborted) landed DURING
+                    // setup before the trio completed — it has already recorded
+                    // the matching lifecycle terminal. `None` is the normal
+                    // trio-completion success (proceed to the operational
+                    // handoff). Propagate the signal so the orchestration can
+                    // skip `process_tasks` and route straight to teardown.
+                    let setup_terminal = self.wait_for_setup(factory).await?;
+                    Ok::<Option<RunOutcome>, String>(setup_terminal)
+                };
+                tokio::pin!(setup);
+                // Persistent-deadline select (the fires-under-load law): the
+                // `sleep_until` is rebuilt each iteration from the STORED
+                // absolute instant, so sibling progress on the setup future
+                // never resets it. An extension only moves the stored instant
+                // FORWARD: the arm wakes at the superseded instant, observes
+                // `!expired()`, and re-sleeps to the new one. `&mut setup` is
+                // polled across iterations without being dropped (cancel-safe
+                // by pinning); only a true expiry abandons it.
+                loop {
+                    tokio::select! {
+                        res = &mut setup => break Some(res),
+                        _ = tokio::time::sleep_until(setup_deadline.deadline()) => {
+                            if setup_deadline.expired() {
+                                break None;
+                            }
+                            // Extended while sleeping — loop re-arms the
+                            // sleep at the new stored instant.
+                        }
+                    }
+                }
             };
-            match tokio::time::timeout(deadline, setup).await {
+            match setup_outcome {
                 // Trio completed normally: fall through to `process_tasks`.
-                Ok(Ok(None)) => {}
+                Some(Ok(None)) => {}
                 // A terminal CRDT flag was observed DURING setup. The
                 // lifecycle terminal is already recorded; skip the operational
                 // handoff and route straight to the SAME terminal-match
                 // teardown the operational `process_tasks` return uses.
-                Ok(Ok(Some(RunOutcome::Terminal))) => {
+                Some(Ok(Some(RunOutcome::Terminal))) => {
                     setup_terminal = Some(RunOutcome::Terminal);
                 }
-                Ok(Err(e)) => {
+                Some(Err(e)) => {
                     // Drain the sampler BEFORE `stop_all_workers`
                     // so the last tick reads still see the
                     // per-worker cgroup leaves the pool's teardown
@@ -1270,7 +1318,9 @@ where
                     self.stop_all_workers().await;
                     return Err(e);
                 }
-                Err(_elapsed) => {
+                None => {
+                    // A full `unconfigured_deadline` of PRIMARY SILENCE
+                    // (the re-armable deadline elapsed un-extended).
                     // Role-aware alive-secondary count over GLOBAL STATE,
                     // NOT the transport's role-blind `peer_count()`:
                     // post-de-role the transport counts the folded primary

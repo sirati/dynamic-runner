@@ -17,6 +17,7 @@
 //!   `WorkerMgmtSignal::TasksAdded`; positive + negative-control +
 //!   is_idle-advisory + coalesce.
 
+mod assembly_beacon;
 mod basic;
 mod capacity_dispatch;
 mod coordinator_setup;

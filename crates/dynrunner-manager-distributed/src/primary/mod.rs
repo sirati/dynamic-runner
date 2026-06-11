@@ -60,7 +60,7 @@ pub use command_channel::{
 };
 pub use config::{
     DEFAULT_TASK_RECONCILIATION_TIMEOUT, OnCustomMessage, OnPhaseEnd, OnPhaseStart,
-    PhaseHookRaiseLatch, PrimaryConfig,
+    PhaseHookRaiseLatch, PrimaryConfig, derive_connect_timeout,
 };
 pub use coordinator::{PrimaryCoordinator, PrimaryRunOutcome};
 pub use error::RunError;
