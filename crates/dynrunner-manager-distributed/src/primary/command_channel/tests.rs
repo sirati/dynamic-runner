@@ -1246,8 +1246,10 @@ async fn spawn_tasks_all_already_in_ledger_is_noop_dedup() {
 /// (b) WITHIN-BATCH still caught: two tasks in ONE fresh spawn batch
 /// share an identity (a genuine ambiguous producer batch — no
 /// authoritative prior copy). This DOES escalate to a run-wide
-/// invalidation (every not-yet-terminal task → InvalidTask), the cluster
-/// continues, and the within-batch dup surfaces as
+/// invalidation (every not-yet-terminal task → InvalidTask) AND a
+/// terminal run abort: the `RunAborted` verdict is latched FIRST with
+/// the duplicate-identity reason (the verdict-before-wipe ordering —
+/// see `invalidate_all_pending`), and the within-batch dup surfaces as
 /// `SpawnError::DuplicateInBatch`. Guards against fix (b) weakening the
 /// genuine-bug detection.
 #[tokio::test(flavor = "current_thread")]
@@ -1287,10 +1289,17 @@ async fn spawn_tasks_within_batch_duplicate_invalidates_run_wide() {
                 super::SpawnError::DuplicateInBatch(h) => assert_eq!(h, &fresh_hash),
                 other => panic!("expected DuplicateInBatch, got {other:?}"),
             }
-            // Run-wide invalidation (cluster continues, no RunAborted).
+            // Run-wide invalidation IS a terminal run abort: the verdict
+            // is latched with the duplicate-identity reason (first
+            // writer; a later finalize render can never overwrite it).
+            let abort_reason = coordinator
+                .cluster_state
+                .run_aborted()
+                .expect("3b must latch the RunAborted verdict before wiping")
+                .to_string();
             assert!(
-                coordinator.cluster_state.run_aborted().is_none(),
-                "3b does not abort the run"
+                abort_reason.contains("duplicate task identity"),
+                "the latched reason names the duplicate-identity verdict: {abort_reason}"
             );
             assert!(
                 matches!(

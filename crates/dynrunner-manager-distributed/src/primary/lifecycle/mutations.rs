@@ -219,6 +219,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///   same replicated facts and re-decide it;
     /// - pre-phase duplicate task id (#3a) → `RunAborted`
     ///   (`fire_pending_run_abort`);
+    /// - post-phase duplicate task id (#3b) → `RunAborted`
+    ///   (`invalidate_all_pending`, latched BEFORE the run-wide
+    ///   `TaskFailed` wipe so the duplicate-identity reason is the FIRST
+    ///   writer and a later hook-raise render can never overwrite it);
     /// - `NoRelocationTarget` → `RunAborted` (`run_pipeline`'s SetupPeer
     ///   arm): NO peer advertised `can_be_primary`, so an election can
     ///   never produce a primary — without the verdict the connected
