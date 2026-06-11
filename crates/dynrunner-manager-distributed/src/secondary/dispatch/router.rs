@@ -495,14 +495,20 @@ where
                 // `ClusterStateSnapshot<I>` (which is the right-side
                 // dependency direction; the protocol crate must not
                 // depend on the manager crate).
-                let snapshot = self.cluster_state.snapshot();
-                let snapshot_json = serde_json::to_string(&snapshot)
+                // Serialize-once per state generation (#367): the cache
+                // inside `ClusterState` keys the reply bytes on the
+                // anti-entropy digest, so a burst of pulls against an
+                // unchanged ledger does not re-serialize ~100 MB per
+                // request.
+                let snapshot_json = self
+                    .cluster_state
+                    .snapshot_json()
                     .map_err(|e| format!("snapshot serialization: {e}"))?;
                 let response = DistributedMessage::ClusterSnapshot {
                     target: None,
                     sender_id: self.config.secondary_id.clone(),
                     timestamp: timestamp_now(),
-                    snapshot_json,
+                    snapshot_json: (*snapshot_json).clone(),
                 };
                 if let Err(e) = self
                     .send_to(

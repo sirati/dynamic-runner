@@ -82,8 +82,20 @@ async fn handle_accepted_quic<I: Identifier>(
     };
     let peer_id = first_msg.sender_id().to_string();
 
-    if incoming_tx.send(first_msg).is_err() {
-        return;
+    // Per-connection chunk reassembly, created BEFORE the first frame
+    // is resolved: if the dialer's first frame is chunk 0 of an
+    // oversized transfer (e.g. an immediate snapshot reply), the chunk
+    // is buffered here and the SAME reassembler continues the transfer
+    // inside the reader pump — the identify→pump boundary is seamless.
+    let mut reassembler = framing::new_reassembler();
+    match framing::resolve_inbound(first_msg, &mut reassembler, CTX, &peer_id) {
+        framing::InboundStep::Deliver(msg) => {
+            if incoming_tx.send(msg).is_err() {
+                return;
+            }
+        }
+        framing::InboundStep::Consumed => {}
+        framing::InboundStep::Fatal => return,
     }
 
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
@@ -110,6 +122,7 @@ async fn handle_accepted_quic<I: Identifier>(
         incoming_tx,
         CTX,
         peer_id.clone(),
+        reassembler,
     ));
 
     let mut writer = tokio::task::spawn_local(framing::run_quic_writer(
@@ -144,8 +157,17 @@ async fn handle_accepted_wss<I: Identifier>(
     };
     let peer_id = first_msg.sender_id().to_string();
 
-    if incoming_tx.send(first_msg).is_err() {
-        return;
+    // Per-connection chunk reassembly across the identify→pump
+    // boundary — see `handle_accepted_quic`.
+    let mut reassembler = framing::new_reassembler();
+    match framing::resolve_inbound(first_msg, &mut reassembler, CTX, &peer_id) {
+        framing::InboundStep::Deliver(msg) => {
+            if incoming_tx.send(msg).is_err() {
+                return;
+            }
+        }
+        framing::InboundStep::Consumed => {}
+        framing::InboundStep::Fatal => return,
     }
 
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
@@ -170,6 +192,7 @@ async fn handle_accepted_wss<I: Identifier>(
         incoming_tx,
         CTX,
         peer_id.clone(),
+        reassembler,
     ));
 
     let mut writer = tokio::task::spawn_local(framing::run_wss_writer(

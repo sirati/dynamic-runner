@@ -455,6 +455,10 @@ impl<I: Identifier> ClusterState<I> {
             // part of the converged ledger (each replica mints its own on
             // origination; a restoring replica cold-starts it).
             task_seq: _task_seq,
+            // node-local: the serialize-once snapshot-JSON cache is a pure
+            // derivation of the replicated fields (keyed on the digest), so
+            // it carries no signal of its own.
+            snapshot_json_cache: _snapshot_json_cache,
         } = self;
         ClusterStateSnapshot {
             tasks: tasks.clone(),
@@ -533,6 +537,58 @@ impl<I: Identifier> ClusterState<I> {
             custom_messages: custom_messages.clone(),
             custom_terminal_watermarks: custom_terminal_watermarks.clone(),
         }
+    }
+
+    /// The snapshot-RPC reply payload, serialized ONCE per state
+    /// generation (#367's CPU half — the serialize-drop loop): returns
+    /// the cached JSON when the current anti-entropy [`digest`]
+    /// (re-derived from live state on EVERY call) matches the digest
+    /// the cache was serialized under, and re-snapshots + re-serializes
+    /// otherwise. ALL snapshot responders (primary, secondary,
+    /// observer) read this one method, so a burst of digest-driven
+    /// pulls / late-joiner requests against an unchanged ledger costs
+    /// one O(tasks) digest fold each instead of one ~100 MB
+    /// serialization each (the production 67k-task ledger:
+    /// ~1.5 KB/task ⇒ ~100 MB per serialization, ~6800 repetitions in
+    /// run_20260611_115429).
+    ///
+    /// Correctness of the digest key: the digest covers every
+    /// SNAPSHOT-HEALABLE replicated field (the structural-completeness
+    /// guards on both projections pin the classification), so any
+    /// divergence a peer can detect — and therefore any pull this
+    /// reply must heal — invalidates the cache. The snapshot fields
+    /// the digest deliberately excludes (`alive_members` /
+    /// `member_generations` project the honest-liveness `peer_state`;
+    /// `peer_holdings` is best-effort steady-state metadata;
+    /// `phase_may_be_empty` co-converges with `phase_deps`) can be
+    /// stale in a cached reply ONLY between two digest-covered
+    /// changes; their merge rules (first-bootstrap-adopt /
+    /// generation-gated insert) tolerate any older snapshot, and their
+    /// steady-state writers are the LIVE broadcast paths, so a
+    /// slightly-stale value never wedges convergence — the next
+    /// digest-covered change refreshes the cache anyway.
+    ///
+    /// [`digest`]: Self::digest
+    pub fn snapshot_json(&mut self) -> Result<std::sync::Arc<String>, String> {
+        let digest = self.digest();
+        if let Some((cached_digest, json)) = &self.snapshot_json_cache
+            && *cached_digest == digest
+        {
+            tracing::debug!(
+                snapshot_bytes = json.len(),
+                "snapshot-RPC reply served from the serialize-once cache"
+            );
+            return Ok(std::sync::Arc::clone(json));
+        }
+        let json = serde_json::to_string(&self.snapshot()).map_err(|e| e.to_string())?;
+        let json = std::sync::Arc::new(json);
+        tracing::debug!(
+            snapshot_bytes = json.len(),
+            tasks = self.tasks.len(),
+            "snapshot-RPC reply serialized (cache refreshed for this state generation)"
+        );
+        self.snapshot_json_cache = Some((digest, std::sync::Arc::clone(&json)));
+        Ok(json)
     }
 
     /// Merge a snapshot into local state per the CRDT lattice

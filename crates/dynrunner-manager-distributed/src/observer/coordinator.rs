@@ -1384,8 +1384,11 @@ where
     /// role (the same `is_observer` field the snapshot responders record):
     /// `Observer(id)` for an observer requester, `Secondary(id)` otherwise.
     async fn answer_snapshot_request(&mut self, requester: &str, requester_is_observer: bool) {
-        let snapshot = self.cluster_state.snapshot();
-        let snapshot_json = match serde_json::to_string(&snapshot) {
+        // Serialize-once per state generation (#367): the cache inside
+        // `ClusterState` keys the reply bytes on the anti-entropy
+        // digest, so a burst of pulls against an unchanged ledger does
+        // not re-serialize ~100 MB per request.
+        let snapshot_json = match self.cluster_state.snapshot_json() {
             Ok(json) => json,
             Err(e) => {
                 tracing::warn!(
@@ -1399,7 +1402,7 @@ where
             target: None,
             sender_id: self.config.node_id.clone(),
             timestamp: timestamp_now(),
-            snapshot_json,
+            snapshot_json: (*snapshot_json).clone(),
         };
         let dst = if requester_is_observer {
             Destination::Observer(PeerId::from(requester.to_string()))

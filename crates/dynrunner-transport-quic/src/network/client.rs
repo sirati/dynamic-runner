@@ -238,7 +238,7 @@ const CTX: &str = "network-client";
 /// The reader is `framing::run_quic_reader` (the shared wire-frame
 /// policy pump, #366); the writer stays local because it owns the
 /// [`Outgoing`] envelope (`Flush` rendezvous), but each `Msg` is
-/// encoded through the same `framing::encode_outbound` gate — an
+/// encoded through the same `framing::encode_outbound_frames` gate — an
 /// unsendable frame is dropped loudly there and the connection kept.
 fn spawn_quic_bridge<I: Identifier>(conn: QuicConnection) -> BridgedConnection<I> {
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Outgoing<I>>();
@@ -252,18 +252,18 @@ fn spawn_quic_bridge<I: Identifier>(conn: QuicConnection) -> BridgedConnection<I
         incoming_tx,
         CTX,
         CTX.to_string(),
+        framing::new_reassembler(),
     ));
 
     let writer = tokio::task::spawn_local(async move {
         let mut send = send_stream;
-        while let Some(item) = outgoing_rx.recv().await {
+        'pump: while let Some(item) = outgoing_rx.recv().await {
             match item {
                 Outgoing::Msg(msg) => {
-                    let Some(frame) = framing::encode_outbound(&msg, CTX, CTX) else {
-                        continue;
-                    };
-                    if send.write_all(&frame).await.is_err() {
-                        break;
+                    for frame in framing::encode_outbound_frames(&msg, CTX, CTX) {
+                        if send.write_all(&frame).await.is_err() {
+                            break 'pump;
+                        }
                     }
                 }
                 Outgoing::Flush(ack) => {
@@ -301,17 +301,17 @@ fn spawn_wss_bridge<I: Identifier>(conn: WssConnection) -> BridgedConnection<I> 
         incoming_tx,
         CTX,
         CTX.to_string(),
+        framing::new_reassembler(),
     ));
 
     let writer = tokio::task::spawn_local(async move {
-        while let Some(item) = outgoing_rx.recv().await {
+        'pump: while let Some(item) = outgoing_rx.recv().await {
             match item {
                 Outgoing::Msg(msg) => {
-                    let Some(frame) = framing::encode_outbound(&msg, CTX, CTX) else {
-                        continue;
-                    };
-                    if ws_write.send(Message::Binary(frame.into())).await.is_err() {
-                        break;
+                    for frame in framing::encode_outbound_frames(&msg, CTX, CTX) {
+                        if ws_write.send(Message::Binary(frame.into())).await.is_err() {
+                            break 'pump;
+                        }
                     }
                 }
                 Outgoing::Flush(ack) => {

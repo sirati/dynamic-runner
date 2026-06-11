@@ -125,9 +125,19 @@ async fn handle_new_quic_connection<I: Identifier>(
     };
     let peer_id = first_msg.sender_id().to_string();
 
-    // Forward first message
-    if incoming_tx.send(first_msg).is_err() {
-        return;
+    // Per-connection chunk reassembly across the identify→pump
+    // boundary (see `peer::accept::handle_accepted_quic`): resolve the
+    // first frame through the same seam the pump uses, so a transfer
+    // whose chunk 0 IS the first frame reassembles seamlessly.
+    let mut reassembler = framing::new_reassembler();
+    match framing::resolve_inbound(first_msg, &mut reassembler, CTX, &peer_id) {
+        framing::InboundStep::Deliver(msg) => {
+            if incoming_tx.send(msg).is_err() {
+                return;
+            }
+        }
+        framing::InboundStep::Consumed => {}
+        framing::InboundStep::Fatal => return,
     }
 
     // Create per-connection write channel
@@ -160,6 +170,7 @@ async fn handle_new_quic_connection<I: Identifier>(
         incoming_tx,
         CTX,
         peer_id.clone(),
+        reassembler,
     ));
 
     // Writer task: drain outgoing channel, write to QUIC send stream
@@ -215,9 +226,19 @@ async fn handle_new_wss_connection<I: Identifier>(
     };
     let peer_id = first_msg.sender_id().to_string();
 
-    // Forward first message
-    if incoming_tx.send(first_msg).is_err() {
-        return;
+    // Per-connection chunk reassembly across the identify→pump
+    // boundary (see `peer::accept::handle_accepted_quic`): resolve the
+    // first frame through the same seam the pump uses, so a transfer
+    // whose chunk 0 IS the first frame reassembles seamlessly.
+    let mut reassembler = framing::new_reassembler();
+    match framing::resolve_inbound(first_msg, &mut reassembler, CTX, &peer_id) {
+        framing::InboundStep::Deliver(msg) => {
+            if incoming_tx.send(msg).is_err() {
+                return;
+            }
+        }
+        framing::InboundStep::Consumed => {}
+        framing::InboundStep::Fatal => return,
     }
 
     // Create per-connection write channel
@@ -248,6 +269,7 @@ async fn handle_new_wss_connection<I: Identifier>(
         incoming_tx,
         CTX,
         peer_id.clone(),
+        reassembler,
     ));
 
     // Writer task: drain outgoing channel, write to WebSocket
