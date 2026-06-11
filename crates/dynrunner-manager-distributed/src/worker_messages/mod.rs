@@ -39,5 +39,5 @@ pub mod event;
 pub mod listener;
 
 pub use dispatcher::run_worker_message_dispatcher;
-pub use event::WorkerCustomMessage;
+pub use event::{WorkerCustomMessage, WorkerMessageItem};
 pub use listener::WorkerMessageListener;

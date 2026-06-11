@@ -502,14 +502,16 @@ where
                     task_type = %type_id,
                     "worker custom message received; dispatching to listeners"
                 );
-                let _ = self
-                    .worker_message_tx
-                    .send(crate::worker_messages::WorkerCustomMessage {
-                        worker_id,
-                        type_id,
-                        topic,
-                        data,
-                    });
+                let _ = self.worker_message_tx.send(
+                    crate::worker_messages::WorkerMessageItem::Custom(
+                        crate::worker_messages::WorkerCustomMessage {
+                            worker_id,
+                            type_id,
+                            topic,
+                            data,
+                        },
+                    ),
+                );
                 Ok(None)
             }
             WorkerEvent::Keepalive { worker_id, .. } => {

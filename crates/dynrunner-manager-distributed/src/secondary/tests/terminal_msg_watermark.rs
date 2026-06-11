@@ -85,16 +85,13 @@ async fn predrain_orders_queued_customs_before_terminal_and_stamps_watermark() {
                 })
                 .unwrap();
 
-            // The worker-event arm's sequence: CAUSAL PRE-DRAIN, then the
-            // event (whose terminal report is stamped at the
-            // send_to_primary chokepoint).
+            // The pool-event seam the loop arm routes through: causal
+            // fence (pre-drain), then the event (whose terminal report
+            // is stamped at the send_to_primary chokepoint).
             let mut control_rx = secondary.secondary_control_rx.take();
-            secondary
-                .drain_pending_control_commands(&mut control_rx)
-                .await;
             let oom = test_oom_watcher();
             secondary
-                .handle_worker_event(
+                .process_worker_pool_event(
                     WorkerEvent::TaskCompleted {
                         worker_id: 0,
                         generation: 0,
@@ -104,6 +101,7 @@ async fn predrain_orders_queued_customs_before_terminal_and_stamps_watermark() {
                         estimated_resources: ResourceMap::new(),
                     },
                     &oom,
+                    &mut control_rx,
                 )
                 .await
                 .unwrap();

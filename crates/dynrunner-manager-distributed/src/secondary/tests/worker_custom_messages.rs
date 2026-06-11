@@ -92,12 +92,16 @@ async fn customs_dispatch_in_order_and_stale_generation_drops() {
 
             // Exactly the two current-generation events, in order,
             // with the running task's type identity.
-            let first = worker_message_rx.try_recv().expect("first custom");
+            let unwrap_custom = |item: crate::worker_messages::WorkerMessageItem| match item {
+                crate::worker_messages::WorkerMessageItem::Custom(event) => event,
+                other => panic!("expected a Custom item on the dispatcher channel: {other:?}"),
+            };
+            let first = unwrap_custom(worker_message_rx.try_recv().expect("first custom"));
             assert_eq!(first.worker_id, 0);
             assert_eq!(first.type_id, expected_type);
             assert_eq!(first.topic, "batch-0");
             assert_eq!(first.data, vec![0u8; 3]);
-            let second = worker_message_rx.try_recv().expect("second custom");
+            let second = unwrap_custom(worker_message_rx.try_recv().expect("second custom"));
             assert_eq!(second.topic, "batch-1");
             assert!(
                 worker_message_rx.try_recv().is_err(),

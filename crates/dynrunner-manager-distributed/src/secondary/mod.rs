@@ -384,15 +384,20 @@ where
     /// arm) enqueues one [`crate::worker_messages::WorkerCustomMessage`]
     /// per inbound worker custom frame; the dispatcher task drains and
     /// fans out to the registered listeners OFF the operational loop
-    /// (the consumer's `worker_message_listener` runs Python).
+    /// (the consumer's `worker_message_listener` runs Python). The
+    /// causal fence's pre-terminal flush
+    /// (`processing/process_tasks.rs`) enqueues
+    /// [`crate::worker_messages::WorkerMessageItem::FlushBarrier`]
+    /// tokens on the same channel — FIFO order is what makes the
+    /// barrier ack an ordering proof.
     pub(super) worker_message_tx:
-        tokio::sync::mpsc::UnboundedSender<crate::worker_messages::WorkerCustomMessage>,
+        tokio::sync::mpsc::UnboundedSender<crate::worker_messages::WorkerMessageItem>,
 
     /// Worker custom-message dispatcher channel receiver. Same
     /// single-shot / `mem::take`-at-first-entry semantics as
     /// `lifecycle_rx` / `task_completed_rx`.
     pub(super) worker_message_rx: Option<
-        tokio::sync::mpsc::UnboundedReceiver<crate::worker_messages::WorkerCustomMessage>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::worker_messages::WorkerMessageItem>,
     >,
 
     /// Consumers of worker custom-message events; same single-shot

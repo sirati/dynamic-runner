@@ -897,21 +897,33 @@ where
     /// the causal-ordering tests drive), so an event is processed
     /// identically in production and under test.
     ///
-    /// CAUSAL PRE-DRAIN (the terminal-ordering gate's
-    /// secondary half): apply every control-plane
-    /// command already queued BEFORE this worker
-    /// event is processed. A consumer's
-    /// `worker_message_listener` that called
-    /// `SecondaryHandle.send_to_primary` before the
-    /// worker exited has its messages queued here —
-    /// processing the exit's terminal report first
-    /// would let the terminal overtake them on the
-    /// wire AND stamp a `msgs_posted_through`
-    /// watermark that misses them (the asm-dataset
-    /// run_20260611_005220 race). Draining first
-    /// makes "control-plane ingress is causally
-    /// ordered before worker events" a loop-level
-    /// rule, with no event-shape knowledge here.
+    /// CAUSAL FENCE (the terminal-ordering gate's secondary half): a
+    /// task terminal report must never be stamped/sent before the
+    /// task's own prior sends, whichever leg of the relay they are on:
+    ///
+    /// 1. PIPELINE FLUSH (terminal-shaped events only — the asm-dataset
+    ///    run_20260611_182745 tail race): the worker's last custom
+    ///    messages may still be crossing the worker-message
+    ///    dispatcher-task → `worker_message_listener` → control-queue
+    ///    hop when its exit lands here. The pool channel orders the
+    ///    customs BEFORE the terminal event, so a flush barrier sent
+    ///    through the same FIFO dispatcher channel — acknowledged only
+    ///    after every prior item's listeners returned — proves their
+    ///    relay commands are in the control queue.
+    /// 2. CONTROL PRE-DRAIN (every event — the asm-dataset
+    ///    run_20260611_005220 race): apply every control-plane command
+    ///    queued by the consumer's listener BEFORE the event is
+    ///    processed, so the relayed customs are `msg_seq`-stamped and
+    ///    sent (or retained) first, and the terminal's
+    ///    `msgs_posted_through` watermark covers them.
+    ///
+    /// Step 1 keys on
+    /// [`dynrunner_manager_local::worker::WorkerEvent::is_task_terminal`]
+    /// — flushing on
+    /// every event would put a dispatcher round-trip (listener
+    /// execution included) on the loop's hot path for keepalives and
+    /// the custom messages themselves, serialising exactly what the
+    /// dispatcher task exists to decouple.
     pub(in crate::secondary) async fn process_worker_pool_event(
         &mut self,
         event: dynrunner_manager_local::worker::WorkerEvent<I>,
@@ -920,6 +932,9 @@ where
             tokio::sync::mpsc::UnboundedReceiver<super::super::control::SecondaryControlCommand>,
         >,
     ) -> Result<(), String> {
+        if event.is_task_terminal() {
+            self.flush_worker_message_pipeline().await;
+        }
         self.drain_pending_control_commands(control_rx).await;
         let restart = self.handle_worker_event(event, oom_watcher).await?;
         if let Some(wid) = restart {
@@ -1014,4 +1029,69 @@ where
             self.handle_secondary_control_command(cmd).await;
         }
     }
+
+    /// Causal-fence step 1: wait until the worker-message dispatcher
+    /// has fully processed every item enqueued before NOW — i.e. every
+    /// worker custom message that preceded the in-hand terminal event
+    /// on the pool channel has been through the consumer's
+    /// `worker_message_listener`, whose relay commands are therefore
+    /// in the control queue for the pre-drain (step 2) to stamp+send
+    /// before the terminal report.
+    ///
+    /// # Liveness
+    ///
+    /// * The await yields the loop, which is what lets the same-thread
+    ///   (`spawn_local`) dispatcher task run the backlog at all. The
+    ///   listeners' relay sends are non-blocking queue pushes
+    ///   (`SecondaryHandle` → unbounded control channel), so the
+    ///   round-trip is bounded by the in-flight backlog — the exact
+    ///   messages the terminal must causally follow.
+    /// * Dispatcher never spawned (`worker_message_rx` still unspent —
+    ///   pre-run paths and unit harnesses): nothing can run a listener
+    ///   before this terminal, so there is no pipeline to flush.
+    /// * Dispatcher gone (channel closed / barrier dropped on abort):
+    ///   no listener will ever relay again — proceed; the loss class
+    ///   is the same as a consumer that never relayed.
+    /// * A pathological listener that wedges the dispatcher is cut off
+    ///   by [`WORKER_MESSAGE_FLUSH_TIMEOUT`]: the terminal proceeds
+    ///   with the watermark it can see (the pre-fence behavior, under
+    ///   a WARN) rather than wedging the operational loop.
+    async fn flush_worker_message_pipeline(&mut self) {
+        if self.worker_message_rx.is_some() {
+            return;
+        }
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if self
+            .worker_message_tx
+            .send(crate::worker_messages::WorkerMessageItem::FlushBarrier(
+                ack_tx,
+            ))
+            .is_err()
+        {
+            return;
+        }
+        match tokio::time::timeout(WORKER_MESSAGE_FLUSH_TIMEOUT, ack_rx).await {
+            // Ok(Ok(())): barrier acknowledged. Ok(Err(_)): the
+            // dispatcher dropped the barrier un-acked (task aborted
+            // mid-drain) — nothing further will ever be relayed.
+            Ok(_) => {}
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = WORKER_MESSAGE_FLUSH_TIMEOUT.as_secs(),
+                    "worker-message pipeline flush timed out before a task \
+                     terminal; a worker_message_listener is stalling the \
+                     dispatcher — the terminal's msgs_posted_through stamp \
+                     may miss the task's last sends"
+                );
+            }
+        }
+    }
 }
+
+/// Upper bound on the pre-terminal pipeline flush
+/// ([`SecondaryCoordinator::flush_worker_message_pipeline`]): the
+/// dispatcher backlog is normally a handful of relay-shaped listener
+/// calls (milliseconds); a consumer listener that holds the dispatcher
+/// longer than this is treated as wedged and the terminal proceeds
+/// under-stamped (WARN) instead of parking the operational loop.
+const WORKER_MESSAGE_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
