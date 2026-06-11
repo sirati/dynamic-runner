@@ -216,9 +216,12 @@ pub(crate) fn find_items<'py>(
 ) -> PyResult<Bound<'py, PyList>> {
     let visit_method = task_definition.getattr("visit")?.unbind();
 
-    let marked = py
+    let (marked, _stats) = py
         .detach(|| -> Result<_, WalkError<PyErr>> {
             let mut bridge = PyVisitorBridge { visit_method };
+            // `_stats` is the once-per-walk diagnostic summary (logged
+            // inside `walk` at its own target); the Python discovery boundary
+            // consumes only the marked files.
             walk(&root, &mut bridge)
         })
         .map_err(|e| match e {
