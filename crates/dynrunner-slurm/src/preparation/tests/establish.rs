@@ -334,6 +334,70 @@ fn establish_tunnel_enforces_per_tunnel_wall_clock_budget() {
     }
 }
 
+/// FAILURE CLASSIFICATION fail-fast: an rc=255 whose stderr carries
+/// auth-class evidence ("Permission denied" — the wrong/missing
+/// key/user PROVISIONING shape) is DETERMINISTIC: every retry would
+/// refuse identically, so the establishment must surface the error
+/// after exactly ONE attempt — no retry budget burned, and the
+/// operator sees the verbatim stderr immediately (asm-dataset
+/// run_20260611: 3 silent retries turned a 10-second "Permission
+/// denied" diagnosis into two failed dispatch attempts).
+#[test]
+fn establish_tunnel_fails_fast_on_auth_class_stderr() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let (err, attempts) = rt.block_on(local.run_until(async {
+        let pool = Arc::new(Semaphore::new(1));
+        let policy = fast_policy(1, 3);
+        let attempt_counter = Arc::new(AtomicUsize::new(0));
+        let attempts_ref = Arc::clone(&attempt_counter);
+
+        let res = establish_tunnel(
+            "secondary-4",
+            &policy,
+            &pool,
+            move || {
+                attempts_ref.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Ok(fail_child(
+                        "runuser@gateway.example: Permission denied (publickey,password).",
+                        255,
+                    ))
+                }
+            },
+            listening_verifier(),
+        )
+        .await;
+
+        let err = res.expect_err("auth-class failure must surface an error");
+        (err, attempt_counter.load(Ordering::SeqCst))
+    }));
+    assert_eq!(
+        attempts, 1,
+        "a deterministic auth-class failure must NOT be retried"
+    );
+    match err {
+        PrepError::TunnelFailed {
+            secondary_id,
+            rc,
+            stderr,
+        } => {
+            assert_eq!(secondary_id, "secondary-4");
+            assert!(rc.is_some());
+            // The verbatim ssh stderr is the operator's diagnosis —
+            // it must survive into the surfaced error untouched.
+            assert_eq!(
+                stderr,
+                "runuser@gateway.example: Permission denied (publickey,password)."
+            );
+        }
+        other => panic!("expected TunnelFailed, got {other}"),
+    }
+}
+
 /// Default policy sanity: the operator-friendly defaults are the
 /// numbers documented in the design (4 concurrent, 3 attempts,
 /// [5s, 15s] backoff, 90s per-tunnel cap). Pinned here so a

@@ -924,6 +924,75 @@ pub(super) fn summarize_linger_enables(ledger: &LingerLedger) {
     }
 }
 
+/// Classification of one failed establishment attempt, derived from
+/// the ssh subprocess's captured stderr. Steers the retry loop in
+/// [`establish_tunnel`](super::establish::establish_tunnel): only
+/// [`Self::Transient`] failures consume retry budget; a
+/// [`Self::Deterministic`] failure fails fast so (a) no backoff sleeps
+/// delay the diagnosis and (b) the verbatim stderr ("Permission
+/// denied …") reaches the operator on the FIRST attempt (asm-dataset
+/// run_20260611: a provisioning gap that omitted workers 5-15 burned
+/// the full retry budget per tunnel before surfacing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TunnelFailureClass {
+    /// Pre-banner / pre-auth connection loss — the probabilistic class
+    /// (sshd `MaxStartups` random-drop, transient resets). A retry
+    /// virtually always lands; this is what the retry budget is FOR.
+    Transient,
+    /// Auth-class refusal (bad/missing key, unknown user, host-key
+    /// rejection, post-banner close) — deterministic: every retry
+    /// refuses identically. Surface immediately.
+    Deterministic,
+}
+
+/// ONE classifier for rc=255-class establishment stderr (the seam the
+/// retry policy consults — see [`TunnelFailureClass`]). Pure, so the
+/// real-world stderr shapes are unit-testable verbatim.
+///
+/// Order is load-bearing:
+///
+/// 1. Explicit auth evidence anywhere ⇒ `Deterministic`. Checked FIRST
+///    because under the ProxyCommand jump (see [`push_jump_prologue`])
+///    the proxy ssh's own stderr lands on the outer ssh's stderr — a
+///    gateway-auth refusal therefore shows "Permission denied" from
+///    the proxy AND "Connection closed by UNKNOWN port 65535" from the
+///    outer ssh in the SAME capture. The auth evidence wins.
+/// 2. Pre-banner loss markers ⇒ `Transient`: the connection died
+///    before/during identification exchange
+///    (`kex_exchange_identification`), or ssh never learned the peer
+///    ("Connection closed by UNKNOWN"), or the TCP layer reset — the
+///    `MaxStartups` random-drop anatomy.
+/// 3. A bare post-banner close line ("Connection closed by <addr>
+///    port <p>" with no pre-banner marker, e.g. sshd disconnecting
+///    after rejected auth attempts) ⇒ `Deterministic`.
+/// 4. Anything unrecognised ⇒ `Transient` — retrying an unknown
+///    failure is the safe default (the pre-classification behaviour
+///    for every failure).
+pub(super) fn classify_tunnel_failure(stderr: &str) -> TunnelFailureClass {
+    const AUTH_MARKERS: [&str; 4] = [
+        "Permission denied",
+        "Host key verification failed",
+        "Too many authentication failures",
+        "No supported authentication methods available",
+    ];
+    if AUTH_MARKERS.iter().any(|m| stderr.contains(m)) {
+        return TunnelFailureClass::Deterministic;
+    }
+    if stderr.contains("kex_exchange_identification")
+        || stderr.contains("Connection closed by UNKNOWN")
+        || stderr.contains("Connection reset by peer")
+    {
+        return TunnelFailureClass::Transient;
+    }
+    if stderr
+        .lines()
+        .any(|l| l.trim_start().starts_with("Connection closed by "))
+    {
+        return TunnelFailureClass::Deterministic;
+    }
+    TunnelFailureClass::Transient
+}
+
 /// When a spawner invocation force-releases the worker-side
 /// `-R <tunnel_port>` binding (via [`release_stale_reverse_port`])
 /// before spawning the reverse tunnel.

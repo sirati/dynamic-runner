@@ -28,8 +28,11 @@ use std::time::Duration;
 ///    still parallelising the bulk of setup.
 ///
 /// 2. **Retry budget** (`attempts`, `backoff`): per-tunnel retry on
-///    handshake-time failure. Only `PrepError::TunnelFailed` is
-///    retried (info-parse / IO errors are non-recoverable). After
+///    handshake-time failure. Only `PrepError::TunnelFailed` whose
+///    stderr classifies as TRANSIENT (pre-banner drop — see
+///    `super::ssh::classify_tunnel_failure`) is retried; an
+///    auth-class DETERMINISTIC refusal fails fast on the first
+///    attempt, and info-parse / IO errors are non-recoverable. After
 ///    `attempts` total tries the last failure surfaces unchanged.
 ///    `backoff[i]` is the sleep BEFORE attempt `i+1` (so `backoff[0]`
 ///    sits between attempts 1 and 2).
