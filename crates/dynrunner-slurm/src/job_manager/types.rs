@@ -43,6 +43,22 @@ pub struct JobStatusInfo {
     pub reason: String,
 }
 
+/// What `cancel_job`'s `scancel` actually did, for callers that need
+/// to pick a log severity (e.g. the respawn revocation path treats a
+/// gone job as a quiet no-op). Distinct from the `Err` arm, which is
+/// reserved for the gateway transport failing — scancel never ran at
+/// all there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// scancel exited 0 — the job was cancelled (or was already in a
+    /// cancelling state scancel accepts silently).
+    Cancelled,
+    /// scancel ran but reported an error — on a reachable gateway this
+    /// means the job id is no longer known to the controller (already
+    /// finished, already cancelled, or purged).
+    AlreadyGone,
+}
+
 /// Manages SLURM job submission and lifecycle via a `Gateway`.
 ///
 /// The `gateway` and `job_ids` fields are `pub(super)` so the impl

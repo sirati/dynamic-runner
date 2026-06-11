@@ -2,7 +2,7 @@
 //!
 //! Single concern: turn a [`SecondarySpawnSpec`] from the
 //! `dynrunner-manager-distributed` operational loop into the SLURM
-//! provider's triple of operations:
+//! provider's operations:
 //!
 //!   1. **Wrapper-script synthesis** for the new secondary id (delegated
 //!      to a caller-supplied closure, because rendering a
@@ -16,7 +16,15 @@
 //!      job name so operators eyeballing `squeue` see the same id the
 //!      framework's respawn-event ring carries.
 //!
-//!   3. **Reverse-tunnel establishment** via the
+//!   3. **Revocation** via [`SecondarySpawner::revoke`]: a
+//!      replacement whose original member is re-admitted before the
+//!      replacement joins is a redundant allocation squatter; the
+//!      spawner scancels the recorded sbatch job (or tombstones a
+//!      submission still in flight). Best-effort — a gone job is a
+//!      quiet no-op, and a transport failure still leaves the job id
+//!      on `job_ids` for the run-teardown scancel sweep.
+//!
+//!   4. **Reverse-tunnel establishment** via the
 //!      [`TunnelEstablisher`](tunnel::TunnelEstablisher) port
 //!      (production-bound to
 //!      [`SlurmPreparation::establish_one_tunnel`](crate::preparation::SlurmPreparation::establish_one_tunnel)).
