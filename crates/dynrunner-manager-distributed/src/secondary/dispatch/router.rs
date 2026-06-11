@@ -87,6 +87,27 @@ where
                 predecessor_outputs,
                 ..
             } => {
+                // Run-terminal gate (asm-dataset run_20260611_112116,
+                // secondary-11's zombie): once the replicated `RunAborted`
+                // verdict is latched, NO work-starting edge may run — not
+                // the ordinary assign, and not the first-bind / type-shift
+                // respawn `ensure_worker_for_type_async` triggers below
+                // (production respawned workers "for type-shift" 3+ minutes
+                // post-abort). The frame is dropped, not bounced: the run
+                // is over cluster-wide, this loop's own tail exits on the
+                // same latch within this iteration, and no reply is owed —
+                // the authority that sent it exits on the same verdict.
+                if let Some(reason) = self.cluster_state.run_aborted() {
+                    tracing::info!(
+                        reason = %reason,
+                        task_hash = %file_hash,
+                        worker_id,
+                        "TaskAssignment ignored: the replicated run-terminal \
+                         verdict is latched (post-abort dispatch); this node \
+                         exits on the same latch"
+                    );
+                    return Ok(());
+                }
                 // Resolve binary path via the three-mode helper
                 // (uses_file_based_items / pre_staged_mode / default
                 // extraction-cache). See `resolve_for_dispatch` for

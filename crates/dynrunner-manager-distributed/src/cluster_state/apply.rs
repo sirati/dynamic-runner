@@ -296,12 +296,24 @@ impl<I: Identifier> ClusterState<I> {
                 ApplyOutcome::Applied
             }
             ClusterMutation::RunAborted { reason } => {
-                // Sticky monotonic: the first abort reason wins. A
+                // Sticky monotonic: the FIRST abort reason wins. A
                 // re-applied / duplicate `RunAborted` (at-least-once
-                // delivery, or a snapshot re-broadcast) is a NoOp so the
-                // reason and the latched flag never churn. Mirror of
-                // the `RunComplete` arm above — the failure twin.
-                if self.run_aborted.is_some() {
+                // delivery, a snapshot re-broadcast, or a second abort
+                // attempt with a DIFFERENT reason — e.g. the finalize
+                // tail's worker-mgmt render after the #3b invalidation
+                // already latched the duplicate-identity verdict) is a
+                // NoOp so the reason and the latched flag never churn.
+                // Mirror of the `RunComplete` arm above — the failure
+                // twin. The drop is logged so a swallowed second reason
+                // stays diagnosable.
+                if let Some(latched) = &self.run_aborted {
+                    tracing::debug!(
+                        latched = %latched,
+                        dropped = %reason,
+                        "RunAborted reason already latched \
+                         (first-writer-wins); dropping the later abort \
+                         reason"
+                    );
                     return ApplyOutcome::NoOp;
                 }
                 self.run_aborted = Some(reason);

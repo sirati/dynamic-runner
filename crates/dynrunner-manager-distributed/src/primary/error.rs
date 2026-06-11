@@ -72,9 +72,10 @@ pub enum RunError {
     /// A structured pre-dispatch terminal with no per-task breakdown to
     /// render — only the reason naming the colliding identities. (A
     /// duplicate detected AFTER a phase started — #3b — does NOT reach
-    /// this variant: it
-    /// invalidates the not-yet-terminal tasks run-wide and the run
-    /// CONTINUES to its normal completion.)
+    /// this variant: `invalidate_all_pending` latches + broadcasts its
+    /// own `RunAborted` verdict, invalidates the not-yet-terminal tasks
+    /// run-wide, and surfaces `FatalPolicyExit` through the
+    /// worker-management bus.)
     DuplicateTaskIdPrePhase {
         /// Human-readable reason naming the colliding `(phase, task_id)`
         /// identity/identities. Same string carried in the broadcast

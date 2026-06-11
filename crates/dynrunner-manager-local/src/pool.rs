@@ -499,16 +499,33 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         // field consistent with the doomed protocol state across
         // the kill+spawn window.
         self.workers[worker_id as usize].subcgroup = None;
-        let subcgroup = prepare_worker_leaf(&self.workers_cgroup, worker_id)?;
-        let (transport, pid) = match &preserved_type {
+        // Pre-generation failures (cgroup leaf prep, the spawn syscall
+        // itself) feed the startup-crash backoff via
+        // `note_spawn_failure` — no successor handle exists to carry
+        // the streak, so the slot's surviving handle records it.
+        let subcgroup = match prepare_worker_leaf(&self.workers_cgroup, worker_id) {
+            Ok(s) => s,
+            Err(e) => {
+                self.note_spawn_failure(worker_id);
+                return Err(e);
+            }
+        };
+        let spawned = match &preserved_type {
             Some(type_id) => factory
                 .spawn_worker_for_type(worker_id, type_id, subcgroup.as_ref())
                 .map_err(|e| {
                     format!("failed to respawn worker {worker_id} for type {type_id}: {e}")
-                })?,
+                }),
             None => factory
                 .spawn_worker(worker_id, subcgroup.as_ref())
-                .map_err(|e| format!("failed to respawn worker {worker_id}: {e}"))?,
+                .map_err(|e| format!("failed to respawn worker {worker_id}: {e}")),
+        };
+        let (transport, pid) = match spawned {
+            Ok(v) => v,
+            Err(e) => {
+                self.note_spawn_failure(worker_id);
+                return Err(e);
+            }
         };
         if print_pid && let Some(pid) = pid {
             tracing::info!(worker_id, pid, label, "worker PID ({label})");
@@ -538,6 +555,41 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         handle.loaded_type_id = preserved_type;
         self.workers[worker_id as usize] = handle;
         Ok(())
+    }
+
+    /// Record a replacement-edge SPAWN FAILURE on the slot — the
+    /// dead-at-spawn-machinery feed for failures that happen BEFORE any
+    /// child generation exists (per-worker cgroup leaf creation failed,
+    /// or the factory's spawn syscall itself errored, e.g. exec ENOENT
+    /// into a gutted container rootfs — asm-dataset
+    /// run_20260611_115429).
+    ///
+    /// Without this, such a failure was invisible to the backoff: no
+    /// successor handle was ever constructed, so nothing extended
+    /// `startup_crash_streak`, and the slot's SURVIVING handle (the
+    /// stopped predecessor, typically `ever_ready = true` from its
+    /// healthy life) made [`Self::restart_backoff_delay`] read ZERO —
+    /// the caller's reschedule then re-ran the broken exec at loop
+    /// speed (the #370 hot-loop class, spawn-failure edition).
+    ///
+    /// The surviving predecessor handle doubles as the slot's
+    /// bookkeeping carrier across the failed replacement (exactly like
+    /// the budget fields): its subprocess is already stopped/killed by
+    /// the edge that failed, so flipping `ever_ready` off and extending
+    /// the streak on it re-purposes the slot as "attempts at a NEW
+    /// subprocess are currently failing" — which is precisely what the
+    /// backoff read keys on. A later SUCCESSFUL spawn constructs a
+    /// fresh handle whose Ready resets both fields.
+    ///
+    /// Single owner: every replacement edge (`replace_worker_slot`,
+    /// `ensure_worker_for_type`, `ensure_worker_for_type_async`) routes
+    /// its pre-generation failure through here so the rule cannot
+    /// drift.
+    fn note_spawn_failure(&mut self, worker_id: WorkerId) {
+        if let Some(worker) = self.workers.get_mut(worker_id as usize) {
+            worker.ever_ready = false;
+            worker.startup_crash_streak = worker.startup_crash_streak.saturating_add(1);
+        }
     }
 
     /// Delay before the NEXT respawn of `worker_id` may execute — the
@@ -643,12 +695,26 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         // rationale on the slot's prior `SubcgroupHandle`.
         old.subcgroup = None;
 
-        let subcgroup = prepare_worker_leaf(&self.workers_cgroup, worker_id)?;
-        let (transport, pid) = factory
+        // Pre-generation failures feed the startup-crash backoff —
+        // same rule as `replace_worker_slot` (`note_spawn_failure`).
+        let subcgroup = match prepare_worker_leaf(&self.workers_cgroup, worker_id) {
+            Ok(s) => s,
+            Err(e) => {
+                self.note_spawn_failure(worker_id);
+                return Err(e);
+            }
+        };
+        let (transport, pid) = match factory
             .spawn_worker_for_type(worker_id, required_type, subcgroup.as_ref())
-            .map_err(|e| {
-                format!("failed to respawn worker {worker_id} for type {required_type}: {e}")
-            })?;
+        {
+            Ok(v) => v,
+            Err(e) => {
+                self.note_spawn_failure(worker_id);
+                return Err(format!(
+                    "failed to respawn worker {worker_id} for type {required_type}: {e}"
+                ));
+            }
+        };
         if print_pid && let Some(pid) = pid {
             tracing::info!(
                 worker_id,
@@ -799,12 +865,26 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         // rationale on the slot's prior `SubcgroupHandle`.
         old.subcgroup = None;
 
-        let subcgroup = prepare_worker_leaf(&self.workers_cgroup, worker_id)?;
-        let (transport, pid) = factory
+        // Pre-generation failures feed the startup-crash backoff —
+        // same rule as `replace_worker_slot` (`note_spawn_failure`).
+        let subcgroup = match prepare_worker_leaf(&self.workers_cgroup, worker_id) {
+            Ok(s) => s,
+            Err(e) => {
+                self.note_spawn_failure(worker_id);
+                return Err(e);
+            }
+        };
+        let (transport, pid) = match factory
             .spawn_worker_for_type(worker_id, required_type, subcgroup.as_ref())
-            .map_err(|e| {
-                format!("failed to respawn worker {worker_id} for type {required_type}: {e}")
-            })?;
+        {
+            Ok(v) => v,
+            Err(e) => {
+                self.note_spawn_failure(worker_id);
+                return Err(format!(
+                    "failed to respawn worker {worker_id} for type {required_type}: {e}"
+                ));
+            }
+        };
         if print_pid && let Some(pid) = pid {
             tracing::info!(
                 worker_id,
@@ -1756,6 +1836,95 @@ mod startup_crash_backoff_tests {
                     matches!(ev, WorkerEvent::Disconnected { worker_id: 0, .. }),
                     "expected Disconnected for the startup-dead slot; got {ev:?}"
                 );
+            })
+            .await;
+    }
+
+    /// Every spawn FAILS AT THE SYSCALL: the factory returns `Err`
+    /// before any child generation exists (the run_20260611_115429
+    /// exec-ENOENT shape — a respawn into a gutted container rootfs).
+    /// Distinct from [`DeadAtSpawnFactory`], whose child IS created and
+    /// then dies before Ready.
+    struct SpawnSyscallFailsFactory;
+
+    impl WorkerFactory<ChannelManagerEnd> for SpawnSyscallFailsFactory {
+        fn spawn_worker(
+            &mut self,
+            worker_id: WorkerId,
+            _subcgroup: Option<&SubcgroupHandle>,
+        ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+            Err(format!(
+                "failed to exec worker {worker_id}: No such file or directory (os error 2)"
+            ))
+        }
+    }
+
+    /// A spawn-syscall failure on a replacement edge must FEED the
+    /// startup-crash backoff exactly like a dead-before-Ready child.
+    ///
+    /// Production trace (asm-dataset run_20260611_115429): a healthy,
+    /// ever-Ready worker's respawn failed at `Command::spawn` (exec
+    /// ENOENT — the container rootfs was gutted under the live
+    /// secondary). No child generation was created, so nothing bumped
+    /// the slot's `startup_crash_streak`, and the surviving handle
+    /// still read `ever_ready = true` — `restart_backoff_delay`
+    /// returned ZERO and the caller's reschedule retried the broken
+    /// exec at loop speed (the #370 hot-loop class, spawn-failure
+    /// edition).
+    ///
+    /// Pinned here: after a failed `restart_worker_async` on a
+    /// previously-healthy slot, the backoff must be non-zero and must
+    /// escalate per consecutive failure (BASE·2^streak, capped).
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_syscall_failure_feeds_startup_crash_backoff() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let scheduler = dynrunner_scheduler::ResourceStealingScheduler::memory();
+                let max = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]);
+                let mut pool: WorkerPool<ChannelManagerEnd, TestId> = WorkerPool::new();
+                // Seed slot 0 (the subprocess never Readies under this
+                // factory, but the slot exists).
+                pool.initialize(1, &max, &scheduler, &mut DeadAtSpawnFactory, false, None)
+                    .await
+                    .expect("init settles");
+                // Model the production pre-state: the slot's current
+                // subprocess HAD reached Ready (healthy worker), so the
+                // backoff reads zero before the failure.
+                pool.workers[0].ever_ready = true;
+                pool.workers[0].startup_crash_streak = 0;
+                assert_eq!(
+                    pool.restart_backoff_delay(0),
+                    std::time::Duration::ZERO,
+                    "healthy slot starts at zero delay"
+                );
+
+                // The respawn fails at the spawn syscall — repeatedly.
+                // Each failure must escalate the backoff: the NEXT
+                // attempt may not run sooner than BASE·2^failures
+                // (capped). Zero delay after a failure is the hot-loop.
+                let mut floor = RESTART_BACKOFF_BASE;
+                for attempt in 1..=8u32 {
+                    let err = pool
+                        .restart_worker_async(0, &mut SpawnSyscallFailsFactory, false)
+                        .await
+                        .expect_err("spawn syscall fails");
+                    assert!(
+                        err.contains("No such file or directory"),
+                        "error shape: {err}"
+                    );
+                    let delay = pool.restart_backoff_delay(0);
+                    assert!(
+                        delay >= floor.min(RESTART_BACKOFF_CAP) && !delay.is_zero(),
+                        "after {attempt} consecutive spawn-syscall failures the \
+                         backoff must be ≥ {:?} (capped at {:?}); got {delay:?} — \
+                         a zero/shrinking delay re-runs the broken exec at loop \
+                         speed",
+                        floor.min(RESTART_BACKOFF_CAP),
+                        RESTART_BACKOFF_CAP,
+                    );
+                    floor = (floor * 2).min(RESTART_BACKOFF_CAP);
+                }
             })
             .await;
     }

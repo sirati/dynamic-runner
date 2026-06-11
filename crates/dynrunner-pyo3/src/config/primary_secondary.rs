@@ -53,7 +53,14 @@ impl PyPrimaryConfig {
         RustPrimaryConfig {
             node_id: self.node_id.clone(),
             num_secondaries: self.num_secondaries,
-            connect_timeout: self.distributed_config.connect_timeout(),
+            // The quorum-proceed window derivation (scale-aware default,
+            // capped strictly below the secondaries' setup deadline) —
+            // the same rule the live `PyPrimaryCoordinator` path applies.
+            connect_timeout: dynrunner_manager_distributed::derive_connect_timeout(
+                self.distributed_config.connect_timeout_override(),
+                self.num_secondaries,
+                self.distributed_config.unconfigured_deadline(),
+            ),
             peer_timeout: self.distributed_config.peer_timeout(),
             keepalive_interval: self.distributed_config.keepalive_interval(),
             keepalive_miss_threshold: self.distributed_config.keepalive_miss_threshold(),

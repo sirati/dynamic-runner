@@ -378,16 +378,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // Replicated run-terminal STAND-DOWN. `run_aborted` is the
             // CRDT-resident terminal verdict (#313): sticky, carried by
             // mutation broadcasts, anti-entropy digests, and snapshots. A
-            // latched verdict on THIS node's mirror was authored by
-            // another authority (this primary's own abort paths return
-            // their structured errors without re-entering the loop), so
+            // latched verdict on THIS node's mirror is either FOREIGN
+            // (another authority's broadcast) or SELF-authored mid-loop
+            // (the #3b run-wide invalidation latches the verdict inside
+            // the command handler, BEFORE wiping the ledger). Either way
             // the run is over cluster-wide and continuing to author —
             // dispatch, retries, a later contradictory verdict — is the
             // zombie split-brain (run_20260610_221140: the deposed
             // epoch-2 primary ran 2 minutes past the epoch-9 RunAborted
             // and exited rc=0 with divergent totals). Break into the
-            // finalize tail, whose verdict gate adopts the abort as a
-            // structured non-zero exit.
+            // finalize tail: the worker-mgmt gate surfaces a typed
+            // self-authored outcome; the verdict gate adopts a foreign
+            // abort as a structured non-zero exit.
             if let Some(reason) = self.cluster_state.run_aborted() {
                 tracing::error!(
                     reason = %reason,
@@ -395,6 +397,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                      over cluster-wide — standing down out of the \
                      operational loop"
                 );
+                // Stand-down fatal pre-drain (mirror of the completion
+                // gate's pre-drain above): the SELF-authored case (the
+                // #3b invalidation) emitted `PolicyFatalExit` onto the
+                // worker-management bus in the same handler that latched
+                // the verdict, and this break runs BEFORE the parked
+                // worker-management arm has consumed it. Without the
+                // drain the typed break outcome would be lost and the
+                // finalize tail would run the retry passes against an
+                // aborted run. Same decoupling-law shape: the loop owns
+                // the drive, the emit site never broke the loop directly.
+                if let Some(batch) = worker_mgmt_rx
+                    .as_mut()
+                    .and_then(crate::worker_signal::try_collect_worker_signal_batch)
+                {
+                    self.react_to_worker_signal_batch(batch).await;
+                }
                 break;
             }
 

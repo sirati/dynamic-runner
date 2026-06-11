@@ -17,6 +17,7 @@
 //!   `WorkerMgmtSignal::TasksAdded`; positive + negative-control +
 //!   is_idle-advisory + coalesce.
 
+mod assembly_beacon;
 mod basic;
 mod capacity_dispatch;
 mod coordinator_setup;
@@ -30,6 +31,7 @@ mod graceful_abort;
 mod hydrate;
 mod initial_assignment;
 mod injected_spread;
+mod invalidation_abort;
 mod mesh_readiness_gate;
 mod message_phase_ordering;
 mod node_gates;
