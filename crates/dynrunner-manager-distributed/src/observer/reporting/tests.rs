@@ -797,12 +797,20 @@ async fn driver_emits_stats_on_10min_cadence_and_idle_on_threshold() {
     // the `format` + `idle` unit tests above).
     let src = SharedSnapshotSource::new(in_flight_snap(&[("sec-b", 1)], &[], 5));
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let (_outage_tx, outage_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::observer::lost_visibility::EndedOutage>();
     let driver = tokio::spawn({
         let src = src.clone();
         async move {
-            super::reporter::run_reporter(src, VirtualClock, async move {
-                let _ = cancel_rx.await;
-            })
+            super::reporter::run_reporter(
+                src,
+                VirtualClock,
+                outage_rx,
+                crate::observer::lost_visibility::WakeNoteSlot::default(),
+                async move {
+                    let _ = cancel_rx.await;
+                },
+            )
             .await;
         }
     });
@@ -814,6 +822,384 @@ async fn driver_emits_stats_on_10min_cadence_and_idle_on_threshold() {
     tokio::time::advance(Duration::from_secs(700)).await;
     tokio::task::yield_now().await;
     // Cancel and confirm the driver terminates (no deadlock).
+    let _ = cancel_tx.send(());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let joined = tokio::time::timeout(Duration::from_secs(1), driver).await;
+    assert!(joined.is_ok(), "driver must terminate on cancel");
+}
+
+// ── wake-stream outage seam: late run + skip-one grid bookkeeping ──
+//
+// Simulated time = injected `Instant`s (the same pattern as the idle
+// tests above); emissions are captured SYNCHRONOUSLY via
+// `capture_important` (the documented non-flaky idiom). The async
+// `run_reporter` wiring for the same seam is pinned separately below via
+// the note-slot side effect (no capture across `.await`).
+
+use super::reporter::{LATE_STATS_MIN_SPACING, Reporter, StatsGridGate};
+use crate::observer::lost_visibility::{EndedOutage, WakeNoteSlot};
+
+fn secs(s: u64) -> Duration {
+    Duration::from_secs(s)
+}
+
+#[test]
+fn grid_gate_runs_every_tick_without_late_emit() {
+    // No outage / no late emit: every grid occurrence runs — including
+    // ticks during a connection outage (the gate has NO connectivity
+    // input; the pre-existing emit-while-down behaviour is preserved by
+    // construction and pinned in the scenario tests below).
+    let t0 = Instant::now();
+    let mut gate = StatsGridGate::new();
+    assert!(gate.grid_tick(t0 + secs(600)));
+    assert!(gate.grid_tick(t0 + secs(1200)));
+    assert!(gate.grid_tick(t0 + secs(1800)));
+}
+
+#[test]
+fn grid_gate_late_run_due_only_if_occurrence_in_down_window() {
+    let t0 = Instant::now();
+    let mut gate = StatsGridGate::new();
+    // Before any occurrence ever fired: never a late run.
+    assert!(!gate.late_run_due(t0));
+    gate.grid_tick(t0 + secs(600));
+    // Outage 650→1370 spans the 1200 occurrence → due.
+    gate.grid_tick(t0 + secs(1200));
+    assert!(gate.late_run_due(t0 + secs(650)));
+    // Outage 1250→1670 (7 min) spans NO occurrence → not due.
+    assert!(!gate.late_run_due(t0 + secs(1250)));
+}
+
+#[test]
+fn grid_gate_skips_single_next_occurrence_within_spacing() {
+    // The spec exception: the next on-grid occurrence is skipped iff it
+    // lands < 5 min after the late emit; the one after fires on the
+    // ORIGINAL grid (the skip clears either way — one candidate only).
+    let t0 = Instant::now();
+    let mut gate = StatsGridGate::new();
+    gate.grid_tick(t0 + secs(1200));
+    gate.record_late_emit(t0 + secs(1620));
+    assert!(
+        !gate.grid_tick(t0 + secs(1800)),
+        "1800 is 180s (< {LATE_STATS_MIN_SPACING:?}) after the late emit — skipped"
+    );
+    assert!(
+        gate.grid_tick(t0 + secs(2400)),
+        "the following occurrence fires on the original grid"
+    );
+}
+
+#[test]
+fn grid_gate_no_skip_when_next_occurrence_outside_spacing() {
+    let t0 = Instant::now();
+    let mut gate = StatsGridGate::new();
+    gate.grid_tick(t0 + secs(1200));
+    gate.record_late_emit(t0 + secs(1430));
+    assert!(
+        gate.grid_tick(t0 + secs(1800)),
+        "1800 is 370s (≥ 5 min) after the late emit — fires on grid"
+    );
+}
+
+/// The full down-12-minutes replay (spec edge case), next grid slot ≥5min
+/// away: the grid occurrence during the outage runs (preserved
+/// behaviour) but is silent against the frozen CRDT; the regain runs ONE
+/// late stats log immediately, carrying the reconnection note; the next
+/// on-grid occurrence (430s later, ≥ the 5-min spacing) fires on the
+/// original grid.
+#[test]
+fn outage_12min_late_periodic_carries_note_next_grid_fires() {
+    let t0 = Instant::now();
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        let mut gate = StatsGridGate::new();
+        let note = WakeNoteSlot::default();
+
+        // t+600 (connected): first grid occurrence, changed stats emit.
+        assert!(gate.grid_tick(t0 + secs(600)));
+        assert!(reporter.on_stats_tick(&snap_with(3, 0)));
+        note.flush_after_host(); // no note pending — no-op
+
+        // Outage 650→1370 (12 min). t+1200: the grid occurrence still
+        // RUNS while down (preserved) but the CRDT is frozen → silent.
+        assert!(gate.grid_tick(t0 + secs(1200)));
+        assert!(!reporter.on_stats_tick(&snap_with(3, 0)), "frozen CRDT → silent");
+
+        // t+1370: regain. The loss was logged (>5 min), the policy parked
+        // the note and sent EndedOutage{down_since: 650}.
+        note.set("reconnection-note".to_string());
+        let ended = EndedOutage {
+            down_since: t0 + secs(650),
+        };
+        assert!(gate.late_run_due(ended.down_since));
+        // The late run: fresh post-reconnect data → emits, hosts the note.
+        assert!(reporter.on_stats_tick(&snap_with(9, 0)));
+        note.flush_after_host();
+        gate.record_late_emit(t0 + secs(1370));
+        assert!(!note.is_pending(), "the late log carried the note");
+
+        // t+1800: 430s after the late emit (≥ 5 min) — fires on grid.
+        assert!(gate.grid_tick(t0 + secs(1800)));
+        assert!(reporter.on_stats_tick(&snap_with(12, 0)));
+        note.flush_after_host(); // empty — the note never duplicates
+    });
+
+    let stats: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.message.contains("periodic cluster stats"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        stats.len(),
+        3,
+        "t+600, the late run, t+1800 — and nothing else: {events:?}"
+    );
+    let notes: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.message.contains("reconnection-note"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(notes.len(), 1, "the note attaches exactly once: {events:?}");
+    assert_eq!(
+        notes[0],
+        stats[1] + 1,
+        "the note rides immediately with the LATE periodic: {events:?}"
+    );
+}
+
+/// The down-12-minutes variant where the next on-grid occurrence lands
+/// <5min after the late run: that single occurrence is skipped; the one
+/// after fires on the original grid.
+#[test]
+fn outage_12min_late_periodic_skips_next_grid_slot_within_5min() {
+    let t0 = Instant::now();
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        let mut gate = StatsGridGate::new();
+        let note = WakeNoteSlot::default();
+
+        assert!(gate.grid_tick(t0 + secs(600)));
+        assert!(reporter.on_stats_tick(&snap_with(3, 0)));
+
+        // Outage 650→1620; the 1200 occurrence elapses while down.
+        assert!(gate.grid_tick(t0 + secs(1200)));
+        assert!(!reporter.on_stats_tick(&snap_with(3, 0)));
+
+        // Regain at 1620: late run emits + hosts the note.
+        note.set("reconnection-note".to_string());
+        assert!(gate.late_run_due(t0 + secs(650)));
+        assert!(reporter.on_stats_tick(&snap_with(9, 0)));
+        note.flush_after_host();
+        gate.record_late_emit(t0 + secs(1620));
+
+        // 1800 is 180s after the late run (< 5 min): SKIPPED, even though
+        // the snapshot changed — the occurrence is consumed, not run.
+        assert!(!gate.grid_tick(t0 + secs(1800)));
+
+        // 2400 fires on the ORIGINAL grid (no shift) and diffs against
+        // the LATE announcement baseline.
+        assert!(gate.grid_tick(t0 + secs(2400)));
+        assert!(reporter.on_stats_tick(&snap_with(15, 0)));
+    });
+
+    let stats: Vec<&crate::test_capture::CapturedEvent> = events
+        .iter()
+        .filter(|e| e.message.contains("periodic cluster stats"))
+        .collect();
+    assert_eq!(
+        stats.len(),
+        3,
+        "t+600, the late run, t+2400 — the t+1800 occurrence is skipped: {events:?}"
+    );
+    assert!(
+        stats[2].message.contains("15(+6)"),
+        "the post-skip occurrence diffs against the late announcement: {:?}",
+        stats[2].message
+    );
+}
+
+/// Down 7 minutes with NO grid occurrence inside the down window: no late
+/// run at regain — the parked note simply rides the next REGULAR
+/// emission (here the next on-grid periodic).
+#[test]
+fn outage_without_elapsed_periodic_has_no_late_run() {
+    let t0 = Instant::now();
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        let mut gate = StatsGridGate::new();
+        let note = WakeNoteSlot::default();
+
+        // Outage 30→450 (7 min): the first grid occurrence is at 600 —
+        // nothing elapsed while down.
+        note.set("reconnection-note".to_string());
+        assert!(
+            !gate.late_run_due(t0 + secs(30)),
+            "no occurrence elapsed while down — no late run"
+        );
+        assert!(note.is_pending(), "the note waits for the next host");
+
+        // The next regular grid occurrence hosts the note.
+        assert!(gate.grid_tick(t0 + secs(600)));
+        assert!(reporter.on_stats_tick(&snap_with(4, 0)));
+        note.flush_after_host();
+        assert!(!note.is_pending());
+    });
+
+    let stats: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.message.contains("periodic cluster stats"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(stats.len(), 1, "only the on-grid emission: {events:?}");
+    let notes: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.message.contains("reconnection-note"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        notes,
+        vec![stats[0] + 1],
+        "the note rides the next regular periodic, exactly once: {events:?}"
+    );
+}
+
+/// While the connection stays down (loss logged, never regained) the
+/// periodic keeps its pre-existing behaviour: grid ticks run and emit iff
+/// the delta rule says so — e.g. changes that landed BEFORE the freeze
+/// are still announced by the first in-outage tick. (Decision recorded in
+/// the module docs: the reporter has no connectivity gate.)
+#[test]
+fn periodic_keeps_emitting_per_delta_rule_while_down() {
+    let t0 = Instant::now();
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        let mut gate = StatsGridGate::new();
+
+        // Changes landed at t+580; outage begins at t+590.
+        // t+600 (down): the tick still runs and announces the pre-outage
+        // delta.
+        assert!(gate.grid_tick(t0 + secs(600)));
+        assert!(
+            reporter.on_stats_tick(&snap_with(5, 0)),
+            "pre-outage changes are announced by the in-outage tick (current \
+             behaviour preserved)"
+        );
+        // t+1200 (still down): frozen CRDT → silent.
+        assert!(gate.grid_tick(t0 + secs(1200)));
+        assert!(!reporter.on_stats_tick(&snap_with(5, 0)));
+    });
+    let stats: Vec<_> = events
+        .iter()
+        .filter(|e| e.message.contains("periodic cluster stats"))
+        .collect();
+    assert_eq!(stats.len(), 1, "one emission, per the delta rule: {events:?}");
+}
+
+/// The async `run_reporter` wiring for the outage seam, under the paused
+/// clock: an `EndedOutage` whose down window swallowed a grid occurrence
+/// triggers the late stats run on the driver task. Observable WITHOUT a
+/// capture-across-await (the documented flaky pattern): the late run
+/// flushes the shared note slot, so the parked note disappearing IS the
+/// late emission. Cancel-safety of the new arm is exercised by the
+/// constant sibling ticks (idle interval fires 10× per stats interval)
+/// and the clean cancel at the end.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn driver_runs_late_stats_on_ended_outage_signal() {
+    let src = SharedSnapshotSource::new(StatsSnapshot::default());
+    let note = WakeNoteSlot::default();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let (outage_tx, outage_rx) = tokio::sync::mpsc::unbounded_channel::<EndedOutage>();
+    // Virtual t0 (the paused clock's view) — the whole run is "down".
+    let down_since = tokio::time::Instant::now().into_std();
+    let driver = tokio::task::spawn({
+        let src = src.clone();
+        let note = note.clone();
+        async move {
+            super::reporter::run_reporter(src, VirtualClock, outage_rx, note, async move {
+                let _ = cancel_rx.await;
+            })
+            .await;
+        }
+    });
+    // Let the driver initialise its intervals at virtual t0 BEFORE the
+    // clock moves (otherwise they would be created at t0+601 and no grid
+    // occurrence would land inside the down window).
+    tokio::task::yield_now().await;
+    // Let a grid occurrence elapse "while down" (ticks keep firing — the
+    // preserved behaviour; all-zero snapshot → silent).
+    tokio::time::advance(Duration::from_secs(601)).await;
+    tokio::task::yield_now().await;
+
+    // Regain: publish the post-reconnect data and signal the outage end.
+    src.publish(snap_with(7, 0));
+    note.set("late-run-probe".to_string());
+    outage_tx
+        .send(EndedOutage { down_since })
+        .expect("driver alive");
+    // The late run is immediate (no further time advance needed) — give
+    // the driver task a few polls.
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !note.is_pending(),
+        "the late stats run must fire immediately on the EndedOutage signal \
+         and flush (host) the parked note"
+    );
+
+    let _ = cancel_tx.send(());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let joined = tokio::time::timeout(Duration::from_secs(1), driver).await;
+    assert!(joined.is_ok(), "driver must terminate on cancel");
+}
+
+/// Counter-wiring: an `EndedOutage` whose down window contains NO grid
+/// occurrence must NOT run a late stats log — the note stays parked,
+/// waiting for the next genuine host.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn driver_skips_late_stats_when_no_periodic_elapsed_while_down() {
+    let src = SharedSnapshotSource::new(StatsSnapshot::default());
+    let note = WakeNoteSlot::default();
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    let (outage_tx, outage_rx) = tokio::sync::mpsc::unbounded_channel::<EndedOutage>();
+    let driver = tokio::task::spawn({
+        let src = src.clone();
+        let note = note.clone();
+        async move {
+            super::reporter::run_reporter(src, VirtualClock, outage_rx, note, async move {
+                let _ = cancel_rx.await;
+            })
+            .await;
+        }
+    });
+    // Let the driver initialise its intervals at virtual t0.
+    tokio::task::yield_now().await;
+    // 7 virtual minutes pass, but NO grid occurrence elapses inside the
+    // down window (the first stats occurrence is at t0+600; the outage
+    // spans t0+30 → t0+450).
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::task::yield_now().await;
+    let down_since = tokio::time::Instant::now().into_std();
+    tokio::time::advance(Duration::from_secs(420)).await;
+    tokio::task::yield_now().await;
+
+    src.publish(snap_with(7, 0));
+    note.set("late-run-probe".to_string());
+    outage_tx
+        .send(EndedOutage { down_since })
+        .expect("driver alive");
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        note.is_pending(),
+        "no grid occurrence elapsed while down — no late run, the note waits"
+    );
+
     let _ = cancel_tx.send(());
     tokio::time::advance(Duration::from_millis(1)).await;
     let joined = tokio::time::timeout(Duration::from_secs(1), driver).await;
