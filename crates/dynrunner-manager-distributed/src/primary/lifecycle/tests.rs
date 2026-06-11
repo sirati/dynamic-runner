@@ -184,11 +184,11 @@ fn make_recording_coordinator(
     )
 }
 
-/// Register a secondary in the primary's routable set so the keepalive
-/// emitter does not early-return on an empty fleet. The pre-welcome
-/// `AwaitingWelcome` state is enough for the emission assertion: the
-/// emitter only checks `secondaries.is_empty()` and reads
-/// `self.config.node_id` + `self.workers` — it does not depend on the
+/// Register a secondary in the primary's routable set, modeling a
+/// fully-connected fleet member. The pre-welcome `AwaitingWelcome`
+/// state is enough for the emission assertion: the keepalive emitter
+/// reads only `self.config.node_id` + `self.workers` (it fans to the
+/// mesh members regardless of the roster) — it does not depend on the
 /// connection's typestate.
 fn seed_secondary(
     coordinator: &mut PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
@@ -250,9 +250,8 @@ async fn activate_local_primary_emits_a_keepalive() {
         .run_until(async {
             let (mut coordinator, log, _ends, _mesh) =
                 make_recording_coordinator(1, Duration::from_millis(100), Duration::from_secs(1));
-            // Seed sec-0 into the local `secondaries` map so the keepalive
-            // emitter has a roster to fan to (`broadcast_primary_keepalive`
-            // early-returns on an empty roster).
+            // Seed sec-0 into the local `secondaries` map, modeling the
+            // bootstrap fleet the activation keepalive addresses.
             seed_secondary(&mut coordinator, "sec-0");
 
             assert_eq!(

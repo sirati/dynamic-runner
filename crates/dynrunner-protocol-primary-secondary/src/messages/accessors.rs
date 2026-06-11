@@ -330,6 +330,50 @@ impl<I> DistributedMessage<I> {
         }
     }
 
+    /// The per-origin CAUSAL custom-message watermark stamped on a task
+    /// terminal (the message-vs-phase-end ordering gate), if any. `None`
+    /// for every non-terminal variant AND for a terminal from a
+    /// pre-field sender / one not yet routed through the stamping
+    /// chokepoint — the gate is open in both cases (no causal claim).
+    ///
+    /// Pairs with [`Self::set_msgs_posted_through`]: the secondary's
+    /// `send_to_primary` chokepoint stamps it once per report (sticky
+    /// across replays); the primary's terminal-gate ingest reads it to
+    /// decide deferral against the origin's replicated custom-inbox
+    /// terminal watermark.
+    pub fn msgs_posted_through(&self) -> Option<u64> {
+        match self {
+            Self::TaskComplete {
+                msgs_posted_through,
+                ..
+            }
+            | Self::TaskFailed {
+                msgs_posted_through,
+                ..
+            } => *msgs_posted_through,
+            _ => None,
+        }
+    }
+
+    /// Stamp the causal custom-message watermark on a task terminal IN
+    /// PLACE. A no-op on every other variant — the stamping chokepoint
+    /// gates on [`Self::task_hash`] (terminal-bearing) first, so a
+    /// non-terminal frame (including a custom message itself) never
+    /// reaches this.
+    pub fn set_msgs_posted_through(&mut self, watermark: u64) {
+        if let Self::TaskComplete {
+            msgs_posted_through,
+            ..
+        }
+        | Self::TaskFailed {
+            msgs_posted_through,
+            ..
+        } = self
+        {
+            *msgs_posted_through = Some(watermark);
+        }
+    }
+
     /// The ORIGINATING reporter of a confirmable frame (the terminal
     /// variants' `secondary_id`; a custom message's
     /// `origin_secondary_id`); `None` for every other variant.

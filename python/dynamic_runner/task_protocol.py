@@ -197,6 +197,17 @@ TaskCompletedListener = Callable[
 # primary logs a rate-limited WARN naming the backlog size and the
 # oldest entry's age. Absent or ``None`` opts out (important messages
 # are then consumed unhandled with a WARN).
+# Message-vs-phase-end ordering: every IMPORTANT message handed to
+# ``SecondaryHandle.send_to_primary`` BEFORE a task's terminal report
+# leaves its secondary is RESOLVED (handled, or failed on a raise)
+# before that terminal is processed at the primary -- so
+# ``on_phase_end`` for the task's phase always fires AFTER this handler
+# saw every message the task streamed before exiting (a
+# ``worker_message_listener`` that forwards synchronously gets this for
+# free). Droppables make no such claim (lost-by-design never delays a
+# phase), and an origin that DIES before its retained messages deliver
+# releases the ordering claim too -- the consumer's ``on_phase_end``
+# barrier then observes the gap and can fail loudly.
 #
 # Spawn-anytime note (F4) for handlers that spawn: spawning into a phase
 # that already ENDED re-opens it and re-fires its ``on_phase_end`` at

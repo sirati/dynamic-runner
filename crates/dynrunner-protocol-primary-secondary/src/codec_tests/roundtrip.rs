@@ -220,6 +220,8 @@ fn roundtrip_task_failed() {
         error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
         error_message: "out of memory".into(),
         delivery_seq: None,
+        // Stamped at the send_to_primary chokepoint (ordering gate).
+        msgs_posted_through: None,
     };
 
     let bytes = serialize_message(&msg).unwrap();
@@ -709,6 +711,8 @@ fn roundtrip_task_complete_with_delivery_seq() {
         task_hash: "h-seq".into(),
         result_data: None,
         delivery_seq: None,
+        // Stamped at the send_to_primary chokepoint (ordering gate).
+        msgs_posted_through: None,
     };
     assert_eq!(msg.delivery_seq(), None);
     msg.set_delivery_seq(11);
@@ -765,11 +769,97 @@ fn delivery_seq_is_wire_additive() {
         task_hash: "h-old".into(),
         result_data: None,
         delivery_seq: None,
+        // Stamped at the send_to_primary chokepoint (ordering gate).
+        msgs_posted_through: None,
     };
     let json = serde_json::to_string(&unstamped).unwrap();
     assert!(
         !json.contains("delivery_seq"),
         "a None delivery_seq must be elided from the wire bytes; got {json}"
+    );
+}
+
+/// A `msgs_posted_through`-stamped terminal (the message-vs-phase-end
+/// ordering gate's causal watermark) round-trips through the
+/// length-prefixed codec with the stamp preserved — what lets a replay
+/// re-land the SAME gate threshold at a promoted primary.
+#[test]
+fn roundtrip_task_complete_with_msgs_posted_through() {
+    let mut msg: DistributedMessage<TestId> = DistributedMessage::TaskComplete {
+        target: None,
+        sender_id: "sec-1".into(),
+        timestamp: 5.0,
+        secondary_id: "sec-1".into(),
+        worker_id: 3,
+        task_hash: "h-gate".into(),
+        result_data: None,
+        delivery_seq: Some(11),
+        msgs_posted_through: None,
+    };
+    assert_eq!(msg.msgs_posted_through(), None);
+    msg.set_msgs_posted_through(4);
+    assert_eq!(msg.msgs_posted_through(), Some(4));
+
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+    assert_eq!(decoded.msgs_posted_through(), Some(4));
+    assert_eq!(decoded.task_hash(), Some("h-gate"));
+}
+
+/// Wire-shape mirror (NOT symmetric-on-the-wrong-shape): decode the
+/// EXACT JSON bytes a stamping secondary emits for a gated terminal —
+/// `"msgs_posted_through":N` riding the internally-tagged
+/// `task_failed` frame — against the other side's actual bytes, so a
+/// tag/field rename that still round-trips against itself is caught.
+#[test]
+fn task_failed_with_msgs_posted_through_decodes_literal_sender_bytes() {
+    let bytes = r#"{"msg_type":"task_failed","sender_id":"sec-2","timestamp":1.0,"secondary_id":"sec-2","worker_id":0,"task_hash":"h-lit","error_type":"Recoverable","error_message":"boom","delivery_seq":3,"msgs_posted_through":4}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(bytes).unwrap();
+    match &decoded {
+        DistributedMessage::TaskFailed {
+            task_hash,
+            msgs_posted_through,
+            ..
+        } => {
+            assert_eq!(task_hash, "h-lit");
+            assert_eq!(*msgs_posted_through, Some(4));
+        }
+        _ => panic!("expected TaskFailed"),
+    }
+    assert_eq!(decoded.msgs_posted_through(), Some(4));
+}
+
+/// Backcompat both ways for the additive `msgs_posted_through` field
+/// (the `delivery_seq` precedent):
+///   * a pre-field sender's bytes decode as `None` — no causal claim,
+///     the gate is open (the pre-fix behaviour for legacy senders), and
+///   * a `None` frame serializes WITHOUT the field — byte-identical to
+///     the pre-gate wire, so a rolling upgrade never trips an old
+///     decoder on an unknown field.
+#[test]
+fn msgs_posted_through_is_wire_additive() {
+    let legacy = r#"{"msg_type":"task_complete","sender_id":"sec-1","timestamp":0.0,"secondary_id":"sec-1","worker_id":0,"task_hash":"h-old","delivery_seq":9}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(legacy).unwrap();
+    assert_eq!(decoded.msgs_posted_through(), None);
+    assert_eq!(decoded.delivery_seq(), Some(9));
+
+    let unstamped: DistributedMessage<TestId> = DistributedMessage::TaskFailed {
+        target: None,
+        sender_id: "sec-1".into(),
+        timestamp: 0.0,
+        secondary_id: "sec-1".into(),
+        worker_id: 0,
+        task_hash: "h-old".into(),
+        error_type: dynrunner_core::ErrorType::Recoverable,
+        error_message: "boom".into(),
+        delivery_seq: None,
+        msgs_posted_through: None,
+    };
+    let json = serde_json::to_string(&unstamped).unwrap();
+    assert!(
+        !json.contains("msgs_posted_through"),
+        "a None msgs_posted_through must be elided from the wire bytes; got {json}"
     );
 }
 

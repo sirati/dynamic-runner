@@ -614,6 +614,8 @@ where
                 ),
                 // Stamped at the send_to_primary chokepoint (#352).
                 delivery_seq: None,
+                // Stamped at the send_to_primary chokepoint (ordering gate).
+                msgs_posted_through: None,
             };
             self.send_to_primary(msg).await?;
             return Ok(true);

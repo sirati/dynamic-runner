@@ -737,18 +737,21 @@ where
     pub(in crate::secondary) next_delivery_seq: u64,
 
     /// Per-origin monotonic custom-message sequence (F5), owned by the
-    /// [`custom_message`] send seam: every consumer custom message this
-    /// secondary ORIGINATES — droppable and important alike — is stamped
-    /// with the next value, so `(secondary_id, msg_seq)` is the
-    /// cluster-wide idempotency key the primary's CRDT inbox dedups
-    /// transport replays by. Distinct from `next_delivery_seq` (the
-    /// #352 retention/ack key): `msg_seq` identifies the MESSAGE,
+    /// [`custom_message`] send seam: every IMPORTANT consumer custom
+    /// message this secondary ORIGINATES is stamped with the next
+    /// value, so `(secondary_id, msg_seq)` is the cluster-wide
+    /// idempotency key the primary's CRDT inbox dedups transport
+    /// replays by. Droppables are UNSEQUENCED (`msg_seq = 0`): they are
+    /// lost-by-design on no-route/failover, so they must not occupy a
+    /// slot in this identity space — the terminal-ordering gate counts
+    /// it (a task terminal's `msgs_posted_through` stamp, read here by
+    /// `send_to_primary`'s terminal-stamping step), and the dense
+    /// important-only space is what makes the CRDT's contiguous-prefix
+    /// watermark exact. Distinct from `next_delivery_seq` (the #352
+    /// retention/ack key): `msg_seq` identifies the MESSAGE,
     /// `delivery_seq` one retention-buffer entry. Starts at 1 so the
     /// per-origin handled watermark's "all of `1..=w` handled"
     /// contiguous-prefix walk has a fixed base.
-    // F2-merge seam twin of `custom_message::send_custom_to_primary`
-    // (its sole reader/writer besides the constructor).
-    #[allow(dead_code)]
     pub(in crate::secondary) next_custom_msg_seq: u64,
 
     /// How long a sent terminal waits for its `TerminalAck` before the

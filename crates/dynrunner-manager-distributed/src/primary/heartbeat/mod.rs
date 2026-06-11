@@ -254,10 +254,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// is not in its own writer table, so the broadcast already excludes
     /// it. "Don't send to self" is the implicit loopback rule, not a
     /// role-flavoured broadcast scope.
+    ///
+    /// Deliberately NOT gated on `self.secondaries` being non-empty: the
+    /// keepalive's audience is the MESH MEMBERS the transport knows, not
+    /// the worker-bearing secondary roster. The historical empty-roster
+    /// early-return (from the pre-mesh era, when the send loop literally
+    /// iterated `self.secondaries.keys()` and an empty roster meant zero
+    /// recipients) silenced the ONLY frame that refreshes a peer's
+    /// `primary_last_seen` clock and cancels elections — so a promoted
+    /// primary in a slow bring-up window (members connected, no welcome /
+    /// hydrate registered yet) fed spurious primary-silence suspicion.
+    /// With zero members the mesh fan is simply a no-op.
     pub(super) async fn broadcast_primary_keepalive(&mut self) {
-        if self.secondaries.is_empty() {
-            return;
-        }
         let msg = DistributedMessage::<I>::Keepalive {
             target: None,
             sender_id: self.config.node_id.clone(),

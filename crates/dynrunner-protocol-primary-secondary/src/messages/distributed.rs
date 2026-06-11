@@ -506,6 +506,26 @@ pub enum DistributedMessage<I> {
         /// the wire bytes byte-identical while the field is `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delivery_seq: Option<u64>,
+        /// Per-origin CAUSAL custom-message watermark (the
+        /// message-vs-phase-end ordering gate): the highest IMPORTANT
+        /// `CustomMessage::msg_seq` the reporting secondary had stamped
+        /// when this terminal first left it. The primary DEFERS
+        /// processing this terminal until the origin's replicated
+        /// custom-inbox terminal watermark covers the stamp — every
+        /// important message the consumer handed to
+        /// `SecondaryHandle.send_to_primary` BEFORE the terminal went
+        /// out is Handled/Failed-resolved first — so phase-end, which
+        /// derives from terminals, can never overtake the messages the
+        /// task causally sent. IMPORTANT-only by construction
+        /// (droppables are never counted in the `msg_seq` space), so a
+        /// legitimately-lost droppable can never wedge the gate.
+        /// Stamped once at the secondary's `send_to_primary` chokepoint
+        /// (sticky across replays, like `delivery_seq`). `None` for a
+        /// pre-field sender — the gate is open (no causal claim).
+        /// `#[serde(default, skip_serializing_if)]` keeps the wire
+        /// bytes byte-identical while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msgs_posted_through: Option<u64>,
     },
     TaskFailed {
         /// Mesh routing target (Phase-C C3): the resolved role-bearing
@@ -532,6 +552,13 @@ pub enum DistributedMessage<I> {
         /// the wire bytes stay byte-identical while `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delivery_seq: Option<u64>,
+        /// Per-origin CAUSAL custom-message watermark — see
+        /// [`DistributedMessage::TaskComplete`]'s twin field for the
+        /// full ordering-gate contract. A failed task's causally-prior
+        /// important messages gate its terminal identically (the
+        /// consumer's phase-end barrier must observe them either way).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msgs_posted_through: Option<u64>,
     },
     /// Primary -> reporting secondary: app-level delivery confirmation
     /// for ONE terminal-bearing report landing (#352).

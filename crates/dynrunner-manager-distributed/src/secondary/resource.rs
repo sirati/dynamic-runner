@@ -380,6 +380,26 @@ where
             self.next_delivery_seq += 1;
             msg.set_delivery_seq(seq);
         }
+        // Causal custom-message watermark stamp (the terminal-ordering
+        // gate): a TASK TERMINAL leaving this origin for the first time
+        // carries the highest IMPORTANT custom `msg_seq` stamped so far
+        // (`next_custom_msg_seq` is the next-to-assign, so `- 1` is the
+        // last assigned; 0 = "none sent", no gate). The operational
+        // loop's worker-event arm pre-drains the control-plane queue
+        // before any worker event, so every message the consumer's
+        // `worker_message_listener` handed to
+        // `SecondaryHandle.send_to_primary` BEFORE this terminal's
+        // triggering event is stamped-and-sent (or retained) by now —
+        // the stamp is a true causal watermark, and every seq it covers
+        // is guaranteed to resolve at the primary (at-least-once
+        // retention while this origin lives; a dead origin's gates are
+        // opened by the primary's membership check). `task_hash()` is
+        // `Some` exactly for the two terminal variants; the `is_none()`
+        // guard keeps the stamp STICKY on the retained replay copy
+        // (same contract as `delivery_seq` above).
+        if msg.task_hash().is_some() && msg.msgs_posted_through().is_none() {
+            msg.set_msgs_posted_through(self.next_custom_msg_seq - 1);
+        }
         let report_hash = msg.task_hash().map(str::to_owned);
         let report_seq = msg.delivery_seq();
         let msg_kind = msg.msg_type();
@@ -835,6 +855,8 @@ where
             error_message: "worker pipe broken; respawning".into(),
             // Stamped at the send_to_primary chokepoint (#352).
             delivery_seq: None,
+            // Stamped at the send_to_primary chokepoint (ordering gate).
+            msgs_posted_through: None,
         };
         self.send_to_primary(msg).await
     }
@@ -1035,6 +1057,8 @@ where
                         error_message,
                         // Stamped at the send_to_primary chokepoint (#352).
                         delivery_seq: None,
+                        // Stamped at the send_to_primary chokepoint (ordering gate).
+                        msgs_posted_through: None,
                     };
                     // Report to the primary role only. The AUTHORITY
                     // originates the terminal CRDT mutation and

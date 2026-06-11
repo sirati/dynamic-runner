@@ -152,6 +152,174 @@ async fn on_phase_end_raise_surfaces_fatal_policy_exit() {
         .await;
 }
 
+/// Shared two-phase fixture for the synchronous dispatch-freeze tests:
+/// phase `p1` holds one task in flight on `(sec-0, 0)`; dependent phase
+/// `p2` holds one Pending task. The `on_phase_end` hook records a raise
+/// into the wired latch iff `raises`. Driving the p1 terminal through
+/// `dispatch_message` runs the REAL cascade (hook fire → latch read →
+/// run-fail emit) and frees the worker — the post-raise dispatch
+/// surface is then directly assertable.
+async fn drive_phase_end_with_two_phase_ledger(
+    raises: bool,
+) -> (
+    PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
+    PrimaryMeshKeepalive,
+) {
+    let (transport, _ends) = setup_test(1);
+    let (mut primary, mesh) = build_test_primary(
+        PrimaryConfig::default(),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    let mut p1_task = make_binary("p1_task", 100);
+    p1_task.phase_id = dynrunner_core::PhaseId::from("p1");
+    let p1_hash = crate::primary::wire::compute_task_hash(&p1_task);
+    let mut p2_task = make_binary("p2_task", 100);
+    p2_task.phase_id = dynrunner_core::PhaseId::from("p2");
+    let p2_hash = crate::primary::wire::compute_task_hash(&p2_task);
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([(
+                dynrunner_core::PhaseId::from("p2"),
+                vec![dynrunner_core::PhaseId::from("p1")],
+            )]),
+        });
+        cs.apply(ClusterMutation::PeerJoined {
+            peer_id: "sec-0".into(),
+            is_observer: false,
+            can_be_primary: true,
+            cap_version: Default::default(),
+            member_gen: 0,
+        });
+        cs.apply(ClusterMutation::SecondaryCapacity {
+            secondary: "sec-0".into(),
+            worker_count: 1,
+            resources: vec![dynrunner_core::ResourceAmount {
+                kind: dynrunner_core::ResourceKind::memory(),
+                amount: 8 * 1024 * 1024 * 1024,
+            }],
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: p1_hash.clone(),
+            task: p1_task,
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: p2_hash,
+            task: p2_task,
+        });
+        cs.apply(ClusterMutation::TaskAssigned {
+            attempt: 0,
+            hash: p1_hash.clone(),
+            secondary: "sec-0".into(),
+            worker: 0,
+            version: Default::default(),
+        });
+    }
+    primary.hydrate_from_cluster_state();
+    // The mesh-readiness dispatch gate would veto sec-0 otherwise.
+    primary.handle_mesh_ready(DistributedMessage::MeshReady {
+        target: None,
+        sender_id: "sec-0".into(),
+        timestamp: 0.0,
+        secondary_id: "sec-0".into(),
+        peer_count: 1,
+    });
+
+    let raise_latch = PhaseHookRaiseLatch::new();
+    primary.set_phase_hook_raise_latch(raise_latch.clone());
+    let hook_latch = raise_latch.clone();
+    primary.register_phase_lifecycle_callbacks(
+        Box::new(|_p| {}),
+        Box::new(move |p, _c, _f, _outputs| {
+            if raises && p.as_str() == "p1" {
+                hook_latch.record("synthetic on_phase_end raise".to_string());
+            }
+        }),
+    );
+
+    // The p1 terminal: the cascade fires on_phase_end(p1) inline.
+    primary
+        .dispatch_message(
+            DistributedMessage::TaskComplete {
+                target: None,
+                sender_id: "sec-0".into(),
+                timestamp: 0.0,
+                secondary_id: "sec-0".into(),
+                worker_id: 0,
+                task_hash: p1_hash,
+                result_data: None,
+                delivery_seq: Some(1),
+                msgs_posted_through: None,
+            },
+            &mut None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        primary.slot_is_idle_for_test("sec-0", 0),
+        "fixture: the p1 terminal freed the worker — the post-phase-end \
+         dispatch surface is live"
+    );
+    (primary, mesh)
+}
+
+/// THE SMELL (run_20260611_005220's second half): after the
+/// `on_phase_end` raise emitted the run-should-fail signal, the
+/// production run STILL started the next phase and assigned 6 tasks
+/// before the asynchronously-consumed signal took effect. The raise
+/// must SYNCHRONOUSLY latch a dispatch freeze through the SAME
+/// dispatch-view step-0 seam the graceful abort uses — by the time the
+/// emit returns, EVERY dispatch path's view is empty, so no next-phase
+/// assignment can escape the raise→abort window.
+#[tokio::test(flavor = "current_thread")]
+async fn on_phase_end_raise_synchronously_freezes_dispatch() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut primary, _mesh) = drive_phase_end_with_two_phase_ledger(true).await;
+            let view = primary.dispatch_view_for_worker(0);
+            assert!(
+                view.is_empty(),
+                "the on_phase_end raise must SYNCHRONOUSLY empty the \
+                 dispatch view (step-0 freeze) — a non-empty view is the \
+                 production window where 6 next-phase tasks were assigned \
+                 after the raise"
+            );
+            // The full dispatch pass agrees: nothing is assigned.
+            primary.dispatch_to_idle_workers(true).await.ok();
+            assert!(
+                primary.slot_is_idle_for_test("sec-0", 0),
+                "no post-raise assignment may reach a worker"
+            );
+        })
+        .await;
+}
+
+/// Control: a non-raising `on_phase_end` leaves dispatch unfrozen — the
+/// dependent phase's work is visible to the very next dispatch view
+/// (the freeze is gated strictly on the run-fail emit, not on the
+/// phase-end edge itself).
+#[tokio::test(flavor = "current_thread")]
+async fn non_raising_phase_end_leaves_dispatch_live() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (primary, _mesh) = drive_phase_end_with_two_phase_ledger(false).await;
+            let view = primary.dispatch_view_for_worker(0);
+            assert!(
+                !view.is_empty(),
+                "without a raise the dependent phase's task must be \
+                 dispatchable (freeze not latched spuriously)"
+            );
+        })
+        .await;
+}
+
 /// Control: an `on_phase_end` hook that does NOT raise (never records
 /// into the latch) leaves the run unaffected — it completes cleanly.
 /// Proves the fatal path is gated strictly on a recorded raise, not a

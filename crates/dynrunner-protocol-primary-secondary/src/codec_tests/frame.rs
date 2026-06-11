@@ -190,6 +190,8 @@ fn roundtrip_all_message_types() {
             task_hash: "h".into(),
             result_data: None,
             delivery_seq: None,
+            // Stamped at the send_to_primary chokepoint (ordering gate).
+            msgs_posted_through: None,
         },
         DistributedMessage::TaskFailed {
             target: None,
@@ -201,6 +203,8 @@ fn roundtrip_all_message_types() {
             error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
             error_message: "m".into(),
             delivery_seq: None,
+            // Stamped at the send_to_primary chokepoint (ordering gate).
+            msgs_posted_through: None,
         },
         DistributedMessage::TerminalAck {
             target: None,
