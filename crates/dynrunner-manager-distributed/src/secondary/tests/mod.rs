@@ -80,6 +80,10 @@
 //!   wiring contract (the separate resource-provider capability).
 //! - [`panik_integration`] — panik self-departure + worker teardown.
 //! - [`memprofile_hook`] — sampler lifecycle hooks.
+//! - [`snapshot_reply_destination`] — snapshot-RPC reply addressing on
+//!   the secondary responder: the `ClusterSnapshot` reply is typed off
+//!   the requester's self-declared role (`Observer(id)` for an observer
+//!   requester, `Secondary(id)` for a worker).
 //! - [`terminal_ack`] — #352 app-level delivery confirmation: the
 //!   blackholed-but-live-leg repro (transport-Ok send retained awaiting
 //!   `TerminalAck`; ack-timeout replays with the same seq; the ack is the
@@ -126,6 +130,7 @@ mod respawn_exec_failure;
 mod run_config_responder;
 mod setup_handshake_resilience;
 mod setup_liveness;
+mod snapshot_reply_destination;
 mod terminal_ack;
 mod terminal_msg_watermark;
 mod voting_candidate_death;

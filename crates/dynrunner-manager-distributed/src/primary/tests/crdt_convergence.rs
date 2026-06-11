@@ -16,7 +16,7 @@ use super::*;
 
 use crate::primary::wire::compute_task_hash;
 use crate::state::{SecondaryConnection, SecondaryConnectionState};
-use dynrunner_protocol_primary_secondary::{MessageType, RemovalCause};
+use dynrunner_protocol_primary_secondary::{Destination, MessageType, PeerId, RemovalCause};
 
 /// One advertised-memory resource amount (bytes), mirroring the live
 /// welcome shape (a single `memory` `ResourceAmount`).
@@ -389,11 +389,20 @@ async fn primary_answers_request_cluster_snapshot() {
                 match msg.msg_type() {
                     MessageType::ClusterSnapshot => {
                         if let DistributedMessage::ClusterSnapshot {
-                            target: _,
+                            target,
                             snapshot_json,
                             ..
                         } = msg
                         {
+                            // The reply is typed off the requester's
+                            // self-declared role: a WORKER requester
+                            // (is_observer=false) gets a Secondary-typed
+                            // reply (the ingress demux selector).
+                            assert_eq!(
+                                target,
+                                Some(Destination::Secondary(PeerId::from("sec-0"))),
+                                "a worker requester's snapshot reply must be Secondary-typed"
+                            );
                             let snap: crate::cluster_state::ClusterStateSnapshot<TestId> =
                                 serde_json::from_str(&snapshot_json).expect("snapshot decodes");
                             let mut restored = crate::cluster_state::ClusterState::<TestId>::new();
@@ -436,6 +445,61 @@ async fn primary_answers_request_cluster_snapshot() {
             assert!(
                 primary.cluster_state_for_test().can_be_primary("sec-0"),
                 "the requester's declared can_be_primary must be recorded"
+            );
+        })
+        .await;
+}
+
+/// (c-observer) The primary's snapshot reply is TYPED off the requester's
+/// self-declared role: an OBSERVER requester (`is_observer: true` on the
+/// request frame) must be answered under `Destination::Observer(requester)`.
+/// The PeerId selects the host at egress; the role variant is the
+/// receiver-side ingress demux selector — pre-fix the responder hardcoded
+/// `Secondary(requester)`, so the reply reached the right host but missed
+/// the observer's slot demux and fell to the fan-to-live-slots WARN (the
+/// production "directed frame names a role with no live local slot …
+/// kind=ClusterSnapshot target=Secondary(setup)" on the relocated
+/// submitter).
+#[tokio::test(flavor = "current_thread")]
+async fn primary_answers_observer_requester_with_observer_typed_reply() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // One existing slot keyed "sec-0" — here it hosts the OBSERVER
+            // requester (the transport channel is role-blind; the stamped
+            // target is what the receiving pump demuxes by).
+            let (transport, mut ends) = setup_test(1);
+            let mut requester_inbox = ends.remove(0).1;
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // The observer's anti-entropy pull declares its own role.
+            primary
+                .handle_request_cluster_snapshot(DistributedMessage::RequestClusterSnapshot {
+                    target: None,
+                    sender_id: "sec-0".into(),
+                    timestamp: 0.0,
+                    is_observer: true,
+                    can_be_primary: false,
+                })
+                .await;
+
+            settle_pump().await;
+            let mut reply_target = None;
+            while let Ok(msg) = requester_inbox.try_recv() {
+                if let DistributedMessage::ClusterSnapshot { target, .. } = msg {
+                    reply_target = Some(target);
+                }
+            }
+            assert_eq!(
+                reply_target,
+                Some(Some(Destination::Observer(PeerId::from("sec-0")))),
+                "an observer requester's snapshot reply must be Observer-typed \
+                 (the requester's self-declared role is the ingress demux selector)"
             );
         })
         .await;
