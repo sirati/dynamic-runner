@@ -315,6 +315,20 @@ pub struct PeerNetwork<I: Identifier> {
     /// where no bootstrap wire was ever folded (an observer/late-joiner
     /// that has no submitter bootstrap link).
     bootstrap_redial_tx: mpsc::UnboundedSender<bootstrap_redial::BootstrapRedial<I>>,
+    /// Optional subscriber for the "this node keeps dialing peer X and
+    /// failing" signal. `None` (the default for every role) means no
+    /// subscriber — the steady-state redial ticker already heals a leg
+    /// whose underlying path recovers on its own, so most transports
+    /// need no out-of-band trigger. A late-joiner observer whose legs
+    /// ride per-peer `ssh -L` forwards wires this (via
+    /// [`Self::notify_persistent_dial_failures`]) so a forward whose ssh
+    /// child died — which the 5s ticker can NEVER heal by re-dialing the
+    /// now-dead `127.0.0.1:<local_port>` endpoint — gets its forward
+    /// rebuilt out-of-band. The transport names only the peer id here; it
+    /// has NO notion of ssh tunnels (the subscriber owns peer→forward).
+    /// Fired on the same `DIAL_SUMMARY_THRESHOLD`/recurrence boundary as
+    /// the operator dial-failure summary, so it inherits that throttle.
+    persistent_dial_failure_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
 impl<I: Identifier> PeerNetwork<I> {
@@ -439,7 +453,25 @@ impl<I: Identifier> PeerNetwork<I> {
             mesh_send_tx,
             bootstrap_redial_rx,
             bootstrap_redial_tx,
+            persistent_dial_failure_tx: None,
         })
+    }
+
+    /// Subscribe to the per-peer "persistently undialable" signal: each
+    /// time this node crosses the dial-failure summary boundary for a
+    /// peer it OWNS the dial side of (it keeps dialing and failing — the
+    /// `DIAL_SUMMARY_THRESHOLD` / `DIAL_SUMMARY_RECURRENCE` cadence), the
+    /// peer id is sent on `sender`. The subscriber decides what an
+    /// undialable peer MEANS — e.g. the late-joiner's local-forward
+    /// registry maps it to its `ssh -L` forward and rebuilds it. The
+    /// transport stays ssh-agnostic: it reports a peer id, nothing more.
+    ///
+    /// Idempotent-by-replacement: a second call replaces the sink (the
+    /// last writer wins). Set BEFORE the network is consumed into the
+    /// mesh; there is no concurrent writer (the field is touched only on
+    /// the LocalSet-bound `recv_peer` path).
+    pub fn notify_persistent_dial_failures(&mut self, sender: mpsc::UnboundedSender<String>) {
+        self.persistent_dial_failure_tx = Some(sender);
     }
 
     /// Fold the secondary's dialed primary connection — the bootstrap
@@ -866,6 +898,29 @@ impl<I: Identifier> PeerNetwork<I> {
                     consecutive_failed_dials = summary.attempts,
                     "peer unreachable; dialing address — verify it is peer-routable"
                 );
+                // Per-leg recovery trigger: this node OWNS the dial to
+                // this peer and keeps failing past the summary boundary.
+                // Tell any subscriber (the late-joiner's local-forward
+                // registry) so a leg whose underlying path the 5s ticker
+                // can NEVER heal by re-dialing — a dead `ssh -L` child
+                // behind the unchanged `127.0.0.1:<local_port>` endpoint
+                // — is rebuilt out-of-band. The send rides the SAME
+                // throttle as the WARN above (the count boundary), so a
+                // persistently-dead leg nudges the subscriber once per
+                // episode + once per recurrence window, never per tick.
+                // Closed channel ⇒ the subscriber went away ⇒ drop the
+                // sink (no per-tick error spam); the once-on-removal log
+                // names it.
+                if let Some(tx) = &self.persistent_dial_failure_tx
+                    && tx.send(summary.peer_id.clone()).is_err()
+                {
+                    self.persistent_dial_failure_tx = None;
+                    tracing::debug!(
+                        peer = %summary.peer_id,
+                        "persistent-dial-failure subscriber dropped; \
+                         disabling the per-leg recovery trigger"
+                    );
+                }
             } else {
                 tracing::warn!(
                     peer = %summary.peer_id,

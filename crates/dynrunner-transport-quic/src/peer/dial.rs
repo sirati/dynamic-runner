@@ -182,13 +182,19 @@ fn format_failures(failures: &[(SocketAddr, String)]) -> String {
 /// eyeballs dialer.
 ///
 /// Narration contract (the silent-branch rule, #362): the dial START
-/// logs the peer + every candidate address + the attempt provenance
-/// (INFO for the initial sweep, DEBUG for the 5s-ticker redials — the
+/// logs the peer + every candidate address + the attempt provenance,
+/// and EVERY terminal outcome logs — success names the transport +
+/// address; failure names every candidate address WITH the reason its
+/// attempt ended. No exit from this function is silent.
+///
+/// Levels are attempt-keyed (the redial-spam rate-limit, #419): the
+/// INITIAL sweep is loud — INFO start, WARN/ERROR failures (first
+/// contact is operator-significant and one-shot); a 5s-ticker REDIAL is
+/// quiet — DEBUG throughout (start AND failures), because the same dead
+/// leg would otherwise emit per-tick lines into the full log forever.
+/// The redial path's operator-level visibility is owned instead by the
 /// throttled `peer unreachable` summary in `process_reconnect_tick`
-/// owns the redial path's operator-level visibility), and EVERY
-/// terminal outcome logs: success names the transport + address;
-/// failure names every candidate address WITH the reason its attempt
-/// ended. No exit from this function is silent.
+/// (which fires once per outage + once per recurrence window).
 pub(super) async fn dial_peer(
     peer_id: &str,
     peer_info: &PeerConnectionInfo,
@@ -218,17 +224,15 @@ pub(super) async fn dial_peer(
                 tracing::info!(peer = peer_id, %addr, %attempt, "connected to peer via QUIC");
                 return Some(PeerConnection::Quic(conn));
             }
-            Err(failures) => {
-                tracing::warn!(
-                    peer = peer_id,
-                    %attempt,
-                    reasons = %format_failures(&failures),
-                    "QUIC race to peer failed across all addresses, trying WSS"
-                );
-            }
+            Err(failures) => emit_dial_step_failure(
+                peer_id,
+                attempt,
+                "QUIC race to peer failed across all addresses, trying WSS",
+                &format_failures(&failures),
+            ),
         }
     } else {
-        tracing::warn!(peer = peer_id, %attempt, "no valid cert for peer, trying WSS");
+        emit_dial_step_failure(peer_id, attempt, "no valid cert for peer, trying WSS", "");
     }
 
     match race_wss(&addrs, ATTEMPT_TIMEOUT).await {
@@ -237,15 +241,47 @@ pub(super) async fn dial_peer(
             Some(PeerConnection::Wss(Box::new(conn)))
         }
         Err(failures) => {
-            tracing::error!(
-                peer = peer_id,
-                %attempt,
-                reasons = %format_failures(&failures),
-                "WSS race to peer failed across all addresses; dial gave up \
-                 (the 5s reconnect ticker keeps retrying while the peer stays \
-                 in the authoritative dial list)"
-            );
+            emit_dial_gave_up(peer_id, attempt, &format_failures(&failures));
             None
+        }
+    }
+}
+
+/// Emit a non-terminal dial-step failure (QUIC race lost → WSS next, or
+/// no-cert → WSS-only). The LEVEL is attempt-keyed (the redial-spam
+/// rate-limit, #419): a first-contact `Initial` dial's step failures are
+/// operator-significant and one-shot, so they stay at WARN; a redial's
+/// step failures fire on EVERY 5s ticker pulse for a persistently-dead
+/// leg, so they drop to DEBUG — the throttled `peer unreachable` summary
+/// in `process_reconnect_tick` (count-boundary cadence) owns the redial
+/// path's operator-level visibility, so per-tick WARNs here would be
+/// pure noise (the bug: 2 lines/5s/dead-leg forever in the full log).
+fn emit_dial_step_failure(peer_id: &str, attempt: DialAttempt, msg: &str, reasons: &str) {
+    match attempt {
+        DialAttempt::Initial => {
+            tracing::warn!(peer = peer_id, %attempt, reasons = %reasons, "{msg}")
+        }
+        DialAttempt::Redial { .. } => {
+            tracing::debug!(peer = peer_id, %attempt, reasons = %reasons, "{msg}")
+        }
+    }
+}
+
+/// Emit the terminal "dial gave up" outcome. Same attempt-keyed level as
+/// [`emit_dial_step_failure`]: `Initial` is ERROR (a first contact that
+/// could reach the peer on no transport is loud), a redial is DEBUG (the
+/// throttled summary owns the operator narration; the per-tick failure is
+/// expected while the leg stays in the authoritative dial list).
+fn emit_dial_gave_up(peer_id: &str, attempt: DialAttempt, reasons: &str) {
+    let msg = "WSS race to peer failed across all addresses; dial gave up \
+               (the 5s reconnect ticker keeps retrying while the peer stays \
+               in the authoritative dial list)";
+    match attempt {
+        DialAttempt::Initial => {
+            tracing::error!(peer = peer_id, %attempt, reasons = %reasons, "{msg}")
+        }
+        DialAttempt::Redial { .. } => {
+            tracing::debug!(peer = peer_id, %attempt, reasons = %reasons, "{msg}")
         }
     }
 }
