@@ -23,6 +23,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 dynrunner-protocol-primary-secondary = { workspace = true, features = ["test-utils"] }
 tracing-subscriber = { workspace = true }
+# `test-util` exposes `#[tokio::test(start_paused = true)]` — the
+# virtual-clock harness the bootstrap-budget production replay drives
+# (mirrors the manager-distributed / pyo3 dev-dep pattern).
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
