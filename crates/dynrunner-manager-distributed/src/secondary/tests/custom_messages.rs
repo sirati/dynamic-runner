@@ -189,9 +189,10 @@ async fn droppable_custom_is_lost_on_no_route_and_never_retained() {
                 "the droppable sent into the no-route window is lost by design"
             );
 
-            // Healthy path: the droppable rides the wire un-stamped, still
-            // with its own (next) per-origin msg_seq, and leaves no
-            // retention entry.
+            // Healthy path: the droppable rides the wire un-stamped AND
+            // UNSEQUENCED (`msg_seq = 0` — droppables never occupy a slot
+            // in the gate-counted important identity space, so a lost one
+            // can never be awaited), and leaves no retention entry.
             secondary
                 .send_custom_to_primary("progress".into(), b"p2".to_vec(), false)
                 .await
@@ -199,9 +200,9 @@ async fn droppable_custom_is_lost_on_no_route_and_never_retained() {
             secondary.drain_egress().await;
             assert_eq!(
                 sent_customs(&log),
-                vec![("sec-2".to_string(), 2, false, None)],
-                "droppable: delivered once, msg_seq advanced past the lost \
-                 one, no delivery_seq stamp"
+                vec![("sec-2".to_string(), 0, false, None)],
+                "droppable: delivered once, unsequenced (msg_seq 0), no \
+                 delivery_seq stamp"
             );
             assert!(secondary.pending_report_replays.is_empty());
         })

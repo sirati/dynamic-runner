@@ -1834,3 +1834,71 @@ async fn removed_but_sending_peer_is_readmitted_on_next_frame() {
         "a fatal-error frame is not proof of ongoing life"
     );
 }
+
+/// Bring-up Primary-keepalive silent window: a primary whose
+/// `self.secondaries` roster is EMPTY (the promoted-primary bring-up
+/// window, before any welcome / hydrate has registered a secondary)
+/// must STILL broadcast Primary-tagged keepalives to its connected
+/// MESH MEMBERS. The keepalive's audience is the liveness peers the
+/// transport knows, not the worker-bearing secondary roster: the
+/// Primary-role keepalive is the ONLY frame that refreshes a peer's
+/// `primary_last_seen` clock (`record_primary_message_if_from_primary`)
+/// and cancels elections, so an empty-roster early-return turns a slow
+/// bring-up into spurious primary-silence suspicion at every connected
+/// member.
+///
+/// The fixture is exactly the bug shape: one connected transport member
+/// (the `empty_transport` outgoing channel), zero registered
+/// secondaries. N keepalive periods are driven; the member must observe
+/// N Primary-role keepalives.
+#[tokio::test(flavor = "current_thread")]
+async fn empty_roster_primary_still_keepalives_connected_mesh_members() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // `empty_transport` wires ONE connected member ("dead-sec")
+            // into the transport's outgoing map — a mesh member with no
+            // roster entry.
+            let (transport, mut member_rx, _kept) = empty_transport();
+            let (mut primary, _mesh) = build_primary_pumped(
+                config(Duration::from_millis(50), 2),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+            assert!(
+                primary.secondaries.is_empty(),
+                "bring-up window precondition: no registered secondaries"
+            );
+
+            // Three keepalive periods' worth of emitter ticks.
+            for _ in 0..3 {
+                primary.broadcast_primary_keepalive().await;
+            }
+            // The keepalive is a QUEUED mesh send; settle the production
+            // pump so it drains onto the member's channel.
+            crate::primary::tests::settle_pump().await;
+
+            let mut primary_keepalives = 0usize;
+            while let Ok(msg) = member_rx.try_recv() {
+                if matches!(
+                    &msg,
+                    DistributedMessage::Keepalive {
+                        emitter_role:
+                            dynrunner_protocol_primary_secondary::KeepaliveRole::Primary,
+                        ..
+                    }
+                ) {
+                    primary_keepalives += 1;
+                }
+            }
+            assert_eq!(
+                primary_keepalives, 3,
+                "a promoted primary with an empty secondary roster must \
+                 still heartbeat to its connected mesh members (the \
+                 keepalive audience is the transport's members, not the \
+                 worker roster)"
+            );
+        })
+        .await;
+}

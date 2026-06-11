@@ -274,12 +274,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///
     /// Called from all three dispatch triggers (ingest, promotion
     /// replay, heartbeat backstop) — see the module doc.
+    ///
+    /// Tail composition: every pass ends with the terminal-ordering
+    /// gate's release sweep ([`PrimaryCoordinator::release_gated_terminals`])
+    /// — this function is where the per-origin terminal watermark
+    /// advances on a live primary, so a deferred task terminal whose
+    /// causal messages just resolved is admitted in the SAME pass, and
+    /// every dispatch trigger (present and future) is a release trigger
+    /// with no per-site wiring. The sweep runs UNCONDITIONALLY (not
+    /// behind the empty-inbox fast path) so gates opened by other means
+    /// — a snapshot restore-merge advancing the watermark, an origin's
+    /// membership removal — release on the heartbeat backstop too.
     pub(crate) async fn dispatch_unhandled_custom_messages(
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
         let unhandled = self.cluster_state.unhandled_custom_messages();
         if unhandled.is_empty() {
+            self.release_gated_terminals(command_rx).await;
             return;
         }
         // BYSTANDER pre-drain: dispatch (with normal per-command
@@ -346,6 +358,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 }
             }
         }
+        // Terminal-ordering gate release sweep — see the doc above the
+        // signature. Runs after the walk so a terminal gated on a
+        // message THIS pass just resolved is admitted immediately.
+        self.release_gated_terminals(command_rx).await;
     }
 
     /// Heartbeat-tick observation point for the keep-up monitor: feed

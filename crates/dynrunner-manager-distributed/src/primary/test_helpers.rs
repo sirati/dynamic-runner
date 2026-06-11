@@ -629,6 +629,8 @@ pub(super) async fn fake_secondary_with_addrs(
                                         task_hash,
                                         result_data: None,
                                         delivery_seq: None,
+                                        // Stamped at the send_to_primary chokepoint (ordering gate).
+                                        msgs_posted_through: None,
                                     })
                                     .unwrap();
                             }
@@ -664,6 +666,8 @@ pub(super) async fn fake_secondary_with_addrs(
                             task_hash: entry.hash.clone(),
                             result_data: None,
                             delivery_seq: None,
+                            // Stamped at the send_to_primary chokepoint (ordering gate).
+                            msgs_posted_through: None,
                         })
                         .unwrap();
 
@@ -695,6 +699,8 @@ pub(super) async fn fake_secondary_with_addrs(
                         task_hash: file_hash,
                         result_data: None,
                         delivery_seq: None,
+                        // Stamped at the send_to_primary chokepoint (ordering gate).
+                        msgs_posted_through: None,
                     })
                     .unwrap();
 
@@ -809,6 +815,8 @@ pub(super) async fn fake_amnesiac_secondary(
                         task_hash: file_hash,
                         result_data: None,
                         delivery_seq: None,
+                        // Stamped at the send_to_primary chokepoint (ordering gate).
+                        msgs_posted_through: None,
                     })
                     .unwrap();
                 outgoing_to_primary
@@ -937,6 +945,8 @@ pub(super) async fn fake_secondary_transport_only_no_meshready(
                                     task_hash,
                                     result_data: None,
                                     delivery_seq: None,
+                                    // Stamped at the send_to_primary chokepoint (ordering gate).
+                                    msgs_posted_through: None,
                                 })
                                 .unwrap();
                         }

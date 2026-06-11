@@ -164,6 +164,8 @@ where
                             result_data,
                             // Stamped at the send_to_primary chokepoint (#352).
                             delivery_seq: None,
+                            // Stamped at the send_to_primary chokepoint (ordering gate).
+                            msgs_posted_through: None,
                         };
                         // Report to the primary role only. The AUTHORITY
                         // originates the terminal CRDT mutation
@@ -210,6 +212,8 @@ where
                                 .unwrap_or_else(|| "Unknown error".into()),
                             // Stamped at the send_to_primary chokepoint (#352).
                             delivery_seq: None,
+                            // Stamped at the send_to_primary chokepoint (ordering gate).
+                            msgs_posted_through: None,
                         };
                         // Report to the primary role only; the authority
                         // originates + broadcasts the terminal CRDT
@@ -405,6 +409,8 @@ where
                         error_message: wire_error_message,
                         // Stamped at the send_to_primary chokepoint (#352).
                         delivery_seq: None,
+                        // Stamped at the send_to_primary chokepoint (ordering gate).
+                        msgs_posted_through: None,
                     };
                     // Report to the primary role only; the authority
                     // originates + broadcasts the terminal CRDT mutation.

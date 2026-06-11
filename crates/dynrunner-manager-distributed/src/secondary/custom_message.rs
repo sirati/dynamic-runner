@@ -38,14 +38,19 @@ where
     ///   `publish_string` precedent) — the Python API surfaces it as a
     ///   `ValueError`.
     /// * Idempotency key: stamps the next per-origin `msg_seq`
-    ///   (monotonic from 1); with this secondary's id it dedups
-    ///   transport replays at the primary's CRDT inbox. The counter
-    ///   advances for droppable messages too, so an origin's important
-    ///   stream keeps a gap-free identity space ONLY if the consumer
-    ///   sends exclusively important messages — the watermark compaction
-    ///   tolerates gaps (it stops at the first unposted seq and the
-    ///   payload-drop tombstone already bounds growth), so mixing
-    ///   classes is correct, merely less compactable.
+    ///   (monotonic from 1) on IMPORTANT messages ONLY; with this
+    ///   secondary's id it dedups transport replays at the primary's
+    ///   CRDT inbox. Droppables are UNSEQUENCED (`msg_seq = 0`, a
+    ///   sentinel the primary's droppable path never reads): a
+    ///   droppable is legitimately lost on no-route/failover, so it
+    ///   must never occupy a slot in the identity space the
+    ///   terminal-ordering gate counts — otherwise a lost droppable
+    ///   would leave a PERMANENT gap below a terminal's
+    ///   `msgs_posted_through` stamp and wedge that gate forever. The
+    ///   important-only counter keeps the per-origin space DENSE, which
+    ///   is also what makes the CRDT's contiguous-prefix watermark
+    ///   compaction exact (every transient gap is an in-flight
+    ///   important that WILL arrive).
     /// * Delivery class: `important = false` is fire-and-forget through
     ///   the chokepoint (at-most-once, lost on no-route/failover by
     ///   design); `important = true` is `delivery_seq`-stamped and
@@ -71,8 +76,16 @@ where
                 CUSTOM_MESSAGE_MAX_BYTES
             ));
         }
-        let msg_seq = self.next_custom_msg_seq;
-        self.next_custom_msg_seq += 1;
+        // IMPORTANT-only sequencing — see the doc above: droppables are
+        // unsequenced (0) so the gate-counted identity space stays
+        // dense and a lost-by-design droppable can never be awaited.
+        let msg_seq = if important {
+            let seq = self.next_custom_msg_seq;
+            self.next_custom_msg_seq += 1;
+            seq
+        } else {
+            0
+        };
         let msg = DistributedMessage::CustomMessage {
             target: None,
             sender_id: self.config.secondary_id.clone(),

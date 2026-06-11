@@ -65,6 +65,23 @@ pub struct PendingPool<I: Identifier> {
     /// cascade-fail before reaching a bucket). Used by the cascade
     /// walk and by extend-time validation.
     pub(super) failed_tasks: HashSet<String>,
+    /// Task ids whose latest attempt terminally failed at the manager
+    /// level but whose PERMANENCE is still pending the manager's
+    /// per-phase retry decision (the retry buckets run at the phase's
+    /// drain edge). Value = the task's phase, so the drain-edge
+    /// finalization can promote exactly the roots whose phase is
+    /// deciding. Written by [`PendingPool::on_item_failed_pending_retry`];
+    /// cleared by [`PendingPool::reinject`] (revival — the bucket gave
+    /// the task another pass) and by the promotions
+    /// ([`PendingPool::finalize_soft_failures`] /
+    /// [`PendingPool::on_item_failed_permanent`], which move the id
+    /// into `failed_tasks`). Read by the drain gate
+    /// (`maybe_transition_drain`): a blocked dependent doomed by a
+    /// same-phase soft-failed prereq must not hold the phase open —
+    /// otherwise the drain edge (where the retry-or-cascade decision
+    /// lives) is unreachable and the run wedges forever (the
+    /// blocked-dependent hang this field exists to break).
+    pub(super) soft_failed: HashMap<String, PhaseId>,
     /// Task ids that have been dispatched (popped from a bucket) and
     /// not yet observed as terminal. Two write sites:
     ///   * `take_at` — when this pool dispatches a task with a
@@ -200,6 +217,7 @@ impl<I: Identifier> PendingPool<I> {
             dependents_of: HashMap::new(),
             completed_tasks: HashSet::new(),
             failed_tasks: HashSet::new(),
+            soft_failed: HashMap::new(),
             in_flight_tasks: HashSet::new(),
             blocked_per_phase: HashMap::new(),
         })

@@ -188,12 +188,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
             // Failure budget: one per task per pass. Recoverable
             // and NonRecoverable both terminate the dispatch slot
-            // and add to `failed_tasks`. The `run()` pipeline calls
-            // `retry_failed_tasks_pass` after the main operational
-            // loop drains, which re-injects everything in
-            // `failed_tasks` (clearing the set) and runs the loop
-            // again. Up to `config.retry_max_passes` retry passes
-            // (default 1) before failures are permanent.
+            // and add to `failed_tasks`. Retry is the per-phase
+            // drain-edge bucket machinery (`try_run_phase_retry_bucket`
+            // inside `process_phase_lifecycle`): the Recoverable bucket
+            // re-injects matching `failed_tasks` entries for up to
+            // `config.retry_max_passes` passes (default 1); once the
+            // buckets decline, `finalize_phase_soft_failures` makes the
+            // surviving failures permanent (cascading their dependents).
             //
             // Critically NOT counted as a failure: secondary
             // disconnect → `requeue_dead_secondary` puts the
@@ -251,9 +252,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // locally-dispatched and inherited (pre-owned) entries
             // uniformly — the latter simply had no slot/type-slot to
             // free, matching the deleted pre-owned fallback's contract.
+            // The error kind rides along so the pool records the
+            // retry-pending failure marker (blocked dependents doomed by
+            // this task stop holding the drain edge hostage; the edge's
+            // buckets then decide reinject-or-finalize) — see
+            // `note_item_failed` for the routing rules.
             if let Some(binary) = recovered_binary {
-                self.note_item_failed(&binary.phase_id, Some(binary.task_id.as_str()), command_rx)
-                    .await;
+                self.note_item_failed(
+                    &binary.phase_id,
+                    Some(binary.task_id.as_str()),
+                    Some(&error_type),
+                    command_rx,
+                )
+                .await;
             }
 
             // Same rationale as `handle_task_complete`: this terminal
@@ -279,5 +290,84 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             self.forward_completion_to_secondaries(&msg, &secondary_id)
                 .await;
         }
+    }
+
+    /// Drain-edge failure-permanence promotion for one drained phase:
+    /// the phase's retry buckets have DECLINED (no candidates, or budget
+    /// exhausted), so its soft (retry-pending) failures are permanent
+    /// NOW and every transitive dependent blocked on them is permanently
+    /// unfulfillable. Invoked by `process_phase_lifecycle` between the
+    /// bucket pass and the `on_phase_end` tally read, so the cascaded
+    /// terminals are already in the replicated per-phase tallies when
+    /// the hook fires.
+    ///
+    /// Per cascaded dependent: the hash-keyed `failed_tasks` mirror gains
+    /// the entry (the run-completion counter `completed + failed >=
+    /// total` is what un-wedges the operational loop) and a
+    /// `ClusterMutation::TaskFailed` with the canonical `upstream-failed`
+    /// shape (kind `NonRecoverable`, the same classification the
+    /// CRDT-side spawn cascade and `apply_fail_permanent` produce for a
+    /// dependent of a non-recoverable terminal) is broadcast so every
+    /// replica mirrors the terminal. Already-terminal hashes (a raced
+    /// wire terminal) are skipped — the wire handler's dedup owns those.
+    ///
+    /// The aggregate emit names the unfulfillable-dependent count at the
+    /// importance target: a dependency graph giving up is an operator-
+    /// visible run event, not a silent bookkeeping detail.
+    pub(crate) async fn finalize_phase_soft_failures(&mut self, phase: &dynrunner_core::PhaseId) {
+        let finalized = self.pool_mut().finalize_soft_failures(phase);
+        if finalized.is_empty() {
+            return;
+        }
+        let mut mutations: Vec<ClusterMutation<I>> = Vec::new();
+        let mut unfulfillable_dependents = 0usize;
+        for (root_id, cascaded) in finalized {
+            for dep in cascaded {
+                let dep_hash = crate::primary::wire::compute_task_hash(&dep);
+                if self.completed_tasks.contains(&dep_hash)
+                    || self.failed_tasks.contains_key(&dep_hash)
+                {
+                    continue;
+                }
+                self.failed_tasks
+                    .insert(dep_hash.clone(), dynrunner_core::ErrorType::NonRecoverable);
+                tracing::warn!(
+                    task_id = %dep.task_id,
+                    phase = %dep.phase_id,
+                    failed_dependency = %root_id,
+                    "task can never run: its dependency terminally failed \
+                     with no retry path; cascading permanent failure"
+                );
+                mutations.push(ClusterMutation::TaskFailed {
+                    hash: dep_hash,
+                    kind: dynrunner_core::ErrorType::NonRecoverable,
+                    error: format!(
+                        "upstream-failed: dependency '{root_id}' terminally \
+                         failed with no retry path"
+                    ),
+                    // Both stamped at the origination choke point
+                    // (apply_locally_for_broadcast): `version` minted,
+                    // `attempt` read from the task's current generation.
+                    version: Default::default(),
+                    attempt: Default::default(),
+                });
+                unfulfillable_dependents += 1;
+            }
+        }
+        if unfulfillable_dependents == 0 {
+            return;
+        }
+        // Operator-facing run event (the LLM-wake class): N dependents
+        // just became permanently unfulfillable. Emitted ONCE per drain
+        // edge with the aggregate count; the per-task WARNs above carry
+        // the identities.
+        tracing::warn!(
+            target: crate::primary::important_events::IMPORTANT_TARGET,
+            phase = %phase,
+            unfulfillable_dependents,
+            "dependency graph can no longer complete here: cascading \
+             permanent failure to dependents of terminally-failed tasks"
+        );
+        self.apply_and_broadcast_cluster_mutations(mutations).await;
     }
 }

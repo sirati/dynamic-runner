@@ -212,6 +212,8 @@ mod tests {
             task_hash: "deadbeef".into(),
             result_data: Some(vec![b'x'; payload_bytes]),
             delivery_seq: Some(1),
+            // Stamped at the send_to_primary chokepoint (ordering gate).
+            msgs_posted_through: None,
         }
     }
 

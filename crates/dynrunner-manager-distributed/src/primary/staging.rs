@@ -253,20 +253,26 @@ where
         // replicated as `InFlight`/terminal task state. Re-running the
         // full staging walk on resume re-copies every binary needlessly
         // (the "auto-staging initial entries binaries=320" smell on a
-        // hydrated resume). A run is RESUMING iff ≥1 task has PROGRESSED
-        // past `Pending`/`Blocked` — i.e. it holds an `InFlight` or
-        // terminal (`Completed`/`Failed`/`Unfulfillable`/`InvalidTask`)
-        // entry. The same "has any progressed task" signal hydrate uses to
-        // seed `started_phases`. A genuinely FRESH promoted destination (a
+        // hydrated resume). A run is RESUMING iff ≥1 task carries
+        // DISPATCH-DERIVED state — `InFlight`, or a terminal a worker
+        // produced (`Completed`/`Failed`/`Unfulfillable`): each of those
+        // proves a primary previously reached its dispatch loop, which
+        // implies the corpus was staged. SEED-TIME terminals prove no such
+        // thing and are excluded: `InvalidTask` (the ingest's #2
+        // missing-dep classification, minted terminal BEFORE any dispatch)
+        // and `SkippedAlreadyDone` (the discovery-time skip) both exist on
+        // a first-ever cold/relocated seed. Counting `invalid_task` here
+        // mis-read any fresh relocate whose corpus carried an invalid
+        // task as a failover-resume, skipped the staging walk wholesale,
+        // and every dispatched task died NonRecoverable "not pre-staged
+        // at <path>" (the distributed-local-subprocess e2e repro,
+        // 2026-06-10). A genuinely FRESH promoted destination (a
         // setup-peer relocate, or a `--source-already-staged` local
-        // primary) hydrates an all-`Pending` (or empty pre-discovery) CRDT,
-        // so this gate is open and the first-ever staging proceeds.
+        // primary) hydrates a CRDT with no dispatch-derived entry, so this
+        // gate is open and the first-ever staging proceeds.
         let counts = self.cluster_state.counts();
-        let progressed = counts.in_flight
-            + counts.completed
-            + counts.failed
-            + counts.unfulfillable
-            + counts.invalid_task;
+        let progressed =
+            counts.in_flight + counts.completed + counts.failed + counts.unfulfillable;
         if progressed > 0 {
             tracing::debug!(
                 in_flight = counts.in_flight,

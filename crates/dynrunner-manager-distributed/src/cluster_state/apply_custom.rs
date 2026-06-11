@@ -235,8 +235,17 @@ impl<I: Identifier> ClusterState<I> {
     }
 
     /// The per-origin terminal watermark, if any prefix has compacted.
-    /// Test-only read surface, like `custom_message_state`.
-    #[cfg(test)]
+    ///
+    /// Read surfaces:
+    ///   * the terminal-ordering gate (`primary/terminal_gate.rs`): a
+    ///     task terminal stamped `msgs_posted_through = W` is deferred
+    ///     until this watermark covers `W` — sound because the
+    ///     watermark only advances over a CONTIGUOUS terminal prefix
+    ///     (`compact_custom_watermark`), and the important `msg_seq`
+    ///     space is dense per origin (droppables are unsequenced), so
+    ///     `watermark >= W` proves every important seq `1..=W` is
+    ///     Handled/Failed-resolved;
+    ///   * tests (alongside `custom_message_state`).
     pub(crate) fn custom_terminal_watermark(&self, origin: &str) -> Option<u64> {
         self.custom_terminal_watermarks.get(origin).copied()
     }

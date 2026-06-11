@@ -464,6 +464,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     error_type: ErrorType::Recoverable,
                     error_message: RECONCILIATION_LOST_WIRE_MESSAGE.into(),
                     delivery_seq: None,
+                    // Stamped at the send_to_primary chokepoint (ordering gate).
+                    msgs_posted_through: None,
                 };
                 self.handle_task_failed(synthetic, command_rx).await;
             }

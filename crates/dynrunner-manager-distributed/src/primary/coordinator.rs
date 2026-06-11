@@ -622,6 +622,31 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// primary restarts the ages from first sight, which only DELAYS a
     /// WARN, never fabricates one.
     pub(super) custom_backlog_monitor: crate::primary::custom_message::CustomBacklogMonitor,
+    /// Terminal-ordering gate parking lot (`primary/terminal_gate.rs`):
+    /// wire task terminals whose `msgs_posted_through` stamp is not yet
+    /// covered by their origin's custom-inbox terminal watermark, FIFO
+    /// in arrival order (per-origin stamps are monotonic, so the FIFO
+    /// scan releases same-origin terminals in arrival order by
+    /// construction). Drained by [`Self::release_gated_terminals`] on
+    /// the custom-message dispatch cadence. Node-local by design: a
+    /// parked terminal is acked-but-unprocessed, so a primary death
+    /// while parked degrades to the standard lost-terminal
+    /// reconciliation (requeue / re-dispatch) — the same window an
+    /// ack-then-die-before-apply always had, here bounded by the
+    /// at-least-once delivery of the awaited messages.
+    pub(super) gated_terminals:
+        std::collections::VecDeque<dynrunner_protocol_primary_secondary::DistributedMessage<I>>,
+    /// SYNCHRONOUS run-fail dispatch freeze (`lifecycle/worker_mgmt.rs`
+    /// owns the latch writes): set the instant a `RunShouldFail` /
+    /// `PolicyFatalExit` is EMITTED onto the worker-management bus —
+    /// before the bus is ever drained — and read by the dispatch-view
+    /// pipeline's step-0 seam alongside the graceful-abort latch. The
+    /// bus consumption (`worker_mgmt_fail_outcome` + the loop break)
+    /// stays asynchronous per the decoupling law; this latch only
+    /// guarantees no assignment escapes the emit→break window (the
+    /// run_20260611_005220 post-raise 6-task leak). Node-local and
+    /// never cleared: a run-fail emit is terminal for this primary.
+    pub(super) run_fail_dispatch_freeze: bool,
     /// The consumer's discovery policy for a relocated (mode-2) primary or
     /// an in-process `--source-already-staged` local primary, plus the
     /// phase graph it seeds alongside the discovered tasks. `None` on every
@@ -1263,6 +1288,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             on_custom_message: None,
             mutation_capture: None,
             custom_backlog_monitor: Default::default(),
+            gated_terminals: std::collections::VecDeque::new(),
+            run_fail_dispatch_freeze: false,
             setup_discovery: None,
             phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
@@ -2154,13 +2181,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let view = self
             .pool()
             .view_for_worker(global_wid, Some(&soft_predicate));
-        // Step 0 — the graceful-abort freeze. Emptying the TYPED view
+        // Step 0 — the dispatch freezes. Emptying the TYPED view
         // (rather than branching at the call sites) keeps every consumer
         // shape-oblivious: the scheduler sees zero candidates and the
         // dispatch loops fall through their existing `is_empty()` skips.
-        // A promoted primary inherits the latch via its snapshot, so the
-        // freeze survives failover with no extra plumbing (no-redo law).
-        if self.cluster_state.graceful_abort_requested() {
+        // Two latches share the seam:
+        //   * the replicated graceful-abort freeze — a promoted primary
+        //     inherits it via its snapshot, so it survives failover with
+        //     no extra plumbing (no-redo law);
+        //   * the node-local run-fail freeze (`run_fail_dispatch_freeze`,
+        //     latched SYNCHRONOUSLY by the `emit_run_fail_signal`
+        //     chokepoint) — this primary is about to break out of its
+        //     loop with a failure verdict, so no assignment may escape
+        //     the emit→break window. Node-local is sufficient: the
+        //     verdict path broadcasts `RunAborted`, which stands every
+        //     peer down.
+        if self.cluster_state.graceful_abort_requested() || self.run_fail_dispatch_freeze {
             return view.filter(|_| false);
         }
         let view = self.apply_strict_preferred_secondaries(view, secondary_id);
@@ -4678,6 +4714,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 {
                     continue;
                 }
+                // Both buckets DECLINED: this phase's soft (retry-pending)
+                // failures are permanent now — finalize them and
+                // cascade-fail their blocked dependents (the dependents can
+                // never run; leaving them blocked wedged the run forever —
+                // see `finalize_phase_soft_failures`). Runs BEFORE the
+                // tally read below so `on_phase_end` reports a tally that
+                // already includes the cascaded terminals (the broadcast's
+                // local apply bumps the per-phase Failed EVENT tally).
+                self.finalize_phase_soft_failures(p).await;
                 // Read the replicated EVENT tallies (F4): identical numbers
                 // to the old node-local maps on the live path, CORRECT on
                 // the promoted path (the events were replicated). EVENT-
@@ -4721,10 +4766,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // and records the typed break outcome the pipeline tail
                 // surfaces.
                 if let Some(reason) = self.phase_hook_raise_latch.take() {
-                    self.cluster_state
-                        .emit_worker_mgmt(WorkerMgmtSignal::PolicyFatalExit {
-                            reason: format!("on_phase_end hook for phase {p} raised: {reason}"),
-                        });
+                    // Routed through the run-fail emit chokepoint
+                    // (`emit_run_fail_signal`), which SYNCHRONOUSLY
+                    // latches the dispatch-view step-0 freeze before
+                    // the bus emit — the cascade below still marks the
+                    // phase done and fires dependent starts, but no
+                    // dispatch path can assign their work in the
+                    // emit→break window (the post-raise assignment
+                    // leak).
+                    self.emit_run_fail_signal(WorkerMgmtSignal::PolicyFatalExit {
+                        reason: format!("on_phase_end hook for phase {p} raised: {reason}"),
+                    });
                 }
                 // Apply any commands the on_phase_end callback queued
                 // via the in-runtime PrimaryHandle path. Without this,
@@ -4800,18 +4852,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     .await;
                     self.pool_mut().mark_phase_done(p);
                 } else {
-                    self.cluster_state
-                        .emit_worker_mgmt(WorkerMgmtSignal::RunShouldFail {
-                            reason: format!(
-                                "phase {p} reached drain with no terminal \
-                                 outcome ({completed} completed, {failed} \
-                                 failed) — either it still owns unresolved \
-                                 residual work, or it is a non-leaf phase that \
-                                 was never injected / discovered (advancing \
-                                 would strand its dependents on inputs that \
-                                 were never produced)"
-                            ),
-                        });
+                    // Same run-fail chokepoint as the raise branch
+                    // above: the emit synchronously freezes dispatch.
+                    self.emit_run_fail_signal(WorkerMgmtSignal::RunShouldFail {
+                        reason: format!(
+                            "phase {p} reached drain with no terminal \
+                             outcome ({completed} completed, {failed} \
+                             failed) — either it still owns unresolved \
+                             residual work, or it is a non-leaf phase that \
+                             was never injected / discovered (advancing \
+                             would strand its dependents on inputs that \
+                             were never produced)"
+                        ),
+                    });
                 }
             }
             // mark_phase_done may have flipped Blocked → Active for
@@ -4860,26 +4913,52 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
     /// Per-failure bookkeeping. Same shape as `note_item_completed`.
     ///
-    /// `task_id` is accepted for symmetry with the success path but is
-    /// NOT forwarded to the pool's per-task completion ledger:
-    /// recoverable failures land in `failed_tasks` and may be
-    /// reinjected on a later retry pass, so dependents must remain
-    /// blocked until the task either succeeds (→ `note_item_completed`
-    /// with `Some(id)`) or is declared permanently failed
-    /// (→ `pool.on_item_failed_permanent`, owned by the retry-budget
-    /// exhaustion path). Param kept so future callers can route via a
-    /// uniform helper without a signature change.
+    /// `task_id` + `kind` decide how the POOL observes the failure:
+    ///
+    /// * `Some(id)` with a non-`Unfulfillable` `kind` — the
+    ///   retry-pending failure marker
+    ///   (`pool.on_item_failed_pending_retry`): the in-flight count
+    ///   drops AND the id is soft-marked so blocked dependents doomed by
+    ///   it stop holding the phase's drain edge hostage. Dependents are
+    ///   NOT cascaded yet — the drain edge's retry buckets may reinject
+    ///   the task (revival clears the marker); only when they decline
+    ///   does `finalize_phase_soft_failures` make the failure permanent
+    ///   and cascade. Without the marker, a terminally-failed prereq's
+    ///   blocked dependents kept the phase `Draining` forever, the drain
+    ///   edge never came, and the run hung after the failure report (the
+    ///   distributed-local-subprocess e2e hang, 2026-06-10).
+    /// * `Some(id)` with `kind = Unfulfillable` — dependents stay
+    ///   BLOCKED (no marker): unfulfillable is the operator-resolvable
+    ///   class, revived through the reinject command / fulfillability
+    ///   matcher rather than the phase retry buckets, and its dependents
+    ///   dormancy is the deliberate contract (`apply_fail_permanent`'s
+    ///   cascade-pause split).
+    /// * `None` task_id or `None` kind — the legacy in-flight-only
+    ///   decrement (`on_item_finished(phase, None)`), for callers whose
+    ///   failure identity/permanence the pool already observed (e.g.
+    ///   `apply_fail_permanent`, whose `on_item_failed_permanent` call
+    ///   precedes this bookkeeping).
     pub(super) async fn note_item_failed(
         &mut self,
         phase_id: &PhaseId,
-        _task_id: Option<&str>,
+        task_id: Option<&str>,
+        kind: Option<&dynrunner_core::ErrorType>,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
         // Same as `note_item_completed`: the per-phase Failed EVENT tally
         // (F4) bump is owned by the `merge_task_state` join (#358) — the
         // caller's `ClusterMutation::TaskFailed` apply bumped it before this
         // bookkeeping runs, identically on every mirror.
-        self.pool_mut().on_item_finished(phase_id, None);
+        match (task_id, kind) {
+            (Some(id), Some(k))
+                if !matches!(k, dynrunner_core::ErrorType::Unfulfillable { .. }) =>
+            {
+                self.pool_mut().on_item_failed_pending_retry(phase_id, id);
+            }
+            _ => {
+                self.pool_mut().on_item_finished(phase_id, None);
+            }
+        }
         self.process_phase_lifecycle(command_rx).await;
     }
 }

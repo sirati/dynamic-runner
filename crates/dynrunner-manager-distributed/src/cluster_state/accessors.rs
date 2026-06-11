@@ -628,6 +628,27 @@ impl<I: Identifier> ClusterState<I> {
         self.secondary_capacities.keys().map(String::as_str)
     }
 
+    /// The subset of [`Self::known_secondaries`] whose membership is NOT
+    /// authoritatively removed — the roster a primary-local rebuild
+    /// (worker slots, secondary connections) may derive state from.
+    ///
+    /// Capacity records are set-once and never deleted: a removed peer's
+    /// `secondary_capacities` entry outlives its membership (preserved so
+    /// a re-admission restores the EXACT capacity the member departed
+    /// with — the removed node never re-advertises). The membership
+    /// ledger (`peer_state` `Dead`, written in lockstep with the
+    /// `CapabilityEntry::Departed` tombstone by `apply_peer_removed`) is
+    /// therefore the filter: a `RemovedMember` id is excluded; a
+    /// re-admission (a generation-advancing `PeerJoined`) flips the same
+    /// entry back to `Alive` and the id re-enters this view with its
+    /// preserved capacity. A `NeverJoined` capacity-bearer is INCLUDED —
+    /// membership may lag capacity at this replica (out-of-order apply),
+    /// and only an authoritative removal may suppress a rebuild.
+    pub fn live_known_secondaries(&self) -> impl Iterator<Item = &str> {
+        self.known_secondaries()
+            .filter(|id| self.peer_membership(id) != super::types::PeerMembership::RemovedMember)
+    }
+
     /// The replicated-membership roster of peers that POSITIVELY run a
     /// live worker-secondary: a peer counts IFF it (a) advertised
     /// worker-secondary capacity (`secondary_capacities` carries a record

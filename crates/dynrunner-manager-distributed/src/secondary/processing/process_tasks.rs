@@ -308,6 +308,23 @@ where
                 {
                     arm_stats.record(ARM_POOL_EVENT);
                     if let Some(event) = event {
+                        // CAUSAL PRE-DRAIN (the terminal-ordering gate's
+                        // secondary half): apply every control-plane
+                        // command already queued BEFORE this worker
+                        // event is processed. A consumer's
+                        // `worker_message_listener` that called
+                        // `SecondaryHandle.send_to_primary` before the
+                        // worker exited has its messages queued here —
+                        // processing the exit's terminal report first
+                        // would let the terminal overtake them on the
+                        // wire AND stamp a `msgs_posted_through`
+                        // watermark that misses them (the asm-dataset
+                        // run_20260611_005220 race). Draining first
+                        // makes "control-plane ingress is causally
+                        // ordered before worker events" a loop-level
+                        // rule, with no event-shape knowledge here.
+                        self.drain_pending_control_commands(&mut secondary_control_rx)
+                            .await;
                         let restart = self.handle_worker_event(event, &oom_watcher).await?;
                         if let Some(wid) = restart {
                             // SCHEDULE, never execute inline: the due
@@ -586,50 +603,12 @@ where
                 } => {
                     arm_stats.record(ARM_SECONDARY_CONTROL);
                     match control {
-                        Some(super::super::control::SecondaryControlCommand::SendToWorker {
-                            worker_id,
-                            topic,
-                            data,
-                        }) => {
-                            let pool = &mut self.op_mut().pool;
-                            match pool.workers.get_mut(worker_id as usize) {
-                                Some(worker) => {
-                                    if let Err(e) = worker.send_custom(topic, data).await {
-                                        tracing::warn!(
-                                            worker_id,
-                                            error = %e,
-                                            "send_to_worker custom message failed; \
-                                             dropping (the worker slot's restart \
-                                             machinery owns recovery)"
-                                        );
-                                    }
-                                }
-                                None => {
-                                    tracing::warn!(
-                                        worker_id,
-                                        "send_to_worker named a worker id with no \
-                                         pool slot; dropping custom message"
-                                    );
-                                }
-                            }
-                        }
-                        Some(super::super::control::SecondaryControlCommand::SendToPrimary {
-                            topic,
-                            data,
-                            important,
-                        }) => {
-                            // The only Err class is the size gate, which
-                            // the API call site already rejected with a
-                            // ValueError — this is the defensive re-check.
-                            if let Err(e) =
-                                self.send_custom_to_primary(topic, data, important).await
-                            {
-                                tracing::warn!(
-                                    error = %e,
-                                    "send_to_primary custom message rejected at \
-                                     the send seam; dropping"
-                                );
-                            }
+                        Some(cmd) => {
+                            // Delegate to the single control-command
+                            // handler the worker-event arm's causal
+                            // pre-drain shares — one apply path, no
+                            // shape divergence.
+                            self.handle_secondary_control_command(cmd).await;
                         }
                         None => {
                             // All senders dropped (no SecondaryHandle
@@ -902,5 +881,83 @@ where
         // signal.
         self.enter_terminal_done();
         Ok(RunOutcome::Terminal)
+    }
+
+    /// Apply ONE secondary control-plane ingress command — the single
+    /// handler both the control `select!` arm and the worker-event
+    /// arm's causal pre-drain route through, so a command queued by the
+    /// PyO3 `SecondaryHandle` is applied identically whichever site
+    /// drains it.
+    pub(in crate::secondary) async fn handle_secondary_control_command(
+        &mut self,
+        cmd: super::super::control::SecondaryControlCommand,
+    ) {
+        match cmd {
+            super::super::control::SecondaryControlCommand::SendToWorker {
+                worker_id,
+                topic,
+                data,
+            } => {
+                let pool = &mut self.op_mut().pool;
+                match pool.workers.get_mut(worker_id as usize) {
+                    Some(worker) => {
+                        if let Err(e) = worker.send_custom(topic, data).await {
+                            tracing::warn!(
+                                worker_id,
+                                error = %e,
+                                "send_to_worker custom message failed; \
+                                 dropping (the worker slot's restart \
+                                 machinery owns recovery)"
+                            );
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            worker_id,
+                            "send_to_worker named a worker id with no \
+                             pool slot; dropping custom message"
+                        );
+                    }
+                }
+            }
+            super::super::control::SecondaryControlCommand::SendToPrimary {
+                topic,
+                data,
+                important,
+            } => {
+                // The only Err class is the size gate, which the API
+                // call site already rejected with a ValueError — this
+                // is the defensive re-check.
+                if let Err(e) = self.send_custom_to_primary(topic, data, important).await {
+                    tracing::warn!(
+                        error = %e,
+                        "send_to_primary custom message rejected at \
+                         the send seam; dropping"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Synchronously drain every control-plane command CURRENTLY queued
+    /// (non-blocking `try_recv` sweep) through the same
+    /// [`Self::handle_secondary_control_command`] the parked arm uses.
+    ///
+    /// The one caller is the worker-event arm's CAUSAL PRE-DRAIN:
+    /// commands enqueued before a worker event must be applied before
+    /// the event's own reports go out, so a task's important custom
+    /// messages are stamped-and-sent (or retained) BEFORE its terminal
+    /// is stamped with the `msgs_posted_through` causal watermark.
+    /// Cancel-safe by shape: each command is consumed and fully applied
+    /// within this call — nothing is held across a `select!` poll.
+    pub(in crate::secondary) async fn drain_pending_control_commands(
+        &mut self,
+        rx: &mut Option<
+            tokio::sync::mpsc::UnboundedReceiver<super::super::control::SecondaryControlCommand>,
+        >,
+    ) {
+        while let Some(cmd) = rx.as_mut().and_then(|rx| rx.try_recv().ok()) {
+            self.handle_secondary_control_command(cmd).await;
+        }
     }
 }
