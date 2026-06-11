@@ -154,7 +154,8 @@ fn primary_one_task_no_worker() -> (
             task,
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
     // The roster is EMPTY: no capacity record applied, so
     // `reconstruct_workers_from_cluster_state` would build 0 slots — the
     // assigned=0 snapshot state.

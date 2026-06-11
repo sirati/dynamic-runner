@@ -101,7 +101,8 @@ fn seed_one_inflight_task(
             version: Default::default(),
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
     hash
 }
 

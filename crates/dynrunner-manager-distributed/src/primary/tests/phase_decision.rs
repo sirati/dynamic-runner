@@ -96,7 +96,8 @@ fn cold_seed_cross_phase_same_task_id_is_not_a_duplicate() {
         .expect("cross-phase same task_id must NOT abort the cold seed");
     // The seed lands in the CRDT; hydrate is the sole pool / total_tasks
     // builder.
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     assert!(
         primary.pending_run_abort.is_none(),
@@ -149,7 +150,8 @@ fn phase_can_proceed_when_some_completed() {
             version: Default::default(),
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     let p = PhaseId::from("compile");
     assert!(primary.phase_can_proceed(&p));
@@ -181,7 +183,8 @@ fn phase_can_proceed_when_all_items_failed_terminally() {
             version: Default::default(),
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     let p = PhaseId::from("compile");
     assert!(primary.phase_can_proceed(&p));
@@ -206,7 +209,8 @@ fn phase_cannot_proceed_with_residual_unresolved_work() {
             task: only,
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     let p = PhaseId::from("compile");
     // Residual pending item ⇒ the phase has a LIVE task (has_live) ⇒ it is
@@ -252,7 +256,8 @@ fn empty_upstream_phase_with_blocked_dependent_proceeds() {
             task: dep,
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     let build_compilers = PhaseId::from("build_compilers");
     // No `build_compilers` ledger entry ⇒ no rollup ⇒ the `_` fallback; zero
@@ -292,7 +297,8 @@ fn empty_leaf_phase_proceeds_when_work_remains_elsewhere() {
             task: work_item,
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     let tail = PhaseId::from("tail");
     assert!(
@@ -324,7 +330,8 @@ fn empty_phase_with_no_work_remaining_fails_loud() {
             deps: HashMap::from([(PhaseId::from("build"), vec![])]),
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     let build = PhaseId::from("build");
     // No `build` ledger entry ⇒ no rollup ⇒ `_` fallback; empty pool, not
@@ -367,7 +374,8 @@ fn declared_may_be_empty_phase_proceeds_when_empty() {
             task: work_item,
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     let gate = PhaseId::from("gate");
     let tail = PhaseId::from("tail");
@@ -421,7 +429,8 @@ fn phase_all_skipped_as_existing_proceeds() {
             );
         }
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     let build = PhaseId::from("build");
     assert!(
@@ -480,7 +489,8 @@ fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
             task: dep_b,
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
     // `hydrate_from_cluster_state` no longer self-drains empty phases (the
     // coordinator owns the narrated cascade at run-entry). Drain the
     // completed-only `build` phase here so its `compile` dependent unblocks
@@ -554,7 +564,8 @@ fn fire_initial_phase_starts_emits_one_starting_job_phase_important_event() {
             task: toolchain,
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     // Worker-management sender so the emit path doesn't drop on a
     // missing sender (orthogonal to the important-event assertion).

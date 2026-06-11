@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo};
-use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{PendingPool, PendingPoolError, ResourceEstimator, Scheduler};
 
 use crate::cluster_state::TaskState;
 use crate::primary::PrimaryCoordinator;
@@ -73,7 +73,31 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// dependents BLOCKED — see the seed-vec docs in the body.
     /// Exercised directly by the hydrate tests and by the production
     /// snapshot-seeded construction caller (`seed_from_promotion_snapshot`).
-    pub(crate) fn hydrate_from_cluster_state(&mut self) {
+    ///
+    /// # Composition validity is the caller's run-policy
+    ///
+    /// The pool build is a graph VALIDATION (`PendingPool::new` checks the
+    /// phase graph; `extend` checks per-task `task_id` uniqueness +
+    /// dependency existence + cycle-freedom). A validation failure means the
+    /// REPLICATED ledger this pool is derived from describes an impossible
+    /// task graph — a duplicate `(phase_id, task_id)` identity (the
+    /// asm-dataset LMU run_~1429 production fatal: a discovered batch carried
+    /// a dup task_id, which `compute_task_hash` cannot collapse because it
+    /// folds `(phase_id, path, identifier)` not `task_id`, so both land as
+    /// distinct CRDT entries and only `extend`'s task_id check surfaces it), a
+    /// missing dep, or a cycle. This is NOT a derived-cache concern: hydrate
+    /// SURFACES it as `Err` and the run-phase caller (`discover_on_promotion`
+    /// / `run_pipeline`) owns the run-fatal policy (latch + broadcast the
+    /// `RunAborted` verdict, return a typed `RunError`) — the SAME terminal-
+    /// verdict path `fire_pending_run_abort` (#3a) and `invalidate_all_pending`
+    /// (#3b) use. Pre-fix this site logged an ERROR and silently left
+    /// `pending = None` ("primary will start with no pending tasks"): the run
+    /// then sat with an empty pool, never aborted, and the fleet died one-by-
+    /// one on their unconfigured deadlines. On `Err` the derived caches built
+    /// so far (`completed_tasks`, `all_binaries`, etc.) are LEFT as-is and
+    /// `pending` is set `None`; the caller aborts the run, so no consumer ever
+    /// reads them.
+    pub(crate) fn hydrate_from_cluster_state(&mut self) -> Result<(), PendingPoolError> {
         let mut completed_task_ids: HashSet<String> = HashSet::new();
         let mut primary_completed: HashSet<String> = HashSet::new();
         let mut items: Vec<TaskInfo<I>> = Vec::new();
@@ -432,10 +456,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 if let Err(e) = p.extend(items) {
                     tracing::error!(
                         error = %e,
-                        "post-composition: invalid task graph in cluster_state; primary will start with no pending tasks"
+                        "post-composition: invalid task graph in cluster_state \
+                         (duplicate task_id / unknown dep / cycle); surfacing as \
+                         a run-fatal — the caller aborts the run via the terminal \
+                         verdict path"
                     );
                     self.pending = None;
-                    return;
+                    return Err(e);
                 }
                 // Seed already-completed-AND-ENDED phases straight to `Done`
                 // (failover-promotion resume). The decision is keyed on the
@@ -507,10 +534,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             Err(e) => {
                 tracing::error!(
                     error = %e,
-                    "post-composition: invalid phase graph in cluster_state; primary will start with no pending tasks"
+                    "post-composition: invalid phase graph in cluster_state \
+                     (cycle / unknown phase dep); surfacing as a run-fatal — the \
+                     caller aborts the run via the terminal verdict path"
                 );
                 self.pending = None;
-                return;
+                return Err(e);
             }
         };
 
@@ -572,6 +601,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             total = self.total_tasks,
             "hydrated primary task list from cluster_state"
         );
+        Ok(())
     }
 
     /// Reconstruct the remote-worker roster (`self.workers`) from the two

@@ -909,7 +909,8 @@ async fn promoted_inflight_reserves_per_type_slot_for_symmetric_release() {
                 });
             }
 
-            promoted.hydrate_from_cluster_state();
+            promoted.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
             // The inherited InFlight task reserved its type slot — symmetric
             // with the live `commit_assignment` path.
@@ -1006,7 +1007,8 @@ fn promoted_hydrate_rebuilds_all_binaries_candidate_source() {
         "all_binaries starts empty before hydrate"
     );
 
-    promoted.hydrate_from_cluster_state();
+    promoted.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     // The candidate universe spans EVERY ledger entry (4 tasks across
     // three state classes), so the retry bucket has a source to filter.
@@ -1058,7 +1060,8 @@ fn promoted_hydrate_advances_next_secondary_id_past_roster_max() {
         }
     }
 
-    promoted.hydrate_from_cluster_state();
+    promoted.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     // The next mint must exceed the highest known id (secondary-5 → 6),
     // NOT reset to the `num_secondaries` floor (2) where it would collide
@@ -1168,7 +1171,8 @@ async fn cold_seed_hydrate_leaves_phase_started_emitted_empty() {
             primary
                 .originate_cold_seed(vec![(a, false), (b, false)], HashMap::new())
                 .expect("cold seed");
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
             assert!(
                 primary.phase_started_emitted.is_empty(),
@@ -1236,7 +1240,8 @@ fn hydrate_does_not_seed_blocked_only_phase_as_started() {
             task: st,
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     assert!(
         primary
@@ -1418,7 +1423,8 @@ fn promoted_hydrate_advances_next_secondary_id_past_ledgered_respawn() {
         );
     }
 
-    promoted.hydrate_from_cluster_state();
+    promoted.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     // The next mint must exceed the highest id ACROSS BOTH the capacity
     // roster (max 1) and the respawn ledger (7) → 8, NOT reset to the

@@ -686,6 +686,17 @@ impl PyPrimaryCoordinator {
                             e @ RunError::DuplicateTaskIdPrePhase { .. } => {
                                 duplicate_task_id_pre_phase = Some(e);
                             }
+                            e @ RunError::InvalidComposedGraph { .. } => {
+                                // Bring-up fatal: the composed task graph was
+                                // invalid (a discovery-batch duplicate identity /
+                                // missing dep / cycle). The primary already
+                                // broadcast the `RunAborted` verdict; RAISE so
+                                // this node's exit is non-zero — never the `Other`
+                                // swallow's false rc=0 "primary finished"
+                                // (run_~1429: the primary logged the ERROR then
+                                // silently continued with an empty pool).
+                                fatal_policy_exit = Some(e);
+                            }
                             e @ RunError::FatalPolicyExit { .. } => {
                                 // A policy abort (e.g. a relocated-observer
                                 // invalid-task fatal-exit). RAISE — never the
