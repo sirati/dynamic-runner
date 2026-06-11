@@ -7,8 +7,8 @@ use pyo3::prelude::*;
 /// declaring a peer dead, 300s peer timeout, 1s retry delay between
 /// secondary→primary connect attempts. The connect timeout defaults to 600s
 /// for the secondary's bootstrap dial; the PRIMARY's quorum-proceed window
-/// DERIVES from fleet size when the knob is unset (see
-/// `connect_timeout_secs`).
+/// DERIVES from the secondaries' `unconfigured_deadline_secs` when the knob
+/// is unset (see `connect_timeout_secs`).
 ///
 /// `keepalive_miss_threshold` is read by the failover voting code (Phase 2);
 /// configurable now so callers don't have to revisit when failover lands.
@@ -26,10 +26,12 @@ use pyo3::prelude::*;
 pub(crate) struct DistributedConfig {
     /// `None` = the operator did not set it. The distinction is
     /// load-bearing for the PRIMARY's quorum-proceed window: unset
-    /// derives the scale-aware default
+    /// derives the deadline-fraction default
     /// (`dynrunner_manager_distributed::derive_connect_timeout` —
-    /// `max(60, n*15)` capped strictly below `unconfigured_deadline_secs`),
-    /// while an explicit value is honored (still capped, with a WARN).
+    /// 80% of `unconfigured_deadline_secs`, the cap itself; per-node
+    /// container bring-up dominates the welcome-wait and does not
+    /// scale with fleet size), while an explicit value is honored
+    /// (still capped, with a WARN).
     /// The SECONDARY's bootstrap-dial budget reads the concrete
     /// [`Self::connect_timeout`] accessor (explicit value or the 600s
     /// default) — a transport patience knob that deliberately does NOT
@@ -184,7 +186,7 @@ impl DistributedConfig {
     /// quorum-proceed window must NOT read this: it goes through
     /// [`Self::connect_timeout_override`] +
     /// `dynrunner_manager_distributed::derive_connect_timeout` so an
-    /// unset knob derives the scale-aware window.
+    /// unset knob derives the deadline-fraction window.
     pub(crate) fn connect_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(
             self.connect_timeout_secs
