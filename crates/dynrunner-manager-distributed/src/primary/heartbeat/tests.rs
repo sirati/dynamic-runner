@@ -831,30 +831,31 @@ use std::time::Instant;
 /// PURE `silence_stage`: classifies a continuous silence into the highest
 /// schedule stage it crossed — `None` below the first WARN, ascending WARN
 /// stages, then `Hard` at the backstop. Schedule: WARN at 1x/2x, HARD at
-/// 4x of a 10ms interval.
+/// 4x of a 10ms interval. The silence is a plain `Duration` — whichever
+/// clock the caller judges by (wall-clock evidence age, or the judged
+/// clock under chronic starvation).
 #[test]
 fn silence_stage_classifies_into_highest_crossed_stage() {
     let interval = Duration::from_millis(10);
     let warn = [1u32, 2u32];
     let hard = 4u32;
-    let now = Instant::now();
-    let at = |ms: u64| now - Duration::from_millis(ms);
+    let silent_for = Duration::from_millis;
 
     // Below the first WARN multiple (1x = 10ms): no stage.
-    assert_eq!(silence_stage(at(5), now, interval, &warn, hard), None);
+    assert_eq!(silence_stage(silent_for(5), interval, &warn, hard), None);
     // Past 1x but below 2x: WARN(0).
     assert_eq!(
-        silence_stage(at(15), now, interval, &warn, hard),
+        silence_stage(silent_for(15), interval, &warn, hard),
         Some(Stage::Warn(0))
     );
     // Past 2x but below the hard 4x: WARN(1) (highest crossed WARN).
     assert_eq!(
-        silence_stage(at(25), now, interval, &warn, hard),
+        silence_stage(silent_for(25), interval, &warn, hard),
         Some(Stage::Warn(1))
     );
     // Past the hard 4x: Hard wins regardless of WARN crossings.
     assert_eq!(
-        silence_stage(at(45), now, interval, &warn, hard),
+        silence_stage(silent_for(45), interval, &warn, hard),
         Some(Stage::Hard)
     );
 }
@@ -1092,8 +1093,7 @@ async fn self_secondary_excluded_from_silent_set_and_oracle() {
     );
     assert_eq!(
         silence_stage(
-            report.silences[0].last_keepalive,
-            Instant::now(),
+            Instant::now().saturating_duration_since(report.silences[0].last_keepalive),
             Duration::from_millis(50),
             &[1],
             10,
@@ -1148,8 +1148,7 @@ async fn self_secondary_excluded_from_early_path_past_hard_backstop() {
     let report = primary.collect_heartbeat_report();
     assert_eq!(
         silence_stage(
-            report.silences[0].last_keepalive,
-            Instant::now(),
+            Instant::now().saturating_duration_since(report.silences[0].last_keepalive),
             Duration::from_millis(50),
             &[1],
             2,
