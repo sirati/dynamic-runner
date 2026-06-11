@@ -28,6 +28,37 @@ fn prepare_worker_leaf(
         .map_err(|e| format!("per-worker cgroup setup failed for worker {worker_id}: {e}"))
 }
 
+/// Base delay before re-spawning a slot whose subprocess died WITHOUT
+/// ever reaching `Ready` (a startup death — broken worker image /
+/// module import error). Doubles per consecutive startup death and
+/// saturates at [`RESTART_BACKOFF_CAP`]. A worker that HAD reached
+/// Ready keeps the historical immediate-restart semantics (zero
+/// delay) — the backoff exists solely to brake the #370
+/// respawn-crash loop, where an instantly-dying child re-entered the
+/// kill+spawn cycle at operational-loop speed and starved the whole
+/// single-threaded runtime.
+pub const RESTART_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
+/// Saturation for the startup-crash respawn backoff: a permanently
+/// broken worker image is retried once a minute, keeping the node
+/// alive and responsive while staying ready to heal on an image fix.
+pub const RESTART_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The startup-crash streak the SUCCESSOR handle of a replacement edge
+/// carries, derived from the replaced (old) handle: a generation that
+/// never reached Ready extends the streak; one that had reached Ready
+/// resets it. Single owner of the carry rule — all three replacement
+/// edges (`replace_worker_slot`, `ensure_worker_for_type`,
+/// `ensure_worker_for_type_async`) call this so they cannot drift.
+fn startup_crash_streak_for_successor<M: ManagerEndpoint + 'static, I: Identifier>(
+    old: &WorkerHandle<M, I>,
+) -> u32 {
+    if old.ever_ready {
+        0
+    } else {
+        old.startup_crash_streak.saturating_add(1)
+    }
+}
+
 /// Outcome of [`WorkerPool::ensure_worker_for_type`].
 ///
 /// Two-axis discriminator: was the slot already bound to the required
@@ -249,17 +280,54 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         Ok(())
     }
 
-    /// Block until every worker has reported Ready.
+    /// Block until every worker has SETTLED: reported Ready, or died
+    /// before ever reaching Ready (`is_startup_dead` — pipe EOF before
+    /// `Response::Ready`, the broken-worker-image shape). A
+    /// startup-dead slot can never become ready by polling, so waiting
+    /// on it would spin this loop forever at yield speed (the #370
+    /// busy-loop class); instead its `Disconnected` event is forwarded
+    /// onto the pool's event channel so the owning manager's restart
+    /// machinery recovers it — on the startup-crash backoff
+    /// ([`Self::restart_backoff_delay`]).
     pub async fn wait_for_all_ready(&mut self) {
         loop {
-            let all_ready = self.workers.iter().all(|w| w.is_ready());
-            if all_ready {
-                tracing::info!("all workers ready");
+            let settled = self
+                .workers
+                .iter()
+                .all(|w| w.is_ready() || w.is_startup_dead());
+            if settled {
+                let dead: Vec<WorkerId> = self
+                    .workers
+                    .iter()
+                    .filter(|w| w.is_startup_dead())
+                    .map(|w| w.worker_id)
+                    .collect();
+                if dead.is_empty() {
+                    tracing::info!("all workers ready");
+                } else {
+                    tracing::warn!(
+                        startup_dead = ?dead,
+                        "worker pool settled with startup-dead slot(s): the \
+                         subprocess(es) died before reporting Ready (broken \
+                         worker image / module import error?); the restart \
+                         machinery retries each on the startup-crash backoff"
+                    );
+                }
                 break;
             }
             for worker in &mut self.workers {
-                if !worker.is_ready() {
-                    worker.poll_ready().await;
+                if !worker.is_ready()
+                    && !worker.is_startup_dead()
+                    && let Some(event) = worker.poll_ready().await
+                {
+                    // Forward the settle event (Ready is consumed by the
+                    // state transition itself; Disconnected is the
+                    // startup-death the manager's event loop must see to
+                    // schedule the backed-off restart). Send failure is
+                    // impossible while the pool lives (it owns a sender).
+                    if matches!(event, WorkerEvent::Disconnected { .. }) {
+                        let _ = self.event_tx.send(event);
+                    }
                 }
             }
             tokio::task::yield_now().await;
@@ -306,6 +374,16 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         loop {
             if self.workers[worker_id as usize].is_ready() {
                 break;
+            }
+            if self.workers[worker_id as usize].is_startup_dead() {
+                // The replacement died before Ready — polling can never
+                // advance it, and looping here would spin forever (the
+                // #370 busy-loop class). Surface the failure; the
+                // caller owns the retry policy.
+                return Err(format!(
+                    "worker {worker_id} restart failed: replacement \
+                     subprocess died before reporting Ready"
+                ));
             }
             self.workers[worker_id as usize].poll_ready().await;
             tokio::task::yield_now().await;
@@ -444,6 +522,11 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         // consumer's generation gate drops it (it can no longer
         // mis-attribute the fresh subprocess's task).
         let next_generation = self.workers[worker_id as usize].generation + 1;
+        // Startup-crash streak carry (the #370 respawn-crash-loop
+        // brake) — carried like the budget/failure-count fields above;
+        // see `startup_crash_streak_for_successor` for the rule.
+        let crash_streak =
+            startup_crash_streak_for_successor(&self.workers[worker_id as usize]);
 
         let mut handle =
             WorkerHandle::new(worker_id, next_generation, transport, self.event_tx.clone());
@@ -451,9 +534,41 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         handle.subcgroup = subcgroup;
         handle.reserved_budgets = reserved_budgets;
         handle.assignment_failure_count = failure_count;
+        handle.startup_crash_streak = crash_streak;
         handle.loaded_type_id = preserved_type;
         self.workers[worker_id as usize] = handle;
         Ok(())
+    }
+
+    /// Delay before the NEXT respawn of `worker_id` may execute — the
+    /// startup-crash backoff read (#370). ZERO for a slot whose current
+    /// subprocess reached `Ready` at least once (a healthy worker that
+    /// died mid-task keeps the immediate-restart semantics) and for an
+    /// unknown slot. For a slot whose current subprocess died before
+    /// Ready, the delay doubles per consecutive startup death —
+    /// [`RESTART_BACKOFF_BASE`] · 2^streak, saturating at
+    /// [`RESTART_BACKOFF_CAP`] — so a broken worker image is retried on
+    /// a calm cadence instead of at operational-loop speed. The pool
+    /// owns the streak (per-slot lifecycle state, carried across
+    /// replacement like the budgets); the CALLER owns the scheduling
+    /// (it computes `now + delay` once, at restart-request time, and
+    /// parks on the stored deadline — the persistent-deadline law).
+    pub fn restart_backoff_delay(&self, worker_id: WorkerId) -> std::time::Duration {
+        let Some(worker) = self.workers.get(worker_id as usize) else {
+            return std::time::Duration::ZERO;
+        };
+        if worker.ever_ready {
+            return std::time::Duration::ZERO;
+        }
+        // The current generation is itself a startup death (or has not
+        // settled yet): attempt N+1's delay is BASE doubled per PRIOR
+        // consecutive startup death, capped.
+        let factor = 1u32
+            .checked_shl(worker.startup_crash_streak)
+            .unwrap_or(u32::MAX);
+        RESTART_BACKOFF_BASE
+            .saturating_mul(factor)
+            .min(RESTART_BACKOFF_CAP)
     }
 
     /// Ensure the given worker's subprocess is bound to `required_type`,
@@ -548,6 +663,9 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         // Bump the slot's generation — the type-shift respawn is a NEW
         // subprocess (same edge as the async variant; see its rustdoc).
         let next_generation = self.workers[idx].generation + 1;
+        // Startup-crash streak carry — same rule as every replacement
+        // edge (`startup_crash_streak_for_successor`).
+        let crash_streak = startup_crash_streak_for_successor(&self.workers[idx]);
 
         let mut handle =
             WorkerHandle::new(worker_id, next_generation, transport, self.event_tx.clone());
@@ -555,15 +673,26 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         handle.subcgroup = subcgroup;
         handle.reserved_budgets = reserved_budgets;
         handle.assignment_failure_count = failure_count;
+        handle.startup_crash_streak = crash_streak;
         handle.loaded_type_id = Some(required_type.clone());
         self.workers[idx] = handle;
 
         // Drive `poll_ready` directly — no background task, no
         // event-channel emission. The synchronous loop mirrors the
-        // pre-extraction implementation bit-for-bit.
+        // pre-extraction implementation, with one settle-exit: a
+        // replacement that died before Ready can never advance, so
+        // surface the failure instead of spinning (the #370 busy-loop
+        // class); the caller owns the retry policy.
         loop {
             if self.workers[idx].is_ready() {
                 break;
+            }
+            if self.workers[idx].is_startup_dead() {
+                return Err(format!(
+                    "worker {worker_id} type-shift respawn for \
+                     {required_type} failed: replacement subprocess died \
+                     before reporting Ready"
+                ));
             }
             self.workers[idx].poll_ready().await;
             tokio::task::yield_now().await;
@@ -694,6 +823,9 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         // drops it rather than mis-attributing it to the freshly-bound
         // task. THIS is the root edge of the wedge the gate closes.
         let next_generation = self.workers[idx].generation + 1;
+        // Startup-crash streak carry — same rule as every replacement
+        // edge (`startup_crash_streak_for_successor`).
+        let crash_streak = startup_crash_streak_for_successor(&self.workers[idx]);
 
         let mut handle =
             WorkerHandle::new(worker_id, next_generation, transport, self.event_tx.clone());
@@ -701,6 +833,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         handle.subcgroup = subcgroup;
         handle.reserved_budgets = reserved_budgets;
         handle.assignment_failure_count = failure_count;
+        handle.startup_crash_streak = crash_streak;
         handle.loaded_type_id = Some(required_type.clone());
         // Spawn the wait-for-Ready background task BEFORE handing
         // the handle to `self.workers[idx]` so the protocol moves
@@ -1553,5 +1686,125 @@ mod cgroup_wiring_tests {
             }
             other => panic!("unexpected initialize outcome: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_crash_backoff_tests {
+    use super::*;
+    use crate::manager::WorkerFactory;
+    use crate::worker::WorkerEvent;
+    use dynrunner_core::{ResourceKind, WorkerId};
+    use dynrunner_transport_channel::{ChannelManagerEnd, channel_pair};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    struct TestId(String);
+
+    /// Every spawn dies at startup: the runner end is dropped before
+    /// anything (including `Ready`) is sent — the manager observes EOF
+    /// before Ready (the #370 broken-worker-image shape).
+    struct DeadAtSpawnFactory;
+
+    impl WorkerFactory<ChannelManagerEnd> for DeadAtSpawnFactory {
+        fn spawn_worker(
+            &mut self,
+            _worker_id: WorkerId,
+            _subcgroup: Option<&SubcgroupHandle>,
+        ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+            let (manager_end, runner_end) = channel_pair();
+            drop(runner_end);
+            Ok((manager_end, None))
+        }
+    }
+
+    /// `initialize` (via `wait_for_all_ready`) must SETTLE — not spin
+    /// forever — when a worker subprocess dies before Ready, and the
+    /// startup death must surface as a `Disconnected` on the pool's
+    /// event channel so the owning manager's restart machinery can
+    /// recover the slot. Pre-fix this test HANGS: `poll_ready` on the
+    /// Stopped slot returns `None` instantly and the wait loop yields
+    /// forever (the #370 busy-loop class, initialize edition).
+    #[tokio::test(flavor = "current_thread")]
+    async fn initialize_settles_on_dead_at_spawn_worker() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let scheduler = dynrunner_scheduler::ResourceStealingScheduler::memory();
+                let max = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]);
+                let mut pool: WorkerPool<ChannelManagerEnd, TestId> = WorkerPool::new();
+
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    pool.initialize(1, &max, &scheduler, &mut DeadAtSpawnFactory, false, None),
+                )
+                .await
+                .expect("initialize must SETTLE on a dead-at-spawn worker, not hang")
+                .expect("a startup-dead slot is not an initialize error");
+
+                assert!(pool.workers[0].is_startup_dead());
+                // The settle forwarded the startup death onto the event
+                // channel for the manager's restart machinery.
+                let ev = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    pool.recv_event(),
+                )
+                .await
+                .expect("the startup death must be forwarded as an event")
+                .expect("event channel open");
+                assert!(
+                    matches!(ev, WorkerEvent::Disconnected { worker_id: 0, .. }),
+                    "expected Disconnected for the startup-dead slot; got {ev:?}"
+                );
+            })
+            .await;
+    }
+
+    /// The startup-crash backoff escalates across consecutive
+    /// dead-before-Ready generations (BASE, 2×, 4×, … capped) and the
+    /// streak is carried by the replacement edges exactly like the
+    /// budget fields. A healthy (ever-Ready) slot reads ZERO — the
+    /// historical immediate-restart semantics.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_backoff_escalates_per_consecutive_startup_death() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let scheduler = dynrunner_scheduler::ResourceStealingScheduler::memory();
+                let max = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]);
+                let mut pool: WorkerPool<ChannelManagerEnd, TestId> = WorkerPool::new();
+                let mut factory = DeadAtSpawnFactory;
+                pool.initialize(1, &max, &scheduler, &mut factory, false, None)
+                    .await
+                    .expect("init settles");
+
+                // Generation 0 died before Ready: first respawn waits BASE.
+                assert_eq!(pool.restart_backoff_delay(0), RESTART_BACKOFF_BASE);
+
+                // Each replacement of a never-ready generation doubles the
+                // wait, saturating at the cap. `restart_worker_async`
+                // (the operational restart edge) drives the carry.
+                let mut expected = RESTART_BACKOFF_BASE;
+                for _ in 0..8 {
+                    pool.restart_worker_async(0, &mut factory, false)
+                        .await
+                        .expect("respawn spawns (the child then dies)");
+                    // Drain the watcher's Disconnected so the channel
+                    // doesn't accumulate (not load-bearing for the carry).
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        pool.recv_event(),
+                    )
+                    .await;
+                    expected = (expected * 2).min(RESTART_BACKOFF_CAP);
+                    assert_eq!(
+                        pool.restart_backoff_delay(0),
+                        expected,
+                        "backoff must double per consecutive startup death \
+                         (capped at {RESTART_BACKOFF_CAP:?})"
+                    );
+                }
+            })
+            .await;
     }
 }

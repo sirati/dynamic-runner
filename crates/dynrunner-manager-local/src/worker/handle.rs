@@ -101,6 +101,24 @@ pub struct WorkerHandle<M: ManagerEndpoint, I: Identifier> {
     /// still records the requested `TypeId` here so the same-type
     /// fast path stays observably correct without any real spawn.
     pub loaded_type_id: Option<TypeId>,
+    /// Whether THIS subprocess generation ever reached `Ready`
+    /// (protocol observed Idle at least once). Drives the
+    /// startup-crash discrimination: a worker that died WITHOUT ever
+    /// reaching Ready is a startup death (broken worker image /
+    /// module import error — the #370 production shape), and its
+    /// slot's next respawn must be backed off
+    /// ([`super::super::pool::WorkerPool::restart_backoff_delay`])
+    /// instead of retried at loop speed. A worker that HAD reached
+    /// Ready keeps the historical immediate-restart semantics.
+    pub ever_ready: bool,
+    /// Count of consecutive PREDECESSOR subprocesses in this slot that
+    /// died without ever reaching Ready. Maintained at the pool's
+    /// replacement edges (carried like `assignment_failure_count`):
+    /// the successor handle gets `old.startup_crash_streak + 1` when
+    /// the replaced generation never reached Ready, and `0` when it
+    /// had. Reaching Ready resets it. Drives the exponential respawn
+    /// backoff for a startup-crashing worker.
+    pub startup_crash_streak: u32,
     /// Current processing phase name (set by PhaseUpdate messages).
     pub phase: Option<String>,
     /// Timestamp of the last keepalive or phase update.
@@ -154,6 +172,8 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
             pid: None,
             subcgroup: None,
             loaded_type_id: None,
+            ever_ready: false,
+            startup_crash_streak: 0,
             phase: None,
             last_keepalive: None,
             phase_started_at: None,
@@ -200,6 +220,19 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         try_reap_subprocess(self.pid)
     }
 
+    /// Fallback reap for the SIGCHLD-race window: when
+    /// [`Self::try_reap_exit`] returned `None` for a child the caller
+    /// KNOWS is dead (pipe EOF observed), schedule the bounded detached
+    /// reaper so the child cannot linger as a zombie just because the
+    /// kernel had not finalised it inside the non-blocking retry
+    /// budget. No-op without a tracked PID; idempotent against any
+    /// other reap path (`ECHILD` exits silently).
+    pub fn reap_detached_fallback(&self) {
+        if let Some(pid) = self.pid {
+            super::exit_status::reap_detached(self.worker_id, pid);
+        }
+    }
+
     /// Actively SIGKILL the worker subprocess. Used by the
     /// secondary's restart path to ensure a stuck or otherwise
     /// non-responsive worker is dead BEFORE its replacement comes
@@ -223,6 +256,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         let Some(pid) = self.pid else {
             return;
         };
+        let pid_raw = pid;
         let pid = Pid::from_raw(pid as i32);
         match kill(pid, Signal::SIGKILL) {
             Ok(()) => {
@@ -231,6 +265,14 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                     pid = %pid,
                     "worker: sent SIGKILL before restart"
                 );
+                // The kill edge OWNS the reap: nothing downstream waits
+                // this child (the replacement aborts its poll task, so
+                // no Disconnected event — and therefore no
+                // `try_reap_exit` — ever fires for it). Without this,
+                // every type-shift/restart kill leaks a zombie for the
+                // life of the manager process (the #370 procfs shape).
+                // Detached + bounded, off the runtime thread.
+                super::exit_status::reap_detached(self.worker_id, pid_raw);
             }
             Err(nix::errno::Errno::ESRCH) => {
                 // Already gone — kernel reaped or process exited
@@ -388,6 +430,22 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         self.protocol.is_idle()
     }
 
+    /// True iff THIS subprocess generation died without ever reaching
+    /// `Ready`: the protocol settled in `Stopped`/`Unconnected` while
+    /// `ever_ready` is still false. A startup-dead slot can never
+    /// become ready by polling — `poll_ready` has nothing left to
+    /// drive — so ready-wait loops must treat it as SETTLED (and let
+    /// the restart machinery own recovery, on the startup-crash
+    /// backoff) instead of spinning on it forever (the #370 busy-loop
+    /// shape).
+    pub fn is_startup_dead(&self) -> bool {
+        !self.ever_ready
+            && matches!(
+                self.protocol,
+                RunnerProtocolState::Stopped(_) | RunnerProtocolState::Unconnected
+            )
+    }
+
     pub fn is_processing(&self) -> bool {
         // Transitioning means the protocol is in a spawned poll task
         self.protocol.is_processing() || self.poll_task.is_some()
@@ -418,6 +476,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
             WaitReadyResult::Ready(idle) => {
                 self.protocol = RunnerProtocolState::Idle(idle);
                 self.idle = true;
+                // This generation reached Ready: it is not a startup
+                // death, and the slot's startup-crash streak ends here.
+                self.ever_ready = true;
+                self.startup_crash_streak = 0;
                 Some(WorkerEvent::Ready {
                     worker_id: self.worker_id,
                     generation: self.generation,
@@ -842,6 +904,15 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         if let Some(handle) = self.poll_task.take() {
             match handle.await {
                 Ok((state, custom_rx)) => {
+                    // An Idle protocol coming back from the background
+                    // task proves this generation reached Ready (the
+                    // ready-watcher's Ready path, or a per-task poll
+                    // loop's Completed — which implies an earlier
+                    // Ready). Ends any startup-crash streak.
+                    if state.is_idle() {
+                        self.ever_ready = true;
+                        self.startup_crash_streak = 0;
+                    }
                     self.protocol = state;
                     // Recover the custom-outbox receiver the per-task
                     // poll loop borrowed (None from the ready-watcher,

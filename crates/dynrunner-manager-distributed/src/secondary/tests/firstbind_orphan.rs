@@ -1400,7 +1400,7 @@ async fn pending_first_bind_reinjects_when_mesh_leg_unconfirmed_at_ready() {
                 !secondary
                     .op_mut()
                     .pending_worker_restarts
-                    .contains(&0),
+                    .contains_key(&0),
                 "the worker is healthy (it reached Ready); the mesh gate must \
                  not flag it for restart"
             );

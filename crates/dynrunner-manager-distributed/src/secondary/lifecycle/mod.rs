@@ -92,7 +92,7 @@
 //! transport, `S` scheduler, `E` estimator) are NOT needed: no field
 //! carried by a state is typed over them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -293,9 +293,16 @@ pub(in crate::secondary) struct OperationalState<M: ManagerEndpoint, I: Identifi
     /// transport at the top of each loop iteration.
     pub(in crate::secondary) pending_peer_messages: Vec<(String, DistributedMessage<I>)>,
 
-    /// Worker IDs queued for respawn at the next processing tick (broken
-    /// pipe observed without a `WorkerEvent::Disconnected`).
-    pub(in crate::secondary) pending_worker_restarts: HashSet<WorkerId>,
+    /// Worker slots queued for respawn, each with the EARLIEST instant
+    /// its restart may execute (`now` for a healthy worker that died
+    /// mid-task — the historical immediate-restart semantics — or
+    /// `now + WorkerPool::restart_backoff_delay` for a startup-crashing
+    /// one, the #370 respawn-crash-loop brake). The deadline is
+    /// PERSISTENT state stored here at schedule time, never derived at
+    /// the wake arm (the watchdog-fires-under-load law); the
+    /// operational loop parks on the map-wide minimum and executes the
+    /// due entries at its tail.
+    pub(in crate::secondary) pending_worker_restarts: HashMap<WorkerId, Instant>,
 
     /// Tasks deferred because the target worker's per-type subprocess is
     /// mid-respawn (respawn-HOLD, #58). Keyed by `WorkerId`.
@@ -534,7 +541,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
         peer_keepalives: HashMap<String, Instant>,
         primary_link: PrimaryLink,
         pending_peer_messages: Vec<(String, DistributedMessage<I>)>,
-        pending_worker_restarts: HashSet<WorkerId>,
+        pending_worker_restarts: HashMap<WorkerId, Instant>,
         pending_first_bind: HashMap<WorkerId, PendingFirstBind<I>>,
     ) -> (Self, OperationalLatches<I>) {
         match self {
@@ -591,7 +598,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
             primary_link,
             active_tasks: HashMap::new(),
             pending_peer_messages: Vec::new(),
-            pending_worker_restarts: HashSet::new(),
+            pending_worker_restarts: HashMap::new(),
             pending_first_bind: HashMap::new(),
         }));
         (state, latches)

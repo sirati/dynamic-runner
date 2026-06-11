@@ -155,3 +155,45 @@ fn try_reap_picks_up_sigterm_with_name() {
     assert_eq!(status.signal, Some(15));
     assert_eq!(status.signal_name, Some("TERM"));
 }
+
+/// The detached reaper must wait a dead child off the process table —
+/// the #370 zombie shape: a startup-dead (or kill-edge) worker child
+/// whose `Disconnected` event path never reaps it sat as a zombie for
+/// the life of the manager. `reap_detached` runs a bounded WNOHANG
+/// poll on the blocking pool; after it completes, a `waitpid` by this
+/// (parent) test process must report ECHILD — the kernel entry is gone.
+#[cfg(target_os = "linux")] // observes the reap via /proc, race-free
+#[tokio::test]
+async fn reap_detached_clears_the_zombie() {
+    use std::process::Command;
+
+    // `/bin/true` exits immediately; holding the `Child` without
+    // waiting leaves it a zombie (std::process::Child::drop does NOT
+    // reap).
+    let child = Command::new("true").spawn().expect("spawn `true`");
+    let pid = child.id();
+    // Keep the Child handle alive so no other reap path exists.
+    let _hold = child;
+    std::thread::sleep(std::time::Duration::from_millis(25));
+
+    // Zombie precondition: the kernel still lists the pid (state Z).
+    let proc_path = format!("/proc/{pid}");
+    assert!(
+        std::path::Path::new(&proc_path).exists(),
+        "test precondition: the unreaped child must still be listed"
+    );
+
+    super::exit_status::reap_detached(7, pid);
+
+    // The reaper runs on the blocking pool with a 5s budget. Observe
+    // its effect WITHOUT a competing waitpid of our own (which would
+    // race the reaper for the same child and make the test vacuous):
+    // once reaped, the /proc entry disappears — a zombie keeps it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    while std::path::Path::new(&proc_path).exists() {
+        if std::time::Instant::now() >= deadline {
+            panic!("reap_detached did not reap the dead child within its budget");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}

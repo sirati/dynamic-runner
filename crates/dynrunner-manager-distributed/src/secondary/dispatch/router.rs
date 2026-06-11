@@ -290,7 +290,7 @@ where
                             type_id = %binary.type_id,
                             "ensure_worker_for_type failed for peer-assigned task; queuing respawn"
                         );
-                        self.op_mut().pending_worker_restarts.insert(target_wid);
+                        self.schedule_worker_restart(target_wid);
                         let task_failed = DistributedMessage::TaskFailed {
                             target: None,
                             sender_id: self.config.secondary_id.clone(),
@@ -359,7 +359,7 @@ where
                             // brings a replacement up; pre-fix the
                             // SLURM-secondary path silently abandoned
                             // the slot.
-                            self.op_mut().pending_worker_restarts.insert(target_wid);
+                            self.schedule_worker_restart(target_wid);
                             // Bug C: the task hasn't been attempted
                             // — the pipe-write never landed. Send
                             // the primary a backpressure-shaped
