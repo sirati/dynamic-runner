@@ -1,13 +1,16 @@
 //! Operational-loop arms for the respawn pipeline. The impl block here
-//! decorates `PrimaryCoordinator` with `dispatch_respawn_request` (called
-//! on the respawn-request select arm) and `handle_respawn_join` (called
-//! when the `JoinSet<RespawnOutcome>` yields a finished task).
+//! decorates `PrimaryCoordinator` with `dispatch_respawn_lifecycle`
+//! (called on the respawn lifecycle select arm; routes `Removed` into
+//! `dispatch_respawn_request` and `Added` into the pending-replacement
+//! reconciliation) and `handle_respawn_join` (called when the
+//! `JoinSet<RespawnOutcome>` yields a finished task).
 
 use std::sync::Arc;
 
 use super::types::{RespawnDecision, RespawnOutcome, RespawnRequest, SecondarySpawnSpec};
 
 use crate::cluster_state::RespawnEventRecord;
+use crate::peer_lifecycle::PeerLifecycleEvent;
 
 // ── Operational-loop entry points ─────────────────────────────────
 //
@@ -29,6 +32,127 @@ where
     E: ResourceEstimator<I>,
     I: Identifier,
 {
+    /// Route one [`PeerLifecycleEvent`] drained off the respawn
+    /// lifecycle channel. `Removed` is a death — translated into a
+    /// [`RespawnRequest`] and dispatched. `Added` is a join —
+    /// reconciled against the pending-replacement bookkeeping (the
+    /// joiner is either a pending replacement claiming its place, the
+    /// re-admitted original whose still-pending replacement is now a
+    /// squatter, or — the common case — neither).
+    pub(crate) fn dispatch_respawn_lifecycle(&mut self, event: PeerLifecycleEvent) {
+        match event {
+            PeerLifecycleEvent::Removed { id, cause } => {
+                self.dispatch_respawn_request(RespawnRequest {
+                    original_id: id,
+                    cause,
+                });
+            }
+            PeerLifecycleEvent::Added { id, .. } => {
+                self.reconcile_replacements_on_join(&id);
+            }
+        }
+    }
+
+    /// Reconcile the pending-replacement bookkeeping against a peer
+    /// that just joined the replicated membership.
+    ///
+    /// Two matches are possible (both cheap map probes; the common
+    /// no-match join costs one lookup + one scan over a map bounded by
+    /// `RespawnBudget::max_total`):
+    ///
+    /// 1. `joined_id` IS a pending replacement → it welcomed and is
+    ///    the legitimate occupant (it joins under its freshly-minted
+    ///    `secondary-N` id, never the dead member's, so there is no
+    ///    identity conflict). Clear its entry. If its original is
+    ///    re-admitted LATER, nothing is revoked: a welcomed member is
+    ///    ordinary fleet capacity, and killing it would only re-enter
+    ///    the removal→respawn churn it was spawned to resolve.
+    ///
+    /// 2. `joined_id` is the ORIGINAL of one or more pending
+    ///    replacements → the re-admission edge (the frame-ingest seam
+    ///    proved the removed member alive and bumped its membership
+    ///    generation). Every still-pending replacement for it is a
+    ///    resource squatter: revoke it through the provider port
+    ///    (best-effort `scancel` for SLURM). The revoke runs detached
+    ///    on the LocalSet — same orphan-safety shape as the
+    ///    provider's own spawn internals — because the loop arm must
+    ///    not await a gateway round-trip. A revoke transport failure
+    ///    is logged loudly; the job id stays on the provider's
+    ///    `job_ids` ledger, so the run-teardown `cleanup()` sweep
+    ///    still scancels it (no re-admission retry sweep exists).
+    ///
+    /// Ordering between the two cases is the lifecycle channel's apply
+    /// order — both `PeerJoined` applies flow through the SAME
+    /// dispatcher → channel → this method, so the
+    /// replacement-welcomed-first and original-re-admitted-first
+    /// interleavings resolve deterministically.
+    fn reconcile_replacements_on_join(&mut self, joined_id: &str) {
+        // Case 1: the joiner is a pending replacement — it claimed its
+        // place; the bookkeeping entry is done.
+        if let Some(original_id) = self.pending_replacements.remove(joined_id) {
+            tracing::info!(
+                target: "dynrunner_respawn",
+                original_id = %original_id,
+                new_id = %joined_id,
+                event = "respawn_replacement_joined",
+                "replacement secondary joined the membership; it is the \
+                 legitimate occupant (no revocation possible for it from \
+                 here on)",
+            );
+            return;
+        }
+        // Case 2: the joiner is the original of pending replacement(s)
+        // — the re-admission edge. Revoke every squatter.
+        let squatters: Vec<String> = self
+            .pending_replacements
+            .iter()
+            .filter(|(_, original_id)| original_id.as_str() == joined_id)
+            .map(|(new_id, _)| new_id.clone())
+            .collect();
+        if squatters.is_empty() {
+            return;
+        }
+        // Defensive mirror of `dispatch_respawn_request`: entries only
+        // exist when `enable_respawn` installed the spawner, so this
+        // cannot fire outside a logic error.
+        let Some(spawner) = self.respawn_spawner.as_ref().map(Arc::clone) else {
+            tracing::warn!(
+                target: "dynrunner_respawn",
+                peer_id = %joined_id,
+                "pending replacements exist but the respawn policy is \
+                 disabled; cannot revoke",
+            );
+            return;
+        };
+        for new_id in squatters {
+            self.pending_replacements.remove(&new_id);
+            tracing::info!(
+                target: "dynrunner_respawn",
+                original_id = %joined_id,
+                new_id = %new_id,
+                event = "respawn_replacement_revoked",
+                "member re-admitted while its replacement was still \
+                 pending; revoking the redundant replacement",
+            );
+            let spawner = Arc::clone(&spawner);
+            tokio::task::spawn_local(async move {
+                if let Err(e) = spawner.revoke(&new_id).await {
+                    tracing::warn!(
+                        target: "dynrunner_respawn",
+                        new_id = %new_id,
+                        error = %e,
+                        event = "respawn_revoke_failed",
+                        "could not revoke the redundant replacement (provider \
+                         backend unreachable); its job id remains on the \
+                         provider's ledger, so run-teardown cleanup() will \
+                         scancel it — if the run aborts before teardown, a \
+                         manual scancel may be needed",
+                    );
+                }
+            });
+        }
+    }
+
     /// Handle one [`RespawnRequest`] drained off the respawn-request
     /// channel. Consults the budget against the REPLICATED respawn ledger
     /// (`cluster_state.respawn_events()`), mints a fresh secondary id on
@@ -68,11 +192,14 @@ where
         // single place a queued request becomes a spawn. Checked BEFORE
         // the budget consult, so a canceled request never writes the
         // replicated ledger (the budget "refund" is structural: the spend
-        // only happens on accept, below). The LAUNCHED stage needs no
+        // only happens on accept, below). The LAUNCHED stage has its own
         // counterpart: an accepted respawn comes up under a freshly-
         // minted `secondary-N` id (never the dead peer's), so it cannot
-        // duplicate the re-admitted identity — it joins as an ordinary
-        // extra secondary.
+        // duplicate the re-admitted identity — but until it JOINS it is
+        // a revocable resource squatter, tracked in
+        // `pending_replacements` and reconciled by
+        // `reconcile_replacements_on_join` when either party's
+        // `PeerJoined` lands.
         if self.cluster_state.is_peer_alive(&request.original_id) {
             tracing::info!(
                 target: "dynrunner_respawn",
@@ -153,6 +280,14 @@ where
                 at: now,
             },
         );
+        // Track the replacement as pending-until-join so a later
+        // re-admission of the original can revoke it (see
+        // `reconcile_replacements_on_join`). Inserted at accept time —
+        // BEFORE the spawn future runs — so a re-admission landing in
+        // the submission window is still observed; the provider's
+        // `revoke` contract absorbs the not-yet-submitted race.
+        self.pending_replacements
+            .insert(new_id.clone(), request.original_id.clone());
         tracing::info!(
             target: "dynrunner_respawn",
             original_id = %request.original_id,

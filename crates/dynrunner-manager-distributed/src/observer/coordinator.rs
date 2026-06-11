@@ -70,8 +70,8 @@ use std::time::{Duration, Instant};
 
 use dynrunner_core::{BoundedString, IMPORTANT_TARGET, Identifier};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, Destination, DistributedMessage, KeepaliveRole, PeerId, RemovalCause,
-    SendTarget, StateDigest, resolve_destination,
+    ClusterMutation, Destination, DistributedMessage, KeepaliveRole, RemovalCause, SendTarget,
+    StateDigest, resolve_destination,
 };
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -1005,14 +1005,15 @@ where
                     // re-evaluates + the lost-visibility recurrence report
                     // fires even with zero inbound traffic.
                     _ = visibility_recheck_tick.tick() => {}
-                    // Wake-stream loss threshold (the 5-minute mark). A
-                    // PERSISTENT deadline: `wake_deadline()` derives from the
-                    // STORED loss instant, so this `sleep_until` — though
-                    // rebuilt every iteration — always targets the same
-                    // absolute instant and fires under constant sibling
-                    // activity (the watchdog law; a relative `sleep` here
-                    // would be reset by every other arm and never fire).
-                    // `None` (visible, or already logged) parks the arm.
+                    // Wake-stream loss cadence (the 5-minute mark, then one
+                    // repeat per 10 minutes while still down). A PERSISTENT
+                    // deadline: `wake_deadline()` derives from STORED
+                    // instants (the loss instant, then the last wake emit),
+                    // so this `sleep_until` — though rebuilt every iteration
+                    // — always targets the same absolute instant and fires
+                    // under constant sibling activity (the watchdog law; a
+                    // relative `sleep` here would be reset by every other
+                    // arm and never fire). `None` (visible) parks the arm.
                     // Cancel-safe: `sleep_until` holds no state beyond its
                     // target instant.
                     _ = async {
@@ -1449,8 +1450,10 @@ where
     /// run_20260610_185621 leaderless wedge).
     ///
     /// The reply destination is typed off the requester's self-declared
-    /// role (the same `is_observer` field the snapshot responders record):
-    /// `Observer(id)` for an observer requester, `Secondary(id)` otherwise.
+    /// role (the same `is_observer` field the snapshot responders record)
+    /// via the shared snapshot-RPC reply policy
+    /// ([`anti_entropy::reply_destination`]): `Observer(id)` for an
+    /// observer requester, `Secondary(id)` otherwise.
     async fn answer_snapshot_request(&mut self, requester: &str, requester_is_observer: bool) {
         // Serialize-once per state generation (#367): the cache inside
         // `ClusterState` keys the reply bytes on the anti-entropy
@@ -1472,11 +1475,7 @@ where
             timestamp: timestamp_now(),
             snapshot_json: (*snapshot_json).clone(),
         };
-        let dst = if requester_is_observer {
-            Destination::Observer(PeerId::from(requester.to_string()))
-        } else {
-            Destination::Secondary(PeerId::from(requester.to_string()))
-        };
+        let dst = anti_entropy::reply_destination(requester, requester_is_observer);
         if let Err(e) = self.send_to(dst, reply).await {
             tracing::warn!(
                 requester = %requester,

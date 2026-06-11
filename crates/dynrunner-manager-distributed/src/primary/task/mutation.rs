@@ -91,9 +91,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     timestamp: timestamp_now(),
                     snapshot_json: (*snapshot_json).clone(),
                 };
+                // Reply typed off the requester's self-declared role (the
+                // request frame's `is_observer`) — the shared snapshot-RPC
+                // reply policy (`anti_entropy::reply_destination`).
                 if let Err(e) = self
                     .send_to(
-                        Destination::Secondary(PeerId::from(sender_id.clone())),
+                        crate::anti_entropy::reply_destination(&sender_id, is_observer),
                         response,
                     )
                     .await

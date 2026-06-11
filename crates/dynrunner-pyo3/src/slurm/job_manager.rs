@@ -351,7 +351,10 @@ impl PyRustSlurmJobManager {
         }))
     }
 
-    /// Cancel a single SLURM job via `scancel`.
+    /// Cancel a single SLURM job via `scancel`. The Rust manager's
+    /// `CancelOutcome` (cancelled vs. already gone) is collapsed to
+    /// `None` here — the historical Python surface never distinguished
+    /// them, and both mean "the job is not running any more".
     fn cancel_job(&self, py: Python<'_>, job_id: String) -> PyResult<()> {
         let inner = self.inner.clone();
         py.detach(|| {
@@ -360,6 +363,7 @@ impl PyRustSlurmJobManager {
                     .await
                     .cancel_job(&job_id)
                     .await
+                    .map(|_outcome| ())
                     .map_err(slurm_err_to_py)
             })
         })

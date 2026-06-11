@@ -17,7 +17,7 @@ use std::time::Duration;
 use dynrunner_core::{ErrorType, PhaseId, TaskInfo, TypeId};
 use dynrunner_protocol_primary_secondary::cluster_mutation::ClusterMutation;
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, KeepaliveRole, PrimaryChangeReason,
+    Destination, DistributedMessage, KeepaliveRole, PrimaryChangeReason,
 };
 use dynrunner_transport_channel::ChannelPeerTransport;
 use serde::{Deserialize, Serialize};
@@ -1889,15 +1889,28 @@ async fn observer_answers_snapshot_pull_from_behind_secondary() {
 
                 // The observer MUST answer with its snapshot, carrying the
                 // relocation fact the requester is missing.
-                let reply = loop {
+                let (reply, reply_target) = loop {
                     let frame = sec1_rx
                         .recv()
                         .await
                         .expect("observer transport stays open");
-                    if let DistributedMessage::ClusterSnapshot { snapshot_json, .. } = frame {
-                        break snapshot_json;
+                    if let DistributedMessage::ClusterSnapshot {
+                        target,
+                        snapshot_json,
+                        ..
+                    } = frame
+                    {
+                        break (snapshot_json, target);
                     }
                 };
+                // The reply is typed off the requester's self-declared role:
+                // a WORKER requester (is_observer=false) gets a
+                // Secondary-typed reply (the ingress demux selector).
+                assert_eq!(
+                    reply_target,
+                    Some(Destination::Secondary(PeerId::from("sec-1"))),
+                    "a worker requester's snapshot reply must be Secondary-typed"
+                );
                 let snap: crate::cluster_state::ClusterStateSnapshot<TestId> =
                     serde_json::from_str(&reply).expect("served snapshot decodes");
                 let mut healed = ClusterState::<TestId>::new();
@@ -1918,6 +1931,79 @@ async fn observer_answers_snapshot_pull_from_behind_secondary() {
         "REVERT-CHECK: the observer never answered the snapshot pull — the only \
          ahead replica is mute and the wedged fleet cannot heal",
     );
+}
+
+/// The observer responder's reply is TYPED off the requester's
+/// self-declared role: an OBSERVER requester (`is_observer: true` on the
+/// request frame) is answered under `Destination::Observer(requester)` —
+/// the receiver-side ingress demux selector (the PeerId already selects
+/// the host at egress). The worker-requester half is pinned by
+/// `observer_answers_snapshot_pull_from_behind_secondary` above.
+#[tokio::test(flavor = "current_thread")]
+async fn observer_answers_observer_requester_with_observer_typed_reply() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // The requesting (behind) PEER OBSERVER's outbox.
+                let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+                let (obs1_tx, mut obs1_rx) = mpsc::unbounded_channel();
+                let mut outgoing = HashMap::new();
+                outgoing.insert("obs-1".to_string(), obs1_tx);
+                let transport =
+                    ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, inbound_rx);
+
+                let mut cs = ClusterState::<TestId>::new();
+                cs.apply(ClusterMutation::PrimaryChanged {
+                    new: "sec-0".into(),
+                    epoch: 1,
+                    reason: PrimaryChangeReason::Transferred,
+                });
+
+                let mut config = observer_config("setup");
+                config.fleet_dead_timeout = Duration::from_secs(60);
+
+                let (client, inbox, pump) = observer_mesh(transport, "setup");
+                tokio::task::spawn_local(pump);
+                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
+                let run_task = tokio::task::spawn_local(async move {
+                    let _ = observer.run().await;
+                });
+
+                // The behind peer observer's anti-entropy pull declares its
+                // own role on the request frame.
+                inbound_tx
+                    .send(DistributedMessage::RequestClusterSnapshot {
+                        target: None,
+                        sender_id: "obs-1".into(),
+                        timestamp: 0.0,
+                        is_observer: true,
+                        can_be_primary: false,
+                    })
+                    .expect("inbound open");
+
+                let reply_target = loop {
+                    let frame = obs1_rx
+                        .recv()
+                        .await
+                        .expect("observer transport stays open");
+                    if let DistributedMessage::ClusterSnapshot { target, .. } = frame {
+                        break target;
+                    }
+                };
+                assert_eq!(
+                    reply_target,
+                    Some(Destination::Observer(PeerId::from("obs-1"))),
+                    "an observer requester's snapshot reply must be Observer-typed \
+                     (the requester's self-declared role is the ingress demux selector)"
+                );
+
+                run_task.abort();
+            })
+            .await;
+    })
+    .await
+    .expect("the observer never answered the peer observer's snapshot pull");
 }
 
 /// #370 fires-under-real-topology: the PRODUCTION observer EMITS its

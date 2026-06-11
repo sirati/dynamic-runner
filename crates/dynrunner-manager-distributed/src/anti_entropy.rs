@@ -13,6 +13,13 @@
 //! comparison, target selection, and frame construction live here ONCE so
 //! no role re-implements them.
 //!
+//! This module also owns BOTH halves of the snapshot-RPC addressing
+//! policy: the request side ([`RequesterIdentity`] — the role facts a
+//! pulling node stamps on its `RequestClusterSnapshot`) and the reply
+//! side ([`reply_destination`] — the responder types its `ClusterSnapshot`
+//! answer off the requester's self-declared role), so no responder
+//! re-implements either.
+//!
 //! This module holds NO merge logic. The pull it requests is the EXISTING
 //! `RequestClusterSnapshot` → `ClusterSnapshot` → `ClusterState::restore`
 //! path; the digest detector ([`StateDigest::is_behind`]) only decides
@@ -91,6 +98,32 @@ pub struct RequesterIdentity<'a> {
     /// `ObserverCoordinator`, which stamps `true` here on its pulls.
     pub is_observer: bool,
     pub can_be_primary: bool,
+}
+
+/// The REPLY half of the snapshot-RPC addressing policy
+/// ([`RequesterIdentity`] is the request half): the `ClusterSnapshot`
+/// answer to a `RequestClusterSnapshot` is typed off the requester's
+/// SELF-DECLARED role — the `is_observer` it stamped on the request
+/// frame — `Destination::Observer(id)` for an observer requester,
+/// `Destination::Secondary(id)` for a compute peer.
+///
+/// The PeerId in the `Destination` selects the HOST at egress; the role
+/// variant is the RECEIVER-side ingress demux selector (which local role
+/// slot the requester's mesh-pump delivers the reply to). A wrong role
+/// still reaches the right host but misses the slot demux and falls to
+/// the fan-to-live-slots WARN — the post-relocation "directed frame names
+/// a role with no live local slot … kind=ClusterSnapshot
+/// target=Secondary(setup)" noise on a submitter whose snapshot pulls
+/// were answered as if it were still a secondary. Every responder
+/// (primary, secondary router, observer) types its reply through this
+/// ONE policy point.
+pub fn reply_destination(requester_id: &str, requester_is_observer: bool) -> Destination {
+    let id = PeerId::from(requester_id.to_string());
+    if requester_is_observer {
+        Destination::Observer(id)
+    } else {
+        Destination::Secondary(id)
+    }
 }
 
 /// Receive-side decision for one peer digest. Given the LOCAL digest, the
@@ -278,6 +311,22 @@ mod tests {
         let b = tick_period("zzzz");
         let c = tick_period("mid-node-7");
         assert!(a != b || b != c || a != c);
+    }
+
+    /// The reply half of the snapshot-RPC policy: the answer is typed off
+    /// the requester's self-declared role (`Observer(id)` for an observer
+    /// requester, `Secondary(id)` for a compute peer) — the receiver-side
+    /// ingress demux selector.
+    #[test]
+    fn reply_destination_is_typed_off_requesters_declared_role() {
+        assert_eq!(
+            reply_destination("obs-1", true),
+            Destination::Observer(PeerId::from("obs-1"))
+        );
+        assert_eq!(
+            reply_destination("sec-1", false),
+            Destination::Secondary(PeerId::from("sec-1"))
+        );
     }
 
     #[test]

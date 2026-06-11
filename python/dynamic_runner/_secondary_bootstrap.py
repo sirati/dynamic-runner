@@ -1,7 +1,10 @@
 """Cold-start bootstrap shim for a mesh-launched secondary.
 
 ==============================================================================
-NO RUNTIME LOGIC HERE — this file orchestrates argv + runpy, nothing more.
+NO RUNTIME LOGIC HERE — this file orchestrates argv + runpy, plus the one
+duty only the process entry point can own: the ``__main__`` guard guarantees
+the process TERMINATES with the contract exit status when an exception
+crosses the boundary (flush-then-``os._exit``; see the guard's comment).
 ==============================================================================
 
 ==============================================================================
@@ -49,8 +52,10 @@ consumer's own argparse.
 from __future__ import annotations
 
 import argparse
+import os
 import runpy
 import sys
+import traceback
 
 from ._boot_banner import announce_secondary_start
 from ._fault_dumps import enable_fault_dumps, write_crash_traceback
@@ -164,5 +169,60 @@ def main(bootstrap_argv: list[str] | None = None) -> None:
         raise
 
 
+def _process_exit_status(exc: BaseException) -> int:
+    """Map the exception crossing the process boundary to the exit status
+    the interpreter's own unhandled-exception contract would deliver.
+
+    PURE (unit-testable): ``SystemExit`` is honoured exactly as CPython
+    honours it — ``None`` → 0, an ``int`` → that code truncated to the
+    low byte (C ``exit()`` semantics; ``os._exit`` requires the same
+    range), any other payload (argparse's usage-message form) → 1.
+    Everything else — a genuine crash, ``KeyboardInterrupt`` included —
+    is CPython's unhandled-exception status 1.
+    """
+    if isinstance(exc, SystemExit):
+        if exc.code is None:
+            return 0
+        if isinstance(exc.code, int):
+            return exc.code & 0xFF
+        return 1
+    return 1
+
+
 if __name__ == "__main__":
-    main()
+    # Process-boundary termination guarantee: this guard is the program's
+    # entry point (the container runs `python -m` on this module), so it
+    # OWNS the process's fate. An exception escaping `main` must reach the
+    # SLURM wrapper as this process's exit status — production
+    # (secondary-0/bootstrap-crash.log, 2026-06-11T11:51:23Z) showed a
+    # connect-deadline RuntimeError whose crash log was written and whose
+    # traceback printed, after which the process LINGERED at interpreter
+    # shutdown instead of exiting non-zero (native-side teardown left by
+    # the failed run; any consumer non-daemon thread wedges it the same
+    # way). Normal interpreter finalization cannot be trusted to complete
+    # here, so after the durable artifacts are written (`main`'s
+    # `write_crash_traceback` opens/flushes/closes the crash log before
+    # re-raising) we mirror the interpreter's stderr surface ourselves,
+    # flush stdio, and TERMINATE via `os._exit` — the flush-then-_exit
+    # pattern, uniform for EVERY `BaseException` (a deliberate
+    # `SystemExit` keeps its code; nothing is special-cased on exception
+    # type beyond the interpreter's own status contract). `main()` itself
+    # keeps its raise contract for in-process callers (tests).
+    try:
+        main()
+    except BaseException as exc:
+        if isinstance(exc, SystemExit):
+            # CPython prints a non-int SystemExit payload (argparse's
+            # usage form) to stderr and nothing for int/None codes.
+            if exc.code is not None and not isinstance(exc.code, int):
+                print(exc.code, file=sys.stderr)
+        else:
+            traceback.print_exception(exc, file=sys.stderr)
+        status = _process_exit_status(exc)
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except OSError:
+            # A torn-down stdio pipe must not stop the exit itself.
+            pass
+        os._exit(status)
