@@ -209,6 +209,16 @@ pub(super) fn build_ssh_argv(
         "-o".into(),
         "TCPKeepAlive=yes".into(),
     ]);
+    // Diagnostic verbosity for the tunnel child (#415 face (a)). Default
+    // OpenSSH `LogLevel` (INFO) is banner-only on these `-N -R` children, so
+    // a fleet-wide wire-drop cause (sshd rekey, a MaxSessions channel
+    // refusal over the shared gateway master) leaves no trace in the child's
+    // stderr. When the operator sets the env knob, raise it so each tunnel
+    // child logs the rekey / `channel ... forwarding` lines a repro needs.
+    if let Some(level) = &opts.tunnel_child_log_level {
+        argv.push("-o".into());
+        argv.push(format!("LogLevel={level}"));
+    }
     argv
 }
 
