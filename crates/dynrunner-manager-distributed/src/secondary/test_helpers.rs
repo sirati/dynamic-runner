@@ -807,8 +807,13 @@ pub(super) struct SecondaryPumpGuard {
 /// (synchronous-before-await), so the secondary's first
 /// `has_peer("primary")`-gated egress reads the folded primary link as
 /// connected from the very first send.
-pub(super) fn start_secondary_pump(
-    harness: SecondaryHarness<ChannelPeerTransport<TestId>>,
+///
+/// Generic over the harness's peer transport (not just
+/// `ChannelPeerTransport`): the handshake-resilience tests drive the
+/// production pump over a `RecordingPeer` whose membership models a
+/// bootstrap wire that has not come up — the pump shape is identical.
+pub(super) fn start_secondary_pump<P: PeerTransport<TestId> + 'static>(
+    harness: SecondaryHarness<P>,
 ) -> (TestSecondary, SecondaryPumpGuard) {
     let SecondaryHarness {
         coord,

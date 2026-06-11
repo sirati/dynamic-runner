@@ -22,6 +22,24 @@ use super::wire::{distributed_to_binary, timestamp_now};
 /// #362 production shape: "received peer list" and then nothing, ever.
 const SETUP_STALL_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Cap on the welcome/cert handshake-retry backoff in [`wait_for_setup`].
+/// The backoff floor is config-derived ([`handshake_retry_initial`]) so it
+/// scales with the deployment's keepalive tempo; this cap bounds the
+/// doubling so a long pre-primary wait still re-offers the handshake at
+/// least every 30s (cheap frames; the primary's welcome handling is
+/// idempotent — re-applies NoOp on the CRDT and re-push the same
+/// run-config).
+const HANDSHAKE_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Initial welcome/cert handshake-retry backoff: the keepalive interval,
+/// floored at 100ms (a zero/near-zero keepalive must not busy-spin the
+/// handshake arm). Config-derived so tests with millisecond keepalives
+/// observe retries fast and production (multi-second keepalives) retries
+/// on its own tempo without a new knob.
+fn handshake_retry_initial(keepalive_interval: std::time::Duration) -> std::time::Duration {
+    keepalive_interval.max(std::time::Duration::from_millis(100))
+}
+
 impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
     M: ManagerEndpoint + 'static,
@@ -172,6 +190,47 @@ where
             liveness_port: self.liveness_port,
         };
         self.send_setup_frame(msg).await
+    }
+
+    /// One welcome + cert-exchange handshake ATTEMPT toward the resolved
+    /// primary, with the send error ABSORBED into a `false`.
+    ///
+    /// The canonical failure is a no-route: the bootstrap wire has not
+    /// been folded into the mesh yet (the background bring-up dial is
+    /// still churning) or it dropped and the redial supervisor has not
+    /// restored it. Neither is fatal — [`Self::wait_for_setup`]'s retry
+    /// cadence owns recovery and the orchestration-level
+    /// `unconfigured_deadline` owns give-up — so this absorbs rather than
+    /// propagates. `attempt` is narration-only (first failure surfaces at
+    /// INFO, the steady retry churn at DEBUG).
+    pub(super) async fn try_send_handshake(&mut self, attempt: u32) -> bool {
+        let result = async {
+            self.send_welcome().await?;
+            self.send_cert_exchange().await
+        }
+        .await;
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                if attempt <= 1 {
+                    tracing::info!(
+                        secondary = %self.config.secondary_id,
+                        error = %error,
+                        "setup handshake not deliverable yet (bootstrap wire \
+                         not up); retrying on a capped backoff — the \
+                         unconfigured-deadline owns give-up"
+                    );
+                } else {
+                    tracing::debug!(
+                        secondary = %self.config.secondary_id,
+                        attempt,
+                        error = %error,
+                        "setup handshake retry not deliverable yet"
+                    );
+                }
+                false
+            }
+        }
     }
 
     /// Ship one setup-phase frame to the primary, opaquely.
@@ -388,6 +447,39 @@ where
              emission logs at DEBUG)"
         );
 
+        // ── Welcome/cert handshake: first attempt + retry cadence ──────
+        //
+        // The handshake is a SETUP concern, owned here (not a once-or-die
+        // preamble in the orchestration): the first attempt fires at entry
+        // — the same position in the setup sequence the pre-move
+        // coordinator block had, strictly before any frame is consumed —
+        // and a capped-backoff arm below RE-SENDS it while the lifecycle
+        // is still `AwaitingPrimary`. Two production failure shapes make
+        // the retry load-bearing (run_20260611_005927):
+        //   * NO ROUTE at boot — the bootstrap wire has not been folded
+        //     yet (the bring-up dial runs in the background); the attempt
+        //     is absorbed and re-offered until the wire lands.
+        //   * WELCOME LOST on a dying wire — the frame was queued onto a
+        //     wire that died before delivery; the redial restores the
+        //     pipe but nothing else would re-enroll this node. The
+        //     primary's first frame (the announce) is the receipt proof
+        //     that stops the retries (`enter_configuring` leaves
+        //     `AwaitingPrimary`, disabling the arm).
+        // Re-sends are safe: the primary's welcome handling is idempotent
+        // (CRDT re-applies NoOp; the run-config re-push delivers the same
+        // value; PeerInfo re-broadcasts are receiver-idempotent).
+        let mut handshake_attempts: u32 = 0;
+        let mut handshake_backoff = handshake_retry_initial(self.config.keepalive_interval);
+        // An operator-tempo floor above the cap is honoured (the cap only
+        // bounds the doubling, never lowers the configured floor) —
+        // mirrors the bring-up dial's backoff contract.
+        let handshake_backoff_cap = HANDSHAKE_RETRY_MAX.max(handshake_backoff);
+        if self.lifecycle.mark_handshake_sent() {
+            handshake_attempts = 1;
+            self.try_send_handshake(handshake_attempts).await;
+        }
+        let mut handshake_at = tokio::time::Instant::now() + handshake_backoff;
+
         while !got_peer_info || !got_assignment || !got_transfer {
             // Terminal-exit backstop. A terminal CRDT flag set DURING setup
             // (RunComplete / RunAborted) means the RUN IS OVER — even though
@@ -453,12 +545,43 @@ where
                 // a fresh window — exactly the pre-select semantics.
                 let stall_deadline =
                     tokio::time::Instant::now() + SETUP_STALL_WARN_INTERVAL;
+                // Handshake retries are an `AwaitingPrimary`-only concern:
+                // the primary's first frame is the delivery proof that
+                // disables the arm. The lifecycle can only change between
+                // `'frame` iterations (the `enter_configuring` transition
+                // fires on a received frame, which exits this loop), so
+                // sampling it here is exact.
+                let awaiting_primary = matches!(
+                    self.lifecycle,
+                    super::lifecycle::SecondaryLifecycle::AwaitingPrimary { .. }
+                );
                 loop {
                     tokio::select! {
                         // Cancel-safe: `recv_setup_frame` is a sync backlog
                         // pop + `RoleInbox::recv` (a plain mpsc recv), so a
                         // tick winning the race loses no frame.
                         frame = self.recv_setup_frame() => break 'frame frame,
+                        // Welcome/cert handshake retry (see the arming
+                        // comment above the trio loop): persistent
+                        // deadline, capped exponential backoff, disabled
+                        // once the primary has spoken. `sleep_until` is
+                        // cancel-safe (tokio docs).
+                        _ = tokio::time::sleep_until(handshake_at), if awaiting_primary => {
+                            handshake_attempts += 1;
+                            let delivered =
+                                self.try_send_handshake(handshake_attempts).await;
+                            if delivered && handshake_attempts > 1 {
+                                tracing::info!(
+                                    attempt = handshake_attempts,
+                                    "setup handshake re-sent (welcome + cert \
+                                     exchange re-offered to the primary)"
+                                );
+                            }
+                            handshake_at =
+                                tokio::time::Instant::now() + handshake_backoff;
+                            handshake_backoff =
+                                (handshake_backoff * 2).min(handshake_backoff_cap);
+                        }
                         // Anti-entropy tick: broadcast this secondary's
                         // digest so every peer can detect divergence and
                         // pull — and so the submitter's accept loop has a

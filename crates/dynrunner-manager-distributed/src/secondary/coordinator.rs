@@ -1231,14 +1231,15 @@ where
             // cleanup-and-exit.
             let deadline = self.config.unconfigured_deadline;
             let setup = async {
-                // The welcome / cert-exchange handshake is the only
-                // primary-facing action available pre-announce. Gate it on
-                // the `AwaitingPrimary` one-shot so a re-entry never
-                // re-sends (defensive; this branch only runs pre-config).
-                if self.lifecycle.mark_handshake_sent() {
-                    self.send_welcome().await?;
-                    self.send_cert_exchange().await?;
-                }
+                // The welcome / cert-exchange handshake is OWNED by
+                // `wait_for_setup` (its entry attempt + the capped-backoff
+                // retry arm): a no-route at boot — the background bring-up
+                // dial has not folded the bootstrap wire yet — or a welcome
+                // lost on a dying wire is absorbed and re-offered there,
+                // rather than aborting the run here. The
+                // `unconfigured_deadline` wrapping this future stays the
+                // single give-up policy.
+                //
                 // `wait_for_setup` returns `Some(RunOutcome::Terminal)` when a
                 // terminal CRDT flag (RunComplete / RunAborted) landed DURING
                 // setup before the trio completed — it has already recorded

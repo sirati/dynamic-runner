@@ -104,14 +104,16 @@ pub(crate) fn run_secondary<'py>(
         "panik_watcher_poll_interval_secs",
         panik_watcher_poll_interval_secs,
     )?;
-    // The consumer's run-config — the byte-identical token sequence the
-    // node re-serves on `RequestRunConfig` and threads into its promoted
+    // The consumer's run-config SEED — the token sequence the node
+    // re-serves on `RequestRunConfig` and threads into its promoted
     // `PrimaryConfig`. Sourced from the parsed `args.forwarded_argv`: on a
-    // cold-start secondary the `_secondary_bootstrap` shim fetched it over
-    // the mesh and spliced it onto `sys.argv`, so the consumer's argparse
-    // re-derived the SAME value the submitter set. Absent / not-a-list (an
-    // out-of-tree caller that drives `run_secondary` with a bare Namespace)
-    // collapses to the constructor's empty default.
+    // cold-start secondary the boot argv carries only framework-regenerated
+    // flags (usually an EMPTY forwarded slice) — the REAL value arrives via
+    // the primary's post-welcome `RunConfig` push and the deferred
+    // `finalize_run_config` reparse (#277; the old pre-coordinator
+    // mesh-fetch shim is gone). Absent / not-a-list (an out-of-tree caller
+    // that drives `run_secondary` with a bare Namespace) collapses to the
+    // constructor's empty default.
     if let Ok(fwd) = task_args.getattr("forwarded_argv")
         && let Ok(fwd) = fwd.extract::<Vec<String>>()
     {
