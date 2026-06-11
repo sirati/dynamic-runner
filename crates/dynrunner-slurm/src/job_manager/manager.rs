@@ -26,6 +26,18 @@ impl<G: Gateway> SlurmJobManager<G> {
         &self.job_ids
     }
 
+    /// Seed the tracked job-id list directly, bypassing `submit_job`'s
+    /// sbatch round-trip. Test-only: lets a unit test stand up a
+    /// manager whose registry already holds a cohort of ids (as if
+    /// `submit_job` had run N times) without driving a canned-id
+    /// gateway N times. Gated `#[cfg(test)]` so it never widens the
+    /// production surface.
+    #[cfg(test)]
+    pub(crate) fn seed_job_ids_for_test(&mut self, ids: &[&str]) {
+        self.job_ids
+            .extend(ids.iter().map(|id| (*id).to_string()));
+    }
+
     pub fn gateway(&self) -> &G {
         &self.gateway
     }

@@ -207,7 +207,13 @@ fn production_spawner(gateway: SshConfig) -> ForwardSpawner {
             cmd.stdin(std::process::Stdio::null());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
+            // Layered reaping: `kill_on_drop` covers the orderly drop
+            // (registry teardown / displaced rebuild), but a SIGKILL or
+            // unhandled SIGTERM of THIS process runs no `Drop` — so the
+            // kernel parent-death-signal is what keeps a signalled
+            // late-joiner from orphaning its `ssh -L` legs (#425).
             cmd.kill_on_drop(true);
+            crate::child_reaping::link_child_death_to_parent(&mut cmd);
             cmd.spawn()
         })
     })
@@ -751,5 +757,94 @@ mod tests {
         );
         assert_eq!(count.load(Ordering::SeqCst), 2);
         tunnels.teardown().await;
+    }
+
+    /// `kill(pid, 0)` liveness probe: `true` iff the pid still exists.
+    fn pid_alive(pid: u32) -> bool {
+        use nix::errno::Errno;
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        !matches!(kill(Pid::from_raw(pid as i32), None), Err(Errno::ESRCH))
+    }
+
+    /// Poll until `pid` is gone or the grace window expires.
+    async fn await_pid_gone(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pid_alive(pid) {
+            assert!(Instant::now() < deadline, "pid {pid} was not reaped in time");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The explicit teardown chokepoint (layer (c)) reaps every tunnel
+    /// child — the orderly success/error exit path the run loop drives.
+    #[tokio::test]
+    async fn teardown_reaps_every_child() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let tunnels = LocalForwardTunnels::with_spawner(
+            counting_spawner(count.clone()),
+            ReconnectEscalation::default(),
+        );
+        let targets = vec![
+            ForwardTarget {
+                peer_id: "secondary-0".into(),
+                host: "compute1".into(),
+                port: 51200,
+            },
+            ForwardTarget {
+                peer_id: "secondary-1".into(),
+                host: "compute2".into(),
+                port: 51201,
+            },
+        ];
+        tunnels.establish(&targets).await.expect("established");
+        let pids: Vec<u32> = {
+            let inner = tunnels.inner.lock().await;
+            inner
+                .entries
+                .values()
+                .map(|e| e.child.id().expect("child pid"))
+                .collect()
+        };
+        assert_eq!(pids.len(), 2);
+        for &pid in &pids {
+            assert!(pid_alive(pid), "child {pid} should be alive pre-teardown");
+        }
+        tunnels.teardown().await;
+        for pid in pids {
+            await_pid_gone(pid).await;
+        }
+    }
+
+    /// The orderly-drop backstop (layer (b)): dropping the registry
+    /// WITHOUT calling `teardown` still reaps every tunnel child via the
+    /// production `kill_on_drop(true)` (here the `healthy_child` stand-in
+    /// carries the same flag). This is the path a panic-unwind or an
+    /// early scope-exit takes — distinct from the SIGKILL path (covered
+    /// by `child_reaping`'s PDEATHSIG test), which runs no `Drop` at all.
+    #[tokio::test]
+    async fn dropping_registry_reaps_children_via_kill_on_drop() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let tunnels = LocalForwardTunnels::with_spawner(
+            counting_spawner(count.clone()),
+            ReconnectEscalation::default(),
+        );
+        let targets = vec![ForwardTarget {
+            peer_id: "secondary-0".into(),
+            host: "compute1".into(),
+            port: 51200,
+        }];
+        tunnels.establish(&targets).await.expect("established");
+        let pid = {
+            let inner = tunnels.inner.lock().await;
+            inner.entries["secondary-0"]
+                .child
+                .id()
+                .expect("child pid")
+        };
+        assert!(pid_alive(pid), "child {pid} should be alive before drop");
+        // Drop the registry without teardown — `kill_on_drop` fires.
+        drop(tunnels);
+        await_pid_gone(pid).await;
     }
 }

@@ -59,6 +59,49 @@ pub enum CancelOutcome {
     AlreadyGone,
 }
 
+/// Bounded poll budget for [`SlurmJobManager::cancel_all_jobs`]'s
+/// post-`scancel` verification sweep.
+///
+/// A bare `scancel` is fire-and-forget: it exits 0 even when the job
+/// then stays RUNNING because the cancel raced a PENDING→RUNNING
+/// transition or the gateway round-trip partially failed (asm-dataset
+/// run_20260611_182745: 3 of 4 jobs cancelled, secondary-2/155629 was
+/// still RUNNING 4+ minutes later and had to be scancelled by hand). So
+/// after issuing the scancel set, `cancel_all_jobs` re-queries squeue
+/// for survivors and re-issues scancel on them, up to `attempts` times
+/// with `poll_delay` between rounds.
+///
+/// FAIL-SAFE by construction: the budget is bounded, so verification
+/// can never turn a clean abort into a hang. Any job still present after
+/// the budget is exhausted is surfaced with a loud WARN carrying the job
+/// id (the operator needs the id to scancel by hand) — the sweep then
+/// returns, it does not block.
+#[derive(Debug, Clone, Copy)]
+pub struct CancelVerifyPolicy {
+    /// Total squeue re-query rounds AFTER the initial scancel pass. Each
+    /// round re-scancels any survivor before the next poll. `0` disables
+    /// verification entirely (legacy fire-and-forget shape).
+    pub attempts: u32,
+    /// Delay between verification rounds. Tests pass a near-zero value
+    /// to keep the bounded loop off the wall clock.
+    pub poll_delay: std::time::Duration,
+}
+
+impl Default for CancelVerifyPolicy {
+    /// 3 verification rounds, 10s apart — a ~30s budget over which a
+    /// genuinely-stuck scancel is re-issued and any final survivor is
+    /// WARN-flagged. Comfortably covers a PENDING→RUNNING race (which
+    /// settles in seconds) without stalling a clean teardown: every
+    /// already-gone job clears on the FIRST squeue poll, so the typical
+    /// path costs one squeue round-trip and returns immediately.
+    fn default() -> Self {
+        Self {
+            attempts: 3,
+            poll_delay: std::time::Duration::from_secs(10),
+        }
+    }
+}
+
 /// Manages SLURM job submission and lifecycle via a `Gateway`.
 ///
 /// The `gateway` and `job_ids` fields are `pub(super)` so the impl

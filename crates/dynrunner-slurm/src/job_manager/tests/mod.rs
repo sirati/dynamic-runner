@@ -14,8 +14,13 @@
 //! - [`important_events`] — pins that the image build/transfer step
 //!   emits its building-image + uploading-image events on the
 //!   `crate::IMPORTANT_TARGET` tracing marker.
+//! - [`cancel_verify`] — pins the post-`scancel` verification sweep in
+//!   `cancel_all_jobs`: a job that scancel exits 0 on but stays in the
+//!   queue (the run_20260611_182745 race) is re-scancelled and, if it
+//!   outlives the budget, WARN-flagged with its id.
 
 mod binary_upload;
+mod cancel_verify;
 mod important_events;
 mod legacy;
 mod shutdown_binary;

@@ -8,6 +8,7 @@
 /// never a per-call-site `if`.
 pub(crate) use dynrunner_core::IMPORTANT_TARGET;
 
+pub(crate) mod child_reaping;
 pub mod config;
 pub mod job_manager;
 pub mod local_forward;
@@ -20,7 +21,9 @@ pub mod respawn;
 pub mod wrapper_script;
 
 pub use config::SlurmConfig;
-pub use job_manager::{CancelOutcome, JobStatus, JobStatusInfo, SlurmError, SlurmJobManager};
+pub use job_manager::{
+    CancelOutcome, CancelVerifyPolicy, JobStatus, JobStatusInfo, SlurmError, SlurmJobManager,
+};
 pub use local_forward::{
     ForwardTarget, LocalForwardError, LocalForwardTunnelReconnector, LocalForwardTunnels,
 };

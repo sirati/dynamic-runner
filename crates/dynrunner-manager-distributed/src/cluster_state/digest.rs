@@ -145,6 +145,9 @@ impl<I: Identifier> ClusterState<I> {
             // derivation of the replicated fields (keyed on the digest), so
             // it carries no signal of its own.
             snapshot_json_cache: _snapshot_json_cache,
+            // node-local: the dead-rejoin WARN throttle is a per-node log
+            // gate (#416) — carries no convergence signal.
+            dead_rejoin_warn: _dead_rejoin_warn,
         } = self;
 
         // `peer_holdings` is steady-state best-effort metadata

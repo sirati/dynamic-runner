@@ -118,12 +118,21 @@ impl QuicListener {
     /// server was up).
     pub async fn bind_addr(cert: &CertPair, addr: SocketAddr) -> Result<Self, String> {
         let server_config = cert.server_config()?;
+        Self::try_bind(server_config, addr).map_err(|e| e.to_string())
+    }
 
-        let endpoint = Endpoint::server(server_config, addr).map_err(|e| e.to_string())?;
-
-        let local_addr = endpoint.local_addr().map_err(|e| e.to_string())?;
+    /// Bind on a pre-built `ServerConfig`, surfacing the raw
+    /// [`std::io::Error`] so a caller can classify the failure (e.g. the
+    /// listener-pair retry distinguishing `AddrInUse` from a fatal
+    /// bind error). The cert→`ServerConfig` step is the caller's
+    /// fail-fast concern; this entry covers only the io-fallible bind.
+    pub(crate) fn try_bind(
+        server_config: quinn::ServerConfig,
+        addr: SocketAddr,
+    ) -> std::io::Result<Self> {
+        let endpoint = Endpoint::server(server_config, addr)?;
+        let local_addr = endpoint.local_addr()?;
         tracing::info!(%local_addr, "QUIC listener bound");
-
         Ok(Self {
             endpoint,
             local_addr,

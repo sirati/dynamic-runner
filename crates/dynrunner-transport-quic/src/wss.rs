@@ -82,8 +82,16 @@ pub struct WssListener {
 impl WssListener {
     /// Bind a WSS server on the given address.
     pub async fn bind(addr: SocketAddr) -> Result<Self, String> {
-        let tcp_listener = TcpListener::bind(addr).await.map_err(|e| e.to_string())?;
-        let local_addr = tcp_listener.local_addr().map_err(|e| e.to_string())?;
+        Self::try_bind(addr).await.map_err(|e| e.to_string())
+    }
+
+    /// Bind on the given address, surfacing the raw [`std::io::Error`]
+    /// so a caller can classify the failure (e.g. the listener-pair
+    /// retry distinguishing the TCP-twin `AddrInUse` race from a fatal
+    /// bind error).
+    pub(crate) async fn try_bind(addr: SocketAddr) -> std::io::Result<Self> {
+        let tcp_listener = TcpListener::bind(addr).await?;
+        let local_addr = tcp_listener.local_addr()?;
         tracing::info!(%local_addr, "WSS listener bound");
         Ok(Self {
             tcp_listener,

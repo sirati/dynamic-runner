@@ -1,5 +1,6 @@
 pub mod certs;
 pub mod framing;
+pub(crate) mod listener_pair;
 pub mod network;
 pub mod no_primary;
 pub mod peer;

@@ -6,7 +6,9 @@
 use dynrunner_gateway::traits::Gateway;
 use tracing;
 
-use super::types::{CancelOutcome, JobStatus, JobStatusInfo, SlurmError, SlurmJobManager};
+use super::types::{
+    CancelOutcome, CancelVerifyPolicy, JobStatus, JobStatusInfo, SlurmError, SlurmJobManager,
+};
 
 impl<G: Gateway> SlurmJobManager<G> {
     /// Create required directories on the gateway.
@@ -205,22 +207,130 @@ impl<G: Gateway> SlurmJobManager<G> {
         Ok(CancelOutcome::Cancelled)
     }
 
-    /// Cancel all submitted jobs.
+    /// Cancel all submitted jobs and VERIFY each one actually left the
+    /// queue.
     ///
-    /// Mirrors the Python `SlurmJobManager.cancel_all_jobs` shape:
-    /// after iterating, `self.job_ids` is cleared so a subsequent
-    /// `cancel_all_jobs` is a no-op rather than re-cancelling already-
-    /// cancelled IDs.
+    /// The id set is the manager's own `job_ids` Vec — the single
+    /// registry every submission lands on, the initial cohort
+    /// (`submit_job`) AND every respawn replacement (the respawn spawner
+    /// drives the SAME `Arc<Mutex<SlurmJobManager>>`, see
+    /// `crate::respawn::spawner`). So a teardown sweep reaches every
+    /// submitted-and-not-yet-terminal job, replacements included; there
+    /// is no second list to consult. After iterating, `self.job_ids` is
+    /// cleared so a subsequent call is a no-op rather than re-cancelling
+    /// already-cancelled IDs.
+    ///
+    /// Verified, not fire-and-forget: a bare `scancel` exits 0 even when
+    /// the job then stays RUNNING (the cancel raced a PENDING→RUNNING
+    /// transition, or the gateway round-trip partially failed), which is
+    /// exactly how asm-dataset run_20260611_182745 left secondary-2
+    /// (job 155629) RUNNING 4+ minutes after a "successful" teardown
+    /// scancel. So this re-queries squeue for survivors and re-issues
+    /// scancel on them, bounded by [`CancelVerifyPolicy`].
+    ///
+    /// FAIL-SAFE: the budget is bounded, so verification can never turn
+    /// a clean abort into a hang. Any id still present after the budget
+    /// is exhausted gets a loud WARN carrying the job id (the operator
+    /// needs it to scancel by hand) and the sweep returns.
     pub async fn cancel_all_jobs(&mut self) -> Result<(), SlurmError> {
+        self.cancel_all_jobs_verified(CancelVerifyPolicy::default())
+            .await
+    }
+
+    /// [`cancel_all_jobs`](Self::cancel_all_jobs) with an explicit
+    /// verification budget. Production uses the default; tests inject a
+    /// near-zero `poll_delay` to keep the bounded loop off the wall
+    /// clock.
+    pub async fn cancel_all_jobs_verified(
+        &mut self,
+        policy: CancelVerifyPolicy,
+    ) -> Result<(), SlurmError> {
         // Drain into a temporary so the borrow on `self.job_ids` is
         // released before we start awaiting `cancel_job(&self, ...)`.
-        let ids: Vec<String> = self.job_ids.drain(..).collect();
-        for job_id in &ids {
+        // This snapshot IS the cancel set: the live registry at cancel
+        // time, replacements included.
+        let mut survivors: Vec<String> = self.job_ids.drain(..).collect();
+
+        // Initial scancel pass over the whole set.
+        for job_id in &survivors {
             if let Err(e) = self.cancel_job(job_id).await {
                 tracing::warn!(job_id, error = %e, "failed to cancel job");
             }
         }
+
+        // Bounded verify-and-re-scancel loop. Each round polls squeue
+        // for the still-present ids and re-issues scancel on them; a job
+        // that has left the queue drops out of `survivors`.
+        for round in 0..policy.attempts {
+            survivors = self.retain_still_queued(&survivors).await;
+            if survivors.is_empty() {
+                // Every cancelled job has left the queue — done.
+                return Ok(());
+            }
+            // Re-issue scancel on the stragglers. A scancel that raced a
+            // state transition the first time lands now that the job is
+            // fully registered.
+            for job_id in &survivors {
+                tracing::warn!(
+                    job_id,
+                    round = round + 1,
+                    attempts = policy.attempts,
+                    "job still in queue after scancel; re-issuing scancel",
+                );
+                if let Err(e) = self.cancel_job(job_id).await {
+                    tracing::warn!(job_id, error = %e, "re-scancel failed");
+                }
+            }
+            tokio::time::sleep(policy.poll_delay).await;
+        }
+
+        // Final check after the last re-scancel + delay.
+        survivors = self.retain_still_queued(&survivors).await;
+        if !survivors.is_empty() {
+            // Loud, id-bearing WARN: the operator must scancel these by
+            // hand. We do NOT block past the budget — fail-safe.
+            tracing::warn!(
+                survivors = ?survivors,
+                "scancel verification budget exhausted; these SLURM jobs are STILL in the \
+                 queue and must be cancelled manually (e.g. `scancel {}`)",
+                survivors.join(" "),
+            );
+        }
         Ok(())
+    }
+
+    /// Filter `ids` down to those squeue still reports as live (PENDING
+    /// or RUNNING). A job with no squeue row (empty output or a
+    /// non-zero `squeue -j` exit, both of which mean "no such job in the
+    /// queue"), or one already in a terminal/cancelling state
+    /// (CANCELLED / COMPLETED / COMPLETING / FAILED-class), has left the
+    /// queue and is dropped.
+    ///
+    /// A squeue probe that fails at the GATEWAY TRANSPORT level (the
+    /// `Err` arm — `get_job_status` never got an exit code at all) is
+    /// conservatively treated as "still present" so the next round
+    /// retries rather than declaring a job gone on a flaky probe.
+    async fn retain_still_queued(&self, ids: &[String]) -> Vec<String> {
+        let mut still_queued = Vec::new();
+        for job_id in ids {
+            match self.get_job_status(job_id).await {
+                Ok(info) => {
+                    if is_still_queued(&info) {
+                        still_queued.push(job_id.clone());
+                    }
+                }
+                Err(e) => {
+                    // Probe failed — do not assume the job is gone.
+                    tracing::debug!(
+                        job_id,
+                        error = %e,
+                        "squeue probe failed during cancel verification; keeping the id for the next round",
+                    );
+                    still_queued.push(job_id.clone());
+                }
+            }
+        }
+        still_queued
     }
 
     /// Query the status of a SLURM job.
@@ -265,5 +375,28 @@ impl<G: Gateway> SlurmJobManager<G> {
             node,
             reason,
         })
+    }
+}
+
+/// Whether a squeue snapshot means the job is STILL holding an
+/// allocation we need to re-`scancel`. Single source of truth for the
+/// "did the cancel actually land" predicate used by the cancel-verify
+/// sweep.
+///
+/// Live (return `true`): `Pending` / `Running` — the job is queued or
+/// executing. `Unknown(_)` is also treated as live: an unrecognised
+/// transient state (e.g. `CONFIGURING`, `RESIZING`, `SUSPENDED`) is one
+/// SLURM still tracks, so re-scancel and re-poll rather than declare it
+/// gone.
+///
+/// Gone (return `false`): no squeue row at all (`state_kind == None`),
+/// or a terminal/cancelling state (`Completed` covers COMPLETED /
+/// COMPLETING, `Cancelled`, `Failed` covers FAILED / NODE_FAIL /
+/// TIMEOUT) — the allocation is releasing or released; scancel has
+/// nothing left to do.
+fn is_still_queued(info: &JobStatusInfo) -> bool {
+    match &info.state_kind {
+        Some(JobStatus::Pending | JobStatus::Running | JobStatus::Unknown(_)) => true,
+        Some(JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled) | None => false,
     }
 }
