@@ -134,7 +134,18 @@ pub fn write_ssh_config(args: &WriteSshConfigArgs) -> Result<PathBuf, IdentityEr
          \n\
          Host {alias}\n    \
             HostName {host}\n    \
-            Port {port}\n    \
+            Port {port}\n\
+         \n\
+         # Fallback for every host this config reaches that is NOT the\n\
+         # gateway alias — most importantly the ProxyJump'd compute-node\n\
+         # hop (`slurm-worker1`, …), which authenticates separately and\n\
+         # with `IdentitiesOnly yes` would otherwise offer ZERO keys\n\
+         # (the worker sshd then denies pubkey auth while the gateway\n\
+         # hop succeeds). ssh applies the first obtained value per\n\
+         # option, so the alias block above keeps its HostName/Port\n\
+         # specifics and every host shares the identity + hard-rule\n\
+         # options below.\n\
+         Host *\n    \
             User {user}\n    \
             IdentityFile {identity}\n    \
             IdentitiesOnly yes\n    \
@@ -199,6 +210,48 @@ mod tests {
             assert!(
                 content.contains(needle),
                 "missing pinned default {needle:?} in:\n{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_ssh_config_covers_jumped_worker_hosts() {
+        // A ProxyJump dispatch authenticates TWICE: once to the
+        // gateway (matched by the alias block) and once to the
+        // compute node (`slurm-worker1`, …), which matches no alias.
+        // With `IdentitiesOnly yes` and no fallback block, the
+        // worker hop offers ZERO keys and sshd denies pubkey auth —
+        // the e2e reverse-mode failure shape (worker sshd logs
+        // "Connection closed by authenticating user … [preauth]"
+        // with no "Failed publickey" line). The wildcard block must
+        // carry the identity + hard-rule options for every
+        // non-alias host.
+        let dir = tempfile::tempdir().unwrap();
+        let args = WriteSshConfigArgs {
+            state_dir: dir.path().to_path_buf(),
+            host_alias: "slurm-gateway".into(),
+            host_name: "localhost".into(),
+            ssh_port: 2200,
+            user: "alice".into(),
+            identity_file: PathBuf::from("/keys/id_ed25519"),
+        };
+        let p = write_ssh_config(&args).unwrap();
+        let content = fs::read_to_string(p).unwrap();
+        let wildcard_at = content
+            .find("\nHost *\n")
+            .expect("ssh_config must contain a `Host *` fallback block for jumped hops");
+        let wildcard_block = &content[wildcard_at..];
+        for needle in [
+            "User alice",
+            "IdentityFile /keys/id_ed25519",
+            "IdentitiesOnly yes",
+            "IdentityAgent none",
+            "StrictHostKeyChecking no",
+            "UserKnownHostsFile /dev/null",
+        ] {
+            assert!(
+                wildcard_block.contains(needle),
+                "wildcard block missing {needle:?} in:\n{content}"
             );
         }
     }
