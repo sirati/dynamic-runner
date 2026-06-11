@@ -339,6 +339,17 @@ impl<P: CollectorPolicy> CollectorDriver<P> {
         F: std::future::Future<Output = ()>,
     {
         tokio::pin!(cancel);
+        // One-shot gate on the wake arm: `false` once `wake.recv()` has
+        // returned `None` (every listener dropped). A closed mpsc
+        // `recv()` resolves `None` synchronously on every poll, so an
+        // ungated wake arm inside the ARMED branch below would be
+        // always-ready and out-race the pending `sleep_until` on every
+        // loop turn — a busy-spin until the window's deadline (and,
+        // with a re-arming policy, forever). With the gate, a closed
+        // wake channel parks the armed branch on the timer alone (the
+        // window still fires — the fires-under-load law), and the idle
+        // branch exits: no listener can ever arm another window.
+        let mut wake_open = true;
         loop {
             // Read the authoritative deadline each iteration so a re-arm
             // (or a one-shot close) is always reflected.
@@ -357,7 +368,12 @@ impl<P: CollectorPolicy> CollectorDriver<P> {
             match armed_until {
                 None => {
                     // Idle (or permanently closed): wait for the listener
-                    // to arm a window, or for cancel.
+                    // to arm a window, or for cancel. With the wake
+                    // channel already closed (latched below), no listener
+                    // can ever arm another window — exit.
+                    if !wake_open {
+                        break;
+                    }
                     tokio::select! {
                         _ = &mut cancel => break,
                         poke = self.wake.recv() => {
@@ -377,12 +393,15 @@ impl<P: CollectorPolicy> CollectorDriver<P> {
                         // window was already armed (record() only pokes on
                         // a fresh arm, but keep the channel from backing
                         // up if a future policy ever re-pokes). A `None`
-                        // here means listeners are gone; keep the armed
-                        // window honest by letting the sleep arm fire.
-                        poke = self.wake.recv() => {
+                        // means listeners are gone: LATCH the arm off —
+                        // a closed receiver resolves `None` synchronously
+                        // forever, so left enabled it would out-race the
+                        // sleep on every turn (busy-spin until the
+                        // deadline). The armed window stays honest: the
+                        // sleep arm alone fires it.
+                        poke = self.wake.recv(), if wake_open => {
                             if poke.is_none() {
-                                // Listeners gone; fall through to let the
-                                // armed window elapse on the next loop.
+                                wake_open = false;
                             }
                         }
                         _ = tokio::time::sleep_until(deadline) => {
@@ -515,6 +534,45 @@ mod tests {
 
         drop(cancel.0);
         let _ = driver_task.await;
+    }
+
+    /// Listener drop mid-window: the armed window STILL FIRES off the
+    /// timer (the fires-under-load law), and the driver then exits
+    /// cleanly (no listener can ever arm another window). Guards the
+    /// wake-arm close latch: a closed wake channel resolves `None`
+    /// synchronously forever, so an ungated arm would out-race the
+    /// sleep on every loop turn (busy-spin until the deadline) — the
+    /// latch parks the armed branch on the timer alone, and must NOT
+    /// swallow the armed window on its way out.
+    #[tokio::test(start_paused = true)]
+    async fn armed_window_fires_after_all_listeners_drop() {
+        let fires = Arc::new(Mutex::new(Vec::new()));
+        let policy = TestPolicy {
+            window: Duration::from_secs(60),
+            rearm: true,
+            fires: Arc::clone(&fires),
+        };
+        let (listener, driver) = windowed_failure_collector(policy);
+        let driver_task = tokio::spawn(run_collector(driver, std::future::pending()));
+
+        // Arm a window, then drop the only listener (its wake sender
+        // closes — the production teardown-races-window shape).
+        listener.on_event(&fail("a", "non_recoverable", "boom"));
+        drop(listener);
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+
+        let got = fires.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "the armed window must fire off the timer");
+        assert_eq!(got[0].len(), 1);
+        assert_eq!(got[0][0].representative.task_id, "a");
+
+        // With listeners gone, the driver exits on its own (no cancel).
+        tokio::time::timeout(Duration::from_secs(1), driver_task)
+            .await
+            .expect("driver must exit once listeners are gone")
+            .expect("driver task must not panic");
     }
 
     /// A successful completion never participates, and a non-matching
