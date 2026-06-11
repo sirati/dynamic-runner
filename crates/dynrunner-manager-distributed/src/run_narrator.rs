@@ -181,7 +181,14 @@ impl RunNarrator {
     /// then complete) first, then the one-shot run summary last — so an
     /// iteration that simultaneously observes the final phase completing
     /// AND `run_complete()` emits the phase line before the summary.
-    pub(crate) fn observe<I: Identifier>(&mut self, state: &ClusterState<I>) {
+    ///
+    /// Returns whether ≥1 narrative event was emitted this call — the
+    /// caller's seam for the wake-stream piggyback (a narrated iteration
+    /// is a wake-stream HOST: the observer loop flushes the pending
+    /// reconnection note right after a `true`). The narrator itself stays
+    /// free of any wake-policy knowledge.
+    pub(crate) fn observe<I: Identifier>(&mut self, state: &ClusterState<I>) -> bool {
+        let mut emitted = false;
         // Phase transitions, read off the single owning phase-state
         // accessor. A phase counts as STARTED once it is dispatchable
         // (every dep-phase has fully terminated) and owns ≥1 task; it
@@ -259,6 +266,7 @@ impl RunNarrator {
                     overall.failed,
                     overall.skipped,
                 );
+                emitted = true;
             }
             if rollup.has_any && !rollup.has_live && self.done_phases.insert(phase.clone()) {
                 tracing::info!(
@@ -266,6 +274,7 @@ impl RunNarrator {
                     phase = %phase,
                     "phase complete",
                 );
+                emitted = true;
             }
         }
 
@@ -296,6 +305,7 @@ impl RunNarrator {
                         "OOM-retry-pass start",
                     ),
                 }
+                emitted = true;
             }
         }
 
@@ -308,7 +318,7 @@ impl RunNarrator {
         // the PROMOTING node's stdout, never the operator's). Placed BEFORE
         // the one-shot terminal summary: a failover is a mid-run transition,
         // the summary is the run's end.
-        self.narrate_failover(state);
+        emitted |= self.narrate_failover(state);
 
         // One-shot graceful-abort REQUEST announcement (mid-run edge): the
         // replicated dispatch-freeze latch landed in the mirror. Narrated
@@ -327,6 +337,7 @@ impl RunNarrator {
                 "graceful abort requested — dispatch frozen; running tasks \
                  will complete and the fleet will drain"
             );
+            emitted = true;
         }
 
         // One-shot run summary, gated on the sticky run-complete /
@@ -351,6 +362,7 @@ impl RunNarrator {
                     reason = %reason,
                     "run aborted — shutting down",
                 );
+                emitted = true;
             } else if state.run_complete() && state.graceful_abort_requested() {
                 // The composed graceful-abort verdict (run_complete ∧
                 // graceful latch): distinct from the clean success below —
@@ -377,6 +389,7 @@ impl RunNarrator {
                     o.fail_retry,
                     unscheduled,
                 );
+                emitted = true;
             } else if state.run_complete() {
                 self.completion_emitted = true;
                 let o = state.outcome_counts();
@@ -399,8 +412,10 @@ impl RunNarrator {
                     o.fail_oom,
                     o.fail_retry,
                 );
+                emitted = true;
             }
         }
+        emitted
     }
 
     /// Narrate the failover / degradation transitions derived from the
@@ -440,7 +455,11 @@ impl RunNarrator {
     /// the "failover in progress" line and a resolved failover emits the
     /// "primary failed over" line, so an UNRESOLVED failover is visible as a
     /// primary-left line with no following primary-changed line.
-    fn narrate_failover<I: Identifier>(&mut self, state: &ClusterState<I>) {
+    ///
+    /// Returns whether ≥1 line was emitted (folded into
+    /// [`Self::observe`]'s emitted-anything contract).
+    fn narrate_failover<I: Identifier>(&mut self, state: &ClusterState<I>) -> bool {
+        let mut emitted = false;
         // The recognised primary, identity-only (epoch carried separately).
         let current_primary = state.current_primary().map(str::to_owned);
 
@@ -464,7 +483,7 @@ impl RunNarrator {
             self.live_remote_secondaries = live_remote;
             self.last_primary = current_primary.map(|id| (id, state.primary_epoch()));
             self.failover_seeded = true;
-            return;
+            return false;
         }
 
         // Operational gate: a transition narrates only once the run is
@@ -489,6 +508,7 @@ impl RunNarrator {
                     live = live_count,
                     "secondary left the cluster",
                 );
+                emitted = true;
             }
         }
         // PEER-REJOINED: a remote secondary live now but not in the prior set
@@ -501,6 +521,7 @@ impl RunNarrator {
                     secondary = %joined,
                     "secondary joined the cluster",
                 );
+                emitted = true;
             }
         }
         self.live_remote_secondaries = live_remote;
@@ -524,6 +545,7 @@ impl RunNarrator {
                 primary = %primary,
                 "primary left the mesh — failover in progress",
             );
+            emitted = true;
         }
 
         // PRIMARY-CHANGED / failover-resolved: the recognised `(id, epoch)`
@@ -542,9 +564,11 @@ impl RunNarrator {
                     epoch = *epoch,
                     "primary failed over to {id} (epoch {epoch})",
                 );
+                emitted = true;
             }
             self.last_primary = current;
         }
+        emitted
     }
 }
 
@@ -1776,6 +1800,88 @@ mod tests {
             changed,
             vec!["p2", "p3"],
             "each new primary narrates a changed line once, in order: {events:?}"
+        );
+    }
+
+    /// The wake-stream host contract: `observe` returns `true` exactly on
+    /// calls that emitted ≥1 narrative event, `false` on quiet calls —
+    /// the seam the observer loop keys the reconnection-note flush on.
+    #[test]
+    fn observe_returns_whether_anything_was_narrated() {
+        capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            let mut narrator = RunNarrator::new();
+            // Empty ledger: nothing to narrate.
+            assert!(!narrator.observe(&state), "empty ledger → quiet");
+            // A phase reaches its start edge: narrated.
+            add(&mut state, &task("compile", "a", &[]));
+            assert!(narrator.observe(&state), "phase start → emitted");
+            // Stable ledger: idempotent re-observe is quiet.
+            assert!(!narrator.observe(&state), "stable ledger → quiet");
+            // Phase completes: narrated again.
+            complete(&mut state, "a");
+            assert!(narrator.observe(&state), "phase complete → emitted");
+            assert!(!narrator.observe(&state), "stable again → quiet");
+        });
+    }
+
+    /// Rule 2 replay (the down-7-minutes spec case at the narrator host):
+    /// nothing emits at reconnect; the NEXT phase event carries the
+    /// reconnection note — attached exactly once, via the same
+    /// `if observe() { flush_after_host() }` composition the observer
+    /// loop runs.
+    #[test]
+    fn reconnection_note_rides_next_phase_event_exactly_once() {
+        use crate::observer::lost_visibility::WakeNoteSlot;
+
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            let mut narrator = RunNarrator::new();
+            let note = WakeNoteSlot::default();
+
+            // The loss policy parked the note at regain (outage > 5 min,
+            // no periodic elapsed). Quiet iterations flush nothing — the
+            // note waits.
+            note.set("reconnection-note".to_string());
+            if narrator.observe(&state) {
+                note.flush_after_host();
+            }
+            assert!(note.is_pending(), "no host yet — the note waits");
+
+            // The next phase event hosts the note.
+            add(&mut state, &task("compile", "a", &[]));
+            if narrator.observe(&state) {
+                note.flush_after_host();
+            }
+            assert!(!note.is_pending(), "the phase event hosted the note");
+
+            // A later phase event must NOT re-attach it.
+            complete(&mut state, "a");
+            if narrator.observe(&state) {
+                note.flush_after_host();
+            }
+        });
+
+        let notes: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.message.contains("reconnection-note"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(notes.len(), 1, "the note attaches exactly once: {events:?}");
+        // It rides AFTER the phase-start block of the hosting iteration
+        // and BEFORE the next iteration's phase-complete line.
+        let start_idx = events
+            .iter()
+            .position(|e| e.message.contains("starting job phase"))
+            .expect("phase start narrated");
+        let done_idx = events
+            .iter()
+            .position(|e| e.message.contains("phase complete"))
+            .expect("phase complete narrated");
+        assert!(
+            start_idx < notes[0] && notes[0] < done_idx,
+            "the note rides together with the hosting iteration: {events:?}"
         );
     }
 }

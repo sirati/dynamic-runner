@@ -1635,13 +1635,15 @@ async fn emit_terminal_reason_lands_on_important_channel() {
         .await;
 }
 
-/// BUG-B (report content): when the observer loses visibility, the report
-/// it emits on the importance channel is the operator-facing "lost
-/// connection — retrying" notice, and crucially NOT a "run terminated"
-/// reason — visibility loss is not a terminal. This is the EXACT emit the
-/// run loop produces: the run loop's only lost-visibility side effect is
-/// `LostVisibilityReporter::observe(Lost { .. })`, so driving that observe
-/// synchronously reproduces the loop's emission. Captured through the
+/// BUG-B (report content): when the observer loses visibility past the
+/// 5-minute wake threshold, the report it emits on the importance channel
+/// is the operator-facing "connection down — retrying" notice, and
+/// crucially NOT a "run terminated" reason — visibility loss is not a
+/// terminal. This drives the EXACT emits the run loop produces: the
+/// loop's lost-visibility side effects are
+/// `LostVisibilityReporter::observe(Lost { .. }, now)` plus the
+/// `on_wake_deadline` threshold arm, so driving them synchronously
+/// reproduces the loop's emission. Captured through the
 /// narrator's own `capture_important` idiom (a SYNCHRONOUS, yield-free
 /// drive with no `.await` between subscriber install and emit — the
 /// documented non-flaky requirement, immune to the cross-test per-callsite
@@ -1655,20 +1657,33 @@ async fn emit_terminal_reason_lands_on_important_channel() {
 /// report CONTENT so the importance assertion stays deterministic.
 #[test]
 fn lost_visibility_report_is_retry_notice_not_a_run_terminal() {
-    use crate::observer::lost_visibility::{LostVisibilityReporter, MeshLiveness, Visibility};
+    use crate::observer::lost_visibility::{
+        LostVisibilityReporter, MeshLiveness, Visibility, WakeNoteSlot,
+    };
 
+    // The wake stream is threshold-gated (5 minutes): the IMMEDIATE loss
+    // observe emits nothing important — only at the threshold mark does
+    // the wake loss land, and it is a retry notice, never a terminal.
+    let t0 = tokio::time::Instant::now();
     let events = crate::test_capture::capture_important(|| {
-        let mut reporter = LostVisibilityReporter::new();
-        reporter.observe(&Visibility::Lost {
-            reason: "no reachable peer".to_string(),
-            mesh_liveness: MeshLiveness::Unknown,
-        });
+        let mut reporter = LostVisibilityReporter::new(WakeNoteSlot::default());
+        reporter.observe(
+            &Visibility::Lost {
+                reason: "no reachable peer".to_string(),
+                mesh_liveness: MeshLiveness::Unknown,
+            },
+            t0,
+        );
+        // The 5-minute mark: the wake-stream loss fires.
+        reporter.on_wake_deadline(t0 + std::time::Duration::from_secs(300));
     });
 
     assert!(
-        events.iter().any(|e| e.message.contains("lost connection")),
-        "a lost-visibility observer must report lost-connection + retry on the \
-         importance channel: {events:?}"
+        events
+            .iter()
+            .any(|e| e.message.contains("has been down for")),
+        "a ≥5-minute lost-visibility episode must report on the importance \
+         channel: {events:?}"
     );
     assert!(
         !events.iter().any(|e| e.message.contains("run terminated")),

@@ -36,6 +36,7 @@ use tokio::time::Instant;
 
 use dynrunner_core::IMPORTANT_TARGET;
 
+use crate::observer::lost_visibility::WakeNoteSlot;
 use crate::task_completed::{CollectedFailure, CollectorPolicy, TaskCompletedEvent};
 
 /// The outer rolling window: dedup memory + window-boundary cadence.
@@ -57,6 +58,11 @@ pub struct ErrorAggregationPolicy {
     /// rolling window. Cleared on each rollover. Suppresses repeat emits
     /// of the same message across sub-windows of one rolling window.
     reported_this_window: HashSet<String>,
+    /// The shared reconnection-note slot: every wake-stream emitter
+    /// flushes it right after emitting, so a parked note rides whichever
+    /// important log comes first. Defaults to an unwired (empty) slot —
+    /// flushing it is then a no-op.
+    note: WakeNoteSlot,
 }
 
 impl Default for ErrorAggregationPolicy {
@@ -70,7 +76,16 @@ impl ErrorAggregationPolicy {
         Self {
             rolling_start: None,
             reported_this_window: HashSet::new(),
+            note: WakeNoteSlot::default(),
         }
+    }
+
+    /// Wire the shared reconnection-note slot (the wake-stream piggyback
+    /// seam): the aggregated-failures emit is a wake-stream host and
+    /// flushes the slot right after it fires.
+    pub fn with_wake_note(mut self, note: WakeNoteSlot) -> Self {
+        self.note = note;
+        self
     }
 
     /// Roll the window over if `now` is at/after the current window's end
@@ -133,6 +148,9 @@ impl CollectorPolicy for ErrorAggregationPolicy {
             target: IMPORTANT_TARGET,
             "task failures (aggregated):\n{detail}",
         );
+        // This emit is a wake-stream host: a parked reconnection note
+        // rides it (no-op when none is pending).
+        self.note.flush_after_host();
     }
 
     fn rearm_after_fire(&self) -> bool {
