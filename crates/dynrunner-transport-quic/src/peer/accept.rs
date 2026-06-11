@@ -21,28 +21,50 @@ use super::{AcceptedPeer, DisconnectedPeer};
 /// Handler-provenance tag carried by the framed-IO pump logs.
 const CTX: &str = "peer-accepted";
 
+// PER-CONNECTION failures never end an accept loop. The pre-fix loops
+// awaited the whole handshake inside `listener.accept()` and broke on
+// ANY `Err` — but that `Err` conflated per-connection faults (a TCP
+// connection reset mid WS-upgrade, an aborted QUIC/TLS handshake, a
+// dialer that never opened its bi stream) with listener death. A
+// simultaneous connection reset (run_20260611_202345: one gateway
+// event RST many sessions in the same second, including in-flight
+// handshakes) therefore permanently killed the listener — every later
+// re-dial (the heal the accept-replace machinery and the
+// redial-request nudges depend on) had nowhere to land, so a peer's
+// replayed task reports could never re-register a session and ingest
+// from it stayed dead for the rest of the run. The loops now accept
+// at the LISTENER level only and drive the per-connection handshake
+// inside the spawned handler, where its failure drops that one
+// attempt and nothing else (it also no longer serializes the loop on
+// a slow dialer's handshake).
+
 pub(super) async fn quic_accept_loop<I: Identifier>(
     listener: QuicListener,
     incoming_tx: InboundTap<I>,
     new_conn_tx: mpsc::UnboundedSender<AcceptedPeer<I>>,
     disconnect_tx: mpsc::UnboundedSender<DisconnectedPeer<I>>,
 ) {
-    loop {
-        match listener.accept().await {
-            Ok(conn) => {
-                let incoming_tx = incoming_tx.clone();
-                let new_conn_tx = new_conn_tx.clone();
-                let disconnect_tx = disconnect_tx.clone();
-                tokio::task::spawn_local(async move {
-                    handle_accepted_quic(conn, incoming_tx, new_conn_tx, disconnect_tx).await;
-                });
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "peer QUIC accept loop ended");
-                break;
-            }
-        }
+    // `None` — the endpoint itself closed — is the only loop exit.
+    while let Some(incoming) = listener.accept_raw().await {
+        let incoming_tx = incoming_tx.clone();
+        let new_conn_tx = new_conn_tx.clone();
+        let disconnect_tx = disconnect_tx.clone();
+        tokio::task::spawn_local(async move {
+            let conn = match QuicConnection::from_incoming(incoming).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "inbound QUIC handshake failed; dropping the attempt \
+                         (listener kept — the dialer's redial lands fresh)"
+                    );
+                    return;
+                }
+            };
+            handle_accepted_quic(conn, incoming_tx, new_conn_tx, disconnect_tx).await;
+        });
     }
+    tracing::debug!("peer QUIC endpoint closed; accept loop ended");
 }
 
 pub(super) async fn wss_accept_loop<I: Identifier>(
@@ -52,18 +74,39 @@ pub(super) async fn wss_accept_loop<I: Identifier>(
     disconnect_tx: mpsc::UnboundedSender<DisconnectedPeer<I>>,
 ) {
     loop {
-        match listener.accept().await {
-            Ok(conn) => {
+        match listener.accept_raw().await {
+            Ok((tcp_stream, peer_addr)) => {
+                tracing::debug!(%peer_addr, "WSS TCP connection accepted");
                 let incoming_tx = incoming_tx.clone();
                 let new_conn_tx = new_conn_tx.clone();
                 let disconnect_tx = disconnect_tx.clone();
                 tokio::task::spawn_local(async move {
+                    let conn = match WssConnection::accept_handshake(tcp_stream).await {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                %peer_addr,
+                                "inbound WSS upgrade failed; dropping the attempt \
+                                 (listener kept — the dialer's redial lands fresh)"
+                            );
+                            return;
+                        }
+                    };
                     handle_accepted_wss(conn, incoming_tx, new_conn_tx, disconnect_tx).await;
                 });
             }
             Err(e) => {
-                tracing::debug!(error = %e, "peer WSS accept loop ended");
-                break;
+                // Listener-level accept(2) fault (transient ECONNABORTED
+                // under a reset storm, EMFILE, …): the listener socket is
+                // still bound, so keep accepting — paced so a persistent
+                // fault cannot busy-spin the executor. The loop ends only
+                // with the task (LocalSet teardown).
+                tracing::warn!(
+                    error = %e,
+                    "WSS accept(2) error; listener kept, retrying after backoff"
+                );
+                tokio::time::sleep(crate::wss::ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }

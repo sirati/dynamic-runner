@@ -14,9 +14,55 @@ pub struct WssConnection {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
 }
 
+/// Bound on one inbound TCP connection's WebSocket upgrade. Applied
+/// inside [`WssConnection::accept_handshake`] so a dialer that
+/// connects at TCP but never sends (or never completes) the HTTP
+/// upgrade releases the per-connection handler task. Generous: a
+/// conformant dialer upgrades immediately after connect.
+const INBOUND_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Pause between retries when the LISTENER-level `accept(2)` itself
+/// errors (e.g. `ECONNABORTED` under a connection-reset storm, or
+/// `EMFILE`). Keeps an accept loop alive across transient listener
+/// errors without letting a persistent error (fd exhaustion) turn the
+/// loop into a busy-spin. The success path never sleeps.
+pub(crate) const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl WssConnection {
     pub fn new(ws: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
         Self { ws }
+    }
+
+    /// Drive ONE accepted TCP connection through the server-side
+    /// WebSocket upgrade. PER-CONNECTION fallible — a connection that
+    /// resets mid-handshake (the run_20260611_202345 simultaneous
+    /// connection reset aborted exactly such in-flight upgrades) errors
+    /// HERE, in whatever task drove this attempt, and says nothing
+    /// about the listener. Accept loops must call this from the
+    /// spawned per-connection handler, never inline in the loop:
+    /// pre-fix the loops folded this failure into `accept()`'s `Err`
+    /// and treated it as loop-fatal, permanently killing the node's
+    /// ability to accept re-dialed sessions.
+    ///
+    /// Runs with the EXPLICIT wire limits from
+    /// [`crate::framing::wire_ws_config`] (#366).
+    pub async fn accept_handshake(tcp_stream: TcpStream) -> Result<Self, String> {
+        let ws_stream = tokio::time::timeout(
+            INBOUND_HANDSHAKE_TIMEOUT,
+            tokio_tungstenite::accept_async_with_config(
+                MaybeTlsStream::Plain(tcp_stream),
+                Some(crate::framing::wire_ws_config()),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "inbound WSS upgrade did not complete within {}s",
+                INBOUND_HANDSHAKE_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| e.to_string())?;
+        Ok(WssConnection::new(ws_stream))
     }
 
     /// Consume the connection and return the underlying WebSocket stream.
@@ -107,32 +153,34 @@ impl WssListener {
         self.local_addr.port()
     }
 
-    /// Accept the next incoming WebSocket connection (plain WS, no TLS).
+    /// Listener-level accept: the next raw TCP connection, BEFORE the
+    /// WebSocket upgrade. An `Err` here is a listener-level `accept(2)`
+    /// fault (transient `ECONNABORTED` under a reset storm, `EMFILE`,
+    /// …) — an accept loop logs it and keeps accepting (paced by
+    /// [`ACCEPT_ERROR_BACKOFF`]); it is NEVER loop-fatal, because the
+    /// listener socket itself is owned and stays bound. Drive the
+    /// returned stream through [`WssConnection::accept_handshake`]
+    /// inside the per-connection handler task.
+    pub async fn accept_raw(&self) -> std::io::Result<(TcpStream, SocketAddr)> {
+        self.tcp_listener.accept().await
+    }
+
+    /// Accept the next incoming WebSocket connection (plain WS, no TLS)
+    /// — `accept_raw` + [`WssConnection::accept_handshake`] in one call,
+    /// for single-connection callers (tests, fixtures). An accept LOOP
+    /// must NOT use this: a per-connection upgrade failure is
+    /// indistinguishable from a listener failure in the flattened
+    /// `Err`, and awaiting the upgrade inline serializes (and, treated
+    /// as fatal, kills) the loop — use `accept_raw` + `accept_handshake`
+    /// in the spawned handler instead.
     ///
     /// For production use behind SSH tunnels / internal networks, TLS is
     /// typically handled at the tunnel level. To add native TLS, wrap the
     /// `TcpStream` with `tokio_native_tls` before the WebSocket handshake.
-    ///
-    /// Runs with the EXPLICIT wire limits from
-    /// [`crate::framing::wire_ws_config`] (#366) — never tungstenite's
-    /// defaults, whose 16 MiB `max_frame_size` silently dropped
-    /// legitimate large mesh frames.
     pub async fn accept(&self) -> Result<WssConnection, String> {
-        let (tcp_stream, peer_addr) = self
-            .tcp_listener
-            .accept()
-            .await
-            .map_err(|e| e.to_string())?;
+        let (tcp_stream, peer_addr) = self.accept_raw().await.map_err(|e| e.to_string())?;
         tracing::debug!(%peer_addr, "WSS TCP connection accepted");
-
-        let ws_stream = tokio_tungstenite::accept_async_with_config(
-            MaybeTlsStream::Plain(tcp_stream),
-            Some(crate::framing::wire_ws_config()),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-        Ok(WssConnection::new(ws_stream))
+        WssConnection::accept_handshake(tcp_stream).await
     }
 }
 
