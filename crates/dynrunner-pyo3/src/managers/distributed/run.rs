@@ -1117,6 +1117,14 @@ impl PyDistributedManager {
                                 // than silently swallow.
                                 no_relocation_target = Some(e);
                             }
+                            e @ RunError::BringUpFailed { .. } => {
+                                // Fleet bring-up failure (0/N welcomes inside
+                                // the quorum-proceed window): no fleet, zero
+                                // dispatch. RAISE — never the `Other` swallow's
+                                // false rc=0 clean teardown (uniform with
+                                // `PyPrimaryCoordinator::run`).
+                                fatal_policy_exit = Some(e);
+                            }
                             e @ (RunError::AbortedByClusterVerdict { .. }
                             | RunError::Deposed { .. }) => {
                                 // Run-authority terminals (zombie split-brain

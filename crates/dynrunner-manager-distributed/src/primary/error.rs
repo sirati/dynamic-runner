@@ -140,6 +140,27 @@ pub enum RunError {
         /// message; the count is the authoritative signal).
         rejected_task_ids: Vec<String>,
     },
+    /// The fleet bring-up FAILED: the primary's quorum-proceed window
+    /// (`connect_timeout`, derived in `primary::config`) expired with ZERO
+    /// secondaries having completed the `SecondaryWelcome` handshake, so
+    /// the run never assembled a fleet and dispatched NOTHING. (One or
+    /// more welcomes proceeds on quorum instead — see
+    /// `wait_for_connections`; only the 0/N shape is fatal.)
+    ///
+    /// Distinct from `Other(String)` so the PyO3 boundary RAISES on it:
+    /// the `Other` path is log-and-swallowed → exit 0, which is exactly
+    /// the run_20260611_131736 false-green — the submitter logged ERROR
+    /// "timeout waiting for secondaries: 0/4 sent SecondaryWelcome", then
+    /// printed the normal "Completed: 0 / Failed: 0 / Stranded: 0"
+    /// teardown and exited rc=0, so the consumer's monitor saw a clean
+    /// stream end. Distinct from `ClusterCollapsed` because nothing was
+    /// stranded by a routing collapse — no task ever entered dispatch.
+    BringUpFailed {
+        /// Human-readable diagnosis from the welcome-wait timeout site
+        /// (names the 0/N count and the transport-level disambiguation
+        /// hints).
+        reason: String,
+    },
     /// The replicated ledger carries the cluster's `RunAborted` verdict
     /// (authored by ANOTHER authority — the live primary's own abort paths
     /// return their structured variants before this gate is consulted).
@@ -286,6 +307,16 @@ impl fmt::Display for RunError {
                     shown.join(", ")
                 )
             }
+            Self::BringUpFailed { reason } => write!(
+                f,
+                "run FAILED at bring-up: {reason}. Zero secondaries completed \
+                 the welcome handshake within the primary's quorum-proceed \
+                 window, so no fleet was assembled and no task was dispatched. \
+                 If the secondaries' container/image bring-up is legitimately \
+                 slow, raise --unconfigured-deadline-secs (the one knob that \
+                 drives both the secondaries' setup deadline and, at 80%, the \
+                 primary's bring-up wait)."
+            ),
             Self::AbortedByClusterVerdict { reason } => write!(
                 f,
                 "run aborted by the cluster's replicated verdict: {reason}. \

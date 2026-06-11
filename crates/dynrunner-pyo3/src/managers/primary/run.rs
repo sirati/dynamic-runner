@@ -708,6 +708,15 @@ impl PyPrimaryCoordinator {
                                 // out instead of.
                                 no_relocation_target = Some(e);
                             }
+                            e @ RunError::BringUpFailed { .. } => {
+                                // Fleet bring-up failure (0/N welcomes inside
+                                // the quorum-proceed window): the run assembled
+                                // no fleet and dispatched NOTHING. RAISE — never
+                                // the `Other` swallow's false "Completed: 0 /
+                                // Failed: 0" clean teardown + rc=0
+                                // (run_20260611_131736).
+                                fatal_policy_exit = Some(e);
+                            }
                             e @ (RunError::AbortedByClusterVerdict { .. }
                             | RunError::Deposed { .. }) => {
                                 // Run-authority terminals (zombie split-brain
