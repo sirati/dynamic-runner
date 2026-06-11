@@ -1126,7 +1126,7 @@ async fn spawn_reverse_tunnel(
 /// lookup. With ≥2 concurrent watchers this is the only safe shape:
 /// using `last_mut()` on a shared `Vec<Child>` would race watcher A
 /// onto watcher B's child as soon as their `push` interleaved.
-pub(super) async fn verify_tunnel_alive(
+pub(crate) async fn verify_tunnel_alive(
     secondary_id: &str,
     child: &mut Child,
 ) -> Result<(), PrepError> {
@@ -1226,7 +1226,7 @@ pub(super) async fn verify_tunnel_alive(
 }
 
 /// Send SIGTERM, wait up to 5s, then SIGKILL.
-pub(super) async fn terminate_child(child: &mut Child) {
+pub(crate) async fn terminate_child(child: &mut Child) {
     if let Err(e) = child.start_kill() {
         // Already dead is fine; other errors are logged but don't
         // block the rest of teardown.

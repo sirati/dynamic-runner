@@ -826,9 +826,17 @@ def _dispatch_late_joiner(task, args, logger) -> None:
     node that holds the replicated CRDT and narrates the run from it. The
     Rust-side coordinator handles every detail of the bootstrap; the
     Python dispatcher's only job is to surface the configured
-    peer-info-dir. The observer needs no task_definition / scheduler /
-    estimator (it runs no workers), so none are forwarded — `task` stays
-    in the signature only for dispatcher-table uniformity.
+    peer-info-dir and (when set) the gateway knobs. The observer needs
+    no task_definition / scheduler / estimator (it runs no workers), so
+    none are forwarded — `task` stays in the signature only for
+    dispatcher-table uniformity.
+
+    With ``--gateway ssh://…`` the peer-info dir is a GATEWAY-SIDE
+    path: the Rust side fetches the `*.info` files through the gateway
+    and reaches each recorded peer over a per-peer `ssh -L`
+    local-forward tunnel (nothing runs on the gateway itself). Without
+    the flag (or with ``--gateway local``) the dir is a local path and
+    the recorded addresses are dialed directly, exactly as before.
 
     No primary URL is required: a late-joiner is a peer-mesh-only
     participant. It reaches the primary via the peer mesh once the
@@ -843,12 +851,17 @@ def _dispatch_late_joiner(task, args, logger) -> None:
     # DistributedConfig default.
     distributed_config = None
 
+    gateway_url = getattr(args, "gateway", None)
+    location = f" (gateway-side, via {gateway_url})" if gateway_url and gateway_url != "local" else ""
     logger.info(
-        f"Late-joiner observer: peer-info-dir={args.observer_join_from_peer_info_dir}"
+        f"Late-joiner observer: peer-info-dir={args.observer_join_from_peer_info_dir}{location}"
     )
     result = _rs.run_observer_late_joiner(
         args.observer_join_from_peer_info_dir,
         distributed_config=distributed_config,
+        gateway_url=gateway_url,
+        ssh_identity_file=getattr(args, "ssh_identity_file", None),
+        ssh_config_file=getattr(args, "ssh_config", None),
         **_panik_kwargs(args),
     )
     logger.info(f"Observer Completed (observed): {result['completed']}")

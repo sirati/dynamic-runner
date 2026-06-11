@@ -80,10 +80,13 @@
 //! - [`builder`] — `Builder` + `Builder::format`.
 //! - [`b64`] — inline base64 codec (cert envelope field).
 //! - [`read_dir`] — `read_dir_v2` + `ReadDirError`.
+//! - [`fetch`] — `fetch_dir_v2` + `PeerInfoFetchError` (gateway-side
+//!   mirror for the `--gateway` late-joiner path).
 //! - [`tests`] — module-internal tests.
 
 mod b64;
 mod builder;
+mod fetch;
 mod parse_impl;
 mod read_dir;
 #[cfg(test)]
@@ -91,6 +94,7 @@ mod tests;
 mod types;
 
 pub use builder::Builder;
+pub use fetch::{PeerInfoFetchError, fetch_dir_v2};
 pub use parse_impl::{parse, parse_v1_uri};
 pub use read_dir::{ReadDirError, read_dir_v2};
 pub use types::{LegacyUri, PeerInfoError, PeerInfoRecord, PeerInfoVersion};

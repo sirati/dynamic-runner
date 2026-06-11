@@ -219,4 +219,11 @@ impl Gateway for SshGateway {
         self.forwarded_ports.push((local_port, remote_port));
         Ok(())
     }
+
+    fn expand_remote_path(&self, remote: &str) -> String {
+        // Delegate to the inherent helper (probed `remote_home`); the
+        // inherent method wins resolution here, so this is a plain
+        // delegation, not recursion.
+        self.expand_remote_path(remote)
+    }
 }

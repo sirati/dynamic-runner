@@ -63,6 +63,18 @@ pub trait Gateway: Send + Sync {
         local_port: u16,
         remote_port: u16,
     ) -> Result<(), GatewayError>;
+
+    /// Expand a `~`-prefixed remote path against the gateway-side home
+    /// directory. Default: identity (no remote-home concept). The SSH
+    /// gateway overrides with its probed `remote_home`, making the
+    /// expansion available to CALLERS composing remote shell commands
+    /// (`execute_command` deliberately runs commands verbatim, so a
+    /// quoted `~` would otherwise reach the remote shell unexpanded
+    /// while the scp-based file methods expand — this hook lets a
+    /// caller resolve the path ONCE and use it consistently).
+    fn expand_remote_path(&self, remote: &str) -> String {
+        remote.to_string()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
