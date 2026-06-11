@@ -385,6 +385,26 @@ pub struct ClusterState<I> {
     /// snapshot + AE digest (no mutation of its own — it is derived
     /// from the terminal stream).
     pub(super) custom_terminal_watermarks: HashMap<String, u64>,
+    /// Node-local serialize-once cache for the snapshot-RPC reply
+    /// payload (the #367 wire-cap fix's CPU half): the last
+    /// `snapshot_json()` result keyed by the anti-entropy
+    /// [`StateDigest`] it was serialized under. A 67k-task ledger
+    /// serializes to ~100 MB; pre-cache every digest-driven pull /
+    /// late-joiner request re-ran that serialization (~6800 times in
+    /// run_20260611_115429), starving the runtime. The digest is
+    /// re-derived from CURRENT state on every read (the same
+    /// structural-completeness-guarded projection `digest()` always
+    /// computes), so the cache can never serve bytes whose
+    /// digest-covered content is stale — and digest-covered content is
+    /// exactly what drives anti-entropy pulls, so convergence is
+    /// preserved by construction. See `snapshot_json()` for the
+    /// non-digest-field staleness analysis. Never replicated, never
+    /// cloned (a clone re-serializes on first use), never part of
+    /// `digest()`/`snapshot()`.
+    pub(super) snapshot_json_cache: Option<(
+        dynrunner_protocol_primary_secondary::StateDigest,
+        std::sync::Arc<String>,
+    )>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -435,6 +455,9 @@ where
             phases_ended,
             custom_messages,
             custom_terminal_watermarks,
+            // Node-local serialize-once cache — not cloned (the clone
+            // re-serializes on its first snapshot_json call).
+            snapshot_json_cache: _snapshot_json_cache,
         } = self;
         Self {
             tasks: tasks.clone(),
@@ -488,6 +511,8 @@ where
             // preserves them (replicated CRDT data, like `tasks`).
             custom_messages: custom_messages.clone(),
             custom_terminal_watermarks: custom_terminal_watermarks.clone(),
+            // Node-local serialize-once cache — see the destructure note.
+            snapshot_json_cache: None,
         }
     }
 }
@@ -531,6 +556,7 @@ where
             phases_ended,
             custom_messages,
             custom_terminal_watermarks,
+            snapshot_json_cache,
         } = self;
         f.debug_struct("ClusterState")
             .field("tasks", tasks)
@@ -564,6 +590,7 @@ where
             .field("phases_ended", phases_ended)
             .field("custom_messages", &custom_messages.len())
             .field("custom_terminal_watermarks", &custom_terminal_watermarks.len())
+            .field("snapshot_json_cache", &snapshot_json_cache.is_some())
             .finish()
     }
 }
@@ -600,6 +627,7 @@ impl<I> Default for ClusterState<I> {
             phases_ended: HashSet::new(),
             custom_messages: HashMap::new(),
             custom_terminal_watermarks: HashMap::new(),
+            snapshot_json_cache: None,
         }
     }
 }

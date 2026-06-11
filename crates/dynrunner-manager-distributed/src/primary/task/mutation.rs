@@ -79,14 +79,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         else {
             return;
         };
-        let snapshot = self.cluster_state.snapshot();
-        match serde_json::to_string(&snapshot) {
+        // Serialize-once per state generation (#367): the cache inside
+        // `ClusterState` keys the reply bytes on the anti-entropy
+        // digest, so a burst of pulls against an unchanged ledger does
+        // not re-serialize ~100 MB per request.
+        match self.cluster_state.snapshot_json() {
             Ok(snapshot_json) => {
                 let response = DistributedMessage::ClusterSnapshot {
                     target: None,
                     sender_id: self.config.node_id.clone(),
                     timestamp: timestamp_now(),
-                    snapshot_json,
+                    snapshot_json: (*snapshot_json).clone(),
                 };
                 if let Err(e) = self
                     .send_to(

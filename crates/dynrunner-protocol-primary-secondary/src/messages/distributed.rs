@@ -979,6 +979,65 @@ pub enum DistributedMessage<I> {
         #[serde(default)]
         attempts: u32,
     },
+    /// Wire-only chunk of ONE oversized framework frame (#367 — the
+    /// 67k-task `ClusterSnapshot` that exceeded the wire cap and was
+    /// serialize-dropped in a loop, starving anti-entropy / rejoin
+    /// forever). A frame whose serialized size exceeds the transport's
+    /// wire limit AND whose type is [`Self::chunk_eligible`] is split by
+    /// the SENDING framing layer into N of these (each individually
+    /// under the cap) and reassembled by the RECEIVING framing layer
+    /// before delivery; the application layer never observes the
+    /// variant (the same contract as `Relay` / `RedialRequest`, one
+    /// layer further down — chunks are consumed at the framed-IO pumps,
+    /// below even the Router).
+    ///
+    /// NOT a relaxation of the wire cap for consumer payloads: the
+    /// eligibility classifier is a closed framework-frame allowlist
+    /// (`ClusterSnapshot`, possibly `Relay`-wrapped), and the receiver
+    /// re-checks eligibility after reassembly, so an oversized
+    /// `TaskComplete`/`CustomMessage` can neither be chunked nor smuggled
+    /// through reassembly (#364/#366 semantics stay).
+    ///
+    /// Reassembly contract (see `chunking::ChunkReassembler`):
+    /// `transfer_id` identifies the transfer on a connection;
+    /// `index`/`total` order the slices; `checksum` (FNV-1a-64 of the
+    /// COMPLETE reassembled payload) proves integrity. Chunks of one
+    /// transfer are written back-to-back on one ordered leg, so a gap /
+    /// supersede / checksum mismatch is a transfer-fatal fault: the
+    /// receiver abandons the partial with ONE loud WARN and the
+    /// higher-level trigger (the anti-entropy digest cadence) is the
+    /// bounded retry. A pre-field receiver fails LOUDLY-but-gracefully:
+    /// the unknown `msg_type` tag is a decode error, which the framed-IO
+    /// pumps surface at ERROR and resolve through the NORMAL disconnect
+    /// path (never a panic).
+    FrameChunk {
+        /// Mesh routing target — present for wire-shape uniformity with
+        /// every other variant; chunks travel leg-level (below routing),
+        /// so the egress never stamps it. `#[serde(default,
+        /// skip_serializing_if)]` keeps the wire bytes minimal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// Sender-local monotonic transfer id: all chunks of one
+        /// oversized frame carry the same value; a new transfer on the
+        /// same leg carries a strictly different one (supersede
+        /// detection).
+        transfer_id: u64,
+        /// Zero-based slice index within the transfer.
+        index: u32,
+        /// Total number of slices in the transfer (≥ 1, constant across
+        /// the transfer).
+        total: u32,
+        /// FNV-1a-64 over the COMPLETE reassembled payload bytes.
+        checksum: u64,
+        /// This slice's bytes, base64-encoded (standard alphabet, with
+        /// padding). Base64 is byte-boundary-safe at any split point and
+        /// inflates 4/3 — vs serde_json's ~4x number-array encoding of
+        /// `Vec<u8>` and the unbounded re-escaping cost of nesting JSON
+        /// text in a JSON string.
+        payload_b64: String,
+    },
 }
 
 /// Which role's liveness a [`DistributedMessage::Keepalive`] asserts.

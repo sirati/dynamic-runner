@@ -45,6 +45,7 @@ pub(super) fn spawn_outgoing_handler<I: Identifier>(
                 incoming_tx,
                 CTX,
                 peer_id.clone(),
+                framing::new_reassembler(),
             ));
             let writer = tokio::task::spawn_local(framing::run_quic_writer(
                 send_stream,
@@ -62,6 +63,7 @@ pub(super) fn spawn_outgoing_handler<I: Identifier>(
                 incoming_tx,
                 CTX,
                 peer_id.clone(),
+                framing::new_reassembler(),
             ));
             let writer = tokio::task::spawn_local(framing::run_wss_writer(
                 ws_write,

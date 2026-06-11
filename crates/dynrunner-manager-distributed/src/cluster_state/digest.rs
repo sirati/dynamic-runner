@@ -141,6 +141,10 @@ impl<I: Identifier> ClusterState<I> {
             // node-local: the originator's per-hash version counter carries
             // no convergence signal (each replica mints its own).
             task_seq: _task_seq,
+            // node-local: the serialize-once snapshot-JSON cache is a pure
+            // derivation of the replicated fields (keyed on the digest), so
+            // it carries no signal of its own.
+            snapshot_json_cache: _snapshot_json_cache,
         } = self;
 
         // `peer_holdings` is steady-state best-effort metadata
