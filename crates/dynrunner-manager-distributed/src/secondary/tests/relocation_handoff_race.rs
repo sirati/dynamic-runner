@@ -399,6 +399,84 @@ async fn setup_wait_emits_anti_entropy_digest_on_cadence() {
         .await;
 }
 
+/// PRE-ANNOUNCE variant (production verdict for run_20260611_005927's
+/// digest gap): secondaries 1-3 sat from +1s to the unconfigured
+/// deadline WITHOUT ever receiving a single primary frame — still in
+/// `AwaitingPrimary`, the state BEFORE the existing test's `PeerInfo`
+/// announce. The anti-entropy emit cadence is armed at `wait_for_setup`
+/// entry, i.e. BEFORE the first frame, so the digest beacon must flow
+/// from `AwaitingPrimary` too: it is the identifying first frame that
+/// registers a (re-dialed) wire AND the divergence beacon that lets a
+/// parked fleet pull a primary fact none of them ever held locally.
+///
+/// REVERT-CHECK: with the cadence armed only after the first primary
+/// frame this times out — the pre-announce fleet is mute for the whole
+/// unconfigured window (the "zero digest lines" production signature).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn setup_wait_emits_anti_entropy_digest_pre_announce() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (sec_to_pri_tx, mut sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+            // Held open so the bootstrap wire stays up (the production
+            // shape: tunnel alive, primary mute) — never sends a frame.
+            let _hold_primary_inbound = pri_to_sec_tx;
+
+            let config = race_config("sec-0");
+            let unified =
+                channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
+            let mut harness = make_secondary_channel(config, unified);
+            harness.set_bootstrap_primary_id("setup".to_string());
+            let (mut secondary, _guard) = start_secondary_pump(harness);
+
+            // The mute-primary side: drain the welcome/cert handshake,
+            // send NOTHING back, and wait for the secondary's own digest
+            // broadcast from `AwaitingPrimary`.
+            let driver = async {
+                let (mut got_welcome, mut got_cert) = (false, false);
+                while !got_welcome || !got_cert {
+                    match sec_to_pri_rx.recv().await.expect("wire open") {
+                        m if matches!(m.msg_type(), MessageType::SecondaryWelcome) => {
+                            got_welcome = true;
+                        }
+                        m if matches!(m.msg_type(), MessageType::CertExchange) => got_cert = true,
+                        _ => {}
+                    }
+                }
+                // NO PeerInfo — the announce never arrives. The digest
+                // must still show up within a couple of jittered periods.
+                loop {
+                    let frame = tokio::select! {
+                        f = sec_to_pri_rx.recv() => f.expect("wire open"),
+                        _ = tokio::time::sleep(Duration::from_secs(60)) => panic!(
+                            "MUTE PRE-ANNOUNCE WAIT (the run_20260611_005927 \
+                             digest-gap shape): the secondary never broadcast \
+                             its anti-entropy StateDigest from AwaitingPrimary \
+                             — a fleet parked before the first primary frame \
+                             stays beacon-dark for the whole unconfigured \
+                             window"
+                        ),
+                    };
+                    if let DistributedMessage::StateDigest { sender_id, .. } = frame {
+                        assert_eq!(sender_id, "sec-0");
+                        break;
+                    }
+                }
+            };
+
+            let mut factory = FakeWorkerFactory;
+            tokio::select! {
+                res = secondary.run_until_setup_or_done(&mut factory) => {
+                    panic!("setup wait must keep waiting pre-announce, got {res:?}");
+                }
+                () = driver => { /* digest observed on the wire */ }
+            }
+        })
+        .await;
+}
+
 /// The relocated-submitter observer behind the production REGISTRATION
 /// GATE (production replay 2212c136, part 2): the secondary's bootstrap
 /// wire flapped at the relocate instant, the `PrimaryChanged { Transferred }`

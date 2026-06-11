@@ -370,10 +370,23 @@ where
         // (the digest is the identifying first frame) and advertises this
         // replica's state, closing the loop. Same `Skip` + dropped-first-tick
         // shape as the operational arm.
-        let mut anti_entropy_interval =
-            tokio::time::interval(crate::anti_entropy::tick_period(&self.config.secondary_id));
+        let anti_entropy_period = crate::anti_entropy::tick_period(&self.config.secondary_id);
+        let mut anti_entropy_interval = tokio::time::interval(anti_entropy_period);
         anti_entropy_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         anti_entropy_interval.reset();
+        // Name the beacon ONCE at arming (run_20260611_005927 forensics:
+        // the emission itself is a silent broadcast and the receive-side
+        // reconcile logs only on divergence, so a parked fleet of
+        // equally-empty replicas produced ZERO digest lines and the
+        // cadence read as absent — operators could not distinguish
+        // "beacon dead" from "beacon healthy but converged"). Per-tick
+        // emission stays DEBUG below.
+        tracing::info!(
+            period_secs = anti_entropy_period.as_secs_f64(),
+            "setup-phase anti-entropy digest beacon armed (broadcasts on \
+             the jittered cadence from AwaitingPrimary onward; per-tick \
+             emission logs at DEBUG)"
+        );
 
         while !got_peer_info || !got_assignment || !got_transfer {
             // Terminal-exit backstop. A terminal CRDT flag set DURING setup
@@ -456,6 +469,10 @@ where
                         // `interval.tick` is cancel-safe (tokio docs).
                         _ = anti_entropy_interval.tick() => {
                             let digest = self.cluster_state.digest();
+                            tracing::debug!(
+                                "setup-phase anti-entropy digest broadcast \
+                                 (the beacon tick)"
+                            );
                             let frame = crate::anti_entropy::digest_broadcast(
                                 &self.config.secondary_id,
                                 timestamp_now(),

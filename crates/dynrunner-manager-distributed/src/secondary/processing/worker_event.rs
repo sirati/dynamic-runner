@@ -265,6 +265,13 @@ where
                 // another path. See WorkerHandle::try_reap_exit for
                 // the full set of None conditions.
                 let exit_status = self.op_mut().pool.workers[worker_id as usize].try_reap_exit();
+                if exit_status.is_none() {
+                    // SIGCHLD race: the child is dead (pipe EOF observed)
+                    // but the non-blocking reap missed it. Hand it to the
+                    // bounded detached reaper so it cannot linger as a
+                    // zombie (no other path will ever wait this pid).
+                    self.op_mut().pool.workers[worker_id as usize].reap_detached_fallback();
+                }
 
                 // Reclaim protocol state from the spawned poll task
                 self.op_mut().pool.workers[worker_id as usize]
@@ -658,7 +665,7 @@ where
                                 "pending first-bind assign_task failed; reporting \
                                  deferred task back to the authority"
                             );
-                            self.op_mut().pending_worker_restarts.insert(worker_id);
+                            self.schedule_worker_restart(worker_id);
                             self.report_deferred_task_lost(worker_id, &log_task_hash)
                                 .await?;
                         }
@@ -679,5 +686,47 @@ where
                 Ok(None)
             }
         }
+    }
+
+    /// Schedule a worker-slot restart: store the EARLIEST instant the
+    /// restart may execute, derived ONCE here from the pool's
+    /// startup-crash backoff ([`dynrunner_manager_local::pool::WorkerPool::
+    /// restart_backoff_delay`] — zero for a healthy worker that died
+    /// mid-task, exponential for a subprocess that died before Ready).
+    /// The operational loop's restart tail executes due entries; its
+    /// wake arm parks on [`Self::next_worker_restart_due`]. Storing the
+    /// deadline at schedule time (never deriving it at the arm) is the
+    /// persistent-deadline law: sibling arms firing cannot push a
+    /// backed-off respawn out. Re-scheduling an already-pending slot
+    /// overwrites the due instant (the inputs are identical, so the
+    /// value is too — last-writer-wins is a no-op).
+    pub(in crate::secondary) fn schedule_worker_restart(&mut self, worker_id: WorkerId) {
+        let delay = self.op_mut().pool.restart_backoff_delay(worker_id);
+        if !delay.is_zero() {
+            // Operator-visible brake engagement: the slot's subprocess
+            // died before Ready (broken worker image / module import
+            // error is the canonical cause), so the respawn waits out a
+            // backoff slot instead of crash-looping at runtime speed.
+            tracing::warn!(
+                worker_id,
+                delay_secs = delay.as_secs_f64(),
+                "worker subprocess died before Ready; backing off its \
+                 respawn (startup-crash backoff — a broken worker image \
+                 would otherwise respawn-crash-loop at runtime speed)"
+            );
+        }
+        let due = std::time::Instant::now() + delay;
+        self.op_mut().pending_worker_restarts.insert(worker_id, due);
+    }
+
+    /// The operational loop's worker-restart wake deadline: the
+    /// EARLIEST stored due instant across the scheduled restarts,
+    /// `None` when nothing is pending (the wake arm parks).
+    pub(in crate::secondary) fn next_worker_restart_due(&self) -> Option<std::time::Instant> {
+        self.op_ref()?
+            .pending_worker_restarts
+            .values()
+            .min()
+            .copied()
     }
 }

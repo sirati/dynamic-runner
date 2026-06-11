@@ -42,6 +42,7 @@ const ARM_FATAL_EXIT: usize = 7;
 const ARM_ANTI_ENTROPY: usize = 8;
 const ARM_SECONDARY_CONTROL: usize = 9;
 const ARM_REPORT_REPLAY: usize = 10;
+const ARM_WORKER_RESTART: usize = 11;
 
 /// Arm names, index-aligned with the `ARM_*` ids above (render order of the
 /// compact stats line).
@@ -57,6 +58,7 @@ const PROCESS_TASKS_ARM_NAMES: &[&str] = &[
     "anti_entropy",
     "secondary_control",
     "report_replay",
+    "worker_restart",
 ];
 
 impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
@@ -116,7 +118,7 @@ where
             std::collections::HashMap::new(),
             primary_link,
             Vec::new(),
-            std::collections::HashSet::new(),
+            std::collections::HashMap::new(),
             std::collections::HashMap::new(),
         );
         self.lifecycle = lifecycle;
@@ -252,8 +254,18 @@ where
             .map(|cell| cell.publish_scoped("secondary", std::sync::Arc::clone(&arm_stats)));
 
         loop {
-            // Workers that need restart after disconnect
-            let mut workers_to_restart: Vec<WorkerId> = Vec::new();
+            // Worker-restart wake deadline: the EARLIEST due instant
+            // across the scheduled slot restarts (None parks the arm —
+            // nothing pending). Same persistent-deadline shape as the
+            // replay arm below: the per-slot due instant is STORED at
+            // schedule time (`schedule_worker_restart`), so the arm's
+            // re-created `sleep_until` always re-targets the same
+            // stored instant — sibling arms firing cannot push a
+            // backed-off respawn out (the watchdog-fires-under-load
+            // law), and a zero-delay (healthy-death) restart is due
+            // immediately, preserving the historical
+            // restart-on-the-same-iteration semantics.
+            let next_restart_due = self.next_worker_restart_due();
 
             // Replay wake deadline: the EARLIEST `next_due` across the
             // retained confirmable reports (None parks the arm —
@@ -315,7 +327,16 @@ where
                             .await;
                         let restart = self.handle_worker_event(event, &oom_watcher).await?;
                         if let Some(wid) = restart {
-                            workers_to_restart.push(wid);
+                            // SCHEDULE, never execute inline: the due
+                            // instant comes from the pool's startup-crash
+                            // backoff (zero for a healthy worker that died
+                            // mid-task — those still restart at this very
+                            // iteration's tail). Executing here at event
+                            // speed was the #370 respawn-crash loop: an
+                            // instantly-dying subprocess re-entered
+                            // kill+spawn per loop iteration and starved
+                            // the whole single-threaded runtime.
+                            self.schedule_worker_restart(wid);
                         }
                     }
                 }
@@ -638,6 +659,25 @@ where
                     arm_stats.record(ARM_REPORT_REPLAY);
                     self.drain_report_replays().await;
                 }
+                // Worker-restart WAKE arm: rouse the loop when the
+                // earliest scheduled slot restart comes due, so the
+                // restart-execution tail below runs it. The body is
+                // deliberately empty — execution lives in exactly one
+                // place (the tail), this arm only defeats the park.
+                // Cancel-safety: `sleep_until` consumes nothing and the
+                // deadline is PERSISTENT per-slot state, so a sibling
+                // arm winning merely re-creates the future against the
+                // SAME stored instant next iteration.
+                _ = async {
+                    match next_restart_due {
+                        Some(due) => {
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await
+                        }
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    arm_stats.record(ARM_WORKER_RESTART);
+                }
             }
 
             // Flush any deferred peer messages — each names a concrete
@@ -759,13 +799,18 @@ where
                 break;
             }
 
-            // Restart workers that disconnected (via the
-            // pool-event channel — typical when a poll_loop
-            // observed pipe-EOF mid-task) OR workers that the
-            // assignment-time paths flagged for respawn (no
-            // poll_loop was running, so no Disconnected event
-            // arrived; the dispatch attempt itself saw the dead
-            // pipe). The two sources are unioned so duplicates are
+            // Execute the DUE scheduled worker restarts — the slots
+            // whose stored deadline has arrived. Sources: the
+            // pool-event arm's disconnect handling (typical when a
+            // poll_loop observed pipe-EOF mid-task) and the
+            // assignment-time paths that flagged a respawn (no
+            // poll_loop was running, so no Disconnected event arrived;
+            // the dispatch attempt itself saw the dead pipe) — both go
+            // through `schedule_worker_restart`, so a healthy worker's
+            // zero-delay entry executes on this very iteration
+            // (historical semantics) while a startup-crashing one
+            // waits out its backoff slot (the #370 brake; the wake arm
+            // above rouses the loop when it comes due). Duplicates are
             // harmless: `restart_worker_async` first stops the slot,
             // which is a no-op on an already-stopped one.
             //
@@ -781,9 +826,16 @@ where
             // the primary (the keepalive-starvation wedge). The repoll
             // therefore rides the Ready arm, NOT a post-restart call here
             // (the slot is not yet assignable when this returns).
-            let mut restart_set: HashSet<WorkerId> = workers_to_restart.into_iter().collect();
-            restart_set.extend(self.op_mut().pending_worker_restarts.drain());
+            let now = std::time::Instant::now();
+            let restart_set: HashSet<WorkerId> = self
+                .op_mut()
+                .pending_worker_restarts
+                .iter()
+                .filter(|(_, due)| **due <= now)
+                .map(|(wid, _)| *wid)
+                .collect();
             for wid in restart_set {
+                self.op_mut().pending_worker_restarts.remove(&wid);
                 // Active SIGKILL before restart so a stuck or
                 // otherwise non-responsive worker is dead BEFORE
                 // the replacement comes up. Prior behaviour relied

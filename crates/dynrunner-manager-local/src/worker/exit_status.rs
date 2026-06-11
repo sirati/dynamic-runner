@@ -156,3 +156,67 @@ pub(crate) fn try_reap_subprocess(pid: Option<u32>) -> Option<WorkerExitStatus> 
 pub(crate) fn try_reap_subprocess(_pid: Option<u32>) -> Option<WorkerExitStatus> {
     None
 }
+
+/// Bounded reap window for [`reap_detached`]: a SIGKILLed child is
+/// normally finalised by the kernel within milliseconds; 5s of 10ms
+/// WNOHANG polls covers a heavily-loaded host without leaving the
+/// blocking-pool thread parked forever on a child that somehow
+/// survives (in which case the give-up WARN names the leak).
+#[cfg(unix)]
+const DETACHED_REAP_BUDGET_MS: u64 = 5_000;
+#[cfg(unix)]
+const DETACHED_REAP_POLL_MS: u64 = 10;
+
+/// Reap a worker child DETACHED from the event flow: bounded WNOHANG
+/// polling on the blocking pool, never on the runtime thread.
+///
+/// The companion to [`try_reap_subprocess`] for the paths where NO
+/// `Disconnected` event will ever fire for the child — the
+/// kill-before-replace edges (`WorkerHandle::kill_subprocess`: the
+/// replacement aborts the poll task, so the killed child's exit is
+/// observed by nobody) and the SIGCHLD-race fallback when the event
+/// path's non-blocking reap returned `None`. Without a reap on those
+/// edges every killed/startup-dead child stays a zombie for the life
+/// of the manager process (the #370 procfs shape).
+///
+/// Best-effort by contract: `ECHILD` (another path — e.g. a Python
+/// factory's own `Popen` bookkeeping — already reaped it) exits
+/// silently; budget exhaustion WARNs with the pid so a genuinely
+/// unkillable child is loud, not a silent zombie.
+#[cfg(unix)]
+pub(crate) fn reap_detached(worker_id: dynrunner_core::WorkerId, pid: u32) {
+    tokio::task::spawn_blocking(move || {
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+        use nix::unistd::Pid;
+        let target = Pid::from_raw(pid as i32);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(DETACHED_REAP_BUDGET_MS);
+        loop {
+            match waitpid(target, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) => {
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            worker_id,
+                            pid,
+                            "detached reap gave up: worker child still not \
+                             reapable after the bounded window (possible \
+                             zombie leak)"
+                        );
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(DETACHED_REAP_POLL_MS));
+                }
+                Ok(status) => {
+                    tracing::debug!(worker_id, pid, ?status, "detached reap: worker child reaped");
+                    return;
+                }
+                // ECHILD: already reaped elsewhere (factory-owned Child
+                // drop, a racing event-path reap). Goal satisfied.
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+pub(crate) fn reap_detached(_worker_id: dynrunner_core::WorkerId, _pid: u32) {}
