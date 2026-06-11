@@ -275,10 +275,21 @@ impl<I: Identifier> PendingPool<I> {
 
     /// Return the union of every task_id the pool currently knows
     /// about (queued in any bucket, blocked waiting on prereqs,
-    /// completed, or failed). Used by `extend`'s duplicate-id check
-    /// and by the sibling `partition_ingest` (`partition.rs`) for its
-    /// phase-less terminal/in-flight fallback — `pub(super)` so the two
+    /// completed, failed, soft-failed, dormant, or in flight). Used by
+    /// `extend`'s duplicate-id check and by the sibling
+    /// `partition_ingest` (`partition.rs`) for its phase-less
+    /// terminal/in-flight fallback — `pub(super)` so the two
     /// well-formedness policies share one collector.
+    ///
+    /// `soft_failed` and `dormant_tasks` membership counts as KNOWN: a
+    /// retry-pending or dormant root is a real task identity the pool
+    /// tracks — its id left the bucket/in-flight sets on its terminal,
+    /// but a dependent referencing it must land in `blocked` (awaiting
+    /// the drain-edge / operator revival decision), not fail
+    /// `UnknownTaskDep`. Neither set enters `commit_item`'s
+    /// pre-resolution (the dep stays unresolved) nor its extend-time
+    /// cascade (the failure is not permanent), so "known" is their ONLY
+    /// extend-side effect.
     pub(super) fn collect_known_task_ids(&self) -> HashSet<String> {
         let mut out: HashSet<String> = HashSet::new();
         for bucket in self.buckets.values() {
@@ -293,6 +304,12 @@ impl<I: Identifier> PendingPool<I> {
             out.insert(id.clone());
         }
         for id in &self.failed_tasks {
+            out.insert(id.clone());
+        }
+        for id in self.soft_failed.keys() {
+            out.insert(id.clone());
+        }
+        for id in &self.dormant_tasks {
             out.insert(id.clone());
         }
         for id in &self.in_flight_tasks {

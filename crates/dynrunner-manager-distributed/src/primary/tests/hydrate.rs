@@ -132,73 +132,111 @@ fn hydrate_seeds_completed_deps_so_dependents_enter_pool() {
 }
 
 /// (1b) An `InvalidTask` terminal prereq plus a `Pending` dependent
-/// whose `task_depends_on` references it. `InvalidTask` is treated as
-/// terminal by hydration: its `task_id` seeds `mark_tasks_completed`
-/// (so the dependent's dep resolves and it enters the pool) and its
-/// hash is recorded in the primary-side completed ledger (so it is not
-/// re-queued). The non-reinjectable terminal entry stays in the CRDT.
-#[test]
-fn hydrate_treats_invalid_task_as_terminal_dep_seed() {
-    let (transport, _ends) = setup_test(1);
-    let (mut primary, _mesh) = build_test_primary(
-        PrimaryConfig::default(),
-        transport,
-        ResourceStealingScheduler::memory(),
-        FixedEstimator(100),
-    );
+/// whose `task_depends_on` references it. A structurally-dead root
+/// dooms its dependents like a `NonRecoverable` one (the
+/// `apply_tasks_spawned` cascade-fail classification): hydration seeds
+/// it into the pool's retry-pending marker — the dependent's dep
+/// RESOLVES (no `UnknownTaskDep`) but lands BLOCKED, never
+/// dispatchable — and the resume cascade's drain edge finalizes the
+/// root (no bucket can revive an `InvalidTask`: its hash is not in the
+/// kind ledger), cascade-failing the dependent with the accounted
+/// `upstream-failed` terminal. The non-reinjectable root entry stays
+/// in the CRDT; its hash is recorded in the primary-side completed
+/// ledger for the run-completion counter (not re-queued).
+#[tokio::test(flavor = "current_thread")]
+async fn hydrate_invalid_task_root_blocks_then_dooms_dependent() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
-    let toolchain = dep_binary("toolchain", "build", &[]);
-    let dep_a = dep_binary("dep-a", "compile", &["toolchain"]);
+            let toolchain = dep_binary("toolchain", "build", &[]);
+            let dep_a = dep_binary("dep-a", "compile", &["toolchain"]);
+            let dep_hash = compute_task_hash(&dep_a);
 
-    {
-        let cs = primary.cluster_state_mut_for_test();
-        cs.apply(ClusterMutation::PhaseDepsSet {
-            deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
-        });
-        cs.apply(ClusterMutation::TaskAdded {
-            hash: "toolchain".into(),
-            task: toolchain.clone(),
-        });
-        // Drive `toolchain` to terminal InvalidTask.
-        cs.apply(ClusterMutation::TaskFailed {
-            attempt: 0,
-            hash: "toolchain".into(),
-            kind: dynrunner_core::ErrorType::InvalidTask {
-                reason: "missing upstream".to_string().into(),
-            },
-            error: "invalid_task:missing upstream".into(),
-            version: Default::default(),
-        });
-        cs.apply(ClusterMutation::TaskAdded {
-            hash: "dep-a".into(),
-            task: dep_a.clone(),
-        });
-    }
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: "toolchain".into(),
+                    task: toolchain.clone(),
+                });
+                // Drive `toolchain` to terminal InvalidTask.
+                cs.apply(ClusterMutation::TaskFailed {
+                    attempt: 0,
+                    hash: "toolchain".into(),
+                    kind: dynrunner_core::ErrorType::InvalidTask {
+                        reason: "missing upstream".to_string().into(),
+                    },
+                    error: "invalid_task:missing upstream".into(),
+                    version: Default::default(),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: dep_hash.clone(),
+                    task: dep_a.clone(),
+                });
+            }
 
-    primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state();
 
-    // The dependent entered the pool — the InvalidTask prereq seeded
-    // `completed_task_ids`, so `extend()` accepted it without an
-    // `UnknownTaskDep` rejection.
-    let pool = primary.pool();
-    let ids: std::collections::HashSet<&str> = pool.iter().map(|t| t.task_id.as_str()).collect();
-    assert!(
-        ids.contains("dep-a"),
-        "dependent of an InvalidTask prereq must enter the pool"
-    );
-    assert!(
-        !ids.contains("toolchain"),
-        "the terminal InvalidTask prereq is not re-queued"
-    );
-    // The terminal InvalidTask hash is recorded in the primary-side
-    // completed ledger.
-    assert!(primary.completed_tasks.contains("toolchain"));
-    // The InvalidTask entry itself stays in the CRDT (non-reinjectable).
-    assert!(matches!(
-        primary.cluster_state_for_test().task_state("toolchain"),
-        Some(crate::cluster_state::TaskState::InvalidTask { .. })
-    ));
-    assert_eq!(primary.total_tasks, 2);
+            // The dependent's dep RESOLVED (no `UnknownTaskDep` pool
+            // wipe-out) but it is BLOCKED — a structurally-dead prereq
+            // must never make its dependents dispatchable.
+            let pool = primary.pool();
+            let ids: std::collections::HashSet<&str> =
+                pool.iter().map(|t| t.task_id.as_str()).collect();
+            assert!(
+                !ids.contains("dep-a"),
+                "dependent of an InvalidTask prereq must NOT be dispatchable"
+            );
+            assert!(
+                !ids.contains("toolchain"),
+                "the terminal InvalidTask prereq is not re-queued"
+            );
+            assert_eq!(pool.blocked_len(), 1, "the dependent hydrates BLOCKED");
+            // The terminal InvalidTask hash is recorded in the primary-side
+            // completed ledger (run-completion accounting slot).
+            assert!(primary.completed_tasks.contains("toolchain"));
+            // The InvalidTask entry itself stays in the CRDT (non-reinjectable).
+            assert!(matches!(
+                primary.cluster_state_for_test().task_state("toolchain"),
+                Some(crate::cluster_state::TaskState::InvalidTask { .. })
+            ));
+            assert_eq!(primary.total_tasks, 2);
+
+            // Resume cascade: the drain edge finalizes the dead root and
+            // dooms the dependent through the standard upstream-failed
+            // cascade — accounted, so the run can complete.
+            primary.fire_initial_phase_starts();
+            primary.pool_mut().drain_empty_active_phases();
+            primary.process_phase_lifecycle(&mut None).await;
+
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&dep_hash),
+                    Some(crate::cluster_state::TaskState::Failed {
+                        kind: dynrunner_core::ErrorType::NonRecoverable,
+                        ..
+                    })
+                ),
+                "the dependent of a structurally-dead root is cascade-failed"
+            );
+            assert!(primary.failed_tasks.contains_key(&dep_hash));
+            assert_eq!(
+                primary.completed_tasks.len() + primary.failed_tasks.len(),
+                primary.total_tasks,
+                "every task terminal — run accounting closes"
+            );
+        })
+        .await;
 }
 
 /// (2) A single `InFlight` task. After hydration the dispatch/recheck
@@ -1274,7 +1312,9 @@ fn hydrate_does_not_seed_done_without_phase_ended_fact() {
          through the cascade"
     );
     assert!(
-        !primary.phase_started_emitted.contains(&PhaseId::from("build")),
+        !primary
+            .phase_started_emitted
+            .contains(&PhaseId::from("build")),
         "a skip is a spawn-time terminal, not activation evidence — the \
          started set must not contain the fresh all-skipped phase, so its \
          first on_phase_start fires before its first on_phase_end"
@@ -1429,6 +1469,404 @@ async fn hydrate_cold_seed_does_not_seed_any_phase_done() {
                      cold-start cascade"
                 );
             }
+        })
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// Per-class terminal-FAILURE dep seeding (fix/hydrate-failed-deps).
+//
+// The replicated ledger's terminal classes carry DIFFERENT dependency
+// semantics (the same classification `apply_tasks_spawned` applies to a
+// freshly-spawned dependent):
+//   * Completed / SkippedAlreadyDone — satisfies dependents' deps.
+//   * Failed { any kind }            — the retry decision is pending at the
+//     phase's drain edge: dependents stay BLOCKED; the drain edge's buckets
+//     either revive the root (`reinject`) or `finalize_soft_failures`
+//     cascade-fails the dependents with the canonical `upstream-failed`
+//     terminal — the SAME path the live primary takes.
+//   * Unfulfillable                  — operator-reinjectable dormancy:
+//     dependents stay BLOCKED, nothing is doomed, the run holds open.
+//   * InvalidTask                    — structurally-dead root: dependents
+//     cascade-fail (`upstream-failed`), like a NonRecoverable root.
+//
+// Pre-fix, hydrate routed EVERY terminal task_id into the dep-resolution
+// COMPLETED seed, so after a failover the dependents of a terminally-FAILED
+// task became DISPATCHABLE (their dep read satisfied) and ran against
+// outputs that were never produced.
+// ---------------------------------------------------------------------------
+
+/// HEADLINE (RED→GREEN): `A` is `Failed { NonRecoverable }` in the inherited
+/// CRDT; `B` (Pending) declares `task_depends_on = [A]`. Pre-fix, hydrate
+/// seeded A's task_id into `mark_tasks_completed` and B became DISPATCHABLE.
+/// Post-fix B hydrates BLOCKED, and the resume cascade (the `run_pipeline`
+/// pre-loop shape) reaches A's phase drain edge where the buckets decline
+/// (NonRecoverable matches none) and `finalize_phase_soft_failures` dooms B
+/// through the EXACT live-path machinery: a broadcast
+/// `TaskFailed { NonRecoverable, "upstream-failed: …" }`, accounted in the
+/// hash-keyed `failed_tasks` ledger.
+#[tokio::test(flavor = "current_thread")]
+async fn hydrate_failed_final_root_dooms_dependents_via_finalize_cascade() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let a = dep_binary("toolchain", "build", &[]);
+            let b = dep_binary("dep-a", "compile", &["toolchain"]);
+            let a_hash = compute_task_hash(&a);
+            let b_hash = compute_task_hash(&b);
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: a_hash.clone(),
+                    task: a.clone(),
+                });
+                cs.apply(ClusterMutation::TaskFailed {
+                    attempt: 0,
+                    hash: a_hash.clone(),
+                    kind: dynrunner_core::ErrorType::NonRecoverable,
+                    error: "exit 1".into(),
+                    version: Default::default(),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: b_hash.clone(),
+                    task: b.clone(),
+                });
+            }
+
+            primary.hydrate_from_cluster_state();
+
+            // A FAILED terminal must NOT satisfy dependents' deps: B is
+            // NOT dispatchable (pre-fix it was queued), it waits BLOCKED
+            // for the drain edge's retry-or-cascade decision.
+            let queued: Vec<&str> = primary.pool().iter().map(|t| t.task_id.as_str()).collect();
+            assert!(
+                !queued.contains(&"dep-a"),
+                "dependent of a FAILED prereq must not be dispatchable \
+                 after hydrate; queued = {queued:?}"
+            );
+            assert_eq!(
+                primary.pool().blocked_len(),
+                1,
+                "the dependent hydrates BLOCKED, awaiting the drain edge"
+            );
+
+            // Resume cascade: the same pre-loop sequence `run_pipeline`
+            // drives after hydrate.
+            primary.fire_initial_phase_starts();
+            primary.pool_mut().drain_empty_active_phases();
+            primary.process_phase_lifecycle(&mut None).await;
+
+            // B was cascade-failed exactly as the live path would have:
+            // the canonical upstream-failed NonRecoverable terminal,
+            // replicated AND accounted.
+            match primary.cluster_state_for_test().task_state(&b_hash) {
+                Some(crate::cluster_state::TaskState::Failed {
+                    kind: dynrunner_core::ErrorType::NonRecoverable,
+                    last_error,
+                    ..
+                }) => {
+                    assert!(
+                        last_error.contains("upstream-failed"),
+                        "cascaded dependent carries the canonical \
+                         upstream-failed shape; got {last_error:?}"
+                    );
+                }
+                other => panic!(
+                    "dependent of a final-failed root must be cascade-failed \
+                     NonRecoverable after the resume cascade; got {other:?}"
+                ),
+            }
+            assert!(
+                primary.failed_tasks.contains_key(&b_hash),
+                "the cascaded dependent is accounted in the hash-keyed ledger"
+            );
+            assert_eq!(primary.pool().blocked_len(), 0, "no dependent stranded");
+            // Run accounting closes: every task terminal.
+            assert_eq!(
+                primary.completed_tasks.len() + primary.failed_tasks.len(),
+                primary.total_tasks,
+                "completed + failed must reach total — the run can complete"
+            );
+        })
+        .await;
+}
+
+/// A `Failed { Recoverable }` root with retry budget REMAINING re-enters the
+/// retry flow at its phase's drain edge: the Recoverable bucket reinjects it
+/// (CRDT `Failed → Pending { attempt+1 }` via `TaskRetried`) and its
+/// dependent stays BLOCKED — NOT doomed, NOT dispatchable — until the
+/// retry resolves. Pre-fix the dependent dispatched immediately.
+#[tokio::test(flavor = "current_thread")]
+async fn hydrate_failed_retryable_root_reenters_retry_flow_dependent_blocked() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig::default(), // retry_max_passes = 1: budget remains
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let a = dep_binary("toolchain", "build", &[]);
+            let b = dep_binary("dep-a", "compile", &["toolchain"]);
+            let a_hash = compute_task_hash(&a);
+            let b_hash = compute_task_hash(&b);
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: a_hash.clone(),
+                    task: a.clone(),
+                });
+                cs.apply(ClusterMutation::TaskFailed {
+                    attempt: 0,
+                    hash: a_hash.clone(),
+                    kind: dynrunner_core::ErrorType::Recoverable,
+                    error: "transient".into(),
+                    version: Default::default(),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: b_hash.clone(),
+                    task: b.clone(),
+                });
+            }
+
+            primary.hydrate_from_cluster_state();
+            assert_eq!(
+                primary.pool().blocked_len(),
+                1,
+                "the dependent hydrates BLOCKED (not dispatchable)"
+            );
+
+            primary.fire_initial_phase_starts();
+            primary.pool_mut().drain_empty_active_phases();
+            primary.process_phase_lifecycle(&mut None).await;
+
+            // The root re-entered the retry flow: reinjected (queued) and
+            // reset in the CRDT (`TaskRetried` → Pending, attempt bumped).
+            let queued: Vec<&str> = primary.pool().iter().map(|t| t.task_id.as_str()).collect();
+            assert!(
+                queued.contains(&"toolchain"),
+                "the retryable root must be reinjected by the Recoverable \
+                 bucket; queued = {queued:?}"
+            );
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&a_hash),
+                    Some(crate::cluster_state::TaskState::Pending { attempt: 1, .. })
+                ),
+                "the CRDT retry reset moves the root Failed → Pending(attempt 1)"
+            );
+            // The dependent is neither doomed nor dispatchable: still
+            // BLOCKED, awaiting the retry's outcome.
+            assert_eq!(primary.pool().blocked_len(), 1);
+            assert!(
+                !primary.failed_tasks.contains_key(&b_hash),
+                "the dependent must NOT be cascade-failed while the retry \
+                 budget can still revive its prereq"
+            );
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&b_hash),
+                    Some(crate::cluster_state::TaskState::Pending { .. })
+                ),
+                "the dependent's CRDT entry stays live"
+            );
+        })
+        .await;
+}
+
+/// A `Failed { Recoverable }` root whose replicated retry budget is already
+/// EXHAUSTED (`retry_max_passes = 0`) behaves like a final root: the bucket
+/// declines, finalize promotes, and the dependent is cascade-failed with the
+/// upstream-failed terminal — the budget decision replays identically on the
+/// promoted primary (no re-granted retries).
+#[tokio::test(flavor = "current_thread")]
+async fn hydrate_failed_retryable_budget_exhausted_dooms_dependent() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let config = PrimaryConfig {
+                retry_max_passes: 0,
+                ..PrimaryConfig::default()
+            };
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let a = dep_binary("toolchain", "build", &[]);
+            let b = dep_binary("dep-a", "compile", &["toolchain"]);
+            let a_hash = compute_task_hash(&a);
+            let b_hash = compute_task_hash(&b);
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: a_hash.clone(),
+                    task: a.clone(),
+                });
+                cs.apply(ClusterMutation::TaskFailed {
+                    attempt: 0,
+                    hash: a_hash.clone(),
+                    kind: dynrunner_core::ErrorType::Recoverable,
+                    error: "transient".into(),
+                    version: Default::default(),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: b_hash.clone(),
+                    task: b.clone(),
+                });
+            }
+
+            primary.hydrate_from_cluster_state();
+            primary.fire_initial_phase_starts();
+            primary.pool_mut().drain_empty_active_phases();
+            primary.process_phase_lifecycle(&mut None).await;
+
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&b_hash),
+                    Some(crate::cluster_state::TaskState::Failed {
+                        kind: dynrunner_core::ErrorType::NonRecoverable,
+                        ..
+                    })
+                ),
+                "with the budget exhausted the dependent is doomed exactly \
+                 like a final-failed root's"
+            );
+            assert_eq!(
+                primary.completed_tasks.len() + primary.failed_tasks.len(),
+                primary.total_tasks
+            );
+        })
+        .await;
+}
+
+/// An `Unfulfillable` root keeps the operator-reinjectable DORMANCY
+/// contract across hydrate: its dependent stays BLOCKED (neither
+/// dispatchable nor doomed), the root's phase proceeds, the dependent's
+/// phase holds the run open, and an operator reinject revives the root.
+#[tokio::test(flavor = "current_thread")]
+async fn hydrate_unfulfillable_root_keeps_dependent_blocked_dormant() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let a = dep_binary("toolchain", "build", &[]);
+            let b = dep_binary("dep-a", "compile", &["toolchain"]);
+            let a_hash = compute_task_hash(&a);
+            let b_hash = compute_task_hash(&b);
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: a_hash.clone(),
+                    task: a.clone(),
+                });
+                cs.apply(ClusterMutation::TaskFailed {
+                    attempt: 0,
+                    hash: a_hash.clone(),
+                    kind: dynrunner_core::ErrorType::Unfulfillable {
+                        reason: "toolchain outpath not staged".to_string().into(),
+                    },
+                    error: "unfulfillable".into(),
+                    version: Default::default(),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: b_hash.clone(),
+                    task: b.clone(),
+                });
+            }
+
+            primary.hydrate_from_cluster_state();
+
+            let queued: Vec<&str> = primary.pool().iter().map(|t| t.task_id.as_str()).collect();
+            assert!(
+                !queued.contains(&"dep-a"),
+                "dependent of an Unfulfillable prereq must not dispatch; \
+                 queued = {queued:?}"
+            );
+            assert_eq!(primary.pool().blocked_len(), 1);
+
+            primary.fire_initial_phase_starts();
+            primary.pool_mut().drain_empty_active_phases();
+            primary.process_phase_lifecycle(&mut None).await;
+
+            // DORMANCY: nothing is doomed, the dependent stays blocked,
+            // the run is held open (not complete), the root entry stays
+            // Unfulfillable (reinjectable).
+            assert_eq!(
+                primary.pool().blocked_len(),
+                1,
+                "the dependent stays BLOCKED through the cascade — dormancy"
+            );
+            assert!(
+                !primary.failed_tasks.contains_key(&b_hash),
+                "no upstream-failed cascade for an Unfulfillable root"
+            );
+            assert!(matches!(
+                primary.cluster_state_for_test().task_state(&a_hash),
+                Some(crate::cluster_state::TaskState::Unfulfillable { .. })
+            ));
+            assert!(
+                !primary.pool().is_run_complete(),
+                "dormancy holds the run open until the operator decides"
+            );
+
+            // REVIVAL: the operator reinject command (the SAME live seam,
+            // through the command-channel chokepoint) moves the root back
+            // into the pool; the dependent stays blocked on it until it
+            // actually completes.
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            crate::primary::command_channel::handle_primary_command(
+                &mut primary,
+                crate::primary::command_channel::PrimaryCommand::ReinjectTask {
+                    hash: a_hash.clone(),
+                    reply: reply_tx,
+                },
+                &mut None,
+            )
+            .await;
+            reply_rx
+                .await
+                .expect("reply delivered")
+                .expect("operator reinject of the dormant root accepts");
+            let queued: Vec<&str> = primary.pool().iter().map(|t| t.task_id.as_str()).collect();
+            assert!(
+                queued.contains(&"toolchain"),
+                "the reinjected root is dispatchable again; queued = {queued:?}"
+            );
+            assert_eq!(primary.pool().blocked_len(), 1);
         })
         .await;
 }
