@@ -441,6 +441,7 @@ async fn degraded_failover_fails_loud_instead_of_self_promoting() {
 #[tokio::test(flavor = "current_thread")]
 async fn mesh_formed_after_watchdog_elapse_restores_failover_path() {
     use super::super::election::ElectionState;
+    use dynrunner_protocol_primary_secondary::{ClusterMutation, PrimaryChangeReason};
     let _ = tracing_subscriber::fmt::try_init();
 
     let (mut secondary, mut sec_to_pri_rx) = arm_watchdog_no_peers("sec-late", 10);
@@ -449,6 +450,16 @@ async fn mesh_formed_after_watchdog_elapse_restores_failover_path() {
     // budget. Read live by `run_election_tick` on every tick.
     secondary.config.primary_silence_backstop = Duration::from_millis(100);
     secondary.enter_operational_for_test();
+    // A real primary identity (the production run had one): the
+    // Suspecting entry's `TimeoutQuery` names the silent primary, so
+    // `current_primary()` must resolve. "setup" is the id the harness
+    // folds the primary channel under, so `Destination::Primary`
+    // egress (the MeshReady report) keeps landing on `sec_to_pri_rx`.
+    secondary.cluster_state.apply(ClusterMutation::PrimaryChanged {
+        new: "setup".into(),
+        epoch: 1,
+        reason: PrimaryChangeReason::Election,
+    });
 
     // 1. The verdict: deadline elapsed with zero alive secondaries →
     //    degraded latched + MeshReady(peer_count=0) (the

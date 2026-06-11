@@ -1,11 +1,18 @@
-//! Peer-mesh-formation watchdog and the idempotent `MeshReady` reporter.
+//! Peer-mesh-formation watchdog, the CONTINUOUS formation supervision,
+//! and the idempotent `MeshReady` reporter.
 //!
-//! Single concern: decide whether the peer mesh formed within the
-//! one-shot watchdog deadline and tell the primary the answer exactly
-//! once (mesh formed, mesh degraded, or no peers expected). The full
-//! degraded-mode contract is documented on
-//! `SecondaryCoordinator::peer_mesh_degraded`; this module owns only
-//! the detection + first-report side.
+//! Single concern: own the secondary's mesh-FORMATION verdict. The
+//! watchdog decides whether the peer mesh formed within the deadline
+//! and tells the primary the answer exactly once (mesh formed, mesh
+//! degraded, or no peers expected). The verdict is NOT terminal:
+//! formation is a supervised, continuous concern — the transport's
+//! reconnect ticker keeps re-dialing roster legs for the life of the
+//! process (never-formed legs included), so the degraded latch is
+//! re-evaluated on every keepalive tick and clears when the mesh
+//! forms late (with a throttled WARN while the fault persists). The
+//! full degraded-mode contract is documented on
+//! `SecondaryCoordinator::peer_mesh_degraded`; this module owns the
+//! detection + first-report + supervision side.
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
@@ -22,12 +29,15 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    /// One-shot watchdog: 30s after `connect_to_peers` fired with a
-    /// non-empty peer list, decide whether the peer mesh formed.
-    /// Self-healing if the mesh forms before the deadline (an alive
-    /// secondary suppresses the fault) or partially forms after the
-    /// deadline (any incoming peer connection clears `peer_mesh_check_at`,
-    /// no fault).
+    /// Formation watchdog + continuous supervision: 30s after
+    /// `connect_to_peers` fired with a non-empty peer list, decide
+    /// whether the peer mesh formed — then KEEP SUPERVISING the
+    /// verdict for the life of the process. Self-healing if the mesh
+    /// forms before the deadline (an alive secondary suppresses the
+    /// fault), partially forms after the deadline (any incoming peer
+    /// connection clears `peer_mesh_check_at`, no fault), or forms
+    /// FULLY LATE (the degraded supervision below clears the latch on
+    /// the first alive peer-secondary).
     ///
     /// "How many peers connected" is the role-aware
     /// [`SecondaryCoordinator::alive_secondary_count`] — alive secondaries
@@ -52,7 +62,9 @@ where
     ///      operational dispatch (over WSS, not the peer mesh) can
     ///      flow. Without this the whole run blocks on the missing
     ///      mesh signal.
-    ///   3. `peer_mesh_check_at = None` so the watchdog is one-shot.
+    ///   3. `peer_mesh_check_at = None` so the DEADLINE is one-shot —
+    ///      but the verdict is not: the degraded-supervision branch
+    ///      keeps re-evaluating the latch every tick (see below).
     ///
     /// Why not fatal? Operational dispatch primary→secondary uses
     /// WSS, not the QUIC peer mesh. If no failover is ever needed
@@ -78,22 +90,79 @@ where
     /// `cluster_state.apply(RunComplete)` site, so call sites stay
     /// agnostic to peer-mesh policy.
     pub(in crate::secondary) async fn check_peer_mesh_watchdog(&mut self) {
-        let deadline = match self.mesh.peer_mesh_check_at {
-            Some(d) => d,
-            None => return,
-        };
         if self.cluster_state.run_complete() || self.cluster_state.run_aborted().is_some() {
             // Run is over — completed cleanly OR aborted cluster-wide.
             // Either way the mesh fault has nothing to report:
             // failover and inter-secondary keepalive paths have nothing
             // left to guard once the run is terminating. Disarm so
-            // subsequent ticks are no-ops. (`run_aborted` is the
-            // failure twin of `run_complete`; both terminate the run,
-            // so both disarm the watchdog — single source of truth here
-            // rather than at every apply site.)
+            // subsequent ticks are no-ops (this also silences the
+            // degraded supervision below during teardown).
+            // (`run_aborted` is the failure twin of `run_complete`;
+            // both terminate the run, so both disarm the watchdog —
+            // single source of truth here rather than at every apply
+            // site.)
             self.mesh.peer_mesh_check_at = None;
             return;
         }
+        // ── Continuous formation supervision (post-verdict). ──
+        // The deadline verdict below is NOT terminal: the transport's
+        // reconnect ticker keeps re-dialing every roster leg for the
+        // life of the process (never-formed legs included — the
+        // tracker reconciliation against `peer_dial_info` is the ONE
+        // owner of "this leg should exist but doesn't, keep trying"),
+        // so the mesh can form long AFTER the watchdog elapsed. The
+        // production failure this closes (run_20260611_200548): under
+        // uncapped startup load every initial dial lost, the verdict
+        // latched `degraded`, and the latch was PERMANENT — when real
+        // primary silence tripped minutes later, a since-healable mesh
+        // still read "peer mesh required for failover but not
+        // available" and 6 of 11 secondaries fatal-exited. Formation
+        // is a supervised, continuous concern: re-evaluate the latch
+        // on every keepalive tick.
+        //
+        //  - First alive peer-secondary observed (the same role-aware
+        //    `alive_secondary_count` the verdict used): the mesh HAS
+        //    formed — clear the latch (INFO names the transition) so
+        //    the failover election and every other degraded-gated
+        //    consumer get their paths back. The "zero peers EVER
+        //    meshed" semantics consumers rely on are preserved: the
+        //    latch clears exactly when a peer first IS alive, never on
+        //    a formed-then-died mesh (that is the lone-survivor path,
+        //    not degraded).
+        //  - Still zero: stay degraded, but LOUD — a throttled WARN
+        //    (once per `DEGRADED_MESH_WARN_INTERVAL`, never per tick)
+        //    keeps the fault visible while the transport retries.
+        //
+        // `mesh_ready_sent` is deliberately untouched: the settled
+        // report to the primary stays once-per-primary-identity; this
+        // supervision changes only the local capability verdict.
+        if self.mesh.degraded {
+            let connected = self.alive_secondary_count();
+            if connected > 0 {
+                self.mesh.degraded = false;
+                tracing::info!(
+                    alive_secondaries = connected,
+                    expected = self.mesh.peer_dial_count,
+                    "peer mesh formed after the watchdog deadline — degraded \
+                     latch cleared; failover and inter-secondary keepalive \
+                     paths restored"
+                );
+            } else if let Some(suppressed) = self.mesh.degraded_warn.permit() {
+                tracing::warn!(
+                    expected = self.mesh.peer_dial_count,
+                    suppressed_since_last_warn = suppressed,
+                    "peer mesh still empty (zero alive secondaries) — \
+                     failover remains unavailable; the transport keeps \
+                     re-dialing and this verdict is re-evaluated every \
+                     keepalive tick"
+                );
+            }
+            return;
+        }
+        let deadline = match self.mesh.peer_mesh_check_at {
+            Some(d) => d,
+            None => return,
+        };
         // Role-aware alive-secondary count over GLOBAL STATE — the
         // watchdog asks "did the peer-SECONDARY mesh form?", so it counts
         // alive secondaries (`alive_secondary_count`: peers that POSITIVELY
