@@ -199,6 +199,46 @@ impl PyObserverLateJoiner {
                                 ObserverConfig::DEFAULT_FLEET_DEATH_PRESUMPTION,
                         };
 
+                        // 4b. Gateway mode: arm the per-LEG forward-recovery
+                        //     trigger (#419). The transport's 5s reconnect
+                        //     ticker re-dials each rewritten
+                        //     `127.0.0.1:<local_port>` endpoint, but a single
+                        //     dead `ssh -L` child leaves that endpoint
+                        //     permanently un-connectable — the ticker redials a
+                        //     hole forever (the run-level lost-visibility
+                        //     trigger never fires while the OTHER legs keep the
+                        //     observer Visible). Subscribe the transport's
+                        //     persistent-dial-failure signal and drive the
+                        //     SAME gated forward rebuild the lost-visibility
+                        //     path uses, but for the ONE undialable peer. The
+                        //     transport reports a peer id; the registry decides
+                        //     "id → forward → rebuild" (unknown ids — peers that
+                        //     joined post-bootstrap — are named-and-skipped by
+                        //     the reconnector). Set on the bare `peer_network`
+                        //     BEFORE it is consumed into the mesh below.
+                        if let Some(runtime) = &gateway_runtime {
+                            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            peer_network.notify_persistent_dial_failures(tx);
+                            let reconnector = dynrunner_slurm::LocalForwardTunnelReconnector::new(
+                                runtime.tunnels.clone(),
+                            );
+                            // Per-leg recovery pump: drain undialable-peer ids
+                            // and rebuild each one's forward through the SHARED
+                            // registry (same liveness gate + escalation state as
+                            // the observer's all-legs reconnector — both hold the
+                            // same `Arc<LocalForwardTunnels>`, so a still-alive
+                            // child is never rebuilt twice). Exits when the
+                            // channel closes (the transport — owned by the Node
+                            // below — drops at run end), so it is bound to the
+                            // run lifetime without a separate teardown lever.
+                            tokio::task::spawn_local(async move {
+                                use dynrunner_manager_distributed::observer::TunnelReconnector;
+                                while let Some(peer_id) = rx.recv().await {
+                                    reconnector.reconnect(std::slice::from_ref(&peer_id)).await;
+                                }
+                            });
+                        }
+
                         // 5. Wrap the live mesh transport (the bootstrap
                         //    rendezvous above already ran on the bare
                         //    `peer_network`, before it is consumed here) in the

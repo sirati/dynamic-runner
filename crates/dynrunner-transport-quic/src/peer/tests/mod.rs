@@ -42,6 +42,11 @@
 //!   scenario (~450 lines, intentionally one file: the multi-phase
 //!   setup/partition/drain/heal pump cannot be cleanly chopped
 //!   without scattering the test's invariants).
+//! - [`persistent_dial_failure_trigger`]: the per-leg forward-recovery
+//!   trigger (#419) — a dial-owned peer that keeps failing past the
+//!   dial-summary boundary publishes its id on the
+//!   `notify_persistent_dial_failures` sink (throttled to the summary
+//!   cadence); silent for connected and non-dial-owned peers.
 //! - [`member_leg_redial`]: the half-open member↔member leg heal
 //!   (run_20260610_221140 / BUG 3.3) — the non-dial-owner's
 //!   `RedialRequest` nudges the dial owner to force-prune + re-dial,
@@ -67,6 +72,7 @@ mod late_joiner_forward;
 mod log_capture;
 mod member_leg_redial;
 mod oversize_snapshot_chunking;
+mod persistent_dial_failure_trigger;
 mod primary_link;
 mod reader_exit_disconnect;
 mod recv_lifetime;
