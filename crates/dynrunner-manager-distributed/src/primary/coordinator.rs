@@ -17,7 +17,7 @@ use super::config::{OnCustomMessage, OnPhaseEnd, OnPhaseStart, PhaseHookRaiseLat
 use super::error::RunError;
 use super::preferred_secondaries;
 use super::respawn::{
-    RespawnBudget, RespawnOutcome, RespawnRequest, SecondarySpawner, respawn_dispatcher_listener,
+    RespawnBudget, RespawnOutcome, SecondarySpawner, respawn_dispatcher_listener,
 };
 
 use crate::cluster_state::{ClusterState, OutcomeSummary};
@@ -909,7 +909,7 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// deployment layer (multi-process / SLURM). `None` disables the
     /// respawn pipeline at construction; the operational `select!`
     /// arm short-circuits (no dispatcher listener registered, no
-    /// `respawn_request_rx` to poll). The trait object is `Send +
+    /// `respawn_lifecycle_rx` to poll). The trait object is `Send +
     /// Sync` so the operational arm can clone the `Arc` across
     /// `spawn_local` boundaries.
     pub(super) respawn_spawner: Option<Arc<dyn SecondarySpawner>>,
@@ -932,11 +932,15 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     pub(super) tunnel_reconnector: crate::observer::ReconnectorHandle,
 
     /// Sender side of the dispatcher → operational-loop respawn
-    /// request channel. Cloned into the registered listener at
-    /// `run()` start so synchronous `on_event` calls have a place
-    /// to enqueue. Held as `Option` so the channel is only
-    /// constructed when the respawn policy is enabled (avoids an
-    /// idle channel sitting on every coordinator).
+    /// lifecycle channel (carries the full
+    /// [`crate::peer_lifecycle::PeerLifecycleEvent`] stream:
+    /// `Removed` drives spawn requests, `Added` drives the
+    /// pending-replacement reconciliation). Cloned into the
+    /// registered listener at `run()` start so synchronous
+    /// `on_event` calls have a place to enqueue. Held as `Option`
+    /// so the channel is only constructed when the respawn policy
+    /// is enabled (avoids an idle channel sitting on every
+    /// coordinator).
     ///
     /// Unbounded shape so the synchronous lifecycle-dispatcher
     /// `on_event` arm never blocks and never drops: mass-death-grace
@@ -944,14 +948,29 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// enqueue every death; the total-budget cap on
     /// `RespawnBudget::max_total` is what bounds the memory cost in
     /// practice (the operational loop reject-accepts beyond it).
-    pub(super) respawn_request_tx: Option<tokio::sync::mpsc::UnboundedSender<RespawnRequest>>,
+    pub(super) respawn_lifecycle_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::peer_lifecycle::PeerLifecycleEvent>>,
 
     /// Receiver side of the dispatcher → operational-loop respawn
-    /// request channel. Taken out for the duration of the
+    /// lifecycle channel. Taken out for the duration of the
     /// operational loop, the same shape as `command_rx` /
     /// `matcher_trigger_rx`. `None` outside an active loop (or
     /// when the respawn policy is disabled).
-    pub(super) respawn_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<RespawnRequest>>,
+    pub(super) respawn_lifecycle_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::peer_lifecycle::PeerLifecycleEvent>>,
+
+    /// Pending replacements awaiting their join: minted replacement id
+    /// → the removed member it replaces. Node-local operational state
+    /// of the respawn pipeline (NOT replicated — the submitting node
+    /// is the only one able to revoke what it submitted; a failed-over
+    /// primary's replacements are reclaimed by the old node's
+    /// run-teardown sweep, the same story as its `job_ids`). Inserted
+    /// on every ACCEPTED dispatch; an entry leaves when its
+    /// replacement joins the membership (the legitimate-occupant case
+    /// — no revocation) or when its original is re-admitted first (the
+    /// squatter case — `SecondarySpawner::revoke` is issued).
+    /// Size is bounded by `RespawnBudget::max_total`.
+    pub(super) pending_replacements: std::collections::HashMap<String, String>,
 
     /// Receiver side of the liveness-beacon listener → operational-loop
     /// channel. The [`crate::liveness::LivenessListener`] (bound on this
@@ -1329,8 +1348,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             respawn_spawner: None,
             respawn_budget: None,
             tunnel_reconnector: None,
-            respawn_request_tx: None,
-            respawn_request_rx: None,
+            respawn_lifecycle_tx: None,
+            respawn_lifecycle_rx: None,
+            pending_replacements: std::collections::HashMap::new(),
             liveness_ping_rx: None,
             beacon_target: crate::liveness::BeaconTarget::new(),
             peer_liveness_addrs: crate::liveness::PeerLivenessAddrs::new(),
@@ -1748,8 +1768,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.respawn_spawner = Some(spawner);
         self.respawn_budget = Some(budget);
-        self.respawn_request_tx = Some(tx.clone());
-        self.respawn_request_rx = Some(rx);
+        self.respawn_lifecycle_tx = Some(tx.clone());
+        self.respawn_lifecycle_rx = Some(rx);
         self.respawn_primary_endpoint = primary_endpoint;
         self.respawn_primary_pubkey_pem = primary_pubkey_pem;
         // Register the dispatcher listener up-front; the
@@ -1765,7 +1785,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// [`crate::liveness::LivenessListener`] the run boundary bound on
     /// this node's runtime). Must be called BEFORE `run()` enters — the
     /// operational loop takes it out at run start, mirroring
-    /// `respawn_request_rx`. Each forwarded node-id refreshes that
+    /// `respawn_lifecycle_rx`. Each forwarded node-id refreshes that
     /// secondary's death-clock as the UNION half (beacon OR mesh frame).
     pub fn set_liveness_ping_rx(&mut self, rx: tokio::sync::mpsc::UnboundedReceiver<String>) {
         self.liveness_ping_rx = Some(rx);
