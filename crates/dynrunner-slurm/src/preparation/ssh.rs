@@ -1,6 +1,6 @@
 //! Low-level ssh-reverse-tunnel wire-up primitives:
 //! [`build_ssh_argv`] (pure argv construction),
-//! [`production_spawner`] (the closure passed to
+//! [`tunnel_spawner`] (the closure passed to
 //! [`establish_one_tunnel_inner`](super::establish::establish_one_tunnel_inner)),
 //! [`spawn_reverse_tunnel`] (`Command::spawn` of the ssh subprocess),
 //! [`verify_tunnel_alive`] (3s sanity-check on the spawned child),
@@ -990,85 +990,40 @@ pub(super) fn classify_tunnel_failure(stderr: &str) -> TunnelFailureClass {
     TunnelFailureClass::Transient
 }
 
-/// When a spawner invocation force-releases the worker-side
-/// `-R <tunnel_port>` binding (via [`release_stale_reverse_port`])
-/// before spawning the reverse tunnel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ReleaseBeforeSpawn {
-    /// Release only on RETRY invocations (the 2nd+ call of the same
-    /// spawner). A first attempt targets a fresh port that no prior
-    /// tunnel of this run has touched — paying the release round-trip
-    /// there would tax every healthy establishment. A retry, by
-    /// contrast, only happens because the PREVIOUS attempt failed
-    /// (rc=255 within the alive-gate, or bind verification found no
-    /// worker-side listener), and in both cases the port may still be
-    /// held on the worker: a leftover partial `-R` bind (sshd binds
-    /// per address family and reports success if EITHER lands — see
-    /// [`build_bind_probe_remote_cmd`]), a stale forward, or the
-    /// colliding squatter itself. The worker's dial target
-    /// (`localhost:<tunnel_port>`) is FIXED at worker startup, so the
-    /// retry cannot move to a fresh port — reclaiming the same one is
-    /// the only honest path.
-    OnRetry,
-    /// Release on EVERY invocation — the observer-reconnect shape,
-    /// where the rebuild only runs once the prior tunnel is known
-    /// dead/half-dead and the stale worker-side binding is the
-    /// expected obstacle.
-    Always,
-}
-
-/// PURE: does invocation number `prior_spawns` (0-based: the number of
-/// spawns this closure performed before the current one) perform the
-/// pre-spawn release under `mode`? Extracted so the retry-release
-/// semantics are unit-testable without spawning ssh.
-pub(super) fn release_before_attempt(mode: ReleaseBeforeSpawn, prior_spawns: usize) -> bool {
-    match mode {
-        ReleaseBeforeSpawn::Always => true,
-        ReleaseBeforeSpawn::OnRetry => prior_spawns > 0,
-    }
-}
-
-/// Shared builder behind [`production_spawner`] / [`reconnect_spawner`]:
-/// the per-attempt ssh wire-up (linger enable → optional worker-side
-/// port release → reverse-tunnel spawn), parameterised ONLY by the
-/// release mode so the two public spawners cannot drift.
-fn tunnel_spawner(
-    secondary_id: String,
-    opts: PreparationOptions,
-    primary_quic_port: u16,
-    linger_ledger: LingerLedger,
-    mode: ReleaseBeforeSpawn,
-) -> impl FnMut(String, u16) -> std::pin::Pin<Box<dyn Future<Output = Result<Child, PrepError>>>> {
-    let mut prior_spawns: usize = 0;
-    move |host: String, tunnel_port: u16| {
-        let release_now = release_before_attempt(mode, prior_spawns);
-        prior_spawns += 1;
-        let secondary_id = secondary_id.clone();
-        let opts = opts.clone();
-        let linger_ledger = linger_ledger.clone();
-        Box::pin(async move {
-            ensure_node_linger(&secondary_id, &host, &opts, &linger_ledger).await;
-            if release_now {
-                release_stale_reverse_port(&secondary_id, &host, tunnel_port, &opts).await;
-            }
-            spawn_reverse_tunnel(&secondary_id, &host, tunnel_port, primary_quic_port, &opts).await
-        })
-    }
-}
-
-/// Build the production spawner closure passed into
-/// [`establish_one_tunnel_inner`]. Captures `(secondary_id, opts,
-/// primary_quic_port)` by move so the returned closure is `'static`
-/// and the futures it produces own their data — no borrow-lifetime
-/// gymnastics at the call site. Each invocation clones the captured
-/// state into the produced future (retry attempts get a fresh future
-/// each time).
+/// Build the reverse-tunnel spawner closure passed into
+/// [`establish_one_tunnel_inner`] — used IDENTICALLY by the cohort
+/// setup, the single-respawn, and the observer-reconnect paths (one
+/// builder, no per-path mode: the establishment concern is the same on
+/// every path). Captures `(secondary_id, opts, primary_quic_port)` by
+/// move so the returned closure is `'static` and the futures it
+/// produces own their data — no borrow-lifetime gymnastics at the call
+/// site. Each invocation clones the captured state into the produced
+/// future (retry attempts get a fresh future each time).
 ///
-/// Retry attempts (2nd+ invocation) FIRST force-release the
-/// worker-side `-R <tunnel_port>` binding before respawning — see
-/// [`ReleaseBeforeSpawn::OnRetry`]: a retry only exists because the
-/// prior attempt failed, and the same fixed port (the worker's baked-in
-/// dial target) must be reclaimed, not re-collided with.
+/// Per attempt, the ssh wire-up is: linger enable → worker-side port
+/// release → reverse-tunnel spawn.
+///
+/// # Release before EVERY bind (incl. the first) — the phantom-tunnel closer
+///
+/// The release ([`release_stale_reverse_port`], a port-scoped
+/// `fuser -k <tunnel_port>/tcp`) runs before the first attempt's bind,
+/// not only on retries. The worker's dial target
+/// (`localhost:<tunnel_port>`) is FIXED at worker startup, so the bind
+/// cannot move to a fresh port; and the port can ALREADY be encumbered
+/// on the very first bind by a holder the bind-probe cannot tell apart
+/// from a healthy listener (#408): a leftover partial `-R` bind from a
+/// prior run on a kernel-reused ephemeral port, a stale forward, or a
+/// transient squatter. sshd reports a `-R` bind SUCCESS if EITHER
+/// address family binds (see [`build_bind_probe_remote_cmd`]), so a
+/// first-try tunnel can "verify" against a holder it doesn't own and
+/// then leave the worker dialing a dead port forever — the phantom.
+/// Skipping the first-attempt release (the prior `OnRetry` policy) was
+/// trading that correctness for one ssh round-trip; releasing
+/// unconditionally makes the first bind clean, which is the only honest
+/// path. (Two of three field repros only ever connected on nodes whose
+/// first attempt happened to fail the gate and thus took the
+/// release+rebind path — the release was load-bearing, not a retry
+/// nicety.)
 ///
 /// Linger: before the reverse tunnel is spawned, the run user's logind
 /// linger is enabled on the target node (decoupling the worker's
@@ -1083,59 +1038,22 @@ fn tunnel_spawner(
 /// happen around this node's tunnel — so the concern-blind establishment
 /// policy ([`establish_tunnel`]) never sees it. Best-effort: a failure
 /// WARNs and the tunnel + worker proceed.
-pub(super) fn production_spawner(
+pub(super) fn tunnel_spawner(
     secondary_id: String,
     opts: PreparationOptions,
     primary_quic_port: u16,
     linger_ledger: LingerLedger,
 ) -> impl FnMut(String, u16) -> std::pin::Pin<Box<dyn Future<Output = Result<Child, PrepError>>>> {
-    tunnel_spawner(
-        secondary_id,
-        opts,
-        primary_quic_port,
-        linger_ledger,
-        ReleaseBeforeSpawn::OnRetry,
-    )
-}
-
-/// Build the OBSERVER-RECONNECT spawner closure: identical to
-/// [`production_spawner`] except it FIRST force-releases any stale
-/// worker-side `-R <tunnel_port>` binding (the listener an ungraceful
-/// drop left bound on the worker's sshd) before re-spawning the
-/// reverse tunnel on the SAME port.
-///
-/// Why the release belongs in the spawner (not the establishment
-/// policy): the policy engine ([`establish_tunnel`]) is concern-blind
-/// — it owns retry/rate-limit/timeout and calls the spawner opaquely.
-/// "Free the remote port before this handshake" is an ssh-wire-up
-/// concern, so it lives here in the ssh module and rides the same
-/// spawner DI seam the tests use. The release runs once per spawn
-/// attempt: on the rare case where the first release races the worker
-/// sshd's own teardown, a retry attempt re-releases and rebinds.
-///
-/// `tunnel_port` is unchanged (option-A "same port"): it is the
-/// worker's own fixed listen port written into the info file at worker
-/// startup, which the worker's mesh dials as `localhost:<tunnel_port>`
-/// — a fresh port would break that dial with no re-coordination path.
-///
-/// Linger: like [`production_spawner`], the run user's linger is enabled on
-/// the target node (recording the original state into the ledger)
-/// before the rebind. A reconnect rebuilds an EXISTING node's dropped
-/// tunnel; re-enabling is idempotent and the first-writer-wins restore map
-/// preserves the node's genuine pre-run state.
-pub(super) fn reconnect_spawner(
-    secondary_id: String,
-    opts: PreparationOptions,
-    primary_quic_port: u16,
-    linger_ledger: LingerLedger,
-) -> impl FnMut(String, u16) -> std::pin::Pin<Box<dyn Future<Output = Result<Child, PrepError>>>> {
-    tunnel_spawner(
-        secondary_id,
-        opts,
-        primary_quic_port,
-        linger_ledger,
-        ReleaseBeforeSpawn::Always,
-    )
+    move |host: String, tunnel_port: u16| {
+        let secondary_id = secondary_id.clone();
+        let opts = opts.clone();
+        let linger_ledger = linger_ledger.clone();
+        Box::pin(async move {
+            ensure_node_linger(&secondary_id, &host, &opts, &linger_ledger).await;
+            release_stale_reverse_port(&secondary_id, &host, tunnel_port, &opts).await;
+            spawn_reverse_tunnel(&secondary_id, &host, tunnel_port, primary_quic_port, &opts).await
+        })
+    }
 }
 
 /// Spawn the ssh tunnel subprocess from `build_ssh_argv` output.

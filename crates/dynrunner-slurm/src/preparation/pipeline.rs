@@ -20,8 +20,8 @@ use super::escalation::{EscalationVerdict, ReconnectEscalation};
 use super::establish::establish_one_tunnel_inner;
 use super::options::{InfoFileReader, PrepError, PreparationOptions};
 use super::ssh::{
-    LingerLedger, production_bind_verifier, production_spawner, reconnect_spawner, restore_linger,
-    summarize_linger_enables,
+    LingerLedger, production_bind_verifier, restore_linger, summarize_linger_enables,
+    tunnel_spawner,
 };
 use super::store::{PerSecondaryTunnelRegistry, SharedTunnelVec, TunnelStore};
 use super::summary::{TunnelSetupSummary, secondary_id};
@@ -207,7 +207,7 @@ impl SlurmPreparation {
             let linger_ledger = self.linger_ledger.clone();
             let id_for_task = secondary_id.clone();
             watchers.spawn_local(async move {
-                let spawner = production_spawner(
+                let spawner = tunnel_spawner(
                     id_for_task.clone(),
                     opts.clone(),
                     primary_quic_port,
@@ -345,7 +345,7 @@ impl SlurmPreparation {
         let linger_ledger = self.linger_ledger.clone();
         let id_owned = secondary_id.to_owned();
 
-        let spawner = production_spawner(
+        let spawner = tunnel_spawner(
             id_owned.clone(),
             opts.clone(),
             primary_quic_port,
@@ -494,7 +494,7 @@ impl SlurmPreparation {
         let linger_ledger = self.linger_ledger.clone();
         let id_owned = secondary_id.to_owned();
 
-        let spawner = reconnect_spawner(
+        let spawner = tunnel_spawner(
             id_owned.clone(),
             opts.clone(),
             primary_quic_port,
