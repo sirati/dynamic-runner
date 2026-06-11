@@ -29,7 +29,7 @@ mod connect_disconnect;
 #[cfg(test)]
 mod tests;
 
-use argv::{master_watcher_loop, terminate_daemon_blocking};
+use argv::{master_watcher_loop, probe_master_pid, terminate_daemon_blocking};
 
 /// Gateway for SSH connections using a persistent ControlMaster connection.
 ///
@@ -141,6 +141,22 @@ impl SshGateway {
         self.daemon_pid
     }
 
+    /// Control socket path of the connected master, if any — `None`
+    /// before `connect()` and after `disconnect()`.
+    ///
+    /// Exposed so other framework-owned ssh subprocesses that target
+    /// the SAME gateway (e.g. the late-joiner observer's `ssh -L`
+    /// local-forward tunnels) can MULTIPLEX over the established
+    /// master (`-o ControlPath=<this> -o ControlMaster=no`) instead of
+    /// paying a fresh TCP+auth handshake per process — the mux-client
+    /// counterpart of [`auth_options_for`]'s "mirror the auth contract
+    /// without bypassing the gateway". Callers should gate use on
+    /// [`control_socket_alive`] (the master may die independently) and
+    /// keep a direct-dial fallback.
+    pub fn control_path(&self) -> Option<&str> {
+        self.control_path.as_deref()
+    }
+
     /// Master-only `-o` flags. Pinned here (not in operator-owned
     /// ssh_config) because they're the framework's lifetime contract
     /// for the master process: liveness-floor + log-noise-suppression.
@@ -165,20 +181,11 @@ impl SshGateway {
     }
 
     pub(super) fn ssh_target(&self) -> String {
-        match &self.config.user {
-            Some(user) => format!("{user}@{}", self.config.host),
-            None => self.config.host.clone(),
-        }
+        ssh_target_for(&self.config)
     }
 
     pub(super) fn base_ssh_args(&self) -> Vec<String> {
-        let mut args = Vec::new();
-        if self.config.port != 22 {
-            args.push("-p".into());
-            args.push(self.config.port.to_string());
-        }
-        args.extend(self.auth_options());
-        args
+        base_ssh_args_for(&self.config)
     }
 
     /// Explicit-auth flags applied to every ssh/scp invocation.
@@ -312,4 +319,42 @@ pub fn auth_options_for(config: &SshConfig) -> Vec<String> {
         opts.extend(["-F".to_string(), config_file.clone()]);
     }
     opts
+}
+
+/// `user@host` (or bare `host`) ssh destination for `config` — the
+/// free-function form of [`SshGateway::ssh_target`] (which delegates
+/// here, so the two can never drift).
+fn ssh_target_for(config: &SshConfig) -> String {
+    match &config.user {
+        Some(user) => format!("{user}@{}", config.host),
+        None => config.host.clone(),
+    }
+}
+
+/// Port + auth flag chain for `config` — the free-function form of
+/// [`SshGateway::base_ssh_args`] (which delegates here).
+fn base_ssh_args_for(config: &SshConfig) -> Vec<String> {
+    let mut args = Vec::new();
+    if config.port != 22 {
+        args.push("-p".into());
+        args.push(config.port.to_string());
+    }
+    args.extend(auth_options_for(config));
+    args
+}
+
+/// `true` iff a live ControlMaster daemon answers `ssh -O check`
+/// behind `control_path` for the gateway described by `config`.
+///
+/// The liveness gate for multiplexing over a shared master (see
+/// [`SshGateway::control_path`]): a framework-owned ssh subprocess
+/// probes first, multiplexes on `true`, and falls back to a direct
+/// dial on `false` — the daemon forks-and-detaches from its launcher,
+/// so the socket is the only authoritative liveness signal. Any
+/// failure (missing socket, unresponsive daemon, ssh spawn failure)
+/// is `false`; the caller owns the fallback policy.
+pub async fn control_socket_alive(control_path: &str, config: &SshConfig) -> bool {
+    probe_master_pid(control_path, &ssh_target_for(config), &base_ssh_args_for(config))
+        .await
+        .is_ok()
 }

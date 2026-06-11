@@ -29,6 +29,25 @@
 //! The auth flag chain comes from [`dynrunner_gateway::auth_options_for`]
 //! — the same single source of truth the gateway master uses.
 //!
+//! # Multiplexing over the gateway master
+//!
+//! The late-joiner already holds a connected
+//! [`dynrunner_gateway::SshGateway`] ControlMaster when it builds this
+//! registry, so each `ssh -N -L` child is spawned as a MUX CLIENT over
+//! that master's control socket (`-o ControlPath=<sock> -o
+//! ControlMaster=no`): one real TCP+auth session total, near-instant
+//! per-forward establishment, and the gateway sshd's `MaxStartups`
+//! never sees more than the master's single connection — which is what
+//! makes the concurrent fan-out in [`LocalForwardTunnels::establish`]
+//! safe. The spawner probes master liveness
+//! ([`dynrunner_gateway::control_socket_alive`]) per spawn — initial
+//! AND rebuild ride the same seam — and falls back to a direct dial
+//! (WARN) when the master is absent or dead: a joiner must never be
+//! hard-broken by a missing master. The full auth/port flag chain is
+//! kept on mux argvs too, so even a master dying between probe and
+//! spawn degrades to a direct dial (`ControlMaster=no` semantics)
+//! instead of failing.
+//!
 //! # Rebuilds keep the local port
 //!
 //! A rebuild (observer lost-visibility reconnect) re-spawns the `ssh
@@ -54,7 +73,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
-use dynrunner_gateway::{SshConfig, auth_options_for, shell_join};
+use dynrunner_gateway::{SshConfig, auth_options_for, control_socket_alive, shell_join};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
@@ -146,17 +165,28 @@ type ForwardSpawner = Box<dyn Fn(&str, u16, &str, u16) -> SpawnFuture + Send + S
 /// Build the argv for `ssh -N -L 127.0.0.1:<local>:<host>:<port>
 /// <gateway>`. Pure (no I/O) so the shape is unit-testable.
 ///
+/// `mux_control_path: Some(sock)` makes the child a mux client over
+/// the gateway master at `sock` (`-o ControlPath=<sock> -o
+/// ControlMaster=no`) — no fresh TCP/auth, the forward is opened
+/// through the established session. The auth/port flags are kept
+/// regardless: on a mux argv they are inert while the socket answers,
+/// and they carry ssh's own direct-dial degradation if the master
+/// dies between the caller's liveness probe and the spawn
+/// (`ControlMaster=no` = "use the socket if live, else dial direct").
+///
 /// The keepalive floor matches the gateway master's
 /// (`ServerAliveInterval=60 × CountMax=1080 = 18h`) and the `-R`
 /// tunnels' — a long observation must not lose its forwards to a
-/// transient stall. `ExitOnForwardFailure=yes` makes a failed local
-/// bind kill the child inside the 3s alive-gate instead of leaving a
-/// forwardless ssh lingering.
+/// transient stall (on a mux client the master owns the keepalives;
+/// the flags are inert there). `ExitOnForwardFailure=yes` makes a
+/// failed local bind kill the child inside the 3s alive-gate instead
+/// of leaving a forwardless ssh lingering.
 pub(crate) fn build_local_forward_argv(
     local_port: u16,
     target_host: &str,
     target_port: u16,
     gateway: &SshConfig,
+    mux_control_path: Option<&str>,
 ) -> Vec<String> {
     let mut argv: Vec<String> = vec!["ssh".into()];
     argv.extend(auth_options_for(gateway));
@@ -186,19 +216,60 @@ pub(crate) fn build_local_forward_argv(
         "-o".into(),
         "LogLevel=ERROR".into(),
     ]);
+    if let Some(control_path) = mux_control_path {
+        argv.extend([
+            "-o".into(),
+            format!("ControlPath={control_path}"),
+            "-o".into(),
+            "ControlMaster=no".into(),
+        ]);
+    }
     argv
 }
 
-/// The production spawner: spawn the `ssh -N -L` child for one forward.
-fn production_spawner(gateway: SshConfig) -> ForwardSpawner {
+/// Per-spawn transport selection: multiplex over the gateway master
+/// when its control socket answers `ssh -O check`; direct-dial (WARN)
+/// when no master was handed over or it is absent/dead. Probed at
+/// EVERY spawn — initial establishment and the reconnect rebuild share
+/// [`LocalForwardTunnels::spawn_and_gate`], so a master that dies
+/// mid-run degrades the next rebuild instead of breaking it.
+async fn resolve_mux_control_path<'a>(
+    control_path: Option<&'a str>,
+    gateway: &SshConfig,
+    peer_id: &str,
+) -> Option<&'a str> {
+    let cp = control_path?;
+    if control_socket_alive(cp, gateway).await {
+        Some(cp)
+    } else {
+        tracing::warn!(
+            peer_id,
+            control_path = %cp,
+            "gateway ControlMaster socket is absent or dead; falling back \
+             to a direct ssh dial for this forward"
+        );
+        None
+    }
+}
+
+/// The production spawner: spawn the `ssh -N -L` child for one
+/// forward, multiplexed over the gateway master at `control_path`
+/// when it is alive (see [`resolve_mux_control_path`]).
+fn production_spawner(gateway: SshConfig, control_path: Option<String>) -> ForwardSpawner {
     Box::new(move |peer_id, local_port, target_host, target_port| {
-        let argv = build_local_forward_argv(local_port, target_host, target_port, &gateway);
+        let gateway = gateway.clone();
+        let control_path = control_path.clone();
         let peer_id = peer_id.to_owned();
+        let target_host = target_host.to_owned();
         Box::pin(async move {
+            let mux = resolve_mux_control_path(control_path.as_deref(), &gateway, &peer_id).await;
+            let argv =
+                build_local_forward_argv(local_port, &target_host, target_port, &gateway, mux);
             tracing::info!(
                 peer_id,
-                local_port,
-                target = %format!("{}:{}", argv_target(&argv), local_port),
+                local = %format!("127.0.0.1:{local_port}"),
+                dest = %format!("{target_host}:{target_port}"),
+                via = %argv_target(&argv),
                 "creating SSH local-forward tunnel through the gateway"
             );
             tracing::debug!(peer_id, cmd = %shell_join(&argv), "ssh -L argv");
@@ -253,9 +324,16 @@ pub struct LocalForwardTunnels {
 impl LocalForwardTunnels {
     /// Production registry over the given gateway credentials (the
     /// same `SshConfig` the connected [`dynrunner_gateway::SshGateway`]
-    /// holds).
-    pub fn new(gateway: SshConfig) -> Self {
-        Self::with_spawner(production_spawner(gateway), ReconnectEscalation::default())
+    /// holds) and that gateway's master control socket
+    /// ([`dynrunner_gateway::SshGateway::control_path`]): every spawn
+    /// multiplexes over the master while it answers `ssh -O check`,
+    /// and direct-dials (WARN) otherwise. `None` means there is no
+    /// master to share — every spawn direct-dials.
+    pub fn new(gateway: SshConfig, master_control_path: Option<String>) -> Self {
+        Self::with_spawner(
+            production_spawner(gateway, master_control_path),
+            ReconnectEscalation::default(),
+        )
     }
 
     /// DI constructor for tests: inject the child factory and the
@@ -270,12 +348,20 @@ impl LocalForwardTunnels {
         }
     }
 
-    /// Establish one forward per target, sequentially (one gateway
-    /// handshake at a time — the same rate-friendliness rationale as
-    /// the `-R` path's establishment limiter). Per-target failures are
-    /// WARNed and tolerated — `join_running_cluster` fans to every
-    /// seed, so one dead record must not brick the bootstrap — but
-    /// ZERO successes is a hard, loud error.
+    /// Establish one forward per target, CONCURRENTLY: every tunnel
+    /// rides the same 3s alive-gate, so a sequential walk pays ~3s ×
+    /// N peers before the bootstrap's connect window even opens (~30s
+    /// observed at 11 peers); fanned out, the whole cohort gates in
+    /// ~3s. Concurrency is safe against the gateway sshd's
+    /// `MaxStartups` because the spawner multiplexes every client
+    /// over the ONE established master session (see the module's
+    /// `# Multiplexing` section); the direct-dial fallback stays
+    /// concurrent — a dead master is already the degraded path, and
+    /// breaking the joiner on it is worse than risking sshd
+    /// rate-limits. Per-target failures are WARNed and tolerated —
+    /// `join_running_cluster` fans to every seed, so one dead record
+    /// must not brick the bootstrap — but ZERO successes is a hard,
+    /// loud error.
     ///
     /// Returns the `peer_id → local_port` endpoint map the caller
     /// substitutes into its seed entries.
@@ -283,9 +369,15 @@ impl LocalForwardTunnels {
         &self,
         targets: &[ForwardTarget],
     ) -> Result<HashMap<String, u16>, LocalForwardError> {
+        let results = futures_util::future::join_all(
+            targets
+                .iter()
+                .map(|t| async move { (t, self.establish_one(t).await) }),
+        )
+        .await;
         let mut endpoints = HashMap::new();
-        for t in targets {
-            match self.establish_one(t).await {
+        for (t, result) in results {
+            match result {
                 Ok(local_port) => {
                     endpoints.insert(t.peer_id.clone(), local_port);
                 }
@@ -580,7 +672,7 @@ mod tests {
 
     #[test]
     fn argv_shape_default_port_and_user() {
-        let argv = build_local_forward_argv(15001, "compute7", 51200, &ssh_config());
+        let argv = build_local_forward_argv(15001, "compute7", 51200, &ssh_config(), None);
         assert_eq!(argv[0], "ssh");
         // No auth flags configured, default port 22: no -p.
         assert!(!argv.contains(&"-p".to_string()), "{argv:?}");
@@ -601,6 +693,59 @@ mod tests {
             argv.contains(&"ServerAliveCountMax=1080".to_string()),
             "{argv:?}"
         );
+        // Direct dial (no master shared): no mux options.
+        assert!(
+            !argv.iter().any(|a| a.starts_with("ControlPath=")),
+            "{argv:?}"
+        );
+        assert!(!argv.contains(&"ControlMaster=no".to_string()), "{argv:?}");
+    }
+
+    /// The mux-client shape: a live master's socket rides in as `-o
+    /// ControlPath=<sock> -o ControlMaster=no`, the `-L` spec is
+    /// unchanged, and the auth/keepalive chain stays (inert on a mux
+    /// client; ssh's own direct-dial degradation if the master dies
+    /// between probe and spawn).
+    #[test]
+    fn argv_mux_client_carries_control_path_and_forward_spec() {
+        let argv = build_local_forward_argv(
+            15001,
+            "compute7",
+            51200,
+            &ssh_config(),
+            Some("/tmp/dynrunner-m-42-7.sock"),
+        );
+        assert!(
+            argv.contains(&"ControlPath=/tmp/dynrunner-m-42-7.sock".to_string()),
+            "{argv:?}"
+        );
+        assert!(argv.contains(&"ControlMaster=no".to_string()), "{argv:?}");
+        let l = argv.iter().position(|a| a == "-L").expect("-L present");
+        assert_eq!(argv[l + 1], "127.0.0.1:15001:compute7:51200");
+        assert_eq!(argv[l + 2], "alice@gw.example.org");
+        assert!(
+            argv.contains(&"ExitOnForwardFailure=yes".to_string()),
+            "{argv:?}"
+        );
+    }
+
+    /// The fallback gate: a configured-but-dead master socket resolves
+    /// to a direct dial (`None`), never a mux argv pointing at a dead
+    /// socket. (`ssh -O check` probes only the local socket — offline
+    /// and fast.) `None` configured stays `None` without probing.
+    #[tokio::test]
+    async fn resolve_mux_dead_socket_falls_back_to_direct() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dead = dir.path().join("no-master.sock");
+        let dead = dead.to_string_lossy();
+        assert_eq!(
+            resolve_mux_control_path(Some(&dead), &ssh_config(), "secondary-0").await,
+            None
+        );
+        assert_eq!(
+            resolve_mux_control_path(None, &ssh_config(), "secondary-0").await,
+            None
+        );
     }
 
     #[test]
@@ -612,7 +757,7 @@ mod tests {
             identity_file: Some("/home/x/key".into()),
             config_file: Some("/home/x/cfg".into()),
         };
-        let argv = build_local_forward_argv(1, "h", 2, &gw);
+        let argv = build_local_forward_argv(1, "h", 2, &gw, None);
         // Auth chain is the shared single source of truth.
         let i = argv.iter().position(|a| a == "-i").expect("-i present");
         assert_eq!(argv[i + 1], "/home/x/key");
@@ -673,6 +818,60 @@ mod tests {
             matches!(err, LocalForwardError::NoneEstablished { total: 1 }),
             "{err:?}"
         );
+    }
+
+    /// Establishment is CONCURRENT: every spawn must begin before any
+    /// completes. The barrier-gated spawner releases only once ALL N
+    /// spawn futures are in flight — a sequential walk (the pre-fix
+    /// shape, ~3s × N alive-gates) deadlocks on the barrier and trips
+    /// the timeout.
+    #[tokio::test]
+    async fn establish_overlaps_all_spawns() {
+        const N: usize = 4;
+        let barrier = Arc::new(tokio::sync::Barrier::new(N));
+        let spawner: ForwardSpawner = Box::new(move |_peer, _l, _h, _p| {
+            let barrier = barrier.clone();
+            Box::pin(async move {
+                barrier.wait().await;
+                Ok(healthy_child())
+            })
+        });
+        let tunnels = LocalForwardTunnels::with_spawner(spawner, ReconnectEscalation::default());
+        let targets: Vec<ForwardTarget> = (0..N)
+            .map(|i| ForwardTarget {
+                peer_id: format!("secondary-{i}"),
+                host: format!("compute{i}"),
+                port: 51200 + i as u16,
+            })
+            .collect();
+        let endpoints = tokio::time::timeout(Duration::from_secs(30), tunnels.establish(&targets))
+            .await
+            .expect(
+                "establish must fan out concurrently — a sequential walk \
+                 deadlocks on the all-spawns barrier",
+            )
+            .expect("all forwards establish");
+        assert_eq!(endpoints.len(), N);
+        tunnels.teardown().await;
+    }
+
+    /// The spawn log line names its three endpoints truthfully:
+    /// `local=` the 127.0.0.1 listen side, `dest=` the real forward
+    /// destination, `via=` the gateway hop. Regression pin for the
+    /// consumer-reported mis-wiring that rendered the gateway paired
+    /// with the LOCAL port as `target=`.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn spawn_log_names_local_dest_and_via() {
+        let spawn = production_spawner(ssh_config(), None);
+        // The log line is emitted before the exec; the child (an ssh
+        // at an unresolvable gateway) is reaped immediately.
+        if let Ok(mut child) = spawn("secondary-0", 15001, "compute7", 51200).await {
+            terminate_child(&mut child).await;
+        }
+        assert!(logs_contain("local=127.0.0.1:15001"));
+        assert!(logs_contain("dest=compute7:51200"));
+        assert!(logs_contain("via=alice@gw.example.org"));
     }
 
     /// The reconnect gate: an alive child is tolerated (no respawn)

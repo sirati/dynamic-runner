@@ -563,6 +563,7 @@ dependencies = [
  "dynrunner-gateway",
  "dynrunner-manager-distributed",
  "dynrunner-slurm-wrapper-config",
+ "futures-util",
  "libc",
  "nix",
  "serde",

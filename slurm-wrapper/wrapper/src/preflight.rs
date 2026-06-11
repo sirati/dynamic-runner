@@ -102,14 +102,20 @@ fn run_in(podman: &str, scan_root: &Path) {
         // default-storage containers were left untouched and why.
         let default_running = run_podman_capture(Command::new(podman).arg("ps").arg("-q"));
         let deferred = parse_container_ids(&default_running).len();
+        // The literal token `default-storage sweep` appears in BOTH
+        // Phase-2 outcome lines (this deferral and the sweep narration in
+        // the else-arm) so ONE forensic grep finds whichever fired — the
+        // #430 RCA grep'd for exactly that token and its zero hits were
+        // misread as "the gate never engaged".
         tracing::warn!(
             target: LOG_TARGET,
             deferred_default_storage_containers = deferred,
             "Pre-flight: a LIVE sibling job holds a scratch-root liveness lock on \
-             this node; SKIPPING the user-default rootless storage sweep \
-             ({deferred} container(s) left untouched). The unscoped `podman rm -af` \
-             would gut a default-storage container the live sibling may own; \
-             these orphans are swept by a later preflight with no live sibling.",
+             this node; SKIPPING the default-storage sweep against the user-default \
+             rootless storage ({deferred} container(s) left untouched). The unscoped \
+             `podman rm -af` would gut a default-storage container the live sibling \
+             may own; these orphans are swept by a later preflight with no live \
+             sibling.",
         );
     } else {
         // No live sibling: safe to sweep the default storage as before.
@@ -119,13 +125,24 @@ fn run_in(podman: &str, scan_root: &Path) {
             found = true;
             tracing::info!(
                 target: LOG_TARGET,
-                "Pre-flight: stopping containers in default storage: {}",
+                "Pre-flight: default-storage sweep: stopping running containers in \
+                 the user-default rootless storage: {}",
                 default_ids.join(" ")
             );
             let mut cmd = Command::new(podman);
             cmd.arg("stop").arg("-t").arg("10").args(&default_ids);
             run_podman_swallow(&mut cmd);
         }
+        // NARRATE the destructive op BEFORE it runs (the #421 lesson:
+        // a silent destructive path is itself a bug). This `rm -af` is
+        // unscoped — it removes EVERY container (running or exited) the
+        // run user owns in the default rootless storage on this node.
+        tracing::info!(
+            target: LOG_TARGET,
+            "Pre-flight: default-storage sweep: removing ALL containers in the \
+             user-default rootless storage (`podman rm -af`; no scratch root on \
+             this node holds a live wrapper.lock)",
+        );
         run_podman_swallow(Command::new(podman).arg("rm").arg("-af"));
     }
 
@@ -201,6 +218,16 @@ fn sweep_scratch_roots(podman: &str, scan_root: &Path) -> SweepOutcome {
             }
             // All containers (including stopped/exited): release storage
             // layers + bind-mount references held by exited containers.
+            // NARRATE the destructive op BEFORE it runs (the #421 lesson:
+            // a silent destructive path is itself a bug) — this used to be
+            // the one sweep step with zero forensic trace unless a running
+            // container also happened to be stopped above.
+            tracing::info!(
+                target: LOG_TARGET,
+                "Pre-flight: removing ALL containers in orphan scratch root \
+                 {storage} (`podman rm -af`; liveness probe found no held \
+                 wrapper.lock — the owning wrapper is dead)",
+            );
             scoped_rm_af(podman, &storage, &runroot);
         }
     }
@@ -532,6 +559,145 @@ mod tests {
             "with a live sibling present the unscoped default-storage \
              stop/rm MUST be suppressed (it would gut the sibling's \
              rootfs); offending calls: {default_teardowns:?}\nfull log:\n{calls}",
+        );
+    }
+
+    /// Capture every tracing line emitted by `f` (INFO and up) into a
+    /// `String`. The preflight sweep is synchronous and single-threaded,
+    /// so a thread-local `with_default` subscriber sees every event the
+    /// swept code emits without touching the global dispatcher (which
+    /// other tests may own).
+    fn capture_logs<F: FnOnce()>(f: F) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).write(b)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(buf.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// OBSERVABILITY PIN (#421's explicit lesson, re-bitten in the
+    /// run_20260611_202345 RCA): every destructive storage operation must
+    /// NARRATE what it is about to destroy and why, BEFORE it runs. The
+    /// Phase-1 per-root `rm -af` against a swept (probe-dead) scratch
+    /// root used to be completely silent — a sweep that gutted a root
+    /// left zero forensic trace unless a *running* container also
+    /// happened to be stopped. The sweep must log the orphan root's
+    /// storage path and the liveness rationale.
+    #[test]
+    fn sweep_narrates_orphan_root_rm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        let calls_log = tmp.path().join("calls.log");
+        let podman = write_fake_podman(tmp.path(), &calls_log);
+
+        // Markerless orphan root: swept, including the silent-by-default
+        // `rm -af`.
+        let orphan = make_scratch_root(&scan, "asm-deadbeef");
+
+        let logs = capture_logs(|| {
+            sweep_scratch_roots(&podman.to_string_lossy(), &scan);
+        });
+
+        let storage = orphan.join("storage").to_string_lossy().into_owned();
+        let rm_lines: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains("rm -af") && l.contains(&storage))
+            .collect();
+        assert!(
+            !rm_lines.is_empty(),
+            "the Phase-1 orphan-root `rm -af` must narrate the storage \
+             root it is about to destroy and why; logs:\n{logs}",
+        );
+        assert!(
+            rm_lines.iter().any(|l| l.contains("wrapper.lock")),
+            "the narration must carry the liveness rationale \
+             (no held wrapper.lock); logs:\n{logs}",
+        );
+    }
+
+    /// OBSERVABILITY PIN: the Phase-2 unscoped `rm -af` against the
+    /// user-default rootless storage must narrate itself, and BOTH
+    /// Phase-2 outcome lines (the sweep and the live-sibling deferral)
+    /// must carry the literal grep token `default-storage sweep`. The
+    /// #430 forensics grep'd the run log tree for exactly that token and
+    /// got zero hits — which was treated as "the sweep never ran /
+    /// never deferred", when in fact NEITHER line contained the token
+    /// (the rm was silent; the WARN said "user-default rootless storage
+    /// sweep"). A destructive path whose log lines can't be found by the
+    /// obvious grep is indistinguishable from an unlogged one.
+    #[test]
+    fn run_narrates_default_storage_sweep_with_grep_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        let calls_log = tmp.path().join("calls.log");
+        let podman = write_fake_podman(tmp.path(), &calls_log);
+
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _disable_guard = EnvGuard::set("DYNRUNNER_DISABLE_PREFLIGHT_PODMAN", "0");
+
+        // No live sibling: the Phase-2 sweep RUNS and must say so.
+        let logs = capture_logs(|| {
+            run_in(&podman.to_string_lossy(), &scan);
+        });
+        assert!(
+            logs.lines()
+                .any(|l| l.contains("default-storage sweep") && l.contains("rm -af")),
+            "the Phase-2 default-storage `rm -af` must narrate itself \
+             with the grep token `default-storage sweep`; logs:\n{logs}",
+        );
+    }
+
+    /// OBSERVABILITY PIN (deferral side of the grep token): when a live
+    /// sibling suppresses the Phase-2 sweep, the WARN must ALSO carry
+    /// the `default-storage sweep` token so one grep finds both
+    /// outcomes.
+    #[test]
+    fn run_deferral_warn_carries_grep_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        let calls_log = tmp.path().join("calls.log");
+        let podman = write_fake_podman(tmp.path(), &calls_log);
+
+        // LIVE sibling: scratch root with a HELD wrapper.lock.
+        let live = make_scratch_root(&scan, "asm-live7777");
+        let _live_guard = crate::scratch_lock::acquire(&live).expect("acquire live lock");
+
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _disable_guard = EnvGuard::set("DYNRUNNER_DISABLE_PREFLIGHT_PODMAN", "0");
+
+        let logs = capture_logs(|| {
+            run_in(&podman.to_string_lossy(), &scan);
+        });
+        assert!(
+            logs.lines()
+                .any(|l| l.contains("default-storage sweep") && l.contains("SKIPPING")),
+            "the live-sibling deferral WARN must carry the grep token \
+             `default-storage sweep`; logs:\n{logs}",
         );
     }
 

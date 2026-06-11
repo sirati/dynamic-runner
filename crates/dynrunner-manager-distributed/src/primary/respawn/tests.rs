@@ -78,65 +78,12 @@ fn respawn_outcome_constructs_with_ok_and_err() {
 // resolved entry to confirm the new id).
 use crate::peer_lifecycle::PeerLifecycleEvent;
 use crate::primary::test_helpers::{
-    FixedEstimator, PrimaryMeshKeepalive, TestId, build_test_primary, setup_test,
+    FixedEstimator, MockSpawner, PrimaryMeshKeepalive, TestId, build_test_primary, setup_test,
 };
 use crate::primary::{PrimaryConfig, PrimaryCoordinator};
 use dynrunner_scheduler::ResourceStealingScheduler;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-
-/// Counting mock spawner: records every `spec.new_secondary_id`
-/// it observes and returns `Ok(())` for the first call (or as
-/// configured). The recorded ids let tests assert the
-/// coordinator minted fresh ids and the `RespawnDecision`
-/// path honoured the budget. `revoke` calls are recorded the
-/// same way so the re-admission reconciliation tests can pin
-/// exactly which replacements were revoked.
-struct MockSpawner {
-    calls: Arc<AtomicU32>,
-    captured_ids: Arc<Mutex<Vec<String>>>,
-    revoked_ids: Arc<Mutex<Vec<String>>>,
-}
-
-impl MockSpawner {
-    fn new() -> Self {
-        Self {
-            calls: Arc::new(AtomicU32::new(0)),
-            captured_ids: Arc::new(Mutex::new(Vec::new())),
-            revoked_ids: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    #[allow(dead_code)]
-    fn call_count(&self) -> u32 {
-        self.calls.load(Ordering::SeqCst)
-    }
-
-    #[allow(dead_code)]
-    fn captured_ids(&self) -> Vec<String> {
-        self.captured_ids.lock().unwrap().clone()
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl SecondarySpawner for MockSpawner {
-    async fn spawn(&self, spec: SecondarySpawnSpec) -> Result<(), SpawnError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        self.captured_ids
-            .lock()
-            .unwrap()
-            .push(spec.new_secondary_id);
-        Ok(())
-    }
-
-    async fn revoke(&self, new_secondary_id: &str) -> Result<(), SpawnError> {
-        self.revoked_ids
-            .lock()
-            .unwrap()
-            .push(new_secondary_id.to_owned());
-        Ok(())
-    }
-}
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 /// Build a coordinator wired with 1 reserved initial-cohort id so
 /// the first minted respawn lands on `secondary-1`. The minted-id

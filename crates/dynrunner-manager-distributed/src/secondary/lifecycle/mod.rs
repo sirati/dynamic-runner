@@ -374,8 +374,33 @@ pub(in crate::secondary) struct MeshFormation {
     /// dispatch over the direct primary link still works; only the
     /// peer-mesh-dependent paths (failover election, peer-keepalive
     /// broadcasts) fail-loud-or-skip on this flag.
+    ///
+    /// NOT permanent: formation is a supervised, continuous concern.
+    /// The transport's reconnect ticker never stops re-dialing roster
+    /// legs (never-formed legs included — see `formation_retry.rs` in
+    /// the QUIC transport), so the mesh can form long after the
+    /// verdict; `check_peer_mesh_watchdog`'s supervision branch clears
+    /// this latch on the first alive peer-secondary, restoring the
+    /// failover paths. (run_20260611_200548: the old permanent latch
+    /// left a since-healed mesh fatally "unavailable" forever.) The
+    /// "zero peers EVER meshed" reading every consumer relies on
+    /// (election degraded-bail, setup-election gate, lone-survivor
+    /// commentary) is preserved: the latch clears exactly when a peer
+    /// first IS alive, never on a formed-then-died mesh.
     pub(in crate::secondary) degraded: bool,
+
+    /// Throttle for the recurring "peer mesh still empty" WARN the
+    /// degraded supervision emits — loud while the fault persists,
+    /// never per keepalive tick. Lives with the latch it narrates so
+    /// the pair cannot drift.
+    pub(in crate::secondary) degraded_warn: crate::warn_throttle::WarnThrottle,
 }
+
+/// Minimum spacing between two "peer mesh still empty" WARNs while the
+/// degraded supervision keeps finding zero alive secondaries. The
+/// supervision runs on every keepalive tick (~seconds); one WARN a
+/// minute keeps the fault visible in `tail -f` without spamming.
+const DEGRADED_MESH_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Default for MeshFormation {
     /// The pre-dial resting state, identical to the flat-field defaults
@@ -389,6 +414,7 @@ impl Default for MeshFormation {
             peer_dial_count: 0,
             mesh_ready_sent: false,
             degraded: false,
+            degraded_warn: crate::warn_throttle::WarnThrottle::new(DEGRADED_MESH_WARN_INTERVAL),
         }
     }
 }

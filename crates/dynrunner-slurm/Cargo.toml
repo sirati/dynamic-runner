@@ -28,6 +28,11 @@ libc = { workspace = true }
 serde = { workspace = true }
 url = { workspace = true }
 async-trait = { workspace = true }
+# `future::join_all` backs the local-forward registry's concurrent
+# tunnel establishment (every `ssh -L` mux client fans out over the one
+# gateway ControlMaster session instead of paying N sequential 3s
+# alive-gates).
+futures-util = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
