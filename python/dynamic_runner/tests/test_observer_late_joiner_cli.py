@@ -205,5 +205,122 @@ class MutualExclusionTests(unittest.TestCase):
         self.assertEqual(args.multi_computer, "slurm")
 
 
+class GatewayModeTests(unittest.TestCase):
+    """`--gateway` composes with the late-joiner flag (the desktop
+    path: DIR is gateway-side, peers are reached over per-peer
+    `ssh -L` local-forward tunnels). The combination is legal and
+    MEANINGFUL — pre-fix it parsed but the gateway was silently
+    ignored, leaving the late-joiner unusable from a desktop whose
+    only reachable host is the gateway.
+    """
+
+    def test_gateway_plus_observer_validates(self) -> None:
+        args = _parse_and_validate(
+            [
+                "--observer-join-from-peer-info-dir",
+                "~/runs/run_x/connection_info",
+                "--gateway",
+                "ssh://alice@gw.example.org",
+            ]
+        )
+        self.assertEqual(args.gateway, "ssh://alice@gw.example.org")
+        self.assertEqual(
+            args.observer_join_from_peer_info_dir, "~/runs/run_x/connection_info"
+        )
+
+    def test_help_documents_dir_semantics_per_mode(self) -> None:
+        # The flag's help must tell the operator what DIR means in each
+        # mode: LOCAL path without --gateway, GATEWAY-SIDE path with it.
+        parser = cli.build_arg_parser("test")
+        # argparse re-wraps help text at arbitrary points; normalise
+        # whitespace so the assertion is wrap-insensitive.
+        help_text = " ".join(parser.format_help().split())
+        self.assertIn("GATEWAY-SIDE path", help_text)
+        self.assertIn("LOCAL path", help_text)
+
+    def test_dispatcher_forwards_gateway_kwargs(self) -> None:
+        # `_dispatch_late_joiner` must hand the gateway knobs through to
+        # the Rust pyfunction — the per-layer plumbing gap is exactly
+        # what made the flag a silent no-op before.
+        run_mod = _load_run_module()
+        recorded: dict = {}
+
+        def fake_run_observer_late_joiner(peer_info_dir, **kwargs):
+            recorded["peer_info_dir"] = peer_info_dir
+            recorded.update(kwargs)
+            return {"completed": 0}
+
+        pkg = sys.modules["dynamic_runner"]
+        pkg.run_observer_late_joiner = fake_run_observer_late_joiner
+        try:
+            args = _parse(
+                [
+                    "--observer-join-from-peer-info-dir",
+                    "/gw/run/connection_info",
+                    "--gateway",
+                    "ssh://alice@gw:2222",
+                    "--ssh-identity-file",
+                    "/home/x/key",
+                    "--ssh-config",
+                    "/home/x/cfg",
+                ]
+            )
+            run_mod._dispatch_late_joiner(None, args, _SilentLogger())
+        finally:
+            del pkg.run_observer_late_joiner
+        self.assertEqual(recorded["peer_info_dir"], "/gw/run/connection_info")
+        self.assertEqual(recorded["gateway_url"], "ssh://alice@gw:2222")
+        self.assertEqual(recorded["ssh_identity_file"], "/home/x/key")
+        self.assertEqual(recorded["ssh_config_file"], "/home/x/cfg")
+
+    def test_dispatcher_passes_none_gateway_when_unset(self) -> None:
+        # Local mode: the kwargs are still passed, as None — the Rust
+        # constructor treats None as "no gateway" and keeps the local
+        # direct-dial path byte-identical.
+        run_mod = _load_run_module()
+        recorded: dict = {}
+
+        def fake_run_observer_late_joiner(peer_info_dir, **kwargs):
+            recorded["peer_info_dir"] = peer_info_dir
+            recorded.update(kwargs)
+            return {"completed": 0}
+
+        pkg = sys.modules["dynamic_runner"]
+        pkg.run_observer_late_joiner = fake_run_observer_late_joiner
+        try:
+            args = _parse(["--observer-join-from-peer-info-dir", "/tmp/ci"])
+            run_mod._dispatch_late_joiner(None, args, _SilentLogger())
+        finally:
+            del pkg.run_observer_late_joiner
+        self.assertIsNone(recorded["gateway_url"])
+        self.assertIsNone(recorded["ssh_identity_file"])
+        self.assertIsNone(recorded["ssh_config_file"])
+
+
+class _SilentLogger:
+    """Minimal logger stand-in for dispatcher-plumbing tests."""
+
+    def info(self, *_a, **_k) -> None:
+        pass
+
+
+def _load_run_module():
+    """Load `dynamic_runner.run` by absolute path through the package
+    stub (same pattern as `test_cli_api.py`) — run.py's intra-package
+    imports are all pure-Python at import time.
+    """
+    package_root = _setup_package_stub()
+    fullname = "dynamic_runner.run"
+    if fullname in sys.modules:
+        return sys.modules[fullname]
+    target = package_root / "run.py"
+    spec = importlib.util.spec_from_file_location(fullname, target)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[fullname] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 if __name__ == "__main__":
     unittest.main()

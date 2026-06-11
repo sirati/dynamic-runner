@@ -209,21 +209,7 @@ impl SshGateway {
     /// user's config-file is authoritative about agent behavior in
     /// that path.
     pub fn auth_options(&self) -> Vec<String> {
-        let mut opts = Vec::new();
-        if let Some(identity) = &self.config.identity_file {
-            opts.extend([
-                "-i".to_string(),
-                identity.clone(),
-                "-o".to_string(),
-                "IdentitiesOnly=yes".to_string(),
-                "-o".to_string(),
-                "IdentityAgent=none".to_string(),
-            ]);
-        }
-        if let Some(config_file) = &self.config.config_file {
-            opts.extend(["-F".to_string(), config_file.clone()]);
-        }
-        opts
+        auth_options_for(&self.config)
     }
 
     pub(super) fn control_args(&self) -> Result<Vec<String>, GatewayError> {
@@ -302,4 +288,28 @@ impl Drop for SshGateway {
             let _ = thread.join();
         }
     }
+}
+
+/// The explicit-auth ssh flag chain for `config` — the free-function
+/// form of [`SshGateway::auth_options`], for framework-owned ssh
+/// subprocesses that target the SAME gateway credentials WITHOUT
+/// holding a connected `SshGateway` (e.g. the late-joiner observer's
+/// `ssh -L` local-forward tunnels). Single source of truth: the
+/// method delegates here, so the two can never drift.
+pub fn auth_options_for(config: &SshConfig) -> Vec<String> {
+    let mut opts = Vec::new();
+    if let Some(identity) = &config.identity_file {
+        opts.extend([
+            "-i".to_string(),
+            identity.clone(),
+            "-o".to_string(),
+            "IdentitiesOnly=yes".to_string(),
+            "-o".to_string(),
+            "IdentityAgent=none".to_string(),
+        ]);
+    }
+    if let Some(config_file) = &config.config_file {
+        opts.extend(["-F".to_string(), config_file.clone()]);
+    }
+    opts
 }

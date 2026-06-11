@@ -65,6 +65,7 @@
 //! [`crate::observer::lost_visibility`] + [`crate::observer::reconnect`].
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{BoundedString, IMPORTANT_TARGET, Identifier};
@@ -471,6 +472,22 @@ where
             wake_note: WakeNoteSlot::default(),
             reconnector,
         }
+    }
+
+    /// Wire (or replace) the transport-recovery port AFTER construction —
+    /// the observer-side mirror of
+    /// `PrimaryCoordinator::set_tunnel_reconnector`. Used by the
+    /// gateway-mode late-joiner, whose `ssh -L` local-forward registry
+    /// only exists once its tunnels are established (after the factory's
+    /// snapshot restore but before `run`): the transport's own QUIC/WSS
+    /// reconnect ticker redials `127.0.0.1:<local_port>`, which heals
+    /// ONLY if the underlying `ssh -L` child is rebuilt out-of-band —
+    /// exactly what the lost-visibility trigger drives through this port.
+    pub fn set_tunnel_reconnector(
+        &mut self,
+        reconnector: Arc<dyn crate::observer::TunnelReconnector>,
+    ) {
+        self.reconnector = Some(reconnector);
     }
 
     /// Read-only access to the replicated ledger (tests / result getters).
@@ -1617,9 +1634,12 @@ where
         HashSet::new(),
         panik_signal_rx,
         holdings,
-        // Cold-join observers run over a real `PeerNetwork` (QUIC reconnect
-        // ticker + dial path), so the transport heals its own links — there
-        // is no out-of-band `-R` for the observer to rebuild.
+        // No reconnector at construction: a cold-join observer whose
+        // addresses are DIRECTLY reachable heals through the transport's
+        // own QUIC/WSS reconnect ticker. The gateway-mode late-joiner,
+        // whose dial targets are `ssh -L` local-forward endpoints that the
+        // ticker alone cannot resurrect, wires its registry afterwards via
+        // `set_tunnel_reconnector`.
         None,
     );
     for snap in snapshots {
