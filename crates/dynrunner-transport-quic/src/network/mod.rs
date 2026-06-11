@@ -19,8 +19,6 @@ use dynrunner_core::Identifier;
 use dynrunner_transport_tunnel::{InboundTap, RegistrationSink};
 
 use crate::certs::CertPair;
-use crate::transport::QuicListener;
-use crate::wss::WssListener;
 
 mod accept;
 mod client;
@@ -82,18 +80,14 @@ impl NetworkServer {
     ) -> Result<Self, String> {
         let cert = CertPair::generate(server_name)?;
 
-        // Bind QUIC (UDP) on the requested address. If the caller
-        // passed port 0 the OS picks; if they passed a fixed port we
-        // honour it (so a primary that already published a URL to
-        // its secondaries can bind to that exact port).
-        let quic_listener = QuicListener::bind_addr(&cert, addr).await?;
+        // Acquire the QUIC(UDP)+WSS(TCP) pair on one port number. A
+        // port-0 `addr` lets the OS pick, with the pairing helper
+        // retrying the whole pair past a TCP-twin collision (#422); a
+        // fixed port is bound fail-fast (a primary that already
+        // published its URL must bind that exact port).
+        let (quic_listener, wss_listener) =
+            crate::listener_pair::bind_listener_pair(&cert, addr).await?;
         let port = quic_listener.port();
-
-        // Bind WSS (TCP) on the same port. Use the QUIC-resolved port
-        // (which equals the requested port when non-zero, or the
-        // OS-assigned port when zero) so both protocols match.
-        let wss_addr = SocketAddr::new(addr.ip(), port);
-        let wss_listener = WssListener::bind(wss_addr).await?;
 
         // Spawn QUIC accept loop
         {

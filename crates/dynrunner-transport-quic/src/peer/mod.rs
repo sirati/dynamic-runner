@@ -16,8 +16,6 @@ use dynrunner_protocol_primary_secondary::{
 use tokio::sync::mpsc;
 
 use crate::certs::CertPair;
-use crate::transport::QuicListener;
-use crate::wss::WssListener;
 
 mod accept;
 mod bootstrap_redial;
@@ -372,17 +370,15 @@ impl<I: Identifier> PeerNetwork<I> {
     pub async fn start(peer_id: &str, bind_port: Option<u16>) -> Result<Self, String> {
         let cert = CertPair::generate(peer_id)?;
 
-        // Bind QUIC (UDP). `bind_port` None → port 0 → the OS picks, which
-        // is exactly what `QuicListener::bind` (the no-port convenience)
-        // does — the None path is unchanged from the historical behaviour.
+        // Acquire the QUIC(UDP)+WSS(TCP) pair on one port number.
+        // `bind_port` None → port 0 → the OS picks, with the pairing
+        // helper retrying the whole pair past a TCP-twin collision (#422);
+        // a concrete port is bound fail-fast (the caller advertised it).
         let quic_bind: SocketAddr =
             (std::net::Ipv4Addr::UNSPECIFIED, bind_port.unwrap_or(0)).into();
-        let quic_listener = QuicListener::bind_addr(&cert, quic_bind).await?;
+        let (quic_listener, wss_listener) =
+            crate::listener_pair::bind_listener_pair(&cert, quic_bind).await?;
         let port = quic_listener.port();
-
-        // Bind WSS (TCP) on the same port
-        let wss_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
-        let wss_listener = WssListener::bind(wss_addr).await?;
 
         let (incoming_raw_tx, incoming_rx) = mpsc::unbounded_channel();
         let (new_conn_tx, new_conn_rx) = mpsc::unbounded_channel();
