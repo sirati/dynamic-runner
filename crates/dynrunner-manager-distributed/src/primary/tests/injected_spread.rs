@@ -111,7 +111,8 @@ fn seed_promoted_roster(primary: &mut TestPrimary, secondary_ids: &[String], wor
             });
         }
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
     primary.reconstruct_workers_from_cluster_state();
 }
 
@@ -413,7 +414,8 @@ async fn injection_during_cascade_dispatches_despite_busy_inbox() {
                     task: utask.clone(),
                 });
             }
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
             primary.reconstruct_workers_from_cluster_state();
             primary.reconstruct_secondaries_from_cluster_state();
             primary.total_tasks = 1;

@@ -218,7 +218,8 @@ async fn drive_phase_end_with_two_phase_ledger(
             version: Default::default(),
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
     // The mesh-readiness dispatch gate would veto sec-0 otherwise.
     primary.handle_mesh_ready(DistributedMessage::MeshReady {
         target: None,

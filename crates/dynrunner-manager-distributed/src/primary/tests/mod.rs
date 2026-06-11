@@ -19,6 +19,7 @@
 
 mod assembly_beacon;
 mod basic;
+mod bringup_composition_fatal;
 mod bringup_fatal;
 mod bringup_milestone;
 mod capacity_dispatch;

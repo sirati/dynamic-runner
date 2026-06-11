@@ -131,7 +131,8 @@ async fn proactive_dispatch_skips_half_joined_member_until_mesh_ready_lands() {
                     task: t1,
                 });
             }
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
             let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
             // `register_idle_worker_for_test` marks BOTH members mesh-confirmed
@@ -231,7 +232,8 @@ async fn reactive_task_request_is_honored_even_when_member_unconfirmed() {
                     task: t0,
                 });
             }
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
             let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
             primary.register_idle_worker_for_test(id.clone(), 0, budget);
 
@@ -300,7 +302,8 @@ async fn first_dispatch_to_unconfirmed_member_is_withheld_until_mesh_ready() {
                     task: t0,
                 });
             }
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
             let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
             primary.register_idle_worker_for_test(id.clone(), 0, budget);
 

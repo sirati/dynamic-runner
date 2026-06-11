@@ -74,7 +74,8 @@ fn seed_two_pending_on_sec0(
             });
         }
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
     primary.confirm_member_mesh_for_test("sec-0");
 }
 
@@ -232,7 +233,8 @@ async fn promoted_primary_inherits_freeze_via_snapshot() {
                 promoted.cluster_state_for_test().graceful_abort_requested(),
                 "the latch must ride the promotion snapshot"
             );
-            promoted.hydrate_from_cluster_state();
+            promoted.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
             promoted.confirm_member_mesh_for_test("sec-0");
 
             promoted

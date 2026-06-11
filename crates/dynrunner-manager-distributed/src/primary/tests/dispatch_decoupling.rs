@@ -131,7 +131,8 @@ fn primary_two_phase_one_worker() -> (
             task: b,
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
     primary.register_idle_worker_for_test(
         "sec-0".into(),
         0,
@@ -341,7 +342,8 @@ async fn dispatch_selects_on_authoritative_free_predicate_not_advisory_is_idle()
                     task: t1,
                 });
             }
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
             let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
             primary.register_idle_worker_for_test("sec-0".into(), 0, budget.clone());
             primary.register_idle_worker_for_test("sec-0".into(), 1, budget);
