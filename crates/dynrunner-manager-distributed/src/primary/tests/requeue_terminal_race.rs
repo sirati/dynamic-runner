@@ -350,6 +350,8 @@ async fn replayed_wire_terminal_reclaims_requeued_task_from_pool() {
                 task_hash: lost_hash.clone(),
                 result_data: None,
                 delivery_seq: Some(2847),
+                // Stamped at the send_to_primary chokepoint (ordering gate).
+                msgs_posted_through: None,
             };
             primary
                 .dispatch_message(replayed_terminal, &mut None)

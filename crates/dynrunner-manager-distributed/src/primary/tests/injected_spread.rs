@@ -268,6 +268,8 @@ async fn injected_batch_on_promoted_primary_spreads_across_live_fleet() {
                         task_hash: compute_task_hash(&ptask("u0")),
                         result_data: None,
                         delivery_seq: None,
+                        // Stamped at the send_to_primary chokepoint (ordering gate).
+                        msgs_posted_through: None,
                     },
                     &mut None,
                 )
@@ -485,6 +487,8 @@ async fn injection_during_cascade_dispatches_despite_busy_inbox() {
                             task_hash: compute_task_hash(&utask),
                             result_data: None,
                             delivery_seq: None,
+                            // Stamped at the send_to_primary chokepoint (ordering gate).
+                            msgs_posted_through: None,
                         })
                         .expect("inbound open");
 

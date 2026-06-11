@@ -304,6 +304,8 @@ where
                             ),
                             // Stamped at the send_to_primary chokepoint (#352).
                             delivery_seq: None,
+                            // Stamped at the send_to_primary chokepoint (ordering gate).
+                            msgs_posted_through: None,
                         };
                         // Report to the primary role only; the authority
                         // owns mesh propagation (it originates the CRDT
@@ -386,6 +388,8 @@ where
                                 error_message: "worker pipe broken; respawning".into(),
                                 // Stamped at the send_to_primary chokepoint (#352).
                                 delivery_seq: None,
+                                // Stamped at the send_to_primary chokepoint (ordering gate).
+                                msgs_posted_through: None,
                             };
                             self.send_to_primary(msg).await?;
                         }
@@ -409,6 +413,8 @@ where
                         error_message: "No idle worker available".into(),
                         // Stamped at the send_to_primary chokepoint (#352).
                         delivery_seq: None,
+                        // Stamped at the send_to_primary chokepoint (ordering gate).
+                        msgs_posted_through: None,
                     };
                     // Report to the primary only — the authority owns
                     // mesh propagation. Routing across a primary

@@ -107,6 +107,8 @@ fn task_complete(secondary_id: &str, worker_id: u32, hash: &str) -> DistributedM
         task_hash: hash.into(),
         result_data: None,
         delivery_seq: None,
+        // Stamped at the send_to_primary chokepoint (ordering gate).
+        msgs_posted_through: None,
     }
 }
 
