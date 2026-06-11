@@ -30,6 +30,7 @@ from typing import Any
 from .. import _native
 from .._native import RustSlurmJobManager
 from ..deployment_spec import TaskDeploymentSpec
+from .gateway import retry_transient
 from .podman import PodmanImageMetadata
 
 logger = logging.getLogger(__name__)
@@ -290,7 +291,13 @@ class SlurmJobManager:
             if parent not in created_dirs:
                 self.gateway.create_directory(parent)
                 created_dirs.add(parent)
-            self.gateway.transfer_file(local, str(remote))
+            # Same idempotent gateway-copy boundary as the image
+            # uploads — one transient scp/ssh fault on one file must
+            # not kill the dispatch.
+            retry_transient(
+                lambda: self.gateway.transfer_file(local, str(remote)),
+                what=f"source-binary upload of {rel}",
+            )
             uploaded += 1
         logger.info("Source-binary upload complete (%d/%d files)", uploaded, len(binaries))
 

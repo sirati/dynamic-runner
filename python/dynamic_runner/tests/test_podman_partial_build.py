@@ -262,3 +262,38 @@ def test_explicit_cache_path_override(patched_subprocess, tmp_path):
     assert custom_cache.exists(), "explicit cache path should receive the assignment"
     # Default location should NOT have been used.
     assert not (patched_subprocess.project_root / DEFAULT_LAYER_CACHE_REL).exists()
+
+
+# ── Transient transfer-fault retry (whole-artifact fallback) ─────────
+
+
+def test_upload_artifact_retries_transient_oserror(tmp_path, monkeypatch):
+    """The non-layered whole-tarball upload is the same idempotent
+    gateway-copy boundary as the layered uploader's per-blob transfer
+    and must carry the same bounded transient-retry policy: one
+    OSError from `transfer_file` is retried, not fatal."""
+    import time
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+
+    local = tmp_path / "img.tar.gz"
+    local.write_bytes(b"tarball-bytes")
+    remote = tmp_path / "remote" / "img.tar.gz"
+    remote.parent.mkdir(parents=True)
+
+    calls: list[str] = []
+
+    class FlakyGateway:
+        def transfer_file(self, local_path: Path, remote_path: str) -> None:
+            calls.append(remote_path)
+            if len(calls) == 1:
+                raise OSError(f"copy {local_path} -> {remote_path}: connection reset")
+            Path(remote_path).write_bytes(Path(local_path).read_bytes())
+
+    pp = PodmanPackaging(deployment=_TEST_DEPLOYMENT)
+    pp._upload_artifact(FlakyGateway(), local, remote)
+
+    assert calls == [str(remote), str(remote)]
+    assert remote.read_bytes() == b"tarball-bytes"
+    assert sleeps == [1.0]

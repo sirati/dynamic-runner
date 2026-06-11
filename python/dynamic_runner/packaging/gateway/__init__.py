@@ -2,6 +2,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from .retry import retry_transient
+
+__all__ = [
+    "Gateway",
+    "GatewayConfig",
+    "create_gateway",
+    "expand_gateway_tilde",
+    "parse_gateway_url",
+    "retry_transient",
+]
+
 
 def expand_gateway_tilde(gateway: Any, path: str | Path) -> str:
     """Resolve a leading ``~`` in a remote path against the gateway's home.
