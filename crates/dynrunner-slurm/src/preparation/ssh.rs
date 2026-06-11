@@ -956,18 +956,27 @@ pub(super) enum TunnelFailureClass {
 ///    the proxy ssh's own stderr lands on the outer ssh's stderr — a
 ///    gateway-auth refusal therefore shows "Permission denied" from
 ///    the proxy AND "Connection closed by UNKNOWN port 65535" from the
-///    outer ssh in the SAME capture. The auth evidence wins.
-/// 2. Pre-banner loss markers ⇒ `Transient`: the connection died
-///    before/during identification exchange
-///    (`kex_exchange_identification`), or ssh never learned the peer
-///    ("Connection closed by UNKNOWN"), or the TCP layer reset — the
-///    `MaxStartups` random-drop anatomy.
-/// 3. A bare post-banner close line ("Connection closed by <addr>
-///    port <p>" with no pre-banner marker, e.g. sshd disconnecting
-///    after rejected auth attempts) ⇒ `Deterministic`.
-/// 4. Anything unrecognised ⇒ `Transient` — retrying an unknown
-///    failure is the safe default (the pre-classification behaviour
-///    for every failure).
+///    outer ssh in the SAME capture. The auth evidence wins. These
+///    four markers are the ONLY positive proof of an auth-class
+///    refusal ssh emits; absent one, the failure is not provably
+///    deterministic.
+/// 2. Anything else ⇒ `Transient` — retry it. This covers BOTH the
+///    pre-banner `MaxStartups` random-drop anatomy
+///    (`kex_exchange_identification` / "Connection closed by UNKNOWN"
+///    / "Connection reset by peer") AND a bare post-banner close
+///    ("Connection closed by <addr> port <p>" with no auth marker):
+///    on the reverse-tunnel setup burst (N nodes × {linger, release,
+///    `-N -R`, bind-probe} ssh logins in seconds) a busy worker sshd
+///    load-sheds an AUTHENTICATED session after the banner, producing
+///    exactly that bare close — and a retry (with its same-port
+///    release+rebind) virtually always lands. Treating the bare close
+///    as `Deterministic` (#408 regression: 31e689bc) severed that
+///    load-bearing retry — fail-fast removes the retry that load-shed
+///    closes depend on, so under establish-burst pressure (fresh image
+///    upload's concurrent scp/ssh + many nodes) the pre-existing
+///    intermittent phantom turned into a near-total welcome loss. A
+///    genuine auth refusal still fails fast via the step-1 markers it
+///    always carries.
 pub(super) fn classify_tunnel_failure(stderr: &str) -> TunnelFailureClass {
     const AUTH_MARKERS: [&str; 4] = [
         "Permission denied",
@@ -976,18 +985,6 @@ pub(super) fn classify_tunnel_failure(stderr: &str) -> TunnelFailureClass {
         "No supported authentication methods available",
     ];
     if AUTH_MARKERS.iter().any(|m| stderr.contains(m)) {
-        return TunnelFailureClass::Deterministic;
-    }
-    if stderr.contains("kex_exchange_identification")
-        || stderr.contains("Connection closed by UNKNOWN")
-        || stderr.contains("Connection reset by peer")
-    {
-        return TunnelFailureClass::Transient;
-    }
-    if stderr
-        .lines()
-        .any(|l| l.trim_start().starts_with("Connection closed by "))
-    {
         return TunnelFailureClass::Deterministic;
     }
     TunnelFailureClass::Transient

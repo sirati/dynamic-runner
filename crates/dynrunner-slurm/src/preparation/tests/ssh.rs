@@ -795,9 +795,11 @@ fn classifier_pre_banner_drop_is_transient() {
 }
 
 /// Auth-class refusals — wrong/missing key, unknown user (the
-/// asm-dataset provisioning gap), host-key rejection, post-banner
-/// close — are DETERMINISTIC: every retry refuses identically, so
-/// the classifier must steer the policy to fail fast.
+/// asm-dataset provisioning gap), host-key rejection, too-many-auth —
+/// are DETERMINISTIC: every retry refuses identically (ssh emits an
+/// explicit auth marker), so the classifier must steer the policy to
+/// fail fast. These markers are the ONLY positive proof of an
+/// auth-class refusal.
 #[test]
 fn classifier_auth_class_is_deterministic() {
     assert_eq!(
@@ -817,11 +819,27 @@ fn classifier_auth_class_is_deterministic() {
         ),
         TunnelFailureClass::Deterministic
     );
-    // Bare post-banner close (sshd disconnected after rejected auth
-    // attempts) — no pre-banner marker present.
+}
+
+/// REGRESSION (#408): a bare post-banner "Connection closed by <addr>
+/// port <p>" — no pre-banner `kex_`/`UNKNOWN` marker, no explicit auth
+/// marker — is TRANSIENT, not deterministic. On the establish burst a
+/// busy worker sshd load-sheds an already-authenticated session after
+/// the banner, emitting exactly this line; a retry (with its same-port
+/// release+rebind) virtually always lands. The 31e689bc classifier
+/// wrongly fast-failed it, removing the retry that load-shed closes
+/// depend on. A genuine auth refusal still carries a step-1 marker, so
+/// only the ambiguous bare close changes class here.
+#[test]
+fn classifier_bare_post_banner_close_is_transient() {
     assert_eq!(
         classify_tunnel_failure("Connection closed by 10.153.52.8 port 22"),
-        TunnelFailureClass::Deterministic
+        TunnelFailureClass::Transient
+    );
+    // Same shape with the trailing newline ssh appends.
+    assert_eq!(
+        classify_tunnel_failure("Connection closed by 10.153.52.8 port 22\r\n"),
+        TunnelFailureClass::Transient
     );
 }
 
