@@ -42,7 +42,7 @@ from argparse import ArgumentParser, Namespace
 from collections.abc import Iterable
 from pathlib import Path
 
-from dynamic_runner._shared import BinaryIdentifier, TaskInfo
+from dynamic_runner._shared import BinaryIdentifier, TaskDep, TaskInfo
 from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
 
 
@@ -157,8 +157,21 @@ class SyntheticTask:
                     # Cross-phase dep: consume-i depends on produce-i.
                     # The phase barrier already gates this; the per-task
                     # edge additionally exercises PendingPool's
-                    # blocked-map shape.
-                    task_depends_on=(_produce_task_id(idx),),
+                    # blocked-map shape. A dependency's full identity is
+                    # ``(phase_id, task_id)`` — a bare string resolves to
+                    # the ENCLOSING phase (here: consume), where no
+                    # ``produce-i`` exists, so the seed would classify the
+                    # consume tasks ``InvalidTask { missing dep }``. The
+                    # cross-phase edge MUST name the prerequisite's phase
+                    # via the ``TaskDep`` dataclass (the documented
+                    # consumer contract; see
+                    # ``dynamic_runner._shared.task_info.TaskDep``).
+                    task_depends_on=(
+                        TaskDep(
+                            task_id=_produce_task_id(idx),
+                            phase_id=_PHASE_PRODUCE,
+                        ),
+                    ),
                     payload={
                         "kind": _PHASE_CONSUME,
                         "idx": idx,
@@ -291,7 +304,7 @@ def _build_task(
     phase_id: str,
     type_id: str,
     task_id: str,
-    task_depends_on: tuple[str, ...],
+    task_depends_on: tuple[str | TaskDep, ...],
     payload: dict,
 ) -> TaskInfo:
     """One TaskInfo for ``input-{idx}.txt``.

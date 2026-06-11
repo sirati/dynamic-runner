@@ -211,8 +211,12 @@ where
 
         // Phase + lifecycle bookkeeping. Must run AFTER the pool
         // mutation so `process_phase_lifecycle` observes the post-
-        // cascade pool state.
-        self.note_item_failed(&phase_id, Some(task_id.as_str()), command_rx)
+        // cascade pool state. `kind = None`: the pool ALREADY observed
+        // this failure's identity + permanence through the
+        // `on_item_failed_permanent` call above, so the routing must take
+        // the legacy in-flight-only decrement — a retry-pending marker
+        // here would be redundant with the final `failed_tasks` entry.
+        self.note_item_failed(&phase_id, Some(task_id.as_str()), None, command_rx)
             .await;
         Ok(())
     }

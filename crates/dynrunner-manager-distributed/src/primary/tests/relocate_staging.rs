@@ -592,12 +592,28 @@ async fn relocated_primary_mode1_file_based_restages() {
 // FRESH promoted destination (all-Pending CRDT) still stages.
 // ─────────────────────────────────────────────────────────────────────────
 
+/// CRDT seed shape for [`build_staging_primary`] — which resume signal (if
+/// any) the seeded ledger carries when `maybe_auto_stage_initial` runs.
+enum StagingSeedShape {
+    /// All tasks `Pending` — a first-ever promoted destination.
+    Fresh,
+    /// One task driven to `InFlight` — a genuine failover-resume.
+    Resumed,
+    /// All stageable tasks `Pending` PLUS one extra task that the SEED
+    /// itself classified terminal `InvalidTask` (the #2 missing-dep
+    /// ingest classification). A seed-time terminal is NOT dispatch
+    /// progress — the corpus has never been staged anywhere — so the
+    /// resume detector must keep the staging gate OPEN.
+    FreshWithSeedTimeInvalid,
+}
+
 /// Seed `n` file-based binaries into a fresh primary's CRDT (all Pending),
-/// hydrate, and return the primary + the source dir kept alive. `progressed`
-/// drives ONE of them to `InFlight` (the resume signal) when true. The config
-/// has `source_dir` set + `uses_file_based_items` so the staging gate is
-/// OTHERWISE open — isolating the resume gate as the sole discriminator.
-fn build_staging_primary(progressed: bool) -> (TestPrimaryForStaging, tempfile::TempDir) {
+/// hydrate, and return the primary + the source dir kept alive. `shape`
+/// selects the resume signal the ledger carries (see [`StagingSeedShape`]).
+/// The config has `source_dir` set + `uses_file_based_items` so the staging
+/// gate is OTHERWISE open — isolating the resume gate as the sole
+/// discriminator.
+fn build_staging_primary(shape: StagingSeedShape) -> (TestPrimaryForStaging, tempfile::TempDir) {
     let source = tempfile::TempDir::new().expect("source tmpdir");
     let names: Vec<String> = (0..3).map(|i| format!("file_{i}")).collect();
     for name in &names {
@@ -637,7 +653,7 @@ fn build_staging_primary(progressed: bool) -> (TestPrimaryForStaging, tempfile::
             cs.apply(ClusterMutation::TaskAdded { hash: hash.clone(), task: b });
             // Drive the first task to InFlight when modelling a RESUME (a
             // task has progressed past Pending — the populated-CRDT signal).
-            if progressed && i == 0 {
+            if matches!(shape, StagingSeedShape::Resumed) && i == 0 {
                 cs.apply(ClusterMutation::TaskAssigned {
                     attempt: 0,
                     hash,
@@ -646,6 +662,31 @@ fn build_staging_primary(progressed: bool) -> (TestPrimaryForStaging, tempfile::
                     version: Default::default(),
                 });
             }
+        }
+        // Seed-time terminal: one EXTRA task the ingest classification
+        // itself marked `InvalidTask` (a missing dep — the #2 class).
+        // Mirrors `originate_cold_seed`'s invalid_deps routing: seeded
+        // `Pending` via `TaskAdded`, then transitioned terminal in the
+        // same batch, BEFORE any dispatch (and before any staging)
+        // happened anywhere.
+        if matches!(shape, StagingSeedShape::FreshWithSeedTimeInvalid) {
+            let invalid = make_binary("seed_time_invalid", 7);
+            let hash = crate::primary::wire::compute_task_hash(&invalid);
+            cs.apply(ClusterMutation::TaskAdded {
+                hash: hash.clone(),
+                task: invalid,
+            });
+            cs.apply(ClusterMutation::TaskFailed {
+                hash,
+                kind: dynrunner_core::ErrorType::InvalidTask {
+                    reason: dynrunner_core::BoundedString::from(
+                        "missing dep (phase=P, task_id=nope)".to_string(),
+                    ),
+                },
+                error: "missing dep (phase=P, task_id=nope)".into(),
+                version: Default::default(),
+                attempt: 0,
+            });
         }
     }
     primary.hydrate_from_cluster_state();
@@ -664,7 +705,7 @@ async fn auto_stage_skipped_on_populated_crdt_resume() {
     local
         .run_until(async {
             // RESUME: one task already InFlight ⇒ the CRDT is populated.
-            let (mut p, _src) = build_staging_primary(true);
+            let (mut p, _src) = build_staging_primary(StagingSeedShape::Resumed);
             p.0.maybe_auto_stage_initial()
                 .expect("auto-stage call ok");
             assert!(
@@ -683,13 +724,41 @@ async fn auto_stage_runs_on_fresh_all_pending_promoted_destination() {
         .run_until(async {
             // FRESH: every task Pending ⇒ a first-ever promoted destination,
             // NOT a resume. Staging must proceed (the gate stays open).
-            let (mut p, _src) = build_staging_primary(false);
+            let (mut p, _src) = build_staging_primary(StagingSeedShape::Fresh);
             p.0.maybe_auto_stage_initial()
                 .expect("auto-stage call ok");
             assert!(
                 !p.0.pending_stage_files.is_empty(),
                 "a fresh all-Pending promoted destination MUST stage the corpus \
                  (resume detection does not over-suppress first-ever staging)"
+            );
+        })
+        .await;
+}
+
+/// A SEED-TIME terminal is not dispatch progress. The cold seed classifies a
+/// missing-dep task terminal `InvalidTask` BEFORE any task was ever
+/// dispatched or staged anywhere; a promoted destination hydrating that
+/// ledger is still a FIRST-EVER primary for the run and MUST stage the
+/// corpus. Pre-fix, the resume detector summed `invalid_task` into its
+/// "progressed" signal, mis-read the fresh relocate as a failover-resume,
+/// skipped the staging walk entirely, and the very first dispatched task
+/// failed NonRecoverable "not pre-staged at <path>" (the
+/// distributed-local-subprocess e2e repro: the seed invalidated the consume
+/// tasks, the promoted primary skipped staging, produce-0 died).
+#[tokio::test(flavor = "current_thread")]
+async fn auto_stage_runs_despite_seed_time_invalid_tasks() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut p, _src) =
+                build_staging_primary(StagingSeedShape::FreshWithSeedTimeInvalid);
+            p.0.maybe_auto_stage_initial().expect("auto-stage call ok");
+            assert!(
+                !p.0.pending_stage_files.is_empty(),
+                "seed-time InvalidTask entries must NOT suppress first-ever \
+                 staging — only dispatch-derived progress (InFlight / Completed \
+                 / Failed / Unfulfillable) marks a resume"
             );
         })
         .await;

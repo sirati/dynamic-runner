@@ -4714,6 +4714,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 {
                     continue;
                 }
+                // Both buckets DECLINED: this phase's soft (retry-pending)
+                // failures are permanent now — finalize them and
+                // cascade-fail their blocked dependents (the dependents can
+                // never run; leaving them blocked wedged the run forever —
+                // see `finalize_phase_soft_failures`). Runs BEFORE the
+                // tally read below so `on_phase_end` reports a tally that
+                // already includes the cascaded terminals (the broadcast's
+                // local apply bumps the per-phase Failed EVENT tally).
+                self.finalize_phase_soft_failures(p).await;
                 // Read the replicated EVENT tallies (F4): identical numbers
                 // to the old node-local maps on the live path, CORRECT on
                 // the promoted path (the events were replicated). EVENT-
@@ -4904,26 +4913,52 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
     /// Per-failure bookkeeping. Same shape as `note_item_completed`.
     ///
-    /// `task_id` is accepted for symmetry with the success path but is
-    /// NOT forwarded to the pool's per-task completion ledger:
-    /// recoverable failures land in `failed_tasks` and may be
-    /// reinjected on a later retry pass, so dependents must remain
-    /// blocked until the task either succeeds (→ `note_item_completed`
-    /// with `Some(id)`) or is declared permanently failed
-    /// (→ `pool.on_item_failed_permanent`, owned by the retry-budget
-    /// exhaustion path). Param kept so future callers can route via a
-    /// uniform helper without a signature change.
+    /// `task_id` + `kind` decide how the POOL observes the failure:
+    ///
+    /// * `Some(id)` with a non-`Unfulfillable` `kind` — the
+    ///   retry-pending failure marker
+    ///   (`pool.on_item_failed_pending_retry`): the in-flight count
+    ///   drops AND the id is soft-marked so blocked dependents doomed by
+    ///   it stop holding the phase's drain edge hostage. Dependents are
+    ///   NOT cascaded yet — the drain edge's retry buckets may reinject
+    ///   the task (revival clears the marker); only when they decline
+    ///   does `finalize_phase_soft_failures` make the failure permanent
+    ///   and cascade. Without the marker, a terminally-failed prereq's
+    ///   blocked dependents kept the phase `Draining` forever, the drain
+    ///   edge never came, and the run hung after the failure report (the
+    ///   distributed-local-subprocess e2e hang, 2026-06-10).
+    /// * `Some(id)` with `kind = Unfulfillable` — dependents stay
+    ///   BLOCKED (no marker): unfulfillable is the operator-resolvable
+    ///   class, revived through the reinject command / fulfillability
+    ///   matcher rather than the phase retry buckets, and its dependents
+    ///   dormancy is the deliberate contract (`apply_fail_permanent`'s
+    ///   cascade-pause split).
+    /// * `None` task_id or `None` kind — the legacy in-flight-only
+    ///   decrement (`on_item_finished(phase, None)`), for callers whose
+    ///   failure identity/permanence the pool already observed (e.g.
+    ///   `apply_fail_permanent`, whose `on_item_failed_permanent` call
+    ///   precedes this bookkeeping).
     pub(super) async fn note_item_failed(
         &mut self,
         phase_id: &PhaseId,
-        _task_id: Option<&str>,
+        task_id: Option<&str>,
+        kind: Option<&dynrunner_core::ErrorType>,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
         // Same as `note_item_completed`: the per-phase Failed EVENT tally
         // (F4) bump is owned by the `merge_task_state` join (#358) — the
         // caller's `ClusterMutation::TaskFailed` apply bumped it before this
         // bookkeeping runs, identically on every mirror.
-        self.pool_mut().on_item_finished(phase_id, None);
+        match (task_id, kind) {
+            (Some(id), Some(k))
+                if !matches!(k, dynrunner_core::ErrorType::Unfulfillable { .. }) =>
+            {
+                self.pool_mut().on_item_failed_pending_retry(phase_id, id);
+            }
+            _ => {
+                self.pool_mut().on_item_finished(phase_id, None);
+            }
+        }
         self.process_phase_lifecycle(command_rx).await;
     }
 }
