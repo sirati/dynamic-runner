@@ -4616,6 +4616,33 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         discarded
     }
 
+    /// The phase-lifecycle cascade's run-terminal gate: `true` iff the
+    /// replicated `RunAborted` verdict is latched, in which case the
+    /// cascade must stop — no `on_phase_end` fire, no `PhaseEnded`
+    /// origination, no `mark_phase_done`, no dependent `on_phase_start`
+    /// — because every one of those would derive "phase progress" from
+    /// post-abort (possibly invalidated/wiped) state. One predicate so
+    /// the three checkpoints inside [`Self::process_phase_lifecycle`]
+    /// (loop top, per drained phase, post-command-drain) cannot drift.
+    ///
+    /// Deliberately scoped to the ABORT latch: `run_complete` ends the
+    /// run through the normal completion exits, and the graceful-abort
+    /// drain RELIES on the cascade running to its end.
+    fn run_terminal_cascade_gate(&self) -> bool {
+        match self.cluster_state.run_aborted() {
+            Some(reason) => {
+                tracing::debug!(
+                    reason = %reason,
+                    "run-terminal verdict latched; suppressing the \
+                     phase-lifecycle cascade (no phase hook may run \
+                     against post-abort state)"
+                );
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Drive `Drained` phases through `on_phase_end` → `mark_phase_done`
     /// → newly-Active phases through `on_phase_start`. Called from
     /// the same code paths that update `completed_tasks` / `failed_tasks`
@@ -4667,11 +4694,32 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             return;
         }
         loop {
+            // Run-terminal gate: once the replicated `RunAborted` verdict is
+            // latched (e.g. the #3b run-wide invalidation latches it BEFORE
+            // wiping the ledger), the run is over and the phase machine must
+            // not re-derive "phase ended" from post-abort state — firing
+            // `on_phase_end` against an invalidated/wiped ledger runs the
+            // consumer hook on facts that no longer describe the run (the
+            // production "spawned=0" raise that overwrote the true abort
+            // reason, asm-dataset run_20260611_112116). Checked per cascade
+            // round AND per drained phase below, because the latch can flip
+            // MID-cascade (a hook-queued spawn tripping the #3b invalidation
+            // inside the command drain).
+            if self.run_terminal_cascade_gate() {
+                return;
+            }
             let drained = self.pool_mut().poll_drain_transitions();
             if drained.is_empty() {
                 break;
             }
             for p in &drained {
+                // Per-phase re-check of the run-terminal gate (see the
+                // loop-top doc): an earlier phase's hook in THIS drained
+                // batch may have latched the verdict via its queued
+                // commands.
+                if self.run_terminal_cascade_gate() {
+                    return;
+                }
                 // Per-phase retry-bucket cascade — runs BEFORE
                 // `on_phase_end` so phase B (which depends on A)
                 // doesn't activate until phase A's retry buckets
@@ -4812,6 +4860,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // call — so the box allocation is gated on a
                 // callback actually queueing a command.
                 self.drain_callback_queued_commands(command_rx).await;
+                // Run-terminal re-check AFTER the drain: the hook's own
+                // queued commands can trip the #3b invalidation (a spawn
+                // batch carrying a duplicate identity), which latches the
+                // verdict mid-cascade. The end edge deliberately does NOT
+                // complete here (no `PhaseEnded`, no `mark_phase_done`,
+                // no dependent starts) — the run is aborting and the
+                // frozen dispatch view already guarantees nothing
+                // downstream can be assigned.
+                if self.run_terminal_cascade_gate() {
+                    return;
+                }
                 // Per-phase proceed-or-fail decision, evaluated AFTER the
                 // retry-bucket cascade has exhausted every reinjection
                 // path (both buckets above returned `false`) and BEFORE

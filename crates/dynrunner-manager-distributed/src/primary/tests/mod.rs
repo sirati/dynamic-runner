@@ -31,6 +31,7 @@ mod graceful_abort;
 mod hydrate;
 mod initial_assignment;
 mod injected_spread;
+mod invalidation_abort;
 mod mesh_readiness_gate;
 mod message_phase_ordering;
 mod node_gates;
