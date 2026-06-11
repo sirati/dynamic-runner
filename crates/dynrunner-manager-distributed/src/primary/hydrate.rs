@@ -462,13 +462,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `self.secondary_keepalives`) from the same CRDT source. The
         // on-demand promotion path bypasses connect.rs / peer_setup.rs (the
         // only writers of `self.secondaries`), so without this a promoted
-        // primary's roster is empty: `broadcast_primary_keepalive`
-        // early-returns (the promoted primary emits NO keepalives →
-        // surviving secondaries trip `primary_silent`), `record_keepalive`
-        // no-ops, and `collect_heartbeat_report` can mark NO secondary dead
-        // — a secondary dying AFTER promotion strands its inherited
-        // in-flight tasks forever. Same "derived cache of the CRDT"
-        // treatment `self.workers` gets above.
+        // primary's roster is empty: `record_keepalive` no-ops, and
+        // `collect_heartbeat_report` can mark NO secondary dead — a
+        // secondary dying AFTER promotion strands its inherited in-flight
+        // tasks forever. (The keepalive EMITTER is roster-independent —
+        // `broadcast_primary_keepalive` fans to the mesh members — so only
+        // the death-clock bookkeeping depends on this rebuild.) Same
+        // "derived cache of the CRDT" treatment `self.workers` gets above.
         self.reconstruct_secondaries_from_cluster_state();
 
         // Seed the unified `in_flight` ledger only after `extend`
@@ -552,7 +552,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// outside (same rationale as the pool rebuild).
     pub(crate) fn reconstruct_workers_from_cluster_state(&mut self) {
         // Roster source: the replicated per-secondary capacity records
-        // (D1), name-sorted for the same deterministic ordering
+        // (D1) of the NOT-authoritatively-removed members
+        // (`live_known_secondaries` — capacity records are set-once and
+        // outlive a `PeerRemoved`, so an unfiltered rebuild would
+        // resurrect a removed peer's slots; a re-admission flips the
+        // membership back to Alive and re-includes the preserved record),
+        // name-sorted for the same deterministic ordering
         // `perform_initial_assignment` uses (it sorts `self.secondaries`'
         // keys). Pull the (id, worker_count, max_res) snapshot up front so
         // the build loop holds no overlapping borrow on `self`. `max_res`
@@ -561,7 +566,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let mem_kind = dynrunner_core::ResourceKind::memory();
         let mut secondary_ids: Vec<String> = self
             .cluster_state
-            .known_secondaries()
+            .live_known_secondaries()
             .map(String::from)
             .collect();
         secondary_ids.sort();
@@ -713,9 +718,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// replicated capacity ledger is the authoritative source.
     pub(crate) fn reconstruct_secondaries_from_cluster_state(&mut self) {
         let observers = self.cluster_state.role_table().observers.clone();
+        // Same membership filter as the worker-roster sibling: a removed
+        // peer's preserved capacity record must not re-enter the
+        // connection/keepalive roster (it would re-arm a death clock for
+        // a tombstoned member); a re-admitted peer re-enters naturally.
         let roster: Vec<(String, u32, Vec<dynrunner_core::ResourceAmount>, bool)> = self
             .cluster_state
-            .known_secondaries()
+            .live_known_secondaries()
             .map(String::from)
             .filter_map(|id| {
                 let can_be_primary = self.cluster_state.can_be_primary(&id);
@@ -743,7 +752,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `next_secondary_id` is a pure derived cache of the CRDT's id space;
         // the `.max(self.next_secondary_id)` floor preserves the
         // `config.num_secondaries` bootstrap reservation when both sources
-        // are smaller than that floor.
+        // are smaller than that floor. Deliberately the UNFILTERED
+        // `known_secondaries()` (NOT `live_known_secondaries`): a REMOVED
+        // peer's id was still handed out, and its index must stay burned
+        // so a later mint never re-issues a dead member's identity.
         let max_known = self
             .cluster_state
             .known_secondaries()
