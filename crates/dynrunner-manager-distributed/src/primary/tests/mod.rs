@@ -20,6 +20,7 @@
 mod assembly_beacon;
 mod basic;
 mod bringup_fatal;
+mod bringup_milestone;
 mod capacity_dispatch;
 mod coordinator_setup;
 mod crdt_convergence;
