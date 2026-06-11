@@ -339,6 +339,112 @@ async fn disabled_policy_writes_nothing_to_replicated_ledger() {
         .await;
 }
 
+/// Respawn-vs-re-admission: a removal that is RE-ADMITTED (the same
+/// incarnation provably returned — the frame-ingest seam flipped its
+/// membership back to `Alive` at the next generation) must CANCEL the
+/// queued-not-launched respawn for that peer. The request sits on the
+/// unbounded channel until the operational loop drains it; the dispatch
+/// decision point is therefore where the queued stage is cancellable,
+/// and the replicated membership is the fact it consults. Because the
+/// ledger entry (the budget spend) is only written on an ACCEPTED
+/// dispatch, a canceled queued respawn never consumes budget — the
+/// "refund" is structural.
+///
+/// A genuine death is intact: the same peer removed AGAIN (membership
+/// `Dead` at dispatch time) spawns a replacement.
+///
+/// (The LAUNCHED stage needs no cancellation: an accepted respawn comes
+/// up under a freshly-minted `secondary-N` id — `mint_secondary_id`,
+/// pinned by `respawn_dispatcher_minted_id_is_monotonic`, with the
+/// failover-monotonic `next_secondary_id` fold over capacity +
+/// respawn-ledger ids — so it can never duplicate the re-admitted
+/// peer's identity; it joins as an ordinary extra secondary.)
+#[tokio::test(flavor = "current_thread")]
+async fn queued_respawn_canceled_when_peer_readmitted_before_dispatch() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use dynrunner_protocol_primary_secondary::ClusterMutation;
+
+            let (mut coordinator, _mesh) = make_coordinator();
+            let spawner = Arc::new(MockSpawner::new());
+            let calls = Arc::clone(&spawner.calls);
+            coordinator.enable_respawn(
+                spawner.clone(),
+                permissive_budget(),
+                "tcp://127.0.0.1:5555".into(),
+                "-----BEGIN PUBLIC KEY-----\nFAKE\n".into(),
+            );
+
+            // The member joins, then is (falsely) removed — the removal
+            // is what enqueued the respawn request the loop will drain.
+            coordinator.cluster_state.apply(ClusterMutation::PeerJoined {
+                peer_id: "sec-x".into(),
+                is_observer: false,
+                can_be_primary: true,
+                cap_version: Default::default(),
+                member_gen: 0,
+            });
+            coordinator
+                .cluster_state
+                .apply(ClusterMutation::PeerRemoved {
+                    id: "sec-x".into(),
+                    cause: RemovalCause::KeepaliveMiss,
+                    member_gen: 0,
+                });
+            // RE-ADMISSION lands BEFORE the queued request is drained:
+            // the generation-advancing PeerJoined the frame-ingest seam
+            // originates.
+            coordinator.cluster_state.apply(ClusterMutation::PeerJoined {
+                peer_id: "sec-x".into(),
+                is_observer: false,
+                can_be_primary: true,
+                cap_version: Default::default(),
+                member_gen: 1,
+            });
+
+            // The operational loop now drains the (stale) queued request.
+            coordinator.dispatch_respawn_request(RespawnRequest {
+                original_id: "sec-x".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            });
+            assert!(
+                coordinator.respawn_tasks.is_empty(),
+                "no replacement may be spawned for a re-admitted (alive) peer"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "spawner never invoked");
+            assert!(
+                coordinator.cluster_state.respawn_events().is_empty(),
+                "a canceled queued respawn must not consume replicated budget"
+            );
+
+            // Genuine death of the re-admitted incarnation: removal at
+            // the CURRENT generation → membership Dead at dispatch time →
+            // the replacement spawns.
+            coordinator
+                .cluster_state
+                .apply(ClusterMutation::PeerRemoved {
+                    id: "sec-x".into(),
+                    cause: RemovalCause::KeepaliveMiss,
+                    member_gen: 1,
+                });
+            coordinator.dispatch_respawn_request(RespawnRequest {
+                original_id: "sec-x".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            });
+            let outcome = coordinator
+                .respawn_tasks
+                .join_next()
+                .await
+                .expect("genuine death must spawn a replacement")
+                .expect("no panic");
+            assert!(outcome.result.is_ok());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(coordinator.cluster_state.respawn_events().len(), 1);
+        })
+        .await;
+}
+
 /// Three deaths in the same family chain (each respawn's `new_id`
 /// becoming the next death's `original_id`) consume the
 /// `max_per_secondary = 3` budget; the fourth death is rejected
