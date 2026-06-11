@@ -29,9 +29,12 @@
 //!   (the starved-pump honesty), DRAINED only on the actual pull.
 //! - [`late_joiner_forward`]: desktop-shaped late-joiner bootstrap —
 //!   the RED repro (compute-internal address unreachable from this
-//!   host ⇒ loud bounded `NoReachablePeer`) and the GREEN contract
+//!   host ⇒ loud bounded `NoReachablePeer`), the GREEN contract
 //!   (join + snapshot RPC succeed through a local TCP forward
-//!   endpoint with a cert-less, WSS-only rewritten seed entry).
+//!   endpoint with a cert-less, WSS-only rewritten seed entry), and
+//!   the production frame shape (the bootstrap window accepts a
+//!   snapshot reply stamped with the Phase-C role-typed routing
+//!   target, amid stamped broadcast gossip).
 //! - [`log_capture`]: shared tracing capture layer + `pump_b_until`
 //!   used by the silent-reconnect + dial-failure-summary scenarios;
 //!   kept here because they observe the framework log trace.
