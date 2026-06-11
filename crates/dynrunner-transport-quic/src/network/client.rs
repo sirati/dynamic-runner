@@ -28,7 +28,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
-use dynrunner_protocol_primary_secondary::DistributedMessage;
+use dynrunner_protocol_primary_secondary::{DistributedMessage, InboundTap};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -249,7 +249,10 @@ fn spawn_quic_bridge<I: Identifier>(conn: QuicConnection) -> BridgedConnection<I
     let reader = tokio::task::spawn_local(framing::run_quic_reader(
         recv_stream,
         existing_buf,
-        incoming_tx,
+        // Untracked tap: this uplink leg has no mesh-liveness consumer
+        // for its arrival clock (the peer mesh's `PeerNetwork` owns the
+        // tracked edges); the shared reader pump takes a tap uniformly.
+        InboundTap::untracked(incoming_tx),
         CTX,
         CTX.to_string(),
         framing::new_reassembler(),
@@ -298,7 +301,8 @@ fn spawn_wss_bridge<I: Identifier>(conn: WssConnection) -> BridgedConnection<I> 
 
     let reader = tokio::task::spawn_local(framing::run_wss_reader(
         ws_read,
-        incoming_tx,
+        // Untracked tap — see `spawn_quic_bridge`.
+        InboundTap::untracked(incoming_tx),
         CTX,
         CTX.to_string(),
         framing::new_reassembler(),

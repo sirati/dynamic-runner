@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, Router};
+use dynrunner_protocol_primary_secondary::{
+    DistributedMessage, InboundTap, IngestEdges, PeerConnectionInfo, Router,
+};
 use tokio::sync::mpsc;
 
 use crate::certs::CertPair;
@@ -183,8 +185,18 @@ pub struct PeerNetwork<I: Identifier> {
     connections: HashMap<String, mpsc::UnboundedSender<DistributedMessage<I>>>,
     /// Incoming messages from all peers.
     incoming_rx: mpsc::UnboundedReceiver<DistributedMessage<I>>,
-    /// Sender side (kept for spawning new connection handlers).
-    incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
+    /// Sender side (kept for spawning new connection handlers). The
+    /// recording [`InboundTap`]: every producer clone stamps each
+    /// decoded frame's sender on `ingest_edges.arrival` — the true
+    /// arrival edge — before the frame enters `incoming_rx`.
+    incoming_tx: InboundTap<I>,
+    /// The inbound queue's two freshness clocks: ARRIVAL stamped by
+    /// `incoming_tx` (and every clone in the reader/accept/dial/
+    /// bootstrap-forwarder tasks), DRAINED stamped in
+    /// `recv_peer`/`try_recv_peer` as frames are pulled back out.
+    /// Published to detached liveness readers via
+    /// [`dynrunner_protocol_primary_secondary::PeerTransport::ingest_edges`].
+    pub(super) ingest_edges: IngestEdges,
     /// New connections from the accept loop that need registration.
     new_conn_rx: mpsc::UnboundedReceiver<AcceptedPeer<I>>,
     /// Sender side for accept loop AND per-peer outgoing-dial tasks
@@ -333,9 +345,14 @@ impl<I: Identifier> PeerNetwork<I> {
         let wss_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
         let wss_listener = WssListener::bind(wss_addr).await?;
 
-        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (incoming_raw_tx, incoming_rx) = mpsc::unbounded_channel();
         let (new_conn_tx, new_conn_rx) = mpsc::unbounded_channel();
         let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel();
+        // Mount the arrival clock on the inbound fan-in so every
+        // producer (accept loops, dial handlers, bootstrap forwarder)
+        // records the sender at the true arrival edge by construction.
+        let ingest_edges = IngestEdges::new();
+        let incoming_tx = InboundTap::new(incoming_raw_tx, ingest_edges.arrival.clone());
 
         // Spawn QUIC accept loop
         {
@@ -406,6 +423,7 @@ impl<I: Identifier> PeerNetwork<I> {
             connections: HashMap::new(),
             incoming_rx,
             incoming_tx,
+            ingest_edges,
             new_conn_rx,
             new_conn_tx,
             disconnect_rx,

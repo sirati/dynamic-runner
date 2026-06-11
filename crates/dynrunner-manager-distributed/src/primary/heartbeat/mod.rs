@@ -27,6 +27,10 @@
 //! tracking, drops the connection state, and notifies surviving peers via
 //! `TimeoutDetected`).
 
+mod ingest_gate;
+
+pub(super) use ingest_gate::IngestEdgeGate;
+
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{BoundedString, Identifier};
@@ -196,17 +200,25 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// is preserved verbatim from the binary-clock version.
     ///
     /// FLOOD IMMUNITY — the INGEST-clock union: each secondary's
-    /// last-evidence-of-life is the LATER of (a) its last PROCESSED
+    /// last-evidence-of-life is the LATEST of (a) its last PROCESSED
     /// frame (`secondary_keepalives`, refreshed at dispatch + by the
-    /// liveness-beacon arm) and (b) its last frame to ENTER this
+    /// liveness-beacon arm), (b) its last frame to ENTER this
     /// primary's inbox (`RoleInbox::last_ingest_from`, recorded at the
     /// slot's delivery choke point BEFORE the frame waits in the
-    /// channel). Under inbox starvation (the run_20260610_221140 face:
-    /// depth 52654, keepalive arm starved) the processed clock inflates
-    /// while the peers' keepalives sit QUEUED — pre-union the sweep
-    /// declared LIVE peers dead off this node's own busyness. The ingest
-    /// clock keeps the silence age honest: it measures the PEER's
-    /// silence, never our backlog.
+    /// channel), and (c) its last frame to ARRIVE at this node's
+    /// TRANSPORT (`RoleInbox::last_transport_arrival_from`, recorded by
+    /// the connection read loops BEFORE the frame waits in the
+    /// transport's inbound queue). Under inbox starvation (the
+    /// run_20260610_221140 face: depth 52654, keepalive arm starved)
+    /// the processed clock inflates while the peers' keepalives sit
+    /// QUEUED — pre-union the sweep declared LIVE peers dead off this
+    /// node's own busyness. And under MESH-PUMP starvation (the
+    /// run_20260611_115429 face: a snapshot-flooded egress starved the
+    /// pump's ingress arm) frames never even reached the slot's choke
+    /// point, so clock (b) lied too — only the transport-arrival clock,
+    /// written by reader tasks that keep running while the pump
+    /// starves, still measures the PEER's silence and never our
+    /// backlog.
     pub(super) fn collect_heartbeat_report(&self) -> SecondaryHeartbeatReport {
         let now = Instant::now();
         let mut silences = Vec::new();
@@ -221,10 +233,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             ) {
                 continue;
             }
-            let last_evidence = match self.inbox.last_ingest_from(id) {
-                Some(ingested) => (*last).max(ingested),
-                None => *last,
-            };
+            let last_evidence = [
+                self.inbox.last_ingest_from(id),
+                self.inbox.last_transport_arrival_from(id),
+            ]
+            .into_iter()
+            .flatten()
+            .fold(*last, Instant::max);
             silences.push(SecondarySilence {
                 secondary_id: id.clone(),
                 last_keepalive: last_evidence,
@@ -484,15 +499,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
     /// Drive one heartbeat-tick cycle: collect the fresh silence sweep
     /// and hand it to the staged dead-secondary declaration policy —
-    /// UNLESS this very sweep is locally starved (the tick's own
-    /// inter-tick gap stretched far past the keepalive cadence: the
-    /// runtime was frozen/starved and every age it would measure is
-    /// inflated by our own stall, not the peers' silence). A starved
-    /// sweep is SKIPPED — named, never silent — and the next on-cadence
-    /// tick (~one keepalive interval later, after the pump has drained
-    /// the backlog into the ingest clocks) decides honestly. A genuine
-    /// death is thereby delayed by at most one tick; a false mass-
-    /// removal of live peers off a wake-from-freeze burst is impossible.
+    /// UNLESS the decider itself is provably unhealthy, on either axis:
+    ///
+    /// - **locally starved** (the tick's own inter-tick gap stretched
+    ///   far past the keepalive cadence: the runtime was frozen/starved
+    ///   and every age it would measure is inflated by our own stall,
+    ///   not the peers' silence), or
+    /// - **ingest-backlogged** (the sweep runs on cadence but the mesh
+    ///   pump is not moving inbound frames: the transport's arrival
+    ///   clock shows frames undrained across sweeps — see
+    ///   [`IngestEdgeGate`] — so the staleness INPUTS are suspect even
+    ///   though the sweep itself is timely; a buried peer's keepalives
+    ///   may sit unattributed in the same backed-up queue).
+    ///
+    /// A deferred sweep is SKIPPED — named, never silent — and the next
+    /// on-cadence tick after the node is healthy again decides
+    /// honestly. A genuine death is thereby delayed only while the
+    /// decider itself is compromised; a false mass-removal of live
+    /// peers off this node's own backlog is impossible.
     pub(super) async fn process_heartbeat_tick(&mut self) -> Result<(), String> {
         let now = Instant::now();
         let starved = local_sweep_starved(
@@ -510,6 +534,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                  on-cadence tick"
             );
             return Ok(());
+        }
+        // Decider-health gate on the staleness INPUTS: fold this
+        // sweep's transport edge-clock sample into the gate (it owns
+        // the deferral narration) and author no removal while it
+        // defers. Same threshold family as the tick-lag guard above —
+        // SWEEP_STARVATION_TICK_MULTIPLE keepalive intervals — far
+        // below the hard death backstop, so a healthy pump never feels
+        // it. Transports without edge clocks return `None` here and the
+        // gate stays inactive (clock (c) of the union is then absent
+        // too — the sweep decides off clocks (a)+(b) and the tick-lag
+        // guard alone).
+        if let Some(edges) = self.inbox.transport_ingest_edges() {
+            let pending_threshold = self
+                .config
+                .keepalive_interval
+                .saturating_mul(SWEEP_STARVATION_TICK_MULTIPLE);
+            if self
+                .ingest_gate
+                .observe(&edges, now, pending_threshold)
+                .is_some()
+            {
+                return Ok(());
+            }
         }
         let report = self.collect_heartbeat_report();
         self.decide_dead_secondaries(report).await
@@ -618,6 +665,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// consumes. Stays `pub(super)` so the silent-id set never leaks past
     /// the `primary` module boundary into dispatch.
     pub(super) fn silent_secondary_ids(&self) -> std::collections::HashSet<String> {
+        // Decider-health gate, mirrored from `process_heartbeat_tick`:
+        // while the ingest path is backlogged, every staleness reading
+        // is suspect, so the dispatch-altitude early-requeue path (the
+        // only other author of staleness-based `PeerRemoved`s, via
+        // `only_silent_held_work_remains` → `declare_silent_secondaries_
+        // dead`) must see NO silent peers either. Reads the most recent
+        // sweep's verdict (at most one tick stale — the same staleness
+        // class as the keepalive clocks this method samples anyway).
+        if self.ingest_gate.deferring().is_some() {
+            return std::collections::HashSet::new();
+        }
         let report = self.collect_heartbeat_report();
         let now = Instant::now();
         // Exclude the recognized primary's own same-peer secondary by IDENTITY

@@ -14,6 +14,9 @@ use crate::primary::{PrimaryConfig, PrimaryCoordinator};
 use crate::process::{LocalRole, Mesh, RoleSlot};
 use crate::state::{SecondaryConnection, SecondaryConnectionState};
 use dynrunner_protocol_primary_secondary::address::PeerId;
+use dynrunner_protocol_primary_secondary::{
+    InboundTap, IngestEdges, PeerConnectionInfo, PeerTransport,
+};
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 use std::sync::Arc;
 
@@ -31,15 +34,15 @@ use std::sync::Arc;
 ///   mesh + slot, so a queued `client.send` reaches the transport's outgoing
 ///   channels. The guard holds the control handle (keeps the pump's control
 ///   arm open) and aborts the pump task on drop.
-struct MeshKeepalive {
-    _mesh: Option<Mesh<TestId, ChannelPeerTransport<TestId>>>,
+struct MeshKeepalive<Tr: PeerTransport<TestId> = ChannelPeerTransport<TestId>> {
+    _mesh: Option<Mesh<TestId, Tr>>,
     _slot: Option<Arc<RoleSlot<TestId>>>,
     _demote_tx: tokio_mpsc::UnboundedSender<()>,
     _control: Option<crate::process::MeshControlHandle<TestId>>,
     pump: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl Drop for MeshKeepalive {
+impl<Tr: PeerTransport<TestId>> Drop for MeshKeepalive<Tr> {
     fn drop(&mut self) {
         if let Some(h) = self.pump.take() {
             h.abort();
@@ -54,20 +57,21 @@ impl Drop for MeshKeepalive {
 /// `new(client, inbox, demote_rx, …)` wiring lives here ONCE, and each entry
 /// point decides only what to do with the returned mesh/slot.
 #[allow(clippy::type_complexity)]
-fn mint_primary<S, E>(
+fn mint_primary<S, E, Tr>(
     config: PrimaryConfig,
-    transport: ChannelPeerTransport<TestId>,
+    transport: Tr,
     scheduler: S,
     estimator: E,
 ) -> (
     PrimaryCoordinator<S, E, TestId>,
-    Mesh<TestId, ChannelPeerTransport<TestId>>,
+    Mesh<TestId, Tr>,
     Arc<RoleSlot<TestId>>,
     tokio_mpsc::UnboundedSender<()>,
 )
 where
     S: Scheduler<TestId>,
     E: ResourceEstimator<TestId>,
+    Tr: PeerTransport<TestId>,
 {
     let mut mesh = Mesh::new(transport);
     let (slot, client, inbox) =
@@ -82,15 +86,16 @@ where
 /// in-memory state, not wire round-trips; the mesh is parked idle in the
 /// keepalive so its egress-queue receiver stays alive (a queued `client.send`
 /// must not error as "pump dropped").
-fn build_primary<S, E>(
+fn build_primary<S, E, Tr>(
     config: PrimaryConfig,
-    transport: ChannelPeerTransport<TestId>,
+    transport: Tr,
     scheduler: S,
     estimator: E,
-) -> (PrimaryCoordinator<S, E, TestId>, MeshKeepalive)
+) -> (PrimaryCoordinator<S, E, TestId>, MeshKeepalive<Tr>)
 where
     S: Scheduler<TestId>,
     E: ResourceEstimator<TestId>,
+    Tr: PeerTransport<TestId>,
 {
     let (primary, mesh, slot, demote_tx) = mint_primary(config, transport, scheduler, estimator);
     (
@@ -111,15 +116,16 @@ where
 /// called inside a `tokio::task::LocalSet` (the pump is `spawn_local`'d); the
 /// queued-egress heartbeat tests wrap their body in `LocalSet::run_until`.
 /// The pump task OWNS the slot `Arc` for its lifetime, mirroring the node.
-fn build_primary_pumped<S, E>(
+fn build_primary_pumped<S, E, Tr>(
     config: PrimaryConfig,
-    transport: ChannelPeerTransport<TestId>,
+    transport: Tr,
     scheduler: S,
     estimator: E,
-) -> (PrimaryCoordinator<S, E, TestId>, MeshKeepalive)
+) -> (PrimaryCoordinator<S, E, TestId>, MeshKeepalive<Tr>)
 where
     S: Scheduler<TestId> + 'static,
     E: ResourceEstimator<TestId> + 'static,
+    Tr: PeerTransport<TestId> + 'static,
 {
     let (primary, mesh, slot, demote_tx) = mint_primary(config, transport, scheduler, estimator);
     // Publish live membership before the pump spawns (the pump republishes
@@ -1901,4 +1907,259 @@ async fn empty_roster_primary_still_keepalives_connected_mesh_members() {
             );
         })
         .await;
+}
+
+// ---------------------------------------------------------------------
+// Transport ingest-edge liveness (run_20260611_115429): the removal
+// decision must consume the TRANSPORT-arrival clock and must be gated
+// on the decider's own ingest health.
+// ---------------------------------------------------------------------
+
+/// Minimal [`PeerTransport`] publishing real [`IngestEdges`]: frames the
+/// test pushes through the returned [`InboundTap`] are stamped on the
+/// ARRIVAL clock (the production read-loop edge) and sit in the inbound
+/// queue until something drives `recv_peer` (the pump), which stamps the
+/// DRAINED clock — exactly the two measuring edges `PeerNetwork` /
+/// `TunneledPeerTransport` mount. The no-pump `build_primary` harness
+/// then reproduces the production starvation verbatim: arrivals without
+/// drains.
+struct EdgeTrackedTransport {
+    edges: IngestEdges,
+    incoming_rx: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+}
+
+fn edge_tracked_transport() -> (EdgeTrackedTransport, InboundTap<TestId>) {
+    let edges = IngestEdges::new();
+    let (tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+    let tap = InboundTap::new(tx, edges.arrival.clone());
+    (EdgeTrackedTransport { edges, incoming_rx }, tap)
+}
+
+impl PeerTransport<TestId> for EdgeTrackedTransport {
+    async fn broadcast(&mut self, _msg: DistributedMessage<TestId>) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn send_to_peer(
+        &mut self,
+        _peer_id: &str,
+        _msg: DistributedMessage<TestId>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn recv_peer(&mut self) -> Option<DistributedMessage<TestId>> {
+        let msg = self.incoming_rx.recv().await?;
+        self.edges.drained.record(msg.sender_id());
+        Some(msg)
+    }
+
+    fn try_recv_peer(&mut self) -> Option<DistributedMessage<TestId>> {
+        let msg = self.incoming_rx.try_recv().ok()?;
+        self.edges.drained.record(msg.sender_id());
+        Some(msg)
+    }
+
+    fn peer_count(&self) -> usize {
+        0
+    }
+
+    fn has_peer(&self, _id: &PeerId) -> bool {
+        false
+    }
+
+    fn ingest_edges(&self) -> Option<IngestEdges> {
+        Some(self.edges.clone())
+    }
+
+    async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
+}
+
+/// REPRO (run_20260611_115429, the false-removal face): a node whose
+/// MESH PUMP is starved — peers' keepalives keep ARRIVING at the
+/// transport's read loops but never reach the slot's delivery choke
+/// point — must NOT author a removal off its stale downstream clocks.
+///
+/// The production sequence, replayed: the processed clock
+/// (`secondary_keepalives`) and the slot-ingest clock
+/// (`RoleSlot::deliver` — the flood-immunity edge) both go stale past
+/// the hard backstop, the sweep's own tick cadence is HEALTHY (the
+/// operational loop ran fine; only the pump lagged — primary.log's
+/// missed-keepalive requeues at last_seen 125-199s with all SLURM jobs
+/// RUNNING), and the peer's keepalive arrives at the TRANSPORT just
+/// before the sweep. Pre-fix the sweep removed the live peer; post-fix
+/// the transport-arrival clock keeps its silence age honest. Evidence
+/// then ENDS (the peer truly goes silent, the queue drains): the very
+/// same schedule still removes it — no permanent immunity.
+#[tokio::test(flavor = "current_thread")]
+async fn transport_arrival_keeps_starved_pump_node_from_removing_live_peer() {
+    let (transport, tap) = edge_tracked_transport();
+    // Hard backstop at 2x the 50ms interval = 100ms; the sweep's own
+    // tick-lag gate trips past 3x = 150ms, so 120ms gaps below keep
+    // every tick locally healthy while silences cross the backstop.
+    let (mut primary, mut keep) = build_primary(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+    register_operational_secondary(&mut primary, "live-sec", 0, "victim");
+
+    // Tick #1 right away: seeds the tick-lag clock; silences are ~0.
+    primary.process_heartbeat_tick().await.unwrap();
+    assert!(primary.secondaries.contains_key("live-sec"));
+
+    // The starved-pump window: every downstream clock ages past the
+    // hard backstop...
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    // ...but the peer's keepalive ARRIVES at the transport (the read
+    // loop stamps the arrival clock) and is never drained to the slot —
+    // the pump is "busy elsewhere".
+    tap.send(keepalive_from("live-sec")).expect("transport live");
+
+    // Tick #2: gap 120ms < the 150ms tick-lag gate, so the sweep RUNS —
+    // and must see the transport-arrival evidence.
+    primary.process_heartbeat_tick().await.unwrap();
+    assert!(
+        primary.secondaries.contains_key("live-sec"),
+        "a peer whose frames ARRIVED at the transport is provably alive — \
+         a node whose pump is starved must not author its removal (the \
+         run_20260611_115429 false-removal face)"
+    );
+
+    // GENUINE death is intact: the pump catches up (drains the queued
+    // keepalive into the slot — refreshing the slot clock and advancing
+    // the drained edge), then the peer sends NOTHING further. The next
+    // on-cadence sweep past the backstop removes it.
+    assert!(
+        keep._mesh
+            .as_mut()
+            .expect("no-pump build parks the mesh")
+            .recv_dial_and_route()
+            .await,
+        "queued frame drains"
+    );
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    primary.process_heartbeat_tick().await.unwrap();
+    assert!(
+        !primary.secondaries.contains_key("live-sec"),
+        "once the evidence ends (queue drained, peer silent at EVERY \
+         edge) the genuine-death backstop still removes on cadence"
+    );
+}
+
+/// REPRO (defense-in-depth — the staleness INPUTS guard): a sweep that
+/// runs ON CADENCE while the node's ingest path is provably backlogged
+/// (a frame arrived at the transport and has sat undrained across
+/// sweeps) must not author ANY staleness-based removal — the buried
+/// peer's keepalives may be sitting in the same backed-up queue,
+/// unattributed (mid-decode, behind the pending frame's FIFO position).
+/// The deferral is NAMED (throttled WARN saying why). When the backlog
+/// drains, the gate lifts and the genuinely-dead peer is removed on the
+/// next cadence — deferred, never amnestied.
+#[tokio::test(flavor = "current_thread")]
+async fn ingest_backlog_defers_staleness_removals_until_drained() {
+    let log = crate::test_capture::TargetCapture::for_target(
+        "dynrunner_manager_distributed::primary::heartbeat::ingest_gate",
+    );
+    let _guard = {
+        use tracing_subscriber::layer::SubscriberExt;
+        tracing::subscriber::set_default(tracing_subscriber::Registry::default().with(log.clone()))
+    };
+
+    let (transport, tap) = edge_tracked_transport();
+    // Hard backstop at 4x the 50ms interval = 200ms — ABOVE the 3x =
+    // 150ms ingest-pending threshold, mirroring production (backstop
+    // 24x >> gate 3x): the gate matures before the backstop fires.
+    let (mut primary, mut keep) = build_primary(
+        PrimaryConfig {
+            silence_hard_multiple: 4,
+            ..config(Duration::from_millis(50), 2)
+        },
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+    register_operational_secondary(&mut primary, "buried-sec", 0, "victim-a");
+    register_operational_secondary(&mut primary, "noisy-sec", 1, "victim-b");
+
+    // One frame from noisy-sec arrives at the transport and is never
+    // drained — the persistent-backlog witness. buried-sec's keepalives
+    // are imagined stuck BEHIND it (unattributed), so the test feeds
+    // nothing for it: every clock the sweep can read goes stale.
+    tap.send(keepalive_from("noisy-sec")).expect("transport live");
+    primary.process_heartbeat_tick().await.unwrap();
+
+    // Five on-cadence sweeps (60ms gaps — under the 150ms tick-lag
+    // gate). buried-sec's silence crosses the 200ms backstop at the
+    // last one; by then the undrained arrival has persisted ~240ms
+    // (> 150ms), so the gate must defer the removal.
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        primary.process_heartbeat_tick().await.unwrap();
+    }
+    assert!(
+        primary.secondaries.contains_key("buried-sec"),
+        "an ingest-backlogged decider must not author staleness-based \
+         removals: the buried peer's frames may sit unattributed in the \
+         same backed-up queue"
+    );
+    assert!(primary.secondaries.contains_key("noisy-sec"));
+    assert!(
+        log.events().iter().any(|e| e.level == tracing::Level::WARN),
+        "the deferral is named, not silent: a WARN on the ingest-gate \
+         target says why removals are deferred"
+    );
+
+    // The pump recovers: the backlog drains (drained edge advances,
+    // the queued keepalive reaches the slot). The gate lifts; the next
+    // on-cadence sweep removes the genuinely-silent buried-sec while
+    // the drained evidence keeps noisy-sec alive... and once noisy-sec
+    // goes silent past the backstop too, it is also removed.
+    assert!(
+        keep._mesh
+            .as_mut()
+            .expect("no-pump build parks the mesh")
+            .recv_dial_and_route()
+            .await
+    );
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    primary.process_heartbeat_tick().await.unwrap();
+    assert!(
+        !primary.secondaries.contains_key("buried-sec"),
+        "the gate DEFERS, it does not amnesty: once the ingest path is \
+         healthy again the genuinely-silent peer is removed on cadence"
+    );
+    assert!(
+        primary.secondaries.contains_key("noisy-sec"),
+        "the freshly-drained keepalive is honest evidence of life"
+    );
+}
+
+/// Genuine-death control: with the ingest-edge clocks PRESENT and
+/// totally healthy (no arrivals at either edge — a truly dead peer),
+/// the gate must not interfere and the removal fires on the normal
+/// cadence.
+#[tokio::test(flavor = "current_thread")]
+async fn truly_dead_peer_removed_on_cadence_when_ingest_healthy() {
+    let (transport, _tap) = edge_tracked_transport();
+    let (mut primary, _keep) = build_primary(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+    register_operational_secondary(&mut primary, "dead-sec", 0, "victim");
+
+    primary.process_heartbeat_tick().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    primary.process_heartbeat_tick().await.unwrap();
+    assert!(
+        !primary.secondaries.contains_key("dead-sec"),
+        "no arrivals at EITHER edge: the dead peer is removed on the \
+         normal cadence — the ingest gate never blocks a healthy decider"
+    );
 }

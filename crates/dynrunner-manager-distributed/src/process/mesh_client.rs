@@ -171,19 +171,31 @@ pub struct RoleInbox<I: Identifier> {
     /// reads ("when did a frame from X last ARRIVE, processed or not")
     /// go through [`Self::last_ingest_from`].
     ingest_liveness: IngestLiveness,
+    /// Read clones of the TRANSPORT's ingest-edge clocks (arrival at
+    /// the connection read loops, drained at the pump's `recv_peer`
+    /// pull) — one queue upstream of the slot cell above. `None` when
+    /// the transport cannot observe arrival earlier than its own
+    /// `recv_peer` (see `PeerTransport::ingest_edges`). The
+    /// coordinator's earliest-attributable liveness read is
+    /// [`Self::last_transport_arrival_from`]; the removal gate samples
+    /// the pair via [`Self::transport_ingest_edges`].
+    transport_edges: Option<dynrunner_protocol_primary_secondary::IngestEdges>,
 }
 
 impl<I: Identifier> RoleInbox<I> {
     /// Internal mint — only [`super::Mesh::register_local_role`] calls
     /// this so the inbox is always paired with its slot's inbound sender
-    /// AND the slot's ingest-freshness cell.
+    /// AND the slot's ingest-freshness cell AND the owning transport's
+    /// ingest-edge clocks.
     pub(super) fn new(
         rx: mpsc::UnboundedReceiver<DistributedMessage<I>>,
         ingest_liveness: IngestLiveness,
+        transport_edges: Option<dynrunner_protocol_primary_secondary::IngestEdges>,
     ) -> Self {
         Self {
             rx,
             ingest_liveness,
+            transport_edges,
         }
     }
 
@@ -195,6 +207,31 @@ impl<I: Identifier> RoleInbox<I> {
     /// peer's frames sit in a backed-up inbox.
     pub fn last_ingest_from(&self, node_id: &str) -> Option<std::time::Instant> {
         self.ingest_liveness.last_seen(node_id)
+    }
+
+    /// When did a frame from `node_id` last arrive AT THE TRANSPORT —
+    /// recorded by the connection read loops the moment the frame
+    /// decodes, BEFORE it waits in the transport's inbound queue (one
+    /// queue upstream of the slot cell behind
+    /// [`Self::last_ingest_from`]). `None` if the transport publishes
+    /// no arrival clock, or no frame from `node_id` ever decoded. The
+    /// ingest-edge read: a death clock that unions this stays honest
+    /// even when the MESH PUMP (not just the coordinator loop) is
+    /// starved and arrived frames never reach the slot's delivery choke
+    /// point — the run_20260611_115429 false-removal face.
+    pub fn last_transport_arrival_from(&self, node_id: &str) -> Option<std::time::Instant> {
+        self.transport_edges
+            .as_ref()
+            .and_then(|edges| edges.arrival.last_seen(node_id))
+    }
+
+    /// Cheap clones of the transport's ingest-edge clock pair, for the
+    /// removal gate's arrival-vs-drained backlog sampling. `None` when
+    /// the transport publishes none (the gate then stays inactive).
+    pub fn transport_ingest_edges(
+        &self,
+    ) -> Option<dynrunner_protocol_primary_secondary::IngestEdges> {
+        self.transport_edges.clone()
     }
 
     /// Await the next frame addressed to this role. `None` once every
