@@ -28,16 +28,17 @@ impl PyPrimaryCoordinator {
         let estimator = self.estimator.clone();
         let phase_deps = self.phase_deps.clone();
         // The PRIMARY's quorum-proceed (straggler) window is DERIVED, not
-        // the raw 600s connect-timeout knob: unset → scale-aware
-        // `max(60, n*15)`, explicit → honored; either way capped strictly
-        // below the secondaries' `unconfigured_deadline` so the welcomed
-        // fleet can never expire before quorum-proceed (the asm-dataset
-        // LMU fleet-death inversion). See
+        // the raw 600s connect-timeout knob: unset → 80% of the
+        // secondaries' `unconfigured_deadline` (the default IS the cap —
+        // per-node container bring-up dominates and doesn't scale with
+        // fleet size), explicit → honored; either way capped strictly
+        // below the deadline so the welcomed fleet can never expire
+        // before quorum-proceed (the asm-dataset LMU fleet-death
+        // inversion). See
         // `dynrunner_manager_distributed::derive_connect_timeout` for the
         // full knob map.
         let dist_connect_timeout = dynrunner_manager_distributed::derive_connect_timeout(
             self.distributed_config.connect_timeout_override(),
-            num_secondaries,
             self.distributed_config.unconfigured_deadline(),
         );
         let dist_peer_timeout = self.distributed_config.peer_timeout();
