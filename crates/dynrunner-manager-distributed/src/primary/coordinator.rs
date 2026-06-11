@@ -677,6 +677,16 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// tick, by which time the ingest/processing clocks have refreshed.
     pub(super) last_heartbeat_tick_at: Option<Instant>,
 
+    /// Decider-health gate on the staleness INPUTS (the companion of
+    /// the tick-lag guard above, for the OTHER starvation axis): tracks
+    /// arrival-vs-drained pending persistence over the transport's
+    /// ingest-edge clocks and defers every staleness-based dead-peer
+    /// declaration while the mesh pump is provably not moving inbound
+    /// frames. Owned by the liveness module (`primary::heartbeat`);
+    /// fed once per heartbeat tick, consulted by the dispatch-altitude
+    /// silent-set read between ticks.
+    pub(super) ingest_gate: super::heartbeat::IngestEdgeGate,
+
     /// Per-secondary count of staged silence WARN stages already logged
     /// for the secondary's CURRENT silence streak. Owned by the liveness
     /// module (`primary::heartbeat`); the heartbeat tick reads it to fire
@@ -1294,6 +1304,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
             last_heartbeat_tick_at: None,
+            ingest_gate: super::heartbeat::IngestEdgeGate::new(),
             silence_warn_stage: HashMap::new(),
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,

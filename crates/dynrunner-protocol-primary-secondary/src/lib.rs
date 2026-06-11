@@ -10,6 +10,7 @@ pub mod cluster_mutation;
 /// (the #364 wedged-IPC class is structurally impossible at 100 KiB).
 pub const CUSTOM_MESSAGE_MAX_BYTES: usize = 100 * 1024;
 pub mod codec;
+pub mod freshness;
 pub mod messages;
 pub mod relay;
 pub mod removal_cause;
@@ -23,6 +24,7 @@ pub use cluster_mutation::{
     ClusterMutation, DiscoveryDebt, PrimaryChangeReason, SecondaryCapacityRecord,
 };
 pub use codec::{decode_frame, deserialize_message, serialize_message};
+pub use freshness::{FreshnessClock, InboundClosed, InboundTap, IngestEdges};
 pub use messages::*;
 pub use relay::{
     BackoffDecision, Clocks, InboundOutcome, MSG_DIRECT_RESTORED, MSG_DROPPED_AT_ORIGINATOR,

@@ -8,7 +8,7 @@
 //! over the underlying transport until the peer disconnects.
 
 use dynrunner_core::{Identifier, MessageReceiver};
-use dynrunner_protocol_primary_secondary::DistributedMessage;
+use dynrunner_protocol_primary_secondary::{DistributedMessage, InboundTap};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
@@ -23,7 +23,7 @@ const CTX: &str = "peer-accepted";
 
 pub(super) async fn quic_accept_loop<I: Identifier>(
     listener: QuicListener,
-    incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
+    incoming_tx: InboundTap<I>,
     new_conn_tx: mpsc::UnboundedSender<AcceptedPeer<I>>,
     disconnect_tx: mpsc::UnboundedSender<DisconnectedPeer<I>>,
 ) {
@@ -47,7 +47,7 @@ pub(super) async fn quic_accept_loop<I: Identifier>(
 
 pub(super) async fn wss_accept_loop<I: Identifier>(
     listener: WssListener,
-    incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
+    incoming_tx: InboundTap<I>,
     new_conn_tx: mpsc::UnboundedSender<AcceptedPeer<I>>,
     disconnect_tx: mpsc::UnboundedSender<DisconnectedPeer<I>>,
 ) {
@@ -71,7 +71,7 @@ pub(super) async fn wss_accept_loop<I: Identifier>(
 
 async fn handle_accepted_quic<I: Identifier>(
     mut conn: QuicConnection,
-    incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
+    incoming_tx: InboundTap<I>,
     new_conn_tx: mpsc::UnboundedSender<AcceptedPeer<I>>,
     disconnect_tx: mpsc::UnboundedSender<DisconnectedPeer<I>>,
 ) {
@@ -133,7 +133,7 @@ async fn handle_accepted_quic<I: Identifier>(
 
 async fn handle_accepted_wss<I: Identifier>(
     mut conn: WssConnection,
-    incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
+    incoming_tx: InboundTap<I>,
     new_conn_tx: mpsc::UnboundedSender<AcceptedPeer<I>>,
     disconnect_tx: mpsc::UnboundedSender<DisconnectedPeer<I>>,
 ) {

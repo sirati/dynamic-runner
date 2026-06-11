@@ -24,6 +24,9 @@
 //!   (#362) — spawned / already-connected / awaiting-inbound (lower-id
 //!   rule) / dropped-from-list — plus the higher-id side's truthful
 //!   "peer leg missing, this node never dials it" summary WARN.
+//! - [`ingest_edges`]: ingest-edge clock recording over a real wire —
+//!   the read loop stamps ARRIVAL without anyone driving `recv_peer`
+//!   (the starved-pump honesty), DRAINED only on the actual pull.
 //! - [`late_joiner_forward`]: desktop-shaped late-joiner bootstrap —
 //!   the RED repro (compute-internal address unreachable from this
 //!   host ⇒ loud bounded `NoReachablePeer`) and the GREEN contract
@@ -56,6 +59,7 @@ mod broadcast_miss;
 mod cert_parsing;
 mod dial_failure_summary;
 mod dial_sweep;
+mod ingest_edges;
 mod late_joiner_forward;
 mod log_capture;
 mod member_leg_redial;

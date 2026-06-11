@@ -10,7 +10,7 @@
 //! module owns only the task supervision + disconnect signalling.
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::DistributedMessage;
+use dynrunner_protocol_primary_secondary::{DistributedMessage, InboundTap};
 use tokio::sync::mpsc;
 
 use crate::framing;
@@ -30,7 +30,7 @@ use super::util::PeerConnection;
 pub(super) fn spawn_outgoing_handler<I: Identifier>(
     peer_id: String,
     connection: PeerConnection,
-    incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
+    incoming_tx: InboundTap<I>,
     disconnect_tx: mpsc::UnboundedSender<DisconnectedPeer<I>>,
 ) -> mpsc::UnboundedSender<DistributedMessage<I>> {
     const CTX: &str = "peer-outgoing";
