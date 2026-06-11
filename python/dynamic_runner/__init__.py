@@ -62,6 +62,7 @@ from ._native import (
     SlurmConfig,
     WorkerSpec,
     compute_task_hash,
+    flush_important_stdio,
     init_logging,
     parse_cores,
     parse_memory,
