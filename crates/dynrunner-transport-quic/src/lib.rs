@@ -10,6 +10,6 @@ pub use certs::CertPair;
 pub use framing::MAX_WIRE_FRAME_BYTES;
 pub use network::{NetworkClient, NetworkServer};
 pub use no_primary::NoPrimaryTransport;
-pub use peer::{MeshSendHandle, PeerNetwork};
+pub use peer::{BootstrapFoldHandle, MeshSendHandle, PeerNetwork};
 pub use transport::{QuicConnection, QuicListener};
 pub use wss::{WssConnection, WssListener};

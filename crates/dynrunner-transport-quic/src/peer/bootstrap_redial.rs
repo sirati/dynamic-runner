@@ -97,6 +97,43 @@ pub(super) struct BootstrapRedial<I: Identifier> {
     pub(super) client: NetworkClient<I>,
 }
 
+/// Cloneable handle for handing an ALREADY-DIALED bootstrap wire to the
+/// owning [`crate::PeerNetwork`] for fold-in.
+///
+/// The BACKGROUND bring-up dial needs this: by the time its dial lands,
+/// the `PeerNetwork` has moved into the mesh pump, so the dial task
+/// cannot call `register_primary_link` (`&mut PeerNetwork`). Instead it
+/// posts the wire through the SAME channel + `recv_peer` fold arm the
+/// re-dial supervisor uses — fold semantics (fan-in writer + inbound
+/// forwarder + next-drop redial arming via `fold_primary_link`) exist in
+/// exactly one place, and the bring-up dial is just the first link of
+/// the existing self-perpetuating cycle.
+#[derive(Clone)]
+pub struct BootstrapFoldHandle<I: Identifier> {
+    tx: mpsc::UnboundedSender<BootstrapRedial<I>>,
+}
+
+impl<I: Identifier> BootstrapFoldHandle<I> {
+    pub(super) fn new(tx: mpsc::UnboundedSender<BootstrapRedial<I>>) -> Self {
+        Self { tx }
+    }
+
+    /// Hand a dialed bootstrap wire over for fold-in. `dial_addr` is the
+    /// address that actually CONNECTED (retained as the fixed re-dial
+    /// target for the next drop); `primary_id` keys the folded wire in
+    /// the mesh. Best-effort: a closed channel means the network is
+    /// tearing down — the wire is simply dropped.
+    pub fn fold(&self, primary_id: String, dial_addr: SocketAddr, client: NetworkClient<I>) {
+        let _ = self.tx.send(BootstrapRedial {
+            target: BootstrapDialTarget {
+                addr: dial_addr,
+                primary_id,
+            },
+            client,
+        });
+    }
+}
+
 /// Re-dial the bootstrap wire with capped backoff, INDEFINITELY, and hand
 /// the fresh client back to `recv_peer` for re-fold.
 ///

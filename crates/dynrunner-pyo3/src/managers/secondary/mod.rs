@@ -157,15 +157,18 @@ pub(crate) struct PySecondaryCoordinator {
     /// supplies no dir. See
     /// `dynrunner_manager_distributed::SecondaryConfig::output_dir`.
     pub(super) memprofile_enabled: bool,
-    /// The consumer's run-config — the byte-identical token sequence the
-    /// framework forwards onto a joining / promoted node's command line.
-    /// Sourced from the consumer's parsed `args.forwarded_argv`: on a
-    /// cold-start secondary that argv was spliced onto `sys.argv` by the
-    /// `_secondary_bootstrap` mesh-fetch shim, so it is byte-identical to
-    /// the submitter's. Threaded at `run()` entry into BOTH this
-    /// secondary's `SecondaryConfig.forwarded_argv` (so it can re-serve
-    /// `RequestRunConfig`) AND the PROMOTED `PrimaryConfig.forwarded_argv`
-    /// (so a node promoted to primary answers identically — no split-brain).
+    /// The consumer's run-config SEED — the token sequence the framework
+    /// forwards onto a joining / promoted node's command line. Sourced
+    /// from the consumer's parsed `args.forwarded_argv`: on a cold-start
+    /// secondary the boot argv carries only framework-regenerated flags,
+    /// so this seed is usually EMPTY — the REAL value arrives via the
+    /// primary's post-welcome `RunConfig` push into the coordinator's
+    /// shared handle (#277; the old pre-coordinator mesh-fetch shim is
+    /// gone). Threaded at `run()` entry into this secondary's
+    /// `SecondaryConfig.forwarded_argv` as the handle's starting value;
+    /// the PROMOTED `PrimaryConfig.forwarded_argv` reads the SAME shared
+    /// handle (post-push), so a node promoted to primary answers
+    /// `RequestRunConfig` identically — no split-brain.
     pub(super) forwarded_argv: Vec<String>,
     /// The consumer's run-config finalize closure (the `args=`/`argv=` path's
     /// deferred reparse). `Some` when the Python dispatcher supplied

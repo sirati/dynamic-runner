@@ -339,12 +339,19 @@ impl PySecondaryCoordinator {
 
                 // Stand up the secondary's mesh transport through the
                 // backend-opaque factory. It owns every backend-naming
-                // step: the WSS dial + retry loop, starting the peer
-                // mesh, reading the backend's cert + QUIC port into the
-                // `PeerCertInfo` the `CertExchange` ships, extracting the
-                // mesh-send capability, and folding the dialed bootstrap
-                // wire into the mesh under the primary's peer-id ("the
-                // tunnel is just a way of joining the mesh").
+                // step: starting the peer mesh (the node's own acceptors
+                // come up FIRST), reading the backend's cert + QUIC port
+                // into the `PeerCertInfo` the `CertExchange` ships,
+                // extracting the mesh-send capability, and spawning the
+                // BACKGROUND WSS dial + retry loop that folds the
+                // bootstrap wire into the mesh under the primary's
+                // peer-id whenever it lands ("the tunnel is just a way of
+                // joining the mesh"). Returns WITHOUT waiting on that
+                // dial: the coordinator below enters its setup-wait
+                // immediately — beaconing, healable through its own
+                // acceptor, and retrying its welcome handshake — so a
+                // dead bootstrap target can no longer park the node deaf
+                // and mute (run_20260611_005927).
                 //
                 // The identity passed to the peer mesh is BOTH the CN
                 // baked into this secondary's QUIC certificate AND the

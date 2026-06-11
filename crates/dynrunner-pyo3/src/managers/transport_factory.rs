@@ -117,7 +117,9 @@ pub(crate) async fn bind_primary_mesh<I: Identifier>(
 /// composition in `run.rs` threads onward.
 pub(crate) struct SecondaryMeshBundle<I: Identifier> {
     /// The opaque mesh transport the `SecondaryCoordinator` holds by
-    /// value, with the bootstrap primary wire already folded in.
+    /// value. The bootstrap primary wire folds in ASYNCHRONOUSLY — the
+    /// background bring-up dial hands it through the network's fold
+    /// channel whenever it lands (`bootstrap_fold_handle`).
     pub transport: PeerNetwork<I>,
     /// The `PeerCertInfo` this secondary ships in its `CertExchange`,
     /// built from the backend's cert PEM + QUIC port (so the manager
@@ -138,7 +140,9 @@ pub(crate) struct SecondaryDialParams<'a> {
     /// for why a single pre-picked address cannot carry a partial
     /// `-R` bind.
     pub addrs: Vec<std::net::SocketAddr>,
-    /// Overall dial budget; the retry loop gives up past this.
+    /// Overall dial budget; the BACKGROUND retry loop gives up past this
+    /// (loud ERROR, no process exit — the coordinator's
+    /// `unconfigured_deadline` owns the node's fate).
     pub connect_timeout: std::time::Duration,
     /// Initial delay between dial attempts; doubled per refused attempt,
     /// capped at [`MAX_DIAL_RETRY_DELAY`].
@@ -387,11 +391,16 @@ where
 
 /// Dial the bootstrap primary and build the secondary's mesh transport.
 ///
-/// Encapsulates every backend-naming step on the secondary path: the
-/// WSS dial + retry loop, starting the real `PeerNetwork`, reading the
-/// backend's cert / port into a `PeerCertInfo`, extracting the mesh-send
-/// capability, and folding the dialed bootstrap wire into the mesh under
-/// the primary's peer-id (`register_primary_link`).
+/// Encapsulates every backend-naming step on the secondary path:
+/// starting the real `PeerNetwork` (the node's own acceptors come up
+/// FIRST), reading the backend's cert / port into a `PeerCertInfo`,
+/// extracting the mesh-send capability, and spawning the BACKGROUND
+/// WSS dial + retry loop that folds the bootstrap wire into the mesh
+/// under the primary's peer-id whenever it lands
+/// (`bootstrap_fold_handle` — the same fold path a re-dialed wire
+/// takes). Returns WITHOUT waiting on the bootstrap dial: the
+/// coordinator's setup-wait owns the entire pre-primary wait
+/// (run_20260611_005927).
 ///
 /// Must run inside the coordinator's `LocalSet`.
 pub(crate) async fn dial_secondary_mesh<I: Identifier>(
@@ -419,31 +428,22 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
         .map(|a| a.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    // Connect to primary via WSS, retrying transient failures until the
-    // configured deadline (`connect_timeout`, default 600s — the same
-    // window as the submitter's secondary-welcome wait, so both sides
-    // give up together). Each attempt sweeps the candidate list in
-    // order; the FIRST address that accepts carries the run (a v6-only
-    // partial `-R` bind connects over `[::1]`).
-    let (client, connected_addr) =
-        dial_until_deadline(&target, connect_timeout, retry_delay, || {
-            dial_candidates_once(&candidates, |addr| NetworkClient::connect_wss_only(addr))
-        })
-        .await?;
-    tracing::info!(
-        addr = %connected_addr,
-        "bootstrap primary dial connected"
-    );
 
-    // Start the secondary's peer mesh. The identity passed to
-    // `PeerNetwork::start` is BOTH the CN baked into this secondary's
-    // QUIC certificate AND the `peer_id` other secondaries pass to
-    // quinn's `connect(addr, server_name)` to validate that cert — the
-    // primary distributes peer info keyed by `secondary_id` (the logical
-    // id), so the cert CN must match the logical id. `quic_bind_port`
-    // (when the operator/wrapper pre-allocated one) pins BOTH mesh
-    // listeners to the advertised port; `None` keeps the OS-picked bind.
-    let mut transport = PeerNetwork::<I>::start(secondary_id, quic_bind_port)
+    // Start the secondary's peer mesh FIRST — before any bootstrap dial.
+    // The node's own acceptors (QUIC UDP + WSS TCP) must be up from t≈0
+    // so a peer that knows this node's recorded port (an observer, a
+    // relocated primary) can dial IN and heal it even while the bootstrap
+    // target is dead — the run_20260611_005927 structural fix (pre-fix,
+    // the blocking dial below parked the whole node deaf for up to
+    // `connect_timeout`). The identity passed to `PeerNetwork::start` is
+    // BOTH the CN baked into this secondary's QUIC certificate AND the
+    // `peer_id` other secondaries pass to quinn's
+    // `connect(addr, server_name)` to validate that cert — the primary
+    // distributes peer info keyed by `secondary_id` (the logical id), so
+    // the cert CN must match the logical id. `quic_bind_port` (when the
+    // operator/wrapper pre-allocated one) pins BOTH mesh listeners to the
+    // advertised port; `None` keeps the OS-picked bind.
+    let transport = PeerNetwork::<I>::start(secondary_id, quic_bind_port)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "failed to start peer network");
@@ -456,23 +456,54 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
     // so the handle reflects the live `PeerNetwork`.
     let mesh_send = Some(transport.mesh_send_handle());
 
-    // Fold the dialed primary bootstrap wire into the mesh as a
-    // directed-routable member keyed by the primary's peer-id: BOTH the
-    // outbound fan-in writer AND the wire's inbound move onto the one
-    // uniform mesh path, so the primary's frames arrive via `recv_peer`
-    // like every other peer's — there is no separate `uplink` leg. "The
-    // tunnel is just a way of joining the mesh."
+    // Dial the bootstrap primary IN THE BACKGROUND: WSS, retrying
+    // transient failures until the configured deadline (`connect_timeout`,
+    // default 600s — the same window as the submitter's secondary-welcome
+    // wait). Each attempt sweeps the candidate list in order; the FIRST
+    // address that accepts carries the run (a v6-only partial `-R` bind
+    // connects over `[::1]`).
     //
-    // `connected_addr` — the candidate that actually accepted — is
-    // retained so the wire is RE-dialable: when the `-R` tunnel drops,
-    // the bootstrap-redial supervisor re-dials this same
-    // `localhost:<tunnel_port>` address indefinitely and re-folds the
-    // fresh client (defect (b)). It is the FIXED tunnel address — never
-    // a LAN addr — because the submitter is unroutable except through
-    // the tunnel; retaining the SUCCESSFUL family means the redial
-    // targets the loopback family the worker-side listener provably
-    // bound.
-    transport.register_primary_link(bootstrap_primary_id, connected_addr, client);
+    // The dial no longer gates the node's existence: the coordinator
+    // enters its setup-wait immediately (beaconing + healable + retrying
+    // its welcome handshake on a capped backoff), and the wire folds in
+    // WHENEVER the dial lands — handed through the `PeerNetwork`'s fold
+    // channel (`bootstrap_fold_handle`), the same path a re-dialed wire
+    // takes, which retains the connected address so the wire stays
+    // RE-dialable after a drop ("the tunnel is just a way of joining the
+    // mesh"). On deadline exhaustion the dial gives up LOUDLY; the node's
+    // fate stays owned by the coordinator's `unconfigured_deadline` (it
+    // may still be healed through its own acceptor by a peer that knows
+    // its recorded port).
+    let fold = transport.bootstrap_fold_handle();
+    tokio::task::spawn_local(async move {
+        match dial_until_deadline(&target, connect_timeout, retry_delay, || {
+            dial_candidates_once(&candidates, |addr| {
+                NetworkClient::<I>::connect_wss_only(addr)
+            })
+        })
+        .await
+        {
+            Ok((client, connected_addr)) => {
+                tracing::info!(
+                    addr = %connected_addr,
+                    "bootstrap primary dial connected; folding the wire into the mesh"
+                );
+                fold.fold(bootstrap_primary_id, connected_addr, client);
+            }
+            Err(error) => {
+                // Loud give-up, no process kill: the unconfigured-deadline
+                // owns the node's fate, and an inbound heal through this
+                // node's own acceptor remains possible without the
+                // bootstrap wire.
+                tracing::error!(
+                    error = %error,
+                    "bootstrap bring-up dial gave up (deadline/hard error); \
+                     the node keeps waiting under its unconfigured deadline \
+                     and stays healable through its own mesh acceptor"
+                );
+            }
+        }
+    });
 
     let peer_cert_info = PeerCertInfo {
         public_cert_pem: cert_pem,
@@ -914,6 +945,80 @@ mod tests {
             err.contains("127.0.0.1:42655") && err.contains("[::1]:42655"),
             "exhaustion carries the per-candidate failures: {err}"
         );
+    }
+
+    /// THE run_20260611_005927 structural pin: the secondary's mesh —
+    /// its OWN acceptors, the coordinator behind them, the digest
+    /// beacon, the heal arms — must come up WITHOUT waiting on the
+    /// bootstrap dial. Pre-fix, `dial_secondary_mesh` parked the whole
+    /// node inside `dial_until_deadline` for up to `connect_timeout`
+    /// (default 600s — the production fleet's full mute window): no
+    /// acceptor bound, no coordinator, heal-unreachable. Post-fix the
+    /// factory returns promptly (the dial churns in the BACKGROUND) and
+    /// the dial still lands once the listener appears — handing the wire
+    /// to the `PeerNetwork`'s fold channel.
+    ///
+    /// REVERT-CHECK: with the blocking dial restored, the 5s bound on
+    /// `dial_secondary_mesh` trips (the dial waits ~30s for a listener
+    /// that only appears after the factory must have returned).
+    #[tokio::test]
+    async fn mesh_comes_up_before_the_bootstrap_dial_lands() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Reserve a bootstrap port, then free it: NOTHING listens
+                // there while the factory runs (the dead-tunnel boot shape).
+                let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let bootstrap_addr = probe.local_addr().unwrap();
+                drop(probe);
+
+                let bundle = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    dial_secondary_mesh::<RunnerIdentifier>(SecondaryDialParams {
+                        addrs: vec![bootstrap_addr],
+                        connect_timeout: Duration::from_secs(30),
+                        retry_delay: Duration::from_millis(50),
+                        secondary_id: "sec-early",
+                        bootstrap_primary_id: "primary".to_string(),
+                        ipv4_address: Some("127.0.0.1".to_string()),
+                        ipv6_address: None,
+                        quic_bind_port: None,
+                    }),
+                )
+                .await
+                .expect(
+                    "dial_secondary_mesh must return promptly with the \
+                     bootstrap target down — the bring-up dial is a \
+                     background concern; blocking here is the \
+                     run_20260611_005927 mute-node park",
+                )
+                .expect("factory bundle");
+
+                // The node's own mesh is LIVE before any bootstrap wire
+                // exists: its advertised WSS port accepts a dial — the
+                // heal-reachability half (an observer holding the primary
+                // fact can reach this node NOW).
+                let mesh_addr: std::net::SocketAddr =
+                    format!("127.0.0.1:{}", bundle.peer_cert_info.quic_port)
+                        .parse()
+                        .unwrap();
+                NetworkClient::<RunnerIdentifier>::connect_wss_only(mesh_addr)
+                    .await
+                    .expect("the node's own acceptor must be up pre-bootstrap-dial");
+
+                // The background dial LANDS once the bootstrap listener
+                // appears: bring it up on the reserved addr and observe
+                // the accept.
+                let listener = dynrunner_transport_quic::WssListener::bind(bootstrap_addr)
+                    .await
+                    .expect("bootstrap listener bind");
+                tokio::time::timeout(Duration::from_secs(10), listener.accept())
+                    .await
+                    .expect("the background bring-up dial must land once the listener appears")
+                    .expect("bootstrap accept");
+                drop(bundle);
+            })
+            .await;
     }
 
     /// Allocate a port free on BOTH protocols (TCP and UDP) — the same

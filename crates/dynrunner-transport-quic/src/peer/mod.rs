@@ -29,6 +29,7 @@ mod util;
 #[cfg(test)]
 mod tests;
 
+pub use bootstrap_redial::BootstrapFoldHandle;
 pub use mesh_send::MeshSendHandle;
 
 use mesh_send::MeshSend;
@@ -464,6 +465,22 @@ impl<I: Identifier> PeerNetwork<I> {
             primary_id,
         };
         self.fold_primary_link(target, client);
+    }
+
+    /// Cloneable handle for folding a bootstrap wire in ASYNCHRONOUSLY —
+    /// the background bring-up dial's hand-over seam.
+    ///
+    /// The bring-up dial runs as a detached task (the node's mesh,
+    /// coordinator, and acceptors come up WITHOUT waiting on it — the
+    /// run_20260611_005927 structural fix), so by the time its dial lands
+    /// this network has moved into the mesh pump and
+    /// [`Self::register_primary_link`] (`&mut self`) is unreachable. The
+    /// handle posts the dialed wire through the SAME channel the re-dial
+    /// supervisor uses; the `recv_peer` fold arm installs it via
+    /// `fold_primary_link` — one fold path for bring-up, re-dial, and
+    /// every future drop.
+    pub fn bootstrap_fold_handle(&self) -> bootstrap_redial::BootstrapFoldHandle<I> {
+        bootstrap_redial::BootstrapFoldHandle::new(self.bootstrap_redial_tx.clone())
     }
 
     /// Fold (or RE-fold) a bootstrap wire into the mesh and arm its

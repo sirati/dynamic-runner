@@ -795,15 +795,21 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
 /// [`OperationalState`] and are unrepresentable here by construction. The
 /// only capability available pre-announce (beyond mesh formation, which is
 /// the orthogonal [`MeshFormation`] sub-concern) is emitting the setup
-/// handshake exactly once.
+/// handshake (armed exactly once; re-offered by `wait_for_setup`'s retry
+/// cadence until the primary's first frame).
 impl<M: ManagerEndpoint, I: Identifier> SecondaryLifecycle<M, I> {
-    /// One-shot guard for the setup handshake (`send_welcome` /
+    /// One-shot guard for ARMING the setup handshake (`send_welcome` /
     /// `send_cert_exchange`). Returns `true` and flips the latch the first
     /// time it is called in `AwaitingPrimary`; subsequent calls (and any
-    /// call from another variant) return `false` so re-entry does not
-    /// re-send. The handshake is the ONLY primary-facing action available
-    /// before the primary announces — there is no worker-spawn and no
-    /// task-acceptance capability in this variant to accompany it.
+    /// call from another variant) return `false` so a re-entry does not
+    /// re-arm. The latch gates the FIRST attempt at `wait_for_setup`
+    /// entry; the capped-backoff RE-sends inside `wait_for_setup`'s retry
+    /// arm deliberately bypass it (a no-route boot / a welcome lost on a
+    /// dying wire must be re-offered until the primary's first frame
+    /// proves receipt — run_20260611_005927). The handshake is the ONLY
+    /// primary-facing action available before the primary announces —
+    /// there is no worker-spawn and no task-acceptance capability in this
+    /// variant to accompany it.
     pub(in crate::secondary) fn mark_handshake_sent(&mut self) -> bool {
         match self {
             SecondaryLifecycle::AwaitingPrimary { handshake_sent, .. } if !*handshake_sent => {
