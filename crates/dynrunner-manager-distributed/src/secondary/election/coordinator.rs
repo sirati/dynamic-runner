@@ -13,6 +13,7 @@ use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::SecondaryCoordinator;
+use super::super::primary_link::PrimaryLink;
 use super::super::wire::timestamp_now;
 use super::{ElectionState, ElectionTickActions, failover_quorum, next_round, push_timeout_query};
 
@@ -23,6 +24,73 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
+    // ── Election-state location accessors (op OR setup) ─────────────────
+    //
+    // The failover election reads four fields — the `ElectionState` machine,
+    // `peer_keepalives`, `primary_last_seen`, and the `PrimaryLink` — that live
+    // in EITHER the lifecycle's `OperationalState` (the operational regime) OR
+    // the coordinator's `setup_election` holder (#420 face (c): a setup-phase
+    // secondary driving a failover election without leaving its setup wait).
+    // Every election method reads its state through THESE accessors, so the
+    // election LOGIC is one code path with the state owned by whichever regime
+    // is driving it — never a per-regime decision mode-branch.
+    //
+    // Resolution order is OP-FIRST: an `Operational` secondary always uses its
+    // `OperationalState` fields (the established home); the `setup_election`
+    // holder is consulted only PRE-`Operational`, where `op_ref()` is `None`.
+    // The two are never both populated for one election (the setup holder is
+    // dropped at the setup→operational handoff, and an operational secondary
+    // never arms a setup election).
+
+    /// Read the active election state machine (op OR setup), if either holds
+    /// one. `None` only in a pre-`Operational` secondary that has not armed a
+    /// setup election.
+    pub(in crate::secondary) fn election_state(&self) -> Option<&ElectionState> {
+        match self.op_ref() {
+            Some(op) => Some(&op.election),
+            None => self.setup_election.as_ref().map(|s| &s.election),
+        }
+    }
+
+    /// Mutable election state machine (op OR setup).
+    pub(in crate::secondary) fn election_state_mut(&mut self) -> Option<&mut ElectionState> {
+        if self.lifecycle.operational_mut().is_some() {
+            return self.lifecycle.operational_mut().map(|op| &mut op.election);
+        }
+        self.setup_election.as_mut().map(|s| &mut s.election)
+    }
+
+    /// The peer-keepalive liveness view backing the quorum denominator (op OR
+    /// setup). `None` when neither regime is driving an election.
+    pub(in crate::secondary) fn election_keepalives(&self) -> Option<&HashMap<String, Instant>> {
+        match self.op_ref() {
+            Some(op) => Some(&op.peer_keepalives),
+            None => self.setup_election.as_ref().map(|s| &s.peer_keepalives),
+        }
+    }
+
+    /// The last-primary-frame clock backing the silence legs (op OR setup).
+    pub(in crate::secondary) fn election_last_seen(&self) -> Option<Instant> {
+        match self.op_ref() {
+            Some(op) => op.primary_last_seen,
+            None => self
+                .setup_election
+                .as_ref()
+                .and_then(|s| s.primary_last_seen),
+        }
+    }
+
+    /// The primary-link health window (op OR setup), mutable for the
+    /// `should_arm_failover` read + the `record_recv_success` reset.
+    pub(in crate::secondary) fn election_primary_link_mut(&mut self) -> Option<&mut PrimaryLink> {
+        if self.lifecycle.operational_mut().is_some() {
+            return self
+                .lifecycle
+                .operational_mut()
+                .map(|op| &mut op.primary_link);
+        }
+        self.setup_election.as_mut().map(|s| &mut s.primary_link)
+    }
     /// Bump the primary-keepalive timestamp on every primary message and
     /// abandon any in-flight failover election. Called from the dispatch
     /// path before any other handling.
@@ -45,17 +113,23 @@ where
     /// waiting for the next loop tick.
     pub(in crate::secondary) fn record_primary_message(&mut self) -> bool {
         let secondary_id = self.config.secondary_id.clone();
-        let op = self.op_mut();
-        op.primary_last_seen = Some(Instant::now());
-        // Reset the primary-link health sub-state. A real message
-        // arriving on the (possibly-reconnected) transport proves
-        // the link is alive again, so any failure-window we'd been
-        // tracking should be discarded. Pre-fix the failover
-        // arming kept counting probes against a stale window even
-        // after a brief flap recovered, so the second flap would
-        // arm faster than the first — confusing semantics. The
-        // reset closes that loop. Idempotent on a healthy link.
-        op.primary_link.record_recv_success();
+        let now = Instant::now();
+        // The three election fields resolve to EITHER the operational state OR
+        // the setup-election holder (op-first), so a primary frame received
+        // DURING a setup-phase election re-arms the silence clock + cancels the
+        // setup election exactly as it does operationally. Each write goes
+        // through its own accessor (disjoint borrows, taken one at a time).
+        if let Some(link) = self.election_primary_link_mut() {
+            // Reset the primary-link health sub-state. A real message
+            // arriving on the (possibly-reconnected) transport proves
+            // the link is alive again, so any failure-window we'd been
+            // tracking should be discarded. Pre-fix the failover
+            // arming kept counting probes against a stale window even
+            // after a brief flap recovered, so the second flap would
+            // arm faster than the first — confusing semantics. The
+            // reset closes that loop. Idempotent on a healthy link.
+            link.record_recv_success();
+        }
         // Cancel a failover election in progress: a primary message
         // proves the original primary is still reachable so the
         // election was a false alarm. Revert to Normal. There is no
@@ -64,29 +138,42 @@ where
         // `cluster_state.current_primary()`, which still names the
         // original primary (no `PrimaryChanged` committed during the
         // aborted election, per the drop-the-transitional-hint design).
-        if matches!(
-            op.election,
-            ElectionState::Suspecting { .. }
-                | ElectionState::Voting { .. }
-                | ElectionState::Candidate { .. }
-        ) {
-            // Visibility on election recovery: pre-fix the
-            // transition from Suspecting/Voting/Candidate back to
-            // Normal was silent — an operator tailing the log saw
-            // the entering-Suspecting WARN but no resolution
-            // signal when keepalives resumed. With this log they
-            // can grep "election recovered" to confirm a
-            // transient blip rather than chase a phantom election
-            // failure.
-            tracing::info!(
-                secondary = %secondary_id,
-                from = ?std::mem::discriminant(&op.election),
-                "election recovered: primary message resumed, reverting to Normal"
-            );
-            op.election = ElectionState::Normal;
-            return true;
+        let recovered = match self.election_state_mut() {
+            Some(election)
+                if matches!(
+                    election,
+                    ElectionState::Suspecting { .. }
+                        | ElectionState::Voting { .. }
+                        | ElectionState::Candidate { .. }
+                ) =>
+            {
+                // Visibility on election recovery: pre-fix the
+                // transition from Suspecting/Voting/Candidate back to
+                // Normal was silent — an operator tailing the log saw
+                // the entering-Suspecting WARN but no resolution
+                // signal when keepalives resumed. With this log they
+                // can grep "election recovered" to confirm a
+                // transient blip rather than chase a phantom election
+                // failure.
+                tracing::info!(
+                    secondary = %secondary_id,
+                    from = ?std::mem::discriminant(&*election),
+                    "election recovered: primary message resumed, reverting to Normal"
+                );
+                *election = ElectionState::Normal;
+                true
+            }
+            _ => false,
+        };
+        // Re-arm the last-primary-frame clock AFTER the election reads above
+        // (the setup holder's `primary_last_seen` lives alongside `election`;
+        // writing it last keeps the disjoint-borrow discipline simple).
+        if let Some(op) = self.lifecycle.operational_mut() {
+            op.primary_last_seen = Some(now);
+        } else if let Some(setup) = self.setup_election.as_mut() {
+            setup.primary_last_seen = Some(now);
         }
-        false
+        recovered
     }
 
     /// Identity-gated wrapper over [`Self::record_primary_message`]: refresh
@@ -288,10 +375,7 @@ where
     /// `node_beacon_fresh` suppression at its decision site, exactly as
     /// the arming side always has.
     pub(in crate::secondary) fn primary_departed_membership(&self) -> bool {
-        let seen = self
-            .op_ref()
-            .map(|op| op.primary_last_seen.is_some())
-            .unwrap_or(false);
+        let seen = self.election_last_seen().is_some();
         seen && self
             .cluster_state
             .current_primary()
@@ -358,8 +442,8 @@ where
             return Some(0.0);
         }
         let age = self
-            .op_ref()
-            .and_then(|op| op.peer_keepalives.get(query_node_id))
+            .election_keepalives()
+            .and_then(|ka| ka.get(query_node_id))
             .map(|t| t.elapsed().as_secs_f64());
         if self.peer_death_observed(query_node_id) {
             None
@@ -405,8 +489,8 @@ where
     /// seen-gate on that peer's own `peer_keepalives` entry.
     pub(in crate::secondary) fn peer_death_observed(&self, id: &str) -> bool {
         let seen = self
-            .op_ref()
-            .map(|op| op.peer_keepalives.contains_key(id))
+            .election_keepalives()
+            .map(|ka| ka.contains_key(id))
             .unwrap_or(false);
         seen && id != self.config.secondary_id
             // DELIVERABILITY, not direct membership (see
@@ -470,16 +554,17 @@ where
     /// metronomically self-promote (the asm-dataset primary ping-pong).
     pub(in crate::secondary) fn live_peer_ids(&self) -> impl Iterator<Item = &String> {
         let current_primary = self.cluster_state.current_primary();
-        // `peer_keepalives` now lives in `OperationalState`; outside
-        // `Operational` there are no peer keepalives to enumerate (the
-        // election that calls this only runs `Operational`), so an empty
-        // iterator is the faithful pre-`Operational` answer. All the
-        // reads here (`cluster_state`, the operational state, the
-        // membership view behind `is_mesh_member`) are shared `&self`
+        // `peer_keepalives` lives in EITHER `OperationalState` OR the
+        // `setup_election` holder (#420 face (c)): `election_keepalives()`
+        // resolves whichever regime is driving the election. Outside both
+        // (a pre-`Operational` secondary with no setup election armed) there
+        // are no peer keepalives to enumerate, so an empty iterator is the
+        // faithful answer. All the reads here (`cluster_state`, the keepalive
+        // view, the membership view behind `is_mesh_member`) are shared `&self`
         // borrows, so they coexist.
-        self.op_ref()
+        self.election_keepalives()
             .into_iter()
-            .flat_map(|op| op.peer_keepalives.keys())
+            .flat_map(|ka| ka.keys())
             .filter(move |id| Some(id.as_str()) != current_primary)
             // The live transport membership view, read through the same
             // single-source seam (`is_mesh_member`) leg (C) and the
@@ -595,10 +680,7 @@ where
     /// Returns the broadcast/self-send messages the loop should flush.
     pub(in crate::secondary) fn run_election_tick(&mut self) -> ElectionTickActions<I> {
         let mut actions = ElectionTickActions::default();
-        if matches!(
-            self.op_ref().map(|op| &op.election),
-            Some(ElectionState::Promoted)
-        ) {
+        if matches!(self.election_state(), Some(ElectionState::Promoted)) {
             return actions;
         }
 
@@ -656,7 +738,7 @@ where
         // candidate's `PromotionVote`, or a primary frame), so on a small
         // fleet where the dead candidate was the only one the election
         // wedged forever. `false` whenever the election is not in Voting.
-        let voting_candidate_dead = match self.op_ref().map(|op| &op.election) {
+        let voting_candidate_dead = match self.election_state() {
             Some(ElectionState::Voting { candidate, .. }) => self.peer_death_observed(candidate),
             _ => false,
         };
@@ -758,17 +840,23 @@ where
             .config
             .keepalive_interval
             .saturating_mul(self.config.keepalive_miss_threshold);
-        let op = self
-            .lifecycle
-            .operational_mut()
-            .expect("run_election_tick reached before Operational — type invariant violation");
 
+        // The election state + its silence inputs resolve to EITHER the
+        // operational state OR the `setup_election` holder (#420 face (c)),
+        // through the op-OR-setup accessors — ONE election logic path, state
+        // owned by whichever regime drives the tick. Read the silence legs
+        // first (each a self-contained accessor borrow), then bind the mutable
+        // election state for the state-machine match below.
+        //
         // (A) genuine-dead-link — the primary link's own no-route arming.
-        let link_dead = op.primary_link.should_arm_failover();
+        let link_dead = self
+            .election_primary_link_mut()
+            .map(|link| link.should_arm_failover())
+            .unwrap_or(false);
         // (B) wedged-primary backstop — patient receive-staleness, ONLY for
         // an app-silent primary whose link never armed leg (A).
-        let primary_silence_exceeded = op
-            .primary_last_seen
+        let primary_silence_exceeded = self
+            .election_last_seen()
             .map(|t| Instant::now().duration_since(t) > backstop)
             .unwrap_or(false);
         // (C) primary departed the transport mesh — snapshotted above via
@@ -787,7 +875,24 @@ where
             link_dead || primary_silence_exceeded || primary_left_membership_after_seen;
         let need_election = mesh_says_dead && !primary_beacon_fresh;
 
-        match &op.election {
+        // Bind the mutable election state with a PARTIAL borrow — only
+        // `self.lifecycle` (operational regime) OR `self.setup_election` (the
+        // #420 face (c) setup regime), op-first — so `self.config` /
+        // `self.fatal_exit` stay disjoint and writable inside the match arms
+        // (the degraded-bail arm writes `self.fatal_exit`). An inline binding
+        // rather than the `election_state_mut()` accessor for exactly that
+        // partial-borrow reason (the accessor borrows all of `self`). `None`
+        // only when NEITHER regime is driving an election — a defensive guard
+        // for a pre-`Operational` secondary with no setup election armed (the
+        // caller never ticks one then); return no actions.
+        let election: &mut ElectionState = if let Some(op) = self.lifecycle.operational_mut() {
+            &mut op.election
+        } else if let Some(setup) = self.setup_election.as_mut() {
+            &mut setup.election
+        } else {
+            return actions;
+        };
+        match &*election {
             ElectionState::Normal if need_election => {
                 // Degraded-mesh failover guard: the election protocol
                 // needs a peer mesh to gather quorum responses
@@ -841,7 +946,7 @@ where
                     "primary death suspected (dead link, app-silence backstop, \
                      or primary departed the mesh); entering Suspecting"
                 );
-                op.election = ElectionState::Suspecting {
+                *election = ElectionState::Suspecting {
                     since: Instant::now(),
                     responses: HashMap::new(),
                 };
@@ -958,7 +1063,7 @@ where
                     .as_ref()
                     .map(|id| id == &secondary_id)
                     .unwrap_or(false);
-                let round = next_round(&op.election);
+                let round = next_round(election);
                 if we_lead {
                     // The candidate counts ITSELF as one confirm. When the
                     // live-peer fleet is empty (`peer_count == 0`, so
@@ -987,7 +1092,7 @@ where
                             "self-promoting: single-survivor self-quorum already met — \
                              committing promotion (no peer confirm to await)"
                         );
-                        op.election = ElectionState::Promoted;
+                        *election = ElectionState::Promoted;
                         actions.promoted = true;
                     } else {
                         if self_confirm.len() >= quorum {
@@ -1013,7 +1118,7 @@ where
                         } else {
                             tracing::info!(round, "self-promoting");
                         }
-                        op.election = ElectionState::Candidate {
+                        *election = ElectionState::Candidate {
                             round,
                             confirms: self_confirm,
                             started: Instant::now(),
@@ -1038,7 +1143,7 @@ where
                 } else if let Some(candidate) = lowest_alive {
                     tracing::info!(%candidate, round, "deferring to lowest-live-id peer");
                     // No transitional routing target (see above).
-                    op.election = ElectionState::Voting { round, candidate };
+                    *election = ElectionState::Voting { round, candidate };
                 }
             }
             ElectionState::Candidate { round, started, .. } => {
@@ -1048,7 +1153,7 @@ where
                 if started.elapsed() > timeout {
                     let next = round + 1;
                     tracing::warn!(round, "candidate timed out, retrying with round {next}");
-                    op.election = ElectionState::Candidate {
+                    *election = ElectionState::Candidate {
                         round: next,
                         confirms: HashSet::from([secondary_id.clone()]),
                         started: Instant::now(),
@@ -1100,7 +1205,7 @@ where
                     "candidate death observed mid-election (departed the mesh, \
                      beacon silent); releasing vote and re-entering Suspecting"
                 );
-                op.election = ElectionState::Suspecting {
+                *election = ElectionState::Suspecting {
                     since: Instant::now(),
                     responses: HashMap::new(),
                 };
@@ -1128,7 +1233,9 @@ where
         peer: String,
         last_keepalive: Option<f64>,
     ) {
-        if let ElectionState::Suspecting { responses, .. } = &mut self.op_mut().election {
+        // op-OR-setup election state (#420 face (c)): a setup-phase candidate
+        // gathers peer agreement through the SAME Suspecting bucket.
+        if let Some(ElectionState::Suspecting { responses, .. }) = self.election_state_mut() {
             responses.insert(peer, last_keepalive);
         }
     }
@@ -1148,8 +1255,7 @@ where
             .keepalive_interval
             .saturating_mul(self.config.keepalive_miss_threshold);
         let frame_silent = self
-            .op_ref()
-            .and_then(|op| op.primary_last_seen)
+            .election_last_seen()
             .map(|t| Instant::now().duration_since(t) > deadline)
             .unwrap_or(true);
         // Deferrer-side leg (C) (#331): the current primary DEPARTING the
@@ -1222,14 +1328,18 @@ where
         // routing target is written — `Role::Primary` re-points only on
         // the winner's authoritative `PrimaryChanged` (P2).
         let sender_id = self.config.secondary_id.clone();
-        let op = self.op_mut();
+        // op-OR-setup election state (#420 face (c)): a setup-phase voter
+        // adopts its candidate through the SAME transition. `None` only if
+        // neither regime drives an election (defensive — the caller gates this
+        // on an active election); no vote then.
+        let election = self.election_state_mut()?;
         let already_voting_for_this_round = matches!(
-            &op.election,
+            &*election,
             ElectionState::Voting { round: r, candidate: c }
                 if *r == round && c == &candidate
         );
         if !already_voting_for_this_round {
-            op.election = ElectionState::Voting {
+            *election = ElectionState::Voting {
                 round,
                 candidate: candidate.clone(),
             };
@@ -1265,8 +1375,13 @@ where
         // (`election::failover_quorum`) — the two sites read ONE function so
         // the majority arithmetic cannot desync on a live failover.
         let quorum = failover_quorum(peer_count);
-        let op = self.op_mut();
-        let promoted = match &mut op.election {
+        // op-OR-setup election state (#420 face (c)): a setup-phase candidate
+        // tallies confirms through the SAME quorum transition. `None` only if
+        // neither regime drives an election (defensive); not promoted then.
+        let Some(election) = self.election_state_mut() else {
+            return false;
+        };
+        let promoted = match &mut *election {
             ElectionState::Candidate {
                 round: r, confirms, ..
             } if *r == round => {
@@ -1285,7 +1400,7 @@ where
             // terminal action the composed runtime drives off this
             // transition; the secondary carries no self-promotion mirror
             // to flip on here.
-            op.election = ElectionState::Promoted;
+            *election = ElectionState::Promoted;
         }
         promoted
     }
@@ -1359,6 +1474,261 @@ where
                  surviving secondaries will re-point on the next election \
                  round or via CRDT snapshot reconciliation"
             );
+        }
+    }
+
+    // ── SETUP-PHASE failover election driver (#420 face (c)) ─────────────
+    //
+    // A `wait_for_setup` secondary whose primary has gone permanently silent
+    // (formed mesh, no primary frames) ARMS the SAME failover election the
+    // operational loop runs, so a survivor promotes instead of the whole fleet
+    // dying one-by-one on its unconfigured deadline (the asm-dataset LMU
+    // run_~1429 fleet death: 11 secondaries sat in wait_for_setup, the promoted
+    // primary hit a fatal during bring-up, and NOBODY elected a replacement).
+    //
+    // ONLY THE WINNER LEAVES SETUP — the load-bearing invariant. The winner
+    // fires `fire_local_promotion` (→ the self-named `PrimaryChanged` →
+    // `PromotionSignal` → the Node builds the snapshot-seeded primary) and
+    // `wait_for_setup` returns so the Node's promotion arm takes over. The
+    // LOSERS stay in `wait_for_setup`: when the winner's `PrimaryChanged`
+    // arrives, `apply_primary_changed → reset_election_to_normal` DROPS the
+    // transient `setup_election` holder, and the winner's `PromotedDestination`
+    // pre-loop chain (send_peer_lists + perform_initial_assignment +
+    // send_transfer_complete) re-sends the setup trio to every secondary —
+    // completing each loser's handshake and spawning its workers exactly as
+    // the relocation-handoff path does. So the election runs WITHIN the setup
+    // wait and is transient for losers; the lifecycle never leaves its setup
+    // variant for a loser (a permanent transition to `Operational` would no-op
+    // `enter_configuring_on_first_primary_frame` and the loser would DROP the
+    // re-sent trio and sit worker-less forever).
+
+    /// The primary-silence threshold that arms a SETUP-phase election: HALF
+    /// the unconfigured deadline. Grounded: it must be ≫ the
+    /// keepalive×miss-threshold death deadline (≈15s prod) so a SLOW-but-LIVE
+    /// primary whose setup-liveness frames (digest beacon / `PeerJoined`
+    /// broadcasts / directed setup frames — see `note_setup_primary_liveness`)
+    /// keep re-arming the deadline NEVER trips it, AND it must leave a full
+    /// second half of the deadline for the election to converge before the
+    /// orchestration's give-up (`run_until_setup_or_done_inner`). Half the
+    /// (default 600s) deadline = 300s ≫ 15s, with 300s of runway for the
+    /// election — comfortably bounded by the remaining unconfigured deadline
+    /// (the owner's caution: a genuinely-unreachable quorum still dies loudly
+    /// at the give-up, never degrades the denominator to "whoever answered").
+    fn setup_election_silence_threshold(&self) -> std::time::Duration {
+        self.config.unconfigured_deadline / 2
+    }
+
+    /// Arm a setup-phase election IFF a primary has gone silent long enough
+    /// AND the mesh is formed AND no election is already armed. Idempotent —
+    /// once `setup_election` is `Some`, re-calls are no-ops (the election
+    /// machinery owns the state from there).
+    ///
+    /// `silent_for` is how long this node has waited without a primary-
+    /// originated frame (the setup-deadline anchor age — re-armed by
+    /// `note_setup_primary_liveness` on every primary frame, so it measures
+    /// PRIMARY SILENCE, never slow-fleet assembly).
+    ///
+    /// SEED (the owner-adjudicated bootstrap-evidence pattern, mirroring the
+    /// promoted primary's `reconstruct_secondaries_from_cluster_state`): the
+    /// election's `peer_keepalives` quorum denominator is seeded from the
+    /// replicated `alive_secondary_members()` that are ALSO live mesh members,
+    /// each stamped AS-OF-NOW. These are MEMBERSHIP-DERIVED BOOTSTRAP STAMPS,
+    /// NOT heard-from keepalive evidence — a setup-phase secondary has received
+    /// no peer `Secondary` keepalives yet, so without this seed the quorum
+    /// denominator would be 0, `failover_quorum(0) == 1`, and EVERY waiting
+    /// secondary would self-promote — an N-way split-brain. Seeding the real
+    /// membership makes the denominator the formed fleet, so the election holds
+    /// a genuine quorum (one winner; the rest defer). The stamps age under the
+    /// real silence machinery once the election runs; the quorum is the
+    /// DENOMINATOR only — agreement still requires real `TimeoutResponse` /
+    /// `PromotionConfirm` votes from live peers, so a chunk of genuinely-dead
+    /// membership fails quorum and the election retries (bounded by the
+    /// remaining unconfigured deadline — the fleet still dies loudly at the
+    /// give-up if quorum is truly unreachable), NEVER degrading to "whoever
+    /// answered".
+    pub(in crate::secondary) fn maybe_arm_setup_election(
+        &mut self,
+        silent_for: std::time::Duration,
+    ) {
+        // Already armed, or already operational (the operational loop owns the
+        // election there) — nothing to do.
+        if self.setup_election.is_some() || self.lifecycle.operational_ref().is_some() {
+            return;
+        }
+        if silent_for < self.setup_election_silence_threshold() {
+            return;
+        }
+        // The mesh must be FORMED — an election needs peers to gather quorum
+        // from. `mesh.degraded` latches only at FORMATION time (zero peers ever
+        // meshed); a never-meshed secondary must NOT arm (it would be the lone
+        // split-brain the operational `mesh_degraded` guard also blocks). The
+        // owner is explicit: this incident's mesh WAS formed (peer lists
+        // received, dial sweeps run), so this gate passes there.
+        if self.mesh.degraded {
+            return;
+        }
+        // Seed the quorum denominator from the membership-derived bootstrap
+        // evidence (see the doc above). Intersect the replicated alive
+        // worker-secondaries with the LIVE mesh membership (the same
+        // `is_mesh_member` seam `live_peer_ids` intersects against), excluding
+        // self, each stamped as-of-now.
+        let now = Instant::now();
+        let self_id = self.config.secondary_id.as_str();
+        let members: Vec<String> = self
+            .cluster_state
+            .alive_secondary_members()
+            .filter(|id| *id != self_id)
+            .map(str::to_owned)
+            .filter(|id| self.is_mesh_member(id))
+            .collect();
+        let mut peer_keepalives: HashMap<String, Instant> = HashMap::new();
+        for id in members {
+            peer_keepalives.insert(id, now);
+        }
+        // The silence anchor: this node has been primary-silent for
+        // `silent_for`, so seed `primary_last_seen` to `now - silent_for` —
+        // the silence legs ((B) backstop) then read the TRUE accumulated
+        // silence, and the (C) membership-departure leg's seen-gate
+        // (`primary_last_seen.is_some()`) is satisfied so it can arm.
+        let primary_last_seen = now.checked_sub(silent_for);
+        let primary_link = super::super::primary_link::PrimaryLink::with_failover_threshold(
+            self.config.primary_link_failure_threshold,
+            self.config.primary_link_failure_window,
+        );
+        tracing::warn!(
+            secondary = %self_id,
+            silent_secs = silent_for.as_secs(),
+            threshold_secs = self.setup_election_silence_threshold().as_secs(),
+            seeded_peers = peer_keepalives.len(),
+            "primary silent through setup past the election threshold with a \
+             formed mesh; ARMING a setup-phase failover election (membership-\
+             seeded quorum) so a survivor promotes instead of the fleet dying \
+             on its unconfigured deadline"
+        );
+        self.setup_election = Some(super::SetupElection::new(
+            peer_keepalives,
+            primary_last_seen,
+            primary_link,
+        ));
+    }
+
+    /// Drive ONE setup-phase election tick: advance the state machine, flush
+    /// its broadcast frames, and — on a self-quorum win — fire the local
+    /// promotion. A no-op when no setup election is armed.
+    ///
+    /// The SAME `run_election_tick` + `fire_local_promotion` the operational
+    /// loop drives (state resolved via the op-OR-setup accessors), so the two
+    /// regimes share ONE election code path.
+    ///
+    /// The WINNER does NOT leave the setup wait — exactly like the operational
+    /// self-promotion path (`process_tasks` keeps running after
+    /// `fire_local_promotion`): the win fires the `PromotionSignal` (→ the Node
+    /// builds the co-located primary), and that new primary's
+    /// `PromotedDestination` pre-loop chain re-sends the setup trio to ALL its
+    /// secondaries — INCLUDING the winner's own secondary, which is still in
+    /// THIS `wait_for_setup` loop — so the winner completes its handshake
+    /// exactly as a loser does, against the primary it just spawned. (And if
+    /// that new primary hits the SAME bring-up fatal this incident's did, its
+    /// face-(a) abort broadcasts `RunAborted`, which the loop-head terminal
+    /// check exits everyone on — the faces compose.)
+    pub(in crate::secondary) async fn drive_setup_election_tick(&mut self) {
+        if self.setup_election.is_none() {
+            return;
+        }
+        let actions = self.run_election_tick();
+        for msg in actions.broadcast {
+            let _ = self
+                .send_to(dynrunner_protocol_primary_secondary::Destination::All, msg)
+                .await;
+        }
+        if actions.promoted {
+            // Lone-survivor self-quorum committed in-tick: drive the SAME
+            // terminal action the peer-confirm path drives.
+            self.fire_local_promotion().await;
+        }
+    }
+
+    /// Handle a peer ELECTION frame received during the setup wait
+    /// (`TimeoutQuery` / `TimeoutResponse` / `PromotionVote` /
+    /// `PromotionConfirm`) — the setup-phase counterpart of the operational
+    /// `handle_inbound` election arms, so a setup-phase election interoperates
+    /// with operational voters over the SAME protocol frames. Frames other
+    /// than the four election variants are not this driver's concern (the
+    /// caller routes them).
+    ///
+    /// Sends are direct (`send_to`) rather than via the operational
+    /// `pending_peer_messages` queue (which lives in `OperationalState`, absent
+    /// here). A `TimeoutQuery` that arrives before this node has armed its own
+    /// election is still ANSWERED (the responder evidence is read via the
+    /// op-OR-setup accessors, which fall back to `None` — the honest "no
+    /// liveness evidence" the querier's tally counts as agreement); a
+    /// `PromotionVote` gets a confirm only once this node has independently
+    /// observed the primary silent. A `PromotionConfirm` that carries THIS node
+    /// over quorum fires `fire_local_promotion` — the winner does NOT leave the
+    /// setup wait (see `drive_setup_election_tick`).
+    pub(in crate::secondary) async fn handle_setup_election_frame(
+        &mut self,
+        msg: DistributedMessage<I>,
+    ) {
+        match msg {
+            DistributedMessage::TimeoutQuery {
+                query_node_id,
+                sender_id,
+                ..
+            } => {
+                let last_keepalive = self.queried_node_liveness_age(&query_node_id);
+                let response = DistributedMessage::TimeoutResponse {
+                    target: None,
+                    sender_id: self.config.secondary_id.clone(),
+                    timestamp: timestamp_now(),
+                    query_node_id,
+                    last_keepalive,
+                };
+                let _ = self
+                    .send_to(
+                        dynrunner_protocol_primary_secondary::Destination::Secondary(
+                            sender_id.into(),
+                        ),
+                        response,
+                    )
+                    .await;
+            }
+            DistributedMessage::TimeoutResponse {
+                sender_id,
+                last_keepalive,
+                ..
+            } => {
+                self.record_timeout_response(sender_id, last_keepalive);
+            }
+            DistributedMessage::PromotionVote {
+                sender_id,
+                candidate_id,
+                vote_round,
+                ..
+            } => {
+                if let Some(reply) = self.record_promotion_vote(candidate_id, vote_round) {
+                    let _ = self
+                        .send_to(
+                            dynrunner_protocol_primary_secondary::Destination::Secondary(
+                                sender_id.into(),
+                            ),
+                            reply,
+                        )
+                        .await;
+                }
+            }
+            DistributedMessage::PromotionConfirm {
+                sender_id,
+                new_primary_id,
+                vote_round,
+                ..
+            } => {
+                let won = self.record_promotion_confirm(sender_id, new_primary_id, vote_round);
+                if won {
+                    self.fire_local_promotion().await;
+                }
+            }
+            _ => {}
         }
     }
 }

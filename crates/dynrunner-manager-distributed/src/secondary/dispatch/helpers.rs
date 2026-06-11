@@ -496,15 +496,30 @@ where
         self.peer_liveness_addrs.clone()
     }
 
-    /// Reset the failover election to `Normal` iff this node has reached
-    /// `Operational` (the only lifecycle state that carries an
-    /// `ElectionState`). Pre-`Operational` receive paths
-    /// (`wait_for_setup`) hold no election, so this is a no-op there —
-    /// using `operational_mut()` rather than `op_mut()` keeps the
-    /// pre-`Operational` apply path panic-free.
+    /// Reset the failover election to `Normal` on a genuine primary-identity
+    /// advance.
+    ///
+    /// OPERATIONAL: revert `OperationalState.election` to `Normal` — a primary
+    /// now exists, so any in-flight election is stale.
+    ///
+    /// SETUP-PHASE (#420 face (c)): a `wait_for_setup` secondary that ARMED a
+    /// setup-phase election (its `setup_election` holder is `Some`) is the
+    /// LOSER of that election when this advance names a PEER — DROP the holder
+    /// entirely. This is the loser contract: the elected primary's re-sent
+    /// setup trio (its `PromotedDestination` pre-loop chain) completes this
+    /// node's handshake and spawns its workers while it stays in
+    /// `wait_for_setup`; the transient election state is discarded so its
+    /// silence clock re-arms fresh against the new primary and no stale
+    /// candidacy lingers. (A self-named advance — this node WON — never reaches
+    /// the loser drop: `fire_local_promotion` already left the holder
+    /// `Promoted` and the winner exits setup via the `PromotionSignal`, so the
+    /// drop here is harmless either way.) A pre-`Operational` secondary that
+    /// never armed an election holds neither — both branches no-op.
     fn reset_election_to_normal(&mut self) {
         if let Some(op) = self.lifecycle.operational_mut() {
             op.election = ElectionState::Normal;
+        } else {
+            self.setup_election = None;
         }
     }
 

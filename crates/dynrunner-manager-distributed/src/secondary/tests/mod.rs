@@ -128,6 +128,7 @@ mod relocation_handoff_race;
 mod replay_backoff;
 mod respawn_exec_failure;
 mod run_config_responder;
+mod setup_election;
 mod setup_handshake_resilience;
 mod setup_liveness;
 mod setup_wait_observability;

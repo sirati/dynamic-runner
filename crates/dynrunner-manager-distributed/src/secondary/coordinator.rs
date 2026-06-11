@@ -158,6 +158,9 @@ where
             forwarded_argv_was_pushed: false,
             setup_frame_backlog: std::collections::VecDeque::new(),
             setup_deadline,
+            // No setup-phase election armed at construction; the setup election
+            // driver in `wait_for_setup` populates this on primary-silence.
+            setup_election: None,
             command_rx: Some(command_rx),
             command_tx,
             // Lazily constructed in `run_until_setup_or_done_inner`
