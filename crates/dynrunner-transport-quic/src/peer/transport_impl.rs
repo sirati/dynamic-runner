@@ -509,4 +509,15 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         // impls (channel, no-op) keep their async signatures.
         PeerNetwork::connect_to_peers(self, peers);
     }
+
+    fn sync_membership(&mut self) {
+        // Fold completed dial/accept registrations into `connections`
+        // so a membership poll loop (`join_running_cluster`'s step-2
+        // rendezvous gate) observes dials that landed AFTER
+        // `connect_to_peers` returned. Without this, the gate's
+        // `peer_count()` spins on a table nothing fills (the drain
+        // otherwise only runs inside send/recv entry points) and the
+        // bootstrap dies `NoReachablePeer` against a reachable seed.
+        self.drain_new_connections();
+    }
 }
