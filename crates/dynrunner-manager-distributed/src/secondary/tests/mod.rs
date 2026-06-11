@@ -130,6 +130,7 @@ mod respawn_exec_failure;
 mod run_config_responder;
 mod setup_handshake_resilience;
 mod setup_liveness;
+mod setup_wait_observability;
 mod snapshot_reply_destination;
 mod terminal_ack;
 mod terminal_msg_watermark;

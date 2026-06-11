@@ -893,6 +893,13 @@ where
         self.replace_lifecycle(|lc| lc.enter_failed(reason));
     }
 
+    /// Drive the lifecycle to the `BringUpFailed` terminal (the
+    /// setup-instructions wait expired), carrying the deadline-expiry
+    /// diagnosis the run loop also propagates as its `Err`.
+    pub(in crate::secondary) fn enter_terminal_bring_up_failed(&mut self, reason: String) {
+        self.replace_lifecycle(|lc| lc.enter_bring_up_failed(reason));
+    }
+
     /// Move the lifecycle out, apply a by-value terminal transition, and
     /// store it back. The terminal `enter_*` transitions consume `self` by
     /// value (they are absorbing), so the move-out/move-in is the only way
@@ -1061,7 +1068,14 @@ where
             Some(super::SecondaryTerminal::Aborted { reason }) => {
                 Err(format!("run aborted by primary: {reason}"))
             }
-            Some(super::SecondaryTerminal::Failed { reason }) => Err(reason),
+            // Like `Failed`, the bring-up expiry normally propagates as the
+            // run loop's `Err` before this match (the deadline site returns
+            // `Err(reason)` after recording the terminal); both arms exist
+            // for the same defensive completeness.
+            Some(
+                super::SecondaryTerminal::Failed { reason }
+                | super::SecondaryTerminal::BringUpFailed { reason },
+            ) => Err(reason),
         }
     }
 
@@ -1336,6 +1350,16 @@ where
                     let peers = self.alive_secondary_count();
                     self.shutdown_sampler_if_present().await;
                     self.stop_all_workers().await;
+                    // Either branch below is the 10-minute point of the
+                    // owner's wait-narration schedule (the 30s/1m/5m marks
+                    // fired inside `wait_for_setup`; the abort line IS the
+                    // 10m mark) — and the give-up is recorded as the TYPED
+                    // `BringUpFailed` lifecycle terminal so the node
+                    // outcome surfaces the structured
+                    // `RunError::BringUpFailed` (non-zero exit with the
+                    // bring-up story + the one-knob hint), never the
+                    // generic policy-exit misattribution or a silent
+                    // cold-exit.
                     if peers == 0 {
                         // The asm-dataset-nix T7 attempt 2 scenario:
                         // primary URL unreachable AND no peers have
@@ -1343,17 +1367,20 @@ where
                         // already complete and SLURM is just booting
                         // a queued secondary against the graveyard.
                         // Exit fast with a clear log.
-                        tracing::warn!(
+                        tracing::error!(
                             secondary = %self.config.secondary_id,
                             deadline_secs = deadline.as_secs(),
                             "setup deadline elapsed with no primary and no peers — \
-                             run appears already complete, exiting cold"
+                             no instructions ever arrived from setup; run appears \
+                             already complete, aborting"
                         );
-                        return Err(format!(
+                        let reason = format!(
                             "setup deadline ({}s) elapsed: no primary, no peers \
                              (cluster appears dead, run likely complete)",
                             deadline.as_secs()
-                        ));
+                        );
+                        self.enter_terminal_bring_up_failed(reason.clone());
+                        return Err(reason);
                     } else {
                         // Peers reachable but setup didn't complete. This
                         // is a distinct scenario from cold-start (primary
@@ -1365,14 +1392,16 @@ where
                             deadline_secs = deadline.as_secs(),
                             peer_count = peers,
                             "setup deadline elapsed despite peers reachable — \
-                             primary unresponsive, exiting"
+                             primary unresponsive, aborting"
                         );
-                        return Err(format!(
+                        let reason = format!(
                             "setup deadline ({}s) elapsed: primary unresponsive \
                              despite {} peer(s) reachable",
                             deadline.as_secs(),
                             peers
-                        ));
+                        );
+                        self.enter_terminal_bring_up_failed(reason.clone());
+                        return Err(reason);
                     }
                 }
             }
@@ -1463,6 +1492,22 @@ where
                     reason = %reason,
                     "secondary reported Terminal with a Failed lifecycle \
                      (unexpected — fatal_exit should propagate Err)"
+                );
+                self.shutdown_sampler_if_present().await;
+                self.stop_all_workers().await;
+            }
+            Some(super::SecondaryTerminal::BringUpFailed { reason }) => {
+                // Same disposition as `Failed`: the deadline-expiry site
+                // records this terminal AND returns `Err` (short-circuiting
+                // the `?` above, after its own worker teardown), so this
+                // arm is unreachable on a `RunOutcome::Terminal`. Guard
+                // defensively rather than weaken the match.
+                tracing::error!(
+                    secondary = %self.config.secondary_id,
+                    reason = %reason,
+                    "secondary reported Terminal with a BringUpFailed \
+                     lifecycle (unexpected — the deadline expiry should \
+                     propagate Err)"
                 );
                 self.shutdown_sampler_if_present().await;
                 self.stop_all_workers().await;

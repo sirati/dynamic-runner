@@ -131,6 +131,14 @@ pub enum RunOutcome {
 ///   run loop returns `Err(reason)`; the lifecycle records this terminal
 ///   with the same `reason`. (The run loop's `Err` is what drives the
 ///   boundary here, not a `RunOutcome::Terminal`.)
+/// - `BringUpFailed`: the setup-instructions wait expired — a full
+///   `unconfigured_deadline` of primary silence before the setup trio
+///   completed. The run loop returns `Err(reason)` like `Failed`, but the
+///   node-outcome mapping types it as the structured
+///   [`crate::primary::RunError::BringUpFailed`] (the secondary-side twin
+///   of the primary's zero-welcome bring-up fatal) so the boundary's
+///   terminal line tells the bring-up story + the one-knob hint instead
+///   of a policy-exit misattribution.
 #[derive(Debug, Clone)]
 pub enum SecondaryTerminal {
     Done,
@@ -142,6 +150,9 @@ pub enum SecondaryTerminal {
         reason: String,
     },
     Failed {
+        reason: String,
+    },
+    BringUpFailed {
         reason: String,
     },
 }

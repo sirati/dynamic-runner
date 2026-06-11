@@ -239,6 +239,17 @@ pub(super) fn secondary_terminal(
         Some(SecondaryTerminal::Failed { reason }) => RunTerminal::Failed {
             error: RunError::FatalPolicyExit { reason },
         },
+        // The setup-instructions wait expired (a full
+        // `unconfigured_deadline` of primary silence before the trio
+        // completed). The secondary-side twin of the primary's
+        // zero-welcome bring-up fatal — typed as the SAME structured
+        // `BringUpFailed` so the boundary raises with the bring-up story
+        // + the one-knob (`--unconfigured-deadline-secs`) hint, never the
+        // `FatalPolicyExit` text that misattributes the exit to a
+        // run-loop policy.
+        Some(SecondaryTerminal::BringUpFailed { reason }) => RunTerminal::Failed {
+            error: RunError::BringUpFailed { reason },
+        },
         // No terminal recorded. `Ok(())` with no terminal is the documented
         // clean default (`Done`). An `Err` with no terminal is a fatal-exit
         // that propagated through `?` before any terminal landed — same
@@ -349,6 +360,32 @@ mod tests {
                 error: RunError::FatalPolicyExit { .. }
             }
         ));
+    }
+
+    /// The setup-instructions wait expiry (the secondary's 10m give-up)
+    /// is the STRUCTURED bring-up fatal — `RunError::BringUpFailed`, the
+    /// same variant the primary's zero-welcome timeout raises — never the
+    /// `FatalPolicyExit` whose text blames a run-loop policy, and never
+    /// the swallow-eligible `Other`.
+    #[test]
+    fn secondary_bring_up_failed_terminal_is_structured_bring_up_fatal() {
+        let reason = "setup deadline (600s) elapsed: no primary, no peers \
+                      (cluster appears dead, run likely complete)";
+        let terminal = secondary_terminal(
+            Err(reason.into()),
+            Some(SecondaryTerminal::BringUpFailed {
+                reason: reason.into(),
+            }),
+        );
+        match terminal {
+            RunTerminal::Failed {
+                error: RunError::BringUpFailed { reason: carried },
+            } => assert_eq!(carried, reason),
+            other => panic!(
+                "a secondary setup-wait expiry must surface as the structured \
+                 RunError::BringUpFailed; got {other:?}"
+            ),
+        }
     }
 
     /// An `Err` with NO terminal recorded is a fatal-exit that propagated

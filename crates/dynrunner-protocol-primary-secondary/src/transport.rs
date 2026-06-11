@@ -511,10 +511,25 @@ pub trait PeerTransport<I: Identifier> {
                             Ok(snapshots)
                         };
                     }
+                    // Accept the reply REGARDLESS of its Phase-C target
+                    // stamp. The responder's coordinator egress stamps
+                    // every frame with the resolved role-typed return
+                    // address (`anti_entropy::reply_destination` →
+                    // `Some(Destination::Observer(<this id>))` /
+                    // `Some(Destination::Secondary(<this id>))`), and the
+                    // frame's ARRIVAL on this node's wire already
+                    // satisfies the host-addressing — the stamp is only
+                    // the mesh-pump's slot-demux hint, and the bootstrap
+                    // window has no role slots (the same never-drop-on-
+                    // stamp ingress rule as `Mesh::route_incoming`).
+                    // `None` (a pre-stamp transport or test double) is
+                    // equally accepted. A `target: None` pattern here
+                    // dropped every production reply as "non-
+                    // ClusterSnapshot … kind=ClusterSnapshot" until the
+                    // budget expired — the gateway late-joiner Test-1a
+                    // bootstrap timeout.
                     Ok(Some(DistributedMessage::ClusterSnapshot {
-                        target: None,
-                        snapshot_json,
-                        ..
+                        snapshot_json, ..
                     })) => {
                         snapshots.push(snapshot_json);
                         continue;
@@ -522,6 +537,7 @@ pub trait PeerTransport<I: Identifier> {
                     Ok(Some(other)) => {
                         tracing::warn!(
                             kind = ?other.msg_type(),
+                            target = ?other.target(),
                             "join_running_cluster: dropped non-ClusterSnapshot frame in bootstrap window"
                         );
                         continue;

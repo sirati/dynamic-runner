@@ -56,6 +56,7 @@ mod setup;
 mod setup_deadline;
 mod staging;
 mod types;
+mod wait_marks;
 mod wire;
 
 #[cfg(test)]
