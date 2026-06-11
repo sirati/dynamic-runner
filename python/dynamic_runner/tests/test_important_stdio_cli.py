@@ -262,6 +262,17 @@ class _RootLoggerSandbox(unittest.TestCase):
         self.py_log_important_calls: list[str] = []
         self._saved_py_log_important = getattr(pkg, "py_log_important", None)
         pkg.py_log_important = lambda m: self.py_log_important_calls.append(m)
+        # Stub the native flush_important_stdio the fatal-flush path reaches
+        # (`_flush_all_logging` does `from . import flush_important_stdio`).
+        # Record calls so a test can assert the debounce buffer is flushed
+        # synchronously on the fatal path.
+        self.flush_important_stdio_calls = 0
+        self._saved_flush_important = getattr(pkg, "flush_important_stdio", None)
+
+        def _record_flush() -> None:
+            self.flush_important_stdio_calls += 1
+
+        pkg.flush_important_stdio = _record_flush
 
     def tearDown(self) -> None:
         root = logging.getLogger()
@@ -290,6 +301,11 @@ class _RootLoggerSandbox(unittest.TestCase):
                 del pkg.py_log_important
         else:
             pkg.py_log_important = self._saved_py_log_important
+        if self._saved_flush_important is None:
+            if hasattr(pkg, "flush_important_stdio"):
+                del pkg.flush_important_stdio
+        else:
+            pkg.flush_important_stdio = self._saved_flush_important
 
 
 class InitLoggingParamPassthroughTests(_RootLoggerSandbox):
@@ -476,6 +492,23 @@ class SurfaceFatalErrorsTests(_RootLoggerSandbox):
         self.assertIn("SLURM dispatch failed: boom", message)
         self.assertIn("RuntimeError", message)
         self.assertIn("Traceback", message)
+
+    def test_fatal_path_flushes_debounced_stdio_buffer(self) -> None:
+        # Under `--important-stdio-only` the operator-stdio sink coalesces
+        # output behind a 500ms-quiet / 5s-max-delay debounce buffer. The
+        # just-emitted fatal IMPORTANT line must NOT wait for that timer — the
+        # surfacing path flushes the native buffer synchronously so the
+        # diagnosable line is on the wire before teardown. REVERT-CHECK: drop
+        # the `flush_important_stdio()` call from `_flush_all_logging` and this
+        # records zero flushes.
+        with self.assertRaises(RuntimeError):
+            with logging_setup.surface_fatal_errors():
+                raise RuntimeError("boom")
+        self.assertGreaterEqual(
+            self.flush_important_stdio_calls,
+            1,
+            "fatal path did not flush the debounced operator-stdio buffer",
+        )
 
     def test_surfacing_never_masks_original_with_secondary_failure(self) -> None:
         # If the native primitive itself raises, the ORIGINAL fatal error must
