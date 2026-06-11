@@ -868,6 +868,18 @@ where
                     .await
                 {
                     tracing::error!(worker_id = wid, error = %e, "secondary worker restart failed");
+                    // RE-SCHEDULE the slot: a restart that failed BEFORE
+                    // any subprocess existed (cgroup leaf prep, the spawn
+                    // syscall itself — e.g. exec ENOENT into a gutted
+                    // container rootfs, asm-dataset run_20260611_115429)
+                    // must keep the slot under restart management, not
+                    // silently drop it from the pool forever (the entry
+                    // was removed above). The pool recorded the failure
+                    // on the slot (`note_spawn_failure`), so the delay
+                    // this schedule reads is the escalating startup-crash
+                    // backoff — the retry runs on the calm #370 cadence
+                    // and heals the slot when the exec context heals.
+                    self.schedule_worker_restart(wid);
                     continue;
                 }
             }

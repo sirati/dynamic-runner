@@ -1056,4 +1056,54 @@ mod tests {
         // uses `stdio_capture: None` and asserts the tempdir stays empty).
         let _ = stdio_capture_streams(None);
     }
+
+    /// ONE-OWNER construction seam pin (asm-dataset run_20260611_115429
+    /// investigation): the INITIAL pool spawn (`spawn_worker` →
+    /// `first_type_runtime` → `render_command`) and a RESPAWN of the same
+    /// type (`spawn_worker_for_type` → `type_runtime_for` →
+    /// `render_command`) must produce BYTE-IDENTICAL `RenderedCommand`s —
+    /// argv, env, cwd, stdio_capture — for the same worker id and
+    /// transport value. There is exactly one command/env owner
+    /// (`render_command` over the shared `WorkerSpec`/`TypeRegistry`); a
+    /// respawn re-RENDERING from different state would be the (a)/(b)
+    /// divergence class the incident review checked for. Exercises the
+    /// WorkerSpec template path (env + cwd + placeholders) — the SLURM
+    /// production shape.
+    #[test]
+    fn respawn_renders_byte_identical_command_to_initial_spawn() {
+        let mut factory = make_factory_with_two_types();
+        factory.worker_spec = Some(WorkerSpec::for_test(
+            vec![
+                "/app/venv/bin/python".into(),
+                "-m".into(),
+                "consumer.worker".into(),
+                "--socket-path".into(),
+                "{SOCKET_PATH}".into(),
+                "--log-file".into(),
+                "{LOG_FILE}".into(),
+                "--worker-id".into(),
+                "{WORKER_ID}".into(),
+            ],
+            std::collections::HashMap::from([
+                ("PYTHONUNBUFFERED".to_string(), "1".to_string()),
+                ("WORKER_LOG".to_string(), "{LOG_FILE}".to_string()),
+            ]),
+            Some("/app".into()),
+        ));
+
+        let initial_runtime = factory.first_type_runtime().unwrap();
+        let respawn_runtime = factory.type_runtime_for(&initial_runtime.type_id).unwrap();
+
+        let sock = std::path::PathBuf::from("/tmp/sock");
+        let initial = factory.render_command(3, &initial_runtime, FdOrSocket::Socket(&sock));
+        let respawn = factory.render_command(3, &respawn_runtime, FdOrSocket::Socket(&sock));
+
+        assert_eq!(initial.argv, respawn.argv, "argv must be byte-identical");
+        assert_eq!(initial.env, respawn.env, "env must be byte-identical");
+        assert_eq!(initial.cwd, respawn.cwd, "cwd must be byte-identical");
+        assert_eq!(
+            initial.stdio_capture, respawn.stdio_capture,
+            "stdio capture path must be byte-identical"
+        );
+    }
 }
