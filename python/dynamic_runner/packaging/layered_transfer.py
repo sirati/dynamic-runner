@@ -81,7 +81,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from .gateway import expand_gateway_tilde
+from .gateway import expand_gateway_tilde, retry_transient
 
 logger = logging.getLogger(__name__)
 
@@ -442,8 +442,16 @@ class LayeredUploader:
             blob.digest[:12],
             _human(blob.size),
         )
-        # transfer_file is the gateway abstraction's atomic copy.
-        self.gateway.transfer_file(blob.local_path, Path(tmp))
+        # transfer_file is the gateway abstraction's atomic copy. One
+        # scp/ssh hiccup on one blob must not kill a multi-GB
+        # many-blob upload, so the copy (idempotent — it lands at the
+        # .partial path and a re-attempt overwrites) goes through the
+        # bounded transient-retry helper. The `mv` below is NOT
+        # retried: it isn't idempotent.
+        retry_transient(
+            lambda: self.gateway.transfer_file(blob.local_path, Path(tmp)),
+            what=f"{blob.kind} blob {blob.digest[:12]} upload",
+        )
         # Atomic rename so a half-uploaded blob never appears under its
         # final digest name (concurrent runs could race otherwise).
         self.gateway.execute_command(f"mv {shlex.quote(tmp)} {shlex.quote(target)}")

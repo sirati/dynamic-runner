@@ -14,9 +14,11 @@ not retransfer the 3 base layers that app inherits via fromImage.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
@@ -561,6 +563,89 @@ def test_verify_helper_with_mocked_gateway_parses_branches(tmp_path):
     with pytest.raises(MissingBlobsError) as excinfo:
         uploader._verify_blobs_present(bundle)
     assert excinfo.value.missing == (d2,)
+
+
+# ── Transient transfer-fault retry ───────────────────────────────────
+
+
+class FlakyGateway(LocalDirGateway):
+    """`LocalDirGateway` whose `transfer_file` raises OSError for the
+    first `fail_times` calls — the production shape of a transient
+    scp/ssh hiccup mid multi-blob upload — then behaves normally.
+    Raised exception instances are recorded so tests can assert the
+    ORIGINAL exception propagates (no wrapping)."""
+
+    def __init__(self, remote_root: Path, fail_times: float) -> None:
+        super().__init__(remote_root)
+        self.fail_times = fail_times
+        self.raised: list[OSError] = []
+
+    def transfer_file(self, local_path: Path, remote_path: Path) -> None:
+        if len(self.raised) < self.fail_times:
+            exc = OSError(f"copy {local_path} -> {remote_path}: connection reset")
+            self.raised.append(exc)
+            raise exc
+        super().transfer_file(local_path, remote_path)
+
+
+@pytest.fixture
+def recorded_sleeps(monkeypatch) -> list[float]:
+    """Stub `time.sleep` (the retry helper's backoff) and record the
+    requested durations, so retry tests run instantly and can assert
+    the backoff schedule."""
+    calls: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda s: calls.append(s))
+    return calls
+
+
+def test_transient_blob_transfer_failure_is_retried(tmp_path, caplog, recorded_sleeps):
+    """Replays the production trace (asm-tokenizer run_20260611_131451):
+    during a fresh many-blob upload, ONE blob's `transfer_file` raised
+    OSError and an immediately identical redispatch uploaded clean.
+    A purely transient single-scp hiccup must not kill the dispatch:
+    the upload must retry that blob, complete, and surface the
+    flakiness as a WARN."""
+    archive = tmp_path / "img.tar.gz"
+    _build_synthetic_archive(archive, [b"alpha", b"beta", b"gamma"])
+
+    cache = tmp_path / "remote/cache"
+    out = tmp_path / "remote/img.tar.gz"
+    gw = FlakyGateway(tmp_path / "remote", fail_times=1)
+
+    with caplog.at_level(logging.WARNING):
+        stats = upload_image_layered(gw, archive, cache, out, image_label="img-flaky")
+
+    assert stats.blobs_uploaded == 4  # 3 layers + 1 config, all landed
+    assert out.exists(), "reassembled tarball must exist despite the hiccup"
+    assert len(gw.raised) == 1, "exactly one transient failure was injected"
+    # The flakiness is visible to operators: a WARN naming the attempt.
+    warn_texts = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("attempt 1/3" in t for t in warn_texts), warn_texts
+    # First (and only) backoff of the schedule was taken.
+    assert recorded_sleeps == [1.0]
+
+
+def test_persistent_transfer_failure_propagates_original_oserror(
+    tmp_path, recorded_sleeps
+):
+    """A genuinely broken transfer (every attempt fails) must exhaust
+    the bounded retry budget — exactly 3 attempts with the 1s/3s
+    backoff — and then propagate the ORIGINAL OSError unchanged
+    (callers and logs depend on the exception identity, not a
+    wrapper)."""
+    archive = tmp_path / "img.tar.gz"
+    _build_synthetic_archive(archive, [b"alpha", b"beta"])
+
+    cache = tmp_path / "remote/cache"
+    out = tmp_path / "remote/img.tar.gz"
+    gw = FlakyGateway(tmp_path / "remote", fail_times=float("inf"))
+
+    with pytest.raises(OSError) as excinfo:
+        upload_image_layered(gw, archive, cache, out, image_label="img-dead")
+
+    assert len(gw.raised) == 3, "retry budget is 3 attempts total"
+    assert excinfo.value is gw.raised[-1], "original exception, not a wrapper"
+    assert recorded_sleeps == [1.0, 3.0]
 
 
 def test_first_upload_after_blob_check_added_calls_stat_once(tmp_path):
