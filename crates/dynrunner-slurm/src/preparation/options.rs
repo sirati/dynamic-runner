@@ -59,6 +59,16 @@ pub struct PreparationOptions {
     /// handshakes, 3 attempts at [0, 5s, 15s] backoff, 90s per-tunnel
     /// wall-clock cap).
     pub establishment: EstablishmentPolicy,
+    /// Optional OpenSSH `LogLevel` for the per-secondary `ssh -N -R`
+    /// reverse-tunnel CHILD processes (diagnostic primitive, #415 face
+    /// (a)). `None` keeps OpenSSH's default (`INFO`, banner-only on these
+    /// children); `Some("DEBUG1".into())` makes each tunnel child emit the
+    /// rekey / `channel ... forwarding` / mux lines a wire-drop
+    /// investigation needs — without which the tunnel-child stderr is
+    /// banner-only and a fleet-wide-drop cause (sshd rekey, MaxSessions
+    /// channel refusal) is invisible. Threaded as config (read once from
+    /// the env at the pyo3 boundary) so the argv builder stays pure.
+    pub tunnel_child_log_level: Option<String>,
 }
 
 impl PreparationOptions {
@@ -80,6 +90,7 @@ impl PreparationOptions {
             setup_timeout: Duration::from_secs(600),
             poll_interval: Duration::from_secs(2),
             establishment: EstablishmentPolicy::default(),
+            tunnel_child_log_level: None,
         }
     }
 }

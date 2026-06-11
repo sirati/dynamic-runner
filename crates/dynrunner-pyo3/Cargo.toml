@@ -54,6 +54,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 nix = { workspace = true }
+# `libc::atexit` registers the importance-mode debounced-stdio flush so the
+# manager run loops' `std::process::exit(137|1)` fatal paths (which run C
+# atexit handlers but NOT Rust `Drop`) cannot eat buffered wake lines.
+libc = { workspace = true }
 async-trait = { workspace = true }
 # Local mirror dir for the gateway-mode late-joiner's peer-info fetch
 # (also used by tests, which previously held it as a dev-dependency).

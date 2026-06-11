@@ -515,6 +515,7 @@ dependencies = [
  "dynrunner-transport-quic",
  "dynrunner-transport-socket",
  "dynrunner-transport-tunnel",
+ "libc",
  "nix",
  "pyo3",
  "serde",

@@ -85,6 +85,39 @@ fn argv_with_auth_uses_proxycommand() {
     assert!(proxy_cmd.contains("'alice@gw.example'"));
 }
 
+/// #415 face (a) diagnostic knob: `tunnel_child_log_level` (env
+/// `DYNRUNNER_SSH_TUNNEL_LOGLEVEL` at the boundary) emits `-o LogLevel=<v>`
+/// on the tunnel child so a fleet-wide-drop repro can see the rekey /
+/// channel-forwarding / mux lines. `None` (the default) emits NOTHING — the
+/// quiet production shape — so the knob is strictly opt-in.
+#[test]
+fn tunnel_child_log_level_knob_emits_loglevel_only_when_set() {
+    // Default: no LogLevel option on the tunnel child.
+    let o = PreparationOptions::new(
+        "/logs".into(),
+        "gw.example".into(),
+        Some("alice".into()),
+        22,
+        vec![],
+        vec![],
+    );
+    let argv = build_ssh_argv("compute01", 40000, 51000, &o);
+    assert!(
+        !argv.iter().any(|s| s.starts_with("LogLevel=")),
+        "no LogLevel option without the knob: {argv:?}"
+    );
+
+    // Set: `-o LogLevel=DEBUG1` is appended.
+    let mut o2 = o.clone();
+    o2.tunnel_child_log_level = Some("DEBUG1".to_string());
+    let argv2 = build_ssh_argv("compute01", 40000, 51000, &o2);
+    let idx = argv2
+        .iter()
+        .position(|s| s == "LogLevel=DEBUG1")
+        .expect("LogLevel=DEBUG1 present when the knob is set");
+    assert_eq!(argv2[idx - 1], "-o", "LogLevel must follow a `-o` flag");
+}
+
 /// The observer-reconnect pre-rebind RELEASE argv must:
 ///   1. reach the compute node over the SAME gateway jump as the
 ///      reverse tunnel (so it can release the binding the tunnel left),

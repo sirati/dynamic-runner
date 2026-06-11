@@ -208,20 +208,32 @@ def surface_fatal_errors():
 
 
 def _flush_all_logging() -> None:
-    """Flush every root-logger handler plus stdout/stderr.
+    """Flush every root-logger handler plus stdout/stderr, and the native
+    importance-stdio debounce buffer.
 
     Single concern: make the fatal surfacing durable before a crash-exit. The
-    native importance/full sinks write synchronously, but the Python console
-    handler (importance mode off) and the process stdio streams are buffered,
-    so flush them so a fatal error is on the wire regardless of how the process
-    exits next.
+    native full sink writes synchronously, but the Python console handler
+    (importance mode off) and the process stdio streams are buffered, so flush
+    them so a fatal error is on the wire regardless of how the process exits
+    next. Under ``--important-stdio-only`` the native operator-stdio sink
+    additionally coalesces bursts behind a debounce buffer, so flush THAT too —
+    the just-emitted :func:`py_log_important` line would otherwise wait for the
+    500ms-quiet / 5s-max-delay timer (or the atexit backstop). The native flush
+    is a no-op off importance mode, so it is called unconditionally.
     """
+    # Local import: the native primitive lives on the package's re-exported
+    # surface (same rationale as `py_log_important`) — importing at module top
+    # would pull `_native` into modules that import this one in isolation.
+    from . import flush_important_stdio
+
     for handler in logging.getLogger().handlers:
         with contextlib.suppress(Exception):
             handler.flush()
     for stream in (sys.stdout, sys.stderr):
         with contextlib.suppress(Exception):
             stream.flush()
+    with contextlib.suppress(Exception):
+        flush_important_stdio()
 
 
 class _TracingBridgeHandler(logging.Handler):
