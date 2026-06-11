@@ -4,8 +4,11 @@ use pyo3::prelude::*;
 ///
 /// All durations are seconds (f64 for sub-second precision). Defaults match
 /// the migration plan §18: 5s keepalive interval, 3 missed keepalives before
-/// declaring a peer dead, 600s connect timeout, 300s peer timeout, 1s
-/// retry delay between secondary→primary connect attempts.
+/// declaring a peer dead, 300s peer timeout, 1s retry delay between
+/// secondary→primary connect attempts. The connect timeout defaults to 600s
+/// for the secondary's bootstrap dial; the PRIMARY's quorum-proceed window
+/// DERIVES from fleet size when the knob is unset (see
+/// `connect_timeout_secs`).
 ///
 /// `keepalive_miss_threshold` is read by the failover voting code (Phase 2);
 /// configurable now so callers don't have to revisit when failover lands.
@@ -21,7 +24,17 @@ use pyo3::prelude::*;
 #[pyclass(name = "DistributedConfig", get_all, set_all, from_py_object)]
 #[derive(Clone, Debug)]
 pub(crate) struct DistributedConfig {
-    connect_timeout_secs: f64,
+    /// `None` = the operator did not set it. The distinction is
+    /// load-bearing for the PRIMARY's quorum-proceed window: unset
+    /// derives the scale-aware default
+    /// (`dynrunner_manager_distributed::derive_connect_timeout` —
+    /// `max(60, n*15)` capped strictly below `unconfigured_deadline_secs`),
+    /// while an explicit value is honored (still capped, with a WARN).
+    /// The SECONDARY's bootstrap-dial budget reads the concrete
+    /// [`Self::connect_timeout`] accessor (explicit value or the 600s
+    /// default) — a transport patience knob that deliberately does NOT
+    /// auto-scale.
+    connect_timeout_secs: Option<f64>,
     connect_retry_delay_secs: f64,
     peer_timeout_secs: f64,
     keepalive_interval_secs: f64,
@@ -78,7 +91,7 @@ pub(crate) struct DistributedConfig {
 impl Default for DistributedConfig {
     fn default() -> Self {
         Self {
-            connect_timeout_secs: 600.0,
+            connect_timeout_secs: None,
             connect_retry_delay_secs: 1.0,
             peer_timeout_secs: 300.0,
             keepalive_interval_secs: 5.0,
@@ -135,7 +148,10 @@ impl DistributedConfig {
         // implicitly. Explicit `oom_retry_max_passes=N` overrides.
         let effective_retry_max_passes = retry_max_passes.unwrap_or(d.retry_max_passes);
         Self {
-            connect_timeout_secs: connect_timeout_secs.unwrap_or(d.connect_timeout_secs),
+            // `None` is preserved (NOT defaulted away): "unset" is the
+            // signal the primary-side derivation keys the scale-aware
+            // quorum-proceed window on.
+            connect_timeout_secs: connect_timeout_secs.or(d.connect_timeout_secs),
             connect_retry_delay_secs: connect_retry_delay_secs
                 .unwrap_or(d.connect_retry_delay_secs),
             peer_timeout_secs: peer_timeout_secs.unwrap_or(d.peer_timeout_secs),
@@ -158,8 +174,29 @@ impl DistributedConfig {
 }
 
 impl DistributedConfig {
+    /// Default for the CONCRETE [`Self::connect_timeout`] accessor when
+    /// the operator left the knob unset — the historical 600s transport
+    /// patience the secondary's bootstrap dial keeps.
+    const CONNECT_TIMEOUT_DEFAULT_SECS: f64 = 600.0;
+
+    /// The concrete connect-timeout (explicit value or the 600s
+    /// default) — the SECONDARY's bootstrap-dial budget. The PRIMARY's
+    /// quorum-proceed window must NOT read this: it goes through
+    /// [`Self::connect_timeout_override`] +
+    /// `dynrunner_manager_distributed::derive_connect_timeout` so an
+    /// unset knob derives the scale-aware window.
     pub(crate) fn connect_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs_f64(self.connect_timeout_secs)
+        std::time::Duration::from_secs_f64(
+            self.connect_timeout_secs
+                .unwrap_or(Self::CONNECT_TIMEOUT_DEFAULT_SECS),
+        )
+    }
+
+    /// The operator's explicit connect-timeout, `None` when unset — the
+    /// input to the primary-side quorum-proceed-window derivation.
+    pub(crate) fn connect_timeout_override(&self) -> Option<std::time::Duration> {
+        self.connect_timeout_secs
+            .map(std::time::Duration::from_secs_f64)
     }
     pub(crate) fn connect_retry_delay(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(self.connect_retry_delay_secs)

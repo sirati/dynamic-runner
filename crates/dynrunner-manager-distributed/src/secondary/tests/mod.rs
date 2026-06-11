@@ -124,6 +124,7 @@ mod relocation_handoff_race;
 mod replay_backoff;
 mod run_config_responder;
 mod setup_handshake_resilience;
+mod setup_liveness;
 mod terminal_ack;
 mod terminal_msg_watermark;
 mod voting_candidate_death;

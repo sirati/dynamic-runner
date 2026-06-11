@@ -3292,6 +3292,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // on the handoff path.
                 panik_watcher_paths: Vec::new(),
                 panik_watcher_poll_interval: Duration::from_secs(60),
+                fleet_death_presumption:
+                    crate::observer::ObserverConfig::DEFAULT_FLEET_DEATH_PRESUMPTION,
             },
             started_phases: phase_started_emitted,
             panik_signal_rx,
