@@ -83,6 +83,11 @@ fn observer_config(node_id: &str) -> ObserverConfig {
         peer_timeout: Duration::from_secs(300),
         panik_watcher_paths: Vec::new(),
         panik_watcher_poll_interval: Duration::from_secs(60),
+        // LONG (the production default, 20 min) so the rc-B
+        // report-and-retry pins in this suite never trip the last-resort
+        // terminal inside their wall-clock windows; the fleet-death tests
+        // shrink it explicitly.
+        fleet_death_presumption: ObserverConfig::DEFAULT_FLEET_DEATH_PRESUMPTION,
     }
 }
 
@@ -1969,4 +1974,108 @@ async fn observer_digest_cadence_emits_on_the_wire() {
             }
         })
         .await;
+}
+
+/// THE asm-dataset LMU stale-snapshot spin replay: every SLURM job is
+/// dead (zero transport legs, zero inbound — forever) but the observer's
+/// last converged CRDT snapshot still shows live worker-secondary
+/// members (a fleet that dies without originating `PeerRemoved` freezes
+/// the membership ledger alive-looking). Pre-fix the observer looped
+/// "last CRDT snapshot still shows N live worker-secondary members …
+/// mesh running autonomously" FOREVER — stale-snapshot reassurance, no
+/// verdict, the submitter never exits.
+///
+/// The fix (`observer::fleet_death`): once nothing has been received
+/// from ANY member for the LONG `fleet_death_presumption` threshold,
+/// with the transport showing zero legs and ≥3 driven reconnect
+/// recovery cycles failed, the observer reports
+/// fleet-unreachable-presumed-dead loudly and exits non-zero
+/// (`RunError::FatalPolicyExit`) — a bounded LAST-RESORT terminal. The
+/// rc-B report-and-retry machinery (immediate full-log diagnostics, the
+/// 5-minute wake gate, the ~60s recurrence) runs untouched ahead of it —
+/// this paused-clock test rides through MANY of those cycles (3+ virtual
+/// minutes of recurrences) before the presumption may trip.
+///
+/// REVERT-CHECK: pre-fix `run()` never returns here — the outer
+/// virtual-time bound (1000s, 2.5× the presumption window) expires with
+/// the observer still spinning on the stale snapshot.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn stale_snapshot_fleet_death_is_bounded_loud_terminal() {
+    use crate::primary::RunError;
+    use dynrunner_core::{ResourceAmount, ResourceKind};
+
+    tokio::time::timeout(Duration::from_secs(1000), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Zero peers, inbound held open but NEVER fed — the
+                // whole-fleet-dead transport view.
+                let (transport, _inbound, _peers) = transport_with_peers("obs", 0);
+
+                // The STALE snapshot: 10 worker-secondaries joined +
+                // advertised capacity, none ever removed — exactly what
+                // the production observer's ledger held while reassuring
+                // the operator.
+                let mut cs = ClusterState::<TestId>::new();
+                for i in 0..10 {
+                    cs.apply(ClusterMutation::PeerJoined {
+                        peer_id: format!("sec-{i}"),
+                        is_observer: false,
+                        can_be_primary: true,
+                        cap_version: Default::default(),
+                        member_gen: 0,
+                    });
+                    cs.apply(ClusterMutation::SecondaryCapacity {
+                        secondary: format!("sec-{i}"),
+                        worker_count: 4,
+                        resources: vec![ResourceAmount {
+                            kind: ResourceKind::memory(),
+                            amount: 1024 * 1024 * 1024,
+                        }],
+                    });
+                }
+                assert!(
+                    cs.alive_secondary_members().count() == 10,
+                    "the stale snapshot must read alive (the production smell)"
+                );
+
+                let mut config = observer_config("obs");
+                config.fleet_dead_timeout = Duration::from_millis(50);
+                // LONG relative to every cadence in the loop (recurrence
+                // 60s, wake gate 300s) but bounded: the presumption trips
+                // at 400s of total virtual silence — after the wake-loss
+                // gate fired and ≥3 recovery cycles failed.
+                config.fleet_death_presumption = Duration::from_secs(400);
+
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
+
+                let err = observer.run().await.expect_err(
+                    "a fleet dead past the presumption threshold (zero legs, \
+                     zero inbound, failed reconnect cycles) must be a BOUNDED \
+                     non-zero terminal — never an infinite stale-snapshot spin",
+                );
+                match err {
+                    RunError::FatalPolicyExit { reason } => {
+                        assert!(
+                            reason.contains("presumed dead"),
+                            "the verdict carries the distinct fleet-death \
+                             wording: {reason}"
+                        );
+                    }
+                    other => panic!(
+                        "the fleet-death terminal must be the structured \
+                         FatalPolicyExit (the PyO3 boundary raises it \
+                         non-zero), got {other:?}"
+                    ),
+                }
+            })
+            .await;
+    })
+    .await
+    .expect(
+        "BOUNDED terminal: the observer must exit within the presumption \
+         window — the pre-fix behaviour spins on the stale snapshot forever",
+    );
 }
