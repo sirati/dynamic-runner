@@ -28,6 +28,154 @@ use dynrunner_core::{PhaseId, TaskDep};
 use super::*;
 use crate::primary::command_channel::PrimaryCommand;
 
+/// #415 face (b1) — the terminal verdict must reach a transiently-down
+/// OBSERVER leg before the authority tears down.
+///
+/// run_20260611_155305: the compute primary broadcast `RunComplete` while
+/// the relocated submitter→observer's `-R` leg was DOWN (the fleet-wide
+/// drop coincided with run-end). The pre-fix `broadcast_terminal_verdict`
+/// fired ONE broadcast + slept a FIXED 500ms, then the fleet tore down —
+/// so the verdict never reached the observer, and a zero-authority
+/// observer (which exits ONLY on observing the CRDT terminal — BUG-B)
+/// blacked out forever once no peer was left to anti-entropy-pull from.
+///
+/// The fix HOLDS the authority alive — RE-BROADCASTING — until every
+/// observer the roster names has a reachable leg again (bounded by the
+/// grace cap). This test seeds an observer in `RoleTable.observers`, starts
+/// its leg DOWN, brings it up mid-wait, and asserts the verdict is
+/// RE-SENT after the leg re-folds AND that `broadcast_terminal_verdict`
+/// does NOT return before the observer is reachable.
+///
+/// REVERT-CHECK: with the fixed-500ms settle restored the call returns with
+/// the leg still down and exactly ONE broadcast (no re-send) — the observer
+/// never gets the verdict.
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_verdict_holds_for_a_transiently_down_observer_leg() {
+    use crate::primary::test_helpers::ControllableMembershipPeer;
+    use crate::process::{LocalRole, Mesh};
+    use dynrunner_protocol_primary_secondary::address::PeerId;
+    use std::collections::HashSet;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Connected set the pump publishes from. Start with ONE compute
+            // secondary present but the OBSERVER leg ("obs") ABSENT — the
+            // verdict-time fleet-wide drop shape.
+            let connected: std::rc::Rc<std::cell::RefCell<HashSet<String>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(HashSet::from(["sec-0".to_string()])));
+            let transport = ControllableMembershipPeer::<TestId>::new(connected.clone());
+            let broadcasts = transport.broadcast_log();
+
+            let mut mesh = Mesh::new(transport);
+            let (slot, client, inbox) = mesh
+                .register_local_role(LocalRole::Primary, PeerId::from("setup"));
+            mesh.publish_membership();
+            let (control, control_rx) = crate::process::pump::control_channel::<TestId>();
+            let pump = tokio::task::spawn_local(async move {
+                let _slot = slot;
+                crate::process::pump::run_pump(mesh, control_rx).await;
+            });
+
+            let (_demote_tx, demote_rx) = tokio_mpsc::unbounded_channel();
+            let mut primary = PrimaryCoordinator::new(
+                test_primary_config(),
+                client,
+                inbox,
+                demote_rx,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            // Seed the roster: a compute secondary + an OBSERVER, so the
+            // terminal-delivery gate has an observer id to hold for.
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PeerJoined {
+                    peer_id: "sec-0".to_string(),
+                    is_observer: false,
+                    can_be_primary: true,
+                    cap_version: Default::default(),
+                    member_gen: 0,
+                });
+                cs.apply(ClusterMutation::PeerJoined {
+                    peer_id: "obs".to_string(),
+                    is_observer: true,
+                    can_be_primary: false,
+                    cap_version: Default::default(),
+                    member_gen: 0,
+                });
+            }
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .role_table()
+                    .observers
+                    .contains("obs"),
+                "the observer must be in the roster for the gate to engage"
+            );
+
+            // Bring the observer leg UP after 1.5s — the secondary's
+            // bootstrap-redial re-folding the wire mid-wait.
+            let flip = connected.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                flip.borrow_mut().insert("obs".to_string());
+            });
+
+            // The call must HOLD until the observer leg is reachable. Bound
+            // it generously below the grace cap so a regression (returns
+            // early, leg still down) is caught by the post-call assertion,
+            // not a hang.
+            let started = std::time::Instant::now();
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                primary.broadcast_terminal_verdict(ClusterMutation::RunComplete),
+            )
+            .await
+            .expect("terminal verdict delivery must complete within the grace cap");
+            let held = started.elapsed();
+
+            // It held until the observer leg came up (≈1.5s), not the fixed
+            // 500ms settle.
+            assert!(
+                held >= Duration::from_millis(1200),
+                "broadcast_terminal_verdict must HOLD until the observer leg \
+                 re-folds (≈1.5s), not return after the fixed 500ms settle; \
+                 held only {held:?}"
+            );
+            assert!(
+                connected.borrow().contains("obs"),
+                "the observer leg must be reachable by the time the call returns"
+            );
+
+            // The verdict was RE-BROADCAST (more than the single pre-fix
+            // send) so the freshly-re-folded observer leg actually received
+            // it. Every logged frame is a RunComplete ClusterMutation.
+            let sends = broadcasts.borrow();
+            let verdict_sends = sends
+                .iter()
+                .filter(|m| {
+                    matches!(
+                        m,
+                        DistributedMessage::ClusterMutation { mutations, .. }
+                            if mutations.iter().any(|cm| matches!(cm, ClusterMutation::RunComplete))
+                    )
+                })
+                .count();
+            assert!(
+                verdict_sends >= 2,
+                "the terminal verdict must be RE-BROADCAST while the observer \
+                 leg is down + once after it re-folds (the pump only fans NEW \
+                 sends to a freshly-registered leg); saw {verdict_sends} \
+                 RunComplete broadcast(s)"
+            );
+
+            drop(control);
+            pump.abort();
+        })
+        .await;
+}
+
 /// 1 real primary + 1 real secondary, 5 single-phase tasks that all
 /// complete cleanly; `on_phase_end` then spawns a runtime batch whose
 /// EVERY task the validator rejects (`UnknownDependency`). The run must

@@ -192,6 +192,15 @@ impl PySlurmPreparation {
             est.per_tunnel_timeout = Duration::from_secs_f64(t);
         }
         opts.establishment = est;
+        // Diagnostic knob (#415 face (a)): `DYNRUNNER_SSH_TUNNEL_LOGLEVEL`
+        // (e.g. `DEBUG1`) raises the per-secondary `-R` tunnel CHILD's
+        // OpenSSH LogLevel so a fleet-wide-drop investigation can see the
+        // rekey / channel-forwarding / mux lines the default banner-only
+        // child stderr hides. Read ONCE here (the single env→config seam)
+        // so the argv builder stays pure. Empty/unset keeps the default.
+        opts.tunnel_child_log_level = std::env::var("DYNRUNNER_SSH_TUNNEL_LOGLEVEL")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
         Ok(Self {
             inner: std::sync::Arc::new(SlurmPreparation::new(opts)),
             gateway,

@@ -398,6 +398,72 @@ fn establish_tunnel_fails_fast_on_auth_class_stderr() {
     }
 }
 
+/// REGRESSION (#408): a bare post-banner "Connection closed by <addr>
+/// port 22" — with NO pre-banner `kex_`/`UNKNOWN` marker and NO
+/// explicit auth marker — is the worker-sshd LOAD-SHED shape under the
+/// setup burst (N nodes × {linger, release, -N -R, bind-probe} ssh
+/// logins in seconds), NOT a deterministic auth refusal. It MUST stay
+/// retryable: the previously-working path retried it and the
+/// same-port release+rebind rescued the tunnel. The 31e689bc
+/// classifier reclassified this shape as Deterministic → fail-fast,
+/// which removed the retry that load-shed closes depend on; under
+/// establish-burst pressure (fresh image upload + many nodes) the
+/// pre-existing intermittent phantom became a near-total welcome loss
+/// (consumer test-env 0/4, LMU 0/11 on d5194adf, while the predecessor
+/// connected). This test pins the restored behavior: attempt 1 exits
+/// the gate with the bare-close stderr, attempt 2 lives → success
+/// after exactly 2 tries.
+#[test]
+fn establish_tunnel_retries_bare_post_banner_close() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let result: Result<(), PrepError> = rt.block_on(local.run_until(async {
+        let pool = Arc::new(Semaphore::new(1));
+        let policy = fast_policy(1, 3);
+        let attempt_counter = Arc::new(AtomicUsize::new(0));
+        let attempts_ref = Arc::clone(&attempt_counter);
+
+        let res = establish_tunnel(
+            "secondary-0",
+            &policy,
+            &pool,
+            move || {
+                let i = attempts_ref.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if i == 0 {
+                        // First attempt: worker sshd load-sheds the
+                        // session post-banner. ssh resolved the peer, so
+                        // the close line names the address (NOT UNKNOWN)
+                        // and carries NO kex_ pre-banner marker — the
+                        // exact capture the classifier wrongly fast-failed.
+                        Ok(fail_child("Connection closed by 10.153.52.8 port 22", 255))
+                    } else {
+                        Ok(alive_child())
+                    }
+                }
+            },
+            listening_verifier(),
+        )
+        .await;
+
+        match res {
+            Ok(_child) => {
+                assert_eq!(
+                    attempt_counter.load(Ordering::SeqCst),
+                    2,
+                    "a bare post-banner close must be RETRIED (load-shed), not fast-failed"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }));
+    result.expect("bare post-banner close must retry-then-succeed, not fail fast");
+}
+
 /// Default policy sanity: the operator-friendly defaults are the
 /// numbers documented in the design (4 concurrent, 3 attempts,
 /// [5s, 15s] backoff, 90s per-tunnel cap). Pinned here so a

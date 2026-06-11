@@ -83,3 +83,28 @@ pub(crate) use coordinator::{RemoteWorkerState, SlotProvenance, SlotState};
 /// (`ingest`) so the two stay in lockstep.
 pub(crate) const PRIMARY_BROADCAST_SETTLE: std::time::Duration =
     std::time::Duration::from_millis(500);
+
+/// Upper bound on how long the terminal-verdict broadcast holds the
+/// authority alive RE-BROADCASTING while an OBSERVER leg the roster names
+/// is transiently unreachable (#415 face (b1)).
+///
+/// The fixed [`PRIMARY_BROADCAST_SETTLE`] is sized for the QUIC delivery
+/// latency of a HEALTHY mesh; it cannot deliver to a peer whose leg is
+/// DOWN at broadcast time. A zero-authority observer never times out on
+/// visibility loss (it exits ONLY on observing the CRDT terminal — BUG-B),
+/// so a terminal that misses its leg is uniquely unrecoverable once the
+/// fleet tears down (the observed run_20260611_155305 blackout: the
+/// fleet-wide `-R` drop coincided with run-end; the verdict never reached
+/// the observer, and after teardown there was no peer left to
+/// anti-entropy-pull from). The compute peers, by contrast, self-heal a
+/// missed terminal — they fail over / time out and release their slot —
+/// so only the observer leg needs this grace.
+///
+/// Bounded so a genuinely-gone observer (its host died) cannot stall the
+/// fleet teardown forever: past this cap the authority gives up and tears
+/// down, exactly as before. 60s comfortably covers the observed
+/// secondary→observer `-R` re-fold (the bootstrap-redial backoff caps at
+/// 30s and the observed re-establish landed in ~27-31s) without holding a
+/// finished run open for an unbounded stretch.
+pub(crate) const TERMINAL_OBSERVER_DELIVERY_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(60);

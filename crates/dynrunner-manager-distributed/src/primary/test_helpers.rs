@@ -152,6 +152,76 @@ impl<I: Identifier> PeerTransport<I> for RecordingPeer<I> {
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
 }
 
+/// PeerTransport whose connected-id set is driven by a shared cell, so a
+/// test can flip a named peer's reachability mid-run (the observer-leg
+/// re-fold in the #415 face-(b1) terminal-delivery test). Records every
+/// outbound `broadcast` so the test can count terminal-verdict re-sends.
+///
+/// `connected_ids` (and thus the pump-published `has_route`/`peer_count`)
+/// projects the shared `Rc<RefCell<HashSet<String>>>`; mutate it from the
+/// test (then let the pump's ~100ms republish tick pick it up) to model a
+/// peer leg dropping and re-folding. Single-threaded (`Rc`/`RefCell`) —
+/// only safe inside a `tokio::task::LocalSet`, like every fixture here.
+pub(super) struct ControllableMembershipPeer<I: Identifier> {
+    /// The ids currently reachable. Shared with the test, which flips it.
+    pub(super) connected: std::rc::Rc<std::cell::RefCell<HashSet<String>>>,
+    /// Every `broadcast`ed message, in order — the test asserts on the
+    /// terminal-verdict re-send count.
+    pub(super) broadcasts: std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<I>>>>,
+}
+
+impl<I: Identifier> ControllableMembershipPeer<I> {
+    pub(super) fn new(
+        connected: std::rc::Rc<std::cell::RefCell<HashSet<String>>>,
+    ) -> Self {
+        Self {
+            connected,
+            broadcasts: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        }
+    }
+
+    pub(super) fn broadcast_log(
+        &self,
+    ) -> std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<I>>>> {
+        self.broadcasts.clone()
+    }
+}
+
+impl<I: Identifier> PeerTransport<I> for ControllableMembershipPeer<I> {
+    async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
+        self.broadcasts.borrow_mut().push(msg);
+        Ok(())
+    }
+    async fn send_to_peer(
+        &mut self,
+        _peer_id: &str,
+        msg: DistributedMessage<I>,
+    ) -> Result<(), String> {
+        self.broadcasts.borrow_mut().push(msg);
+        Ok(())
+    }
+    async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        std::future::pending().await
+    }
+    fn try_recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        None
+    }
+    fn peer_count(&self) -> usize {
+        self.connected.borrow().len()
+    }
+    fn has_peer(&self, id: &PeerId) -> bool {
+        self.connected.borrow().contains(id.as_str())
+    }
+    fn connected_ids(&self) -> Vec<PeerId> {
+        self.connected
+            .borrow()
+            .iter()
+            .map(|s| PeerId::from(s.as_str()))
+            .collect()
+    }
+    async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
+}
+
 /// PeerTransport that drops every message and never produces input.
 // Unused since `spawn_real_secondary*` moved to the channel-backed mesh
 // harness (`channel_mesh_secondary_ends`); kept as a drop-everything

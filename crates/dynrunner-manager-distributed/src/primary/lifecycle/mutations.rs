@@ -244,7 +244,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///   survive — a verdict here would tear down a salvageable run;
     /// - crashes / panics / SIGKILL: no code runs; failover handles it.
     pub(crate) async fn broadcast_terminal_verdict(&mut self, mutation: ClusterMutation<I>) {
-        self.apply_and_broadcast_cluster_mutations(vec![mutation])
+        self.apply_and_broadcast_cluster_mutations(vec![mutation.clone()])
             .await;
         // Brief settle window so the broadcast lands on every peer before
         // the dispatcher tears down its transport. Without this, fast
@@ -253,6 +253,91 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // wrappers whose secondaries didn't see the verdict. See
         // `PRIMARY_BROADCAST_SETTLE` for the rationale.
         tokio::time::sleep(crate::primary::PRIMARY_BROADCAST_SETTLE).await;
+        // Then HOLD (re-broadcasting) until every observer the roster names
+        // is reachable again, bounded by the grace cap (#415 face (b1)).
+        // The fixed settle above delivers to a healthy mesh; this covers the
+        // observer leg that was DOWN at broadcast time and is re-folding.
+        self.await_terminal_observer_delivery(mutation).await;
+    }
+
+    /// Hold the authority alive — re-broadcasting `mutation` — until every
+    /// observer the roster names has a reachable transport leg, bounded by
+    /// [`crate::primary::TERMINAL_OBSERVER_DELIVERY_GRACE`].
+    ///
+    /// # Single concern (#415 face (b1))
+    ///
+    /// The terminal verdict must reach the OBSERVER before the fleet tears
+    /// down. A zero-authority observer exits ONLY on observing the CRDT
+    /// terminal (it never strands on visibility loss — BUG-B), so a verdict
+    /// that misses its leg is unrecoverable once the compute peers exit and
+    /// no peer is left to anti-entropy-pull from. The compute peers self-heal
+    /// a missed terminal (fail over / time out, release their slot), so this
+    /// gate is specifically about the observer leg — read off the
+    /// `RoleTable.observers` projection the primary already holds, against the
+    /// pump-published reachability (`MeshClient::has_route`).
+    ///
+    /// No-op when the roster names no observer (the common single-process /
+    /// no-observer topology returns after the fixed settle alone). The
+    /// re-broadcast is idempotent (`apply_and_broadcast_cluster_mutations`
+    /// filters the CRDT NoOp), so a leg that recovers mid-wait re-receives
+    /// the verdict; a leg that never recovers (the observer host genuinely
+    /// died) gives up at the cap and tears down exactly as the pre-#415
+    /// fixed settle did — the bound is what keeps a finished run from
+    /// stalling forever on a gone observer.
+    async fn await_terminal_observer_delivery(&mut self, mutation: ClusterMutation<I>) {
+        let observers: Vec<PeerId> = self
+            .cluster_state
+            .role_table()
+            .observers
+            .iter()
+            .map(|id| PeerId::from(id.as_str()))
+            .collect();
+        if observers.is_empty() {
+            return;
+        }
+        let all_reachable = |client: &crate::process::MeshClient<I>| {
+            observers.iter().all(|id| client.has_route(id))
+        };
+        if all_reachable(&self.client) {
+            return;
+        }
+        let deadline =
+            tokio::time::Instant::now() + crate::primary::TERMINAL_OBSERVER_DELIVERY_GRACE;
+        tracing::info!(
+            observers = observers.len(),
+            grace_secs = crate::primary::TERMINAL_OBSERVER_DELIVERY_GRACE.as_secs(),
+            "terminal verdict broadcast but an observer leg is not yet reachable; \
+             holding + re-broadcasting until it re-folds (or the grace cap)"
+        );
+        loop {
+            // Re-broadcast each poll so a leg that re-folds mid-wait
+            // re-receives the verdict (the pump only fans NEW sends to a
+            // freshly-registered connection — there is no retransmit-on-
+            // reconnect for the original broadcast). `broadcast_applied_
+            // mutations` (NOT `apply_and_broadcast_cluster_mutations`)
+            // because the verdict already latched on the FIRST broadcast's
+            // local apply: the apply-and-broadcast path NoOp-filters an
+            // already-applied mutation off the wire (#50's N²-amplification
+            // guard), which would silently swallow every re-send. The
+            // raw re-broadcast re-emits the frame; the receiving observer
+            // applies it idempotently (it observes the terminal → exits).
+            self.broadcast_applied_mutations(vec![mutation.clone()])
+                .await;
+            tokio::time::sleep(crate::primary::PRIMARY_BROADCAST_SETTLE).await;
+            if all_reachable(&self.client) {
+                tracing::info!("observer leg re-folded; terminal verdict delivered");
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    grace_secs = crate::primary::TERMINAL_OBSERVER_DELIVERY_GRACE.as_secs(),
+                    "observer leg still unreachable after the terminal-delivery grace; \
+                     tearing down anyway (the observer host may be gone — its fleet-death \
+                     presumption is the backstop)"
+                );
+                return;
+            }
+        }
     }
 
     /// Originate the CRDT `Pending → InFlight` transition for a task
