@@ -2139,3 +2139,167 @@ async fn truly_dead_peer_removed_on_cadence_when_ingest_healthy() {
          normal cadence — the ingest gate never blocks a healthy decider"
     );
 }
+
+// ======================================================================
+// Chronic-starvation replay (run_20260611_200548)
+// ======================================================================
+
+/// REPLAY (run_20260611_200548): a CHRONICALLY starved primary — EVERY
+/// heartbeat tick's own inter-tick gap stretched past the starvation
+/// threshold, for a streak spanning many hard silence windows — must
+/// STILL remove a member that went permanently silent, and the removal
+/// must reach the respawn pipeline (a replacement is requested under the
+/// on-secondary-death policy).
+///
+/// The production sequence: six secondaries fatal-exited while the
+/// promoted primary's node was saturated by uncapped workers; the
+/// primary's own tick lagged on every sweep ("own tick lagged ...
+/// deferring silence-based judgments", repeatedly for >22 minutes), so
+/// the per-tick whole-sweep deferral repeated unboundedly — the dead
+/// members were never judged, never removed from the membership, and the
+/// respawn pipeline never received a lifecycle event (respawn_request=0
+/// for 30 minutes with the respawn policy active).
+///
+/// The pinned contract: chronic deferral must ESCALATE. Once the starved
+/// streak has spanned the hard silence window, sweeps resume on
+/// starvation-honest accrued time (each lagged gap contributes at most
+/// the starvation threshold), so a permanently-silent member is removed
+/// within a bounded number of lagged sweeps while a member with fresh
+/// evidence each round is never falsely declared (judged silence never
+/// exceeds wall silence).
+#[tokio::test(flavor = "current_thread")]
+async fn chronically_starved_primary_removes_dead_member_and_requests_respawn() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _sec_rx, _kept) = empty_transport();
+            // interval 50ms → starvation threshold 150ms (3×); hard
+            // backstop 100ms (2×).
+            let (mut primary, keep) = build_primary(
+                config(Duration::from_millis(50), 2),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+            install_default_pool(&mut primary);
+            // The incident's respawn policy defaults: 3 per family,
+            // 10 total, 30s cooldown.
+            let spawner = std::sync::Arc::new(crate::primary::test_helpers::MockSpawner::new());
+            let calls = std::sync::Arc::clone(&spawner.calls);
+            primary.enable_respawn(
+                spawner,
+                crate::primary::respawn::RespawnBudget {
+                    max_per_secondary: 3,
+                    max_total: 10,
+                    cooldown: Duration::from_secs(30),
+                },
+                "tcp://127.0.0.1:5555".into(),
+                "-----BEGIN PUBLIC KEY-----\nFAKE\n".into(),
+            );
+            register_operational_secondary(&mut primary, "doomed", 0, "victim");
+            register_operational_secondary(&mut primary, "survivor", 1, "victim-2");
+
+            // Baseline on-cadence tick (sets the own-tick clock; both
+            // members fresh).
+            primary.process_heartbeat_tick().await.unwrap();
+
+            // `doomed` dies (its process exits — no frame ever arrives
+            // again). The primary's own runtime is CHRONICALLY starved:
+            // every inter-tick gap (200ms) exceeds the 150ms starvation
+            // threshold and the streak spans many 100ms hard windows.
+            // `survivor` keeps delivering frames each round (its
+            // keepalives land in the inbox at the slot's ingest choke
+            // point), exactly like the five surviving members did.
+            let mut removed_at_tick = None;
+            for tick in 0..8 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                keep._slot
+                    .as_ref()
+                    .expect("no-pump build parks the slot")
+                    .deliver(keepalive_from("survivor"))
+                    .expect("inbox live");
+                primary.process_heartbeat_tick().await.unwrap();
+                if !primary.secondaries.contains_key("doomed") {
+                    removed_at_tick = Some(tick);
+                    break;
+                }
+            }
+            assert!(
+                removed_at_tick.is_some(),
+                "a permanently-silent member must be removed within a \
+                 bounded number of chronically-lagged sweeps — perpetual \
+                 whole-sweep deferral must escalate once the starved \
+                 streak spans the hard silence window (the \
+                 run_20260611_200548 face: 30 minutes of deferral, six \
+                 dead members never removed)"
+            );
+            assert!(
+                primary.secondaries.contains_key("survivor"),
+                "a member with fresh evidence every round must NOT be \
+                 swept up by the chronic-starvation escalation (judged \
+                 silence resets on every evidence advance)"
+            );
+            assert!(
+                !primary.cluster_state.is_peer_alive("doomed"),
+                "the replicated membership must mark the dead member removed"
+            );
+
+            // The removal must reach the respawn pipeline through the
+            // SAME listener `enable_respawn` registered — replicate the
+            // lifecycle dispatcher fan-out the run loop drives
+            // (`run_peer_lifecycle_dispatcher` + the respawn select arm).
+            let mut lifecycle_rx = primary
+                .lifecycle_rx
+                .take()
+                .expect("lifecycle dispatcher channel installed at construction");
+            while let Ok(event) = lifecycle_rx.try_recv() {
+                for listener in &primary.peer_lifecycle_listeners {
+                    listener.on_event(&event);
+                }
+            }
+            let mut respawn_rx = primary
+                .respawn_lifecycle_rx
+                .take()
+                .expect("enable_respawn installed the respawn lifecycle channel");
+            let mut removed_events = 0;
+            while let Ok(event) = respawn_rx.try_recv() {
+                if matches!(
+                    &event,
+                    crate::peer_lifecycle::PeerLifecycleEvent::Removed { id, .. } if id == "doomed"
+                ) {
+                    removed_events += 1;
+                }
+                primary.dispatch_respawn_lifecycle(event);
+            }
+            assert_eq!(
+                removed_events, 1,
+                "exactly one Removed lifecycle event for the dead member \
+                 reaches the respawn pipeline"
+            );
+
+            // The request was ACCEPTED: replicated ledger entry written,
+            // replacement tracked pending, spawner invoked with a fresh id.
+            assert_eq!(
+                primary.cluster_state.respawn_events().len(),
+                1,
+                "the accepted respawn is recorded on the replicated ledger"
+            );
+            assert!(
+                primary
+                    .pending_replacements
+                    .values()
+                    .any(|original| original == "doomed"),
+                "the replacement is tracked pending-until-join for the dead member"
+            );
+            let outcome = primary
+                .respawn_tasks
+                .join_next()
+                .await
+                .expect("respawn spawn future present after dispatch")
+                .expect("respawn task must not panic");
+            assert!(outcome.result.is_ok());
+            assert_eq!(outcome.original_id, "doomed");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        })
+        .await;
+}

@@ -1460,3 +1460,63 @@ pub(super) fn setup_test(
         secondary_ends,
     )
 }
+
+/// Counting mock spawner: records every `spec.new_secondary_id` it
+/// observes and returns `Ok(())`. The recorded ids let tests assert the
+/// coordinator minted fresh ids and the `RespawnDecision` path honoured
+/// the budget. `revoke` calls are recorded the same way so the
+/// re-admission reconciliation tests can pin exactly which replacements
+/// were revoked. Shared between the respawn pipeline tests and the
+/// heartbeat chronic-starvation replay (identifier-agnostic — the
+/// `SecondarySpawner` trait carries no `Identifier` parameter).
+pub(super) struct MockSpawner {
+    pub(super) calls: Arc<std::sync::atomic::AtomicU32>,
+    pub(super) captured_ids: Arc<std::sync::Mutex<Vec<String>>>,
+    pub(super) revoked_ids: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl MockSpawner {
+    pub(super) fn new() -> Self {
+        Self {
+            calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            captured_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+            revoked_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn call_count(&self) -> u32 {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn captured_ids(&self) -> Vec<String> {
+        self.captured_ids.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::primary::respawn::SecondarySpawner for MockSpawner {
+    async fn spawn(
+        &self,
+        spec: crate::primary::respawn::SecondarySpawnSpec,
+    ) -> Result<(), crate::primary::respawn::SpawnError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.captured_ids
+            .lock()
+            .unwrap()
+            .push(spec.new_secondary_id);
+        Ok(())
+    }
+
+    async fn revoke(
+        &self,
+        new_secondary_id: &str,
+    ) -> Result<(), crate::primary::respawn::SpawnError> {
+        self.revoked_ids
+            .lock()
+            .unwrap()
+            .push(new_secondary_id.to_owned());
+        Ok(())
+    }
+}
