@@ -67,6 +67,12 @@
 //!   stale half-open `connections` entry on the accept side; the
 //!   lower-id-dials dedup is preserved on the dial-owner side, and the
 //!   replacement is generation-checked.
+//! - [`reset_then_redial`]: the simultaneous-reset replay
+//!   (run_20260611_202345) — an established session RST plus aborted
+//!   in-flight handshakes at BOTH listeners must not end the accept
+//!   loops; the peer's re-dialed session re-registers and its replayed
+//!   seq-stamped report is delivered + ackable, and the errored accept
+//!   path neither spins nor monopolises the executor.
 //!
 //! The shared [`TestId`] is defined here so every sub-module gets
 //! the same `Identifier` impl via `super::TestId`.
@@ -113,5 +119,6 @@ mod primary_link;
 mod reader_exit_disconnect;
 mod recv_lifetime;
 mod recv_tick_closed_spins;
+mod reset_then_redial;
 mod silent_reconnect;
 mod two_peers;

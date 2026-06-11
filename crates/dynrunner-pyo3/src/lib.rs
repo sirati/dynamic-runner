@@ -16,6 +16,7 @@ mod protocol_manager_worker;
 mod publish;
 mod pytypes;
 mod slurm;
+mod spawn_priority;
 mod subprocess_factory;
 mod system_resources;
 mod task_completed_bridge;

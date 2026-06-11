@@ -21,6 +21,7 @@ rcgen = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
+socket2 = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 base64 = { workspace = true }

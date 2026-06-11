@@ -18,6 +18,13 @@
 //! `secondaries`, so the fleet-dead arm would never arm and a fully-silent
 //! fleet would hang forever.
 //!
+//! The schedule consumes the wall-clock evidence age while the decider's
+//! own ticks run on cadence, and the starvation-honest JUDGED clock (a
+//! difference of `OwnTickHealth::judged_elapsed` readings, per-member
+//! anchored by [`SilenceJudgedMark`]) while the decider is CHRONICALLY
+//! starved — the bounded escalation of the tick-lag deferral, see
+//! [`PrimaryCoordinator::process_heartbeat_tick`].
+//!
 //! Both declaration paths — the hard backstop here and the lazy on-demand
 //! requeue at the dispatch altitude (`only_silent_held_work_remains` →
 //! `declare_silent_secondaries_dead`) — funnel through
@@ -79,20 +86,21 @@ pub(super) enum Stage {
 /// PURE: classify a continuous silence into the highest schedule stage it
 /// has crossed, or `None` if it has not crossed the first stage yet.
 ///
-/// `last_seen`/`now` define the silence age; `keepalive_interval` scales
-/// the schedule; `warn_multiples` are the ascending WARN-stage multiples
-/// and `hard_multiple` is the terminal backstop multiple. No `&self`, no
-/// I/O — a property-testable classifier. The schedule entries are read in
-/// place (the caller owns the config) so the silence-age arithmetic lives
-/// in exactly one spot.
+/// `silence` is the member's continuous-silence age on whichever clock
+/// the caller judges by (the wall-clock evidence age on a healthy
+/// decider; the starvation-honest judged-clock difference under the
+/// chronic-starvation escalation — see [`SilenceJudgedMark`]);
+/// `keepalive_interval` scales the schedule; `warn_multiples` are the
+/// ascending WARN-stage multiples and `hard_multiple` is the terminal
+/// backstop multiple. No `&self`, no I/O — a property-testable
+/// classifier. The schedule entries are read in place (the caller owns
+/// the config) so the silence-age arithmetic lives in exactly one spot.
 pub(super) fn silence_stage(
-    last_seen: Instant,
-    now: Instant,
+    silence: Duration,
     keepalive_interval: Duration,
     warn_multiples: &[u32],
     hard_multiple: u32,
 ) -> Option<Stage> {
-    let silence = now.saturating_duration_since(last_seen);
     let crossed = |multiple: u32| silence > keepalive_interval.saturating_mul(multiple);
     if crossed(hard_multiple) {
         return Some(Stage::Hard);
@@ -110,6 +118,30 @@ pub(super) fn silence_stage(
 pub(super) struct DeadSecondary {
     pub(super) secondary_id: String,
     pub(super) last_keepalive: Instant,
+}
+
+/// Per-member judged-silence mark: the member's last evidence-of-life
+/// instant paired with the [`crate::own_tick_health::OwnTickHealth`]
+/// judged-clock reading when a sweep first observed that evidence.
+///
+/// The chronic-starvation escalation's per-member state: while the
+/// decider's own ticks are chronically lagged, wall-clock silence
+/// (`now - last_evidence`) is inflated by the decider's OWN stall, so the
+/// escalated sweep judges `judged_now - judged_at_evidence` instead — a
+/// difference of judged-clock readings, which accrues at most one
+/// starvation threshold per lagged round and therefore never exceeds the
+/// wall silence (an escalated sweep can only be MORE conservative than a
+/// wall-clock sweep, never less). Maintained on every sweep; an evidence
+/// advance resets the mark, so a member with fresh frames each round
+/// measures zero judged silence regardless of how stretched the rounds
+/// are.
+pub(in crate::primary) struct SilenceJudgedMark {
+    /// The evidence instant the mark was last reset on (the same union
+    /// clock `collect_heartbeat_report` reports).
+    pub(super) last_evidence: Instant,
+    /// `OwnTickHealth::judged_elapsed()` at the sweep that observed
+    /// `last_evidence` as fresh.
+    pub(super) judged_at_evidence: Duration,
 }
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
@@ -145,6 +177,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.secondary_keepalives
             .insert(secondary_id.into(), Instant::now());
         self.silence_warn_stage.remove(secondary_id);
+        // A welcome is an incarnation boundary: drop any stale judged-
+        // silence mark so the new incarnation's judged clock starts from
+        // its own fresh evidence (the next sweep re-seeds it).
+        self.silence_judged_marks.remove(secondary_id);
     }
 
     /// Fold the per-secondary keepalive map into a sweep of RAW silence
@@ -366,9 +402,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
         self.secondaries.remove(&secondary_id);
         self.secondary_keepalives.remove(&secondary_id);
-        // The secondary is gone; drop any staged-WARN state so a
-        // re-welcomed id (respawn reusing the slot) starts a fresh streak.
+        // The secondary is gone; drop any staged-WARN state and the
+        // judged-silence mark so a re-welcomed id (respawn reusing the
+        // slot) starts a fresh streak.
         self.silence_warn_stage.remove(&secondary_id);
+        self.silence_judged_marks.remove(&secondary_id);
 
         // Authoritative origination, one batch: the dead secondary's
         // in-flight tasks transition `InFlight → Pending` in the CRDT
@@ -483,6 +521,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// honestly. A genuine death is thereby delayed only while the
     /// decider itself is compromised; a false mass-removal of live
     /// peers off this node's own backlog is impossible.
+    ///
+    /// The tick-lag deferral is BOUNDED: on a CHRONICALLY starved node
+    /// (every inter-tick gap lagged, for a streak spanning the hard
+    /// silence window — the run_20260611_200548 face) the primitive
+    /// escalates instead of deferring forever, and the sweep resumes on
+    /// its starvation-honest judged clock (each lagged round contributes
+    /// at most one starvation threshold of judgeable silence — see
+    /// [`SilenceJudgedMark`]). A genuinely dead member is then still
+    /// removed within a bounded number of lagged rounds, while a member
+    /// with fresh evidence each round measures zero judged silence and is
+    /// never falsely declared.
     pub(super) async fn process_heartbeat_tick(&mut self) -> Result<(), String> {
         let now = Instant::now();
         // Own-tick-health gate — the shared authority (mesh ⊥ role: the
@@ -494,6 +543,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // on-cadence tick. The primitive also re-bases its trustworthy floor
         // on the lag, but the primary defers the WHOLE sweep rather than
         // clamping per-peer — a deferred sweep authors no removal at all.
+        // Under the CHRONIC escalation the verdict flips to `false` and the
+        // sweep below judges on the judged clock instead (see the method
+        // doc).
         if self.own_tick_health.observe_tick(now) {
             return Ok(());
         }
@@ -551,20 +603,38 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         &mut self,
         report: SecondaryHeartbeatReport,
     ) -> Result<(), String> {
-        let now = Instant::now();
         let interval = self.config.keepalive_interval;
         let warn_multiples = self.config.silence_warn_multiples.clone();
         let hard_multiple = self.config.silence_hard_multiple;
+        // Chronic-starvation escalation (see `process_heartbeat_tick`):
+        // while active, judge each member on the starvation-honest judged
+        // clock instead of the wall-clock evidence age.
+        let chronic = self.own_tick_health.in_chronic_starvation();
+        let judged_now = self.own_tick_health.judged_elapsed();
 
         let mut hard_dead: Vec<DeadSecondary> = Vec::new();
         for s in report.silences {
-            match silence_stage(
-                s.last_keepalive,
-                now,
-                interval,
-                &warn_multiples,
-                hard_multiple,
-            ) {
+            // Maintain the judged mark on EVERY sweep (not just escalated
+            // ones) so the escalation has per-member history the moment it
+            // engages. An evidence advance resets the mark — a member with
+            // fresh frames each round measures zero judged silence.
+            let mark = self
+                .silence_judged_marks
+                .entry(s.secondary_id.clone())
+                .or_insert(SilenceJudgedMark {
+                    last_evidence: s.last_keepalive,
+                    judged_at_evidence: judged_now,
+                });
+            if s.last_keepalive > mark.last_evidence {
+                mark.last_evidence = s.last_keepalive;
+                mark.judged_at_evidence = judged_now;
+            }
+            let silence = if chronic {
+                judged_now.saturating_sub(mark.judged_at_evidence)
+            } else {
+                s.silence
+            };
+            match silence_stage(silence, interval, &warn_multiples, hard_multiple) {
                 None => continue,
                 Some(Stage::Hard) => {
                     hard_dead.push(DeadSecondary {
@@ -573,7 +643,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     });
                 }
                 Some(Stage::Warn(idx)) => {
-                    self.log_silence_warn_once(&s.secondary_id, idx, s.silence);
+                    self.log_silence_warn_once(&s.secondary_id, idx, silence);
                 }
             }
         }
@@ -638,7 +708,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             return std::collections::HashSet::new();
         }
         let report = self.collect_heartbeat_report();
-        let now = Instant::now();
+        // Same judged-clock substitution as `decide_dead_secondaries`,
+        // read-only (this method is `&self`; the marks are maintained by
+        // the per-tick sweep, so a reading here is at most one tick stale
+        // — the same staleness class as the keepalive clocks). A member
+        // without a mark, or whose evidence advanced past it, measures
+        // zero judged silence (not silent — conservative).
+        let chronic = self.own_tick_health.in_chronic_starvation();
+        let judged_now = self.own_tick_health.judged_elapsed();
         // Exclude the recognized primary's own same-peer secondary by IDENTITY
         // (the same `id != current_primary` cut `alive_remote_secondary_count`
         // uses). The EARLY dispatch-altitude requeue acts on first-stage silence,
@@ -652,9 +729,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .silences
             .into_iter()
             .filter(|s| {
+                let silence = if chronic {
+                    match self.silence_judged_marks.get(&s.secondary_id) {
+                        Some(mark) if s.last_keepalive <= mark.last_evidence => {
+                            judged_now.saturating_sub(mark.judged_at_evidence)
+                        }
+                        // Fresh evidence past the mark, or no mark yet:
+                        // not silent on the judged clock.
+                        _ => Duration::ZERO,
+                    }
+                } else {
+                    s.silence
+                };
                 silence_stage(
-                    s.last_keepalive,
-                    now,
+                    silence,
                     self.config.keepalive_interval,
                     &self.config.silence_warn_multiples,
                     self.config.silence_hard_multiple,

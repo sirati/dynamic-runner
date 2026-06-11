@@ -681,8 +681,24 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// declaring removals off that sweep would author deaths of live peers.
     /// `observe_tick` returning `true` defers the WHOLE sweep to the NEXT
     /// (on-cadence) tick, by which time the ingest/processing clocks have
-    /// refreshed.
+    /// refreshed. Deferral is BOUNDED (the chronic escalation, armed at
+    /// construction with the hard silence window): once one starved streak
+    /// has spanned a full death verdict, sweeps resume and judge on the
+    /// primitive's starvation-honest judged clock (via
+    /// `silence_judged_marks` below) instead of wall-clock ages.
     pub(super) own_tick_health: crate::own_tick_health::OwnTickHealth,
+
+    /// Per-secondary judged-silence marks (owned by the liveness module,
+    /// `primary::heartbeat`): each member's last evidence-of-life instant
+    /// paired with the judged-clock reading when a sweep first observed
+    /// that evidence. Maintained on EVERY sweep so the chronic-starvation
+    /// escalation has per-member history the moment it engages; read by
+    /// the escalated sweep (and the dispatch-altitude silent-set read) as
+    /// `judged_now - judged_at_evidence`, which never exceeds the wall
+    /// silence. Entry removed on requeue and welcome (incarnation
+    /// boundaries), self-corrected on evidence advance.
+    pub(super) silence_judged_marks:
+        HashMap<String, super::heartbeat::SilenceJudgedMark>,
 
     /// Decider-health gate on the staleness INPUTS (the companion of
     /// the tick-lag guard above, for the OTHER starvation axis): tracks
@@ -1297,7 +1313,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         );
         // Own-tick-health authority, built off the keepalive cadence before
         // `config` moves into `this.config` (mirroring the snapshots above).
-        let own_tick_health = crate::own_tick_health::OwnTickHealth::new(config.keepalive_interval);
+        // The primary gates its WHOLE sweep on the DEFER verdict, so it
+        // opts into the chronic escalation: once a starved streak has
+        // spanned the hard silence window (deferral has then outlived a
+        // full death verdict), sweeps resume on the starvation-honest
+        // judged clock instead of deferring forever — the
+        // run_20260611_200548 fix (dead members were never removed, so
+        // the respawn pipeline never fired).
+        let own_tick_health = crate::own_tick_health::OwnTickHealth::new_with_chronic_escalation(
+            config.keepalive_interval,
+            config
+                .keepalive_interval
+                .saturating_mul(config.silence_hard_multiple),
+        );
         let mut this = Self {
             config,
             client,
@@ -1333,6 +1361,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
             own_tick_health,
+            silence_judged_marks: HashMap::new(),
             ingest_gate: super::heartbeat::IngestEdgeGate::new(),
             silence_warn_stage: HashMap::new(),
             backpressured_secondaries: HashMap::new(),
