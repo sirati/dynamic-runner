@@ -20,7 +20,7 @@ pub mod respawn;
 pub mod wrapper_script;
 
 pub use config::SlurmConfig;
-pub use job_manager::{JobStatus, JobStatusInfo, SlurmError, SlurmJobManager};
+pub use job_manager::{CancelOutcome, JobStatus, JobStatusInfo, SlurmError, SlurmJobManager};
 pub use local_forward::{
     ForwardTarget, LocalForwardError, LocalForwardTunnelReconnector, LocalForwardTunnels,
 };
