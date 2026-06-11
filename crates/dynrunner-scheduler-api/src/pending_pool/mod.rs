@@ -36,7 +36,8 @@
 //!   combinators (`filter`, `sort_by_key`).
 //! * [`pool`] — the [`PendingPool`] struct definition, constructor
 //!   `new`, and cluster-state pre-seeding (`mark_tasks_completed`,
-//!   `mark_tasks_in_flight`).
+//!   `mark_tasks_failed`, `mark_tasks_failed_pending_retry`,
+//!   `mark_tasks_dormant`, `mark_tasks_in_flight`).
 //! * [`extend`] — `extend` and its private helpers (`commit_item`,
 //!   `collect_known_task_ids`).
 //! * [`dispatch`] — `pop_for_worker`, `view_for_worker`,

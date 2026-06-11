@@ -82,6 +82,23 @@ pub struct PendingPool<I: Identifier> {
     /// lives) is unreachable and the run wedges forever (the
     /// blocked-dependent hang this field exists to break).
     pub(super) soft_failed: HashMap<String, PhaseId>,
+    /// Task ids the pool knows ONLY as terminal-DORMANT roots: tasks
+    /// whose latest attempt terminated in the operator-resolvable
+    /// class (`Unfulfillable`) — neither completed (their dependents'
+    /// deps stay UNRESOLVED, so dependents land in `blocked`), nor
+    /// failed (no extend-time cascade, no drain-gate doom: their
+    /// dependents are LIVE blocked work that legitimately holds the
+    /// run open), nor in flight. Written by
+    /// [`PendingPool::mark_tasks_dormant`] (the hydration pre-seed —
+    /// on the live path the dormant root's id was already known to
+    /// `extend` from its time in a bucket, so no marker was needed);
+    /// cleared by [`PendingPool::reinject`] (revival — the operator
+    /// reinject / fulfillability matcher gave the root another pass,
+    /// so its id is once again known through its bucket entry). Read
+    /// only by the `extend`/`partition_ingest` known-id collector so
+    /// dependents resolve their `task_depends_on` reference instead
+    /// of failing `UnknownTaskDep`.
+    pub(super) dormant_tasks: HashSet<String>,
     /// Task ids that have been dispatched (popped from a bucket) and
     /// not yet observed as terminal. Two write sites:
     ///   * `take_at` — when this pool dispatches a task with a
@@ -218,6 +235,7 @@ impl<I: Identifier> PendingPool<I> {
             completed_tasks: HashSet::new(),
             failed_tasks: HashSet::new(),
             soft_failed: HashMap::new(),
+            dormant_tasks: HashSet::new(),
             in_flight_tasks: HashSet::new(),
             blocked_per_phase: HashMap::new(),
         })
@@ -263,6 +281,69 @@ impl<I: Identifier> PendingPool<I> {
     /// the CRDT separately). Idempotent on repeated ids.
     pub fn mark_tasks_failed(&mut self, ids: impl IntoIterator<Item = String>) {
         self.failed_tasks.extend(ids);
+    }
+
+    /// Pre-seed `soft_failed` with task ids whose latest attempt
+    /// terminally FAILED with the failure's PERMANENCE still pending the
+    /// per-phase drain-edge retry decision. The hydration twin of
+    /// [`PendingPool::on_item_failed_pending_retry`] (which additionally
+    /// owns the in-flight decrement the live wire-terminal path needs;
+    /// a hydrated `Failed` entry was never counted in flight here, so
+    /// this seed touches only the marker).
+    ///
+    /// Effects on a SUBSEQUENT `extend`, completing the per-class
+    /// pre-seed contract (`mark_tasks_completed` = dep-satisfying,
+    /// `mark_tasks_failed` = extend-time cascade, this = decision
+    /// PENDING):
+    ///   * The seeded ids count as "known", so a dependent whose
+    ///     `task_depends_on` references one passes dep-existence
+    ///     validation instead of failing `UnknownTaskDep`.
+    ///   * The dep stays UNRESOLVED, so the dependent lands in
+    ///     `blocked` — neither dispatchable (the prereq never
+    ///     succeeded) nor cascade-failed (the drain edge may yet
+    ///     revive the prereq).
+    ///
+    /// From there the standard drain-edge machinery owns the outcome,
+    /// identically to a live-observed soft failure: the drain gate
+    /// discounts the doomed dependents so the edge is reachable, a
+    /// retry-bucket [`PendingPool::reinject`] revives the root
+    /// (clearing the marker), and a declined budget promotes it through
+    /// [`PendingPool::finalize_soft_failures`] (cascading the
+    /// dependents).
+    ///
+    /// An id already PERMANENTLY failed keeps its `failed_tasks`
+    /// membership and gets no marker — the same idempotence rule the
+    /// live `on_item_failed_pending_retry` applies. Must be called
+    /// BEFORE `extend()` for the seeded ids to participate in dep
+    /// validation.
+    pub fn mark_tasks_failed_pending_retry(
+        &mut self,
+        items: impl IntoIterator<Item = (String, PhaseId)>,
+    ) {
+        for (task_id, phase_id) in items {
+            if !self.failed_tasks.contains(&task_id) {
+                self.soft_failed.insert(task_id, phase_id);
+            }
+        }
+    }
+
+    /// Pre-seed the terminal-DORMANT known set with task ids whose
+    /// latest attempt terminated in the operator-resolvable class
+    /// (`Unfulfillable`): revivable via [`PendingPool::reinject`], with
+    /// dependents deliberately held BLOCKED until then. Sibling of
+    /// [`Self::mark_tasks_failed_pending_retry`] for the failure class
+    /// whose revival decision belongs to the OPERATOR (reinject command
+    /// / fulfillability matcher), not the phase's drain-edge buckets.
+    ///
+    /// Single effect: the seeded ids count as "known" to a subsequent
+    /// `extend`, so a dependent's `task_depends_on` reference resolves
+    /// (landing it in `blocked`) instead of failing `UnknownTaskDep`.
+    /// No marker enters `soft_failed` or `failed_tasks`: the blocked
+    /// dependents are LIVE work — they hold their phase open (the
+    /// dormancy contract) and are never doomed by the drain gate or
+    /// the finalize cascade. Must be called BEFORE `extend()`.
+    pub fn mark_tasks_dormant(&mut self, ids: impl IntoIterator<Item = String>) {
+        self.dormant_tasks.extend(ids);
     }
 
     /// Pre-seed `in_flight_tasks` (and bump `in_flight_per_phase`) with

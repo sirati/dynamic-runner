@@ -372,8 +372,12 @@ impl<I: Identifier> PendingPool<I> {
         // Revival: a reinjected task's pending-retry failure marker is
         // void — the retry bucket granted it another pass, so blocked
         // dependents are once again legitimately waiting on it and the
-        // drain gate must stop discounting them.
+        // drain gate must stop discounting them. The dormant
+        // registration (an operator-reinjectable Unfulfillable root
+        // seeded at hydration) is likewise void: the id is known again
+        // through its bucket entry from here on.
         self.soft_failed.remove(&item.task_id);
+        self.dormant_tasks.remove(&item.task_id);
         let key = (
             item.phase_id.clone(),
             item.type_id.clone(),

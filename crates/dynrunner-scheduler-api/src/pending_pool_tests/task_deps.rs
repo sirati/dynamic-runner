@@ -391,7 +391,9 @@ fn reinject_revives_soft_failed_root_and_dependents_resolve() {
     assert_eq!(a2.task_id, "a");
     // Retry succeeds → the dependent unblocks normally.
     p.on_item_finished(&phase("P"), Some("a"));
-    let b = p.pop_for_worker(1).expect("b unblocked after revived success");
+    let b = p
+        .pop_for_worker(1)
+        .expect("b unblocked after revived success");
     assert_eq!(b.task_id, "b");
 }
 
@@ -454,4 +456,108 @@ fn cross_phase_soft_root_does_not_doom_for_foreign_drain_gate() {
         vec![phase("P")],
         "the cascade's drain transition releases the dependent's phase"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Hydration pre-seeds for terminal-FAILURE classes (fix/hydrate-failed-deps):
+// `mark_tasks_failed_pending_retry` (Failed roots — drain-edge decision
+// pending) and `mark_tasks_dormant` (Unfulfillable roots — operator-
+// reinjectable dormancy). Both make the seeded id KNOWN to `extend` so a
+// dependent lands in `blocked` instead of failing `UnknownTaskDep`, and
+// NEITHER satisfies the dep (the `mark_tasks_completed` contract) nor
+// cascade-fails it at extend time (the `mark_tasks_failed` contract).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn seeded_soft_failed_id_resolves_dep_and_blocks_dependent() {
+    let mut p = pool_with(&["P"], &[]);
+    p.mark_tasks_failed_pending_retry([("root".to_string(), phase("P"))]);
+    p.extend([t_with_id("P", "T", "", 1, "child", &["root"])])
+        .expect("a soft-failed prereq id must be KNOWN to extend");
+    // The dependent is BLOCKED: not dispatchable, not cascade-failed.
+    assert!(p.iter().next().is_none(), "child must not be queued");
+    assert_eq!(p.blocked_len(), 1);
+    // Drain gate (#382 shape): the doomed dependent does not hold the
+    // phase open — the drain edge is reachable, where the retry-or-
+    // cascade decision lives.
+    p.drain_empty_active_phases();
+    assert_eq!(
+        p.poll_drain_transitions(),
+        vec![phase("P")],
+        "the seeded soft root's phase reaches its drain edge"
+    );
+    // Finalize promotes the seeded root and cascades the dependent —
+    // identical to the live `on_item_failed_pending_retry` flow.
+    let finalized = p.finalize_soft_failures(&phase("P"));
+    assert_eq!(finalized.len(), 1);
+    assert_eq!(finalized[0].0, "root");
+    let cascaded_ids: Vec<_> = finalized[0].1.iter().map(|t| t.task_id.clone()).collect();
+    assert_eq!(cascaded_ids, vec!["child".to_string()]);
+    assert_eq!(p.blocked_len(), 0);
+}
+
+#[test]
+fn seeded_soft_failed_root_revived_by_reinject_keeps_dependent_blocked() {
+    let mut p = pool_with(&["P"], &[]);
+    p.mark_tasks_failed_pending_retry([("root".to_string(), phase("P"))]);
+    p.extend([t_with_id("P", "T", "", 1, "child", &["root"])])
+        .expect("dependent blocks on the seeded soft root");
+    // Revival (the retry bucket's seam): reinject clears the soft marker;
+    // the dependent stays blocked until the root actually completes.
+    p.reinject(t_with_id("P", "T", "", 1, "root", &[]));
+    assert_eq!(p.blocked_len(), 1, "child still waits for the retry");
+    let root = p.pop_for_worker(1).expect("revived root dispatches");
+    assert_eq!(root.task_id, "root");
+    p.on_item_finished(&phase("P"), Some("root"));
+    let child = p.pop_for_worker(1).expect("child unblocks on completion");
+    assert_eq!(child.task_id, "child");
+    // The cleared marker means a later finalize has nothing to promote.
+    assert!(p.finalize_soft_failures(&phase("P")).is_empty());
+}
+
+#[test]
+fn seeded_dormant_id_resolves_dep_and_blocks_dependent_until_revival() {
+    let mut p = pool_with(&["P"], &[]);
+    p.mark_tasks_dormant(["root".to_string()]);
+    p.extend([t_with_id("P", "T", "", 1, "child", &["root"])])
+        .expect("a dormant prereq id must be KNOWN to extend");
+    assert!(p.iter().next().is_none(), "child must not be queued");
+    assert_eq!(p.blocked_len(), 1);
+    // A dormant root does NOT doom its dependent: the dependent counts as
+    // LIVE blocked work, so the phase holds open (Draining), never
+    // reaching the drain edge's cascade — the dormancy contract.
+    p.drain_empty_active_phases();
+    assert!(
+        p.poll_drain_transitions().is_empty(),
+        "a live-blocked dependent holds the phase open"
+    );
+    assert_eq!(
+        p.phase_state(&phase("P")),
+        Some(crate::PhaseState::Draining)
+    );
+    assert!(p.finalize_soft_failures(&phase("P")).is_empty());
+    // Revival: reinject the root; complete it; the dependent unblocks.
+    p.reinject(t_with_id("P", "T", "", 1, "root", &[]));
+    let root = p.pop_for_worker(1).expect("revived root dispatches");
+    assert_eq!(root.task_id, "root");
+    p.on_item_finished(&phase("P"), Some("root"));
+    let child = p.pop_for_worker(1).expect("child unblocks");
+    assert_eq!(child.task_id, "child");
+}
+
+#[test]
+fn seeded_failure_ids_reject_duplicate_task_id_on_extend() {
+    // Both seed classes claim the identity: a later batch reusing the
+    // task_id is a producer-side bug, same as reusing a completed id.
+    let mut p = pool_with(&["P"], &[]);
+    p.mark_tasks_failed_pending_retry([("soft".to_string(), phase("P"))]);
+    p.mark_tasks_dormant(["dormant".to_string()]);
+    assert!(matches!(
+        p.extend([t_with_id("P", "T", "", 1, "soft", &[])]),
+        Err(PendingPoolError::DuplicateTaskId(_))
+    ));
+    assert!(matches!(
+        p.extend([t_with_id("P", "T", "", 1, "dormant", &[])]),
+        Err(PendingPoolError::DuplicateTaskId(_))
+    ));
 }

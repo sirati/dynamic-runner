@@ -47,7 +47,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// (Pending / InFlight / Completed / Failed / Unfulfillable /
     /// Blocked) is iterated once; only `Pending` / `Blocked`
     /// entries enter the pool, terminal entries contribute their
-    /// `task_id` to the dep-resolution seed, and `InFlight` entries are
+    /// `task_id` to the PER-CLASS dep seed (completed-satisfying,
+    /// retry-pending, or dormant — see the seed-vec docs in the body),
+    /// and `InFlight` entries are
     /// recorded in the unified `in_flight` ledger with no holding slot
     /// (the originating dispatcher owns the work; this coordinator
     /// picks up completion only via the broadcast path).
@@ -57,13 +59,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// double-counting in-flight items this coordinator can't observe
     /// from outside.
     ///
-    /// Why we seed completed task_ids: the new pool's `completed_tasks`
-    /// set is keyed by task_id. Variants in the `Pending` set may
-    /// declare `task_depends_on` against a toolchain task_id whose
-    /// task is no longer pending (already terminal). Without seeding
-    /// the new pool's `completed_tasks` with those task_ids,
-    /// `extend()`'s validation rejects every variant whose toolchain
-    /// finished pre-composition as `UnknownTaskDep`.
+    /// Why we seed terminal task_ids: variants in the `Pending` set may
+    /// declare `task_depends_on` against a toolchain task_id whose task
+    /// is no longer pending (already terminal). Without seeding the new
+    /// pool with those task_ids, `extend()`'s validation rejects every
+    /// variant whose toolchain finished pre-composition as
+    /// `UnknownTaskDep`. WHICH seed a terminal feeds is per-class —
+    /// only a `Completed`/`SkippedAlreadyDone` prereq SATISFIES its
+    /// dependents' deps (`mark_tasks_completed`); a `Failed`/
+    /// `InvalidTask` prereq seeds the retry-pending marker
+    /// (`mark_tasks_failed_pending_retry`) and an `Unfulfillable` one
+    /// the dormant set (`mark_tasks_dormant`), both of which hold
+    /// dependents BLOCKED — see the seed-vec docs in the body.
     /// Exercised directly by the hydrate tests and by the production
     /// snapshot-seeded construction caller (`seed_from_promotion_snapshot`).
     pub(crate) fn hydrate_from_cluster_state(&mut self) {
@@ -97,6 +104,37 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // live path. The replicated `retry_passes_used` budget gates
         // re-retry, so seeding every recoverable `Failed` is safe.
         let mut failed_tasks: HashMap<String, ErrorType> = HashMap::new();
+        // Pool-side terminal-FAILURE dep seeds — the per-class dependency
+        // semantics a FAILED terminal carries (mirroring the
+        // `apply_tasks_spawned` classification a freshly-spawned dependent
+        // gets, so a pre-existing dependent converges to the same state):
+        //   * `soft_failed_seed` — every `Failed { .. }` root (any kind)
+        //     plus every `InvalidTask` root: the root's task_id becomes
+        //     KNOWN to `extend` (dependents land `blocked`, never
+        //     `UnknownTaskDep`, never DISPATCHABLE) and the phase's
+        //     drain-edge machinery owns the outcome exactly as on the live
+        //     path — the retry buckets revive a retryable root with budget
+        //     (`reinject` clears the marker, dependents stay blocked) or
+        //     decline (`finalize_soft_failures` cascade-fails the
+        //     dependents with the canonical broadcast `upstream-failed`
+        //     terminal). A root the original primary already finalized
+        //     replays to the same decision: the replicated
+        //     `retry_passes_used` budget is inherited, so the bucket
+        //     declines again and the finalize cascade re-derives the doom
+        //     (accounted; its already-terminal dependents are not in the
+        //     pool, so nothing double-fires). `InvalidTask` rides the same
+        //     seed because a structurally-dead root dooms its dependents
+        //     like a NonRecoverable one (the spawn-side cascade-fail
+        //     classification); it never enters the coordinator
+        //     `failed_tasks` kind ledger, so no bucket ever revives it.
+        //   * `dormant_seed` — every `Unfulfillable` root: KNOWN to
+        //     `extend` (dependents land `blocked`) with NO doom marker —
+        //     the operator-reinjectable dormancy contract
+        //     (`note_item_failed`'s Unfulfillable arm): dependents are
+        //     LIVE blocked work holding the run open until the reinject
+        //     command / fulfillability matcher revives the root.
+        let mut soft_failed_seed: Vec<(String, PhaseId)> = Vec::new();
+        let mut dormant_seed: Vec<String> = Vec::new();
         // V3: the set of phases that have fired `on_phase_start`, derived
         // from the CRDT on BOTH the cold and promote paths (replacing the
         // old split: `originate_cold_seed`'s `.clear()` + the promote-only
@@ -149,24 +187,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         for (hash, state) in self.cluster_state.tasks_iter() {
             all_binaries.push(state.task().clone());
             match state {
-                // Terminal-ish for hydration: contribute task_id to the
-                // dep-resolution seed and mark hash as completed in the
-                // primary-side ledger. `Unfulfillable` is included
-                // because the dep graph treats unfulfillable prereqs
-                // the same way the legacy `Failed { Unfulfillable, .. }`
-                // shape did — surviving variants' `task_depends_on`
-                // references must still resolve so `extend()` accepts
-                // them. The Unfulfillable entry itself stays in the
-                // CRDT and is reinjectable via the command channel; no
-                // pool work is needed for it. `InvalidTask` is likewise
-                // terminal: it stays in the CRDT (non-reinjectable) and
-                // its task_id seeds the dep-resolution set so dependents
-                // resolve their reference — those dependents cascade
-                // through the pool's dep machine exactly as they would
-                // against any other terminal prereq.
-                // `Failed` does the SAME dep-resolution seed as the other
-                // terminal-ish states (so dependents' `task_depends_on`
-                // resolve in `extend()`) AND additionally re-seeds the
+                // A FAILED terminal must NOT satisfy dependents' deps: it
+                // never produced its outputs. Its task_id seeds the pool's
+                // retry-pending (`soft_failed`) marker — see the
+                // `soft_failed_seed` doc above for the full per-class
+                // routing — so dependents hydrate BLOCKED (never
+                // dispatchable) and the drain-edge buckets/finalize own
+                // the revive-or-cascade decision exactly as the live
+                // primary would have. `Failed` additionally re-seeds the
                 // hash-keyed `failed_tasks` ledger from the carried `kind`,
                 // so the retry bucket has a candidate source post-promotion.
                 // The CRDT entry itself stays `Failed`; the bucket's reset
@@ -180,25 +208,56 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // `task::complete.rs`). The run-complete counter sums both
                 // (`completed_tasks.len() + failed_tasks.len()`), so seeding
                 // an inherited `Failed` into both would count it TWICE and
-                // trip a premature false-complete. The dep-resolution seed a
-                // failed prereq's dependents need is `completed_task_ids`
-                // (task_id-keyed, a DIFFERENT set), which is preserved; the
-                // late-TaskFailed dedup in `task::failed.rs` ORs
+                // trip a premature false-complete. The late-TaskFailed
+                // dedup in `task::failed.rs` ORs
                 // `failed_tasks.contains_key`, so it still dedupes without
                 // the `completed_tasks` membership.
                 TaskState::Failed { task, kind, .. } => {
                     started_phases.insert(task.phase_id.clone());
                     phases_with_terminal.insert(task.phase_id.clone());
-                    completed_task_ids.insert(task.task_id.clone());
+                    soft_failed_seed.push((task.task_id.clone(), task.phase_id.clone()));
                     failed_tasks.insert(hash.clone(), kind.clone());
                 }
-                TaskState::Completed { task, .. }
-                | TaskState::Unfulfillable { task, .. }
-                | TaskState::InvalidTask { task, .. } => {
+                // The ONLY dispatch-observed terminal that satisfies
+                // dependents' deps: a completed prereq produced its
+                // outputs, so its task_id enters the dep-resolution
+                // completed seed and dependents pre-resolve in `extend()`.
+                TaskState::Completed { task, .. } => {
                     started_phases.insert(task.phase_id.clone());
                     phases_with_terminal.insert(task.phase_id.clone());
                     primary_completed.insert(hash.clone());
                     completed_task_ids.insert(task.task_id.clone());
+                }
+                // Operator-reinjectable dormancy: the entry stays
+                // `Unfulfillable` in the CRDT (revivable via the command
+                // channel / fulfillability matcher) and its task_id seeds
+                // the pool's dormant-known set, so dependents hydrate
+                // BLOCKED — live work that holds the run open — instead of
+                // dispatching against outputs that were never produced.
+                // The hash still enters `primary_completed` purely for the
+                // run-completion counter (the historical accounting slot
+                // for the non-`Failed`-state terminals; the entry is in
+                // neither bucket-kind ledger, so no retry path touches it).
+                TaskState::Unfulfillable { task, .. } => {
+                    started_phases.insert(task.phase_id.clone());
+                    phases_with_terminal.insert(task.phase_id.clone());
+                    primary_completed.insert(hash.clone());
+                    dormant_seed.push(task.task_id.clone());
+                }
+                // Structurally-dead root (non-reinjectable): dependents can
+                // NEVER run, the same doom a `Failed { NonRecoverable }`
+                // root carries (the `apply_tasks_spawned` cascade-fail
+                // classification). Seeded soft-failed so the drain edge
+                // finalizes it — no bucket ever revives it (its hash is
+                // not in the kind ledger) — and the finalize cascade dooms
+                // the dependents with the accounted, broadcast
+                // `upstream-failed` terminal. Hash into `primary_completed`
+                // for the run-completion counter, as before.
+                TaskState::InvalidTask { task, .. } => {
+                    started_phases.insert(task.phase_id.clone());
+                    phases_with_terminal.insert(task.phase_id.clone());
+                    primary_completed.insert(hash.clone());
+                    soft_failed_seed.push((task.task_id.clone(), task.phase_id.clone()));
                 }
                 // `SkippedAlreadyDone` is a terminal that was NEVER
                 // dispatched, so it is seeded like the other terminal-ish
@@ -360,6 +419,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let pool = match PendingPool::new(phase_ids, phase_deps) {
             Ok(mut p) => {
                 p.mark_tasks_completed(completed_task_ids);
+                // Per-class terminal-FAILURE seeds (see the seed-vec docs
+                // at the top): Failed/InvalidTask roots enter the
+                // retry-pending marker, Unfulfillable roots the
+                // dormant-known set. Both make the root's task_id KNOWN to
+                // `extend` below — dependents land BLOCKED — without
+                // satisfying the dep (the `mark_tasks_completed` contract,
+                // which is reserved for terminals that produced outputs).
+                p.mark_tasks_failed_pending_retry(soft_failed_seed);
+                p.mark_tasks_dormant(dormant_seed);
                 p.mark_tasks_in_flight(in_flight_pairs);
                 if let Err(e) = p.extend(items) {
                     tracing::error!(
