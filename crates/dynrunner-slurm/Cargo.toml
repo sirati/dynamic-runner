@@ -19,6 +19,12 @@ dynrunner-slurm-wrapper-config = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+# `process` (parent-death-signal `prctl`) + `signal` (the `Signal` enum)
+# back the child-death-linkage primitive in `child_reaping` that arms
+# `PR_SET_PDEATHSIG` on long-lived `ssh -N` tunnel children; `libc` is the
+# async-signal-safe `_exit(2)` for that primitive's fork/arm race close.
+nix = { workspace = true }
+libc = { workspace = true }
 serde = { workspace = true }
 url = { workspace = true }
 async-trait = { workspace = true }
