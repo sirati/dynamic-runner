@@ -216,6 +216,25 @@ pub(in crate::secondary) enum SecondaryLifecycle<M: ManagerEndpoint, I: Identifi
         /// The fatal-exit reason the run loop propagates as its `Err`.
         reason: String,
     },
+
+    /// Terminal: the setup-instructions wait expired — a full
+    /// `unconfigured_deadline` of primary silence elapsed before the
+    /// setup trio completed (the re-armable
+    /// [`super::setup_deadline::SetupDeadline`] fired un-extended). The
+    /// orchestration records this terminal and returns `Err(reason)`;
+    /// the node-outcome mapping projects it to the STRUCTURED
+    /// [`crate::primary::RunError::BringUpFailed`] so the PyO3 boundary
+    /// raises (non-zero exit with the bring-up story + the
+    /// `--unconfigured-deadline-secs` knob hint), never a generic
+    /// policy-exit misattribution. Distinct from
+    /// [`Failed`](Self::Failed): nothing local faulted — the cluster
+    /// never delivered instructions.
+    BringUpFailed {
+        /// The deadline-expiry diagnosis (names the horizon and the
+        /// no-peers vs peers-reachable disambiguation) — the same string
+        /// the run loop propagates as its `Err`.
+        reason: String,
+    },
 }
 
 /// State data for [`SecondaryLifecycle::Configuring`].
@@ -638,6 +657,15 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
         SecondaryLifecycle::Failed { reason }
     }
 
+    /// `* → BringUpFailed` (terminal): the setup-instructions wait expired
+    /// (a full `unconfigured_deadline` of primary silence before the trio
+    /// completed). The orchestration also returns `Err(reason)`; this
+    /// terminal types the outcome so the boundary surfaces the STRUCTURED
+    /// bring-up fatal instead of a generic policy exit.
+    pub(in crate::secondary) fn enter_bring_up_failed(self, reason: String) -> Self {
+        SecondaryLifecycle::BringUpFailed { reason }
+    }
+
     /// Whether the lifecycle has reached `Operational` or a terminal
     /// variant — i.e. the old `setup_phase_completed` latch, recovered as a
     /// projection of the typed state rather than a separate bool. Used as
@@ -676,6 +704,11 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
             SecondaryLifecycle::Failed { reason } => Some(SecondaryTerminal::Failed {
                 reason: reason.clone(),
             }),
+            SecondaryLifecycle::BringUpFailed { reason } => {
+                Some(SecondaryTerminal::BringUpFailed {
+                    reason: reason.clone(),
+                })
+            }
             _ => None,
         }
     }

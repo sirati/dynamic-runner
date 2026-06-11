@@ -11,16 +11,12 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use super::SecondaryCoordinator;
 use super::wire::{distributed_to_binary, timestamp_now};
 
-/// Setup-progress heartbeat cadence for [`wait_for_setup`]'s recv:
-/// when NO setup frame arrives for this long while the trio
-/// (PeerInfo / InitialAssignment / TransferComplete) is incomplete,
-/// one WARN names which frames are still missing and how long the
-/// wait has lasted. Narration only — the wait itself is unbounded
-/// (the unconfigured-deadline owns the give-up policy). Without this
-/// heartbeat a secondary wedged in setup (e.g. the primary's directed
-/// sends never reach it) is TOTALLY silent until that deadline — the
-/// #362 production shape: "received peer list" and then nothing, ever.
-const SETUP_STALL_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// This module's tracing target (the default `module_path!` — events here
+/// don't override it), named as a const so the log-shape tests
+/// (`tests::setup_wait_observability`) capture exactly this module's
+/// emissions. Mirrors `primary::reconciliation_probe::LOG_TARGET`.
+#[cfg(test)]
+pub(crate) const LOG_TARGET: &str = module_path!();
 
 /// Cap on the welcome/cert handshake-retry backoff in [`wait_for_setup`].
 /// The backoff floor is config-derived ([`handshake_retry_initial`]) so it
@@ -401,9 +397,11 @@ where
     /// Wait for PeerInfo + InitialAssignment + TransferComplete from primary.
     /// Dispatches any initial task assignments to local workers.
     ///
-    /// Recv loop with two periodic arms: the 60s stall-warn narration and
-    /// the setup-phase anti-entropy digest broadcast (see the cadence
-    /// comment at the interval's construction below).
+    /// Recv loop with two periodic arms: the escalating wait-mark
+    /// narration (the owner's 30s/1m/5m schedule over the setup-deadline's
+    /// anchor — see [`super::wait_marks`]; the 10m point is the deadline
+    /// abort itself) and the setup-phase anti-entropy digest broadcast
+    /// (see the cadence comment at the interval's construction below).
     ///
     /// History of the select-vs-serial shape: the earlier 1cb8cb8 version
     /// raced the recv against a keepalive ticker; after c9a7808 made
@@ -414,15 +412,34 @@ where
     /// [`Self::recv_setup_frame`] — a sync backlog pop + `RoleInbox::recv`
     /// (a plain mpsc recv, documented cancel-safe; the mesh-pump only ever
     /// delivers WHOLE frames into the slot) — so racing it in a `select!`
-    /// drops no data. The stall-warn deadline is computed OUTSIDE the
-    /// select iteration so the ~20s anti-entropy tick cannot keep
-    /// resetting it (a per-iteration `timeout` would never fire — the
+    /// drops no data. The wait-mark arm sleeps to a STORED next-mark
+    /// instant so the ~20s anti-entropy tick cannot keep resetting it (a
+    /// per-iteration `timeout` would never fire — the
     /// watchdog-needs-a-fires-under-load law).
     pub(super) async fn wait_for_setup(
         &mut self,
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<Option<super::RunOutcome>, String> {
-        tracing::debug!("waiting for setup messages from primary");
+        // READY (owner-spec line 2): this is the precise point the
+        // secondary can act on instructions from setup — its mesh
+        // acceptors have been up since transport bring-up (#389 made the
+        // bootstrap dial a background concern), the inbox is registered,
+        // and THIS loop now consumes it; the welcome handshake offered
+        // just below is what solicits those instructions. Logged BEFORE
+        // the first handshake attempt so the line marks readiness, not
+        // first contact. The wait-mark schedule + the abort horizon are
+        // named here so an operator reading a wedged node's log knows
+        // what narration to expect and when the node will give up.
+        tracing::info!(
+            secondary = %self.config.secondary_id,
+            hostname = %self.config.hostname,
+            wait_mark_secs = ?super::wait_marks::WAIT_MARKS.map(|m| m.as_secs()),
+            give_up_after_secs = self.setup_deadline.horizon().as_secs(),
+            "secondary ready to receive instructions from setup; waiting \
+             for the primary (the wait is narrated at the escalating marks \
+             and the run is abandoned after the configured horizon of \
+             primary silence)"
+        );
 
         let mut got_peer_info = false;
         let mut got_assignment = false;
@@ -506,6 +523,19 @@ where
         }
         let mut handshake_at = tokio::time::Instant::now() + handshake_backoff;
 
+        // The escalating wait-mark narration (owner-spec line 3): marks at
+        // 30s/1m/5m of waiting for instructions, measured on the SAME
+        // clock the give-up policy measures — the schedule reads the
+        // shared `setup_deadline` cell's anchor, which `wait_for_setup`
+        // re-arms on every primary-originated frame (see
+        // `note_setup_primary_liveness`). The 10m point of the spec's
+        // schedule is the deadline expiry itself: the orchestration's
+        // abort line + structured `BringUpFailed` fatal IS the 10m mark.
+        // Supersedes the fixed 60s stall heartbeat (#362) — one wait, one
+        // narration schedule.
+        let mut wait_marks =
+            super::wait_marks::SetupWaitMarks::new(self.setup_deadline.clone());
+
         while !got_peer_info || !got_assignment || !got_transfer {
             // Terminal-exit backstop. A terminal CRDT flag set DURING setup
             // (RunComplete / RunAborted) means the RUN IS OVER — even though
@@ -556,106 +586,103 @@ where
             // host dials/accepts; the manager addresses peers by id and
             // never sees a transport role split.
             //
-            // Stall heartbeat (#362): a persistent 60s deadline arm logs
-            // WHICH trio frames are still missing and loops back to
-            // waiting — narration only, no behavior change (the
-            // unconfigured-deadline still owns the give-up policy).
-            let received = 'frame: loop {
-                // One stall window per warn cycle, computed OUT here so the
-                // anti-entropy arm firing cannot reset it: a per-`select!`
-                // `timeout(...)` would be re-armed by every ~20s digest tick
-                // and the 60s stall warn would NEVER fire (the
-                // watchdog-needs-a-fires-under-load law). The deadline
-                // persists across select iterations; only a delivered frame
-                // (which exits this loop entirely) or the warn itself starts
-                // a fresh window — exactly the pre-select semantics.
-                let stall_deadline =
-                    tokio::time::Instant::now() + SETUP_STALL_WARN_INTERVAL;
-                // Handshake retries persist until the primary PROVES it
-                // received the welcome — and the only proof is a DIRECTED
-                // setup frame to THIS secondary: `InitialAssignment` or
-                // `TransferComplete`, the trio members the primary sends
-                // only to secondaries in its welcomed registry. The
-                // lifecycle state is deliberately NOT the gate: the
-                // `AwaitingPrimary → Configuring` announce fires on ANY
-                // primary-originated frame, including BROADCASTS
-                // (`PeerJoined` / `PeerInfo` / cold-seed `ClusterMutation`
-                // batches), and receiving a broadcast proves nothing about
-                // the welcome having landed (the asm-dataset LMU 5-of-15
-                // welcome loss). `got_assignment` / `got_transfer` can only
-                // change between `'frame` iterations (they flip on a
-                // received frame, which exits this loop), so sampling here
-                // is exact. Re-sends stay safe past `Configuring`: the
-                // primary's welcome handling is idempotent and the
-                // immediately-following cert-exchange restores the
-                // connection record the re-welcome resets.
-                let welcome_unproven = !got_assignment && !got_transfer;
-                loop {
-                    tokio::select! {
-                        // Cancel-safe: `recv_setup_frame` is a sync backlog
-                        // pop + `RoleInbox::recv` (a plain mpsc recv), so a
-                        // tick winning the race loses no frame.
-                        frame = self.recv_setup_frame() => break 'frame frame,
-                        // Welcome/cert handshake retry (see the arming
-                        // comment above the trio loop): persistent
-                        // deadline, capped exponential backoff, disabled
-                        // once a DIRECTED setup frame proves the welcome
-                        // landed. `sleep_until` is cancel-safe (tokio docs).
-                        _ = tokio::time::sleep_until(handshake_at), if welcome_unproven => {
-                            handshake_attempts += 1;
-                            let delivered =
-                                self.try_send_handshake(handshake_attempts).await;
-                            if delivered && handshake_attempts > 1 {
-                                tracing::info!(
-                                    attempt = handshake_attempts,
-                                    "setup handshake re-sent (welcome + cert \
-                                     exchange re-offered to the primary)"
-                                );
-                            }
-                            handshake_at =
-                                tokio::time::Instant::now() + handshake_backoff;
-                            handshake_backoff =
-                                (handshake_backoff * 2).min(handshake_backoff_cap);
-                        }
-                        // Anti-entropy tick: broadcast this secondary's
-                        // digest so every peer can detect divergence and
-                        // pull — and so the submitter's accept loop has a
-                        // first frame to register a re-dialed bootstrap
-                        // wire under. Pure EMIT of the role-agnostic frame
-                        // built by `crate::anti_entropy`; the receive-side
-                        // compare+pull lives in the `StateDigest` arm below.
-                        // `interval.tick` is cancel-safe (tokio docs).
-                        _ = anti_entropy_interval.tick() => {
-                            let digest = self.cluster_state.digest();
-                            tracing::debug!(
-                                "setup-phase anti-entropy digest broadcast \
-                                 (the beacon tick)"
+            // Handshake retries persist until the primary PROVES it
+            // received the welcome — and the only proof is a DIRECTED
+            // setup frame to THIS secondary: `InitialAssignment` or
+            // `TransferComplete`, the trio members the primary sends
+            // only to secondaries in its welcomed registry. The
+            // lifecycle state is deliberately NOT the gate: the
+            // `AwaitingPrimary → Configuring` announce fires on ANY
+            // primary-originated frame, including BROADCASTS
+            // (`PeerJoined` / `PeerInfo` / cold-seed `ClusterMutation`
+            // batches), and receiving a broadcast proves nothing about
+            // the welcome having landed (the asm-dataset LMU 5-of-15
+            // welcome loss). `got_assignment` / `got_transfer` can only
+            // change between trio-loop iterations (they flip on a
+            // received frame, which exits the select loop below), so
+            // sampling here is exact. Re-sends stay safe past
+            // `Configuring`: the primary's welcome handling is idempotent
+            // and the immediately-following cert-exchange restores the
+            // connection record the re-welcome resets.
+            let welcome_unproven = !got_assignment && !got_transfer;
+            let received = loop {
+                tokio::select! {
+                    // Cancel-safe: `recv_setup_frame` is a sync backlog
+                    // pop + `RoleInbox::recv` (a plain mpsc recv), so a
+                    // tick winning the race loses no frame.
+                    frame = self.recv_setup_frame() => break frame,
+                    // Welcome/cert handshake retry (see the arming
+                    // comment above the trio loop): persistent
+                    // deadline, capped exponential backoff, disabled
+                    // once a DIRECTED setup frame proves the welcome
+                    // landed. `sleep_until` is cancel-safe (tokio docs).
+                    _ = tokio::time::sleep_until(handshake_at), if welcome_unproven => {
+                        handshake_attempts += 1;
+                        let delivered =
+                            self.try_send_handshake(handshake_attempts).await;
+                        if delivered && handshake_attempts > 1 {
+                            tracing::info!(
+                                attempt = handshake_attempts,
+                                "setup handshake re-sent (welcome + cert \
+                                 exchange re-offered to the primary)"
                             );
-                            let frame = crate::anti_entropy::digest_broadcast(
-                                &self.config.secondary_id,
-                                timestamp_now(),
-                                digest,
-                            );
-                            if let Err(e) = self.send_to(Destination::All, frame).await {
-                                tracing::warn!(
-                                    error = %e,
-                                    "setup-phase anti-entropy digest broadcast \
-                                     failed; the next tick retries"
-                                );
-                            }
                         }
-                        _ = tokio::time::sleep_until(stall_deadline) => {
+                        handshake_at =
+                            tokio::time::Instant::now() + handshake_backoff;
+                        handshake_backoff =
+                            (handshake_backoff * 2).min(handshake_backoff_cap);
+                    }
+                    // Anti-entropy tick: broadcast this secondary's
+                    // digest so every peer can detect divergence and
+                    // pull — and so the submitter's accept loop has a
+                    // first frame to register a re-dialed bootstrap
+                    // wire under. Pure EMIT of the role-agnostic frame
+                    // built by `crate::anti_entropy`; the receive-side
+                    // compare+pull lives in the `StateDigest` arm below.
+                    // `interval.tick` is cancel-safe (tokio docs).
+                    _ = anti_entropy_interval.tick() => {
+                        let digest = self.cluster_state.digest();
+                        tracing::debug!(
+                            "setup-phase anti-entropy digest broadcast \
+                             (the beacon tick)"
+                        );
+                        let frame = crate::anti_entropy::digest_broadcast(
+                            &self.config.secondary_id,
+                            timestamp_now(),
+                            digest,
+                        );
+                        if let Err(e) = self.send_to(Destination::All, frame).await {
                             tracing::warn!(
+                                error = %e,
+                                "setup-phase anti-entropy digest broadcast \
+                                 failed; the next tick retries"
+                            );
+                        }
+                    }
+                    // Wait-mark narration (the owner's 30s/1m/5m schedule;
+                    // see the arming comment above the trio loop). The
+                    // sleep targets the STORED next-mark instant — sibling
+                    // arms firing never reset it (the fires-under-load
+                    // law), and a wake at a superseded mark (the anchor
+                    // moved while sleeping) fires nothing and re-sleeps to
+                    // the fresh window's first mark. `sleep_until` is
+                    // cancel-safe (tokio docs).
+                    _ = tokio::time::sleep_until(wait_marks.next_mark_at()) => {
+                        if let Some(waited) = wait_marks.fire() {
+                            tracing::warn!(
+                                waited_secs = waited.as_secs(),
                                 got_peer_info,
                                 got_assignment,
                                 got_transfer,
-                                "still waiting for the setup trio from the primary \
-                                 (no setup frame for 60s); the missing directed \
-                                 frames may indicate the primary has no route to \
-                                 this node or proceeded without it"
+                                handshake_attempts,
+                                "still waiting for instructions from setup \
+                                 (no primary-originated frame this whole \
+                                 window); the missing frames may indicate \
+                                 the primary has no route to this node, is \
+                                 still assembling, or proceeded without it \
+                                 — the run is abandoned at the configured \
+                                 setup deadline"
                             );
-                            // Restart the stall window; keep waiting.
-                            break;
                         }
                     }
                 }
