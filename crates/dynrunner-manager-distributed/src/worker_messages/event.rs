@@ -48,3 +48,30 @@ pub struct WorkerCustomMessage {
     pub topic: String,
     pub data: Vec<u8>,
 }
+
+/// One item on the worker-message dispatcher channel: a consumer
+/// custom message to fan out, or an ordering token for the secondary's
+/// causal fence.
+///
+/// Why the channel carries more than [`WorkerCustomMessage`]: a task's
+/// terminal report must never be stamped/sent while the task's own
+/// custom messages are still crossing the dispatcher-task → listener →
+/// control-queue hop (the asm-dataset run_20260611_182745 tail race —
+/// the terminal's `msgs_posted_through` watermark missed the final
+/// batch + summary because the control-queue pre-drain cannot see sends
+/// that have not yet been relayed by the listener). The barrier makes
+/// the pipeline's drain point observable to the operational loop
+/// without the loop ever touching listener execution.
+#[derive(Debug)]
+pub enum WorkerMessageItem {
+    /// Fan out to every registered listener (the original channel
+    /// payload).
+    Custom(WorkerCustomMessage),
+    /// Causal flush barrier: the dispatcher signals the sender once
+    /// every item enqueued BEFORE this barrier has been fully
+    /// processed (all its listeners returned — and with them every
+    /// relay command they queued). The operational loop's pre-terminal
+    /// fence awaits this signal so a task terminal's
+    /// `msgs_posted_through` stamp covers the task's LAST sends.
+    FlushBarrier(tokio::sync::oneshot::Sender<()>),
+}

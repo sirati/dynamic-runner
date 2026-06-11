@@ -385,18 +385,23 @@ where
         // carries the highest IMPORTANT custom `msg_seq` stamped so far
         // (`next_custom_msg_seq` is the next-to-assign, so `- 1` is the
         // last assigned; 0 = "none sent", no gate). The operational
-        // loop's worker-event arm pre-drains the control-plane queue
-        // before any worker event, so every message the consumer's
-        // `worker_message_listener` handed to
-        // `SecondaryHandle.send_to_primary` BEFORE this terminal's
-        // triggering event is stamped-and-sent (or retained) by now —
-        // the stamp is a true causal watermark, and every seq it covers
-        // is guaranteed to resolve at the primary (at-least-once
-        // retention while this origin lives; a dead origin's gates are
-        // opened by the primary's membership check). `task_hash()` is
-        // `Some` exactly for the two terminal variants; the `is_none()`
-        // guard keeps the stamp STICKY on the retained replay copy
-        // (same contract as `delivery_seq` above).
+        // loop's pool-event seam runs the CAUSAL FENCE before any
+        // terminal-shaped worker event (`process_worker_pool_event`):
+        // first the worker-message PIPELINE FLUSH — a barrier through
+        // the dispatcher channel proving the consumer's
+        // `worker_message_listener` has run for every custom the worker
+        // sent before exiting (their relay commands are in the control
+        // queue) — then the control-queue PRE-DRAIN, which
+        // `msg_seq`-stamps and sends (or retains) them. So every
+        // message the task handed over BEFORE its terminal's triggering
+        // event is sequenced by now — the stamp is a true causal
+        // watermark, and every seq it covers is guaranteed to resolve
+        // at the primary (at-least-once retention while this origin
+        // lives; a dead origin's gates are opened by the primary's
+        // membership check). `task_hash()` is `Some` exactly for the
+        // two terminal variants; the `is_none()` guard keeps the stamp
+        // STICKY on the retained replay copy (same contract as
+        // `delivery_seq` above).
         if msg.task_hash().is_some() && msg.msgs_posted_through().is_none() {
             msg.set_msgs_posted_through(self.next_custom_msg_seq - 1);
         }

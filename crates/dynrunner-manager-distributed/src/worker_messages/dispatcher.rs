@@ -1,9 +1,11 @@
 //! Worker custom-message dispatcher task.
 //!
 //! Single concern: drain a
-//! [`tokio::sync::mpsc::UnboundedReceiver<WorkerCustomMessage>`] and
-//! fan each event out to a fixed list of [`WorkerMessageListener`]
-//! consumers. Owns no state beyond the rx + listener vector.
+//! [`tokio::sync::mpsc::UnboundedReceiver<WorkerMessageItem>`], fan
+//! each custom message out to a fixed list of
+//! [`WorkerMessageListener`] consumers, and acknowledge each flush
+//! barrier in FIFO turn. Owns no state beyond the rx + listener
+//! vector.
 //!
 //! # Why an unbounded channel
 //!
@@ -40,11 +42,15 @@ use std::panic::AssertUnwindSafe;
 
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use super::event::WorkerCustomMessage;
+use super::event::WorkerMessageItem;
 use super::listener::WorkerMessageListener;
 
-/// Drain `rx` and fan each event to every entry in `listeners`, in
-/// registration order. Exits when `rx` closes (last sender dropped).
+/// Drain `rx` and fan each custom message to every entry in
+/// `listeners`, in registration order; acknowledge each
+/// [`WorkerMessageItem::FlushBarrier`] the moment it is dequeued — by
+/// the channel's FIFO order that proves every item enqueued before it
+/// has been fully processed (the causal-fence contract). Exits when
+/// `rx` closes (last sender dropped).
 ///
 /// Spawned once per coordinator at run start (see
 /// `SecondaryCoordinator::run_until_setup_or_done`). The returned
@@ -52,10 +58,20 @@ use super::listener::WorkerMessageListener;
 /// wrap it in `tokio::spawn` or `spawn_local` per the surrounding
 /// runtime's shape.
 pub async fn run_worker_message_dispatcher(
-    mut rx: UnboundedReceiver<WorkerCustomMessage>,
+    mut rx: UnboundedReceiver<WorkerMessageItem>,
     listeners: Vec<Box<dyn WorkerMessageListener>>,
 ) {
-    while let Some(event) = rx.recv().await {
+    while let Some(item) = rx.recv().await {
+        let event = match item {
+            WorkerMessageItem::Custom(event) => event,
+            WorkerMessageItem::FlushBarrier(ack) => {
+                // A dropped receiver (the fence's await was cancelled
+                // or timed out) is fine — the barrier's only job is
+                // the ordering proof, owed to whoever still listens.
+                let _ = ack.send(());
+                continue;
+            }
+        };
         for (idx, listener) in listeners.iter().enumerate() {
             // `AssertUnwindSafe` is safe here: the listener is a
             // shared reference (`&dyn Trait`), `event` is borrowed
@@ -97,6 +113,7 @@ mod tests {
 
     use tokio::sync::mpsc::unbounded_channel;
 
+    use super::super::event::WorkerCustomMessage;
     use super::*;
 
     /// Capturing listener used by the dispatcher tests below. Records
@@ -121,13 +138,13 @@ mod tests {
         }
     }
 
-    fn msg(worker_id: u32, topic: &str, data: &[u8]) -> WorkerCustomMessage {
-        WorkerCustomMessage {
+    fn msg(worker_id: u32, topic: &str, data: &[u8]) -> WorkerMessageItem {
+        WorkerMessageItem::Custom(WorkerCustomMessage {
             worker_id,
             type_id: "build".into(),
             topic: topic.into(),
             data: data.to_vec(),
-        }
+        })
     }
 
     /// Pins the dispatcher's core fan-out contract: events appear at
@@ -186,5 +203,60 @@ mod tests {
         // earlier listener in the vector panicked on each fire.
         let observed = captured.lock().unwrap().clone();
         assert_eq!(observed.len(), 2);
+    }
+
+    /// Pins the causal-fence contract: a `FlushBarrier` resolves only
+    /// after every item enqueued BEFORE it has been fully processed
+    /// (its listeners returned) — while the channel stays open.
+    #[tokio::test]
+    async fn flush_barrier_resolves_after_all_prior_items_processed() {
+        let (tx, rx) = unbounded_channel();
+        let captured: Arc<Mutex<Vec<WorkerCustomMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let listeners: Vec<Box<dyn WorkerMessageListener>> = vec![Box::new(CapturingListener {
+            captured: Arc::clone(&captured),
+        })];
+
+        let dispatcher = tokio::spawn(run_worker_message_dispatcher(rx, listeners));
+
+        tx.send(msg(0, "spawn_batch", b"619")).unwrap();
+        tx.send(msg(0, "summary", b"66713")).unwrap();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(WorkerMessageItem::FlushBarrier(ack_tx)).unwrap();
+
+        ack_rx.await.expect("barrier acknowledged");
+        {
+            let observed = captured.lock().unwrap();
+            assert_eq!(
+                observed.len(),
+                2,
+                "barrier ack proves both prior items were processed"
+            );
+        }
+
+        // The dispatcher keeps draining after a barrier.
+        tx.send(msg(1, "late", b"after")).unwrap();
+        drop(tx);
+        dispatcher.await.unwrap();
+        assert_eq!(captured.lock().unwrap().len(), 3);
+    }
+
+    /// A barrier whose awaiter has gone away (dropped receiver — the
+    /// fence timed out) must not panic or halt the dispatcher.
+    #[tokio::test]
+    async fn flush_barrier_with_dropped_receiver_is_harmless() {
+        let (tx, rx) = unbounded_channel();
+        let captured: Arc<Mutex<Vec<WorkerCustomMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let listeners: Vec<Box<dyn WorkerMessageListener>> = vec![Box::new(CapturingListener {
+            captured: Arc::clone(&captured),
+        })];
+        let dispatcher = tokio::spawn(run_worker_message_dispatcher(rx, listeners));
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        drop(ack_rx);
+        tx.send(WorkerMessageItem::FlushBarrier(ack_tx)).unwrap();
+        tx.send(msg(0, "after", b"x")).unwrap();
+        drop(tx);
+        dispatcher.await.unwrap();
+        assert_eq!(captured.lock().unwrap().len(), 1);
     }
 }

@@ -74,6 +74,20 @@ impl<I: Identifier> WorkerEvent<I> {
         }
     }
 
+    /// Does this event end the slot's current task — i.e. can its
+    /// handling originate a task terminal report (`TaskComplete` /
+    /// `TaskFailed`)? `TaskCompleted` always does; `Disconnected` does
+    /// whenever a task was bound to the slot. Consumers that must
+    /// order causally-prior effects BEFORE a terminal (the distributed
+    /// secondary's pre-terminal causal fence) key on this predicate so
+    /// the event type owns its own shape knowledge.
+    pub fn is_task_terminal(&self) -> bool {
+        matches!(
+            self,
+            WorkerEvent::TaskCompleted { .. } | WorkerEvent::Disconnected { .. }
+        )
+    }
+
     /// The subprocess generation that produced the event. Compared
     /// against the slot's live generation to reject stale-generation
     /// events (a buffered terminal a respawn could not retract).

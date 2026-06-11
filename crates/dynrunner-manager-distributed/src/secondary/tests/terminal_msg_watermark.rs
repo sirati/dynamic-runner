@@ -85,16 +85,13 @@ async fn predrain_orders_queued_customs_before_terminal_and_stamps_watermark() {
                 })
                 .unwrap();
 
-            // The worker-event arm's sequence: CAUSAL PRE-DRAIN, then the
-            // event (whose terminal report is stamped at the
-            // send_to_primary chokepoint).
+            // The pool-event seam the loop arm routes through: causal
+            // fence (pre-drain), then the event (whose terminal report
+            // is stamped at the send_to_primary chokepoint).
             let mut control_rx = secondary.secondary_control_rx.take();
-            secondary
-                .drain_pending_control_commands(&mut control_rx)
-                .await;
             let oom = test_oom_watcher();
             secondary
-                .handle_worker_event(
+                .process_worker_pool_event(
                     WorkerEvent::TaskCompleted {
                         worker_id: 0,
                         generation: 0,
@@ -104,6 +101,7 @@ async fn predrain_orders_queued_customs_before_terminal_and_stamps_watermark() {
                         estimated_resources: ResourceMap::new(),
                     },
                     &oom,
+                    &mut control_rx,
                 )
                 .await
                 .unwrap();
@@ -215,6 +213,227 @@ async fn terminal_with_no_prior_customs_stamps_zero() {
                 vec![Some(0)],
                 "no prior importants → watermark 0 (gate trivially open)"
             );
+        })
+        .await;
+}
+
+/// #426 trace replay (asm-dataset run_20260611_182745): the tail of a
+/// streamed spawn — the worker sends its FINAL descriptor batch, then
+/// the summary, then completes immediately. The batches enter as
+/// `WorkerEvent::CustomMessage` POOL events (the production ingress —
+/// NOT pre-queued control commands), ride the real worker-message
+/// dispatcher pipeline to the consumer's relaying
+/// `worker_message_listener`, and only THEN become `SendToPrimary`
+/// control commands. The completion pool event arrives while the final
+/// sends are still in that pipeline.
+///
+/// Production failure this pins: on_phase_end fired with
+/// spawned = 66675 = 66713 − 38 — the terminal's
+/// `msgs_posted_through` stamp covered every batch EXCEPT the final one
+/// (and the summary), because #386's control-queue pre-drain cannot see
+/// sends that have not yet crossed the dispatcher-task → listener →
+/// control-queue hop. The fence must make the terminal wait for the
+/// pipeline: every important the task sent before completing leaves the
+/// wire BEFORE the terminal, and the stamp covers them ALL.
+#[tokio::test(flavor = "current_thread")]
+async fn trace_426_completion_covers_customs_still_in_dispatcher_pipeline() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log) = make_secondary_recording(election_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            // The consumer's `worker_message_listener` shape: relay
+            // every worker batch/summary to the primary as IMPORTANT,
+            // through the same control-channel ingress the PyO3
+            // `SecondaryHandle.send_to_primary` uses (a non-blocking
+            // queue — the listener never touches the loop's state).
+            struct RelayListener {
+                control: tokio::sync::mpsc::UnboundedSender<SecondaryControlCommand>,
+            }
+            impl crate::worker_messages::WorkerMessageListener for RelayListener {
+                fn on_message(&self, event: &crate::worker_messages::WorkerCustomMessage) {
+                    self.control
+                        .send(SecondaryControlCommand::SendToPrimary {
+                            topic: event.topic.clone(),
+                            data: event.data.clone(),
+                            important: true,
+                        })
+                        .expect("control channel alive");
+                }
+            }
+            let control = secondary.secondary_control_sender();
+            secondary.register_worker_message_listener(Box::new(RelayListener { control }));
+            // Stand up the REAL dispatcher pipeline (the spawn the
+            // coordinator performs at run start).
+            secondary.spawn_worker_message_dispatcher();
+
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            let binary = make_binary("dep_graph", 50);
+            let file_hash = format!("hash_{}", binary.identifier.0);
+            secondary
+                .op_mut()
+                .active_tasks
+                .insert(file_hash.clone(), 0);
+
+            // Batches 1..618 of the trace, compressed to two: already
+            // relayed AND seq-assigned (seqs 1, 2) — the part of the
+            // stream the production stamp DID cover.
+            for n in [617u64, 618] {
+                secondary
+                    .send_custom_to_primary("spawn_batch".into(), n.to_string().into_bytes(), true)
+                    .await
+                    .unwrap();
+            }
+
+            let mut control_rx = secondary.secondary_control_rx.take();
+            let oom = test_oom_watcher();
+
+            // THE TRACE TAIL, each step entering through the loop's
+            // pool-event seam exactly as the operational arm runs it:
+            // final batch → summary → immediate completion.
+            for (topic, data) in [
+                ("spawn_batch", b"619".to_vec()),
+                ("summary", b"66713".to_vec()),
+            ] {
+                secondary
+                    .process_worker_pool_event(
+                        WorkerEvent::CustomMessage {
+                            worker_id: 0,
+                            generation: 0,
+                            topic: topic.into(),
+                            data,
+                        },
+                        &oom,
+                        &mut control_rx,
+                    )
+                    .await
+                    .unwrap();
+            }
+            secondary
+                .process_worker_pool_event(
+                    WorkerEvent::TaskCompleted {
+                        worker_id: 0,
+                        generation: 0,
+                        result: TaskResult::ok(),
+                        result_data: None,
+                        binary: Some(binary),
+                        estimated_resources: ResourceMap::new(),
+                    },
+                    &oom,
+                    &mut control_rx,
+                )
+                .await
+                .unwrap();
+            secondary.drain_egress().await;
+
+            // The wire must show ALL FOUR importants (dense seqs 1..=4)
+            // before the terminal, whose stamp covers every one of them.
+            let frames = log.borrow().clone();
+            let mut custom_seqs = Vec::new();
+            let mut terminal_stamp = None;
+            for frame in &frames {
+                match frame {
+                    DistributedMessage::CustomMessage { msg_seq, .. } => {
+                        assert!(
+                            terminal_stamp.is_none(),
+                            "a custom the task sent before completing must \
+                             precede its terminal on the wire; got one after: \
+                             {frames:?}"
+                        );
+                        custom_seqs.push(*msg_seq);
+                    }
+                    DistributedMessage::TaskComplete {
+                        task_hash,
+                        msgs_posted_through,
+                        ..
+                    } if *task_hash == file_hash => {
+                        terminal_stamp = Some(*msgs_posted_through);
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                custom_seqs,
+                vec![1, 2, 3, 4],
+                "all four importants (incl. the final batch + summary that \
+                 rode the dispatcher pipeline) leave before the terminal; \
+                 frames: {frames:?}"
+            );
+            assert_eq!(
+                terminal_stamp,
+                Some(Some(4)),
+                "the terminal's causal watermark covers the task's LAST \
+                 sends, not just the ones the pre-drain caught; frames: \
+                 {frames:?}"
+            );
+        })
+        .await;
+}
+
+/// The common-path negative (#426): a completion with NO outstanding
+/// sends in the dispatcher pipeline processes promptly — the fence adds
+/// one dispatcher round-trip, never a timeout-class wait.
+#[tokio::test(flavor = "current_thread")]
+async fn trace_426_completion_with_empty_pipeline_processes_immediately() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log) = make_secondary_recording(election_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+            // Real dispatcher running, zero listeners — an idle pipeline.
+            secondary.spawn_worker_message_dispatcher();
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            let binary = make_binary("plain", 50);
+            let file_hash = format!("hash_{}", binary.identifier.0);
+            secondary
+                .op_mut()
+                .active_tasks
+                .insert(file_hash.clone(), 0);
+            let mut control_rx = secondary.secondary_control_rx.take();
+            let oom = test_oom_watcher();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                secondary.process_worker_pool_event(
+                    WorkerEvent::TaskCompleted {
+                        worker_id: 0,
+                        generation: 0,
+                        result: TaskResult::ok(),
+                        result_data: None,
+                        binary: Some(binary),
+                        estimated_resources: ResourceMap::new(),
+                    },
+                    &oom,
+                    &mut control_rx,
+                ),
+            )
+            .await
+            .expect("an empty pipeline must never make the terminal wait")
+            .unwrap();
+            secondary.drain_egress().await;
+
+            let stamps: Vec<Option<u64>> = log
+                .borrow()
+                .iter()
+                .filter_map(|m| match m {
+                    DistributedMessage::TaskComplete {
+                        msgs_posted_through,
+                        ..
+                    } => Some(*msgs_posted_through),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(stamps, vec![Some(0)], "no prior importants → watermark 0");
         })
         .await;
 }
