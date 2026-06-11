@@ -418,6 +418,213 @@ async fn degraded_failover_fails_loud_instead_of_self_promoting() {
     );
 }
 
+/// The run_20260611_200548 replay (#432, REPRO-FIRST): under severe
+/// startup load EVERY initial mesh dial fails, the formation watchdog
+/// elapses (`MeshReady` peer_count=0, trigger=watchdog-elapsed,
+/// degraded latched), and the transport's reconnect ticker keeps
+/// re-dialing in the background. The peers then BECOME reachable — a
+/// peer's `Secondary` keepalive lands (the same `peer_keepalives`
+/// write the message_handler recognition arm performs once the
+/// re-dialed leg carries frames). Formation must be a CONTINUOUS
+/// concern: the next supervision tick revises the degraded verdict,
+/// and when real primary silence trips afterwards the secondary has
+/// its election path back (Suspecting + TimeoutQuery), instead of the
+/// production fatal "peer mesh required for failover but not
+/// available" that killed 6 of 11 secondaries.
+///
+/// Pre-fix this is RED at step 3: `mesh.degraded` was a PERMANENT
+/// latch — set once at watchdog-elapse, re-read forever by
+/// `run_election_tick`'s degraded-bail — so a mesh that healed at the
+/// transport level (legs established, keepalives flowing) still
+/// fatal-exited at the first primary silence. No membership event, no
+/// promotion, no re-`PeerInfo` is involved in the recovery.
+#[tokio::test(flavor = "current_thread")]
+async fn mesh_formed_after_watchdog_elapse_restores_failover_path() {
+    use super::super::election::ElectionState;
+    use dynrunner_protocol_primary_secondary::{ClusterMutation, PrimaryChangeReason};
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let (mut secondary, mut sec_to_pri_rx) = arm_watchdog_no_peers("sec-late", 10);
+    // Election-grade timing: the patient leg-(B) backstop trips
+    // sub-second so the post-recovery silence step stays in test
+    // budget. Read live by `run_election_tick` on every tick.
+    secondary.config.primary_silence_backstop = Duration::from_millis(100);
+    secondary.enter_operational_for_test();
+    // A real primary identity (the production run had one): the
+    // Suspecting entry's `TimeoutQuery` names the silent primary, so
+    // `current_primary()` must resolve. "setup" is the id the harness
+    // folds the primary channel under, so `Destination::Primary`
+    // egress (the MeshReady report) keeps landing on `sec_to_pri_rx`.
+    secondary.cluster_state.apply(ClusterMutation::PrimaryChanged {
+        new: "setup".into(),
+        epoch: 1,
+        reason: PrimaryChangeReason::Election,
+    });
+
+    // 1. The verdict: deadline elapsed with zero alive secondaries →
+    //    degraded latched + MeshReady(peer_count=0) (the
+    //    watchdog-elapsed report the production log shows).
+    secondary.check_peer_mesh_watchdog().await;
+    secondary.drain_egress().await;
+    assert!(
+        secondary.is_mesh_degraded(),
+        "pre-condition: watchdog-elapse with zero alive secondaries latches degraded"
+    );
+    let mut saw_mesh_ready_zero = false;
+    while let Ok(msg) = sec_to_pri_rx.try_recv() {
+        if let DistributedMessage::MeshReady { peer_count, .. } = msg {
+            assert_eq!(peer_count, 0, "watchdog-elapsed report carries zero peers");
+            saw_mesh_ready_zero = true;
+        }
+    }
+    assert!(
+        saw_mesh_ready_zero,
+        "pre-condition: MeshReady(0) is sent so the run proceeds degraded"
+    );
+
+    // 2. Peers BECOME reachable: the transport's reconnect ticker
+    //    (formation_retry.rs pins that it never stops re-dialing
+    //    never-formed legs) establishes a leg and the peer's Secondary
+    //    keepalive lands.
+    secondary
+        .op_mut()
+        .peer_keepalives
+        .insert("peer-1".into(), std::time::Instant::now());
+
+    // 3. The next keepalive tick re-runs the formation supervision:
+    //    the degraded verdict must be revised — formation is a
+    //    continuous concern, not a one-shot give-up.
+    secondary.check_peer_mesh_watchdog().await;
+    assert!(
+        !secondary.is_mesh_degraded(),
+        "a mesh that formed AFTER the watchdog elapsed must clear the \
+         degraded latch (formation supervision is continuous, not \
+         abandoned at the verdict — the #432 shape)"
+    );
+
+    // The settled-report latch is untouched by the recovery: MeshReady
+    // was already sent for this primary identity, no duplicate.
+    secondary.drain_egress().await;
+    assert!(
+        sec_to_pri_rx.try_recv().is_err(),
+        "recovery must not re-send MeshReady (one settled report per \
+         primary identity)"
+    );
+
+    // 4. REAL primary silence now trips (the 18:21:16 moment): with a
+    //    live peer the election must PROCEED — Suspecting entered,
+    //    TimeoutQuery broadcast — not fatal-exit.
+    secondary.record_primary_message();
+    tokio::time::sleep(Duration::from_millis(110)).await;
+    let actions = secondary.run_election_tick();
+    assert!(
+        secondary.fatal_exit.is_none(),
+        "primary silence with a since-formed mesh must NOT fatal-exit \
+         (the fatal is only correct while the mesh has never formed); \
+         got: {:?}",
+        secondary.fatal_exit
+    );
+    assert!(
+        matches!(
+            secondary.op_mut().election,
+            ElectionState::Suspecting { .. }
+        ),
+        "the election path must be available again (Suspecting)"
+    );
+    assert!(
+        !actions.broadcast.is_empty(),
+        "Suspecting entry broadcasts the TimeoutQuery over the healed mesh"
+    );
+}
+
+/// Degraded-supervision observability: while the mesh stays empty
+/// after the watchdog verdict, the supervision tick emits a
+/// rate-limited WARN (once per throttle interval, never per keepalive
+/// tick), and the late-formation recovery is narrated at INFO once the
+/// first alive secondary appears — after which the supervision goes
+/// silent. Also pins that supervision never re-sends MeshReady.
+#[tokio::test(start_paused = true)]
+async fn degraded_supervision_warns_throttled_while_mesh_stays_empty() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let capture = crate::test_capture::TargetCapture::for_target(
+        "dynrunner_manager_distributed::secondary::peer::mesh_watchdog",
+    );
+    let subscriber = tracing_subscriber::Registry::default().with(capture.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (mut secondary, mut sec_to_pri_rx) = arm_watchdog_no_peers("sec-degsup", 10);
+    secondary.enter_operational_for_test();
+
+    // The verdict: degraded latched, MeshReady(0) sent.
+    secondary.check_peer_mesh_watchdog().await;
+    secondary.drain_egress().await;
+    assert!(secondary.is_mesh_degraded());
+    while sec_to_pri_rx.try_recv().is_ok() {}
+
+    let degraded_warns = |capture: &crate::test_capture::TargetCapture| {
+        capture
+            .events()
+            .iter()
+            .filter(|e| {
+                e.level == tracing::Level::WARN && e.event.message.contains("peer mesh still empty")
+            })
+            .count()
+    };
+
+    // Supervision ticks inside the throttle window: exactly ONE WARN
+    // (the first occurrence emits; the rest are suppressed) — loud but
+    // never per-tick.
+    for _ in 0..5 {
+        secondary.check_peer_mesh_watchdog().await;
+    }
+    assert_eq!(
+        degraded_warns(&capture),
+        1,
+        "degraded supervision must warn exactly once inside the throttle window"
+    );
+
+    // Past the throttle interval the WARN recurs.
+    tokio::time::advance(Duration::from_secs(61)).await;
+    secondary.check_peer_mesh_watchdog().await;
+    assert_eq!(
+        degraded_warns(&capture),
+        2,
+        "degraded supervision must keep warning once per throttle interval"
+    );
+
+    // Supervision never re-sends MeshReady while degraded.
+    secondary.drain_egress().await;
+    assert!(
+        sec_to_pri_rx.try_recv().is_err(),
+        "degraded supervision must not emit MeshReady"
+    );
+
+    // Recovery: the first alive secondary clears the latch with an
+    // INFO naming the transition...
+    secondary
+        .op_mut()
+        .peer_keepalives
+        .insert("peer-1".into(), std::time::Instant::now());
+    secondary.check_peer_mesh_watchdog().await;
+    assert!(!secondary.is_mesh_degraded());
+    assert!(
+        capture.events().iter().any(|e| {
+            e.level == tracing::Level::INFO && e.event.message.contains("degraded latch cleared")
+        }),
+        "late formation must be narrated at INFO; captured: {:#?}",
+        capture.events()
+    );
+
+    // ...and the supervision goes silent afterwards.
+    tokio::time::advance(Duration::from_secs(61)).await;
+    secondary.check_peer_mesh_watchdog().await;
+    assert_eq!(
+        degraded_warns(&capture),
+        2,
+        "a recovered mesh must not keep warning"
+    );
+}
+
 /// T-B1-quorum-survives: sanity check that the watchdog's
 /// healthy-mesh path is unaffected by the degrade refactor. With
 /// three alive peer-secondaries in GLOBAL STATE (their `Secondary`

@@ -24,6 +24,11 @@
 //!   (#362) — spawned / already-connected / awaiting-inbound (lower-id
 //!   rule) / dropped-from-list — plus the higher-id side's truthful
 //!   "peer leg missing, this node never dials it" summary WARN.
+//! - [`formation_retry`]: mesh-formation retry — a leg whose INITIAL
+//!   dial never landed (peer unreachable during a startup-load window)
+//!   stays tracked by the reconnect reconciliation and establishes the
+//!   moment the peer becomes reachable, with no further membership
+//!   event (run_20260611_200548 replay, transport half).
 //! - [`ingest_edges`]: ingest-edge clock recording over a real wire —
 //!   the read loop stamps ARRIVAL without anyone driving `recv_peer`
 //!   (the starved-pump honesty), DRAINED only on the actual pull.
@@ -67,6 +72,24 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct TestId(pub(crate) String);
 
+/// Allocate a port that is currently free on BOTH protocols (TCP and
+/// UDP) — the same shape the SLURM wrapper's host-side pre-allocation
+/// produces. Retries a handful of OS-picked candidates so a UDP
+/// squatter on a TCP-free port can't flake the test. Shared by
+/// [`bind_port`] (the explicit-port contract) and [`formation_retry`]
+/// (the peer-becomes-reachable replay).
+pub(crate) fn alloc_dual_free_port() -> u16 {
+    for _ in 0..16 {
+        let tcp = std::net::TcpListener::bind("0.0.0.0:0").expect("probe tcp bind");
+        let port = tcp.local_addr().expect("probe tcp addr").port();
+        if std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok() {
+            // Both binds succeeded; release them for the network to claim.
+            return port;
+        }
+    }
+    panic!("could not find a port free on both TCP and UDP in 16 attempts");
+}
+
 mod accept_replace_rejoin;
 mod bind_port;
 mod bootstrap_redial;
@@ -74,6 +97,7 @@ mod broadcast_miss;
 mod cert_parsing;
 mod dial_failure_summary;
 mod dial_sweep;
+mod formation_retry;
 mod ingest_edges;
 mod late_joiner_forward;
 mod log_capture;
