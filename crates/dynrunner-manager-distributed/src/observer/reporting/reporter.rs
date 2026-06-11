@@ -26,6 +26,7 @@ use dynrunner_core::IMPORTANT_TARGET;
 use super::format::render_report;
 use super::idle::IdleDetector;
 use super::stats::StatsSnapshot;
+use crate::observer::lost_visibility::{EndedOutage, WakeNoteSlot};
 
 /// The 10-minute periodic-stats cadence.
 pub const STATS_INTERVAL: Duration = Duration::from_secs(600);
@@ -34,6 +35,13 @@ pub const STATS_INTERVAL: Duration = Duration::from_secs(600);
 /// work) has been idle for ≥ the threshold.
 pub const IDLE_INTERVAL: Duration = Duration::from_secs(60);
 pub const IDLE_THRESHOLD: Duration = Duration::from_secs(60);
+/// Minimum spacing between a LATE stats log (run immediately on
+/// reconnection after a logged outage that swallowed ≥1 grid occurrence)
+/// and the next ON-GRID occurrence: if the next scheduled occurrence
+/// would land less than this after the late one, that single occurrence
+/// is skipped (the one after it fires on the original grid — the grid
+/// itself NEVER shifts). The owner's spec sets this to 5 minutes.
+pub const LATE_STATS_MIN_SPACING: Duration = Duration::from_secs(300);
 
 /// Source of CRDT-derived snapshots. The driver calls `snapshot()` once
 /// per tick. Production projects the live replicated `ClusterState`;
@@ -136,53 +144,155 @@ impl Reporter {
     /// baseline; on a non-empty report, emit it and advance the
     /// baseline. An all-omitted tick emits nothing and leaves the
     /// baseline untouched (so the next real change still diffs against
-    /// the last ANNOUNCEMENT, not the last tick).
-    pub fn on_stats_tick(&mut self, snapshot: &StatsSnapshot) {
+    /// the last ANNOUNCEMENT, not the last tick). Returns whether a
+    /// report was emitted (the caller flushes the wake-note slot after a
+    /// genuine emission — the emitted report is a wake-stream host).
+    pub fn on_stats_tick(&mut self, snapshot: &StatsSnapshot) -> bool {
         if let Some(report) = render_report(snapshot, &self.last_announced) {
             // The whole report is one importance-channel event so the
             // dual-sink routes it to stdio atomically under
             // `--important-stdio-only` (C1's filter keys on the target).
             tracing::info!(target: IMPORTANT_TARGET, "periodic cluster stats (10m):\n{report}");
             self.last_announced = snapshot.clone();
+            true
+        } else {
+            false
         }
     }
 
     /// Process one IDLE tick: fold the snapshot into the gates and emit
-    /// one alert per newly-stalled secondary.
-    pub fn on_idle_tick(&mut self, snapshot: &StatsSnapshot, now: Instant) {
+    /// one alert per newly-stalled secondary. Returns whether ≥1 alert
+    /// was emitted (a wake-stream host for the note flush).
+    pub fn on_idle_tick(&mut self, snapshot: &StatsSnapshot, now: Instant) -> bool {
+        let mut emitted = false;
         for secondary in self.idle.tick(snapshot, now) {
             tracing::info!(
                 target: IMPORTANT_TARGET,
                 secondary = %secondary,
                 "secondary has been idle (0 in-flight tasks) for ≥1 minute while ready work is queued"
             );
+            emitted = true;
         }
+        emitted
     }
 
     /// Flush a final stats line before observer exit; delegates to
     /// [`on_stats_tick`](Self::on_stats_tick) (a short run renders every
     /// nonzero metric; a steady run with no change stays silent).
-    pub fn flush_final(&mut self, snapshot: &StatsSnapshot) {
-        self.on_stats_tick(snapshot);
+    /// Returns whether a report was emitted, like the tick it delegates
+    /// to.
+    pub fn flush_final(&mut self, snapshot: &StatsSnapshot) -> bool {
+        self.on_stats_tick(snapshot)
+    }
+}
+
+/// Grid bookkeeping for the periodic stats log across a connection
+/// outage. Owned HERE because the GRID is this module's concern: the
+/// loss policy ([`crate::observer::lost_visibility`]) only says "a logged
+/// outage just ended, it began at T"; whether a grid occurrence elapsed
+/// inside the down window, whether a late run is due, and whether the
+/// following on-grid occurrence must be skipped are decisions of the
+/// grid's owner.
+///
+/// # The grid never shifts
+///
+/// The `tokio::time::interval` driving the stats cadence is NEVER
+/// touched: a late run is an EXTRA `on_stats_tick` invocation, and a
+/// skip is a consumed-but-not-run tick. Both leave the original schedule
+/// intact (the occurrence after a skipped one fires on the original
+/// grid).
+///
+/// # While the connection is down (current behaviour, preserved)
+///
+/// The periodic reporter has NO connectivity input: grid ticks keep
+/// firing during an outage and apply the normal `>0`-and-changed delta
+/// rule. With the CRDT mirror frozen (no inbound frames) those ticks are
+/// typically silent, but a tick that still sees un-announced
+/// pre-outage changes emits exactly as it always did. This struct adds
+/// no down-gating — it only RECORDS each tick so the late-run decision
+/// ("did an occurrence elapse while down?") can be answered at regain.
+#[derive(Debug, Default)]
+pub(crate) struct StatsGridGate {
+    /// The instant of the most recent grid occurrence (skipped or run).
+    last_grid_tick: Option<Instant>,
+    /// `Some(t)` after a late stats log EMITTED at `t`: the IMMEDIATELY
+    /// next grid occurrence is skipped iff it lands within
+    /// [`LATE_STATS_MIN_SPACING`] of `t`. Cleared by that next occurrence
+    /// either way — only ever one skip candidate per late run.
+    late_emit: Option<Instant>,
+}
+
+impl StatsGridGate {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a grid occurrence at `now` and decide whether to RUN it.
+    /// Returns `false` exactly when this is the single occurrence
+    /// following a late emit AND it lands less than
+    /// [`LATE_STATS_MIN_SPACING`] after that late emit (the spec's
+    /// skip-one exception); `true` otherwise.
+    pub(crate) fn grid_tick(&mut self, now: Instant) -> bool {
+        self.last_grid_tick = Some(now);
+        match self.late_emit.take() {
+            Some(late) => now.duration_since(late) >= LATE_STATS_MIN_SPACING,
+            None => true,
+        }
+    }
+
+    /// Whether a late stats run is due for an outage that began at
+    /// `down_since`: true iff ≥1 grid occurrence elapsed while the
+    /// connection was down (the most recent occurrence landed at or after
+    /// the loss instant). `false` when no occurrence has ever fired.
+    pub(crate) fn late_run_due(&self, down_since: Instant) -> bool {
+        self.last_grid_tick.is_some_and(|t| t >= down_since)
+    }
+
+    /// Record that a late stats log actually EMITTED at `now`, arming the
+    /// skip-one check for the next grid occurrence. A late run whose
+    /// delta rendered nothing does NOT arm the skip (no spam to avoid —
+    /// the next on-grid occurrence is then the first emission).
+    pub(crate) fn record_late_emit(&mut self, now: Instant) {
+        self.late_emit = Some(now);
     }
 }
 
 /// Drive both cadences until `cancel` resolves. Pulls a fresh snapshot
 /// from `source` on every tick. Cancel-safe: each arm awaits a tokio
-/// interval tick or the cancel future, all cancel-safe; dropping the
-/// driver abandons the in-flight tick cleanly.
+/// interval tick, an `UnboundedReceiver::recv` (cancel-safe per tokio's
+/// docs — a sibling win cannot lose a queued signal), or the cancel
+/// future; dropping the driver abandons the in-flight tick cleanly.
 ///
 /// Production spawns this concurrently with the observer run loop and
 /// cancels it when the run loop returns. The 10-minute and 1-minute
 /// intervals are separate `tokio::time::interval`s so a paused-clock
 /// test advances each independently.
-pub async fn run_reporter<S, C, F>(source: S, clock: C, cancel: F)
-where
+///
+/// # The wake-stream outage seam
+///
+/// `outage_rx` carries the loss policy's [`EndedOutage`] signal (a
+/// LOGGED outage just regained visibility). If ≥1 grid occurrence
+/// elapsed inside the down window ([`StatsGridGate::late_run_due`]), ONE
+/// stats log runs immediately — naturally carrying the parked
+/// reconnection note, since every emission here flushes the shared
+/// [`WakeNoteSlot`] right after it emits. The grid never shifts; the
+/// single next occurrence is skipped iff it would land within
+/// [`LATE_STATS_MIN_SPACING`] of the late emission. Grid ticks while the
+/// connection is down keep their pre-existing behaviour (they run the
+/// normal delta rule — see [`StatsGridGate`]).
+pub async fn run_reporter<S, C, F>(
+    source: S,
+    clock: C,
+    outage_rx: tokio::sync::mpsc::UnboundedReceiver<EndedOutage>,
+    note: WakeNoteSlot,
+    cancel: F,
+) where
     S: CrdtSnapshotSource,
     C: Clock,
     F: std::future::Future<Output = ()>,
 {
     let mut reporter = Reporter::new();
+    let mut grid_gate = StatsGridGate::new();
     let mut stats_interval = tokio::time::interval(STATS_INTERVAL);
     let mut idle_interval = tokio::time::interval(IDLE_INTERVAL);
     // Both intervals fire immediately on first poll by default; skip
@@ -194,18 +304,65 @@ where
     let _ = stats_interval.tick().await; // consume the immediate tick
     let _ = idle_interval.tick().await; // consume the immediate tick
 
+    // Once the sender side drops (the run loop is tearing down; cancel is
+    // imminent) the arm parks instead of hot-looping on `None`.
+    let mut outage_rx = Some(outage_rx);
+
     tokio::pin!(cancel);
     loop {
         tokio::select! {
             _ = stats_interval.tick() => {
-                let snapshot = source.snapshot();
-                reporter.on_stats_tick(&snapshot);
+                if grid_gate.grid_tick(clock.now()) {
+                    let snapshot = source.snapshot();
+                    if reporter.on_stats_tick(&snapshot) {
+                        note.flush_after_host();
+                    }
+                }
             }
             _ = idle_interval.tick() => {
                 let snapshot = source.snapshot();
-                reporter.on_idle_tick(&snapshot, clock.now());
+                if reporter.on_idle_tick(&snapshot, clock.now()) {
+                    note.flush_after_host();
+                }
             }
-            _ = &mut cancel => { reporter.flush_final(&source.snapshot()); break; }
+            ended = recv_outage(&mut outage_rx) => {
+                if grid_gate.late_run_due(ended.down_since) {
+                    // Rule 3: ≥1 grid occurrence elapsed while down — run
+                    // ONE stats log immediately. It follows the normal
+                    // delta rule; on a genuine emission it hosts the
+                    // reconnection note and arms the skip-one check.
+                    let snapshot = source.snapshot();
+                    if reporter.on_stats_tick(&snapshot) {
+                        note.flush_after_host();
+                        grid_gate.record_late_emit(clock.now());
+                    }
+                }
+            }
+            _ = &mut cancel => {
+                if reporter.flush_final(&source.snapshot()) {
+                    note.flush_after_host();
+                }
+                break;
+            }
         }
+    }
+}
+
+/// Await the next [`EndedOutage`] from an optional receiver; a closed
+/// channel parks the arm (take the receiver, pend forever) instead of
+/// resolving `None` in a hot loop — mirroring the coordinator's
+/// `recv_panik` idiom. Cancel-safe (`UnboundedReceiver::recv` is).
+async fn recv_outage(
+    rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<EndedOutage>>,
+) -> EndedOutage {
+    match rx {
+        Some(r) => match r.recv().await {
+            Some(ended) => ended,
+            None => {
+                rx.take();
+                std::future::pending().await
+            }
+        },
+        None => std::future::pending().await,
     }
 }

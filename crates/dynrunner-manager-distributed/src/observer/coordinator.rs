@@ -45,8 +45,10 @@
 //!   3. `run_complete()` ⇒ exit 0 — the PRIMARY's verdict,
 //!   4. otherwise compute the observer's own VISIBILITY (any peer
 //!      reachable + the named primary not silent) and feed the
-//!      [`LostVisibilityReporter`] — which REPORTS lost / retrying and
-//!      NEVER exits.
+//!      [`LostVisibilityReporter`] — which REPORTS lost / retrying (full
+//!      log immediately; the operator wake stream only after the 5-minute
+//!      threshold, with the reconnection note riding the next wake log —
+//!      see the module's wake-stream policy) and NEVER exits.
 //!
 //! The observer terminates ONLY on an OBSERVED run-terminal: `run_complete`
 //! (Done), `run_aborted` (Aborted — the primary's broadcast verdict), or
@@ -82,7 +84,7 @@ use crate::observer::announcer::{AnnouncerOutboxItem, PeerMeshAnnouncerSender};
 use crate::observer::failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 use crate::observer::lifecycle::{AnnouncerHandle, attach_observer_announcer};
 use crate::observer::lost_visibility::{
-    LostVisibilityReporter, MeshLiveness, RetryDirective, Visibility,
+    EndedOutage, LostVisibilityReporter, MeshLiveness, RetryDirective, Visibility, WakeNoteSlot,
 };
 use crate::observer::reconnect::ReconnectorHandle;
 use crate::observer::reporting::{SharedSnapshotSource, StatsSnapshot, TokioClock, run_reporter};
@@ -274,6 +276,13 @@ where
     ae_digest_warn: WarnThrottle,
     /// Same gate for the AE-3 recovery tick's fault WARNs.
     ae_recovery_warn: WarnThrottle,
+    /// The shared reconnection-note slot (the wake-stream piggyback seam,
+    /// see [`WakeNoteSlot`]). ONE slot per observer: the
+    /// [`LostVisibilityReporter`] writes into it on a logged-loss regain;
+    /// every wake-stream emitter in this process (the narrator's caller,
+    /// the periodic reporter, the failure policies, the coordinator's own
+    /// important emits) flushes it right after emitting.
+    wake_note: WakeNoteSlot,
     /// The transport-recovery port (BUG-B reconnect). `Some` on the
     /// relocated submitter→observer path, whose
     /// [`dynrunner_transport_tunnel::TunneledPeerTransport`] reaches the
@@ -402,6 +411,7 @@ where
             recovery_cursor: 0,
             ae_digest_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
+            wake_note: WakeNoteSlot::default(),
             reconnector,
         }
     }
@@ -458,6 +468,7 @@ where
             recovery_cursor: 0,
             ae_digest_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
+            wake_note: WakeNoteSlot::default(),
             reconnector,
         }
     }
@@ -510,6 +521,8 @@ where
             target: IMPORTANT_TARGET,
             "run terminated — {reason}",
         );
+        // A wake-stream host: a parked reconnection note rides it.
+        self.wake_note.flush_after_host();
     }
 
     /// The observer's OWN egress edge: resolve `Destination::Primary`
@@ -597,6 +610,8 @@ where
             "graceful abort triggered on the observer; sending \
              GracefulAbortRequest to the primary"
         );
+        // A wake-stream host: a parked reconnection note rides it.
+        self.wake_note.flush_after_host();
         let msg = DistributedMessage::GracefulAbortRequest {
             target: None,
             sender_id: self.config.node_id.clone(),
@@ -652,12 +667,14 @@ where
         // dedicated unbounded mpsc consumed by the run loop's fatal-exit
         // arm; the policy never calls `std::process::exit`.
         let (fatal_exit_tx, mut fatal_exit_rx) = mpsc::unbounded_channel::<String>();
-        let (invalid_task_listener, invalid_task_driver) =
-            windowed_failure_collector(InvalidTaskMonitorPolicy::new(fatal_exit_tx));
+        let (invalid_task_listener, invalid_task_driver) = windowed_failure_collector(
+            InvalidTaskMonitorPolicy::new(fatal_exit_tx).with_wake_note(self.wake_note.clone()),
+        );
         // Policy D: rolling error aggregation (importance-channel emit,
         // never exits).
-        let (aggregation_listener, aggregation_driver) =
-            windowed_failure_collector(ErrorAggregationPolicy::new());
+        let (aggregation_listener, aggregation_driver) = windowed_failure_collector(
+            ErrorAggregationPolicy::new().with_wake_note(self.wake_note.clone()),
+        );
 
         // Spawn the task-completed dispatcher with the Policy B/D listeners
         // AFTER building them — the load-bearing ordering (install sender →
@@ -719,10 +736,21 @@ where
             SharedSnapshotSource::new(StatsSnapshot::from_cluster_state(&self.cluster_state));
         let snapshot_publisher = snapshot_source.clone();
         let (reporter_cancel_tx, reporter_cancel_rx) = oneshot::channel::<()>();
-        let reporter_task =
-            tokio::task::spawn_local(run_reporter(snapshot_source, TokioClock, async move {
+        // The wake-stream outage seam: the run loop forwards the loss
+        // policy's EndedOutage signal (a LOGGED outage regained
+        // visibility) to the reporter task, which owns the late-run /
+        // skip-one grid bookkeeping; the shared note slot lets the
+        // reporter's emissions host the parked reconnection note.
+        let (outage_tx, outage_rx) = mpsc::unbounded_channel::<EndedOutage>();
+        let reporter_task = tokio::task::spawn_local(run_reporter(
+            snapshot_source,
+            TokioClock,
+            outage_rx,
+            self.wake_note.clone(),
+            async move {
                 let _ = reporter_cancel_rx.await;
-            }));
+            },
+        ));
 
         // Bootstrap recovery REQUEST half (§6): fire one snapshot request
         // to `Destination::Primary` at entry, gated on a known primary,
@@ -755,7 +783,9 @@ where
             // The report-lost-and-keep-observing state machine (BUG-B): the
             // observer's loss of its OWN transport view is reported + retried,
             // NEVER a run verdict — see [`crate::observer::lost_visibility`].
-            let mut visibility_reporter = LostVisibilityReporter::new();
+            // It shares the wake-note slot so a logged-loss regain parks the
+            // reconnection note every wake emitter can host.
+            let mut visibility_reporter = LostVisibilityReporter::new(self.wake_note.clone());
             let mut primary_last_seen = Instant::now();
             let mut transport_closed = false;
 
@@ -822,8 +852,12 @@ where
             loop {
                 // 1. Narrate (item 9/14): emit pending phase / summary
                 //    BEFORE the terminal early-returns so the completing
-                //    iteration emits the summary first.
-                narrator.observe(&self.cluster_state);
+                //    iteration emits the summary first. A narrated
+                //    iteration is a wake-stream HOST: the pending
+                //    reconnection note (if any) rides it.
+                if narrator.observe(&self.cluster_state) {
+                    self.wake_note.flush_after_host();
+                }
                 // Keep the reporter's cell fresh with the live projection.
                 snapshot_publisher.publish(StatsSnapshot::from_cluster_state(&self.cluster_state));
 
@@ -845,10 +879,20 @@ where
                 // SECONDARY's bootstrap-redial supervisor re-dials through
                 // the rebuilt tunnel and re-folds the wire (an owned
                 // mechanism in transport-quic, not an assumed side effect).
-                let directive =
-                    visibility_reporter.observe(&self.current_visibility(primary_last_seen));
-                if directive == RetryDirective::ReconnectDue {
+                let outcome = visibility_reporter.observe(
+                    &self.current_visibility(primary_last_seen),
+                    tokio::time::Instant::now(),
+                );
+                if outcome.directive == RetryDirective::ReconnectDue {
                     self.trigger_reconnect();
+                }
+                // A LOGGED outage just regained visibility: forward the
+                // ended-outage signal to the periodic reporter, which owns
+                // the late-run decision (did a grid occurrence elapse while
+                // down?) + the skip-one bookkeeping. Best-effort: a closed
+                // channel means the reporter task is already torn down.
+                if let Some(ended) = outcome.ended_logged_outage {
+                    let _ = outage_tx.send(ended);
                 }
 
                 // 3. Await events.
@@ -876,6 +920,36 @@ where
                     // re-evaluates + the lost-visibility recurrence report
                     // fires even with zero inbound traffic.
                     _ = visibility_recheck_tick.tick() => {}
+                    // Wake-stream loss threshold (the 5-minute mark). A
+                    // PERSISTENT deadline: `wake_deadline()` derives from the
+                    // STORED loss instant, so this `sleep_until` — though
+                    // rebuilt every iteration — always targets the same
+                    // absolute instant and fires under constant sibling
+                    // activity (the watchdog law; a relative `sleep` here
+                    // would be reset by every other arm and never fire).
+                    // `None` (visible, or already logged) parks the arm.
+                    // Cancel-safe: `sleep_until` holds no state beyond its
+                    // target instant.
+                    _ = async {
+                        match visibility_reporter.wake_deadline() {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        // Re-check the LIVE visibility before logging: the
+                        // transport may have healed between the last observe
+                        // and this deadline — then the episode was a blip
+                        // SHORTER than the threshold and must produce
+                        // nothing (the next top-of-loop observe clears the
+                        // loss state). Only a STILL-down connection at the
+                        // mark is "continuously down for 5 minutes".
+                        if matches!(
+                            self.current_visibility(primary_last_seen),
+                            Visibility::Lost { .. }
+                        ) {
+                            visibility_reporter.on_wake_deadline(tokio::time::Instant::now());
+                        }
+                    }
                     // Anti-entropy tick (item 3): broadcast our digest.
                     _ = ae_tick.tick() => {
                         self.on_anti_entropy_tick().await;

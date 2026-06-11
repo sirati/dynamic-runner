@@ -39,6 +39,22 @@
 //! numerator is `> 0` and either component changed since the last
 //! announcement.
 
+//! # Connection outages (the wake-stream loss policy seam)
+//!
+//! The reporter has NO connectivity input of its own: grid ticks keep
+//! firing while the observer's connection is down, applying the normal
+//! delta rule (typically silent against a frozen CRDT — this
+//! pre-existing behaviour is deliberately preserved). The loss policy
+//! ([`crate::observer::lost_visibility`]) feeds the driver exactly two
+//! things: the shared [`crate::observer::lost_visibility::WakeNoteSlot`]
+//! (every emission here flushes it, so a pending reconnection note rides
+//! the next stats/idle log) and the
+//! [`crate::observer::lost_visibility::EndedOutage`] regain signal, on
+//! which the driver runs ONE late stats log iff a grid occurrence
+//! elapsed inside the down window — late-run + skip-one bookkeeping
+//! live in [`reporter::StatsGridGate`], because the grid is THIS
+//! module's concern.
+
 pub mod format;
 pub mod idle;
 pub mod reporter;

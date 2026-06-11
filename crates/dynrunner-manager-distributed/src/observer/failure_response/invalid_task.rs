@@ -31,6 +31,7 @@ use tokio::time::Instant;
 
 use dynrunner_core::IMPORTANT_TARGET;
 
+use crate::observer::lost_visibility::WakeNoteSlot;
 use crate::task_completed::{CollectedFailure, CollectorPolicy, TaskCompletedEvent};
 
 /// The invalid_task collection window: a batch of invalid tasks that
@@ -59,11 +60,25 @@ pub type ObserverFatalExit = UnboundedSender<String>;
 /// invalid task observed.
 pub struct InvalidTaskMonitorPolicy {
     fatal_exit: ObserverFatalExit,
+    /// The shared reconnection-note slot (wake-stream piggyback seam) —
+    /// the exit announcement is a wake-stream host and flushes it.
+    /// Defaults to an unwired (empty) slot.
+    note: WakeNoteSlot,
 }
 
 impl InvalidTaskMonitorPolicy {
     pub fn new(fatal_exit: ObserverFatalExit) -> Self {
-        Self { fatal_exit }
+        Self {
+            fatal_exit,
+            note: WakeNoteSlot::default(),
+        }
+    }
+
+    /// Wire the shared reconnection-note slot (see
+    /// [`WakeNoteSlot::flush_after_host`]).
+    pub fn with_wake_note(mut self, note: WakeNoteSlot) -> Self {
+        self.note = note;
+        self
     }
 }
 
@@ -91,6 +106,9 @@ impl CollectorPolicy for InvalidTaskMonitorPolicy {
              and the cluster will not complete them:\n{detail}",
             distinct_count(&collected),
         );
+        // This emit is a wake-stream host: a parked reconnection note
+        // rides it (no-op when none is pending).
+        self.note.flush_after_host();
         // Fire the fatal-exit signal. Best-effort: a dropped receiver
         // (the run loop already exiting for another reason) makes this a
         // no-op, which is correct — we only ever wanted to ensure the
