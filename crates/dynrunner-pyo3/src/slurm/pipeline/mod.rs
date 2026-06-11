@@ -98,27 +98,33 @@ pub(super) fn should_upload_source_binaries(
 ///
 /// ## Setup-abort job rollback (arm/disarm)
 ///
-/// Between sbatch-submit and the coordinator genuinely owning the run
-/// there is a window of setup work — `upload_source_binaries`,
+/// Between the first sbatch submission and the coordinator genuinely
+/// owning the run there is a window of setup work — the rest of the
+/// submit-loop, reverse-tunnel establishment, `upload_source_binaries`,
 /// coordinator construction, the consumer's `on_run_start` hook — any
 /// step of which can fail. A failure there used to leave the
 /// already-submitted SLURM jobs orphaned: the secondaries dialed their
 /// now-torn-down reverse tunnels forever ("Connection refused") and
 /// stranded the fleet, forcing the operator to `scancel` manually.
 ///
-/// The guard closes that window. [`Self::arm_job_cancel`] is called the
-/// instant `run_preparation` returns (jobs submitted, `job_ids`
-/// populated); [`Self::disarm_job_cancel`] is called the instant the
-/// run is handed to `coord.run()` (the coordinator now owns the
-/// lifecycle — its teardown, not this setup guard, governs the jobs
+/// The guard closes that window. [`Self::arm_job_cancel`] is called
+/// BEFORE `run_preparation` begins (the sbatch submit-loop and the
+/// reverse-tunnel setup both run inside it — arming only on its return
+/// left a tunnel-establishment failure orphaning the whole
+/// just-submitted cohort); [`Self::disarm_job_cancel`] is called the
+/// instant the run is handed to `coord.run()` (the coordinator now owns
+/// the lifecycle — its teardown, not this setup guard, governs the jobs
 /// from here, and that runtime path is a separate, owner-gated
 /// concern). While armed, the `Drop` scancels via the job manager's
-/// `cancel_all_jobs`, which targets ONLY this run's own tracked
-/// `job_ids` — never a broad `scancel` pattern that could reach a
-/// co-tenant's jobs on a shared host. A healthy fleet is therefore
-/// NEVER scancelled: by the time `coord.run()` runs (success path), the
-/// guard is disarmed, and a normal return drops a disarmed guard. Only
-/// an abort *before* the hand-off finds the guard still armed.
+/// `cancel_all_jobs`, which drains ONLY this run's own tracked
+/// `job_ids` AT DROP TIME — never a broad `scancel` pattern that could
+/// reach a co-tenant's jobs on a shared host. Pre-submission arming is
+/// therefore safe by construction (no ids tracked → the drop is a
+/// no-op) and a mid-submit-loop abort cancels exactly the
+/// already-submitted subset. A healthy fleet is NEVER scancelled: by
+/// the time `coord.run()` runs (success path), the guard is disarmed,
+/// and a normal return drops a disarmed guard. Only an abort *before*
+/// the hand-off finds the guard still armed.
 ///
 /// The scancel runs FIRST in `Drop` — before tunnel cleanup and the
 /// gateway disconnect — because `cancel_all_jobs` issues `scancel` over
@@ -151,10 +157,12 @@ impl CleanupGuard {
         self.tunnel_manager = Some(tunnel_manager);
     }
 
-    /// Arm setup-abort job rollback. Called right after sbatch
-    /// submission (`run_preparation` returns): from here until
+    /// Arm setup-abort job rollback. Called BEFORE `run_preparation`
+    /// (which owns the sbatch submit-loop): from here until
     /// [`Self::disarm_job_cancel`], any abort drops an armed guard that
-    /// scancels `job_manager`'s tracked job ids. Holds the
+    /// scancels `job_manager`'s tracked job ids — the ids tracked AT
+    /// DROP time, so pre-submission arming is a no-op and a mid-setup
+    /// abort cancels exactly the already-submitted subset. Holds the
     /// `job_manager` so `Drop` can call `cancel_all_jobs` on it.
     pub(super) fn arm_job_cancel(&mut self, job_manager: Py<PyAny>) {
         self.job_manager = Some(job_manager);
@@ -476,6 +484,60 @@ mod cleanup_guard_tests {
             assert!(
                 cancelled_ids(py, &globals).is_empty(),
                 "a disarmed guard must NEVER scancel a healthy fleet",
+            );
+        });
+    }
+
+    /// EARLY ARM (pre-submission): the guard is armed BEFORE
+    /// `run_preparation` runs the sbatch submit-loop, so at arm time
+    /// the job manager tracks ZERO ids. `cancel_all_jobs` drains the
+    /// ids tracked AT DROP time — an abort after some submissions
+    /// must scancel exactly the already-submitted subset, not the
+    /// (empty) arm-time snapshot. This pins the contract that makes
+    /// the pre-preparation arm point correct: a tunnel-establishment
+    /// failure inside `run_preparation` (the asm-dataset
+    /// run_20260611 orphaned-cohort shape) now rolls the cohort back.
+    #[test]
+    fn early_armed_abort_scancels_jobs_submitted_after_arming() {
+        let (gateway, job_manager, globals) = make_doubles(&[]);
+        Python::attach(|py| {
+            let mut guard = CleanupGuard::new(gateway.clone_ref(py));
+            // Arm BEFORE any submission — zero tracked ids.
+            guard.arm_job_cancel(job_manager.clone_ref(py));
+            // Simulate the submit-loop populating tracked ids after
+            // the arm (the real job manager appends on each sbatch).
+            let jm = job_manager.bind(py);
+            for id in ["401", "402", "403"] {
+                jm.getattr("job_ids")
+                    .unwrap()
+                    .call_method1("append", (id,))
+                    .unwrap();
+            }
+            // Abort mid-setup (e.g. ssh tunnel establishment failed).
+            drop(guard);
+
+            assert_eq!(
+                cancelled_ids(py, &globals),
+                vec!["401", "402", "403"],
+                "an early-armed guard must scancel the ids tracked at DROP time",
+            );
+        });
+    }
+
+    /// EARLY ARM, abort before any submission: an armed guard whose
+    /// job manager tracks no ids drops as a harmless no-op — arming
+    /// before `run_preparation` can never invent cancellations.
+    #[test]
+    fn early_armed_abort_before_submission_is_noop() {
+        let (gateway, job_manager, globals) = make_doubles(&[]);
+        Python::attach(|py| {
+            let mut guard = CleanupGuard::new(gateway.clone_ref(py));
+            guard.arm_job_cancel(job_manager.clone_ref(py));
+            drop(guard);
+
+            assert!(
+                cancelled_ids(py, &globals).is_empty(),
+                "no submissions → nothing to scancel",
             );
         });
     }

@@ -19,7 +19,9 @@ use crate::peer_info::parse as parse_peer_info;
 
 use super::options::{InfoFileReader, PrepError, PreparationOptions};
 use super::policy::EstablishmentPolicy;
-use super::ssh::{BindProbe, terminate_child, verify_tunnel_alive};
+use super::ssh::{
+    BindProbe, TunnelFailureClass, classify_tunnel_failure, terminate_child, verify_tunnel_alive,
+};
 use super::store::TunnelStore;
 
 /// Per-tunnel work shared by `setup_ssh_tunnels` (run in parallel
@@ -166,8 +168,9 @@ where
 /// Establish a single SSH reverse tunnel: acquire a semaphore permit,
 /// spawn (via the caller-supplied spawner), verify the resulting
 /// child survives the 3s alive-gate, then verify the WORKER-side
-/// listener actually exists (via the caller-supplied verifier). On
-/// `PrepError::TunnelFailed` (rc=255-class handshake failure) or a
+/// listener actually exists (via the caller-supplied verifier). On a
+/// TRANSIENT-classified `PrepError::TunnelFailed` (pre-banner rc=255
+/// drop — see [`classify_tunnel_failure`]) or a
 /// definite bind-verification miss, retry
 /// up to [`EstablishmentPolicy::attempts`] total times with
 /// [`EstablishmentPolicy::backoff`] sleeps in between. The overall
@@ -319,7 +322,28 @@ where
                     }
                 },
                 Err(e @ PrepError::TunnelFailed { .. }) => {
-                    // Retryable: log + record, fall through to next
+                    // Failure classification: only the TRANSIENT class
+                    // (pre-banner drop — the probabilistic `MaxStartups`
+                    // anatomy) consumes retry budget. A DETERMINISTIC
+                    // auth-class refusal (bad/missing key, unknown user
+                    // — the provisioning-gap shape) would refuse
+                    // identically on every retry, so it surfaces on the
+                    // FIRST attempt with the verbatim ssh stderr as the
+                    // operator's diagnosis. See `classify_tunnel_failure`.
+                    if let PrepError::TunnelFailed { stderr, .. } = &e
+                        && classify_tunnel_failure(stderr) == TunnelFailureClass::Deterministic
+                    {
+                        tracing::error!(
+                            secondary_id,
+                            error = %e,
+                            "SSH tunnel attempt failed with a DETERMINISTIC auth-class error \
+                             (credentials / user provisioning / host key) — failing fast \
+                             without burning the retry budget; every retry would refuse \
+                             identically"
+                        );
+                        return Err(e);
+                    }
+                    // Transient: log + record, fall through to next
                     // iteration's pre-sleep (if any).
                     tracing::warn!(
                         secondary_id,

@@ -8,10 +8,10 @@ use tokio::task::JoinSet;
 
 use crate::preparation::options::{PrepError, PreparationOptions};
 use crate::preparation::ssh::{
-    BindProbe, LingerLedger, LingerVerb, ReleaseBeforeSpawn, build_bind_probe_argv,
-    build_linger_argv, build_release_argv, build_ssh_argv, linger_fail_reason, linger_succeeded,
-    parse_bind_probe, parse_was_linger, release_before_attempt, verify_tunnel_alive,
-    was_linger_from_probe,
+    BindProbe, LingerLedger, LingerVerb, ReleaseBeforeSpawn, TunnelFailureClass,
+    build_bind_probe_argv, build_linger_argv, build_release_argv, build_ssh_argv,
+    classify_tunnel_failure, linger_fail_reason, linger_succeeded, parse_bind_probe,
+    parse_was_linger, release_before_attempt, verify_tunnel_alive, was_linger_from_probe,
 };
 
 /// Ssh spawn argv shape (no auth-options): -J jump_target form,
@@ -754,4 +754,112 @@ fn release_before_attempt_modes() {
     assert!(release_before_attempt(ReleaseBeforeSpawn::OnRetry, 2));
     assert!(release_before_attempt(ReleaseBeforeSpawn::Always, 0));
     assert!(release_before_attempt(ReleaseBeforeSpawn::Always, 1));
+}
+
+/// THE failure classifier (one function, both classes, real stderr
+/// shapes): pre-banner connection loss — the probabilistic sshd
+/// `MaxStartups` random-drop anatomy — is TRANSIENT (worth the retry
+/// budget).
+#[test]
+fn classifier_pre_banner_drop_is_transient() {
+    // The canonical MaxStartups random-drop capture: identification
+    // exchange died, peer never learned.
+    assert_eq!(
+        classify_tunnel_failure(
+            "kex_exchange_identification: Connection closed by remote host\r\n\
+             Connection closed by UNKNOWN port 65535"
+        ),
+        TunnelFailureClass::Transient
+    );
+    // Same drop where the resolved peer address IS known: the kex
+    // marker must keep it transient even though a bare
+    // "Connection closed by <addr> port 22" line is present.
+    assert_eq!(
+        classify_tunnel_failure(
+            "kex_exchange_identification: Connection closed by remote host\r\n\
+             Connection closed by 10.153.52.8 port 22"
+        ),
+        TunnelFailureClass::Transient
+    );
+    // TCP-level reset before the banner.
+    assert_eq!(
+        classify_tunnel_failure(
+            "kex_exchange_identification: read: Connection reset by peer"
+        ),
+        TunnelFailureClass::Transient
+    );
+    assert_eq!(
+        classify_tunnel_failure("Connection closed by UNKNOWN port 65535"),
+        TunnelFailureClass::Transient
+    );
+}
+
+/// Auth-class refusals — wrong/missing key, unknown user (the
+/// asm-dataset provisioning gap), host-key rejection, post-banner
+/// close — are DETERMINISTIC: every retry refuses identically, so
+/// the classifier must steer the policy to fail fast.
+#[test]
+fn classifier_auth_class_is_deterministic() {
+    assert_eq!(
+        classify_tunnel_failure(
+            "runuser@gateway.example: Permission denied (publickey,password)."
+        ),
+        TunnelFailureClass::Deterministic
+    );
+    assert_eq!(
+        classify_tunnel_failure("Host key verification failed."),
+        TunnelFailureClass::Deterministic
+    );
+    assert_eq!(
+        classify_tunnel_failure(
+            "Received disconnect from 10.153.52.8 port 22:2: Too many authentication failures\r\n\
+             Disconnected from 10.153.52.8 port 22"
+        ),
+        TunnelFailureClass::Deterministic
+    );
+    // Bare post-banner close (sshd disconnected after rejected auth
+    // attempts) — no pre-banner marker present.
+    assert_eq!(
+        classify_tunnel_failure("Connection closed by 10.153.52.8 port 22"),
+        TunnelFailureClass::Deterministic
+    );
+}
+
+/// Under the ProxyCommand jump the proxy ssh's stderr lands on the
+/// outer ssh's stderr: a gateway-auth refusal shows BOTH the proxy's
+/// "Permission denied" AND the outer ssh's pre-banner
+/// "Connection closed by UNKNOWN port 65535". The auth evidence must
+/// win — this mixed capture is deterministic.
+#[test]
+fn classifier_proxyjump_mixed_capture_auth_wins() {
+    assert_eq!(
+        classify_tunnel_failure(
+            "runuser@gateway.example: Permission denied (publickey).\r\n\
+             kex_exchange_identification: Connection closed by remote host\r\n\
+             Connection closed by UNKNOWN port 65535"
+        ),
+        TunnelFailureClass::Deterministic
+    );
+}
+
+/// Unrecognised stderr defaults to TRANSIENT — retrying an unknown
+/// failure is the pre-classification behaviour and the safe default
+/// (a fail-fast on an unknown shape would turn recoverable blips
+/// into dispatch aborts).
+#[test]
+fn classifier_unknown_defaults_to_transient() {
+    assert_eq!(
+        classify_tunnel_failure("ssh: connect to host gw port 22: Connection timed out"),
+        TunnelFailureClass::Transient
+    );
+    assert_eq!(classify_tunnel_failure(""), TunnelFailureClass::Transient);
+    // Mid-protocol fatal with a "Connection closed by" SUFFIX on the
+    // dispatch line (not a bare post-banner close line) stays
+    // transient: it is not the auth-rejection shape.
+    assert_eq!(
+        classify_tunnel_failure(
+            "ssh_dispatch_run_fatal: Connection closed by 10.153.52.8 port 22"
+        ),
+        TunnelFailureClass::Transient
+    );
 }

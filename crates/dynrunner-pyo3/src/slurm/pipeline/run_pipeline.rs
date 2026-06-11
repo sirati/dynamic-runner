@@ -323,6 +323,20 @@ pub(crate) fn run_slurm_pipeline<'py>(
     // ---- try/finally guard. Owns gateway + (post-prep) tunnel_manager. ----
     let mut guard = CleanupGuard::new(gateway.clone().unbind());
 
+    // Arm setup-abort job rollback BEFORE preparation begins. The
+    // sbatch submit-loop runs INSIDE `run_preparation`, and the steps
+    // after it in there (reverse-tunnel setup, connection-info dir
+    // prep) can fail — arming only after `run_preparation` returned
+    // left that window uncovered, orphaning the whole just-submitted
+    // cohort in the queue (asm-dataset run_20260611: a tunnel
+    // establishment failure aborted dispatch with 15 jobs stranded,
+    // twice). Pre-submission arming is safe by the guard's own
+    // contract: `cancel_all_jobs` drains ONLY the job manager's
+    // tracked `job_ids` — empty before the first sbatch, exactly the
+    // already-submitted subset at any abort point after. See
+    // `CleanupGuard`'s arm/disarm doc.
+    guard.arm_job_cancel(job_manager.clone().unbind());
+
     // Inner block whose error short-circuits to the guard's Drop.
     let pipeline_result: PyResult<()> = (|| {
         // ---- Preparation phase (ported from
@@ -374,14 +388,13 @@ pub(crate) fn run_slurm_pipeline<'py>(
             guard.set_tunnel_manager(mgr);
         }
 
-        // Arm setup-abort job rollback. sbatch has submitted the cohort
-        // and `job_manager`'s tracked `job_ids` are now populated, so any
-        // failure in the remaining setup steps below (source-binary
-        // upload, coordinator construction, the consumer's on_run_start
-        // hook) must scancel those just-submitted jobs rather than orphan
-        // them. `drive_rust_primary` disarms the instant it hands the run
-        // to `coord.run()`. See `CleanupGuard`'s arm/disarm doc.
-        guard.arm_job_cancel(job_manager.clone().unbind());
+        // Setup-abort job rollback is already armed (before
+        // `run_preparation` above), so a failure in any remaining setup
+        // step below (source-binary upload, coordinator construction,
+        // the consumer's on_run_start hook) scancels the just-submitted
+        // jobs rather than orphaning them. `drive_rust_primary` disarms
+        // the instant it hands the run to `coord.run()`. See
+        // `CleanupGuard`'s arm/disarm doc.
 
         log.call_method1(
             "info",
