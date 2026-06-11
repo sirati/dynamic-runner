@@ -901,6 +901,28 @@ def run(
         if args is None:
             parser = argparser or _build_default_argparser()
             args = parser.parse_args()
+        # Per-worker crash/frame-dump diagnostics (#365): register
+        # `faulthandler` (fatal signals + on-demand SIGUSR1 all-thread
+        # dump, no exit) in the WORKER subprocess. FIRST framework
+        # action after argv parsing — BEFORE the consumer's `on_args`
+        # hook, mirroring the secondary bootstrap's ordering rationale:
+        # the dump must work even when consumer setup code wedges. An
+        # operator `kill -USR1 <worker pid>` (or the runtime watchdog,
+        # were it ever pointed at a worker) names a wedged handler's
+        # Python stack with no ptrace; without the registration USR1's
+        # default disposition TERMINATES the worker. Dump target: the
+        # per-worker `worker_<id>-faulthandler.log` sibling of the
+        # `--log-file` when one was passed; otherwise `sys.stderr`
+        # (`dump_path=None` → `_fault_dumps` argv resolution → stderr
+        # fallback), which the spawner's stdio-capture appends into the
+        # per-worker log file, so the dump is durable either way.
+        # Best-effort by `enable_fault_dumps` contract.
+        from .._fault_dumps import enable_fault_dumps
+
+        log_file = getattr(args, "log_file", None)
+        enable_fault_dumps(
+            dump_path=_derive_fault_dump_path(log_file) if log_file else None
+        )
         if on_args is not None:
             on_args(args)
         # Framework default: route this worker's logs to the per-worker
@@ -911,22 +933,7 @@ def run(
         # logging concern out of the runtime module's import surface.
         from .logging_setup import setup_worker_logging
 
-        setup_worker_logging(getattr(args, "log_file", None))
-        # Per-worker crash/frame-dump diagnostics (#365): register
-        # `faulthandler` (fatal signals + on-demand SIGUSR1 all-thread
-        # dump, no exit) in the WORKER subprocess, writing to a
-        # per-worker sibling of the `--log-file`
-        # (`worker_<id>-faulthandler.log`). An operator
-        # `kill -USR1 <worker pid>` (or the runtime watchdog, were it
-        # ever pointed at a worker) names a wedged handler's Python
-        # stack with no ptrace. Best-effort by `enable_fault_dumps`
-        # contract; skipped when no `--log-file` was passed (no
-        # durable per-worker target to write to).
-        log_file = getattr(args, "log_file", None)
-        if log_file:
-            from .._fault_dumps import enable_fault_dumps
-
-            enable_fault_dumps(dump_path=_derive_fault_dump_path(log_file))
+        setup_worker_logging(log_file)
         comm = _open_comm(args)
 
     prev_handlers = _install_exit_signal_handlers()
