@@ -140,12 +140,20 @@ pub enum RunError {
         /// message; the count is the authoritative signal).
         rejected_task_ids: Vec<String>,
     },
-    /// The fleet bring-up FAILED: the primary's quorum-proceed window
-    /// (`connect_timeout`, derived in `primary::config`) expired with ZERO
-    /// secondaries having completed the `SecondaryWelcome` handshake, so
-    /// the run never assembled a fleet and dispatched NOTHING. (One or
-    /// more welcomes proceeds on quorum instead — see
-    /// `wait_for_connections`; only the 0/N shape is fatal.)
+    /// The node's bring-up wait FAILED — the run never delivered this
+    /// node its setup counterpart inside the bring-up window, so it
+    /// dispatched NOTHING. Both sides of the welcome exchange raise it:
+    ///
+    /// * PRIMARY: the quorum-proceed window (`connect_timeout`, derived
+    ///   in `primary::config` at 80% of the one knob) expired with ZERO
+    ///   secondaries having completed the `SecondaryWelcome` handshake —
+    ///   no fleet was assembled. (One or more welcomes proceeds on quorum
+    ///   instead — see `wait_for_connections`; only the 0/N shape is
+    ///   fatal.)
+    /// * SECONDARY: the setup-instructions wait expired — a full
+    ///   `unconfigured_deadline` of primary silence before the setup trio
+    ///   completed (the `SecondaryTerminal::BringUpFailed` lifecycle
+    ///   terminal, mapped here by `process::run::outcome`).
     ///
     /// Distinct from `Other(String)` so the PyO3 boundary RAISES on it:
     /// the `Other` path is log-and-swallowed → exit 0, which is exactly
@@ -156,9 +164,10 @@ pub enum RunError {
     /// stream end. Distinct from `ClusterCollapsed` because nothing was
     /// stranded by a routing collapse — no task ever entered dispatch.
     BringUpFailed {
-        /// Human-readable diagnosis from the welcome-wait timeout site
-        /// (names the 0/N count and the transport-level disambiguation
-        /// hints).
+        /// Human-readable diagnosis from the expiry site (the primary's
+        /// welcome-wait timeout names the 0/N count + transport
+        /// disambiguation hints; the secondary's deadline expiry names
+        /// the horizon + the no-peers vs peers-reachable split).
         reason: String,
     },
     /// The replicated ledger carries the cluster's `RunAborted` verdict
@@ -309,13 +318,14 @@ impl fmt::Display for RunError {
             }
             Self::BringUpFailed { reason } => write!(
                 f,
-                "run FAILED at bring-up: {reason}. Zero secondaries completed \
-                 the welcome handshake within the primary's quorum-proceed \
-                 window, so no fleet was assembled and no task was dispatched. \
-                 If the secondaries' container/image bring-up is legitimately \
-                 slow, raise --unconfigured-deadline-secs (the one knob that \
-                 drives both the secondaries' setup deadline and, at 80%, the \
-                 primary's bring-up wait)."
+                "run FAILED at bring-up: {reason}. This node never completed \
+                 its side of the setup exchange within the bring-up window \
+                 (the primary's quorum-proceed wait for welcomes, or the \
+                 secondary's wait for setup instructions), so it dispatched \
+                 no task. If the fleet's container/image bring-up is \
+                 legitimately slow, raise --unconfigured-deadline-secs (the \
+                 one knob that drives both the secondaries' setup deadline \
+                 and, at 80%, the primary's bring-up wait)."
             ),
             Self::AbortedByClusterVerdict { reason } => write!(
                 f,

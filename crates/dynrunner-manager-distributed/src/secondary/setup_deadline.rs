@@ -105,6 +105,24 @@ impl SetupDeadline {
     pub(in crate::secondary) fn expired(&self) -> bool {
         Instant::now() >= self.deadline()
     }
+
+    /// The instant the CURRENT wait window began — the last `arm()` /
+    /// `extend()` (i.e. setup entry, or the most recent primary-liveness
+    /// evidence). Derived from the stored deadline (`deadline − horizon`)
+    /// so the one cell stays the single source of truth for "how long has
+    /// this secondary been waiting for instructions": the escalating
+    /// wait-mark narration ([`super::wait_marks`]) and the give-up policy
+    /// (the deadline itself) share the same clock by construction. Same
+    /// armed-before-read contract as [`Self::deadline`].
+    pub(in crate::secondary) fn anchor(&self) -> Instant {
+        self.deadline() - self.horizon
+    }
+
+    /// The configured primary-silence horizon (the `unconfigured_deadline`
+    /// config value this cell was built with).
+    pub(in crate::secondary) fn horizon(&self) -> Duration {
+        self.horizon
+    }
 }
 
 #[cfg(test)]

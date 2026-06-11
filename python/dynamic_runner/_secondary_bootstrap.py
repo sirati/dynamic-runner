@@ -57,6 +57,7 @@ import runpy
 import sys
 import traceback
 
+from ._boot_banner import announce_secondary_start
 from ._fault_dumps import enable_fault_dumps, write_crash_traceback
 
 
@@ -124,6 +125,14 @@ def main(bootstrap_argv: list[str] | None = None) -> None:
     A test passes an explicit slice.
     """
     raw = list(sys.argv[1:] if bootstrap_argv is None else bootstrap_argv)
+
+    # IMMEDIATE start banner (owner-spec line 1): the FIRST observable
+    # output of the secondary process, on stderr (conmon captures it),
+    # emitted before ANY work that could hang — so a node that dies
+    # between launch and its first framework log line is never mute. The
+    # banner concern lives in `_boot_banner`; this shim only sequences it
+    # first. Best-effort by contract — it can never raise.
+    announce_secondary_start(raw)
 
     # Install per-process Python frame dumps (fatal-signal + on-demand
     # SIGUSR1) BEFORE the consumer module runs, so the runtime-starvation
