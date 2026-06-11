@@ -136,6 +136,13 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
             inbound_tx,
             ingest_liveness.clone(),
         ));
+        // The transport's ingest-edge clocks (arrival at the connection
+        // read loops / drained at the pump's `recv_peer` pull) ride the
+        // SAME inbox handle as the slot-ingest cell, so a coordinator's
+        // liveness reads reach the earliest attributable measuring point
+        // on this node without ever touching the transport. `None` for
+        // transports that cannot observe arrival pre-`recv_peer`.
+        let transport_edges = self.transport.ingest_edges();
         let weak = Arc::downgrade(&slot);
         match role {
             LocalRole::Primary => self.primary = Some(weak),
@@ -147,7 +154,7 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
             self.local_dispatch_tx.clone(),
             self.membership.clone(),
         );
-        let inbox = RoleInbox::new(inbound_rx, ingest_liveness);
+        let inbox = RoleInbox::new(inbound_rx, ingest_liveness, transport_edges);
         (slot, client, inbox)
     }
 

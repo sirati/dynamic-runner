@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo, PeerId, PeerTransport, Router,
-    SendOutcome,
+    Clocks, DistributedMessage, InboundOutcome, IngestEdges, PeerConnectionInfo, PeerId,
+    PeerTransport, Router, SendOutcome,
 };
 use tokio::sync::mpsc;
 
@@ -58,7 +58,13 @@ pub type SharedOutgoing<I> =
 /// the inbound half of the `NetworkServer` ownership move: the real
 /// inbound channel is owned here, not in a separate legacy transport
 /// behind a fan-out tap.
-pub type InboundTap<I> = mpsc::UnboundedSender<DistributedMessage<I>>;
+///
+/// The protocol crate's recording sender: every push stamps the
+/// frame's sender on the transport's [`IngestEdges::arrival`] clock —
+/// the earliest point a peer's frame is attributable on this node — so
+/// the producer side of the inbound queue is measured by construction,
+/// at every producer.
+pub use dynrunner_protocol_primary_secondary::InboundTap;
 
 /// A newly-accepted peer's writer registration. The accept loops mint
 /// one per handshaked secondary (after reading its first frame to
@@ -142,6 +148,13 @@ pub struct TunneledPeerTransport<I: Identifier> {
     /// deliberately dropped — there is nothing for the submitter to dial
     /// out to.
     router: Router<I>,
+    /// The inbound queue's two freshness clocks: ARRIVAL is stamped by
+    /// the [`InboundTap`] this transport minted (every producer —
+    /// accept-loop readers, the in-process forwarder — records through
+    /// it); DRAINED is stamped here as `recv_peer`/`try_recv_peer`
+    /// pulls each frame back out. Published to detached liveness
+    /// readers via [`PeerTransport::ingest_edges`].
+    ingest_edges: IngestEdges,
 }
 
 impl<I: Identifier> TunneledPeerTransport<I> {
@@ -177,15 +190,20 @@ impl<I: Identifier> TunneledPeerTransport<I> {
     /// no separate copy (it has no role-addressing envelope to stamp).
     pub fn new(local_id: String) -> (Self, SharedOutgoing<I>, InboundTap<I>, RegistrationSink<I>) {
         let outgoing: SharedOutgoing<I> = Rc::new(RefCell::new(HashMap::new()));
-        let (inbound_tap, incoming_rx) = mpsc::unbounded_channel();
+        let (inbound_raw_tx, incoming_rx) = mpsc::unbounded_channel();
         let (new_conn_tx, new_conn_rx) = mpsc::unbounded_channel();
         let router = Router::new(local_id);
+        // Mount the arrival clock on the tap so every producer into the
+        // inbound queue records the sender at the true arrival edge.
+        let ingest_edges = IngestEdges::new();
+        let inbound_tap = InboundTap::new(inbound_raw_tx, ingest_edges.arrival.clone());
         let transport = Self {
             outgoing: Rc::clone(&outgoing),
             incoming_rx,
             new_conn_rx,
             registrations_open: true,
             router,
+            ingest_edges,
         };
         (transport, outgoing, inbound_tap, new_conn_tx)
     }
@@ -397,7 +415,14 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
                     // legacy `NetworkServer::recv`, which called
                     // `drain_new_connections()` on every inbound yield.
                     self.drain_registrations();
-                    msg?
+                    let msg = msg?;
+                    // Drained-edge stamp: the frame just left the inbound
+                    // queue. Keyed by the same envelope `sender_id` the
+                    // tap stamped at arrival, so the two edges measure
+                    // the same stream symmetrically (Router-consumed
+                    // relay frames included).
+                    self.ingest_edges.drained.record(msg.sender_id());
+                    msg
                 }
                 reg = self.new_conn_rx.recv(), if self.registrations_open => {
                     match reg {
@@ -443,6 +468,8 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
         self.router.prune(clocks.now);
         loop {
             let msg = self.incoming_rx.try_recv().ok()?;
+            // Drained-edge stamp — see the `recv_peer` twin.
+            self.ingest_edges.drained.record(msg.sender_id());
             // Sync Router dispatch: unwraps a `Relay` addressed to us,
             // drops a `Relay` addressed elsewhere (forwarding needs the
             // async path — same constraint as
@@ -468,6 +495,13 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
         // removed. Short synchronous borrow — no await in scope, so the
         // `await_holding_refcell_ref` lint is satisfied.
         self.outgoing.borrow().contains_key(id.as_str())
+    }
+
+    fn ingest_edges(&self) -> Option<IngestEdges> {
+        // Real read-loop tasks feed this transport's inbound queue, so
+        // both edges carry honest stamps — publish them for detached
+        // liveness readers (the primary's heartbeat sweep).
+        Some(self.ingest_edges.clone())
     }
 
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {

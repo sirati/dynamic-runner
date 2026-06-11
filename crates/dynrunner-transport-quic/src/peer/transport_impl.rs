@@ -214,6 +214,12 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                     clocks = now_clocks();
                     self.router.prune(clocks.now);
                     let msg = msg?;
+                    // Drained-edge stamp: the frame just left the inbound
+                    // queue. Same envelope `sender_id` key the InboundTap
+                    // stamped at arrival, so the two edges measure the
+                    // same stream symmetrically (Router-consumed relay /
+                    // RedialRequest frames included).
+                    self.ingest_edges.drained.record(msg.sender_id());
                     match self.router.process_inbound(
                         msg,
                         &mut self.connections,
@@ -409,6 +415,8 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         self.router.prune(clocks.now);
         loop {
             let msg = self.incoming_rx.try_recv().ok()?;
+            // Drained-edge stamp — see the `recv_peer` twin.
+            self.ingest_edges.drained.record(msg.sender_id());
             match self.router.process_inbound_sync(msg, clocks) {
                 InboundOutcome::Deliver { msg, redial_target } => {
                     if let Some(id) = redial_target {
@@ -501,6 +509,13 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
             .keys()
             .map(|k| PeerId::from(k.as_str()))
             .collect()
+    }
+
+    fn ingest_edges(&self) -> Option<dynrunner_protocol_primary_secondary::IngestEdges> {
+        // Real read-loop tasks feed this network's inbound queue, so
+        // both edges carry honest stamps — publish them for detached
+        // liveness readers (the primary's heartbeat sweep).
+        Some(self.ingest_edges.clone())
     }
 
     async fn connect_to_peers(&mut self, peers: &[PeerConnectionInfo]) {

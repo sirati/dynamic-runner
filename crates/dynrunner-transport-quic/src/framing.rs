@@ -46,7 +46,7 @@
 //! its own copy of the loop with its own silent error branches.
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, chunking, codec};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, InboundTap, chunking, codec};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -488,12 +488,19 @@ pub(crate) fn oversize_announced_len(buf: &[u8]) -> Option<usize> {
 /// two at ERROR naming the peer and the violation (#366: no exit that
 /// loses data is silent).
 ///
+/// `incoming_tx` is the recording [`InboundTap`]: each push stamps the
+/// decoded frame's sender on the transport's arrival-edge clock — this
+/// read loop IS the earliest point a peer's frame is attributable on
+/// this node, and it keeps running (recording honest arrivals) while
+/// the inbound queue's consumer is starved. Bytes that have not yet
+/// formed a complete frame are unattributable and stamp nothing.
+///
 /// `ctx` names the owning handler (e.g. `"peer-outgoing"`) so the done
 /// line keeps the provenance the per-handler loops used to carry.
 pub(crate) async fn run_quic_reader<I: Identifier>(
     mut recv: quinn::RecvStream,
     mut recv_buf: Vec<u8>,
-    incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
+    incoming_tx: InboundTap<I>,
     ctx: &'static str,
     peer: String,
     // Per-connection chunk reassembly (a chunked transfer travels ONE
@@ -586,9 +593,12 @@ pub(crate) async fn run_quic_writer<I: Identifier>(
 /// configured limit) — or a corrupt frame; both error exits at ERROR
 /// naming the peer (#366: this branch used to be the silent drop point
 /// of the production 55 MB `TaskComplete`).
+///
+/// `incoming_tx` is the recording [`InboundTap`] — see
+/// [`run_quic_reader`]'s arrival-edge note; the same contract applies.
 pub(crate) async fn run_wss_reader<I: Identifier>(
     mut ws_read: SplitStream<WsStream>,
-    incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
+    incoming_tx: InboundTap<I>,
     ctx: &'static str,
     peer: String,
     // Per-connection chunk reassembly — see `run_quic_reader`.
