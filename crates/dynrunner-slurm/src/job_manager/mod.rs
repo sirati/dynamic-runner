@@ -39,5 +39,5 @@ mod types;
 mod wrapper_binary;
 
 pub use shutdown_binary::SHUTDOWN_BIN_REMOTE_BASENAME;
-pub use types::{JobStatus, JobStatusInfo, SlurmError, SlurmJobManager};
+pub use types::{CancelOutcome, JobStatus, JobStatusInfo, SlurmError, SlurmJobManager};
 pub use wrapper_binary::WRAPPER_BIN_REMOTE_BASENAME;

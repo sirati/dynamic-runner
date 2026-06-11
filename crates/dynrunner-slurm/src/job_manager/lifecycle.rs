@@ -6,7 +6,7 @@
 use dynrunner_gateway::traits::Gateway;
 use tracing;
 
-use super::types::{JobStatus, JobStatusInfo, SlurmError, SlurmJobManager};
+use super::types::{CancelOutcome, JobStatus, JobStatusInfo, SlurmError, SlurmJobManager};
 
 impl<G: Gateway> SlurmJobManager<G> {
     /// Create required directories on the gateway.
@@ -180,14 +180,29 @@ impl<G: Gateway> SlurmJobManager<G> {
     }
 
     /// Cancel a specific SLURM job.
-    pub async fn cancel_job(&self, job_id: &str) -> Result<(), SlurmError> {
+    ///
+    /// Returns what scancel actually did (see [`CancelOutcome`]):
+    /// `Cancelled` on a clean exit, `AlreadyGone` when scancel ran but
+    /// reported an error (on a reachable gateway that means the job id
+    /// is no longer known — finished, cancelled, or purged), and `Err`
+    /// only when the gateway transport itself failed (scancel never
+    /// ran). Logging here stays severity-neutral (debug for the gone
+    /// case) so callers with different stakes — best-effort revocation
+    /// vs. teardown sweep — pick their own loudness.
+    pub async fn cancel_job(&self, job_id: &str) -> Result<CancelOutcome, SlurmError> {
         let cmd = format!("scancel {job_id}");
         let result = self.gateway.execute_command(&cmd, None).await?;
         if !result.success() {
-            tracing::warn!(job_id, stderr = %result.stderr, "scancel returned error");
+            tracing::debug!(
+                job_id,
+                stderr = %result.stderr,
+                "scancel reported an error — the job is likely already \
+                 finished, cancelled, or purged",
+            );
+            return Ok(CancelOutcome::AlreadyGone);
         }
         tracing::info!(job_id, "SLURM job cancelled");
-        Ok(())
+        Ok(CancelOutcome::Cancelled)
     }
 
     /// Cancel all submitted jobs.

@@ -1005,14 +1005,15 @@ where
                     // re-evaluates + the lost-visibility recurrence report
                     // fires even with zero inbound traffic.
                     _ = visibility_recheck_tick.tick() => {}
-                    // Wake-stream loss threshold (the 5-minute mark). A
-                    // PERSISTENT deadline: `wake_deadline()` derives from the
-                    // STORED loss instant, so this `sleep_until` — though
-                    // rebuilt every iteration — always targets the same
-                    // absolute instant and fires under constant sibling
-                    // activity (the watchdog law; a relative `sleep` here
-                    // would be reset by every other arm and never fire).
-                    // `None` (visible, or already logged) parks the arm.
+                    // Wake-stream loss cadence (the 5-minute mark, then one
+                    // repeat per 10 minutes while still down). A PERSISTENT
+                    // deadline: `wake_deadline()` derives from STORED
+                    // instants (the loss instant, then the last wake emit),
+                    // so this `sleep_until` — though rebuilt every iteration
+                    // — always targets the same absolute instant and fires
+                    // under constant sibling activity (the watchdog law; a
+                    // relative `sleep` here would be reset by every other
+                    // arm and never fire). `None` (visible) parks the arm.
                     // Cancel-safe: `sleep_until` holds no state beyond its
                     // target instant.
                     _ = async {

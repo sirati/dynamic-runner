@@ -273,7 +273,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // policy is disabled at construction (no spawner, no budget,
         // no channel) — the arm parks on `pending().await` in that
         // case, matching the command-channel disabled-arm shape.
-        let mut respawn_request_rx = self.respawn_request_rx.take();
+        let mut respawn_lifecycle_rx = self.respawn_lifecycle_rx.take();
 
         // Liveness-beacon ping receiver. Same disabled-arm shape: `None`
         // when no listener was wired (channel-only fixtures) → the arm
@@ -780,8 +780,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         )
                         .await;
                 }
-                req = async {
-                    match respawn_request_rx.as_mut() {
+                event = async {
+                    match respawn_lifecycle_rx.as_mut() {
                         Some(rx) => rx.recv().await,
                         // Respawn policy disabled (or rx already
                         // consumed by a prior loop entry): park
@@ -792,16 +792,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     }
                 } => {
                     arm_stats.record(ARM_RESPAWN_REQUEST);
-                    match req {
-                        Some(request) => {
-                            // Single-line delegation: the dispatch
-                            // logic (budget check + id mint +
-                            // spawner invocation + JoinSet push)
-                            // lives in `primary::respawn` /
-                            // `dispatch_respawn_request`. This arm
-                            // only translates "a request arrived"
+                    match event {
+                        Some(event) => {
+                            // Single-line delegation: the routing
+                            // (Removed → budget check + id mint +
+                            // spawner invocation + JoinSet push;
+                            // Added → pending-replacement
+                            // reconciliation / revocation) lives in
+                            // `primary::respawn` /
+                            // `dispatch_respawn_lifecycle`. This arm
+                            // only translates "an event arrived"
                             // into the call.
-                            self.dispatch_respawn_request(request);
+                            self.dispatch_respawn_lifecycle(event);
                         }
                         None => {
                             // Every sender dropped. Drop the
@@ -809,10 +811,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             // arms keep driving exit conditions.
                             // Same shape as the command-channel
                             // None arm.
-                            respawn_request_rx = None;
+                            respawn_lifecycle_rx = None;
                             tracing::debug!(
-                                "respawn request channel closed; disabling \
-                                 the respawn-request arm for the remainder \
+                                "respawn lifecycle channel closed; disabling \
+                                 the respawn-lifecycle arm for the remainder \
                                  of the loop"
                             );
                         }
@@ -936,10 +938,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // draining the same bus so a `TasksAdded` emitted during a
         // retry pass still drives the dispatch recheck.
         self.worker_mgmt_rx = worker_mgmt_rx;
-        // Same rationale for the respawn-request receiver: retry
-        // passes re-enter the operational loop and a death observed
-        // during a retry pass should still drive the dispatcher.
-        self.respawn_request_rx = respawn_request_rx;
+        // Same rationale for the respawn lifecycle receiver: retry
+        // passes re-enter the operational loop and a death (or a
+        // reconciling join) observed during a retry pass should still
+        // drive the dispatcher.
+        self.respawn_lifecycle_rx = respawn_lifecycle_rx;
         // Same rationale for the liveness-beacon ping receiver: a retry
         // pass that re-enters the operational loop must keep refreshing
         // death-clocks from beacon datagrams (the union half), or a busy
