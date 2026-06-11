@@ -21,7 +21,11 @@ impl PyObserverLateJoiner {
         holdings = None,
         panik_watcher_paths = None,
         panik_watcher_poll_interval_secs = 10.0,
+        gateway_url = None,
+        ssh_identity_file = None,
+        ssh_config_file = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         peer_info_dir: PathBuf,
         observer_id: Option<String>,
@@ -29,7 +33,33 @@ impl PyObserverLateJoiner {
         holdings: Option<Vec<String>>,
         panik_watcher_paths: Option<Vec<PathBuf>>,
         panik_watcher_poll_interval_secs: f64,
+        gateway_url: Option<String>,
+        ssh_identity_file: Option<String>,
+        ssh_config_file: Option<String>,
     ) -> PyResult<Self> {
+        // Resolve the gateway mode UP FRONT so a malformed URL fails at
+        // construction (operator-visible, before any runtime spins up).
+        // `--gateway local` means "the dir and the cluster are reachable
+        // from this host" — identical to passing no gateway at all, so
+        // both collapse to `None` and the local path stays byte-identical.
+        let gateway = match gateway_url.as_deref() {
+            None | Some("local") => None,
+            Some(url) => match dynrunner_gateway::parse_gateway_url(url).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "observer late-joiner: invalid --gateway value: {e}"
+                ))
+            })? {
+                dynrunner_gateway::GatewayConfig::Local => None,
+                dynrunner_gateway::GatewayConfig::Ssh(mut cfg) => {
+                    // The auth-file knobs are gateway-config concerns,
+                    // folded in post-parse exactly as the SLURM
+                    // pipeline does on its Python gateway config.
+                    cfg.identity_file = ssh_identity_file;
+                    cfg.config_file = ssh_config_file;
+                    Some(cfg)
+                }
+            },
+        };
         // Default observer-id includes a small random suffix so two
         // concurrent observer-dispatchers on the same gateway don't
         // collide on the peer-id (the mesh keys on it). The format
@@ -57,6 +87,7 @@ impl PyObserverLateJoiner {
         Ok(Self {
             observer_id,
             peer_info_dir,
+            gateway,
             distributed_config: distributed_config.unwrap_or_default(),
             holdings,
             panik_watcher_paths: panik_watcher_paths.unwrap_or_default(),

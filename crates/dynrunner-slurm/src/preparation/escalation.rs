@@ -73,7 +73,7 @@ const DEFAULT_FRESH_EPISODE_GAP: Duration = Duration::from_secs(300);
 
 /// What the reestablish path should do with an alive-noop tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum EscalationVerdict {
+pub(crate) enum EscalationVerdict {
     /// Trust the liveness gate — keep the no-op. Carries the current
     /// consecutive-noop streak for the caller's log line.
     Tolerate { streak: u32 },
@@ -94,7 +94,7 @@ struct Streak {
 /// [`SlurmPreparation`](super::pipeline::SlurmPreparation), shared by
 /// every reestablish call on that manager.
 #[derive(Debug)]
-pub(super) struct ReconnectEscalation {
+pub(crate) struct ReconnectEscalation {
     force_after: u32,
     fresh_episode_gap: Duration,
     streaks: HashMap<String, Streak>,
@@ -109,7 +109,7 @@ impl Default for ReconnectEscalation {
 impl ReconnectEscalation {
     /// `force_after` is clamped to ≥1 (0 would force on a state the
     /// machine never observes).
-    pub(super) fn new(force_after: u32, fresh_episode_gap: Duration) -> Self {
+    pub(crate) fn new(force_after: u32, fresh_episode_gap: Duration) -> Self {
         Self {
             force_after: force_after.max(1),
             fresh_episode_gap,
@@ -119,7 +119,7 @@ impl ReconnectEscalation {
 
     /// Record one alive-noop reconnect tick for `secondary_id` at `now`
     /// and learn whether to keep tolerating or force the rebuild.
-    pub(super) fn on_alive_noop(&mut self, secondary_id: &str, now: Instant) -> EscalationVerdict {
+    pub(crate) fn on_alive_noop(&mut self, secondary_id: &str, now: Instant) -> EscalationVerdict {
         let streak = self
             .streaks
             .entry(secondary_id.to_owned())
@@ -148,7 +148,7 @@ impl ReconnectEscalation {
 
     /// A rebuild for `secondary_id` completed (gate-found-dead path or
     /// forced path alike): the fresh child starts with a clean slate.
-    pub(super) fn on_rebuilt(&mut self, secondary_id: &str) {
+    pub(crate) fn on_rebuilt(&mut self, secondary_id: &str) {
         self.streaks.remove(secondary_id);
     }
 }

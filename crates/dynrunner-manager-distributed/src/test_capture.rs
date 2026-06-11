@@ -34,6 +34,33 @@ pub(crate) struct CapturedEvent {
     pub(crate) fields: HashMap<String, String>,
 }
 
+/// One captured event together with its level — the record of the
+/// general (non-importance) [`TargetCapture`].
+#[derive(Clone, Debug)]
+pub(crate) struct LeveledEvent {
+    pub(crate) level: tracing::Level,
+    pub(crate) event: CapturedEvent,
+}
+
+/// Debug-render an event's `message` + remaining fields — the one
+/// shared visitor behind every capture layer in this module.
+fn render_event(event: &tracing::Event<'_>) -> CapturedEvent {
+    struct EventVisitor<'a>(&'a mut CapturedEvent);
+    impl tracing::field::Visit for EventVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
+            if field.name() == "message" {
+                self.0.message = rendered;
+            } else {
+                self.0.fields.insert(field.name().to_string(), rendered);
+            }
+        }
+    }
+    let mut captured = CapturedEvent::default();
+    event.record(&mut EventVisitor(&mut captured));
+    captured
+}
+
 /// Records every important event into a shared buffer.
 #[derive(Clone, Default)]
 pub(crate) struct ImportantCapture(Arc<Mutex<Vec<CapturedEvent>>>);
@@ -55,23 +82,62 @@ where
     S: tracing::Subscriber,
 {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        struct EventVisitor<'a>(&'a mut CapturedEvent);
-        impl tracing::field::Visit for EventVisitor<'_> {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                let rendered = format!("{value:?}");
-                if field.name() == "message" {
-                    self.0.message = rendered;
-                } else {
-                    self.0.fields.insert(field.name().to_string(), rendered);
-                }
-            }
-        }
-        let mut captured = CapturedEvent::default();
-        event.record(&mut EventVisitor(&mut captured));
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(captured);
+            .push(render_event(event));
+    }
+}
+
+/// Records every event emitted on ONE exact tracing target, at any
+/// level, with the level preserved — so a log-shape test can assert
+/// "exactly one INFO, everything else DEBUG". The target
+/// discrimination happens INSIDE `on_event` rather than via a layer
+/// filter: a filtered install caches per-callsite `Interest` in the
+/// PROCESS-GLOBAL table and can poison sibling tests' callsites (see
+/// `capture_important` and `staging`'s `WarnCapture`); an unfiltered
+/// layer caches `Interest::always`, which never suppresses anyone.
+/// Unlike `capture_important`'s synchronous-body constraint, an
+/// always-interest install is also safe to hold (via
+/// `tracing::subscriber::set_default`) across `.await`s on a
+/// current-thread runtime: while this dispatcher is registered, every
+/// interest-cache rebuild yields at least `sometimes`, so no emission
+/// can be cached away from it.
+#[derive(Clone)]
+pub(crate) struct TargetCapture {
+    target: &'static str,
+    events: Arc<Mutex<Vec<LeveledEvent>>>,
+}
+
+impl TargetCapture {
+    pub(crate) fn for_target(target: &'static str) -> Self {
+        Self {
+            target,
+            events: Arc::default(),
+        }
+    }
+
+    /// Snapshot of every captured event, in emission order.
+    pub(crate) fn events(&self) -> Vec<LeveledEvent> {
+        self.events.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl<S> Layer<S> for TargetCapture
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        if event.metadata().target() != self.target {
+            return;
+        }
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(LeveledEvent {
+                level: *event.metadata().level(),
+                event: render_event(event),
+            });
     }
 }
 

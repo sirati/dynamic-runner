@@ -10,6 +10,7 @@ pub(crate) use dynrunner_core::IMPORTANT_TARGET;
 
 pub mod config;
 pub mod job_manager;
+pub mod local_forward;
 pub mod observer_reconnect;
 pub mod packaging;
 pub mod peer_info;
@@ -20,12 +21,15 @@ pub mod wrapper_script;
 
 pub use config::SlurmConfig;
 pub use job_manager::{JobStatus, JobStatusInfo, SlurmError, SlurmJobManager};
+pub use local_forward::{
+    ForwardTarget, LocalForwardError, LocalForwardTunnelReconnector, LocalForwardTunnels,
+};
 pub use observer_reconnect::SlurmPreparationTunnelReconnector;
 pub use packaging::{PackagingError, PodmanImageMetadata, PodmanPackaging};
 pub use peer_info::{
-    Builder as PeerInfoBuilder, LegacyUri, PeerInfoError, PeerInfoRecord, PeerInfoVersion,
-    ReadDirError as PeerInfoReadDirError, parse as parse_peer_info, parse_v1_uri,
-    read_dir_v2 as read_peer_info_dir_v2,
+    Builder as PeerInfoBuilder, LegacyUri, PeerInfoError, PeerInfoFetchError, PeerInfoRecord,
+    PeerInfoVersion, ReadDirError as PeerInfoReadDirError, fetch_dir_v2 as fetch_peer_info_dir_v2,
+    parse as parse_peer_info, parse_v1_uri, read_dir_v2 as read_peer_info_dir_v2,
 };
 pub use pipeline::{CleanupSteps, PipelineGuard, PipelineSteps, pkill_residual_reverse_tunnels};
 pub use preparation::{InfoFileReader, PrepError, PreparationOptions, SlurmPreparation};

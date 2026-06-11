@@ -55,9 +55,11 @@ tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 nix = { workspace = true }
 async-trait = { workspace = true }
+# Local mirror dir for the gateway-mode late-joiner's peer-info fetch
+# (also used by tests, which previously held it as a dev-dependency).
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 # `test-util` exposes `tokio::time::pause`/`advance` +
 # `#[tokio::test(start_paused = true)]` so the observer reporter's
 # cadence/idle tests are deterministic with no wall-clock race.

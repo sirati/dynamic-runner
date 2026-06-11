@@ -24,6 +24,11 @@
 //!   (#362) — spawned / already-connected / awaiting-inbound (lower-id
 //!   rule) / dropped-from-list — plus the higher-id side's truthful
 //!   "peer leg missing, this node never dials it" summary WARN.
+//! - [`late_joiner_forward`]: desktop-shaped late-joiner bootstrap —
+//!   the RED repro (compute-internal address unreachable from this
+//!   host ⇒ loud bounded `NoReachablePeer`) and the GREEN contract
+//!   (join + snapshot RPC succeed through a local TCP forward
+//!   endpoint with a cert-less, WSS-only rewritten seed entry).
 //! - [`log_capture`]: shared tracing capture layer + `pump_b_until`
 //!   used by the silent-reconnect + dial-failure-summary scenarios;
 //!   kept here because they observe the framework log trace.
@@ -51,6 +56,7 @@ mod broadcast_miss;
 mod cert_parsing;
 mod dial_failure_summary;
 mod dial_sweep;
+mod late_joiner_forward;
 mod log_capture;
 mod member_leg_redial;
 mod primary_link;

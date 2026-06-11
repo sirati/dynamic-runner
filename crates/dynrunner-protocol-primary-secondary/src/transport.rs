@@ -239,6 +239,27 @@ pub trait PeerTransport<I: Identifier> {
         peers: &[crate::PeerConnectionInfo],
     ) -> impl std::future::Future<Output = ()>;
 
+    /// Fold any asynchronously-completed connection registrations into
+    /// the membership view that [`Self::peer_count`] / [`Self::has_peer`]
+    /// / [`Self::connected_ids`] report.
+    ///
+    /// Transports whose dials register lazily (the QUIC `PeerNetwork`:
+    /// dial tasks complete on spawned tasks and park the accepted
+    /// connection on a channel that is only drained inside `&mut self`
+    /// entry points like `send`/`recv`) override this with that drain.
+    /// Pre-wired transports (channel mesh, mocks) keep the no-op
+    /// default.
+    ///
+    /// Exists for membership POLL LOOPS that hold `&mut self` but call
+    /// none of the draining entry points — most importantly
+    /// [`Self::join_running_cluster`]'s step-2 rendezvous gate, which
+    /// spins on `peer_count()` between sleeps: without this fold the
+    /// gate can never observe a dial that completed after
+    /// `connect_to_peers` returned, and the bootstrap dies with
+    /// [`JoinError::NoReachablePeer`] against a perfectly reachable
+    /// seed.
+    fn sync_membership(&mut self) {}
+
     /// The local node's own peer-id, used as the bootstrap RPC's
     /// return address (the `sender_id` of the
     /// [`DistributedMessage::RequestClusterSnapshot`] frame
@@ -357,6 +378,12 @@ pub trait PeerTransport<I: Identifier> {
             // all replies and merging them via the idempotent lattice
             // heals an incomplete responder.
             loop {
+                // Fold completed dial registrations into the membership
+                // view first: `peer_count()` is `&self` and lazily-
+                // registering transports (the QUIC `PeerNetwork`) only
+                // fold inside `&mut self` entry points this poll loop
+                // otherwise never calls — see `sync_membership`'s doc.
+                self.sync_membership();
                 if self.peer_count() > 0 {
                     break;
                 }

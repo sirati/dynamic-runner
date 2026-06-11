@@ -72,7 +72,14 @@ mod summary;
 mod tests;
 
 pub use io::read_peer_info_file;
+// Crate-internal reuse seam for the late-joiner's `ssh -L` local-forward
+// registry (`crate::local_forward`): the SAME 3s alive-gate, SIGTERM
+// teardown ladder, and half-dead escalation state machine the `-R`
+// reverse-tunnel path uses, so the two tunnel flavours cannot drift on
+// lifecycle policy.
+pub(crate) use escalation::{EscalationVerdict, ReconnectEscalation};
 pub use options::{InfoFileReader, PrepError, PreparationOptions};
 pub use pipeline::SlurmPreparation;
 pub use policy::EstablishmentPolicy;
+pub(crate) use ssh::{terminate_child, verify_tunnel_alive};
 pub use summary::{TunnelSetupSummary, secondary_id};

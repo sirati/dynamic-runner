@@ -60,6 +60,9 @@
 //! pyfunction dispatcher. `new` is the constructor pymethods block.
 //! `run` is the run() + completed getter pymethods block. `helpers`
 //! carries `map_read_dir_error` + `records_to_seed` + their tests.
+//! `gateway_mode` carries the `--gateway` desktop path: gateway-side
+//! `.info` fetch, per-peer `ssh -L` local-forward tunnels, the ONE
+//! seed-rewrite seam, and the reconnector hand-off.
 
 use std::path::PathBuf;
 
@@ -68,6 +71,7 @@ use pyo3::types::PyDict;
 
 use crate::config::distributed::DistributedConfig;
 
+mod gateway_mode;
 mod helpers;
 mod new;
 mod run;
@@ -92,8 +96,20 @@ pub(crate) struct PyObserverLateJoiner {
     pub(super) observer_id: String,
     /// Directory holding the SLURM wrapper's `<secondary_id>.info`
     /// files. Read once at the start of `run()` to build the seed
-    /// list for [`PeerTransport::join_running_cluster`].
+    /// list for [`PeerTransport::join_running_cluster`]. A LOCAL path
+    /// when `gateway` is `None`; a GATEWAY-SIDE path (fetched through
+    /// the gateway into a local mirror) when `gateway` is `Some`.
     pub(super) peer_info_dir: PathBuf,
+    /// `Some(SshConfig)` activates gateway mode (`--gateway ssh://…`):
+    /// the peer-info dir is fetched from the gateway and every seed
+    /// peer is reached through a per-peer `ssh -L` local-forward
+    /// tunnel whose `127.0.0.1:<local_port>` endpoint replaces the
+    /// recorded compute-internal address (see [`gateway_mode`]).
+    /// `None` (no `--gateway`, or `--gateway local`) keeps the
+    /// original direct-dial path byte-identical. Parsed + validated in
+    /// the constructor so a malformed URL fails before any runtime
+    /// spins up.
+    pub(super) gateway: Option<dynrunner_gateway::SshConfig>,
     pub(super) distributed_config: DistributedConfig,
     /// Static set of `holdings` this observer advertises to the
     /// cluster (e.g. asm-dataset-nix passes the local Nix-store
@@ -132,7 +148,11 @@ pub(crate) struct PyObserverLateJoiner {
     holdings = None,
     panik_watcher_paths = None,
     panik_watcher_poll_interval_secs = 10.0,
+    gateway_url = None,
+    ssh_identity_file = None,
+    ssh_config_file = None,
 ))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_observer_late_joiner<'py>(
     py: Python<'py>,
     peer_info_dir: PathBuf,
@@ -141,10 +161,22 @@ pub(crate) fn run_observer_late_joiner<'py>(
     holdings: Option<Vec<String>>,
     panik_watcher_paths: Option<Vec<PathBuf>>,
     panik_watcher_poll_interval_secs: f64,
+    gateway_url: Option<String>,
+    ssh_identity_file: Option<String>,
+    ssh_config_file: Option<String>,
 ) -> PyResult<Py<PyAny>> {
     let kwargs = PyDict::new(py);
     if let Some(id) = observer_id.as_ref() {
         kwargs.set_item("observer_id", id)?;
+    }
+    if let Some(url) = gateway_url.as_ref() {
+        kwargs.set_item("gateway_url", url)?;
+    }
+    if let Some(identity) = ssh_identity_file.as_ref() {
+        kwargs.set_item("ssh_identity_file", identity)?;
+    }
+    if let Some(cfg) = ssh_config_file.as_ref() {
+        kwargs.set_item("ssh_config_file", cfg)?;
     }
     if let Some(dc) = distributed_config.as_ref() {
         kwargs.set_item("distributed_config", dc.clone())?;
