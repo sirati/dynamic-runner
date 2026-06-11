@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Any
 
 from ..deployment_spec import TaskDeploymentSpec
-from .gateway import expand_gateway_tilde
+from .gateway import expand_gateway_tilde, retry_transient
 from .layered_transfer import LayeredUploader, UploadStats, make_bundle_from_archive
 
 logger = logging.getLogger(__name__)
@@ -346,7 +346,13 @@ class PodmanPackaging:
 
     def _upload_artifact(self, gateway: Any, local_path: Path, remote_path: Path) -> None:
         logger.info("Transferring container image to gateway at %s...", remote_path)
-        gateway.transfer_file(local_path, str(remote_path))
+        # Same idempotent-copy boundary as the layered uploader's
+        # per-blob transfer — one transient scp/ssh fault must not
+        # kill the dispatch.
+        retry_transient(
+            lambda: gateway.transfer_file(local_path, str(remote_path)),
+            what=f"image artifact upload to {remote_path}",
+        )
 
     def build_images(self, gateway: Any, local_project_root: Path, output_dir: str | Path) -> PodmanImageMetadata:
         """Build and transfer the single image artifact.

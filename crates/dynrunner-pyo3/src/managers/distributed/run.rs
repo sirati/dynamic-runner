@@ -109,14 +109,13 @@ impl PyDistributedManager {
         let dist_keepalive = self.distributed_config.keepalive_interval();
         let dist_peer_timeout = self.distributed_config.peer_timeout();
         // The PRIMARY's quorum-proceed (straggler) window is DERIVED (unset
-        // → scale-aware `max(60, n*15)`; explicit → honored; both capped
-        // strictly below the secondaries' `unconfigured_deadline`). The
-        // in-process mesh has no bootstrap dial, so this is the knob's only
-        // consumer here. See
+        // → 80% of the secondaries' `unconfigured_deadline`, the default IS
+        // the cap; explicit → honored; both capped strictly below the
+        // deadline). The in-process mesh has no bootstrap dial, so this is
+        // the knob's only consumer here. See
         // `dynrunner_manager_distributed::derive_connect_timeout`.
         let dist_connect_timeout = dynrunner_manager_distributed::derive_connect_timeout(
             self.distributed_config.connect_timeout_override(),
-            num_secondaries,
             self.distributed_config.unconfigured_deadline(),
         );
         let dist_keepalive_miss_threshold = self.distributed_config.keepalive_miss_threshold();
@@ -1117,6 +1116,14 @@ impl PyDistributedManager {
                                 // compute secondary surfaces this. RAISE rather
                                 // than silently swallow.
                                 no_relocation_target = Some(e);
+                            }
+                            e @ RunError::BringUpFailed { .. } => {
+                                // Fleet bring-up failure (0/N welcomes inside
+                                // the quorum-proceed window): no fleet, zero
+                                // dispatch. RAISE — never the `Other` swallow's
+                                // false rc=0 clean teardown (uniform with
+                                // `PyPrimaryCoordinator::run`).
+                                fatal_policy_exit = Some(e);
                             }
                             e @ (RunError::AbortedByClusterVerdict { .. }
                             | RunError::Deposed { .. }) => {

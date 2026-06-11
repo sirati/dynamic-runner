@@ -17,10 +17,17 @@
 //! loss — the [`dynrunner_core::IMPORTANT_TARGET`] view is deliberately
 //! quieter than the full log:
 //!
-//!   1. A loss reaches the wake stream ONLY once it has been continuously
-//!      down for [`WAKE_LOSS_THRESHOLD`] (5 minutes). A shorter blip
-//!      produces NOTHING on the wake stream, ever — the full-log
-//!      diagnostics above stay immediate and untouched.
+//!   1. A loss reaches the wake stream ONLY once there has been no
+//!      successful reconnect-and-sync for [`WAKE_LOSS_THRESHOLD`]
+//!      (5 minutes) — the coordinator's `Visible` verdict already MEANS
+//!      synced (it keys on inbound frames from the recognised primary, so
+//!      a transport-level reconnect that never syncs stays `Lost` and
+//!      resets nothing). A shorter blip produces NOTHING on the wake
+//!      stream, ever — the full-log diagnostics above stay immediate and
+//!      untouched. While the condition persists, the warning REPEATS at
+//!      the [`WAKE_LOSS_RECURRENCE`] cadence (10 minutes): a 25-minute
+//!      outage wakes the operator at ~+5, ~+15 and ~+25 — never the ~60s
+//!      full-log recurrence.
 //!   2. A reconnection is NEVER its own wake event. If (and only if) the
 //!      loss WAS logged on the wake stream, regaining visibility parks a
 //!      reconnection NOTE in the shared [`WakeNoteSlot`]; the note rides
@@ -109,6 +116,13 @@ const REPORT_RECURRENCE: Duration = Duration::from_secs(60);
 /// nor a reconnection — ever. The full-log diagnostics are NOT gated on
 /// this threshold (they stay immediate).
 pub(crate) const WAKE_LOSS_THRESHOLD: Duration = Duration::from_secs(300);
+
+/// How often the wake-stream loss warning REPEATS while the connection
+/// stays down after the first ([`WAKE_LOSS_THRESHOLD`]-gated) warning.
+/// One mechanism owns the whole cadence: [`LostVisibilityReporter::wake_deadline`]
+/// derives the FIRST deadline from the loss instant and every subsequent
+/// one from the last wake emit — there is no separate recurrence state.
+pub(crate) const WAKE_LOSS_RECURRENCE: Duration = Duration::from_secs(600);
 
 /// The shared "reconnection note" slot — the piggyback seam between the
 /// wake-stream loss policy (the single WRITER: [`LostVisibilityReporter`]
@@ -279,11 +293,14 @@ pub struct LostVisibilityReporter {
     /// The last instant a "connection lost / still retrying" report was
     /// emitted, so recurrence fires at most once per [`REPORT_RECURRENCE`].
     last_report: Option<Instant>,
-    /// Latch: the CURRENT loss episode has been reported on the wake
-    /// stream (it stayed down past [`WAKE_LOSS_THRESHOLD`]). Reset on
-    /// regain. Gates both "emit the wake loss exactly once" and "only a
-    /// logged loss earns a reconnection note".
-    loss_logged: bool,
+    /// `Some(t)` once the CURRENT loss episode has been reported on the
+    /// wake stream (it stayed down past [`WAKE_LOSS_THRESHOLD`]) — the
+    /// instant of the LAST wake-stream loss emit, from which the next
+    /// [`WAKE_LOSS_RECURRENCE`] deadline derives. Reset on regain. The ONE
+    /// state owning "has this outage been reported" (it gates the
+    /// reconnection note + the [`EndedOutage`] signal) AND the repeat
+    /// cadence — never two parallel gates.
+    last_wake_emit: Option<Instant>,
     /// The latest lost-reason + mesh-liveness evidence observed while
     /// down, so the threshold emit (which fires from the deadline arm, not
     /// from an `observe` call) carries the same gated wording as the
@@ -314,10 +331,11 @@ impl LostVisibilityReporter {
     /// report, clear the loss state, and return [`RetryDirective::Idle`].
     ///
     /// None of those diagnostics touch the wake stream: the wake-stream
-    /// loss is emitted exactly once at the [`WAKE_LOSS_THRESHOLD`] mark
-    /// (via [`Self::on_wake_deadline`], also checked here as a backstop),
-    /// and a regain after a LOGGED loss parks the reconnection note +
-    /// returns the [`EndedOutage`] signal — never a wake emit of its own.
+    /// loss is emitted at the [`WAKE_LOSS_THRESHOLD`] mark and then once
+    /// per [`WAKE_LOSS_RECURRENCE`] while still down (via
+    /// [`Self::on_wake_deadline`], also checked here as a backstop), and a
+    /// regain after a LOGGED loss parks the reconnection note + returns
+    /// the [`EndedOutage`] signal — never a wake emit of its own.
     ///
     /// NEVER returns an exit signal — a lost-visibility observer keeps
     /// observing. This is the entire BUG-B contract: the observer reports,
@@ -337,7 +355,7 @@ impl LostVisibilityReporter {
                         "observer reconnected — visibility regained; resuming passive \
                          observation of the run"
                     );
-                    if self.loss_logged {
+                    if self.last_wake_emit.is_some() {
                         // The loss WAS reported on the wake stream, so the
                         // operator must eventually learn it ended — but a
                         // reconnection is never a wake event of its own:
@@ -353,7 +371,7 @@ impl LostVisibilityReporter {
                         });
                     }
                 }
-                self.loss_logged = false;
+                self.last_wake_emit = None;
                 self.last_lost_context = None;
                 self.last_report = None;
                 ObserveOutcome {
@@ -369,9 +387,10 @@ impl LostVisibilityReporter {
                 self.lost_since.get_or_insert(now);
                 // Keep the wake-threshold emit's context fresh (the
                 // deadline arm fires between observes) and run the
-                // threshold check as a backstop — `on_wake_deadline` is
-                // latched, so the dedicated deadline arm and this backstop
-                // can never double-emit.
+                // cadence check as a backstop — `on_wake_deadline` is
+                // self-spacing (the next deadline derives from the last
+                // emit), so the dedicated deadline arm and this backstop
+                // can never double-emit inside one cadence window.
                 self.last_lost_context = Some((reason.clone(), *mesh_liveness));
                 self.on_wake_deadline(now);
                 let due = first
@@ -432,24 +451,29 @@ impl LostVisibilityReporter {
         }
     }
 
-    /// The wake-stream loss deadline: `Some(lost_since + 5min)` while the
-    /// connection is down and the loss has not yet been logged on the wake
-    /// stream; `None` otherwise. Derived from the STORED loss instant
-    /// (the persistent-deadline law): the coordinator's select arm
-    /// rebuilds `sleep_until` from this value every iteration, so sibling
-    /// arm activity never resets the clock.
+    /// The NEXT wake-stream loss deadline while the connection is down:
+    /// `Some(lost_since + 5min)` before the episode's first wake emit,
+    /// then `Some(last_emit + 10min)` for each repeat
+    /// ([`WAKE_LOSS_RECURRENCE`]); `None` while visible. Derived from
+    /// STORED instants (the persistent-deadline law): the coordinator's
+    /// select arm rebuilds `sleep_until` from this value every iteration,
+    /// so sibling arm activity never resets the clock.
     pub fn wake_deadline(&self) -> Option<Instant> {
-        match (self.lost_since, self.loss_logged) {
-            (Some(since), false) => Some(since + WAKE_LOSS_THRESHOLD),
-            _ => None,
+        match (self.lost_since, self.last_wake_emit) {
+            (Some(since), None) => Some(since + WAKE_LOSS_THRESHOLD),
+            (Some(_), Some(last_emit)) => Some(last_emit + WAKE_LOSS_RECURRENCE),
+            (None, _) => None,
         }
     }
 
-    /// Emit the wake-stream loss event if the threshold has been reached:
-    /// the connection has been continuously down for
-    /// [`WAKE_LOSS_THRESHOLD`]. Latched — exactly one wake loss per loss
-    /// episode, no matter how often the deadline arm or the `observe`
-    /// backstop call this. The wording carries the same
+    /// Emit the wake-stream loss event if the next cadence deadline has
+    /// been reached: no successful reconnect-and-sync for
+    /// [`WAKE_LOSS_THRESHOLD`] (the first), then one repeat per elapsed
+    /// [`WAKE_LOSS_RECURRENCE`] while still down. Self-spacing — the
+    /// deadline always derives from the last emit, so no matter how often
+    /// the deadline arm or the `observe` backstop call this (the ~60s
+    /// full-log/reconnect cadence included), the wake stream sees at most
+    /// one line per cadence window. The wording carries the same
     /// positive-CRDT-evidence gate as the full-log banner (see
     /// [`MeshLiveness`]). The emit is itself a wake-stream host: a note
     /// still pending from an EARLIER outage rides it.
@@ -460,12 +484,11 @@ impl LostVisibilityReporter {
         if now < deadline {
             return;
         }
-        self.loss_logged = true;
+        self.last_wake_emit = Some(now);
         let since = self
             .lost_since
             .expect("wake_deadline() is Some only while lost");
         let lost_secs = now.duration_since(since).as_secs();
-        let threshold_secs = WAKE_LOSS_THRESHOLD.as_secs();
         let (reason, mesh_liveness) = self
             .last_lost_context
             .clone()
@@ -477,11 +500,12 @@ impl LostVisibilityReporter {
                     %reason,
                     lost_secs,
                     alive_secondaries = alive_count,
-                    "observer connection to the run has been down for ≥{threshold_secs}s — the \
-                     last CRDT snapshot still shows {alive_count} live worker-secondary \
-                     member(s), so the compute mesh is running autonomously over its direct \
-                     links; the observer keeps retrying reconnect. The run's verdict comes from \
-                     the primary, never from the observer's own view."
+                    "observer connection to the run has been down for {lost_secs}s with no \
+                     successful reconnect+sync — the last CRDT snapshot still shows \
+                     {alive_count} live worker-secondary member(s), so the compute mesh is \
+                     running autonomously over its direct links; the observer keeps retrying \
+                     reconnect. The run's verdict comes from the primary, never from the \
+                     observer's own view."
                 );
             }
             MeshLiveness::Unknown => {
@@ -489,11 +513,11 @@ impl LostVisibilityReporter {
                     target: IMPORTANT_TARGET,
                     %reason,
                     lost_secs,
-                    "observer connection to the run has been down for ≥{threshold_secs}s — \
-                     compute-mesh state UNKNOWN: the observer holds NO live worker-secondary in \
-                     its last CRDT snapshot, so it CANNOT confirm the mesh survived. The \
-                     observer keeps retrying reconnect; the run's verdict comes from the \
-                     primary, never from the observer's own view."
+                    "observer connection to the run has been down for {lost_secs}s with no \
+                     successful reconnect+sync — compute-mesh state UNKNOWN: the observer holds \
+                     NO live worker-secondary in its last CRDT snapshot, so it CANNOT confirm \
+                     the mesh survived. The observer keeps retrying reconnect; the run's \
+                     verdict comes from the primary, never from the observer's own view."
                 );
             }
         }
@@ -510,10 +534,10 @@ impl LostVisibilityReporter {
     }
 
     /// Whether the CURRENT loss episode has been reported on the wake
-    /// stream. Test/diagnostic accessor.
+    /// stream (at least once). Test/diagnostic accessor.
     #[cfg(test)]
     pub(crate) fn loss_logged(&self) -> bool {
-        self.loss_logged
+        self.last_wake_emit.is_some()
     }
 }
 
@@ -725,9 +749,11 @@ mod tests {
     }
 
     #[test]
-    fn loss_logged_exactly_once_at_threshold_mark() {
-        // Rule 1: the loss reaches the wake stream exactly once, AT the
-        // 5-minute mark — not at loss time, not repeated afterwards.
+    fn loss_logged_once_at_threshold_then_spaced_by_recurrence() {
+        // Rule 1: the loss reaches the wake stream AT the 5-minute mark —
+        // not at loss time — and inside the following 10-minute cadence
+        // window nothing repeats, no matter how often the ~60s arm/backstop
+        // fire.
         let t0 = Instant::now();
         let wake = capture_important(|| {
             let mut r = LostVisibilityReporter::new(WakeNoteSlot::default());
@@ -738,20 +764,22 @@ mod tests {
             assert_eq!(
                 r.wake_deadline(),
                 Some(t0 + WAKE_LOSS_THRESHOLD),
-                "deadline derives from the STORED loss instant"
+                "first deadline derives from the STORED loss instant"
             );
             // The mark: the deadline arm fires.
             r.on_wake_deadline(at(t0, 300));
             assert!(r.loss_logged());
             assert_eq!(
                 r.wake_deadline(),
-                None,
-                "a logged loss parks the deadline arm"
+                Some(at(t0, 300) + WAKE_LOSS_RECURRENCE),
+                "after the first emit the deadline re-arms at the 10-minute \
+                 recurrence, derived from the last emit"
             );
-            // Still down much later: the observe backstop + a stray
-            // deadline call must NOT re-emit.
+            // Still down inside the cadence window: the observe backstop +
+            // stray deadline calls must NOT re-emit.
             r.observe(&lost("fleet empty"), at(t0, 360));
             r.on_wake_deadline(at(t0, 400));
+            r.on_wake_deadline(at(t0, 899));
         });
         let losses: Vec<_> = wake
             .iter()
@@ -760,7 +788,7 @@ mod tests {
         assert_eq!(
             losses.len(),
             1,
-            "exactly one wake loss event per episode: {wake:?}"
+            "exactly one wake loss event per cadence window: {wake:?}"
         );
         assert_eq!(
             wake.len(),
@@ -888,9 +916,10 @@ mod tests {
     }
 
     #[test]
-    fn never_regained_loss_has_no_note_ever() {
-        // Loss logged, connection never returns: the single loss event is
-        // all the wake stream ever sees — no reconnection note.
+    fn never_regained_loss_repeats_at_recurrence_and_has_no_note_ever() {
+        // Loss logged, connection never returns: the wake stream sees the
+        // 5-minute loss event and then one repeat per 10-minute cadence
+        // window — never the ~60s tick rate — and no reconnection note.
         let t0 = Instant::now();
         let note = WakeNoteSlot::default();
         let wake = capture_important(|| {
@@ -902,8 +931,66 @@ mod tests {
                 r.on_wake_deadline(at(t0, m * 60));
             }
         });
-        assert_eq!(wake.len(), 1, "one loss event, nothing more: {wake:?}");
+        // Emits: +300s, then every 600s (900, 1500, …, 6900) — 12 in two
+        // hours of minutely ticks, not ~114.
+        assert_eq!(
+            wake.len(),
+            12,
+            "one loss event per cadence window, nothing more: {wake:?}"
+        );
+        assert!(
+            wake.iter().all(|e| e.message.contains("has been down for")),
+            "every wake event of a never-regained loss is a loss line: {wake:?}"
+        );
         assert!(!note.is_pending(), "no regain — no note");
+    }
+
+    #[test]
+    fn owner_repro_25_minute_outage_wakes_thrice_not_per_minute() {
+        // The owner's live observation (13:31–13:40): one loss line per
+        // ~60s reporter tick on the wake stream. Spec: the FIRST warning at
+        // 5 minutes of no successful reconnect+sync, then repeats at a
+        // 10-MINUTE cadence — a 25-minute outage wakes the operator at
+        // ~+5, ~+15 and ~+25, i.e. exactly 3 emissions, not 25, not 1.
+        // This replays the observed sequence: visibility lost, the
+        // coordinator's ~60s recheck tick driving observe + the deadline
+        // arm every minute, for 25 minutes.
+        let t0 = Instant::now();
+        let wake = capture_important(|| {
+            let mut r = LostVisibilityReporter::new(WakeNoteSlot::default());
+            r.observe(
+                &Visibility::Lost {
+                    reason: "no reachable peer".to_string(),
+                    mesh_liveness: MeshLiveness::KnownAlive { alive_count: 4 },
+                },
+                t0,
+            );
+            for m in 1..=25 {
+                r.observe(
+                    &Visibility::Lost {
+                        reason: "no reachable peer".to_string(),
+                        mesh_liveness: MeshLiveness::KnownAlive { alive_count: 4 },
+                    },
+                    at(t0, m * 60),
+                );
+                r.on_wake_deadline(at(t0, m * 60));
+            }
+        });
+        let down_secs: Vec<&str> = wake
+            .iter()
+            .map(|e| {
+                e.message
+                    .split("down for ")
+                    .nth(1)
+                    .and_then(|rest| rest.split('s').next())
+                    .expect("every wake event is a loss line")
+            })
+            .collect();
+        assert_eq!(
+            down_secs,
+            vec!["300", "900", "1500"],
+            "exactly three wake emissions, at the +5/+15/+25 boundaries: {wake:?}"
+        );
     }
 
     #[test]

@@ -4,15 +4,22 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::command_channel::PrimaryCommand;
+use crate::primary::error::RunError;
 use crate::state::{SecondaryConnection, SecondaryConnectionState};
 
 use super::PrimaryCoordinator;
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
+    /// Returns the structured [`RunError`] directly (not the helper-level
+    /// `Result<(), String>` shape): the zero-welcome timeout is a KNOWN
+    /// must-raise run terminal ([`RunError::BringUpFailed`]) and must not
+    /// be flattened through `From<String>` into the swallow-eligible
+    /// `Other`. The transport/dispatch error paths inside keep their
+    /// generic `Other` typing via the blanket `From` on `?`.
     pub(super) async fn wait_for_connections(
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RunError> {
         tracing::info!("waiting for {} secondaries", self.config.num_secondaries);
 
         let deadline = tokio::time::Instant::now() + self.config.connect_timeout;
@@ -157,19 +164,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     // requires N>=1; zero connected is still a
                     // hard error.
                     if cert_done == 0 {
-                        return Err(format!(
-                            "timeout waiting for secondaries: 0/{expected} sent \
-                             SecondaryWelcome (transport-level connection accept \
-                             happens lazily on first message, so 0/N here can mean \
-                             either no peer ever connected OR connections completed \
-                             handshake but never sent Welcome — in the latter case \
-                             the per-connection accept handler should have logged a \
-                             'peer connected but did not send SecondaryWelcome \
-                             within Ns; closing as non-conformant' line in the \
-                             transport log; that points at the consumer's \
-                             worker_module not completing the runner protocol's \
-                             Ready handshake)"
-                        ));
+                        // Structured run terminal, NOT a bare string: a
+                        // 0/N bring-up is a run-level FATAL the PyO3
+                        // boundary must RAISE — typing it `Other` (the
+                        // old `From<String>` flattening) made the
+                        // boundary swallow it into a clean
+                        // "Completed: 0 / Failed: 0" rc=0 teardown
+                        // (run_20260611_131736).
+                        return Err(RunError::BringUpFailed {
+                            reason: format!(
+                                "timeout waiting for secondaries: 0/{expected} sent \
+                                 SecondaryWelcome (transport-level connection accept \
+                                 happens lazily on first message, so 0/N here can mean \
+                                 either no peer ever connected OR connections completed \
+                                 handshake but never sent Welcome — in the latter case \
+                                 the per-connection accept handler should have logged a \
+                                 'peer connected but did not send SecondaryWelcome \
+                                 within Ns; closing as non-conformant' line in the \
+                                 transport log; that points at the consumer's \
+                                 worker_module not completing the runner protocol's \
+                                 Ready handshake)"
+                            ),
+                        });
                     }
                     // Drop secondaries that are present in the registry
                     // but didn't make it to cert-exchanged (Handshaking
