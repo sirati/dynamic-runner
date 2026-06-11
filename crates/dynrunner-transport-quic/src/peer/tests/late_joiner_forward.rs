@@ -23,13 +23,28 @@
 //!   bootstrap snapshot RPC end-to-end. This is the linchpin
 //!   assumption of the gateway-mode late-joiner: WSS rides a plain
 //!   TCP byte-pipe unchanged.
+//!
+//! - Production frame shape
+//!   (`join_accepts_role_stamped_snapshot_reply`): the Test-1a replay.
+//!   A REAL responder replies through its coordinator egress, which
+//!   stamps the Phase-C routing target on every frame
+//!   (`msg.with_target(reply_destination(..))` →
+//!   `Some(Destination::Observer(joiner-id))`) — unlike the canned
+//!   `target: None` reply above, which models the pre-one-mesh wire.
+//!   The joiner must ACCEPT the stamped reply (and keep skipping the
+//!   stamped broadcast gossip interleaved with it). Before the fix the
+//!   bootstrap window's accept arm pattern-matched `target: None` and
+//!   dropped every production reply as "non-ClusterSnapshot … kind=
+//!   ClusterSnapshot" until the budget expired — the asm-tokenizer
+//!   Test-1a `JoinError::Timeout`.
 
 use std::time::Duration;
 
 use super::super::PeerNetwork;
 use super::TestId;
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, JoinError, PeerConnectionInfo, PeerTransport,
+    Destination, DistributedMessage, JoinError, KeepaliveRole, PeerConnectionInfo, PeerId,
+    PeerTransport,
 };
 
 /// Seed entry shaped like a production v2 `.info` record after
@@ -169,6 +184,100 @@ async fn join_succeeds_through_tcp_forward_endpoint() {
                 .join_running_cluster(&seed, Duration::from_secs(10), true, false)
                 .await
                 .expect("join through the TCP forward endpoint must succeed");
+            assert_eq!(snapshots, vec!["{\"canned\":true}".to_string()]);
+            responder.await.expect("responder completed");
+        })
+        .await;
+}
+
+/// Test-1a replay (production frame shape): the responder's reply
+/// carries the Phase-C routing target every coordinator egress stamps —
+/// `Some(Destination::Observer(<joiner-id>))`, what
+/// `anti_entropy::reply_destination` resolves for an observer requester
+/// — and broadcast gossip stamped `Some(Destination::All)` interleaves
+/// with it on the joiner's wire, exactly the frame mix the production
+/// joiner logged. `join_running_cluster` must skip the gossip and
+/// ACCEPT the stamped snapshot reply: the frame's arrival on this leg
+/// already satisfies the host-addressing, and the target stamp is only
+/// the mesh-pump's slot-demux hint (the bootstrap window has no slots).
+#[tokio::test(flavor = "current_thread")]
+async fn join_accepts_role_stamped_snapshot_reply() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // The "cluster" peer (a compute secondary in production).
+            let mut cluster: PeerNetwork<TestId> =
+                PeerNetwork::start("secondary-0", None).await.unwrap();
+            let cluster_port = cluster.port();
+            let cluster_addr: std::net::SocketAddr =
+                format!("127.0.0.1:{cluster_port}").parse().unwrap();
+
+            // The local forward endpoint (production: the ssh -L child's
+            // 127.0.0.1:<local_port> listener).
+            let forward = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let forward_port = forward.local_addr().unwrap().port();
+            tokio::task::spawn_local(async move {
+                while let Ok((inbound, _)) = forward.accept().await {
+                    tokio::task::spawn_local(proxy_one(inbound, cluster_addr));
+                }
+            });
+
+            // The cluster peer's responder: gossip first (stamped `All`,
+            // as the coordinator broadcast egress stamps it), then the
+            // snapshot reply stamped with the requester's role-typed
+            // return address — the production egress shape.
+            let responder = tokio::task::spawn_local(async move {
+                loop {
+                    let Some(msg) = cluster.recv_peer().await else {
+                        panic!("cluster peer transport closed before the snapshot request");
+                    };
+                    if let DistributedMessage::RequestClusterSnapshot {
+                        sender_id,
+                        is_observer,
+                        ..
+                    } = msg
+                    {
+                        assert!(is_observer, "late-joiner observer must declare its role");
+                        let gossip: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+                            target: None,
+                            sender_id: "secondary-0".into(),
+                            timestamp: 0.0,
+                            secondary_id: "secondary-0".into(),
+                            active_workers: 0,
+                            emitter_role: KeepaliveRole::Secondary,
+                        }
+                        .with_target(Destination::All);
+                        cluster
+                            .broadcast(gossip)
+                            .await
+                            .expect("gossip broadcast reaches the joiner's wire");
+                        let reply: DistributedMessage<TestId> =
+                            DistributedMessage::ClusterSnapshot {
+                                target: None,
+                                sender_id: "secondary-0".into(),
+                                timestamp: 0.0,
+                                snapshot_json: "{\"canned\":true}".into(),
+                            }
+                            .with_target(Destination::Observer(PeerId::from(sender_id.clone())));
+                        cluster
+                            .send_to_peer(&sender_id, reply)
+                            .await
+                            .expect("stamped snapshot reply over the proxied connection");
+                        return;
+                    }
+                }
+            });
+
+            // The desktop-shaped joiner: seed rewritten to the forward
+            // endpoint, cert cleared (WSS-only through the TCP pipe).
+            let mut joiner: PeerNetwork<TestId> =
+                PeerNetwork::start("observer-stamped", None).await.unwrap();
+            let seed = vec![seed_entry("secondary-0", "127.0.0.1", forward_port)];
+
+            let snapshots = joiner
+                .join_running_cluster(&seed, Duration::from_secs(10), true, false)
+                .await
+                .expect("the role-stamped snapshot reply must be accepted by the bootstrap window");
             assert_eq!(snapshots, vec!["{\"canned\":true}".to_string()]);
             responder.await.expect("responder completed");
         })
