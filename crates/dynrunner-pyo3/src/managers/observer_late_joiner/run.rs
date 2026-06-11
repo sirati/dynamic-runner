@@ -47,7 +47,7 @@ impl PyObserverLateJoiner {
         let peer_info_dir = self.peer_info_dir.clone();
         let local_seed = if gateway_cfg.is_none() {
             let records = read_peer_info_dir_v2(&self.peer_info_dir).map_err(map_read_dir_error)?;
-            let seed = records_to_seed(&records);
+            let mut seed = records_to_seed(&records);
             if seed.is_empty() {
                 // `read_peer_info_dir_v2` already errors on the empty /
                 // all-v1 case; this guards against the (currently
@@ -60,6 +60,15 @@ impl PyObserverLateJoiner {
                      empty seed (would hang on the connect-budget)",
                 ));
             }
+            // Overlay the submitter-persisted cert pins (explicit path,
+            // or the run's conventional local cert dir) so the peer
+            // dials authenticate over QUIC. Absent credentials keep the
+            // cert-less WSS-fallback seed byte-identical.
+            super::helpers::apply_local_peer_credentials(
+                &mut seed,
+                self.mesh_credentials_path.as_deref(),
+                &self.peer_info_dir,
+            )?;
             Some(seed)
         } else {
             None

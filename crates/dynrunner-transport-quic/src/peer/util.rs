@@ -17,9 +17,22 @@ pub(super) enum PeerConnection {
 }
 
 /// Parse a PEM certificate string to get the DER-encoded certificate.
-pub(super) fn parse_cert_pem(pem: &str) -> Option<rustls::pki_types::CertificateDer<'static>> {
+///
+/// Returns `Err` with the SPECIFIC validation failure (the
+/// dial-path silent-branch rule: the no-valid-cert WARN in
+/// `dial::dial_peer` surfaces this string as its `reasons=` field, so
+/// the operator can tell "the seed record simply carries no cert —
+/// e.g. a late-joiner reading the wrapper's cert-less `.info` files"
+/// apart from "a cert travelled but is corrupt").
+pub(super) fn parse_cert_pem(
+    pem: &str,
+) -> Result<rustls::pki_types::CertificateDer<'static>, String> {
     if pem.is_empty() {
-        return None;
+        return Err(
+            "peer record carries no certificate (empty cert field — e.g. a seed built \
+             from cert-less peer-info records); QUIC needs the peer's pinned cert"
+                .to_string(),
+        );
     }
     // Simple PEM parser: extract base64 between BEGIN/END markers
     let mut in_cert = false;
@@ -37,11 +50,11 @@ pub(super) fn parse_cert_pem(pem: &str) -> Option<rustls::pki_types::Certificate
         }
     }
     if b64.is_empty() {
-        return None;
+        return Err("no CERTIFICATE PEM block found in the peer record's cert field".to_string());
     }
     use base64::Engine;
     let der = base64::engine::general_purpose::STANDARD
         .decode(&b64)
-        .ok()?;
-    Some(rustls::pki_types::CertificateDer::from(der))
+        .map_err(|e| format!("cert PEM base64 failed to decode: {e}"))?;
+    Ok(rustls::pki_types::CertificateDer::from(der))
 }

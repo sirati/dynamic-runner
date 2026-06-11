@@ -4,7 +4,11 @@
 //! - [`bind_port`]: `PeerNetwork::start` bind-port contract (#355) —
 //!   an explicit port pins both listeners (QUIC/UDP + WSS/TCP);
 //!   `None` keeps the OS-picked ephemeral behaviour.
-//! - [`cert_parsing`]: pure PEM→DER bridge tests.
+//! - [`cert_parsing`]: pure PEM→DER bridge tests (the `Err` strings
+//!   are the no-valid-cert WARN's `reasons=` payload).
+//! - [`dial_cert`]: dial-side cert contract — a cert-carrying seed
+//!   entry connects QUIC; a cert-less one falls back to WSS with a
+//!   NON-EMPTY `reasons=` on the no-valid-cert WARN.
 //! - [`two_peers`]: basic peer exchange + dial tie-break
 //!   (`higher_id_does_not_dial_lower_id`).
 //! - [`recv_lifetime`]: `recv_peer_tick_survives_outer_drop` —
@@ -101,6 +105,7 @@ mod bind_port;
 mod bootstrap_redial;
 mod broadcast_miss;
 mod cert_parsing;
+mod dial_cert;
 mod dial_failure_summary;
 mod dial_sweep;
 mod formation_retry;
