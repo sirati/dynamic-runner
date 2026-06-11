@@ -557,6 +557,43 @@ where
     /// death).
     pub(super) setup_deadline: setup_deadline::SetupDeadline,
 
+    /// SETUP-PHASE failover election state (#420 face (c)). `None` in the
+    /// normal setup wait; `Some` once a `wait_for_setup` secondary whose
+    /// primary has gone permanently silent (formed mesh, no primary frames for
+    /// half the unconfigured deadline) ARMS a failover election WITHOUT
+    /// transitioning its lifecycle to `Operational`.
+    ///
+    /// Why a coordinator field and not the lifecycle's `OperationalState`: the
+    /// LOSERS of a setup-phase election must STAY in `wait_for_setup` so the
+    /// elected primary's re-sent setup trio (PeerInfo / InitialAssignment /
+    /// TransferComplete — its `PromotedDestination` arm re-runs the full
+    /// pre-loop chain) completes their handshake and spawns their workers (the
+    /// relocation-handoff path is the precedent). A permanent transition to
+    /// `Operational` would no-op `enter_configuring_on_first_primary_frame`
+    /// (it fires only from `AwaitingPrimary`), so a loser that went Operational
+    /// would DROP the re-sent trio and sit worker-less forever. Parking the
+    /// election state HERE keeps the lifecycle in its setup variant — only the
+    /// WINNER leaves setup (via `fire_local_promotion` → `PromotionSignal` →
+    /// the Node builds the primary). The election LOGIC is unchanged: every
+    /// election method reads its four fields through the op-OR-setup accessors
+    /// ([`Self::election_state`] etc.), so there is ONE election code path with
+    /// the state owned by whichever regime drives it.
+    pub(in crate::secondary) setup_election: Option<election::SetupElection<I>>,
+
+    /// The shared own-tick-health authority (`crate::own_tick_health`): the
+    /// SAME primitive the primary's heartbeat sweep consumes. The
+    /// keepalive-arm tick (and the setup-phase election tick) feeds each
+    /// tick's instant to it; a lagged tick means THIS node's runtime was
+    /// frozen/starved, so every silence age it would measure — the
+    /// primary-silence backstop (leg B), the peer-keepalive reaper, the
+    /// setup-election arm — is inflated by its OWN stall, not the peer's
+    /// silence. The authority re-bases its trustworthy floor on the lag, and
+    /// every silence judgment reads `now - trustworthy_anchor(last_evidence)`
+    /// so the starved window contributes ZERO silence: peers are judged from
+    /// fresh, post-lag evidence (a genuine death is detected one healthy
+    /// cadence window later — correctness over speed).
+    pub(in crate::secondary) own_tick_health: crate::own_tick_health::OwnTickHealth,
+
     /// Cross-thread / cross-runtime ingress for the `PrimaryHandle`
     /// PyO3 surface (when the handle was minted from a
     /// `PySecondaryCoordinator`).

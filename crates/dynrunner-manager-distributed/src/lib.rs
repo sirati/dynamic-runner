@@ -6,6 +6,7 @@ pub mod liveness;
 pub mod message_router;
 pub mod observer;
 pub mod oploop_instrumentation;
+pub(crate) mod own_tick_health;
 pub mod panik_watcher;
 pub mod peer_lifecycle;
 pub mod primary;

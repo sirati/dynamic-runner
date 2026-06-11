@@ -481,6 +481,21 @@ where
              emission logs at DEBUG)"
         );
 
+        // Setup-phase failover-election cadence (#420 face (c)). Once a primary
+        // has been silent past the election threshold (half the unconfigured
+        // deadline) with a FORMED mesh, this tick ARMS + DRIVES the SAME
+        // failover election the operational loop runs, so a survivor promotes
+        // instead of the whole fleet dying one-by-one on its unconfigured
+        // deadline. Cadence = `keepalive_interval` (the same gather/advance
+        // tempo the operational election uses, so a setup-phase election
+        // converges on the protocol's own clock). The arming gate
+        // (`maybe_arm_setup_election`) is idempotent + threshold-guarded, so
+        // ticking before the threshold is a cheap no-op; the per-tick drive is
+        // a no-op until an election is armed.
+        let mut setup_election_interval = tokio::time::interval(self.config.keepalive_interval);
+        setup_election_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        setup_election_interval.reset();
+
         // ── Welcome/cert handshake: first attempt + retry cadence ──────
         //
         // The handshake is a SETUP concern, owned here (not a once-or-die
@@ -659,6 +674,47 @@ where
                             );
                         }
                     }
+                    // Setup-phase failover-election tick (#420 face (c)). The
+                    // silence clock is the SAME re-armable `setup_deadline`
+                    // anchor the wait-mark schedule + the give-up policy read
+                    // (re-armed by `note_setup_primary_liveness` on every
+                    // primary frame), so it measures PRIMARY SILENCE, never
+                    // slow-fleet assembly: a SLOW-but-LIVE primary keeps
+                    // pushing the anchor forward and `silent_for` stays below
+                    // the threshold, so NO election arms (the negative case).
+                    // Once a primary has been genuinely silent past the
+                    // threshold with a formed mesh, `maybe_arm_setup_election`
+                    // arms (idempotent + membership-seeded), and
+                    // `drive_setup_election_tick` advances it on the keepalive
+                    // cadence — a winner promotes via the PromotionSignal while
+                    // staying in this wait (its own new primary re-sends the
+                    // trio), so the whole fleet no longer dies on its deadline.
+                    // `interval.tick` is cancel-safe (tokio docs).
+                    _ = setup_election_interval.tick() => {
+                        // Own-tick-health gate FIRST (the SAME shared
+                        // authority the operational keepalive arm and the
+                        // primary's heartbeat sweep feed): a setup-election
+                        // tick that fires long past its cadence means THIS
+                        // node's runtime was frozen/starved, so the
+                        // `silent_for` it would measure reflects OUR stall,
+                        // not the primary's silence. `starved` defers the
+                        // ARM this tick (the primary may simply be unheard
+                        // because we couldn't process its setup frames), and
+                        // the re-based trustworthy floor clamps the seeded
+                        // `primary_last_seen` in the election legs of
+                        // `drive_setup_election_tick` (#423).
+                        let starved =
+                            self.own_tick_health.observe_tick(std::time::Instant::now());
+                        // `setup_deadline` is built on `tokio::time::Instant`
+                        // (the same clock its `sleep_until` reader uses), so
+                        // measure the silence against `tokio::time::Instant::now()`.
+                        let silent_for = tokio::time::Instant::now()
+                            .saturating_duration_since(self.setup_deadline.anchor());
+                        if !starved {
+                            self.maybe_arm_setup_election(silent_for);
+                        }
+                        self.drive_setup_election_tick().await;
+                    }
                     // Wait-mark narration (the owner's 30s/1m/5m schedule;
                     // see the arming comment above the trio loop). The
                     // sleep targets the STORED next-mark instant — sibling
@@ -751,6 +807,31 @@ where
                         // (RunComplete / RunAborted) — re-loop to the single
                         // terminal-exit check at the loop head, exactly as
                         // the ClusterMutation arm below does.
+                        continue;
+                    }
+                    // Setup-phase failover-election frames (#420 face (c)):
+                    // `TimeoutQuery` / `TimeoutResponse` / `PromotionVote` /
+                    // `PromotionConfirm`. Handled BEFORE the `enter_configuring`
+                    // announce trigger (like the StateDigest / RunConfig frames
+                    // above) and `continue`d, so an election frame from a peer
+                    // is NOT mistaken for a primary announce and never spawns
+                    // the worker pool. This is the receive half of the setup
+                    // election — its responder + tally edges run through the
+                    // SAME election machinery the operational loop uses (state
+                    // resolved via the op-OR-setup accessors), so a setup-phase
+                    // election interoperates with operational voters over the
+                    // same protocol frames. Pre-fix these fell to the `other =>`
+                    // debug-drop arm, so a setup-wedged secondary could neither
+                    // start nor answer an election — the run_~1429 leaderless
+                    // fleet death.
+                    if matches!(
+                        msg.msg_type(),
+                        MessageType::TimeoutQuery
+                            | MessageType::TimeoutResponse
+                            | MessageType::PromotionVote
+                            | MessageType::PromotionConfirm
+                    ) {
+                        self.handle_setup_election_frame(msg).await;
                         continue;
                     }
                     // FIRST primary-originated frame = the announce. This

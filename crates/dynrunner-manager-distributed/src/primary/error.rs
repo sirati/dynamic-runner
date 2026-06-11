@@ -83,6 +83,46 @@ pub enum RunError {
         /// secondary-side log agree.
         reason: String,
     },
+    /// The replicated ledger this primary composed its pool from describes
+    /// an IMPOSSIBLE task graph — surfaced at the `hydrate_from_cluster_state`
+    /// pool build (`PendingPool::new` phase-graph validation OR `extend`'s
+    /// per-task `task_id`-uniqueness / dependency-existence / cycle check).
+    /// The canonical case is the asm-dataset LMU run_~1429 bring-up fatal: a
+    /// promoted primary's mode-2 discovery returned a batch carrying a
+    /// duplicate `(phase_id, task_id)` identity. Because `compute_task_hash`
+    /// folds `(phase_id, path, identifier)` not `task_id`, the two
+    /// same-task_id-distinct-content entries hash differently — both land in
+    /// the CRDT (the `TaskAdded` NoOp never collapses them) and ONLY `extend`'s
+    /// task_id check surfaces the collision, at composition time.
+    ///
+    /// This IS a terminal run abort (the run's task set is ambiguous — like
+    /// the #3a/#3b duplicate paths): the primary latches + broadcasts the
+    /// replicated `RunAborted { reason }` FIRST (so every secondary's
+    /// setup-wait / operational run-terminal gate exits on the verdict instead
+    /// of dying on its unconfigured deadline, and the observer receives the
+    /// verdict) and returns this so its OWN PyO3 boundary surfaces a non-zero
+    /// exit. Detected during BRING-UP (before the operational loop), so —
+    /// like `DuplicateTaskIdPrePhase` (#3a) — the abort is the broadcast +
+    /// the typed return, NOT a worker-management `PolicyFatalExit` (no loop is
+    /// running to drain the bus).
+    ///
+    /// Distinct from `Other(String)` so the PyO3 boundary RAISES on it (the
+    /// `Other` path is log-and-swallowed → exit 0, which is exactly the
+    /// run_~1429 false-not-shutdown this variant exists to prevent: the
+    /// primary logged the ERROR and then silently continued with an empty
+    /// pool, never aborting, while the fleet died one-by-one on setup
+    /// deadlines). Distinct from `DuplicateTaskIdPrePhase` because that
+    /// variant's detection edge is the INITIAL-batch ingest (`partition_ingest`
+    /// before seeding); this one's edge is the post-seed COMPOSITION the
+    /// authoritative pool builder runs — a duplicate that slipped past
+    /// hash-keyed dedup into the replicated ledger.
+    InvalidComposedGraph {
+        /// Human-readable reason naming the composition fault (the
+        /// `PendingPoolError` Display — duplicate task_id / unknown dep /
+        /// cycle). Same string carried in the broadcast `RunAborted { reason }`
+        /// so the primary-side exception and the secondary-side log agree.
+        reason: String,
+    },
     /// A run-loop POLICY ABORT — a deliberate, consumer-/policy-driven
     /// non-zero exit that is NOT a strand/collapse and NOT a pre-phase
     /// duplicate. The canonical case is the observer's invalid-task Policy-B
@@ -267,6 +307,21 @@ impl fmt::Display for RunError {
                  torn down cluster-wide rather than proceeding on an ambiguous \
                  task set. Fix the producer so every (phase_id, task_id) is \
                  unique within the run."
+            ),
+            Self::InvalidComposedGraph { reason } => write!(
+                f,
+                "run aborted: the composed task graph is invalid — {reason}. The \
+                 replicated ledger this primary built its pool from describes an \
+                 impossible task graph (a duplicate (phase_id, task_id) identity, \
+                 a missing dependency, or a cycle), detected at the authoritative \
+                 pool composition during bring-up. The canonical case is a mode-2 \
+                 discovery batch that returned a duplicate task identity; because \
+                 the content hash folds (phase_id, path, identifier) not task_id, \
+                 such a collision slips past hash-keyed dedup into the ledger and \
+                 only surfaces at composition. The run was torn down cluster-wide \
+                 rather than starting with an empty pool. Fix the producer/discovery \
+                 so every (phase_id, task_id) is unique and every dependency \
+                 resolves."
             ),
             Self::FatalPolicyExit { reason } => write!(
                 f,

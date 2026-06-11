@@ -450,6 +450,47 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         Err(RunError::DuplicateTaskIdPrePhase { reason })
     }
 
+    /// Abort the run on an INVALID COMPOSED GRAPH surfaced by the
+    /// authoritative pool builder (`hydrate_from_cluster_state` returned
+    /// `Err`) during bring-up.
+    ///
+    /// THE single policy home for the post-composition fatal (the
+    /// asm-dataset LMU run_~1429 bring-up defect): a promoted primary's
+    /// mode-2 discovery — or any pre-loop hydrate — found the replicated
+    /// ledger describes an impossible task graph (a duplicate
+    /// `(phase_id, task_id)` identity, a missing dep, or a cycle), which the
+    /// hash-keyed CRDT dedup cannot collapse (`compute_task_hash` folds
+    /// `(phase_id, path, identifier)`, not `task_id`) and only `extend`'s
+    /// task_id/dep/cycle validation surfaces. Pre-fix `hydrate` logged ERROR
+    /// and silently left `pending = None`; the run then never aborted — it
+    /// sat with an empty pool while every secondary died one-by-one on its
+    /// unconfigured deadline (the fleet never heard a verdict).
+    ///
+    /// Routed through the SAME terminal-verdict mechanism the #3a path
+    /// (`fire_pending_run_abort`) uses — NOT a new special case: latch +
+    /// broadcast the replicated `RunAborted { reason }` (so every secondary's
+    /// setup-wait run-terminal gate at `setup.rs`'s loop head exits on the
+    /// verdict instead of its deadline, and the observer receives it), then
+    /// return the typed [`RunError::InvalidComposedGraph`] so this primary's
+    /// own PyO3 boundary surfaces a non-zero exit. Detected BEFORE the
+    /// operational loop, so — like #3a — the abort is the broadcast + the
+    /// typed return, NOT an `emit_run_fail_signal` (no loop is running to
+    /// drain the worker-management bus). A re-elected successor that hits the
+    /// SAME duplicate re-aborts the run identically (its own hydrate-Err →
+    /// this path), and the FIRST verdict latch wins (sticky first-writer).
+    pub(crate) async fn abort_run_on_invalid_composition(
+        &mut self,
+        e: dynrunner_scheduler_api::PendingPoolError,
+    ) -> RunError {
+        let reason = format!("invalid composed task graph in cluster_state: {e}");
+        tracing::error!(reason = %reason, "aborting run on invalid composed task graph");
+        self.broadcast_terminal_verdict(ClusterMutation::RunAborted {
+            reason: reason.clone(),
+        })
+        .await;
+        RunError::InvalidComposedGraph { reason }
+    }
+
     /// Fail every not-yet-terminal task across the WHOLE run as
     /// `InvalidTask` — the #3b op (a duplicate detected AFTER a phase
     /// started). The duplicate made the run's task set ambiguous, so

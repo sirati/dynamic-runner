@@ -111,7 +111,8 @@ fn hydrate_seeds_completed_deps_so_dependents_enter_pool() {
         });
     }
 
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     // The pool exists and carries exactly the two dependents — the
     // terminal toolchain seeded `completed_task_ids`, so `extend()`
@@ -185,7 +186,8 @@ async fn hydrate_invalid_task_root_blocks_then_dooms_dependent() {
                 });
             }
 
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
             // The dependent's dep RESOLVED (no `UnknownTaskDep` pool
             // wipe-out) but it is BLOCKED — a structurally-dead prereq
@@ -279,7 +281,8 @@ fn hydrate_inflight_task_not_reoffered_and_counter_one() {
         });
     }
 
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     let phase = PhaseId::from("work");
     let pool = primary.pool();
@@ -363,7 +366,8 @@ async fn inherited_in_flight_completion_decrements_phase_counter() {
                     version: Default::default(),
                 });
             }
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
             let phase = PhaseId::from("work");
             assert_eq!(primary.pool().in_flight(&phase), 1);
@@ -450,7 +454,8 @@ async fn hydrate_reconstructs_worker_roster_from_capacity_and_inflight() {
                 });
             }
 
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
             // FULL roster reconstructed: 2 slots for sec-0's advertised
             // capacity (was 0 before this fix — a promoted primary could
@@ -578,7 +583,8 @@ async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
                 // sec-dead has no capacity record, so the occupancy
                 // crossing logs a no-slot warning for it — but the ledger
                 // entry is seeded regardless.
-                live.hydrate_from_cluster_state();
+                live.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
                 assert_eq!(live.in_flight_len_for_test(), 1);
 
                 // sec-dead dies: recover its in-flight work. The returned
@@ -611,7 +617,8 @@ async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
             );
             promoted.cluster_state_mut_for_test().restore(snapshot);
 
-            promoted.hydrate_from_cluster_state();
+            promoted.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
             // The requeued task hydrated as a pending pool item (Pending in
             // the CRDT), NOT into the in-flight ledger.
             assert_eq!(
@@ -729,7 +736,8 @@ async fn promoted_primary_reconciles_stale_inherited_slot_on_idle_request() {
                 });
             }
 
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
             // Post-hydrate: the only worker slot is phantom-busy (Assigned,
             // INHERITED provenance) and the ready task cannot dispatch —
@@ -941,7 +949,8 @@ async fn reconcile_inherited_slot_gates_on_provenance() {
                     version: Default::default(),
                 });
             }
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
             let idx = primary
                 .worker_idx_for("sec-0", 0)
                 .expect("inherited slot resolves");
@@ -1221,7 +1230,8 @@ fn hydrate_seeds_completed_phases_as_done_not_rerun() {
         });
     }
 
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     let pool = primary.pool();
     // X, Y, Z are already-completed-and-ended → seeded straight to Done so
@@ -1294,7 +1304,8 @@ fn hydrate_does_not_seed_done_without_phase_ended_fact() {
         });
     }
 
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     let pool = primary.pool();
     assert_eq!(
@@ -1384,7 +1395,8 @@ async fn inherited_ended_phase_with_fact_does_not_refire_on_phase_end() {
                 ends_cb.lock().unwrap().push(p.to_string());
             }));
 
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
             assert_eq!(
                 primary.pool().phase_state(&PhaseId::from("build")),
                 Some(PhaseState::Done),
@@ -1451,7 +1463,8 @@ async fn hydrate_cold_seed_does_not_seed_any_phase_done() {
             primary
                 .originate_cold_seed(vec![(a, false), (b, false)], HashMap::new())
                 .expect("cold seed");
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
             let pool = primary.pool();
             for ph in ["build", "ship"] {
@@ -1544,7 +1557,8 @@ async fn hydrate_failed_final_root_dooms_dependents_via_finalize_cascade() {
                 });
             }
 
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
             // A FAILED terminal must NOT satisfy dependents' deps: B is
             // NOT dispatchable (pre-fix it was queued), it waits BLOCKED
@@ -1646,7 +1660,8 @@ async fn hydrate_failed_retryable_root_reenters_retry_flow_dependent_blocked() {
                 });
             }
 
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
             assert_eq!(
                 primary.pool().blocked_len(),
                 1,
@@ -1739,7 +1754,8 @@ async fn hydrate_failed_retryable_budget_exhausted_dooms_dependent() {
                 });
             }
 
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
             primary.fire_initial_phase_starts();
             primary.pool_mut().drain_empty_active_phases();
             primary.process_phase_lifecycle(&mut None).await;
@@ -1808,7 +1824,8 @@ async fn hydrate_unfulfillable_root_keeps_dependent_blocked_dormant() {
                 });
             }
 
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
             let queued: Vec<&str> = primary.pool().iter().map(|t| t.task_id.as_str()).collect();
             assert!(

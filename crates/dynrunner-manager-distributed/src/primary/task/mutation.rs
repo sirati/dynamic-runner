@@ -639,7 +639,27 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                          pool; rebuilding from cluster_state so the discovered \
                          tasks become dispatchable"
                     );
-                    self.hydrate_from_cluster_state();
+                    // A wire-received discovery batch that seeded a duplicate
+                    // `(phase_id, task_id)` identity into the ledger (the
+                    // hash-keyed dedup cannot collapse it) surfaces here as a
+                    // hydrate `Err`. The operational loop IS running at this
+                    // MID-RUN rebuild, so this is the #3b class: route it
+                    // through `invalidate_all_pending` — the SAME run-wide
+                    // invalidation the within-batch-duplicate spawn path uses
+                    // (latch + broadcast `RunAborted` FIRST, freeze dispatch via
+                    // the worker-management bus, then wipe the not-yet-terminal
+                    // ledger). NOT the bring-up `abort_run_on_invalid_composition`
+                    // (that one's typed return is the exit; here the running
+                    // loop's worker-mgmt drain owns the shutdown). Return early:
+                    // with `pending = None` there is no pool to drain/dispatch.
+                    if let Err(e) = self.hydrate_from_cluster_state() {
+                        self.invalidate_all_pending(format!(
+                            "invalid composed task graph in cluster_state \
+                             (mid-run discovery rebuild): {e}"
+                        ))
+                        .await;
+                        return;
+                    }
                     // `hydrate_from_cluster_state` no longer self-drains empty
                     // phases (the primary's coordinator owns the narrated
                     // cascade at run-entry). At this MID-RUN rebuild there is

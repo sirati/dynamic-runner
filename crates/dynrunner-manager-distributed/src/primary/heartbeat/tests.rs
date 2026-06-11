@@ -796,7 +796,8 @@ async fn r1_dead_secondary_requeue_then_hydrate_redispatches_exactly_once() {
         FixedEstimator,
     );
     promoted.cluster_state_mut_for_test().restore(snapshot);
-    promoted.hydrate_from_cluster_state();
+    promoted.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     // EXACTLY ONCE: the requeued task hydrates into the pool as a
     // dispatchable (queued) item — not stranded in the in-flight ledger
@@ -1671,38 +1672,13 @@ async fn starved_primary_does_not_remove_peer_whose_frames_are_queued() {
     );
 }
 
-/// PURE `local_sweep_starved`: the sweep's own inter-tick gap judges
-/// local starvation — `None` (first sweep) is never starved; a gap at or
-/// under the multiple is healthy; a gap beyond it defers. The gate must
-/// FIRE under a genuine stall (the watchdog fires-under-load law: this
-/// deadline is a stored Instant compared per tick, not a resettable
-/// select-arm sleep).
-#[test]
-fn local_sweep_starved_judges_inter_tick_gap() {
-    use super::{SWEEP_STARVATION_TICK_MULTIPLE, local_sweep_starved};
-    let interval = Duration::from_millis(50);
-    let now = Instant::now();
-    // First sweep: never starved.
-    assert!(!local_sweep_starved(None, now, interval));
-    // On-cadence gap: healthy.
-    assert!(!local_sweep_starved(
-        Some(now - Duration::from_millis(60)),
-        now,
-        interval
-    ));
-    // Exactly at the threshold: healthy (strictly-greater fires).
-    assert!(!local_sweep_starved(
-        Some(now - interval * SWEEP_STARVATION_TICK_MULTIPLE),
-        now,
-        interval
-    ));
-    // A genuine stall (gap far beyond the cadence): starved → defer.
-    assert!(local_sweep_starved(
-        Some(now - Duration::from_millis(400)),
-        now,
-        interval
-    ));
-}
+// The PURE own-tick-lag classifier (formerly `local_sweep_starved`) now
+// lives in the shared `crate::own_tick_health` primitive, with its
+// `None`-first / at-threshold-healthy / beyond-threshold-starved coverage in
+// that module's own unit tests. The primary-altitude behavioural deferral
+// (a stalled runtime defers the sweep, the on-cadence follow-up removes a
+// genuinely silent peer) is pinned by
+// `starved_primary_does_not_remove_peer_whose_frames_are_queued` above.
 
 /// REPRO (face b — the headline): a member REMOVED from the replicated
 /// membership whose authenticated frames keep arriving is RE-ADMITTED

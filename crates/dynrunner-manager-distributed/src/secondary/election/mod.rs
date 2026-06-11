@@ -20,12 +20,78 @@
 //! in `handle_peer_message`.
 
 use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
 use std::time::Instant;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::DistributedMessage;
 
+use super::primary_link::PrimaryLink;
+
 mod coordinator;
+
+/// The election sub-state, OWNED BY THE CALLER (CLAUDE.md single-path reuse).
+///
+/// The failover election needs exactly four pieces of state — the
+/// [`ElectionState`] machine, the `peer_keepalives` liveness view, the
+/// `primary_last_seen` clock, and the `PrimaryLink` health window — and they
+/// live in TWO places depending on the lifecycle regime that drives the
+/// election:
+///   * OPERATIONAL: inside [`super::lifecycle::OperationalState`] (the
+///     established home — election runs once per processing-loop tick); and
+///   * SETUP (#420 face (c)): in THIS struct, parked on the coordinator's
+///     `setup_election` field, when a `wait_for_setup` secondary whose primary
+///     has gone permanently silent (formed mesh, no primary frames) drives a
+///     failover election WITHOUT transitioning its lifecycle to `Operational`
+///     (which would no-op the worker-spawn the LOSERS still need — see the
+///     `setup_election` field doc + the setup election driver).
+///
+/// The election LOGIC is identical for both: every election method reads its
+/// four fields through the op-OR-setup accessors (`election_state` /
+/// `election_state_mut` / `election_keepalives` / `election_last_seen` /
+/// `election_primary_link_mut`), so there is ONE election code path with the
+/// state owned by whichever regime is driving it — never a per-regime mode
+/// branch in the decision logic.
+pub(super) struct SetupElection<I: Identifier> {
+    /// The election state machine — the same type the operational state holds.
+    pub(super) election: ElectionState,
+    /// Last time any frame was seen from the primary (drives the silence
+    /// legs). Seeded from `setup_deadline.anchor()` evidence at the driver.
+    pub(super) primary_last_seen: Option<Instant>,
+    /// Peer-keepalive liveness view (the quorum DENOMINATOR source). SEEDED
+    /// from the replicated membership at the setup→election entry (bootstrap
+    /// evidence, NOT heard-from keepalives — see the seed site), then aged by
+    /// the real silence machinery. The same `peer_id -> receipt-Instant` shape
+    /// the operational state's field carries.
+    pub(super) peer_keepalives: HashMap<String, Instant>,
+    /// The secondary→primary link health window (leg (A) `should_arm_failover`).
+    /// A fresh `PrimaryLink` from config — a setup-phase secondary has issued no
+    /// primary-bound send, so the window is unarmed (leg (A) stays silent; the
+    /// setup election arms on the silence backstop / membership-departure legs).
+    pub(super) primary_link: PrimaryLink,
+    _marker: PhantomData<I>,
+}
+
+impl<I: Identifier> SetupElection<I> {
+    /// Build a setup-phase election holder seeded with the membership-derived
+    /// bootstrap evidence (`peer_keepalives` stamped as-of-now per the owner's
+    /// caution: these are membership-derived bootstrap stamps, NOT heard-from
+    /// liveness proof). The `primary_last_seen` is the silence anchor the
+    /// driver supplies.
+    pub(super) fn new(
+        peer_keepalives: HashMap<String, Instant>,
+        primary_last_seen: Option<Instant>,
+        primary_link: PrimaryLink,
+    ) -> Self {
+        Self {
+            election: ElectionState::Normal,
+            primary_last_seen,
+            peer_keepalives,
+            primary_link,
+            _marker: PhantomData,
+        }
+    }
+}
 
 #[cfg(test)]
 mod observer_filter_tests;

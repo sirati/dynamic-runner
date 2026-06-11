@@ -1104,6 +1104,16 @@ impl PyDistributedManager {
                             e @ RunError::DuplicateTaskIdPrePhase { .. } => {
                                 duplicate_task_id_pre_phase = Some(e);
                             }
+                            e @ RunError::InvalidComposedGraph { .. } => {
+                                // Bring-up fatal: the composed task graph was
+                                // invalid (a discovery-batch duplicate identity /
+                                // missing dep / cycle). The primary already
+                                // broadcast the `RunAborted` verdict; RAISE here
+                                // so this node's own exit is non-zero — never the
+                                // `Other` swallow's false rc=0 (the run_~1429
+                                // false-not-shutdown this fix prevents).
+                                fatal_policy_exit = Some(e);
+                            }
                             e @ RunError::FatalPolicyExit { .. } => {
                                 fatal_policy_exit = Some(e);
                             }
