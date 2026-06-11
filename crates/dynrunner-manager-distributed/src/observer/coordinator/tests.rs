@@ -125,6 +125,53 @@ fn transport_with_peers(
     (transport, inbound_tx, keepalive)
 }
 
+/// A `PeerTransport` whose connected-id set is a shared cell the test
+/// flips, modelling a leg that re-registers then dies (the production `-R`
+/// rebuild-success-then-die flap) WITHOUT ever delivering an application
+/// frame. `recv_peer` pends forever (no inbound), so `last_inbound_at`
+/// never advances — the whole point of the #415 (b2) repro. Used only by
+/// `fleet_death_terminal_fires_under_flapping_leg_with_no_delivery`.
+struct FlappingMembershipPeer {
+    connected: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+}
+
+impl dynrunner_protocol_primary_secondary::PeerTransport<TestId> for FlappingMembershipPeer {
+    async fn broadcast(&mut self, _msg: DistributedMessage<TestId>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn send_to_peer(
+        &mut self,
+        _peer_id: &str,
+        _msg: DistributedMessage<TestId>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    async fn recv_peer(&mut self) -> Option<DistributedMessage<TestId>> {
+        std::future::pending().await
+    }
+    fn try_recv_peer(&mut self) -> Option<DistributedMessage<TestId>> {
+        None
+    }
+    fn peer_count(&self) -> usize {
+        self.connected.borrow().len()
+    }
+    fn has_peer(&self, id: &PeerId) -> bool {
+        self.connected.borrow().contains(id.as_str())
+    }
+    fn connected_ids(&self) -> Vec<PeerId> {
+        self.connected
+            .borrow()
+            .iter()
+            .map(|s| PeerId::from(s.as_str()))
+            .collect()
+    }
+    async fn connect_to_peers(
+        &mut self,
+        _peers: &[dynrunner_protocol_primary_secondary::PeerConnectionInfo],
+    ) {
+    }
+}
+
 /// Mint the Observer mesh trio over `transport` and hand back the
 /// coordinator's `(client, inbox)` plus a PUMP future to drive concurrently
 /// on the same `LocalSet` as `observer.run()`.
@@ -2163,5 +2210,131 @@ async fn stale_snapshot_fleet_death_is_bounded_loud_terminal() {
     .expect(
         "BOUNDED terminal: the observer must exit within the presumption \
          window — the pre-fix behaviour spins on the stale snapshot forever",
+    );
+}
+
+/// #415 face (b2) — the presumed-dead terminal under a FLAPPING leg, the
+/// production-vs-#394-test gap.
+///
+/// run_20260611_155305: the observer sat blind past 20 min WITHOUT ever
+/// rendering the presumed-dead terminal, while it cycled `-R` tunnel
+/// rebuilds (193 "observer rebuilt reverse tunnel" SUCCESSES). The #394
+/// test (`stale_snapshot_fleet_death_is_bounded_loud_terminal`) passes
+/// because its leg view is FLAT zero forever — but production's was not.
+/// A SUCCESSFUL `-R` rebuild re-opens the worker-side listener; a stale /
+/// retrying compute peer (or a lingering wire) momentarily re-registers a
+/// writer in the observer's `outgoing` table, so `peer_count()` flaps
+/// 0→N→0 each rebuild cycle WITHOUT a single application frame ever
+/// arriving (the run is over; no terminal is delivered).
+///
+/// That transient `peer_count > 0` is the bug: the detector treats ANY
+/// wired leg as a full episode reset (`reconnect_attempts = 0`, silence
+/// baseline restarts), so a leg that flaps up faster than the presumption
+/// window keeps resetting the clock — the terminal never fires and the
+/// observer spins on its stale snapshot forever. The fix must require a
+/// leg to actually DELIVER (a fresh inbound frame), not merely register,
+/// before it counts as a sign of life that resets the death presumption.
+///
+/// REVERT-CHECK: with the fix reverted the flapping leg resets the episode
+/// every ~60s and the 4000s outer bound expires with no terminal — the
+/// production blackout verbatim.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fleet_death_terminal_fires_under_flapping_leg_with_no_delivery() {
+    use crate::primary::RunError;
+    use dynrunner_core::{ResourceAmount, ResourceKind};
+
+    tokio::time::timeout(Duration::from_secs(4000), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // The whole-fleet-dead transport view: a leg that flaps
+                // present↔absent (the FlappingMembershipPeer below), inbound
+                // never fed — no application frame ever arrives (run is over).
+                let mut cs = ClusterState::<TestId>::new();
+                for i in 0..10 {
+                    cs.apply(ClusterMutation::PeerJoined {
+                        peer_id: format!("sec-{i}"),
+                        is_observer: false,
+                        can_be_primary: true,
+                        cap_version: Default::default(),
+                        member_gen: 0,
+                    });
+                    cs.apply(ClusterMutation::SecondaryCapacity {
+                        secondary: format!("sec-{i}"),
+                        worker_count: 4,
+                        resources: vec![ResourceAmount {
+                            kind: ResourceKind::memory(),
+                            amount: 1024 * 1024 * 1024,
+                        }],
+                    });
+                }
+
+                let mut config = observer_config("obs");
+                config.fleet_dead_timeout = Duration::from_millis(50);
+                config.fleet_death_presumption = Duration::from_secs(1200);
+
+                // The mesh's membership is read off the transport each pump
+                // cycle. To FLAP `peer_count` (a leg that re-registers on a
+                // rebuild then dies again, delivering nothing) we drive a
+                // shared cell the test toggles 0↔1 on a ~60s cadence — the
+                // rebuild-success-then-die rhythm — directly on the slot the
+                // pump republishes from. The flap is faster than the 1200s
+                // presumption window, so a reset-on-any-wired-leg detector
+                // never accumulates the silence.
+                let connected: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>> =
+                    std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashSet::new()));
+                let peer = FlappingMembershipPeer {
+                    connected: connected.clone(),
+                };
+                let mut mesh = Mesh::<TestId, _>::new(peer);
+                let (slot, client, inbox) =
+                    mesh.register_local_role(LocalRole::Observer, PeerId::from("obs"));
+                mesh.publish_membership();
+                tokio::task::spawn_local(async move {
+                    let _slot = slot;
+                    let (_control, control_rx) = crate::process::pump::control_channel::<TestId>();
+                    crate::process::pump::run_pump(mesh, control_rx).await;
+                });
+                // The flapper: every 60s the leg "re-registers" for a beat
+                // (peer_count 0→1) then drops again — no frame delivered.
+                let flap = connected.clone();
+                tokio::task::spawn_local(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(58)).await;
+                        flap.borrow_mut().insert("sec-0".to_string());
+                        // Held just long enough for the ~100ms pump publish +
+                        // a top-of-loop observe to read it, then dropped.
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        flap.borrow_mut().clear();
+                    }
+                });
+
+                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
+
+                let err = observer.run().await.expect_err(
+                    "the presumed-dead terminal MUST fire within a bounded \
+                     window even though the leg flaps 0→1→0 every ~60s — a \
+                     re-registering leg that never DELIVERS a frame is not a \
+                     sign of life (the run is over). Pre-fix the flap reset \
+                     the episode each cycle and the observer spun forever \
+                     (the run_20260611_155305 blackout).",
+                );
+                match err {
+                    RunError::FatalPolicyExit { reason } => {
+                        assert!(
+                            reason.contains("presumed dead"),
+                            "the verdict carries the fleet-death wording: {reason}"
+                        );
+                    }
+                    other => panic!("expected the bounded FatalPolicyExit, got {other:?}"),
+                }
+            })
+            .await;
+    })
+    .await
+    .expect(
+        "BOUNDED terminal under a flapping no-delivery leg: the observer must \
+         exit within a bounded window — the pre-fix production blackout spun \
+         forever because each rebuild's transient leg reset the presumption",
     );
 }

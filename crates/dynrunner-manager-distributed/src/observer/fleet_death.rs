@@ -121,6 +121,26 @@ impl FleetDeathDetector {
     /// * `last_inbound_at` — when the observer last received ANYTHING
     ///   from ANY member (every inbound frame, regardless of type or
     ///   sender).
+    ///
+    /// # Why a wired leg alone is NOT a sign of life (#415 face (b2))
+    ///
+    /// The ONLY full reset is genuine DELIVERY — a fresh inbound frame
+    /// (`last_inbound_at` advanced since the last check). A transport leg
+    /// merely being PRESENT at the sampling instant is NOT enough: in the
+    /// proven run_20260611_155305 blackout the observer's `-R` rebuilds
+    /// kept SUCCEEDING (193 of them), so a stale/retrying peer (or a
+    /// lingering wire) re-registered a writer for a beat each ~60s rebuild
+    /// cycle — `peer_count()` flapped 0→N→0 — while NOT ONE application
+    /// frame ever arrived (the run was over). The pre-fix detector reset
+    /// the whole episode on any `!zero_legs`, so every flap wiped the
+    /// accumulated silence + the recovery-attempt floor and the presumption
+    /// never tripped: the observer spun on its stale snapshot forever. A
+    /// wired-but-silent leg therefore only BLOCKS the verdict for the tick
+    /// it is up (the mesh might be reachable) — it never resets the silence
+    /// clock. A genuinely live mesh keeps `fresh_inbound` true (its AE
+    /// digests / keepalives arrive every ~20s), so it never approaches the
+    /// LONG presumption threshold; only a mesh that delivers NOTHING for
+    /// the whole window — flapping legs or not — is presumed dead.
     pub(crate) fn observe(
         &mut self,
         zero_legs: bool,
@@ -131,11 +151,20 @@ impl FleetDeathDetector {
             .seen_inbound_at
             .is_some_and(|seen| last_inbound_at > seen);
         self.seen_inbound_at = Some(last_inbound_at);
-        if !zero_legs || fresh_inbound {
-            // Sign of life — full episode reset. The attempts that fired
-            // belonged to an episode that is over.
+        if fresh_inbound {
+            // Genuine delivery — full episode reset. The attempts that
+            // fired belonged to an episode that is over.
             self.reconnect_attempts = 0;
             return FleetDeathVerdict::Alive;
+        }
+        if !zero_legs {
+            // A leg is wired right now but has delivered nothing since the
+            // last check. The mesh MIGHT be reachable, so do not presume it
+            // dead this tick — but do NOT reset the accumulated silence /
+            // attempt floor either (a flapping leg that never delivers is
+            // exactly the blackout this guards). Keep watching; the silence
+            // clock, anchored on `last_inbound_at`, is the sole arbiter.
+            return FleetDeathVerdict::Watching;
         }
         let silence = now.saturating_duration_since(last_inbound_at);
         if silence < self.threshold || self.reconnect_attempts < MIN_RECONNECT_ATTEMPTS {
@@ -198,29 +227,19 @@ mod tests {
         }
     }
 
-    /// A wired leg OR a fresh inbound frame resets the episode — the
-    /// presumption never builds across signs of life.
+    /// Genuine DELIVERY (a fresh inbound frame) resets the episode — the
+    /// presumption never builds across real signs of life. A wired leg
+    /// alone does NOT reset (see `flapping_leg_without_delivery_*`).
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn any_sign_of_life_resets_the_episode() {
+    async fn fresh_inbound_resets_the_episode() {
         let t0 = Instant::now();
         let mut d = FleetDeathDetector::new(Duration::from_secs(100));
-        for _ in 0..5 {
-            d.note_reconnect_attempt();
-        }
-        // Legs present: alive, attempts reset.
-        assert_eq!(
-            d.observe(false, t0, at(t0, 200)),
-            FleetDeathVerdict::Alive,
-            "a wired leg is life regardless of inbound age"
-        );
-        // Legs gone again, silence already past the threshold by age —
-        // but the attempts were reset, so it only watches.
-        assert_eq!(d.observe(true, t0, at(t0, 350)), FleetDeathVerdict::Watching);
+        // Seed `seen_inbound_at` (the first observe never reads as fresh).
+        assert_eq!(d.observe(true, t0, at(t0, 10)), FleetDeathVerdict::Watching);
         for _ in 0..3 {
             d.note_reconnect_attempt();
         }
-        // A FRESH inbound frame (newer last_inbound_at) is life even with
-        // zero legs at sampling time.
+        // A FRESH inbound frame (newer last_inbound_at) is life — full reset.
         assert_eq!(
             d.observe(true, at(t0, 400), at(t0, 401)),
             FleetDeathVerdict::Alive,
@@ -239,6 +258,53 @@ mod tests {
             d.observe(true, at(t0, 400), at(t0, 500)),
             FleetDeathVerdict::PresumedDead { .. }
         ));
+    }
+
+    /// #415 face (b2) — a leg that FLAPS up (present at the sampling
+    /// instant) but DELIVERS NOTHING must NOT reset the death presumption.
+    ///
+    /// The run_20260611_155305 mechanism: successful `-R` rebuilds
+    /// re-registered a transport writer for a beat each ~60s cycle
+    /// (`peer_count()` flapped 0→N→0) while no application frame ever
+    /// arrived. Pre-fix the `!zero_legs` arm reset `reconnect_attempts` +
+    /// the silence baseline on every flap, so the presumption never
+    /// accumulated and the observer spun forever. Post-fix the wired-but-
+    /// silent leg only blocks the verdict for the tick it is up; the
+    /// silence keeps accruing across flaps and the bounded terminal fires.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn flapping_leg_without_delivery_still_reaches_presumed_dead() {
+        let t0 = Instant::now();
+        let mut d = FleetDeathDetector::new(Duration::from_secs(300));
+        let last_inbound = t0; // never advances — nothing is delivered, ever
+        // Seed `seen_inbound_at`.
+        assert_eq!(
+            d.observe(true, last_inbound, t0),
+            FleetDeathVerdict::Watching
+        );
+        // Drive ~6 minutes of flapping: a recovery cycle fires each minute,
+        // and at every minute boundary the leg is briefly UP (zero_legs =
+        // false) — the rebuild-success flap — yet no frame is delivered.
+        for m in 1..=6 {
+            d.note_reconnect_attempt();
+            // The "up" beat of the flap: a wired leg, but no delivery.
+            assert_eq!(
+                d.observe(false, last_inbound, at(t0, m * 60)),
+                FleetDeathVerdict::Watching,
+                "a wired-but-silent leg blocks the verdict this tick but \
+                 must NOT reset the episode (minute {m})"
+            );
+        }
+        // Past the threshold, sampled on a "down" beat: the silence has
+        // accrued across every flap and recovery was driven — PRESUMED DEAD.
+        match d.observe(true, last_inbound, at(t0, 400)) {
+            FleetDeathVerdict::PresumedDead { reason } => {
+                assert!(reason.contains("presumed dead"), "{reason}");
+            }
+            other => panic!(
+                "a flapping leg that never delivers must still reach the \
+                 bounded terminal; got {other:?}"
+            ),
+        }
     }
 
     /// Silence alone never trips the verdict: without the recovery-cycle
