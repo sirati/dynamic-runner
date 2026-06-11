@@ -4,7 +4,7 @@
 //! terminal error.
 //!
 //! Single concern: deadline + partial-fleet semantics. Drives the
-//! senders directly so the tests don't depend on `production_spawner`
+//! senders directly so the tests don't depend on `tunnel_spawner`
 //! (real `ssh`) or the info-file polling loop. The companion
 //! pipeline-level test `timeout_when_no_secondary_ready` covers the
 //! same zero-fleet branch through the public `setup_ssh_tunnels`

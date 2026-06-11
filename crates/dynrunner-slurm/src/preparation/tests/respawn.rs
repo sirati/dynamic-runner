@@ -18,6 +18,7 @@ use tokio::task::JoinSet;
 use crate::preparation::SlurmPreparation;
 use crate::preparation::establish::establish_one_tunnel_inner;
 use crate::preparation::options::{InfoFileReader, PrepError};
+use crate::preparation::policy::EstablishmentPolicy;
 use crate::preparation::store::SharedTunnelVec;
 
 use super::establish::{alive_child, fail_child, listening_inner_verifier};
@@ -186,7 +187,7 @@ fn establish_one_tunnel_applies_rate_limiter() {
 /// This is the unit pin of the BUG-fix DECISION, driven through the
 /// SAME [`establish_one_tunnel_inner`] seam the production
 /// `reestablish_one_tunnel` uses, with the spawner shaped exactly like
-/// the production `reconnect_spawner` (a release-action followed by a
+/// the production `tunnel_spawner` (a release-action followed by a
 /// spawn-action). It models the worker-side state directly — no real
 /// ssh — via a shared `port_in_use` flag:
 ///
@@ -217,7 +218,7 @@ fn reconnect_release_then_rebind_same_port_succeeds_vs_reuse_fails() {
     // "port in use" the production tunnel hits; once released it
     // returns a long-lived child that passes the verify gate. The
     // `release` flag, when set by the spawner, models the production
-    // `reconnect_spawner` clearing the stale binding before the spawn.
+    // `tunnel_spawner` clearing the stale binding before the spawn.
     fn spawn_for(port_in_use: &Arc<AtomicBool>) -> Child {
         if port_in_use.load(Ordering::SeqCst) {
             fail_child(
@@ -257,7 +258,7 @@ fn reconnect_release_then_rebind_same_port_succeeds_vs_reuse_fails() {
                 move |_host, _port| {
                     let piu = Arc::clone(&piu);
                     async move {
-                        // reconnect_spawner shape: RELEASE the stale
+                        // tunnel_spawner shape: RELEASE the stale
                         // binding, then spawn the SAME-port rebind.
                         piu.store(false, Ordering::SeqCst);
                         Ok(spawn_for(&piu))
@@ -289,7 +290,7 @@ fn reconnect_release_then_rebind_same_port_succeeds_vs_reuse_fails() {
                 &pool2,
                 move |_host, _port| {
                     let piu2 = Arc::clone(&piu2);
-                    // production_spawner shape: no release — the stale
+                    // Pre-fix counterfactual: no release — the stale
                     // binding stays, every attempt collides.
                     async move { Ok(spawn_for(&piu2)) }
                 },
@@ -316,6 +317,166 @@ fn reconnect_release_then_rebind_same_port_succeeds_vs_reuse_fails() {
             );
         }
         other => panic!("expected reuse-without-release to fail rc=255, got {other:?}"),
+    }
+}
+
+/// PHANTOM-TUNNEL closer (#408): the COHORT/first-try path must release
+/// the worker-side port before its FIRST bind — not only on retries.
+///
+/// The worker-side state fixture is the same `port_in_use` proxy the
+/// reconnect test uses: a stale holder is present at the very first
+/// bind (a prior run's partial `-R` leftover on a kernel-reused
+/// ephemeral port, or a transient squatter — the holder the bind-probe
+/// cannot tell from a healthy listener). A bind while it is held fails
+/// rc=255 (the bind-probe would otherwise "verify" against the holder
+/// and leave the worker dialing a dead port forever — the phantom).
+///
+/// ARM 1 mirrors the UNIFIED spawner (release-before-EVERY-bind,
+/// including attempt 0): the first bind is clean and the tunnel
+/// establishes on attempt 1 — `attempts == 1`, no retry budget spent.
+/// ARM 2 mirrors the PRE-FIX cohort wiring (`OnRetry`: skip the first
+/// release): with a single-attempt budget the only bind collides with
+/// the never-cleared holder and the establishment fails. The single
+/// differentiator is the first-attempt release — proving it is the
+/// phantom closer.
+#[test]
+fn cohort_release_before_first_bind_clears_phantom() {
+    use std::sync::atomic::AtomicBool;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+
+    fn spawn_for(port_in_use: &Arc<AtomicBool>) -> Child {
+        if port_in_use.load(Ordering::SeqCst) {
+            fail_child(
+                "Warning: remote port forwarding failed for listen port",
+                255,
+            )
+        } else {
+            alive_child()
+        }
+    }
+
+    let (with_first_release, attempts_with, without_first_release): (
+        Result<u16, PrepError>,
+        usize,
+        Result<u16, PrepError>,
+    ) = rt.block_on(local.run_until(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut opts = opts_for(&tmp);
+        // Single attempt, no backoff: each arm gets EXACTLY ONE bind, so
+        // the only variable is whether THAT bind is preceded by a
+        // release. (A multi-attempt policy would let ARM 2's 2nd attempt
+        // release and mask the first-bind regression.)
+        opts.establishment = EstablishmentPolicy {
+            max_concurrent: 1,
+            attempts: 1,
+            backoff: vec![],
+            per_tunnel_timeout: Duration::from_secs(30),
+        };
+
+        // ---- ARM 1: unified spawner — RELEASE before the FIRST bind ----
+        let port_in_use = Arc::new(AtomicBool::new(true)); // holder present at t=0
+        let tunnels: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
+        let store = SharedTunnelVec::new(Arc::clone(&tunnels));
+        let port_map: Arc<StdMutex<HashMap<String, u16>>> = Arc::new(StdMutex::new(HashMap::new()));
+        let pool = Arc::new(Semaphore::new(1));
+        let reader = CannedUriReader {
+            uri: "tcp://compute-9:40000".into(),
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let piu = Arc::clone(&port_in_use);
+        let att = Arc::clone(&attempts);
+        let with_first_release = establish_one_tunnel_inner(
+            "secondary-0",
+            "/unused",
+            51000,
+            &opts,
+            reader,
+            &store,
+            &port_map,
+            &pool,
+            move |_host, _port| {
+                let piu = Arc::clone(&piu);
+                let att = Arc::clone(&att);
+                async move {
+                    att.fetch_add(1, Ordering::SeqCst);
+                    // Unified spawner: release BEFORE the bind, every
+                    // attempt — so the very first bind is clean.
+                    piu.store(false, Ordering::SeqCst);
+                    Ok(spawn_for(&piu))
+                }
+            },
+            listening_inner_verifier(),
+        )
+        .await;
+        let attempts_with = attempts.load(Ordering::SeqCst);
+
+        // ---- ARM 2: pre-fix cohort wiring — SKIP the first release ----
+        let port_in_use2 = Arc::new(AtomicBool::new(true)); // holder present at t=0
+        let tunnels2: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
+        let store2 = SharedTunnelVec::new(Arc::clone(&tunnels2));
+        let port_map2: Arc<StdMutex<HashMap<String, u16>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
+        let pool2 = Arc::new(Semaphore::new(1));
+        let reader2 = CannedUriReader {
+            uri: "tcp://compute-9:40000".into(),
+        };
+        let prior2 = Arc::new(AtomicUsize::new(0));
+        let piu2 = Arc::clone(&port_in_use2);
+        let prior2c = Arc::clone(&prior2);
+        let without_first_release = establish_one_tunnel_inner(
+            "secondary-0",
+            "/unused",
+            51000,
+            &opts,
+            reader2,
+            &store2,
+            &port_map2,
+            &pool2,
+            move |_host, _port| {
+                let piu2 = Arc::clone(&piu2);
+                let prior2c = Arc::clone(&prior2c);
+                async move {
+                    // OnRetry shape: release only from the 2nd attempt
+                    // on. With a single-attempt budget the first (only)
+                    // bind never gets a release.
+                    if prior2c.fetch_add(1, Ordering::SeqCst) > 0 {
+                        piu2.store(false, Ordering::SeqCst);
+                    }
+                    Ok(spawn_for(&piu2))
+                }
+            },
+            listening_inner_verifier(),
+        )
+        .await;
+
+        (with_first_release, attempts_with, without_first_release)
+    }));
+
+    // ARM 1: release-before-first-bind establishes on the FIRST attempt.
+    let port = with_first_release
+        .expect("release-before-first-bind must establish the cohort tunnel on attempt 1");
+    assert_eq!(port, 40000, "the clean bind uses the worker's fixed port");
+    assert_eq!(
+        attempts_with, 1,
+        "a clean first bind must NOT need a retry — the phantom is closed up front"
+    );
+
+    // ARM 2: skipping the first release leaves the holder; with a single
+    // attempt the establishment never recovers — the phantom.
+    match without_first_release {
+        Err(PrepError::TunnelFailed { rc, stderr, .. }) => {
+            assert_eq!(rc, Some(255), "no-first-release collides with the holder");
+            assert!(
+                stderr.contains("remote port forwarding failed"),
+                "expected the port-in-use phantom failure, got {stderr:?}"
+            );
+        }
+        other => panic!("expected no-first-release to phantom (rc=255), got {other:?}"),
     }
 }
 

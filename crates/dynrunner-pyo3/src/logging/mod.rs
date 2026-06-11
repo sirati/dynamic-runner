@@ -689,10 +689,35 @@ pub(crate) fn py_log(level: &str, record_target: &str, message: &str) {
 /// or line-buffered `io::stdout`) writers, so a single newline-terminated
 /// emit is durable before the process exits — no separate Rust-side flush is
 /// needed.
+///
+/// `level` selects the tracing level the event is emitted at. It defaults to
+/// `"ERROR"` so the existing fatal-surfacing caller
+/// (`logging_setup.surface_fatal_errors`) is unchanged. Non-fatal Python
+/// callers (the bring-up milestone emits) pass `"INFO"` so a routine
+/// milestone is not recorded as an error in the full log — the importance
+/// gate is target-only (level-independent), so every level still reaches the
+/// `--important-stdio-only` operator stream. `tracing::event!` needs a
+/// compile-time-constant level, so the runtime name selects one of the
+/// const-level emits; an unrecognised name degrades to INFO (a milestone is
+/// a real line, never dropped).
 #[pyfunction]
-#[pyo3(name = "py_log_important", signature = (message))]
-pub(crate) fn py_log_important(message: &str) {
-    tracing::event!(target: IMPORTANT_TARGET, tracing::Level::ERROR, "{message}");
+#[pyo3(name = "py_log_important", signature = (message, level = "ERROR"))]
+pub(crate) fn py_log_important(message: &str, level: &str) {
+    match level {
+        "CRITICAL" | "ERROR" => {
+            tracing::event!(target: IMPORTANT_TARGET, tracing::Level::ERROR, "{message}")
+        }
+        "WARNING" | "WARN" => {
+            tracing::event!(target: IMPORTANT_TARGET, tracing::Level::WARN, "{message}")
+        }
+        "DEBUG" => tracing::event!(target: IMPORTANT_TARGET, tracing::Level::DEBUG, "{message}"),
+        "TRACE" | "NOTSET" => {
+            tracing::event!(target: IMPORTANT_TARGET, tracing::Level::TRACE, "{message}")
+        }
+        // "INFO" and any unrecognised name: a milestone is a real line, so
+        // never drop it — default to INFO.
+        _ => tracing::event!(target: IMPORTANT_TARGET, tracing::Level::INFO, "{message}"),
+    }
 }
 
 /// Flush the importance-mode debounced stdio buffer immediately, if installed;
@@ -1530,7 +1555,7 @@ mod tests {
         let subscriber = Registry::default().with(layers).with(LevelFilter::INFO);
         with_default(subscriber, || {
             // The fatal-error primitive — emits at the IMPORTANT target.
-            py_log_important("SLURM dispatch failed: boom");
+            py_log_important("SLURM dispatch failed: boom", "ERROR");
             // A regular bridged Python record — emits at BRIDGE_TARGET.
             py_log("ERROR", "consumer.cli", "routine-bridge-error");
         });

@@ -8,10 +8,10 @@ use tokio::task::JoinSet;
 
 use crate::preparation::options::{PrepError, PreparationOptions};
 use crate::preparation::ssh::{
-    BindProbe, LingerLedger, LingerVerb, ReleaseBeforeSpawn, TunnelFailureClass,
-    build_bind_probe_argv, build_linger_argv, build_release_argv, build_ssh_argv,
-    classify_tunnel_failure, linger_fail_reason, linger_succeeded, parse_bind_probe,
-    parse_was_linger, release_before_attempt, verify_tunnel_alive, was_linger_from_probe,
+    BindProbe, LingerLedger, LingerVerb, TunnelFailureClass, build_bind_probe_argv,
+    build_linger_argv, build_release_argv, build_ssh_argv, classify_tunnel_failure,
+    linger_fail_reason, linger_succeeded, parse_bind_probe, parse_was_linger, verify_tunnel_alive,
+    was_linger_from_probe,
 };
 
 /// Ssh spawn argv shape (no auth-options): -J jump_target form,
@@ -773,21 +773,12 @@ fn parse_bind_probe_inconclusive_on_missing_tool_or_marker() {
     }
 }
 
-/// Spawner release semantics: the cohort/respawn spawner
-/// (`OnRetry`) keeps the FIRST attempt release-free (a fresh port,
-/// no round-trip tax on the healthy path) and releases on every
-/// RETRY (the prior attempt failed, so the worker may still hold the
-/// fixed port — partial bind leftover, stale forward, or the
-/// squatter); the observer-reconnect spawner (`Always`) releases on
-/// every attempt.
-#[test]
-fn release_before_attempt_modes() {
-    assert!(!release_before_attempt(ReleaseBeforeSpawn::OnRetry, 0));
-    assert!(release_before_attempt(ReleaseBeforeSpawn::OnRetry, 1));
-    assert!(release_before_attempt(ReleaseBeforeSpawn::OnRetry, 2));
-    assert!(release_before_attempt(ReleaseBeforeSpawn::Always, 0));
-    assert!(release_before_attempt(ReleaseBeforeSpawn::Always, 1));
-}
+// The worker-side port release now runs before EVERY bind (incl. the
+// first), with no per-attempt mode to branch on — one `tunnel_spawner`
+// serves the cohort, respawn, and reconnect paths identically. The
+// release-before-bind behavior that closes the phantom (#408) is pinned
+// end-to-end against the stale-holder fixture in
+// `tests/respawn.rs::cohort_release_before_first_bind_clears_phantom`.
 
 /// THE failure classifier (one function, both classes, real stderr
 /// shapes): pre-banner connection loss — the probabilistic sshd
@@ -828,9 +819,11 @@ fn classifier_pre_banner_drop_is_transient() {
 }
 
 /// Auth-class refusals — wrong/missing key, unknown user (the
-/// asm-dataset provisioning gap), host-key rejection, post-banner
-/// close — are DETERMINISTIC: every retry refuses identically, so
-/// the classifier must steer the policy to fail fast.
+/// asm-dataset provisioning gap), host-key rejection, too-many-auth —
+/// are DETERMINISTIC: every retry refuses identically (ssh emits an
+/// explicit auth marker), so the classifier must steer the policy to
+/// fail fast. These markers are the ONLY positive proof of an
+/// auth-class refusal.
 #[test]
 fn classifier_auth_class_is_deterministic() {
     assert_eq!(
@@ -850,11 +843,27 @@ fn classifier_auth_class_is_deterministic() {
         ),
         TunnelFailureClass::Deterministic
     );
-    // Bare post-banner close (sshd disconnected after rejected auth
-    // attempts) — no pre-banner marker present.
+}
+
+/// REGRESSION (#408): a bare post-banner "Connection closed by <addr>
+/// port <p>" — no pre-banner `kex_`/`UNKNOWN` marker, no explicit auth
+/// marker — is TRANSIENT, not deterministic. On the establish burst a
+/// busy worker sshd load-sheds an already-authenticated session after
+/// the banner, emitting exactly this line; a retry (with its same-port
+/// release+rebind) virtually always lands. The 31e689bc classifier
+/// wrongly fast-failed it, removing the retry that load-shed closes
+/// depend on. A genuine auth refusal still carries a step-1 marker, so
+/// only the ambiguous bare close changes class here.
+#[test]
+fn classifier_bare_post_banner_close_is_transient() {
     assert_eq!(
         classify_tunnel_failure("Connection closed by 10.153.52.8 port 22"),
-        TunnelFailureClass::Deterministic
+        TunnelFailureClass::Transient
+    );
+    // Same shape with the trailing newline ssh appends.
+    assert_eq!(
+        classify_tunnel_failure("Connection closed by 10.153.52.8 port 22\r\n"),
+        TunnelFailureClass::Transient
     );
 }
 

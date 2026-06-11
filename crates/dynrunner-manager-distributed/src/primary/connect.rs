@@ -25,6 +25,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let deadline = tokio::time::Instant::now() + self.config.connect_timeout;
         let expected = self.config.num_secondaries as usize;
 
+        // Whether the wait exits via the quorum-proceed timeout arm
+        // (k<expected welcomed) rather than the full-fleet break. Drives
+        // the bring-up milestone's full-vs-quorum phrasing after the loop
+        // — set ONCE in the timeout arm so the single post-loop emit reads
+        // it without re-deriving the count comparison.
+        let mut proceeded_at_quorum = false;
+
         // Setup-liveness beacon: the SAME jittered anti-entropy digest
         // cadence every other waiting state already runs (the secondary's
         // `wait_for_setup`, this primary's `operational_loop`, the observer
@@ -217,22 +224,44 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                          no tasks lost)"
                     );
                     self.config.num_secondaries = cert_done as u32;
+                    proceeded_at_quorum = true;
                     break;
                 }
             }
         }
 
-        // Whole-cluster-ready milestone (the LLM-wake "connected to
-        // gateway" event): every connected secondary has completed
-        // cert-exchange, so the mesh is formed and the run can proceed.
-        // Emitted at the importance target so the dual-sink routes it
-        // to stdio under `--important-stdio-only` while the full log
-        // keeps it too.
-        tracing::info!(
-            target: super::important_events::IMPORTANT_TARGET,
-            secondaries = self.secondaries.len(),
-            "all secondaries connected",
-        );
+        // Whole-cluster-ready milestone (the LLM-wake "all secondaries
+        // connected" bring-up event): every connected secondary has
+        // completed cert-exchange, so the mesh is formed and the run can
+        // proceed. Emitted at the importance target so the dual-sink
+        // routes it to stdio under `--important-stdio-only` while the full
+        // log keeps it too.
+        //
+        // The two loop-exit paths the operator must be able to tell apart:
+        // a FULL fleet (every requested secondary welcomed) vs a
+        // QUORUM-proceed (the straggler window expired with k<requested,
+        // the missing ones already dropped from the dispatch). Both report
+        // k/n so an LLM woken on stdio sees the actual fleet size; the
+        // quorum case additionally says it is proceeding at reduced
+        // parallelism. `expected` is the ORIGINAL requested count captured
+        // before the timeout arm overwrote `self.config.num_secondaries`.
+        let connected = self.secondaries.len();
+        if proceeded_at_quorum {
+            tracing::info!(
+                target: super::important_events::IMPORTANT_TARGET,
+                connected,
+                requested = expected,
+                "secondaries connected at quorum: {connected}/{expected} \
+                 welcomed; proceeding at reduced parallelism",
+            );
+        } else {
+            tracing::info!(
+                target: super::important_events::IMPORTANT_TARGET,
+                connected,
+                requested = expected,
+                "all secondaries connected: {connected}/{expected}",
+            );
+        }
         Ok(())
     }
 

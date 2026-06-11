@@ -4,7 +4,7 @@
 //! and the single-respawn path
 //! ([`SlurmPreparation::establish_one_tunnel`](super::pipeline::SlurmPreparation::establish_one_tunnel)).
 //! Ssh wire-up is delegated to a spawner closure (production-bound to
-//! [`production_spawner`](super::ssh::production_spawner)); tests
+//! [`tunnel_spawner`](super::ssh::tunnel_spawner)); tests
 //! supply an in-memory variant.
 
 use std::collections::HashMap;
@@ -131,7 +131,7 @@ where
         tokio::time::sleep(opts.poll_interval).await;
     };
     // `primary_quic_port` is captured by the production spawner
-    // closure (see `production_spawner`). For test stubs that don't
+    // closure (see `tunnel_spawner`). For test stubs that don't
     // touch ssh, it's passed in for parity but ignored.
     let _ = primary_quic_port;
     // Delegate spawn + verify + rate-limit + retry to a single
@@ -205,8 +205,8 @@ where
 /// * `NotListening` — definite miss: the child is terminated and the
 ///   attempt counts as failed; the retry respawns on the SAME port
 ///   (the worker's dial target is fixed at worker startup) after the
-///   spawner's retry-release reclaims it — see
-///   `ReleaseBeforeSpawn::OnRetry` in [`super::ssh`].
+///   spawner's pre-bind release reclaims it — see
+///   [`tunnel_spawner`](super::ssh::tunnel_spawner) in [`super::ssh`].
 /// * `Inconclusive` — probe infrastructure failure (`ss` missing,
 ///   probe ssh died): WARN and KEEP the gate-verified tunnel; the
 ///   probe's own availability must never kill tunnels that met the
