@@ -330,6 +330,19 @@ pub(super) fn run_preparation<'py>(
     }
     log.call_method1("info", (format!("All {num_secondaries} jobs submitted"),))?;
 
+    // All-jobs-queued milestone (LLM-wake): occurrence point is the end of
+    // the sbatch submit-loop — every secondary's batch script is now on the
+    // controller's queue. The next setup steps (reverse-tunnel wire-up, the
+    // primary's welcome wait) can take minutes, so an operator watching
+    // `--important-stdio-only` learns the queue half of bring-up finished
+    // before the connect wait begins. Direct importance emit so the
+    // dual-sink surfaces it on stdio; the full log keeps it too.
+    tracing::info!(
+        target: IMPORTANT_TARGET,
+        jobs = num_secondaries,
+        "all {num_secondaries} SLURM jobs queued",
+    );
+
     // Optional reverse-tunnel setup. Owns the per-secondary
     // `ssh -N -R` lifecycle; the watcher state machine + subprocess
     // teardown live in the `RustSlurmPreparation` pyclass.

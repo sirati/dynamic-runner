@@ -79,9 +79,12 @@ import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 from .gateway import expand_gateway_tilde, retry_transient
+
+if TYPE_CHECKING:
+    from .upload_milestones import UploadProgressReporter
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +369,7 @@ class LayeredUploader:
         output_path: Path,
         *,
         force_reassemble: bool = False,
+        reporter: "UploadProgressReporter | None" = None,
     ) -> UploadStats:
         """Upload missing blobs from `bundle`, then ensure
         `output_path` on the gateway is a fully-formed docker-archive
@@ -376,6 +380,16 @@ class LayeredUploader:
         marker already records this bundle's `manifest_digest` AND
         `<output_path>` exists. That makes a "no blobs changed" run
         an O(1)-network operation.
+
+        `reporter` (optional) receives the bring-up milestones for this
+        transfer — START with the cache-miss totals, one `blob_done` per
+        uploaded blob, and a terminal FINISHED / SKIPPED. The transfer
+        loop is the single owner of "what went on the wire"; the reporter
+        owns the milestone phrasing, the per-minute progress timer, and
+        the IMPORTANT-stream emit (see
+        :mod:`dynamic_runner.packaging.upload_milestones`). When omitted,
+        the upload is silent on the milestone stream (the per-blob DEBUG
+        logs below are unaffected either way).
         """
         self.ensure_layout()
 
@@ -392,9 +406,30 @@ class LayeredUploader:
             _human(sum(b.size for b in missing)),
         )
 
+        # Milestone START (or SKIPPED when every blob is already cached):
+        # the reporter arms its per-minute progress timer here and emits
+        # the up-front totals; an all-hits run transfers nothing, so it is
+        # the layered analogue of the whole-image cache hit.
+        if reporter is not None:
+            if missing:
+                reporter.start(
+                    total_blobs=len(missing),
+                    total_bytes=sum(b.size for b in missing),
+                )
+            else:
+                reporter.skipped(
+                    f"all {len(bundle.all_blobs)} blobs already cached "
+                    f"({_human(bytes_skipped)})"
+                )
+
         bytes_uploaded = 0
         for blob in missing:
-            bytes_uploaded += self._upload_blob(blob)
+            uploaded = self._upload_blob(blob)
+            bytes_uploaded += uploaded
+            if reporter is not None:
+                reporter.blob_done(uploaded)
+        if reporter is not None and missing:
+            reporter.finish()
 
         # Gate reassembly on the marker so a second run with no blob
         # changes doesn't even rebuild the tarball.

@@ -44,11 +44,14 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..deployment_spec import TaskDeploymentSpec
 from .gateway import expand_gateway_tilde, retry_transient
 from .layered_transfer import LayeredUploader, UploadStats, make_bundle_from_archive
+
+if TYPE_CHECKING:
+    from .upload_milestones import UploadProgressReporter
 
 logger = logging.getLogger(__name__)
 
@@ -433,20 +436,37 @@ class PodmanPackaging:
         legacy `remote_path` keeps its `podman load`-compatible
         contents via gateway-side reassembly.
         """
+        from .upload_milestones import UploadProgressReporter
+
         local_hash = self._compute_sha256(local_path)
         remote_marker_hash = self._read_remote_file(gateway, marker_path)
         remote_exists = self._remote_file_exists(gateway, remote_path)
 
+        # Single owner of the upload bring-up milestones for this image:
+        # one reporter drives the SKIPPED (cache hit / all-blobs-cached) vs
+        # STARTED → per-minute PROGRESS → FINISHED milestone stream across
+        # whichever transfer branch runs below. The transfer code stays
+        # milestone-agnostic — the layered uploader receives the reporter
+        # and notifies it per blob; the fallback brackets its single
+        # transfer with start/finish.
+        reporter = UploadProgressReporter(label)
+
         if remote_marker_hash == local_hash and remote_exists:
             logger.info("%s image cache hit: reusing remote %s", label, remote_path)
+            reporter.skipped("cached (remote artifact matches local image hash)")
             return (False, local_hash)
 
         logger.info("%s image upload required (hash mismatch or missing remote artifact).", label)
         if self.layered_transfer and layer_cache_root is not None:
-            self._upload_layered(gateway, local_path, remote_path, layer_cache_root, label)
+            self._upload_layered(gateway, local_path, remote_path, layer_cache_root, label, reporter)
         else:
             gateway.execute_command(f"rm -f {remote_path}")
-            self._upload_artifact(gateway, local_path, remote_path)
+            reporter.start(total_blobs=1, total_bytes=local_path.stat().st_size)
+            try:
+                self._upload_artifact(gateway, local_path, remote_path)
+                reporter.blob_done(local_path.stat().st_size)
+            finally:
+                reporter.finish()
         gateway.execute_command(f"printf '%s\n' '{local_hash}' > {marker_path}")
         logger.info("%s image uploaded; marker updated at %s", label, marker_path)
         return (True, local_hash)
@@ -458,12 +478,18 @@ class PodmanPackaging:
         remote_path: Path,
         layer_cache_root: Path,
         label: str,
+        reporter: "UploadProgressReporter | None" = None,
     ) -> UploadStats:
-        """Layered upload path: extract → push missing blobs → reassemble."""
+        """Layered upload path: extract → push missing blobs → reassemble.
+
+        `reporter` (when given) receives the per-blob bring-up milestones
+        from the uploader's transfer loop; `_maybe_upload` owns its
+        lifecycle, so this method just threads it through.
+        """
         bundle, scratch = make_bundle_from_archive(local_path)
         try:
             uploader = LayeredUploader(gateway, layer_cache_root)
-            stats = uploader.upload(bundle, remote_path)
+            stats = uploader.upload(bundle, remote_path, reporter=reporter)
             logger.info(
                 "%s image layered upload: %d/%d blobs sent (%s on the wire, %s deduplicated, %.0f%% cache hit)",
                 label,
