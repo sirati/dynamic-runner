@@ -691,12 +691,28 @@ where
                     // trio), so the whole fleet no longer dies on its deadline.
                     // `interval.tick` is cancel-safe (tokio docs).
                     _ = setup_election_interval.tick() => {
+                        // Own-tick-health gate FIRST (the SAME shared
+                        // authority the operational keepalive arm and the
+                        // primary's heartbeat sweep feed): a setup-election
+                        // tick that fires long past its cadence means THIS
+                        // node's runtime was frozen/starved, so the
+                        // `silent_for` it would measure reflects OUR stall,
+                        // not the primary's silence. `starved` defers the
+                        // ARM this tick (the primary may simply be unheard
+                        // because we couldn't process its setup frames), and
+                        // the re-based trustworthy floor clamps the seeded
+                        // `primary_last_seen` in the election legs of
+                        // `drive_setup_election_tick` (#423).
+                        let starved =
+                            self.own_tick_health.observe_tick(std::time::Instant::now());
                         // `setup_deadline` is built on `tokio::time::Instant`
                         // (the same clock its `sleep_until` reader uses), so
                         // measure the silence against `tokio::time::Instant::now()`.
                         let silent_for = tokio::time::Instant::now()
                             .saturating_duration_since(self.setup_deadline.anchor());
-                        self.maybe_arm_setup_election(silent_for);
+                        if !starved {
+                            self.maybe_arm_setup_election(silent_for);
+                        }
                         self.drive_setup_election_tick().await;
                     }
                     // Wait-mark narration (the owner's 30s/1m/5m schedule;
