@@ -104,4 +104,9 @@ pub enum MessageType {
     /// is dead — prune your entry for me and re-dial." Consumed by the
     /// transport's recv path; the application layer never observes it.
     RedialRequest,
+    /// Wire-only chunk of one oversized chunk-eligible framework frame
+    /// (the `ClusterSnapshot` wire-cap fix). Split and reassembled
+    /// entirely inside the framing layer's framed-IO pumps; the
+    /// application layer (and even the Router) never observes it.
+    FrameChunk,
 }

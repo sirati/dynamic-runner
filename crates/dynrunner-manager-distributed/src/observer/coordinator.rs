@@ -83,6 +83,7 @@ use crate::anti_entropy::{self, RequesterIdentity};
 use crate::cluster_state::ClusterState;
 use crate::observer::announcer::{AnnouncerOutboxItem, PeerMeshAnnouncerSender};
 use crate::observer::failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
+use crate::observer::fleet_death::{FleetDeathDetector, FleetDeathVerdict};
 use crate::observer::lifecycle::{AnnouncerHandle, attach_observer_announcer};
 use crate::observer::lost_visibility::{
     EndedOutage, LostVisibilityReporter, MeshLiveness, RetryDirective, Visibility, WakeNoteSlot,
@@ -135,6 +136,26 @@ pub struct ObserverConfig {
     pub panik_watcher_paths: Vec<std::path::PathBuf>,
     /// Panik poll cadence.
     pub panik_watcher_poll_interval: Duration,
+    /// LAST-RESORT fleet-death presumption threshold (see
+    /// [`crate::observer::fleet_death`]): how long NOTHING may be
+    /// received from ANY member — with the transport showing zero live
+    /// legs and ≥3 driven reconnect recovery cycles failed — before the
+    /// observer stops spinning on its stale CRDT snapshot, reports
+    /// fleet-unreachable-presumed-dead loudly, and exits non-zero.
+    /// Deliberately LONG (default
+    /// [`Self::DEFAULT_FLEET_DEATH_PRESUMPTION`], 20 minutes — far past
+    /// the `peer_timeout`, the keepalive family, and the 5-minute
+    /// wake-loss threshold) so the never-fatal report-and-retry
+    /// machinery (BUG-B / rc-B) stays the primary behaviour; this is the
+    /// bounded terminal behind it, never a replacement for it.
+    pub fleet_death_presumption: Duration,
+}
+
+impl ObserverConfig {
+    /// Default for [`Self::fleet_death_presumption`]: 20 minutes — 4× the
+    /// default 300s `peer_timeout` and 4× the 5-minute wake-loss
+    /// threshold, i.e. "far past every timeout in the system".
+    pub const DEFAULT_FLEET_DEATH_PRESUMPTION: Duration = Duration::from_secs(1200);
 }
 
 /// Everything a relocation hands to a freshly-spun observer so it
@@ -805,6 +826,22 @@ where
             let mut visibility_reporter = LostVisibilityReporter::new(self.wake_note.clone());
             let mut primary_last_seen = Instant::now();
             let mut transport_closed = false;
+            // LAST-RESORT fleet-death presumption (see `fleet_death.rs`):
+            // tracks the one bounded terminal the never-fatal
+            // report-and-retry machinery above deliberately never renders.
+            // Fed at top-of-loop from the observer's OWN present-tense
+            // evidence — its transport leg view + the last-received-
+            // ANYTHING clock below — never from the (possibly stale) CRDT
+            // snapshot.
+            let mut fleet_death =
+                FleetDeathDetector::new(self.config.fleet_death_presumption);
+            // When the observer last received ANYTHING from ANY member
+            // (every inbound frame, regardless of type/sender). Seeded at
+            // loop entry so the presumption clock starts from "now", not
+            // from process epoch. A `tokio::time::Instant` (not the file's
+            // std `Instant`) so paused-clock tests drive the presumption
+            // window in virtual time, matching the detector's clock.
+            let mut last_inbound_at = tokio::time::Instant::now();
 
             // Visibility re-check poll tick: the same cadence as before, but
             // it is NO LONGER a death timer — it only re-drives the loop so
@@ -902,6 +939,10 @@ where
                 );
                 if outcome.directive == RetryDirective::ReconnectDue {
                     self.trigger_reconnect();
+                    // One recovery cycle driven — the fleet-death attempt
+                    // floor counts these (recovery must have been TRIED,
+                    // and failed, before the presumption may trip).
+                    fleet_death.note_reconnect_attempt();
                 }
                 // A LOGGED outage just regained visibility: forward the
                 // ended-outage signal to the periodic reporter, which owns
@@ -910,6 +951,29 @@ where
                 // channel means the reporter task is already torn down.
                 if let Some(ended) = outcome.ended_logged_outage {
                     let _ = outage_tx.send(ended);
+                }
+                // LAST-RESORT fleet-death presumption (after the
+                // report-and-retry machinery above has had its turn —
+                // ordering is the rc-B contract). The inputs are the
+                // observer's OWN present-tense evidence: zero live
+                // transport legs + the last-received-anything clock —
+                // NEVER the CRDT snapshot, whose membership ledger freezes
+                // alive-looking when a fleet dies without originating
+                // `PeerRemoved` (the asm-dataset LMU "still shows 10 live
+                // members … running autonomously" forever-spin). On the
+                // verdict: one loud wake-stream terminal reason (the same
+                // single emit site every local terminal uses) + a
+                // structured non-zero exit (`FatalPolicyExit` — the
+                // documented home of deliberate policy aborts, which the
+                // PyO3 boundary RAISES).
+                if let FleetDeathVerdict::PresumedDead { reason } = fleet_death.observe(
+                    self.client.peer_count() == 0,
+                    last_inbound_at,
+                    tokio::time::Instant::now(),
+                ) {
+                    let err = RunError::FatalPolicyExit { reason };
+                    self.emit_terminal_reason_important(&err.to_string());
+                    return Err(err);
                 }
 
                 // 3. Await events.
@@ -920,6 +984,10 @@ where
                     maybe = self.inbox.recv() => {
                         match maybe {
                             Some(msg) => {
+                                // ANY inbound frame is fleet life — feed the
+                                // last-received-anything clock the
+                                // fleet-death presumption derives from.
+                                last_inbound_at = tokio::time::Instant::now();
                                 self.on_inbound(msg, &mut primary_last_seen).await;
                             }
                             None => {
@@ -1384,8 +1452,11 @@ where
     /// role (the same `is_observer` field the snapshot responders record):
     /// `Observer(id)` for an observer requester, `Secondary(id)` otherwise.
     async fn answer_snapshot_request(&mut self, requester: &str, requester_is_observer: bool) {
-        let snapshot = self.cluster_state.snapshot();
-        let snapshot_json = match serde_json::to_string(&snapshot) {
+        // Serialize-once per state generation (#367): the cache inside
+        // `ClusterState` keys the reply bytes on the anti-entropy
+        // digest, so a burst of pulls against an unchanged ledger does
+        // not re-serialize ~100 MB per request.
+        let snapshot_json = match self.cluster_state.snapshot_json() {
             Ok(json) => json,
             Err(e) => {
                 tracing::warn!(
@@ -1399,7 +1470,7 @@ where
             target: None,
             sender_id: self.config.node_id.clone(),
             timestamp: timestamp_now(),
-            snapshot_json,
+            snapshot_json: (*snapshot_json).clone(),
         };
         let dst = if requester_is_observer {
             Destination::Observer(PeerId::from(requester.to_string()))

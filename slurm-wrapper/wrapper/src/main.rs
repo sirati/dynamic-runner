@@ -42,6 +42,7 @@ mod network;
 mod podman_run;
 mod preflight;
 mod relay;
+mod scratch_lock;
 mod shutdown_spawn;
 mod signals;
 mod teardown;
@@ -131,6 +132,26 @@ async fn run(cfg: WrapperConfig) -> ExitCode {
         tracing::error!(target: LOG_TARGET, "failed to create scratch dirs: {e}");
         return ExitCode::from(1);
     }
+    // Mark THIS scratch root LIVE for the whole run: the exclusive
+    // `wrapper.lock` is what a concurrent sibling job's pre-flight
+    // sweep probes to tell a live root from an orphan (see
+    // `scratch_lock`). Held by this scope until `run` returns; the
+    // kernel releases it on ANY process exit, so a killed wrapper
+    // leaves a probe-dead root the next sweep cleans. Best-effort:
+    // failing to mark liveness must never gate the launch (it merely
+    // leaves this job as exposed as a pre-fix one — logged loudly).
+    let _scratch_lock = match scratch_lock::acquire(&layout.rndtmp) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            tracing::warn!(
+                target: LOG_TARGET,
+                "could not acquire scratch-root liveness lock ({e}); a \
+                 concurrent sibling job's pre-flight sweep may treat this \
+                 job's containers as orphans"
+            );
+            None
+        }
+    };
     banner_job_start(&layout);
 
     // --- 2. resolve bins (generate.rs:364-387) ---

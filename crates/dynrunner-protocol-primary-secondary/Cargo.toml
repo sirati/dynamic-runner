@@ -17,6 +17,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
+# Chunked large-frame transfer (`chunking`): the chunk payload rides the
+# JSON wire as a base64 string (boundary-safe at any byte split; fixed
+# 4/3 inflation instead of serde_json's ~4x number-array encoding of
+# `Vec<u8>`).
+base64 = { workspace = true }
 
 [features]
 # Enable test-only inspection of routing state from downstream crates'

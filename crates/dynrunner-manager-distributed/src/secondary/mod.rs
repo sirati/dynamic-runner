@@ -53,6 +53,7 @@ mod processing;
 pub(crate) mod resource;
 mod sampler_hooks;
 mod setup;
+mod setup_deadline;
 mod staging;
 mod types;
 mod wire;
@@ -543,6 +544,17 @@ where
     /// setup-handling logic). Empty in the common path (the push lands before
     /// the first setup frame, so the backstop never recvs).
     pub(super) setup_frame_backlog: std::collections::VecDeque<DistributedMessage<I>>,
+
+    /// The re-armable pre-`Operational` deadline (the
+    /// `unconfigured_deadline` made structural — see
+    /// [`setup_deadline::SetupDeadline`]). The orchestration
+    /// (`run_until_setup_or_done_inner`) arms it at setup entry and
+    /// sleeps against a clone; `wait_for_setup` EXTENDS it on every frame
+    /// whose sender is the primary, so the deadline measures PRIMARY
+    /// SILENCE (the dead-primary detection it exists for), never
+    /// slow-fleet assembly (the asm-dataset LMU 15-secondary fleet
+    /// death).
+    pub(super) setup_deadline: setup_deadline::SetupDeadline,
 
     /// Cross-thread / cross-runtime ingress for the `PrimaryHandle`
     /// PyO3 surface (when the handle was minted from a

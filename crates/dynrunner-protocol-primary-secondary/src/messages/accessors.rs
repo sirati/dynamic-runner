@@ -50,7 +50,8 @@ impl<I> DistributedMessage<I> {
             | Self::ClusterMutation { target, .. }
             | Self::Relay { target, .. }
             | Self::RelayBackoff { target, .. }
-            | Self::RedialRequest { target, .. } => target.as_ref(),
+            | Self::RedialRequest { target, .. }
+            | Self::FrameChunk { target, .. } => target.as_ref(),
         }
     }
 
@@ -94,7 +95,8 @@ impl<I> DistributedMessage<I> {
             | Self::ClusterMutation { target, .. }
             | Self::Relay { target, .. }
             | Self::RelayBackoff { target, .. }
-            | Self::RedialRequest { target, .. } => target,
+            | Self::RedialRequest { target, .. }
+            | Self::FrameChunk { target, .. } => target,
         };
         *slot = Some(dst);
     }
@@ -152,7 +154,8 @@ impl<I> DistributedMessage<I> {
             | Self::ClusterMutation { target, .. }
             | Self::Relay { target, .. }
             | Self::RelayBackoff { target, .. }
-            | Self::RedialRequest { target, .. } => target,
+            | Self::RedialRequest { target, .. }
+            | Self::FrameChunk { target, .. } => target,
         };
         *slot = None;
     }
@@ -191,7 +194,8 @@ impl<I> DistributedMessage<I> {
             | Self::ClusterMutation { sender_id, .. }
             | Self::Relay { sender_id, .. }
             | Self::RelayBackoff { sender_id, .. }
-            | Self::RedialRequest { sender_id, .. } => sender_id,
+            | Self::RedialRequest { sender_id, .. }
+            | Self::FrameChunk { sender_id, .. } => sender_id,
         }
     }
 
@@ -229,7 +233,8 @@ impl<I> DistributedMessage<I> {
             | Self::ClusterMutation { timestamp, .. }
             | Self::Relay { timestamp, .. }
             | Self::RelayBackoff { timestamp, .. }
-            | Self::RedialRequest { timestamp, .. } => *timestamp,
+            | Self::RedialRequest { timestamp, .. }
+            | Self::FrameChunk { timestamp, .. } => *timestamp,
         }
     }
 
@@ -396,6 +401,34 @@ impl<I> DistributedMessage<I> {
         }
     }
 
+    /// Whether the framing layer may transparently CHUNK this frame
+    /// when its serialized size exceeds the wire limit (the
+    /// `FrameChunk` transfer — see that variant's doc).
+    ///
+    /// A closed FRAMEWORK-FRAME allowlist, deliberately NOT "everything"
+    /// (#364/#366: the wire cap on consumer payloads —
+    /// `TaskComplete.result_data`, `CustomMessage.data` — is a
+    /// contract, not a transport shortcoming; chunking them would
+    /// silently relax it). `ClusterSnapshot` is the first and only
+    /// member: its size grows with the replicated ledger (67k tasks ≈
+    /// 100 MB in production), it is framework-internal, and dropping it
+    /// starves anti-entropy / rejoin / promotion-hydrate fleet-wide.
+    /// A `Relay` envelope is eligible iff its INNER frame is, so an
+    /// indirect (forwarded) snapshot transfer chunks hop-by-hop exactly
+    /// like a direct one.
+    ///
+    /// The classifier is owned by the enum so the sender's split gate
+    /// and the receiver's post-reassembly re-check read the SAME
+    /// predicate (the receiver re-checks so a non-conformant sender
+    /// cannot smuggle a consumer payload past the cap through chunks).
+    pub fn chunk_eligible(&self) -> bool {
+        match self {
+            Self::ClusterSnapshot { .. } => true,
+            Self::Relay { inner, .. } => inner.chunk_eligible(),
+            _ => false,
+        }
+    }
+
     pub fn msg_type(&self) -> MessageType {
         match self {
             Self::SecondaryWelcome { .. } => MessageType::SecondaryWelcome,
@@ -431,6 +464,7 @@ impl<I> DistributedMessage<I> {
             Self::Relay { .. } => MessageType::RelayMessage,
             Self::RelayBackoff { .. } => MessageType::RelayBackoff,
             Self::RedialRequest { .. } => MessageType::RedialRequest,
+            Self::FrameChunk { .. } => MessageType::FrameChunk,
         }
     }
 }

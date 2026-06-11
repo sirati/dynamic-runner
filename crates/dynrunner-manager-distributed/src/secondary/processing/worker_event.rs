@@ -580,6 +580,27 @@ where
                         predecessor_outputs,
                     } = pending;
                     let log_task_hash = file_hash.clone();
+                    // Run-terminal gate (asm-dataset run_20260611_112116,
+                    // secondary-6's zombie): once the replicated `RunAborted`
+                    // verdict is latched, this continuation must NOT bind the
+                    // deferred task ("pending first-bind assigned post-Ready"
+                    // 3+ minutes post-abort). The stash is DROPPED — not
+                    // reinjected to the authority (the authority exits on the
+                    // same verdict; there is no run left to requeue into) —
+                    // and this loop's own tail exits on the same latch within
+                    // this iteration, tearing every worker down.
+                    if let Some(reason) = self.cluster_state.run_aborted() {
+                        tracing::info!(
+                            worker_id,
+                            task_hash = %log_task_hash,
+                            reason = %reason,
+                            "pending first-bind NOT assigned post-Ready: the \
+                             replicated run-terminal verdict is latched; \
+                             dropping the deferred task (this node exits on \
+                             the same latch)"
+                        );
+                        return Ok(None);
+                    }
                     // #360 gate: this continuation is a DISPATCH-shaped
                     // bind (it puts work on a worker without the
                     // authority's per-tick gate seeing it again), so it

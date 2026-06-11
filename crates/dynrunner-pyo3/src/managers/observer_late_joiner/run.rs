@@ -195,6 +195,8 @@ impl PyObserverLateJoiner {
                             peer_timeout,
                             panik_watcher_paths,
                             panik_watcher_poll_interval,
+                            fleet_death_presumption:
+                                ObserverConfig::DEFAULT_FLEET_DEATH_PRESUMPTION,
                         };
 
                         // 5. Wrap the live mesh transport (the bootstrap

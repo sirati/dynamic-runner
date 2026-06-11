@@ -21,8 +21,8 @@ use crate::secondary::SecondaryTerminal;
 /// run (no per-role `Option` fields). The mapping is uniform:
 ///
 /// - [`Self::Done`] ⇒ exit 0 (a clean `RunComplete`).
-/// - [`Self::Aborted`] ⇒ exit 1 (the cluster broadcast `RunAborted` — a #3a
-///   pre-phase duplicate-task-id).
+/// - [`Self::Aborted`] ⇒ exit 1 (the cluster broadcast `RunAborted` — e.g.
+///   a #3a pre-phase or #3b post-phase duplicate-task-id verdict).
 /// - [`Self::Panik`] ⇒ exit 137 (operator emergency stop; the worker pgids
 ///   were already killed by the role's own teardown).
 /// - [`Self::Failed`] ⇒ a non-zero exit the boundary derives from the
@@ -34,7 +34,8 @@ use crate::secondary::SecondaryTerminal;
 pub enum RunTerminal {
     /// Clean completion — exit 0.
     Done,
-    /// Cluster-wide `RunAborted` (#3a pre-phase duplicate) — exit 1.
+    /// Cluster-wide `RunAborted` (a duplicate-task-id verdict — #3a
+    /// pre-phase or #3b post-phase — or any other #313 abort) — exit 1.
     Aborted { reason: String },
     /// The operator's GRACEFUL abort ran its drain protocol to the end:
     /// dispatch was frozen, running tasks completed, the fleet drained,

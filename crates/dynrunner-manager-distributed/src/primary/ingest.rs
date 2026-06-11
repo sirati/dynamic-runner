@@ -9,8 +9,10 @@
 //!     the INITIAL batch aborts the whole run (`RunAborted` + a
 //!     structured `RunError`);
 //!   * **#3b post-phase duplicate** — handled by `invalidate_all_pending`
-//!     (invoked from the runtime `SpawnTasks` path), which fails every
-//!     not-yet-terminal task run-wide while the cluster CONTINUES.
+//!     (invoked from the runtime `SpawnTasks` path), which latches the
+//!     `RunAborted` verdict FIRST and then fails every not-yet-terminal
+//!     task run-wide (a terminal run abort, like #3a — only the
+//!     detection edge differs).
 //!
 //! The pool returns DATA; this module (the manager) decides what
 //! `ClusterMutation`s / `RunError`s that data becomes and broadcasts
@@ -450,9 +452,35 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
     /// Fail every not-yet-terminal task across the WHOLE run as
     /// `InvalidTask` — the #3b op (a duplicate detected AFTER a phase
-    /// started). The cluster CONTINUES (no `RunAborted`); the run simply
-    /// produces a fully-invalid outcome because the duplicate made the
-    /// task set ambiguous.
+    /// started). The duplicate made the run's task set ambiguous, so
+    /// this IS a terminal run abort: the verdict is latched + broadcast
+    /// FIRST (`ClusterMutation::RunAborted` carrying the
+    /// duplicate-identity reason), the dispatch freeze is latched
+    /// synchronously, and only THEN is the ledger wiped.
+    ///
+    /// # Ordering is load-bearing (asm-dataset run_20260611_112116)
+    ///
+    /// Pre-fix this wiped the ledger WITHOUT authoring a verdict ("the
+    /// cluster continues"): the phase machine then re-derived "phase
+    /// ended" from the wiped ledger, the consumer's `on_phase_end` hook
+    /// (correctly, from its view) raised against the zeroed handoff
+    /// state, and THAT raise became the `RunAborted` reason the fleet
+    /// read — a false narrative ("spawned=0") burying the true
+    /// invalid-task verdict. Latching the verdict before the wipe makes
+    /// the first writer the honest one (the latch is sticky
+    /// first-writer-wins, see the `RunAborted` apply arm) and the
+    /// run-terminal gate in `process_phase_lifecycle` keeps every phase
+    /// hook from running against invalidated state.
+    ///
+    /// The primary's own structured exit rides the decoupled
+    /// worker-management bus (`PolicyFatalExit` — a deliberate policy
+    /// abort, surfacing `RunError::FatalPolicyExit` so the PyO3
+    /// boundary RAISES): the emit synchronously freezes dispatch
+    /// (step-0 seam), and the operational loop's stand-down /
+    /// worker-mgmt exits drive the clean shutdown. The finalize tail's
+    /// later broadcast of its own abort render NoOps locally and is
+    /// filtered from the wire (`apply_locally_for_broadcast`), so the
+    /// reason never churns.
     ///
     /// Scans `cluster_state.tasks_iter()` and emits a `TaskFailed
     /// { kind: InvalidTask }` for every entry in a non-terminal state
@@ -465,10 +493,27 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// InvalidTask` transition fans a `TaskCompletedEvent` to the
     /// dispatcher exactly like the #2 path.
     ///
-    /// Routed through the canonical broadcast/apply pipeline. The pool's
-    /// own copies of the now-invalid tasks drain via the normal
-    /// terminal-observation paths.
+    /// Routed through the canonical broadcast/apply pipeline.
     pub(crate) async fn invalidate_all_pending(&mut self, reason: String) {
+        // 1. Latch + broadcast the terminal verdict FIRST — before any
+        //    ledger wipe — so every replica (and this node's own phase
+        //    machine, via the run-terminal cascade gate) reads the TRUE
+        //    duplicate-identity reason. Single origination mechanism
+        //    (#313): same apply/broadcast/settle path as every other
+        //    terminal verdict.
+        self.broadcast_terminal_verdict(ClusterMutation::RunAborted {
+            reason: reason.clone(),
+        })
+        .await;
+        // 2. Synchronously freeze dispatch + drive the primary's own
+        //    structured exit through the decoupled worker-management bus
+        //    (the same chokepoint the on_phase_end-raise path uses). The
+        //    freeze is effective the moment this returns; the loop's
+        //    drain classifies the signal into `RunError::FatalPolicyExit`.
+        self.emit_run_fail_signal(crate::worker_signal::WorkerMgmtSignal::PolicyFatalExit {
+            reason: reason.clone(),
+        });
+        // 3. Only now wipe the ledger.
         // Collect targets first (immutable borrow), then build the
         // mutation batch — `apply_and_broadcast` takes `&mut self`.
         let targets: Vec<(String, TaskInfo<I>)> = self
@@ -495,8 +540,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         tracing::error!(
             count = targets.len(),
             reason = %reason,
-            "duplicate task identity after a phase started; invalidating all \
-             not-yet-terminal tasks run-wide (cluster continues)"
+            "duplicate task identity after a phase started; run aborted \
+             (verdict latched first) and all not-yet-terminal tasks \
+             invalidated run-wide"
         );
         let mut mutations: Vec<ClusterMutation<I>> = Vec::with_capacity(targets.len());
         for (hash, _task) in targets {

@@ -19,12 +19,18 @@
 //!   * [`reconnect`]        — the transport-recovery port the observer
 //!     triggers on lost visibility (the `-R` tunnel rebuild seam; the
 //!     observer triggers, the provider layer owns ssh).
+//!   * [`fleet_death`]      — the LAST-RESORT fleet-death presumption: a
+//!     bounded terminal when the WHOLE fleet has been unreachable (zero
+//!     legs, zero inbound) far past every timeout and driven reconnects
+//!     failed — the one verdict the report-and-retry machinery above
+//!     deliberately never renders.
 //!
 //! See each submodule's header for its concern.
 
 pub mod announcer;
 pub mod coordinator;
 pub mod failure_response;
+pub(crate) mod fleet_death;
 pub mod lifecycle;
 pub mod lost_visibility;
 pub mod reconnect;

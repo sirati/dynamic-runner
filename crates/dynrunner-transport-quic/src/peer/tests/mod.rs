@@ -63,6 +63,7 @@ mod ingest_edges;
 mod late_joiner_forward;
 mod log_capture;
 mod member_leg_redial;
+mod oversize_snapshot_chunking;
 mod primary_link;
 mod reader_exit_disconnect;
 mod recv_lifetime;

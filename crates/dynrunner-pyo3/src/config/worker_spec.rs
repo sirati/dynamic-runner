@@ -49,6 +49,21 @@ impl WorkerSpec {
     }
 }
 
+impl WorkerSpec {
+    /// Test-only constructor for in-crate unit tests that cannot go
+    /// through the PyO3 `#[new]` (no interpreter in the lib test
+    /// target). Same shape as a Python-side `WorkerSpec(argv, env,
+    /// cwd)` with all fields supplied.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        argv: Vec<String>,
+        env: std::collections::HashMap<String, String>,
+        cwd: Option<String>,
+    ) -> Self {
+        Self { argv, env, cwd }
+    }
+}
+
 /// Runtime values substituted into a `WorkerSpec` template.
 pub(crate) struct WorkerVars<'a> {
     pub(crate) comm_fd: Option<i32>,

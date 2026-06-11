@@ -9,6 +9,7 @@ pub mod cluster_mutation;
 /// payload — the limit exists so a consumer stream stays signal-sized
 /// (the #364 wedged-IPC class is structurally impossible at 100 KiB).
 pub const CUSTOM_MESSAGE_MAX_BYTES: usize = 100 * 1024;
+pub mod chunking;
 pub mod codec;
 pub mod freshness;
 pub mod messages;
@@ -22,6 +23,9 @@ pub use address::{
 };
 pub use cluster_mutation::{
     ClusterMutation, DiscoveryDebt, PrimaryChangeReason, SecondaryCapacityRecord,
+};
+pub use chunking::{
+    AbandonedTransfer, ChunkIngest, ChunkOutcome, ChunkReassembler, split_frame,
 };
 pub use codec::{decode_frame, deserialize_message, serialize_message};
 pub use freshness::{FreshnessClock, InboundClosed, InboundTap, IngestEdges};

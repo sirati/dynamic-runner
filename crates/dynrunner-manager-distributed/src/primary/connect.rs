@@ -18,6 +18,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let deadline = tokio::time::Instant::now() + self.config.connect_timeout;
         let expected = self.config.num_secondaries as usize;
 
+        // Setup-liveness beacon: the SAME jittered anti-entropy digest
+        // cadence every other waiting state already runs (the secondary's
+        // `wait_for_setup`, this primary's `operational_loop`, the observer
+        // tail) — `wait_for_connections` was the one wait WITHOUT it, which
+        // made an assembling primary INVISIBLE to its fleet for up to the
+        // whole `connect_timeout` straggler window. The broadcast digest is
+        // the "still assembling the fleet" liveness signal the secondaries'
+        // re-armable setup deadline keys on (see
+        // `secondary::setup_deadline`): every welcomed/announce-received
+        // secondary that can hear the primary keeps waiting while it
+        // assembles, so the quorum-proceed lands on a LIVE fleet — the
+        // asm-dataset LMU death (15/15 secondaries expired inside the
+        // primary's silent 600s straggler window, the quorum-proceed at
+        // 11:16:10 relocating into a fleet dead for 20s) cannot recur. It
+        // ALSO doubles as the standard anti-entropy EMIT half, healing
+        // mid-setup divergence exactly as the sibling waits do. `Skip` +
+        // dropped-first-tick mirrors the operational arm.
+        let mut assembly_beacon =
+            tokio::time::interval(crate::anti_entropy::tick_period(&self.config.node_id));
+        assembly_beacon.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        assembly_beacon.tick().await;
+
         loop {
             // Check if all secondaries have completed cert exchange
             let cert_done = self
@@ -75,6 +97,41 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         // dispatch is just ordered after initial assignment.
                         Some(m) => self.dispatch_message(m, command_rx).await?,
                         None => return Err("transport closed".into()),
+                    }
+                }
+                // Setup-liveness beacon tick (see the arming comment above
+                // the loop): narrate assembly progress + broadcast this
+                // primary's digest so the fleet's re-armable setup
+                // deadlines observe a LIVE assembling primary. Pure EMIT of
+                // the role-agnostic anti-entropy frame; the receive-side
+                // compare+pull is the `StateDigest` arm of
+                // `dispatch_message`. `interval.tick` is cancel-safe
+                // (tokio docs).
+                _ = assembly_beacon.tick() => {
+                    tracing::info!(
+                        welcomed = cert_done,
+                        expected,
+                        "still assembling the fleet ({cert_done}/{expected} \
+                         welcomed); broadcasting setup-liveness digest"
+                    );
+                    let digest = self.cluster_state.digest();
+                    let frame = crate::anti_entropy::digest_broadcast(
+                        &self.config.node_id,
+                        super::wire::timestamp_now(),
+                        digest,
+                    );
+                    if let Err(error) = self
+                        .send_to(
+                            dynrunner_protocol_primary_secondary::Destination::All,
+                            frame,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "setup-liveness digest broadcast failed; the next \
+                             tick retries"
+                        );
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
