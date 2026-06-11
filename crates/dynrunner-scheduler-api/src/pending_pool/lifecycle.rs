@@ -6,6 +6,11 @@
 //! * [`PendingPool::on_item_finished`] — terminal success.
 //! * [`PendingPool::on_item_failed_permanent`] — terminal failure
 //!   (cascades through `dependents_of`).
+//! * [`PendingPool::on_item_failed_pending_retry`] — terminal failure
+//!   whose permanence awaits the phase's drain-edge retry decision
+//!   (soft marker; no cascade yet).
+//! * [`PendingPool::finalize_soft_failures`] — drain-edge promotion of
+//!   a phase's soft failures to permanent (+ the dependents cascade).
 //! * [`PendingPool::mark_in_flight`] — out-of-band dispatch from
 //!   the promoted-secondary path.
 //! * [`PendingPool::requeue`] — transient retry, item back to FRONT.
@@ -147,15 +152,41 @@ impl<I: Identifier> PendingPool<I> {
             *c = c.saturating_sub(1);
         }
         self.in_flight_tasks.remove(task_id);
+        // The failure is permanent NOW — a still-pending soft marker for
+        // this id (the retry-decision-pending state) is superseded.
+        self.soft_failed.remove(task_id);
         self.failed_tasks.insert(task_id.to_string());
 
-        let mut cascaded: Vec<TaskInfo<I>> = Vec::new();
         let mut affected_phases: HashSet<PhaseId> = HashSet::new();
         affected_phases.insert(phase_id.clone());
+        let cascaded = self.cascade_fail_dependents_of(task_id, &mut affected_phases);
 
-        // BFS over `dependents_of`. Every dependent we reach is
-        // unreachable for any successful path — it cannot satisfy its
-        // dep on a permanently-failed prereq. Cascade-fail it.
+        for ph in &affected_phases {
+            self.maybe_transition_drain(ph);
+        }
+        cascaded
+    }
+
+    /// The permanent-failure dependents walk shared by
+    /// [`Self::on_item_failed_permanent`] (immediate permanence — the
+    /// consumer-command / extend-time class) and
+    /// [`Self::finalize_soft_failures`] (drain-edge permanence — the
+    /// wire-terminal class whose retry decision just declined).
+    ///
+    /// BFS over `dependents_of`. Every dependent reached is unreachable
+    /// for any successful path — it cannot satisfy its dep on a
+    /// permanently-failed prereq. Cascade-fail it: record in
+    /// `failed_tasks`, drop its dep bookkeeping, remove it from
+    /// `blocked` (collecting the `TaskInfo` for the caller's own
+    /// ledgers), and accumulate every touched phase into
+    /// `affected_phases` so the CALLER runs the drain transitions once
+    /// after all roots are walked.
+    fn cascade_fail_dependents_of(
+        &mut self,
+        task_id: &str,
+        affected_phases: &mut HashSet<PhaseId>,
+    ) -> Vec<TaskInfo<I>> {
+        let mut cascaded: Vec<TaskInfo<I>> = Vec::new();
         let mut frontier: VecDeque<String> = VecDeque::new();
         frontier.push_back(task_id.to_string());
         while let Some(failed_id) = frontier.pop_front() {
@@ -166,6 +197,10 @@ impl<I: Identifier> PendingPool<I> {
                     // blocked entry is gone too; skip.
                     continue;
                 }
+                // A cascaded dependent's own pending-retry marker (it
+                // could itself have soft-failed earlier) is superseded
+                // by the cascade's permanence.
+                self.soft_failed.remove(&dep_id);
                 self.task_deps.remove(&dep_id);
                 if let Some(item) = self.blocked.remove(&dep_id) {
                     let dep_phase = item.phase_id.clone();
@@ -178,11 +213,90 @@ impl<I: Identifier> PendingPool<I> {
                 frontier.push_back(dep_id);
             }
         }
+        cascaded
+    }
 
+    /// Notify the pool that a task's latest attempt terminally FAILED at
+    /// the manager level, with the failure's PERMANENCE still pending the
+    /// manager's per-phase retry decision (the retry buckets run at the
+    /// phase's drain edge; a reinject there revives the task).
+    ///
+    /// The retry-pending twin of `on_item_finished(phase, None)`:
+    /// decrements the phase's in-flight count and drops the in-flight
+    /// id, but ADDITIONALLY records the id in the `soft_failed` marker
+    /// set so the drain gate can discount blocked dependents doomed by
+    /// this failure. Without the marker the dependents hold the phase in
+    /// `Draining` forever, the drain edge (where the retry-or-cascade
+    /// decision lives) is unreachable, and the run wedges — the
+    /// blocked-dependent hang.
+    ///
+    /// Dependents are NOT cascaded here (the failure may yet be revived
+    /// by a retry-bucket reinject); permanence is decided at the drain
+    /// edge by [`Self::finalize_soft_failures`]. An id that is already
+    /// permanently failed keeps its `failed_tasks` membership and gets
+    /// no soft marker (idempotence against the immediate-permanence
+    /// path having run first).
+    pub fn on_item_failed_pending_retry(&mut self, phase_id: &PhaseId, task_id: &str) {
+        if let Some(c) = self.in_flight_per_phase.get_mut(phase_id) {
+            let was = *c;
+            *c = c.saturating_sub(1);
+            tracing::debug!(
+                phase = %phase_id,
+                new_in_flight = *c,
+                saturated = was == 0,
+                "pool: in_flight -1 (on_item_failed_pending_retry)"
+            );
+        }
+        self.in_flight_tasks.remove(task_id);
+        if !self.failed_tasks.contains(task_id) {
+            self.soft_failed
+                .insert(task_id.to_string(), phase_id.clone());
+        }
+        self.maybe_transition_drain(phase_id);
+    }
+
+    /// Promote `phase_id`'s soft (retry-pending) failures to PERMANENT
+    /// and cascade-fail their transitive dependents.
+    ///
+    /// The drain-edge counterpart of [`Self::on_item_failed_pending_retry`]:
+    /// the manager calls this once the phase's retry buckets have
+    /// DECLINED at the drain edge (no candidates, or budget exhausted) —
+    /// at that point no future pass can revive the phase's failures, so
+    /// every dependent blocked on them is permanently unfulfillable and
+    /// must stop holding the run open.
+    ///
+    /// Per finalized root: the id moves `soft_failed → failed_tasks` and
+    /// the shared cascade walk collects its dependents. Returns
+    /// `(root_task_id, cascaded_dependents)` pairs so the caller can
+    /// attribute + account each dependent in its own ledgers (and
+    /// broadcast the terminal state). Drain transitions run once for
+    /// every phase the cascades touched. Empty when the phase holds no
+    /// soft failures — the common no-failure drain edge stays free.
+    pub fn finalize_soft_failures(
+        &mut self,
+        phase_id: &PhaseId,
+    ) -> Vec<(String, Vec<TaskInfo<I>>)> {
+        let roots: Vec<String> = self
+            .soft_failed
+            .iter()
+            .filter(|(_, p)| *p == phase_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if roots.is_empty() {
+            return Vec::new();
+        }
+        let mut affected_phases: HashSet<PhaseId> = HashSet::new();
+        let mut out: Vec<(String, Vec<TaskInfo<I>>)> = Vec::with_capacity(roots.len());
+        for root in roots {
+            self.soft_failed.remove(&root);
+            self.failed_tasks.insert(root.clone());
+            let cascaded = self.cascade_fail_dependents_of(&root, &mut affected_phases);
+            out.push((root, cascaded));
+        }
         for ph in &affected_phases {
             self.maybe_transition_drain(ph);
         }
-        cascaded
+        out
     }
 
     /// Notify the pool that a task has been dispatched outside the
@@ -255,6 +369,11 @@ impl<I: Identifier> PendingPool<I> {
     /// whether the second-pass dispatch is observable to consumers.
     pub fn reinject(&mut self, item: TaskInfo<I>) {
         let phase_id = item.phase_id.clone();
+        // Revival: a reinjected task's pending-retry failure marker is
+        // void — the retry bucket granted it another pass, so blocked
+        // dependents are once again legitimately waiting on it and the
+        // drain gate must stop discounting them.
+        self.soft_failed.remove(&item.task_id);
         let key = (
             item.phase_id.clone(),
             item.type_id.clone(),
@@ -475,6 +594,21 @@ impl<I: Identifier> PendingPool<I> {
 
         let next = match (queued, in_flight, blocked) {
             (0, 0, 0) => PhaseState::Drained,
+            // Blocked items remain, but every one of them is DOOMED by a
+            // dead prereq (final-failed anywhere, or soft-failed in THIS
+            // phase — see `live_blocked_count`): they are not live work,
+            // they are dependents awaiting the drain edge's
+            // retry-or-cascade decision. Counting them as live would make
+            // the drain edge unreachable — the retry buckets and the
+            // permanent-failure finalization both run AT that edge, so
+            // the phase would hold itself open waiting for a decision
+            // that only the drain edge can take (the blocked-dependent
+            // run-wedge). The manager's drain-edge handler either
+            // reinjects the root (flipping the phase back to `Active`,
+            // dependents stay blocked) or finalizes
+            // (`finalize_soft_failures` cascade-fails the dependents
+            // before `on_phase_end` fires).
+            (0, 0, _) if self.live_blocked_count(phase_id) == 0 => PhaseState::Drained,
             (0, _, _) => PhaseState::Draining,
             (_, _, _) => PhaseState::Active,
         };
@@ -489,6 +623,59 @@ impl<I: Identifier> PendingPool<I> {
                 }
             }
         }
+    }
+
+    /// Count of `phase_id`'s blocked items that are LIVE — i.e. NOT
+    /// doomed by a dead prerequisite. A prereq is dead when it is
+    /// final-failed (`failed_tasks`, any phase) or soft-failed in
+    /// `phase_id` ITSELF (`soft_failed` — its retry decision happens at
+    /// THIS phase's drain edge, which is exactly the edge this count
+    /// gates). A soft failure in ANOTHER phase does NOT doom for this
+    /// gate: that phase's own drain edge owns the retry-or-cascade
+    /// decision, and its finalization cascade will reach our dependents
+    /// (re-running our drain transition) if it declines.
+    ///
+    /// Doom propagates transitively through the blocked graph — a
+    /// dependent of a doomed blocked item is itself doomed (ANY dead or
+    /// doomed dep suffices: the item can never satisfy ALL deps, the
+    /// same any-dep rule the permanent cascade walks) — computed as a
+    /// fixpoint over the WHOLE blocked map because chains may cross
+    /// phases. Cost is bounded by `blocked.len()` per iteration and the
+    /// caller only evaluates it on the candidate-wedge shape
+    /// (`queued == 0 && in_flight == 0 && blocked > 0`).
+    fn live_blocked_count(&self, phase_id: &PhaseId) -> usize {
+        let is_dead = |id: &str| {
+            self.failed_tasks.contains(id)
+                || self.soft_failed.get(id).is_some_and(|p| p == phase_id)
+        };
+        let mut doomed: HashSet<&str> = HashSet::new();
+        loop {
+            let mut changed = false;
+            for id in self.blocked.keys() {
+                if doomed.contains(id.as_str()) {
+                    continue;
+                }
+                // No dep entry (defensive — a blocked item always has
+                // one): treat as live.
+                let Some(deps) = self.task_deps.get(id) else {
+                    continue;
+                };
+                if deps
+                    .iter()
+                    .any(|d| is_dead(d) || doomed.contains(d.as_str()))
+                {
+                    doomed.insert(id.as_str());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.blocked
+            .values()
+            .filter(|it| it.phase_id == *phase_id && !doomed.contains(it.task_id.as_str()))
+            .count()
     }
 
     /// Sum of queued items across all buckets of `phase_id`.

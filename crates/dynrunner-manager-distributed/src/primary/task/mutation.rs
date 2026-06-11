@@ -354,7 +354,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         if counter_completed {
             self.failed_tasks.remove(task_hash);
             self.completed_tasks.insert(task_hash.to_string());
-        } else if let Some(kind) = failed_kind
+        } else if let Some(kind) = failed_kind.clone()
             && !self.completed_tasks.contains(task_hash)
         {
             self.failed_tasks.insert(task_hash.to_string(), kind);
@@ -369,7 +369,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             self.note_item_completed(&phase, Some(task_id.as_str()), command_rx)
                 .await;
         } else {
-            self.note_item_failed(&phase, None, command_rx).await;
+            // Failure-like terminal. A `Failed { kind }` forwards the kind
+            // so the pool records the retry-pending failure marker — the
+            // mirror-path twin of the wire handler's routing (a relayed
+            // terminal must un-wedge blocked dependents exactly like a
+            // directly-delivered one). The `Unfulfillable` / `InvalidTask`
+            // states surface `failed_kind = None` here, which keeps the
+            // legacy dormancy: their dependents stay blocked for the
+            // operator-resolvable reinject path.
+            self.note_item_failed(
+                &phase,
+                Some(task_id.as_str()),
+                failed_kind.as_ref(),
+                command_rx,
+            )
+            .await;
         }
         // A slot freed / a phase may have advanced: decoupled recheck emit,
         // never a direct dispatch call (the dispatch-decoupling law).
