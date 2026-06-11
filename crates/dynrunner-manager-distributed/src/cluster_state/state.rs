@@ -405,6 +405,24 @@ pub struct ClusterState<I> {
         dynrunner_protocol_primary_secondary::StateDigest,
         std::sync::Arc<String>,
     )>,
+    /// Node-local per-peer throttle for the "PeerJoined for dead id at a
+    /// non-advancing generation ignored" WARN (#416). A removed-but-alive
+    /// peer redials forever; until its transport leg re-admits, EVERY
+    /// authenticated frame re-applies the same non-advancing `PeerJoined`
+    /// and re-trips that WARN — 45+ min untrottled in
+    /// run_20260611_123632. The WARN must stay (it names a real
+    /// re-admission stall) but be quiet: one per peer per
+    /// [`DEAD_REJOIN_WARN_INTERVAL`], the suppressed count carried on the
+    /// next emit. Keyed by peer id so distinct peers don't share a window;
+    /// the `WarnThrottle` interval covers the within-episode re-emit spam.
+    ///
+    /// NOT replicated — a pure node-local diagnostic gate (each replica
+    /// throttles its own log stream): skipped from `Clone`, snapshot,
+    /// restore, and the digest (classified node-local in the
+    /// exhaustive-destructure guards, like `task_seq` /
+    /// `snapshot_json_cache`). A cloned / restoring replica cold-starts the
+    /// throttle (its first dead-rejoin observation emits immediately).
+    pub(super) dead_rejoin_warn: HashMap<String, crate::warn_throttle::WarnThrottle>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -458,6 +476,9 @@ where
             // Node-local serialize-once cache — not cloned (the clone
             // re-serializes on its first snapshot_json call).
             snapshot_json_cache: _snapshot_json_cache,
+            // Node-local log-throttle — not cloned (a cloned replica
+            // throttles its own log stream from a cold start).
+            dead_rejoin_warn: _dead_rejoin_warn,
         } = self;
         Self {
             tasks: tasks.clone(),
@@ -513,6 +534,8 @@ where
             custom_terminal_watermarks: custom_terminal_watermarks.clone(),
             // Node-local serialize-once cache — see the destructure note.
             snapshot_json_cache: None,
+            // Node-local log-throttle — cold-start on the clone.
+            dead_rejoin_warn: HashMap::new(),
         }
     }
 }
@@ -557,6 +580,7 @@ where
             custom_messages,
             custom_terminal_watermarks,
             snapshot_json_cache,
+            dead_rejoin_warn,
         } = self;
         f.debug_struct("ClusterState")
             .field("tasks", tasks)
@@ -591,6 +615,7 @@ where
             .field("custom_messages", &custom_messages.len())
             .field("custom_terminal_watermarks", &custom_terminal_watermarks.len())
             .field("snapshot_json_cache", &snapshot_json_cache.is_some())
+            .field("dead_rejoin_warn", &dead_rejoin_warn.len())
             .finish()
     }
 }
@@ -628,6 +653,7 @@ impl<I> Default for ClusterState<I> {
             custom_messages: HashMap::new(),
             custom_terminal_watermarks: HashMap::new(),
             snapshot_json_cache: None,
+            dead_rejoin_warn: HashMap::new(),
         }
     }
 }

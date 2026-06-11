@@ -20,6 +20,7 @@
 //! arms to these methods.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use dynrunner_core::{Identifier, ResourceAmount, TaskVersion};
 use dynrunner_protocol_primary_secondary::{RemovalCause, SecondaryCapacityRecord};
@@ -28,6 +29,16 @@ use super::merge::merge_capability;
 use super::types::{CapabilityEntry, PeerEntry, PeerState};
 use super::{ApplyOutcome, ClusterState};
 use crate::peer_lifecycle::PeerLifecycleEvent;
+use crate::warn_throttle::WarnThrottle;
+
+/// Minimum spacing between two "PeerJoined for dead id" WARNs FOR THE SAME
+/// PEER (#416). A removed-but-alive peer re-applies the same non-advancing
+/// `PeerJoined` on every authenticated frame until its transport leg
+/// re-admits; an untrottled WARN spammed for 45+ min in
+/// run_20260611_123632. A minute-cadence per-peer gate keeps the
+/// re-admission stall narrated (one line + a suppressed count) without one
+/// line per frame.
+const DEAD_REJOIN_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 impl<I: Identifier> ClusterState<I> {
     /// Rebuild BOTH `RoleTable.observers` and `RoleTable.can_be_primary`
@@ -145,14 +156,29 @@ impl<I: Identifier> ClusterState<I> {
     ) -> ApplyOutcome {
         match self.peer_state.get(&peer_id) {
             Some(entry) if entry.state == PeerState::Dead && member_gen <= entry.member_gen => {
-                tracing::warn!(
-                    target: "dynrunner_cluster_state",
-                    peer_id = %peer_id,
-                    entry_gen = entry.member_gen,
-                    join_gen = member_gen,
-                    "PeerJoined for dead id at a non-advancing generation ignored \
-                     (sticky removal within the membership incarnation)",
-                );
+                // Per-peer throttle (#416): a removed-but-alive peer
+                // re-applies this same non-advancing join on EVERY frame
+                // until its transport leg re-admits — emit once per peer
+                // per minute, carrying the suppressed count, never one
+                // line per frame. (The WARN still names a real
+                // re-admission stall, so it stays — just quiet.)
+                let entry_gen = entry.member_gen;
+                if let Some(suppressed) = self
+                    .dead_rejoin_warn
+                    .entry(peer_id.clone())
+                    .or_insert_with(|| WarnThrottle::new(DEAD_REJOIN_WARN_INTERVAL))
+                    .permit()
+                {
+                    tracing::warn!(
+                        target: "dynrunner_cluster_state",
+                        peer_id = %peer_id,
+                        entry_gen = entry_gen,
+                        join_gen = member_gen,
+                        suppressed_since_last_warn = suppressed,
+                        "PeerJoined for dead id at a non-advancing generation ignored \
+                         (sticky removal within the membership incarnation)",
+                    );
+                }
                 return ApplyOutcome::NoOp;
             }
             _ => {}

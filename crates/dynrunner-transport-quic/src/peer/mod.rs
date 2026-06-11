@@ -69,6 +69,19 @@ pub(crate) const MSG_REDIAL_REQUEST_HONORED: &str =
 /// immediately.
 pub(super) const REDIAL_REQUEST_PRUNE_AFTER: u32 = 2;
 
+/// Grace window for the accept-loop stale-entry replacement (#416): the
+/// number of fresh authenticated inbounds for a peer that ALREADY has a
+/// LIVE (open-writer) `connections` entry which are treated as
+/// mesh-forming transients and DROPPED before the entry is judged a stale
+/// half-open tombstone and REPLACED. The accept-side analog of
+/// [`REDIAL_REQUEST_PRUNE_AFTER`]: an establishment-race duplicate is a
+/// one-shot (count never advances past 1), while a removed-but-alive peer
+/// re-dialing a dead leg produces a fresh inbound on every ~5s reconnect
+/// tick (count climbs until it crosses this window). Above it, the
+/// persistent re-dial is authoritative proof the local entry is stale.
+/// A provably-dead (`is_closed`) entry bypasses the window entirely.
+pub(super) const ACCEPT_REPLACE_GRACE: u32 = 2;
+
 /// One redial-request nudge the reconnect tick asks the transport to
 /// send: the tracked-disconnected peer this node structurally never
 /// dials (the peer owns the dial side), plus the running
@@ -266,6 +279,18 @@ pub struct PeerNetwork<I: Identifier> {
     /// the tracker stays an implementation detail; callers don't
     /// see (or depend on) the milestone schedule directly.
     pub(super) reconnect_tracker: reconnect::ReconnectTracker,
+    /// Accept-loop stale-entry replacement evidence (#416): per-peer count
+    /// of fresh authenticated inbounds that arrived while this node ALREADY
+    /// held a LIVE (open-writer) `connections` entry for the peer. The
+    /// persistence gate behind [`ACCEPT_REPLACE_GRACE`] reads it — a
+    /// one-shot establishment-race duplicate never advances it past the
+    /// window, while a removed-but-alive peer re-dialing a dead leg climbs
+    /// it on every ~5s reconnect tick until the entry is judged a stale
+    /// half-open tombstone. Reset whenever a fresh connection is registered
+    /// for the peer (the entry is now authoritative again). Bounded by the
+    /// peer count; a lingering count for a long-gone peer is inert (the
+    /// next inbound registers vacant and clears it).
+    pub(super) accept_replace_evidence: HashMap<String, u32>,
     /// Peers whose member leg has EVER been registered in
     /// `connections` on this node. The redial-request nudge keys on
     /// this: only a leg that EXISTED and then DIED earns a nudge to
@@ -448,6 +473,7 @@ impl<I: Identifier> PeerNetwork<I> {
             #[cfg(test)]
             reconnect_tick_tx_for_test,
             reconnect_tracker: reconnect::ReconnectTracker::new(),
+            accept_replace_evidence: HashMap::new(),
             ever_connected: std::collections::HashSet::new(),
             proxy_rx,
             mesh_send_tx,
@@ -811,24 +837,113 @@ impl<I: Identifier> PeerNetwork<I> {
         self.peer_id.as_str() < peer_id
     }
 
-    /// Drain any newly accepted incoming connections and register them.
+    /// THE single registration disposition for one accepted/dialed
+    /// connection — the SOLE owner of the replace-vs-drop decision, shared
+    /// by the synchronous drain ([`Self::drain_new_connections`]) AND the
+    /// `recv_peer` select arm, so neither hand-rolls the rule (no
+    /// duplicated logic, no second drop path).
+    ///
+    /// When the peer has NO entry the fresh connection registers. When an
+    /// entry already exists the disposition is staleness-gated — the SAME
+    /// "external evidence beats a healthy-looking local channel, but not
+    /// while the wire might be a mesh-forming transient" rule
+    /// [`Self::handle_redial_request`] encodes with its grace window:
+    ///
+    /// - **Existing wire PROVABLY dead (`is_closed()` — its writer task
+    ///   exited because the QUIC/WSS stream was torn down):** REPLACE
+    ///   immediately. Unambiguous evidence.
+    ///
+    /// - **Existing wire still open, but a fresh authenticated inbound for
+    ///   the peer keeps arriving (PERSISTENCE past
+    ///   [`ACCEPT_REPLACE_GRACE`]):** REPLACE. The peer is re-dialing
+    ///   because ITS side of this leg is dead (a blackholed half-open whose
+    ///   `IDLE_TIMEOUT` has not — maybe never will — fired on this side),
+    ///   so our healthy-looking entry is a tombstone. This is the
+    ///   rejoin-exile heal (#416): a removed-but-alive peer that re-dials
+    ///   forever past `forget_departed` (which cleared `peer_dial_info` —
+    ///   severing the redial-request / nudge escapes — but NOT this
+    ///   transport state) would otherwise be dropped here for the run.
+    ///
+    /// - **Existing wire still open, fresh inbound within the grace
+    ///   window:** DROP the duplicate (the original lower-id-dials dedup —
+    ///   see the commentary on `connect_to_peers`). The early duplicate is
+    ///   most likely our own racing redial (dial-owner side) or a
+    ///   mesh-forming second inbound during the establishment dial race
+    ///   (accept side), where the existing wire is healthy and the peer is
+    ///   NOT re-dialing. REPLACING it would tear down the frames queued on
+    ///   its writer AND collapse the wire under the peer, whose reconnect
+    ///   ticker would then re-dial — a self-sustaining replace storm across
+    ///   the fleet (the arm-hunt burst regression shape). The grace window
+    ///   is the persistence test that tells a one-shot transient (count
+    ///   never advances) from a re-dialing peer (count climbs every ~5s
+    ///   tick) apart — the accept-side analog of
+    ///   [`REDIAL_REQUEST_PRUNE_AFTER`].
+    ///
+    /// Generation safety of a REPLACE: the `insert` overwrites the old
+    /// `outgoing_tx`; a late [`DisconnectedPeer`] for the old wire then
+    /// carries the OLD sender, which fails `handle_peer_disconnect`'s
+    /// `same_channel` check against the freshly inserted sender and is a
+    /// no-op. So a racing disconnect of the old wire cannot kill the new
+    /// one (the same generation discipline the disconnect path enforces).
+    pub(super) fn register_accepted(&mut self, accepted: AcceptedPeer<I>) {
+        if let Some(existing) = self.connections.get(&accepted.peer_id) {
+            // Provably-dead wire ⇒ replace at once; otherwise gate on
+            // persistence so a mesh-forming transient does not collapse a
+            // healthy wire (the replace-storm guard).
+            if !existing.is_closed() {
+                let seen = self
+                    .accept_replace_evidence
+                    .entry(accepted.peer_id.clone())
+                    .or_insert(0);
+                *seen += 1;
+                if *seen <= ACCEPT_REPLACE_GRACE {
+                    // Within the grace window: treat as a transient
+                    // duplicate of the live wire and DROP it (dedup). The
+                    // peer's next regular frame keeps the live wire
+                    // identified; if the peer is genuinely re-dialing a
+                    // dead leg, the next inbound advances the count.
+                    tracing::debug!(
+                        peer = %accepted.peer_id,
+                        fresh_inbounds_while_entry_live = *seen,
+                        "duplicate inbound inside the accept-replace grace \
+                         window; keeping the existing wire"
+                    );
+                    return;
+                }
+                // Persistence past the grace window: the peer keeps
+                // re-dialing, so the healthy-looking entry is a stale
+                // half-open tombstone — fall through to replace it.
+            }
+        }
+        // Either no entry, or the existing entry is stale (dead wire, or
+        // persistently re-dialed past the grace window): register the fresh
+        // connection. A replace is a state transition worth narrating.
+        let replaced_stale = self.connections.contains_key(&accepted.peer_id);
+        self.accept_replace_evidence.remove(&accepted.peer_id);
+        // Clear reconnect-tracker state for this peer
+        // BEFORE inserting into `connections` so the
+        // operator log shape is:
+        //   "peer reconnected (attempts=N elapsed=Ms)"
+        // then
+        //   "incoming peer registered"
+        // (resolution preceded by the reconnect-tracker
+        // disposition the operator was tracking).
+        self.reconnect_tracker.observe_reconnect(&accepted.peer_id);
+        tracing::info!(
+            peer = %accepted.peer_id,
+            replaced_stale_entry = replaced_stale,
+            "incoming peer registered"
+        );
+        self.ever_connected.insert(accepted.peer_id.clone());
+        self.connections
+            .insert(accepted.peer_id, accepted.outgoing_tx);
+    }
+
+    /// Drain any newly accepted incoming connections and register them
+    /// through the single [`Self::register_accepted`] disposition.
     fn drain_new_connections(&mut self) {
         while let Ok(accepted) = self.new_conn_rx.try_recv() {
-            if !self.connections.contains_key(&accepted.peer_id) {
-                // Clear reconnect-tracker state for this peer
-                // BEFORE inserting into `connections` so the
-                // operator log shape is:
-                //   "peer reconnected (attempts=N elapsed=Ms)"
-                // then
-                //   "incoming peer registered"
-                // (resolution preceded by the reconnect-tracker
-                // disposition the operator was tracking).
-                self.reconnect_tracker.observe_reconnect(&accepted.peer_id);
-                tracing::info!(peer = %accepted.peer_id, "incoming peer registered");
-                self.ever_connected.insert(accepted.peer_id.clone());
-                self.connections
-                    .insert(accepted.peer_id, accepted.outgoing_tx);
-            }
+            self.register_accepted(accepted);
         }
     }
 

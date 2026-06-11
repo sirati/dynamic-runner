@@ -19,6 +19,30 @@ use std::process::Command;
 
 const LOG_TARGET: &str = "slurm-wrapper";
 
+/// Outcome of the Phase-1 per-job-root sweep.
+///
+/// Carries two independent facts the Phase-2 (default-storage) policy
+/// and the operator summary line each need:
+///
+/// - `found_running` — at least one running container was stopped in a
+///   swept (dead) root; feeds the "cleaned up leftover containers"
+///   summary.
+/// - `live_sibling_present` — at least one scratch root probed LIVE
+///   (a held `wrapper.lock`). When set, the node hosts a running
+///   sibling secondary, so the UNSCOPED Phase-2 `podman rm -af` against
+///   the user-default rootless storage MUST be suppressed: a
+///   default-storage container the live sibling owns cannot be
+///   distinguished from a true orphan there, and tearing it down guts
+///   the sibling's rootfs exactly as the Phase-1 gate prevents for
+///   custom-root jobs. Deferring the default-storage cleanup to a later
+///   preflight that runs with no live sibling is strictly safer than
+///   gutting a live one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SweepOutcome {
+    found_running: bool,
+    live_sibling_present: bool,
+}
+
 /// Graceful-stop (-t 10) + `rm -af` orphan podman containers under
 /// `/tmp/*/storage` (owned by this user, NOT liveness-locked) and the
 /// user-default storage. `podman` is the resolved absolute path from
@@ -32,6 +56,16 @@ const LOG_TARGET: &str = "slurm-wrapper";
 /// wrapper ([`crate::scratch_lock::is_live`]), and the 10s
 /// graceful-stop window precedes the unconditional `rm -af`.
 pub fn run(podman: &str) {
+    run_in(podman, Path::new("/tmp"));
+}
+
+/// Body of [`run`], parameterised over the scratch-scan root so the
+/// end-to-end test can point Phase 1 at a tempdir of fake per-job roots
+/// (the `/tmp` literal `run` passes in production is not test-writable
+/// with controlled contents). Phase 2 (default storage) is unscoped and
+/// driven purely by the supplied `podman` binary, so a fake-podman in
+/// the test observes both phases through one call log.
+fn run_in(podman: &str, scan_root: &Path) {
     if std::env::var("DYNRUNNER_DISABLE_PREFLIGHT_PODMAN").as_deref() == Ok("1") {
         tracing::info!(
             target: LOG_TARGET,
@@ -45,24 +79,55 @@ pub fn run(podman: &str) {
         "Pre-flight: scanning for leftover podman containers..."
     );
 
-    // Phase 1: orphan per-job storage roots under /tmp/.
-    let mut found = sweep_scratch_roots(podman, Path::new("/tmp"));
+    // Phase 1: orphan per-job storage roots (liveness-gated per root).
+    // The outcome also reports whether ANY root probed live.
+    let sweep = sweep_scratch_roots(podman, scan_root);
 
-    // Phase 2: user-default rootless storage.
-    let default_running = run_podman_capture(Command::new(podman).arg("ps").arg("-q"));
-    let default_ids = parse_container_ids(&default_running);
-    if !default_ids.is_empty() {
-        found = true;
-        tracing::info!(
+    // Phase 2: user-default rootless storage. UNSCOPED (`podman` with no
+    // `--root`/`--runroot`), so unlike Phase 1 it cannot attribute a
+    // default-storage container to a particular scratch root — a `stop`
+    // + `rm -af` here hits EVERY default-storage container the run user
+    // owns on this node. When a live sibling job is present
+    // (`sweep.live_sibling_present`), one of those may belong to it, and
+    // tearing it down guts the sibling's rootfs exactly as the Phase-1
+    // gate prevents for custom-root jobs (run_20260611_175319 — the
+    // respawned-worker torn-PATH tear). Defer the default-storage
+    // cleanup: a later preflight running with no live sibling sweeps the
+    // genuine orphans, while a live sibling is never gutted.
+    let mut found = sweep.found_running;
+    if sweep.live_sibling_present {
+        // NARRATE the deferral: silent suppression reads as "swept clean"
+        // in forensics, and this class already cost two RCA rounds partly
+        // because the sweep's actions weren't logged. Surface how many
+        // default-storage containers were left untouched and why.
+        let default_running = run_podman_capture(Command::new(podman).arg("ps").arg("-q"));
+        let deferred = parse_container_ids(&default_running).len();
+        tracing::warn!(
             target: LOG_TARGET,
-            "Pre-flight: stopping containers in default storage: {}",
-            default_ids.join(" ")
+            deferred_default_storage_containers = deferred,
+            "Pre-flight: a LIVE sibling job holds a scratch-root liveness lock on \
+             this node; SKIPPING the user-default rootless storage sweep \
+             ({deferred} container(s) left untouched). The unscoped `podman rm -af` \
+             would gut a default-storage container the live sibling may own; \
+             these orphans are swept by a later preflight with no live sibling.",
         );
-        let mut cmd = Command::new(podman);
-        cmd.arg("stop").arg("-t").arg("10").args(&default_ids);
-        run_podman_swallow(&mut cmd);
+    } else {
+        // No live sibling: safe to sweep the default storage as before.
+        let default_running = run_podman_capture(Command::new(podman).arg("ps").arg("-q"));
+        let default_ids = parse_container_ids(&default_running);
+        if !default_ids.is_empty() {
+            found = true;
+            tracing::info!(
+                target: LOG_TARGET,
+                "Pre-flight: stopping containers in default storage: {}",
+                default_ids.join(" ")
+            );
+            let mut cmd = Command::new(podman);
+            cmd.arg("stop").arg("-t").arg("10").args(&default_ids);
+            run_podman_swallow(&mut cmd);
+        }
+        run_podman_swallow(Command::new(podman).arg("rm").arg("-af"));
     }
-    run_podman_swallow(Command::new(podman).arg("rm").arg("-af"));
 
     if found {
         tracing::info!(target: LOG_TARGET, "Pre-flight: cleaned up leftover containers");
@@ -81,8 +146,12 @@ pub fn run(podman: &str) {
 ///
 /// `scan_root` is `/tmp` in production; parameterised so tests drive
 /// the sweep against a tempdir with a fake podman.
-fn sweep_scratch_roots(podman: &str, scan_root: &Path) -> bool {
-    let mut found = false;
+///
+/// Returns a [`SweepOutcome`]: whether a running container was stopped
+/// in a swept root, AND whether any root probed LIVE — the latter
+/// gates the Phase-2 default-storage sweep (see [`SweepOutcome`]).
+fn sweep_scratch_roots(podman: &str, scan_root: &Path) -> SweepOutcome {
+    let mut outcome = SweepOutcome::default();
     let euid = nix::unistd::geteuid();
     if let Ok(entries) = std::fs::read_dir(scan_root) {
         for entry in entries.flatten() {
@@ -99,8 +168,12 @@ fn sweep_scratch_roots(podman: &str, scan_root: &Path) -> bool {
             // LIVENESS GATE: a held wrapper.lock means a RUNNING wrapper
             // owns this scratch root — it is a live sibling job, not an
             // orphan. Stopping/removing its containers would gut the
-            // rootfs under its live secondary (run_20260611_115429).
+            // rootfs under its live secondary (run_20260611_115429). The
+            // same live fact also disarms the UNSCOPED Phase-2 sweep (a
+            // live sibling may own a default-storage container too — see
+            // `SweepOutcome::live_sibling_present`).
             if crate::scratch_lock::is_live(&entry.path()) {
+                outcome.live_sibling_present = true;
                 tracing::info!(
                     target: LOG_TARGET,
                     "Pre-flight: skipping LIVE sibling scratch root {} \
@@ -118,7 +191,7 @@ fn sweep_scratch_roots(podman: &str, scan_root: &Path) -> bool {
             let running = scoped_ps(podman, &storage, &runroot);
             let ids = parse_container_ids(&running);
             if !ids.is_empty() {
-                found = true;
+                outcome.found_running = true;
                 tracing::info!(
                     target: LOG_TARGET,
                     "Pre-flight: stopping containers in {storage}: {}",
@@ -131,7 +204,7 @@ fn sweep_scratch_roots(podman: &str, scan_root: &Path) -> bool {
             scoped_rm_af(podman, &storage, &runroot);
         }
     }
-    found
+    outcome
 }
 
 /// `<podman> --root <storage> --runroot <runroot> --cgroup-manager=cgroupfs ps -q`.
@@ -203,6 +276,16 @@ fn parse_container_ids(stdout: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `DYNRUNNER_DISABLE_PREFLIGHT_PODMAN` is process-global; the test
+    /// runner schedules tests in parallel threads, so every test that
+    /// SETS or READS it (the disable-escape probe + the two `run_in`
+    /// end-to-end tests) must serialise through this lock. Without it a
+    /// concurrent `run_returns_on_disable_env` leaves the var at `1`
+    /// while a `run_in` test reads it and skips the whole sweep
+    /// (empty call log → spurious failure).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parse_container_ids_splits_and_trims() {
@@ -244,6 +327,7 @@ mod tests {
 
     #[test]
     fn run_returns_on_disable_env() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvGuard::set("DYNRUNNER_DISABLE_PREFLIGHT_PODMAN", "1");
         // The disable path must return without invoking podman or panicking.
         run("podman");
@@ -311,7 +395,7 @@ mod tests {
         let orphan = make_scratch_root(&scan, "asm-dead5678");
         drop(crate::scratch_lock::acquire(&orphan).expect("acquire+release orphan lock"));
 
-        let found = sweep_scratch_roots(&podman.to_string_lossy(), &scan);
+        let outcome = sweep_scratch_roots(&podman.to_string_lossy(), &scan);
 
         let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
         let live_storage = live.join("storage");
@@ -334,7 +418,15 @@ mod tests {
             orphan_lines.iter().any(|l| l.contains(" rm ")),
             "the orphan root must still be rm -af'd; calls:\n{calls}",
         );
-        assert!(found, "the orphan's running container counts as found");
+        assert!(
+            outcome.found_running,
+            "the orphan's running container counts as found"
+        );
+        assert!(
+            outcome.live_sibling_present,
+            "the held-lock live root must be reported so Phase 2's unscoped \
+             default-storage sweep is suppressed",
+        );
     }
 
     /// A root with NO liveness marker at all (a wrapper from before
@@ -359,6 +451,113 @@ mod tests {
             calls.lines().any(|l| l.contains(&storage) && l.contains(" rm ")),
             "a markerless (pre-fix / true-orphan) root must still be swept; \
              calls:\n{calls}",
+        );
+    }
+
+    /// A `stop`/`rm` call is "default-storage" when it carries NO
+    /// `--root`/`--runroot` (the unscoped Phase-2 shape). The scoped
+    /// Phase-1 calls always prefix those flags, so their absence on a
+    /// `stop`/`rm` line uniquely identifies a default-storage teardown.
+    ///
+    /// The fake podman logs argv space-joined, so the verb is the FIRST
+    /// token on the default-storage lines (`stop -t 10 …`, `rm -af`) and
+    /// a leading-space match would miss them — split into tokens and
+    /// look for the verb as token[0].
+    fn is_default_storage_teardown(line: &str) -> bool {
+        let mut toks = line.split_whitespace();
+        let verb = toks.next();
+        matches!(verb, Some("stop") | Some("rm"))
+            && !line.contains("--root")
+            && !line.contains("--runroot")
+    }
+
+    /// THE root-cause pin for run_20260611_175319 (respawned-worker
+    /// torn-PATH). Replays the observed sequence END-TO-END through the
+    /// real preflight `run_in`:
+    ///
+    ///   * a LIVE sibling secondary holds its `wrapper.lock`, AND
+    ///   * the fake podman reports a RUNNING default-storage container
+    ///     (`ps -q` → an id) — standing in for the live sibling's
+    ///     own default-storage container.
+    ///
+    /// The unscoped Phase-2 sweep (`podman stop` + `podman rm -af`, no
+    /// `--root`) would tear that container down and gut the live
+    /// sibling's rootfs — exactly the PATH/libc.so.6/nix-store tear the
+    /// consumer hit. With the live-sibling suppression, preflight must
+    /// issue NO default-storage `stop`/`rm` at all (the container stays
+    /// alive) and must NARRATE the deferral.
+    ///
+    /// Revert-check: drop the `if sweep.live_sibling_present` guard in
+    /// `run_in` (back to the always-rm shape) and the default-storage
+    /// `rm -af` reappears in the call log, failing the survive assert.
+    #[test]
+    fn run_suppresses_default_storage_sweep_when_live_sibling_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        let calls_log = tmp.path().join("calls.log");
+        // The fake podman answers EVERY `ps` with a container id, so the
+        // unscoped Phase-2 `ps -q` reports a running default-storage
+        // container — the one a non-suppressed sweep would gut.
+        let podman = write_fake_podman(tmp.path(), &calls_log);
+
+        // LIVE sibling: scratch root with a HELD wrapper.lock.
+        let live = make_scratch_root(&scan, "asm-live9999");
+        let _live_guard = crate::scratch_lock::acquire(&live).expect("acquire live lock");
+
+        // `run_in` reads the process-global disable env; serialise + pin
+        // it OFF so the ambient state / a parallel disable-probe test
+        // cannot skip the sweep out from under this test.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _disable_guard = EnvGuard::set("DYNRUNNER_DISABLE_PREFLIGHT_PODMAN", "0");
+
+        run_in(&podman.to_string_lossy(), &scan);
+
+        let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
+
+        // The live sibling's scratch root is never touched (Phase-1 gate).
+        let live_storage = live.join("storage").to_string_lossy().into_owned();
+        assert!(
+            !calls.contains(&live_storage),
+            "Phase 1 must skip the live sibling's scratch root; calls:\n{calls}",
+        );
+        // CORE: no UNSCOPED default-storage stop/rm — the live sibling's
+        // default-storage container survives the preflight.
+        let default_teardowns: Vec<&str> = calls
+            .lines()
+            .filter(|l| is_default_storage_teardown(l))
+            .collect();
+        assert!(
+            default_teardowns.is_empty(),
+            "with a live sibling present the unscoped default-storage \
+             stop/rm MUST be suppressed (it would gut the sibling's \
+             rootfs); offending calls: {default_teardowns:?}\nfull log:\n{calls}",
+        );
+    }
+
+    /// Counterpart: with NO live sibling, `run_in` still performs the
+    /// default-storage sweep (`rm -af`) — the suppression must not
+    /// regress true-orphan cleanup on a node with no live job.
+    #[test]
+    fn run_sweeps_default_storage_when_no_live_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        let calls_log = tmp.path().join("calls.log");
+        let podman = write_fake_podman(tmp.path(), &calls_log);
+
+        // No scratch roots at all → no live sibling. Serialise + pin the
+        // disable env OFF (see the live-sibling test).
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _disable_guard = EnvGuard::set("DYNRUNNER_DISABLE_PREFLIGHT_PODMAN", "0");
+
+        run_in(&podman.to_string_lossy(), &scan);
+
+        let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        assert!(
+            calls.lines().any(is_default_storage_teardown),
+            "with no live sibling the default-storage sweep must still run \
+             (true-orphan cleanup); calls:\n{calls}",
         );
     }
 }

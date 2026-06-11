@@ -272,6 +272,46 @@ async fn setup_phase_never_meshed_does_not_arm_election() {
         .await;
 }
 
+/// #423 NEGATIVE: under a lagged OWN tick (CPU starvation), the setup-phase
+/// election arm must NOT arm even past the silence threshold. The
+/// `silent_for` the arm reads is the setup-deadline-anchor age; when THIS
+/// node's runtime froze, that age reflects OUR stall (we could not process
+/// the primary's setup frames), not the primary's silence. `wait_for_setup`'s
+/// select arm feeds the SAME shared `own_tick_health` authority once per tick
+/// and gates `maybe_arm_setup_election` on `!starved` — exactly the sequence
+/// this test replays. (Once the node recovers a healthy tick, a still-silent
+/// primary arms on the next on-cadence tick — covered by the headline arm
+/// test above.)
+#[tokio::test(flavor = "current_thread")]
+async fn setup_phase_lagged_own_tick_defers_arm() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, _members) = setup_secondary_formed_mesh();
+
+            // Replay the select arm: observe the tick (a 10s inter-tick gap ≫
+            // the 150ms = 3× 50ms-cadence starvation threshold), then gate the
+            // arm on the verdict — the precise `wait_for_setup` sequence.
+            let now = std::time::Instant::now();
+            assert!(!sec
+                .own_tick_health
+                .observe_tick(now - Duration::from_secs(10)));
+            let starved = sec.own_tick_health.observe_tick(now);
+            assert!(starved, "a 10s inter-tick gap must be judged starved");
+
+            if !starved {
+                sec.maybe_arm_setup_election(Duration::from_secs(300));
+            }
+            assert!(
+                sec.setup_election.is_none(),
+                "a lagged own tick must DEFER the setup-phase election arm — the \
+                 measured primary silence reflects OUR stall, not the primary's"
+            );
+        })
+        .await;
+}
+
 /// LOSER CONTRACT: a setup-phase candidate that observes a PEER win the
 /// election (a `PrimaryChanged` naming the peer) must DROP its transient
 /// `setup_election` holder and STAY in setup (it never went operational), so

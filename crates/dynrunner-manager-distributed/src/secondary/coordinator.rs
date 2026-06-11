@@ -98,6 +98,13 @@ where
         // outside a tokio runtime); the orchestration arms it at setup
         // entry and `wait_for_setup` re-arms it on primary liveness.
         let setup_deadline = super::setup_deadline::SetupDeadline::new(config.unconfigured_deadline);
+        // Own-tick-health authority, built off the keepalive cadence before
+        // `config` moves into `this.config` (mirroring `setup_deadline`). The
+        // SAME shared primitive the primary's heartbeat sweep consumes; fed
+        // once per keepalive-arm tick and read by every silence-based
+        // judgment (the primary-silence backstop, the peer-keepalive reaper,
+        // the setup-phase election arm).
+        let own_tick_health = crate::own_tick_health::OwnTickHealth::new(config.keepalive_interval);
         let mut this = Self {
             config,
             client,
@@ -161,6 +168,7 @@ where
             // No setup-phase election armed at construction; the setup election
             // driver in `wait_for_setup` populates this on primary-silence.
             setup_election: None,
+            own_tick_health,
             command_rx: Some(command_rx),
             command_tx,
             // Lazily constructed in `run_until_setup_or_done_inner`

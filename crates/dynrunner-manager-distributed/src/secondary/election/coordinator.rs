@@ -855,9 +855,24 @@ where
             .unwrap_or(false);
         // (B) wedged-primary backstop — patient receive-staleness, ONLY for
         // an app-silent primary whose link never armed leg (A).
+        //
+        // Own-tick-health re-base (#423): the staleness anchor
+        // (`primary_last_seen`) is clamped UP to the shared trustworthy
+        // floor before the comparison, so a CPU-starved node measures
+        // primary silence ONLY from fresh, post-lag evidence. The
+        // production failure was exactly this leg firing on a node whose
+        // own keepalive arm had lagged: `now - primary_last_seen` looked
+        // past the ≈120s backstop because OUR runtime froze, not because
+        // the (alive-but-unheard) primary went silent — and that fed the
+        // fatal "peer mesh required for failover" exit + the failover
+        // cascade. With no starvation the clamp is the identity, so a
+        // genuinely-wedged primary still elects at the backstop one healthy
+        // cadence window after the node recovers.
         let primary_silence_exceeded = self
             .election_last_seen()
-            .map(|t| Instant::now().duration_since(t) > backstop)
+            .map(|t| {
+                Instant::now().duration_since(self.own_tick_health.trustworthy_anchor(t)) > backstop
+            })
             .unwrap_or(false);
         // (C) primary departed the transport mesh — snapshotted above via
         // the single-source `primary_departed_membership()` (which carries

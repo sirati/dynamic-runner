@@ -65,17 +65,35 @@ where
         // `current_primary` is the single source of "who is primary now".
         // Own the current-primary id before borrowing the operational
         // `peer_keepalives`: `current_primary()` borrows `cluster_state`
-        // (a separate field), and the iteration borrows the pool-state
-        // via `op_mut()` (a full `&mut self`) — taking the id by value
-        // first keeps the two borrows disjoint.
+        // (a separate field), so taking the id by value first keeps the
+        // read loop's `&self` borrows (the pool view + the own-tick floor)
+        // disjoint from it.
         let current_primary = self.cluster_state.current_primary().map(str::to_owned);
-        let op = self.op_mut();
-        for (peer_id, last_seen) in &op.peer_keepalives {
-            if Some(peer_id.as_str()) == current_primary.as_deref() {
-                continue;
-            }
-            if now.duration_since(*last_seen) > timeout {
-                timed_out.push(peer_id.clone());
+        // The read loop holds only `&self` borrows (`op_ref` + the own-tick
+        // floor below), both disjoint from the `&mut` `op_mut()` reused for
+        // the eviction loop afterwards.
+        if let Some(op) = self.op_ref() {
+            for (peer_id, last_seen) in &op.peer_keepalives {
+                if Some(peer_id.as_str()) == current_primary.as_deref() {
+                    continue;
+                }
+                // Own-tick-health re-base: clamp `last_seen` UP to the shared
+                // trustworthy floor so a peer's silence is measured from
+                // fresh, post-lag evidence. If THIS node's own keepalive arm
+                // just lagged past its cadence (CPU starvation/freeze),
+                // `last_seen` predates a frozen window during which we could
+                // not have processed an inbound keepalive even if it arrived
+                // — counting that window as the peer's silence would
+                // mass-prune a LIVE mesh off our own stall (the
+                // mesh-view-emptiness face of #423, which empties
+                // `peer_keepalives` → `live_peer_ids` → the failover quorum
+                // denominator). With no starvation observed the clamp is the
+                // identity, so a genuinely silent peer past `peer_timeout` is
+                // still pruned.
+                let anchor = self.own_tick_health.trustworthy_anchor(*last_seen);
+                if now.saturating_duration_since(anchor) > timeout {
+                    timed_out.push(peer_id.clone());
+                }
             }
         }
 

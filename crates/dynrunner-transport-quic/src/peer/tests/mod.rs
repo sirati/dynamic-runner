@@ -52,6 +52,12 @@
 //!   `RedialRequest` nudges the dial owner to force-prune + re-dial,
 //!   relay covers directed sends meanwhile; plus the
 //!   genuine-departure stop (roster replacement forgets tracking).
+//! - [`accept_replace_rejoin`]: the rejoin-exile heal (#416 /
+//!   run_20260611_123632) — a removed-but-alive peer that redials is
+//!   re-admitted because a fresh authenticated inbound REPLACES the
+//!   stale half-open `connections` entry on the accept side; the
+//!   lower-id-dials dedup is preserved on the dial-owner side, and the
+//!   replacement is generation-checked.
 //!
 //! The shared [`TestId`] is defined here so every sub-module gets
 //! the same `Identifier` impl via `super::TestId`.
@@ -61,6 +67,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct TestId(pub(crate) String);
 
+mod accept_replace_rejoin;
 mod bind_port;
 mod bootstrap_redial;
 mod broadcast_miss;
