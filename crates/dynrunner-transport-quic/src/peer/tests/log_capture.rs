@@ -26,6 +26,10 @@ use tracing_subscriber::layer::{Context, Layer};
 #[derive(Debug, Clone)]
 pub(crate) struct CapturedEvent {
     pub(crate) target: String,
+    /// The event's verbosity level (`tracing::Level`). Tests that pin a
+    /// rate-limit downgrade (a redial-path line that drops from WARN to
+    /// DEBUG) match on this; the message/target-scoped tests ignore it.
+    pub(crate) level: tracing::Level,
     pub(crate) message: String,
     /// Space-joined `name=value` renderings of every structured
     /// field OTHER than `message` (e.g. `peer=…`, `addr=…`,
@@ -113,6 +117,7 @@ pub(crate) struct CaptureLayer {
 impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let target = event.metadata().target().to_string();
+        let level = *event.metadata().level();
         let mut visitor = MessageVisitor::new();
         event.record(&mut visitor);
         // Lock can poison if a concurrent test panics, but this
@@ -123,6 +128,7 @@ impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
         if let Ok(mut buf) = self.records.lock() {
             buf.push(CapturedEvent {
                 target,
+                level,
                 message: visitor.message,
                 fields: visitor.fields,
             });

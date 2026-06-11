@@ -388,13 +388,16 @@ pub(crate) fn run_slurm_pipeline<'py>(
             guard.set_tunnel_manager(mgr);
         }
 
-        // Setup-abort job rollback is already armed (before
-        // `run_preparation` above), so a failure in any remaining setup
-        // step below (source-binary upload, coordinator construction,
-        // the consumer's on_run_start hook) scancels the just-submitted
-        // jobs rather than orphaning them. `drive_rust_primary` disarms
-        // the instant it hands the run to `coord.run()`. See
-        // `CleanupGuard`'s arm/disarm doc.
+        // Job rollback is already armed (before `run_preparation`
+        // above), so a failure in any remaining setup step below
+        // (source-binary upload, coordinator construction, the
+        // consumer's on_run_start hook) scancels the just-submitted jobs
+        // rather than orphaning them. `drive_rust_primary` keeps it
+        // armed ACROSS `coord.run()` and disarms only after a SUCCESSFUL
+        // (verdict-broadcast) return — so a `run()` raise (e.g. a
+        // BringUpFailed bring-up fatal that assembled no fleet) also
+        // scancels the stranded cohort rather than leaving it RUNNING.
+        // See `CleanupGuard`'s arm/disarm doc.
 
         log.call_method1(
             "info",
@@ -423,9 +426,11 @@ pub(crate) fn run_slurm_pipeline<'py>(
 
         // ---- Hand-off to the Rust primary coordinator. ----
         //
-        // `&mut guard` so the hand-off can disarm setup-abort job
-        // rollback at the exact instant `coord.run()` takes ownership of
-        // the run — see `drive_rust_primary` and `CleanupGuard`.
+        // `&mut guard` so the hand-off can disarm job rollback only after
+        // `coord.run()` RETURNS SUCCESSFULLY (the verdict-broadcast proof
+        // the fleet is self-terminating). A `run()` raise leaves the
+        // guard armed so this scope's `drop(guard)` below scancels the
+        // cohort — see `drive_rust_primary` and `CleanupGuard`.
         drive_rust_primary(
             py,
             task,
