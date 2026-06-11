@@ -730,7 +730,8 @@ where
             // `SecondaryTerminal::Aborted` so the PyO3 secondary/observer
             // wrappers translate it to `std::process::exit(1)`. Originators
             // (#313): every deliberate fail-loud primary terminal — the
-            // pre-phase duplicate-task-id case (#3a), the routing-collapse
+            // duplicate-task-id cases (#3a pre-phase, #3b run-wide
+            // invalidation — latched BEFORE the wipe), the routing-collapse
             // strand, the wholesale spawn rejection, the worker-management
             // fail latch (`RunShouldFail` / `PolicyFatalExit`), and the
             // no-relocation-target topology. See the primary's

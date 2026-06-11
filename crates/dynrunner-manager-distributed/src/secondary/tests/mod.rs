@@ -92,6 +92,7 @@
 
 #![cfg(test)]
 
+mod abort_gates;
 mod anti_entropy_heal;
 mod custom_messages;
 mod dead_worker_spin;
@@ -124,6 +125,7 @@ mod replay_backoff;
 mod respawn_exec_failure;
 mod run_config_responder;
 mod setup_handshake_resilience;
+mod setup_liveness;
 mod terminal_ack;
 mod terminal_msg_watermark;
 mod voting_candidate_death;

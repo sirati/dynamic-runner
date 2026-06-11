@@ -442,3 +442,147 @@ impl PrimaryConfig {
         }
     }
 }
+
+/// Floor of the auto-scaled quorum-proceed (straggler) window — even a
+/// 1-secondary fleet gets a minute for SLURM scheduling + container boot.
+pub const QUORUM_WINDOW_FLOOR: Duration = Duration::from_secs(60);
+
+/// Per-secondary slice of the auto-scaled quorum-proceed window: each
+/// expected secondary buys the fleet another 15s of straggler patience
+/// (the ba889cd scale-aware shape, `max(60, n*15)` — re-homed here after
+/// the old `setup_deadline` knob it originally derived was removed and
+/// the derivation silently fell back to the flat 600s default).
+pub const QUORUM_WINDOW_PER_SECONDARY: Duration = Duration::from_secs(15);
+
+/// The quorum-proceed window must end STRICTLY BEFORE the secondaries'
+/// setup deadline can fire — the fraction of `unconfigured_deadline` it
+/// is capped at. The 20% margin absorbs the arming skew: secondaries arm
+/// their deadline at boot, the primary arms its window only after the
+/// submitter's sbatch + tunnel bring-up (≈20s in the asm-dataset LMU
+/// trace), so equal values GUARANTEE the fleet dies first whenever any
+/// secondary is missing.
+pub const QUORUM_WINDOW_DEADLINE_FRACTION: f64 = 0.8;
+
+/// Derive the primary's quorum-proceed (straggler) window — the
+/// [`PrimaryConfig::connect_timeout`] value `wait_for_connections` waits
+/// before proceeding with a partial fleet.
+///
+/// # The knob map this function exists to keep honest
+///
+/// THREE knobs historically shared the one 600s value, and the
+/// asm-dataset LMU fleet death was the result:
+///
+/// * `DistributedConfig.connect_timeout_secs` (default 600) fed BOTH the
+///   secondary's bootstrap DIAL budget (`dial_until_deadline` — a
+///   transport patience knob, untouched here) AND the primary's
+///   straggler window (this derivation's subject).
+/// * `DistributedConfig.unconfigured_deadline_secs` (default 600) is the
+///   secondaries' setup deadline — armed EARLIER than the primary's
+///   window, so any missing secondary made the welcomed fleet expire
+///   strictly before quorum-proceed.
+/// * The old scale-aware `setup_deadline` (`max(60, n*15)`, ba889cd) was
+///   removed with its knob (7d9129c7) — LMU_OPERATIONS still documents
+///   it, but nothing computed it any more and the flat 600 won.
+///
+/// # Derivation
+///
+/// * `explicit = None` (operator left the knob at default): the
+///   scale-aware `max(`[`QUORUM_WINDOW_FLOOR`]`, n ×`
+///   [`QUORUM_WINDOW_PER_SECONDARY`]`)` — 225s for the LMU n=15.
+/// * `explicit = Some(v)`: the operator's value.
+/// * EITHER WAY the result is capped at
+///   [`QUORUM_WINDOW_DEADLINE_FRACTION`] ×
+///   `secondary_unconfigured_deadline` (WARN when the cap engages on an
+///   explicit value): a straggler window that outlives the fleet's setup
+///   deadline can only ever proceed into dead secondaries, which is
+///   strictly worse than proceeding earlier with the same quorum. The
+///   cap is the structural belt to the setup-liveness suspenders (the
+///   assembly beacon + the secondaries' re-armable deadline keep a
+///   REACHABLE fleet alive regardless; the cap bounds the blast radius
+///   for a fleet the beacon cannot reach).
+pub fn derive_connect_timeout(
+    explicit: Option<Duration>,
+    num_secondaries: u32,
+    secondary_unconfigured_deadline: Duration,
+) -> Duration {
+    let cap = secondary_unconfigured_deadline.mul_f64(QUORUM_WINDOW_DEADLINE_FRACTION);
+    match explicit {
+        Some(v) if v > cap => {
+            tracing::warn!(
+                requested_secs = v.as_secs_f64(),
+                capped_secs = cap.as_secs_f64(),
+                unconfigured_deadline_secs = secondary_unconfigured_deadline.as_secs_f64(),
+                "explicit connect_timeout exceeds the fleet's setup deadline \
+                 margin; capping the quorum-proceed window — a straggler wait \
+                 that outlives the secondaries' unconfigured_deadline proceeds \
+                 into a dead fleet (raise --unconfigured-deadline-secs to \
+                 raise both)"
+            );
+            cap
+        }
+        Some(v) => v,
+        None => QUORUM_WINDOW_FLOOR
+            .max(QUORUM_WINDOW_PER_SECONDARY * num_secondaries)
+            .min(cap),
+    }
+}
+
+#[cfg(test)]
+mod connect_timeout_tests {
+    use super::*;
+
+    /// The ba889cd auto-scale is honored again: an unset knob derives
+    /// `max(60, n*15)` — 225s for the LMU n=15 fleet, the value
+    /// LMU_OPERATIONS documents — instead of the flat 600s that shipped
+    /// after the old knob's removal orphaned the derivation.
+    #[test]
+    fn auto_scale_honored_when_unset() {
+        let d = Duration::from_secs(600);
+        assert_eq!(
+            derive_connect_timeout(None, 15, d),
+            Duration::from_secs(225),
+            "n=15 derives the documented max(60, 15*15) = 225s"
+        );
+        assert_eq!(
+            derive_connect_timeout(None, 1, d),
+            Duration::from_secs(60),
+            "small fleets sit on the 60s floor"
+        );
+    }
+
+    /// The structural inversion guard: the derived straggler window is
+    /// STRICTLY shorter than the secondaries' setup deadline, for both
+    /// the auto-scaled and the explicit-operator shapes — equal values
+    /// (the production 600/600) are exactly the fleet-death geometry.
+    #[test]
+    fn straggler_window_strictly_below_secondary_deadline() {
+        let deadline = Duration::from_secs(600);
+        // The production shape: explicit 600 vs deadline 600 → capped.
+        let derived = derive_connect_timeout(Some(Duration::from_secs(600)), 15, deadline);
+        assert!(
+            derived < deadline,
+            "an explicit window equal to the setup deadline must be capped \
+             below it (got {derived:?})"
+        );
+        assert_eq!(derived, Duration::from_secs(480), "80% of 600s");
+        // A huge auto-scale (n=100 → 1500s) is capped the same way.
+        let derived = derive_connect_timeout(None, 100, deadline);
+        assert!(derived < deadline);
+        assert_eq!(derived, Duration::from_secs(480));
+    }
+
+    /// An explicit operator value BELOW the cap is sovereign — the
+    /// derivation never lengthens or shortens it (the 0.1s
+    /// `test_lifecycle_hooks` fast-fail shape keeps working).
+    #[test]
+    fn explicit_value_below_cap_is_untouched() {
+        assert_eq!(
+            derive_connect_timeout(
+                Some(Duration::from_millis(100)),
+                4,
+                Duration::from_secs(600)
+            ),
+            Duration::from_millis(100)
+        );
+    }
+}

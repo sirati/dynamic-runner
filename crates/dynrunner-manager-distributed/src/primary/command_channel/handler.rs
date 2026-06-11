@@ -442,9 +442,12 @@ where
         // #3b: a WITHIN-BATCH `(phase_id, task_id)` duplicate in a RUNTIME
         // spawn (any spawn reaching this handler is post-phase-start — the
         // 3a/3b discriminator `phase_started_emitted.is_empty()` is
-        // structurally false here) invalidates EVERY not-yet-terminal task
-        // across the whole run; the cluster CONTINUES (no `RunAborted`). The
-        // signal is `validate_spawn_tasks`'s `DuplicateInBatch`: the SAME
+        // structurally false here) is a TERMINAL run abort: the
+        // `RunAborted` verdict is latched + broadcast FIRST (carrying the
+        // duplicate-identity reason) and EVERY not-yet-terminal task is
+        // then invalidated run-wide — see `invalidate_all_pending` for the
+        // verdict-before-wipe ordering. The signal is
+        // `validate_spawn_tasks`'s `DuplicateInBatch`: the SAME
         // `(phase_id, task_id)` appeared twice in ONE fresh spawn-set (no
         // authoritative prior copy), so the run's task set is genuinely
         // ambiguous and adding the would-be survivors only to immediately
