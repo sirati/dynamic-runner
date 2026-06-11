@@ -673,16 +673,16 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     // Per-secondary last-keepalive tracking for failover detection (F1).
     pub(super) secondary_keepalives: HashMap<String, Instant>,
 
-    /// When the heartbeat tick LAST ran — the tick's own clock, owned by
-    /// the liveness module (`primary::heartbeat`). The dead-secondary
-    /// declaration reads the inter-tick gap as its local-starvation
-    /// guard: a gap far beyond the keepalive cadence means THIS node's
-    /// runtime was frozen/starved for the interim, so every silence age
-    /// it would measure is inflated by its own stall — declaring
-    /// removals off that sweep would author deaths of live peers. One
-    /// lagged tick defers the hard declarations to the NEXT (on-cadence)
-    /// tick, by which time the ingest/processing clocks have refreshed.
-    pub(super) last_heartbeat_tick_at: Option<Instant>,
+    /// The shared own-tick-health authority (`crate::own_tick_health`): the
+    /// SAME primitive the secondary's silence judgments consume. The
+    /// heartbeat sweep feeds each tick's instant to it; a lagged tick means
+    /// THIS node's runtime was frozen/starved for the interim, so every
+    /// silence age it would measure is inflated by its own stall —
+    /// declaring removals off that sweep would author deaths of live peers.
+    /// `observe_tick` returning `true` defers the WHOLE sweep to the NEXT
+    /// (on-cadence) tick, by which time the ingest/processing clocks have
+    /// refreshed.
+    pub(super) own_tick_health: crate::own_tick_health::OwnTickHealth,
 
     /// Decider-health gate on the staleness INPUTS (the companion of
     /// the tick-lag guard above, for the OTHER starvation axis): tracks
@@ -1295,6 +1295,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 .keepalive_interval
                 .saturating_mul(config.keepalive_miss_threshold),
         );
+        // Own-tick-health authority, built off the keepalive cadence before
+        // `config` moves into `this.config` (mirroring the snapshots above).
+        let own_tick_health = crate::own_tick_health::OwnTickHealth::new(config.keepalive_interval);
         let mut this = Self {
             config,
             client,
@@ -1329,7 +1332,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             setup_discovery: None,
             phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
-            last_heartbeat_tick_at: None,
+            own_tick_health,
             ingest_gate: super::heartbeat::IngestEdgeGate::new(),
             silence_warn_stage: HashMap::new(),
             backpressured_secondaries: HashMap::new(),

@@ -133,6 +133,7 @@ mod setup_handshake_resilience;
 mod setup_liveness;
 mod setup_wait_observability;
 mod snapshot_reply_destination;
+mod starved_judgments;
 mod terminal_ack;
 mod terminal_msg_watermark;
 mod voting_candidate_death;

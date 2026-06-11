@@ -433,6 +433,22 @@ where
                 }
                 _ = keepalive_interval.tick() => {
                     arm_stats.record(ARM_KEEPALIVE);
+                    // Own-tick-health gate FIRST, before any silence-based
+                    // judgment this arm drives. A keepalive tick that fires
+                    // long past its cadence means THIS node's runtime was
+                    // frozen/starved (the wake-from-freeze face: the
+                    // `MissedTickBehavior::Skip` arm fires one catch-up tick
+                    // the instant the runtime unfreezes, BEFORE the mesh pump
+                    // has drained the inbound backlog into the liveness
+                    // clocks). Feeding the tick here re-bases the shared
+                    // trustworthy floor, so the peer-keepalive reaper
+                    // (`check_peer_timeouts`) and the primary-silence legs
+                    // (`run_election_tick`) below read `now -
+                    // trustworthy_anchor(last_seen)` and measure ZERO silence
+                    // across the frozen window — judging peers from fresh,
+                    // post-lag evidence instead of declaring live peers dead
+                    // off our own stall (#423).
+                    self.own_tick_health.observe_tick(std::time::Instant::now());
                     self.send_keepalive().await;
                     self.check_peer_timeouts();
                     self.check_peer_mesh_watchdog().await;

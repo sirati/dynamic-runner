@@ -580,6 +580,20 @@ where
     /// the state owned by whichever regime drives it.
     pub(in crate::secondary) setup_election: Option<election::SetupElection<I>>,
 
+    /// The shared own-tick-health authority (`crate::own_tick_health`): the
+    /// SAME primitive the primary's heartbeat sweep consumes. The
+    /// keepalive-arm tick (and the setup-phase election tick) feeds each
+    /// tick's instant to it; a lagged tick means THIS node's runtime was
+    /// frozen/starved, so every silence age it would measure — the
+    /// primary-silence backstop (leg B), the peer-keepalive reaper, the
+    /// setup-election arm — is inflated by its OWN stall, not the peer's
+    /// silence. The authority re-bases its trustworthy floor on the lag, and
+    /// every silence judgment reads `now - trustworthy_anchor(last_evidence)`
+    /// so the starved window contributes ZERO silence: peers are judged from
+    /// fresh, post-lag evidence (a genuine death is detected one healthy
+    /// cadence window later — correctness over speed).
+    pub(in crate::secondary) own_tick_health: crate::own_tick_health::OwnTickHealth,
+
     /// Cross-thread / cross-runtime ingress for the `PrimaryHandle`
     /// PyO3 surface (when the handle was minted from a
     /// `PySecondaryCoordinator`).

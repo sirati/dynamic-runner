@@ -25,14 +25,15 @@
 //! queue-transit old, which the arrival-clock union already covers).
 //! The gate trips when some peer has been continuously
 //! pending-without-drain-progress longer than the caller's threshold
-//! (the same `SWEEP_STARVATION_TICK_MULTIPLE` × keepalive-interval
-//! budget the sweep's own tick-lag guard uses — far below the hard
-//! death backstop, so a healthy node never feels it).
+//! (the same `own_tick_health::STARVATION_TICK_MULTIPLE` ×
+//! keepalive-interval budget the sweep's own tick-lag guard uses — far
+//! below the hard death backstop, so a healthy node never feels it).
 //!
 //! # Relation to the sibling guards (defense-in-depth layers)
 //!
-//! - the TICK-LAG guard (`local_sweep_starved`) catches a starved
-//!   OPERATIONAL loop — the sweep itself ran late;
+//! - the TICK-LAG guard (the shared `crate::own_tick_health` authority,
+//!   fed by `process_heartbeat_tick`) catches a starved OPERATIONAL loop —
+//!   the sweep itself ran late;
 //! - the ARRIVAL-CLOCK union in `collect_heartbeat_report` keeps
 //!   silence ages honest for peers whose frames the read loops could
 //!   attribute;
