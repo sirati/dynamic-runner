@@ -43,53 +43,17 @@
 //! stops sending simply stops refreshing its entry. (Eviction belongs
 //! to the role-specific death-clock, not to this raw freshness view.)
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
-
-/// A cloneable handle to the per-peer frame-ingest freshness view.
+/// The per-peer frame-ingest freshness view: the slot-mounted instance
+/// of the shared [`FreshnessClock`] mechanism (defined once in the
+/// protocol crate; the transports mount the same cell type on their own
+/// ingest edges — see `dynrunner_protocol_primary_secondary::freshness`).
 ///
 /// Every clone shares one cell. The role slot holds the write side
-/// ([`IngestLiveness::record`], called from `RoleSlot::deliver`); the
-/// matching [`super::RoleInbox`] holds a clone for
-/// [`IngestLiveness::last_seen`].
-#[derive(Clone, Default)]
-pub struct IngestLiveness {
-    inner: Arc<Mutex<HashMap<String, Instant>>>,
-}
-
-impl IngestLiveness {
-    /// A fresh view with no frames ingested yet.
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    /// Record that a frame from `node_id` just ENTERED the inbox (local
-    /// receipt `Instant`). Called by the slot's delivery choke point per
-    /// frame. Keying on a monotonic receipt `Instant` (mirroring the
-    /// secondary's `primary_last_seen` and the primary's
-    /// `secondary_keepalives`) makes the freshness immune to a
-    /// coordinated host suspend/resume.
-    pub fn record(&self, node_id: &str) {
-        self.inner
-            .lock()
-            .expect("ingest liveness poisoned")
-            .insert(node_id.to_string(), Instant::now());
-    }
-
-    /// The most recent frame-ingest `Instant` for `node_id`, or `None`
-    /// if no frame from it has ever entered the inbox. The reader
-    /// compares `now - last_seen` against its own staleness threshold.
-    pub fn last_seen(&self, node_id: &str) -> Option<Instant> {
-        self.inner
-            .lock()
-            .expect("ingest liveness poisoned")
-            .get(node_id)
-            .copied()
-    }
-}
+/// (`record`, called from `RoleSlot::deliver` with a monotonic receipt
+/// `Instant` — suspend/resume-immune like the secondary's
+/// `primary_last_seen` and the primary's `secondary_keepalives`); the
+/// matching [`super::RoleInbox`] holds a clone for `last_seen`.
+pub type IngestLiveness = dynrunner_protocol_primary_secondary::FreshnessClock;
 
 #[cfg(test)]
 mod tests {

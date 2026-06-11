@@ -233,6 +233,28 @@ pub trait PeerTransport<I: Identifier> {
         Vec::new()
     }
 
+    /// The transport's inbound ingest-edge clocks
+    /// ([`crate::freshness::IngestEdges`]): per-peer last-ARRIVAL
+    /// (recorded by the connection read loops the moment a decoded
+    /// frame enters the transport's inbound queue) and per-peer
+    /// last-DRAINED (recorded as `recv_peer`/`try_recv_peer` pulls it
+    /// back out). Cloneable Arc-backed handles — a detached liveness
+    /// reader samples them on its own cadence while the transport's
+    /// reader tasks keep writing, so the arrival clock stays honest
+    /// even when the consumer side is starved.
+    ///
+    /// `None` (the default) means this transport cannot observe a
+    /// frame's arrival any earlier than its own `recv_peer` (e.g. the
+    /// channel transport, whose inbound queue is filled directly by the
+    /// sending peer) — liveness readers then fall back to their
+    /// downstream clocks and the ingest-health gate stays inactive.
+    /// Transports with independent read-loop tasks (the QUIC/WSS
+    /// `PeerNetwork`, the submitter's `TunneledPeerTransport`) override
+    /// with `Some` of their owned pair.
+    fn ingest_edges(&self) -> Option<crate::freshness::IngestEdges> {
+        None
+    }
+
     /// Connect to peers from the peer list received from primary.
     fn connect_to_peers(
         &mut self,
