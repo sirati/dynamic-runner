@@ -997,6 +997,110 @@ async fn reconstruct_workers_double_invoke_is_sum_capacity_not_double() {
         .await;
 }
 
+/// The worker-roster rebuild must NOT resurrect a REMOVED peer: capacity
+/// records are set-once and never deleted (`secondary_capacities` keys
+/// outlive the member), so an unfiltered rebuild re-creates worker slots
+/// for a peer whose membership was authoritatively killed by
+/// `PeerRemoved` — any later capacity-growth rebuild
+/// (`react_to_capacity_growth`) would hand the dead peer dispatchable
+/// slots again. The membership ledger (`peer_state` `Dead`, written in
+/// lockstep with the `CapabilityEntry::Departed` tombstone) is the
+/// filter seam. Re-admission (a generation-advancing `PeerJoined`) flips
+/// the SAME ledger entry back to `Alive`, so a re-admitted peer's
+/// preserved capacity record naturally re-enters the roster — restored,
+/// never re-advertised.
+#[tokio::test(flavor = "current_thread")]
+async fn reconstruct_workers_excludes_removed_peer_until_readmission() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            // Two members join and advertise capacity: sec-0 → 2 slots,
+            // sec-1 → 3 slots (the full welcome-time replicated facts:
+            // membership + capacity).
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                for (id, count) in [("sec-0", 2u32), ("sec-1", 3u32)] {
+                    cs.apply(ClusterMutation::PeerJoined {
+                        peer_id: id.into(),
+                        is_observer: false,
+                        can_be_primary: true,
+                        cap_version: Default::default(),
+                        member_gen: 0,
+                    });
+                    cs.apply(ClusterMutation::SecondaryCapacity {
+                        secondary: id.into(),
+                        worker_count: count,
+                        resources: mem(8 * 1024 * 1024 * 1024),
+                    });
+                }
+            }
+            primary.reconstruct_workers_from_cluster_state();
+            assert_eq!(
+                primary.alive_worker_count_for_test(),
+                5,
+                "both live members' capacity enters the roster"
+            );
+
+            // Authoritative removal of sec-1 (kills its membership
+            // incarnation; the capacity record stays — set-once).
+            let dead_gen = primary.cluster_state_for_test().peer_member_gen("sec-1");
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::PeerRemoved {
+                    id: "sec-1".into(),
+                    cause: dynrunner_protocol_primary_secondary::RemovalCause::KeepaliveMiss,
+                    member_gen: dead_gen,
+                });
+
+            // A capacity-growth-shaped rebuild after the removal.
+            primary.reconstruct_workers_from_cluster_state();
+            assert!(
+                !primary.workers.iter().any(|w| w.secondary_id == "sec-1"),
+                "a rebuild must NOT resurrect worker slots for an \
+                 authoritatively-removed peer (its capacity record is a \
+                 tombstoned member's, not a live one's)"
+            );
+            assert_eq!(
+                primary.alive_worker_count_for_test(),
+                2,
+                "the surviving member's slots are intact"
+            );
+
+            // RE-ADMISSION: the generation-advancing PeerJoined (what the
+            // frame-ingest re-admission seam originates) restores the
+            // member — and with it, its preserved capacity record.
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::PeerJoined {
+                    peer_id: "sec-1".into(),
+                    is_observer: false,
+                    can_be_primary: true,
+                    cap_version: Default::default(),
+                    member_gen: dead_gen + 1,
+                });
+            primary.reconstruct_workers_from_cluster_state();
+            assert_eq!(
+                primary
+                    .workers
+                    .iter()
+                    .filter(|w| w.secondary_id == "sec-1")
+                    .count(),
+                3,
+                "re-admission restores the peer's full advertised capacity \
+                 to the roster"
+            );
+            assert_eq!(primary.alive_worker_count_for_test(), 5);
+        })
+        .await;
+}
+
 /// (a) HEADLINE (#326 guard): a promoted primary hydrated from a CRDT where
 /// phases X,Y,Z are ALL-terminal (completed) AND carry the replicated
 /// `PhaseEnded` fact (the original primary's cascade originated it at its

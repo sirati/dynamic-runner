@@ -58,6 +58,33 @@ where
             );
             return;
         }
+        // Re-admission heal gate: the removal that enqueued this request
+        // may have been FALSE — the frame-ingest re-admission seam flips
+        // a removed-but-provably-alive member back to `Alive` (at the
+        // next membership generation) while the request still sits queued
+        // on the channel. A replacement for a peer that is alive again is
+        // pure waste (and a budget spend on a non-death), so the queued
+        // stage is canceled HERE, at the dispatch decision point — the
+        // single place a queued request becomes a spawn. Checked BEFORE
+        // the budget consult, so a canceled request never writes the
+        // replicated ledger (the budget "refund" is structural: the spend
+        // only happens on accept, below). The LAUNCHED stage needs no
+        // counterpart: an accepted respawn comes up under a freshly-
+        // minted `secondary-N` id (never the dead peer's), so it cannot
+        // duplicate the re-admitted identity — it joins as an ordinary
+        // extra secondary.
+        if self.cluster_state.is_peer_alive(&request.original_id) {
+            tracing::info!(
+                target: "dynrunner_respawn",
+                peer_id = %request.original_id,
+                cause = ?request.cause,
+                event = "respawn_canceled_readmitted",
+                "peer was re-admitted (alive again) after the removal that \
+                 requested this respawn; canceling the queued replacement \
+                 (no budget consumed)",
+            );
+            return;
+        }
         let (spawner, budget) = match (self.respawn_spawner.as_ref(), self.respawn_budget.as_ref())
         {
             (Some(s), Some(b)) => (Arc::clone(s), b.clone()),
