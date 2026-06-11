@@ -93,7 +93,8 @@ async fn two_phase_primary_with_counting_raise_hook() -> (
             version: Default::default(),
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
     primary.handle_mesh_ready(DistributedMessage::MeshReady {
         target: None,
         sender_id: "sec-0".into(),

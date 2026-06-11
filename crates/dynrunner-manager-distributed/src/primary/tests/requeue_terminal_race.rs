@@ -120,7 +120,8 @@ fn seed_inherited_inflight(
             version: Default::default(),
         });
     }
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
     assert!(
         primary.slot_is_inherited_for_test("sec-0", 0),
         "fixture: the reconstructed slot is INHERITED (unconfirmed occupancy)"

@@ -24,6 +24,13 @@ use crate::cluster_state::{ClusterState, OutcomeSummary};
 use crate::state::SecondaryConnectionState;
 use crate::worker_signal::WorkerMgmtSignal;
 
+/// This module's tracing target (the default `module_path!` — the run-loop
+/// exit line + the rest of the coordinator's events use it), named as a const
+/// so the exit-log shape test (`tests::bringup_composition_fatal`) captures
+/// exactly this module's emissions. Mirrors `secondary::setup::LOG_TARGET`.
+#[cfg(test)]
+pub(crate) const LOG_TARGET: &str = module_path!();
+
 /// The single-task lifecycle typestate of a remote worker slot.
 ///
 /// Replaces the removed `(current_task: Option<TaskInfo>, is_idle:
@@ -1605,7 +1612,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         snapshot: crate::cluster_state::ClusterStateSnapshot<I>,
     ) {
         self.cluster_state.restore(snapshot);
-        self.hydrate_from_cluster_state();
+        // Constructor-time seed: a composition failure here cannot broadcast a
+        // verdict (the run loop + its dispatchers have not started yet — this
+        // runs in the `Node`'s builder BEFORE `run`). Leave it surfaced by the
+        // subsequent `run_pipeline` re-hydrate, which ALWAYS re-runs the SOLE
+        // pool builder and routes an `Err` through the terminal-verdict path
+        // (`abort_run_on_invalid_composition`). So here we only log + leave
+        // `pending = None` (set by hydrate on `Err`); the rosters below are
+        // still rebuilt from the inherited capacity ledger (independent of the
+        // pool), and the run aborts cleanly at the run-phase hydrate.
+        if let Err(e) = self.hydrate_from_cluster_state() {
+            tracing::error!(
+                error = %e,
+                "promotion-snapshot seed found an invalid composed task graph; \
+                 leaving the pool empty — the run-phase hydrate re-surfaces it \
+                 and aborts the run via the terminal verdict path"
+            );
+        }
         self.reconstruct_workers_from_cluster_state();
         self.reconstruct_secondaries_from_cluster_state();
         // `phase_started_emitted` is seeded by `hydrate_from_cluster_state`
@@ -3347,14 +3370,55 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
     }
 
+    /// THE single primary run-loop chokepoint: run the pipeline and emit a
+    /// GUARANTEED terminal log line on EVERY exit path (success, error,
+    /// relocation-to-parked).
+    ///
+    /// Both `run` (the `&mut self` test entry) and `run_consuming` (the
+    /// production by-value entry) drive the pipeline through this one wrapper,
+    /// so a single emit here covers every way the primary's run loop returns.
+    /// Pre-fix there was NO such line: the asm-dataset LMU run_~1429 primary
+    /// logged its last line at the post-composition ERROR and then nothing —
+    /// no exit, no verdict, no proof it ever returned, so an operator could
+    /// not tell a wedged primary from a cleanly-exited one. The emit reads the
+    /// `Result` the pipeline returned: `Ok(())` → INFO "primary exiting"
+    /// (clean), `Err(e)` → ERROR "primary exiting" with the `RunError` reason.
+    /// (A relocation never returns from `run_pipeline` — the demote arm in
+    /// `run_consuming` cancels the pipeline future, so the "Relocated" outcome
+    /// is narrated by the Node's role-swap path, not here. This chokepoint is
+    /// specifically "the primary's RUN LOOP returned".)
+    async fn run_pipeline(
+        &mut self,
+        seed: crate::process::SeedSource<I>,
+        on_phase_start: OnPhaseStart,
+        on_phase_end: OnPhaseEnd,
+    ) -> Result<(), RunError> {
+        let result = self
+            .run_pipeline_inner(seed, on_phase_start, on_phase_end)
+            .await;
+        match &result {
+            Ok(()) => tracing::info!(
+                node = %self.config.node_id,
+                "primary exiting: run loop returned cleanly (Ok)"
+            ),
+            Err(e) => tracing::error!(
+                node = %self.config.node_id,
+                reason = %e,
+                "primary exiting: run loop returned an error"
+            ),
+        }
+        result
+    }
+
     /// Original `run()` body, factored out so the public `run` wrapper
     /// can drive cleanup-on-exit regardless of how this function
-    /// returns. See [`Self::run`] for the rationale.
+    /// returns. See [`Self::run`] for the rationale. Wrapped by
+    /// [`Self::run_pipeline`], the single exit-log chokepoint.
     ///
     /// The body runs the whole pipeline through `&mut self`: it bootstraps
     /// the mesh, activates this node as the local primary, and runs the
     /// operational loop to completion in-place.
-    async fn run_pipeline(
+    async fn run_pipeline_inner(
         &mut self,
         seed: crate::process::SeedSource<I>,
         on_phase_start: OnPhaseStart,
@@ -3453,7 +3517,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `ingest_initial_batch` duplication against `hydrate`'s own build):
         // it derives the pool, `total_tasks`, the unified `in_flight` ledger,
         // and the worker / secondary rosters from whatever the CRDT now holds.
-        self.hydrate_from_cluster_state();
+        //
+        // A composition failure (the seeded ledger describes an impossible
+        // task graph — a duplicate `(phase_id, task_id)` identity, a missing
+        // dep, or a cycle) is a run-fatal during bring-up: route it through
+        // the SAME terminal-verdict path the #3a/#3b duplicate aborts use
+        // (latch + broadcast `RunAborted`, surface the typed `RunError`) so
+        // the fleet exits on the verdict instead of stranding on an empty
+        // pool. The mode-2 `RelocatedSeed` ledger is still empty here (its
+        // corpus seeds in `discover_on_promotion`, which guards its own
+        // hydrate the same way), so this gate fires only for a cold-seed /
+        // promotion-snapshot ledger that already carries the dup.
+        if let Err(e) = self.hydrate_from_cluster_state() {
+            return Err(self.abort_run_on_invalid_composition(e).await);
+        }
 
         // Point-in-time "primary starting" observation. Read inline — NOT
         // captured into a local that flows downstream: on the mode-2

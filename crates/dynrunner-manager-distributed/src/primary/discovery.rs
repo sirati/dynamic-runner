@@ -154,7 +154,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // — closing the only window where the deleted explicit `RunComplete`
         // was load-bearing (an all-skipped corpus whose skips fire NO
         // completion event on the live path).
-        self.hydrate_from_cluster_state();
+        //
+        // A composition failure here (a discovered batch carrying a duplicate
+        // `(phase_id, task_id)` identity, a missing dep, or a cycle) is a
+        // run-fatal during bring-up — the asm-dataset LMU run_~1429 defect.
+        // Route it through the SAME terminal-verdict path the #3a/#3b
+        // duplicate aborts use (`abort_run_on_invalid_composition`): latch +
+        // broadcast `RunAborted` so the fleet exits on the verdict (not on
+        // its setup deadline) and surface the typed `RunError`. Pre-fix
+        // hydrate swallowed this (ERROR + empty pool), so the run never
+        // aborted and the fleet died slowly on deadlines.
+        if let Err(e) = self.hydrate_from_cluster_state() {
+            return Err(self.abort_run_on_invalid_composition(e).await);
+        }
         Ok(())
     }
 }

@@ -556,7 +556,8 @@ fn cold_seed_marked_item_lands_skipped_unmarked_lands_pending() {
     primary
         .originate_cold_seed(vec![(skipped, true), (to_run, false)], HashMap::new())
         .expect("mixed marked cold seed");
-    primary.hydrate_from_cluster_state();
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     assert_eq!(
         primary.cluster_state_for_test().task_count(),
@@ -704,7 +705,8 @@ async fn discovery_owed_suppresses_phase_cascade_until_settled() {
             let mut deps = HashMap::new();
             deps.insert(dynrunner_core::PhaseId::from("build"), vec![]);
             primary.originate_relocated_seed(deps);
-            primary.hydrate_from_cluster_state();
+            primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
             // While Owed, the cascade is a defence-in-depth no-op: NO
             // on_phase_end fires for the transiently-empty "build" phase.

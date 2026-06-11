@@ -796,7 +796,8 @@ async fn r1_dead_secondary_requeue_then_hydrate_redispatches_exactly_once() {
         FixedEstimator,
     );
     promoted.cluster_state_mut_for_test().restore(snapshot);
-    promoted.hydrate_from_cluster_state();
+    promoted.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
 
     // EXACTLY ONCE: the requeued task hydrates into the pool as a
     // dispatchable (queued) item — not stranded in the in-flight ledger
