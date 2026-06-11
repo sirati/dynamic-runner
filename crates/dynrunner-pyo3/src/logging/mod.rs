@@ -66,6 +66,7 @@
 //! nothing operator-relevant is lost).
 
 mod compact_format;
+mod debounce;
 
 use std::fs::OpenOptions;
 use std::io;
@@ -535,7 +536,17 @@ where
             )));
         }
     }
-    layers.push(stdio_layer(io::stdout, config.important_stdio_only));
+    // The stdio sink's writer differs by mode. In importance mode each flush
+    // to the real stdout is ONE wake event for the LLM operator, so the writer
+    // is a debouncing buffer ([`debounce`]) that coalesces bursts into a single
+    // flush (500ms quiet edge / 5s max delay) — the gate filter and emit sites
+    // stay unaware; only the `MakeWriter` changes. Normal mode keeps the
+    // historical unbuffered, line-buffered `io::stdout`.
+    if config.important_stdio_only {
+        layers.push(stdio_layer(debounce::install_debounced_stdout(), true));
+    } else {
+        layers.push(stdio_layer(io::stdout, false));
+    }
     layers
 }
 
@@ -682,6 +693,24 @@ pub(crate) fn py_log(level: &str, record_target: &str, message: &str) {
 #[pyo3(name = "py_log_important", signature = (message))]
 pub(crate) fn py_log_important(message: &str) {
     tracing::event!(target: IMPORTANT_TARGET, tracing::Level::ERROR, "{message}");
+}
+
+/// Flush the importance-mode debounced stdio buffer immediately, if installed;
+/// a no-op in normal mode (no buffer) and when importance mode is off.
+///
+/// Single concern: be the Python end of the FATAL-path buffer flush. Under
+/// `--important-stdio-only` the operator-stdio sink buffers lines and flushes
+/// them as one wake event on a 500ms-quiet / 5s-max-delay debounce
+/// ([`debounce`]). On a fatal exit the surfacing path
+/// (`logging_setup._flush_all_logging`) must put the just-emitted
+/// [`py_log_important`] line on the wire SYNCHRONOUSLY rather than wait for the
+/// debounce timer or the `atexit` backstop — so it calls this after the
+/// important emit. Off importance mode there is no buffer and this is inert, so
+/// the Python side calls it unconditionally with no mode knowledge.
+#[pyfunction]
+#[pyo3(name = "flush_important_stdio")]
+pub(crate) fn py_flush_important_stdio() {
+    debounce::flush_now();
 }
 
 #[cfg(test)]

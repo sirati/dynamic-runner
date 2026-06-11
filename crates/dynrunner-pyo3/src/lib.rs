@@ -72,6 +72,14 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // the one the importance gate admits (see `crate::logging::py_log_important`
     // and `logging_setup.surface_fatal_errors`).
     m.add_function(wrap_pyfunction!(logging::py_log_important, m)?)?;
+    // Flush the importance-mode debounced operator-stdio buffer synchronously.
+    // Under `--important-stdio-only` the stdio sink coalesces bursts into one
+    // wake event behind a 500ms-quiet / 5s-max-delay buffer; the fatal-surfacing
+    // path calls this after `py_log_important` so the diagnosable line is on the
+    // wire before teardown. A no-op off importance mode (see
+    // `crate::logging::py_flush_important_stdio` and
+    // `logging_setup._flush_all_logging`).
+    m.add_function(wrap_pyfunction!(logging::py_flush_important_stdio, m)?)?;
 
     m.add_class::<PyBinaryIdentifier>()?;
     m.add_class::<PyTaskInfo>()?;
