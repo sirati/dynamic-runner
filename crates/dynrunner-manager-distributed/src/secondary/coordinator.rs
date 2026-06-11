@@ -537,6 +537,25 @@ where
         }
     }
 
+    /// Spawn the worker custom-message dispatcher (first call only —
+    /// the receiver is `take()`n, so re-entry is a no-op). The
+    /// worker-event bridge only `tx.send()`s; the consumer's
+    /// `worker_message_listener` (Python, GIL-bound) fires on this
+    /// dispatcher task, strictly off the operational loop. Extracted
+    /// from `run_until_setup_or_done_inner` so tests can stand up the
+    /// REAL pipeline.
+    pub(in crate::secondary) fn spawn_worker_message_dispatcher(&mut self) {
+        use tracing::Instrument as _;
+        if let Some(rx) = self.worker_message_rx.take() {
+            let listeners = std::mem::take(&mut self.worker_message_listeners);
+            let handle = tokio::task::spawn_local(
+                crate::worker_messages::run_worker_message_dispatcher(rx, listeners)
+                    .instrument(tracing::Span::current()),
+            );
+            self.worker_message_dispatcher_handle = Some(handle);
+        }
+    }
+
     /// Abort + join the worker-message dispatcher task. Mirrors
     /// [`Self::cleanup_task_completed_dispatcher`] — same
     /// Drop-vs-explicit cleanup rationale.
@@ -1192,18 +1211,9 @@ where
             );
             self.task_completed_dispatcher_handle = Some(handle);
         }
-        // Same shape for the worker custom-message dispatcher: the
-        // worker-event bridge only `tx.send()`s; the consumer's
-        // `worker_message_listener` (Python, GIL-bound) fires on this
-        // dispatcher task, strictly off the operational loop.
-        if let Some(rx) = self.worker_message_rx.take() {
-            let listeners = std::mem::take(&mut self.worker_message_listeners);
-            let handle = tokio::task::spawn_local(
-                crate::worker_messages::run_worker_message_dispatcher(rx, listeners)
-                    .instrument(tracing::Span::current()),
-            );
-            self.worker_message_dispatcher_handle = Some(handle);
-        }
+        // Same shape for the worker custom-message dispatcher — see
+        // [`Self::spawn_worker_message_dispatcher`].
+        self.spawn_worker_message_dispatcher();
         // Enter `AwaitingPrimary` (`Connecting → AwaitingPrimary`): the
         // secondary is now actively trying to reach a primary, but none
         // has announced yet. The peer mesh keeps forming (the orthogonal

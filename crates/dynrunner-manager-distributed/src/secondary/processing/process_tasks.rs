@@ -308,36 +308,16 @@ where
                 {
                     arm_stats.record(ARM_POOL_EVENT);
                     if let Some(event) = event {
-                        // CAUSAL PRE-DRAIN (the terminal-ordering gate's
-                        // secondary half): apply every control-plane
-                        // command already queued BEFORE this worker
-                        // event is processed. A consumer's
-                        // `worker_message_listener` that called
-                        // `SecondaryHandle.send_to_primary` before the
-                        // worker exited has its messages queued here —
-                        // processing the exit's terminal report first
-                        // would let the terminal overtake them on the
-                        // wire AND stamp a `msgs_posted_through`
-                        // watermark that misses them (the asm-dataset
-                        // run_20260611_005220 race). Draining first
-                        // makes "control-plane ingress is causally
-                        // ordered before worker events" a loop-level
-                        // rule, with no event-shape knowledge here.
-                        self.drain_pending_control_commands(&mut secondary_control_rx)
-                            .await;
-                        let restart = self.handle_worker_event(event, &oom_watcher).await?;
-                        if let Some(wid) = restart {
-                            // SCHEDULE, never execute inline: the due
-                            // instant comes from the pool's startup-crash
-                            // backoff (zero for a healthy worker that died
-                            // mid-task — those still restart at this very
-                            // iteration's tail). Executing here at event
-                            // speed was the #370 respawn-crash loop: an
-                            // instantly-dying subprocess re-entered
-                            // kill+spawn per loop iteration and starved
-                            // the whole single-threaded runtime.
-                            self.schedule_worker_restart(wid);
-                        }
+                        // The full per-event sequence (causal fence +
+                        // handler + restart scheduling) is owned by
+                        // [`Self::process_worker_pool_event`] — one seam
+                        // the loop arm and the seam's tests share.
+                        self.process_worker_pool_event(
+                            event,
+                            &oom_watcher,
+                            &mut secondary_control_rx,
+                        )
+                        .await?;
                     }
                 }
                 // Single mesh inbound arm. There is one role inbound
@@ -910,6 +890,51 @@ where
         // signal.
         self.enter_terminal_done();
         Ok(RunOutcome::Terminal)
+    }
+
+    /// Process ONE worker pool event end to end — the single seam the
+    /// operational loop's pool-event arm routes through (and the seam
+    /// the causal-ordering tests drive), so an event is processed
+    /// identically in production and under test.
+    ///
+    /// CAUSAL PRE-DRAIN (the terminal-ordering gate's
+    /// secondary half): apply every control-plane
+    /// command already queued BEFORE this worker
+    /// event is processed. A consumer's
+    /// `worker_message_listener` that called
+    /// `SecondaryHandle.send_to_primary` before the
+    /// worker exited has its messages queued here —
+    /// processing the exit's terminal report first
+    /// would let the terminal overtake them on the
+    /// wire AND stamp a `msgs_posted_through`
+    /// watermark that misses them (the asm-dataset
+    /// run_20260611_005220 race). Draining first
+    /// makes "control-plane ingress is causally
+    /// ordered before worker events" a loop-level
+    /// rule, with no event-shape knowledge here.
+    pub(in crate::secondary) async fn process_worker_pool_event(
+        &mut self,
+        event: dynrunner_manager_local::worker::WorkerEvent<I>,
+        oom_watcher: &OomWatcher,
+        control_rx: &mut Option<
+            tokio::sync::mpsc::UnboundedReceiver<super::super::control::SecondaryControlCommand>,
+        >,
+    ) -> Result<(), String> {
+        self.drain_pending_control_commands(control_rx).await;
+        let restart = self.handle_worker_event(event, oom_watcher).await?;
+        if let Some(wid) = restart {
+            // SCHEDULE, never execute inline: the due
+            // instant comes from the pool's startup-crash
+            // backoff (zero for a healthy worker that died
+            // mid-task — those still restart at this very
+            // iteration's tail). Executing here at event
+            // speed was the #370 respawn-crash loop: an
+            // instantly-dying subprocess re-entered
+            // kill+spawn per loop iteration and starved
+            // the whole single-threaded runtime.
+            self.schedule_worker_restart(wid);
+        }
+        Ok(())
     }
 
     /// Apply ONE secondary control-plane ingress command — the single
