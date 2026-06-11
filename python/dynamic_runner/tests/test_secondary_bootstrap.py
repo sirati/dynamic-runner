@@ -308,5 +308,169 @@ class CrashLogEndToEndTests(unittest.TestCase):
         )
 
 
+# Child program for the process-termination end-to-end (#405): replay the
+# REAL production launch shape — the container entrypoint runs
+# ``python -m dynamic_runner._secondary_bootstrap``, i.e. the shim executes
+# under ``__name__ == "__main__"`` and its termination guard (not a direct
+# ``main()`` call) owns the process's fate. ``runpy.run_module(...,
+# run_name="__main__")`` reproduces that exactly under the package stub.
+_MAIN_GUARD_CHILD_PROGRAM = textwrap.dedent(
+    """
+    import pathlib, runpy, sys, types
+
+    pkg_root = pathlib.Path(sys.argv[1])
+    consumer_dir = sys.argv[2]
+    consumer_name = sys.argv[3]
+    log_dir = sys.argv[4]
+
+    pkg = types.ModuleType("dynamic_runner")
+    pkg.__path__ = [str(pkg_root)]
+    sys.modules["dynamic_runner"] = pkg
+
+    sys.path.insert(0, consumer_dir)
+    sys.argv = [
+        "dynamic_runner._secondary_bootstrap",
+        "--secondary-module",
+        consumer_name,
+        "--secondary",
+        "tcp://gw.cluster:4433",
+        "--secondary-id",
+        "sec-0",
+        "--full-log-dir",
+        log_dir,
+    ]
+    runpy.run_module("dynamic_runner._secondary_bootstrap", run_name="__main__")
+    """
+)
+
+# A consumer thread that would keep the interpreter alive forever at
+# finalization (``threading._shutdown`` joins non-daemon threads). The
+# production linger (bootstrap-crash.log written, then the secondary's
+# SLURM job never ends — run secondary-0/bootstrap-crash.log,
+# 2026-06-11T11:51:23Z) wedges on the native side after the traceback is
+# printed; this thread replays the same observable sequence (crash log
+# durably written, traceback on stderr, THEN the hang at interpreter
+# shutdown) through a mechanism a pure-Python test can construct.
+_LINGERING_THREAD = (
+    "import threading, time\n"
+    "threading.Thread(target=time.sleep, args=(3600,),\n"
+    "                 name='lingering-non-daemon').start()\n"
+)
+
+
+class MainGuardTerminationTests(unittest.TestCase):
+    """The ``__main__`` boundary GUARANTEES process termination (#405).
+
+    Production trace: ``_rs.run_secondary`` raised after its 600s connect
+    deadline, the bootstrap wrote ``bootstrap-crash.log`` — and the
+    process then stayed alive instead of exiting non-zero ("secondaries
+    do not shut down after this"). The guard must deliver the exit code
+    to the wrapper no matter what threads/finalizers exist.
+    """
+
+    #: Far above a healthy exit (subsecond), far below the test runner's
+    #: patience: a child still alive at this bound IS the linger.
+    _EXIT_BOUND_SECS = 20
+
+    def _run_child(self, consumer_body: str):
+        import subprocess
+        import tempfile
+
+        tmp_ctx = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp_ctx.cleanup)
+        tmp = pathlib.Path(tmp_ctx.name)
+        log_dir = tmp / "sec-0"
+        log_dir.mkdir()
+        consumer_name = "_bootstrap_linger_consumer"
+        (tmp / f"{consumer_name}.py").write_text(consumer_body)
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    _MAIN_GUARD_CHILD_PROGRAM,
+                    str(_PACKAGE_ROOT),
+                    str(tmp),
+                    consumer_name,
+                    str(log_dir),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=self._EXIT_BOUND_SECS,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail(
+                "bootstrap process LINGERED past the exit bound — the #405 "
+                "production hang replayed: the crash was recorded but the "
+                "process never terminated"
+            )
+        return proc, log_dir
+
+    def test_consumer_crash_with_lingering_thread_still_exits_nonzero(self) -> None:
+        proc, log_dir = self._run_child(
+            _LINGERING_THREAD + 'raise RuntimeError("boom-linger")\n'
+        )
+        self.assertEqual(proc.returncode, 1, f"stderr:\n{proc.stderr}")
+        # The operator-visible surfaces survive the hard exit: the durable
+        # crash record AND the stderr traceback.
+        self.assertIn("boom-linger", proc.stderr)
+        body = (log_dir / "bootstrap-crash.log").read_text()
+        self.assertIn("RuntimeError: boom-linger", body)
+
+    def test_deliberate_exit_with_lingering_thread_keeps_exit_code(self) -> None:
+        # The asm-dataset 2212c136 shape under linger conditions: a
+        # deliberate sys.exit(1) must reach the wrapper as exit 1 — and
+        # stay classified as a deliberate exit, never a crash.
+        proc, log_dir = self._run_child(_LINGERING_THREAD + "import sys\nsys.exit(1)\n")
+        self.assertEqual(proc.returncode, 1, f"stderr:\n{proc.stderr}")
+        self.assertFalse((log_dir / "bootstrap-crash.log").exists())
+        self.assertIn(
+            "bootstrap exited deliberately rc=1",
+            (log_dir / "bootstrap-exit.log").read_text(),
+        )
+
+    def test_clean_exit_with_lingering_thread_exits_zero(self) -> None:
+        proc, log_dir = self._run_child(_LINGERING_THREAD + "import sys\nsys.exit(0)\n")
+        self.assertEqual(proc.returncode, 0, f"stderr:\n{proc.stderr}")
+        self.assertFalse((log_dir / "bootstrap-crash.log").exists())
+
+    def test_healthy_consumer_exits_zero(self) -> None:
+        # No crash, no lingering thread: the guard changes nothing — the
+        # consumer returns, the interpreter finalizes normally, exit 0.
+        proc, log_dir = self._run_child("x = 1\n")
+        self.assertEqual(proc.returncode, 0, f"stderr:\n{proc.stderr}")
+        self.assertFalse((log_dir / "bootstrap-crash.log").exists())
+
+
+class ProcessExitStatusTests(unittest.TestCase):
+    """`_process_exit_status`: mirror CPython's unhandled-exception
+    exit-status contract (SystemExit honoured, everything else 1)."""
+
+    def test_genuine_exception_is_one(self) -> None:
+        self.assertEqual(bootstrap._process_exit_status(RuntimeError("x")), 1)
+
+    def test_keyboard_interrupt_is_one(self) -> None:
+        self.assertEqual(bootstrap._process_exit_status(KeyboardInterrupt()), 1)
+
+    def test_system_exit_none_is_zero(self) -> None:
+        self.assertEqual(bootstrap._process_exit_status(SystemExit()), 0)
+
+    def test_system_exit_int_codes_pass_through(self) -> None:
+        self.assertEqual(bootstrap._process_exit_status(SystemExit(0)), 0)
+        self.assertEqual(bootstrap._process_exit_status(SystemExit(2)), 2)
+        self.assertEqual(bootstrap._process_exit_status(SystemExit(137)), 137)
+
+    def test_system_exit_int_codes_truncate_like_exit(self) -> None:
+        # C `exit()` truncates to the low byte; `os._exit` requires the
+        # same range — the mapping reproduces the interpreter's contract.
+        self.assertEqual(bootstrap._process_exit_status(SystemExit(256)), 0)
+        self.assertEqual(bootstrap._process_exit_status(SystemExit(-1)), 255)
+
+    def test_system_exit_message_is_one(self) -> None:
+        self.assertEqual(
+            bootstrap._process_exit_status(SystemExit("usage: nope")), 1
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
