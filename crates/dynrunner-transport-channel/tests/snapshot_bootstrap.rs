@@ -39,8 +39,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use dynrunner_protocol_primary_secondary::{
-    DEFAULT_JOIN_TIMEOUT, DistributedMessage, JoinError, PeerConnectionInfo, PeerTransport,
-    timestamp_now,
+    DEFAULT_JOIN_TIMEOUT, Destination, DistributedMessage, JoinError, KeepaliveRole,
+    PeerConnectionInfo, PeerId, PeerTransport, timestamp_now,
 };
 use dynrunner_transport_channel::{ChannelPeerTransport, peer_mesh};
 use serde::{Deserialize, Serialize};
@@ -477,4 +477,149 @@ async fn join_running_cluster_empty_seed_errors_fast() {
         Err(JoinError::SendFailed(_)) | Err(JoinError::NoReachablePeer) => {}
         other => panic!("expected SendFailed or NoReachablePeer, got {other:?}"),
     }
+}
+
+/// Pump one cluster peer through a PRIMARY-PROMOTION window. Each pass
+/// first pushes realistic gossip at the joiner (a stamped broadcast
+/// `Keepalive` + `ClusterMutation` — exactly the frame traffic the
+/// production joiner's legs carried throughout its bootstrap window),
+/// then drains the inbox:
+///
+/// - a `RequestClusterSnapshot` received BEFORE `promoted_at` is
+///   DROPPED — the promotion window: the responder seat is churning
+///   (mid coordinator-swap slot loss / reply legs not yet established),
+///   so the joiner's first-shot request dies silently;
+/// - after `promoted_at`, the peer holding `snapshot_json = Some(..)`
+///   is the newly-seated responder and answers with a
+///   production-shaped, role-stamped reply
+///   (`Some(Destination::Observer(<joiner>))` — the
+///   `anti_entropy::reply_destination` stamp); peers with `None` keep
+///   gossiping and never answer.
+async fn promotion_window_pump(
+    transport: &mut ChannelPeerTransport<TestId>,
+    id: &str,
+    snapshot_json: Option<&str>,
+    promoted_at: tokio::time::Instant,
+) {
+    let keepalive: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+        target: Some(Destination::All),
+        sender_id: id.to_string(),
+        timestamp: timestamp_now(),
+        secondary_id: id.to_string(),
+        active_workers: 0,
+        emitter_role: KeepaliveRole::Secondary,
+    };
+    let _ = transport.send_to_peer("joiner", keepalive).await;
+    let mutation: DistributedMessage<TestId> = DistributedMessage::ClusterMutation {
+        target: Some(Destination::All),
+        sender_id: id.to_string(),
+        timestamp: timestamp_now(),
+        mutations: Vec::new(),
+    };
+    let _ = transport.send_to_peer("joiner", mutation).await;
+    loop {
+        let next = tokio::time::timeout(Duration::from_millis(5), transport.recv_peer()).await;
+        match next {
+            Err(_) => return, // inbox quiescent
+            Ok(None) => return,
+            Ok(Some(DistributedMessage::RequestClusterSnapshot { sender_id, .. })) => {
+                let seated = tokio::time::Instant::now() >= promoted_at;
+                if let (true, Some(json)) = (seated, snapshot_json) {
+                    let reply: DistributedMessage<TestId> = DistributedMessage::ClusterSnapshot {
+                        target: Some(Destination::Observer(PeerId::from(sender_id.clone()))),
+                        sender_id: id.to_string(),
+                        timestamp: timestamp_now(),
+                        snapshot_json: json.to_string(),
+                    };
+                    let _ = transport.send_to_peer(&sender_id, reply).await;
+                }
+                // In-window requests (and post-window requests to a
+                // non-responder) are dropped — one-shot loss.
+            }
+            Ok(Some(_other)) => {}
+        }
+    }
+}
+
+/// Promotion-window replay (asm-tokenizer test-env forensics): an
+/// observer late-joiner bootstraps while NO primary is seated. Its
+/// snapshot-request fan-out lands inside the promotion window and every
+/// first-shot request is lost; broadcast gossip (`ClusterMutation` /
+/// `Keepalive`) keeps arriving on the joiner's legs the whole time —
+/// the bootstrap window is NOT a silent channel. The promotion
+/// completes INSIDE the bootstrap budget.
+///
+/// Contract under test: the bootstrap RE-REQUESTS the snapshot on a
+/// cadence until its deadline, so a re-request reaching the
+/// newly-seated responder heals the join within the SAME bootstrap
+/// budget. A one-shot request protocol fails this test by sitting out
+/// the rest of the budget dropping gossip and dying
+/// `JoinError::Timeout` — the production observer late-joiner FATAL.
+#[tokio::test]
+async fn join_rerequests_until_a_promotion_window_closes() {
+    let peer_ids: Vec<String> = vec![
+        "joiner".into(),
+        "promoting-peer".into(),
+        "secondary-1".into(),
+        "secondary-2".into(),
+    ];
+    let mut transports: Vec<ChannelPeerTransport<TestId>> = peer_mesh::<TestId>(&peer_ids);
+    let mut joiner = transports.remove(0);
+    let mut promoting = transports.remove(0);
+    let mut sec1 = transports.remove(0);
+    let mut sec2 = transports.remove(0);
+
+    let canned = make_synthetic_snapshot();
+    let canned_json = serde_json::to_string(&canned).expect("synthetic snapshot serializes");
+
+    let seed: Vec<PeerConnectionInfo> = ["promoting-peer", "secondary-1", "secondary-2"]
+        .iter()
+        .map(|id| PeerConnectionInfo {
+            secondary_id: (*id).into(),
+            cert: String::new(),
+            ipv4: None,
+            ipv6: None,
+            port: 0,
+            is_observer: false,
+            liveness_port: None,
+        })
+        .collect();
+
+    // The promotion seats 600ms in — well inside the 2s bootstrap
+    // budget, mirroring the production timeline (dial at :54, the
+    // PrimaryChanged released ~6s later, ~4s of budget left).
+    let promoted_at = tokio::time::Instant::now() + Duration::from_millis(600);
+
+    let join_fut = joiner.join_running_cluster(&seed, Duration::from_secs(2), true, false);
+    tokio::pin!(join_fut);
+
+    let join_result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut join_fut => break result,
+                _ = promotion_window_pump(&mut promoting, "promoting-peer", Some(&canned_json), promoted_at) => {}
+                _ = promotion_window_pump(&mut sec1, "secondary-1", None, promoted_at) => {}
+                _ = promotion_window_pump(&mut sec2, "secondary-2", None, promoted_at) => {}
+            }
+        }
+    })
+    .await
+    .expect("test deadline: join_running_cluster did not resolve within 5s");
+
+    let snapshot_jsons = match join_result {
+        Ok(s) => s,
+        Err(e) => panic!(
+            "bootstrap must re-request and heal once the promotion completes \
+             within its own budget; instead it failed: {e}"
+        ),
+    };
+    assert!(
+        !snapshot_jsons.is_empty(),
+        "the re-request reaching the newly-seated responder must yield a snapshot"
+    );
+    let parsed: SyntheticSnapshot =
+        serde_json::from_str(&snapshot_jsons[0]).expect("returned snapshot_json round-trips");
+    assert_eq!(parsed.primary_epoch, 7);
+    assert_eq!(parsed.current_primary.as_deref(), Some("primary-peer"));
 }

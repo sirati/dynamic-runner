@@ -25,19 +25,41 @@ use crate::messages::timestamp_now;
 /// [`PeerTransport::join_running_cluster`].
 pub const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Cap on the bootstrap re-request cadence inside
+/// [`PeerTransport::join_running_cluster`]'s reply-wait window.
+///
+/// The snapshot request is RE-FANNED periodically until the bootstrap
+/// deadline (the realised interval is `recv_budget / 3` capped here, so
+/// every budget gets at least two re-request opportunities). The first
+/// fan-out fires the instant the FIRST mesh leg registers, which makes
+/// it a one-shot race against leg establishment (later seeds get at
+/// best a relay) and against responder-seat churn — a joiner dialing
+/// inside a primary-promotion window can lose EVERY first-shot request
+/// while its legs keep delivering gossip. Re-requesting is safe by
+/// design: every responder serializes through a digest-keyed cache and
+/// originates the joiner's `PeerJoined` through idempotent CRDT apply,
+/// so a duplicate request is a cheap re-reply, never a state change.
+const JOIN_REREQUEST_CAP: Duration = Duration::from_secs(5);
+
 /// Error from [`PeerTransport::join_running_cluster`].
 #[derive(Debug)]
 pub enum JoinError {
     /// `connect_to_peers` ran but no peer became reachable within
     /// the per-peer-connect slice of the bootstrap budget.
     NoReachablePeer,
-    /// At least one peer was reachable and we sent the snapshot
-    /// request, but no `ClusterSnapshot` reply arrived within the
-    /// budget. The transport may have received other live messages
-    /// during the window — those are dropped (logged at `warn`).
-    /// Bootstrap is a single-RPC contract; the caller drives any
-    /// retry policy.
-    Timeout,
+    /// At least one peer was reachable and snapshot requests were sent
+    /// — re-fanned periodically until the deadline (see
+    /// [`JOIN_REREQUEST_CAP`]) — but no `ClusterSnapshot` reply ever
+    /// arrived within the budget. The transport may have received other
+    /// live messages during the window — those are dropped (logged at
+    /// `warn`). The carried counters say how hard the bootstrap tried;
+    /// the caller drives any whole-bootstrap retry policy.
+    Timeout {
+        /// Total individual snapshot requests sent across all fan-outs.
+        requests_sent: usize,
+        /// Number of fan-out rounds driven before the deadline.
+        fan_outs: usize,
+    },
     /// `send_to_peer` returned an error while delivering the
     /// snapshot request. The wrapped string is the transport's
     /// error message verbatim.
@@ -50,8 +72,15 @@ impl std::fmt::Display for JoinError {
             Self::NoReachablePeer => f.write_str(
                 "join_running_cluster: no seed peer became reachable within the connect window",
             ),
-            Self::Timeout => f.write_str(
-                "join_running_cluster: no ClusterSnapshot reply within the bootstrap timeout",
+            Self::Timeout {
+                requests_sent,
+                fan_outs,
+            } => write!(
+                f,
+                "join_running_cluster: no ClusterSnapshot reply within the bootstrap timeout \
+                 ({requests_sent} snapshot requests sent across {fan_outs} fan-outs, re-sent \
+                 until the deadline; a cluster mid primary-promotion can leave every request \
+                 unanswered for the whole window)"
             ),
             Self::SendFailed(e) => write!(f, "join_running_cluster: failed to send request: {e}"),
         }
@@ -302,7 +331,8 @@ pub trait PeerTransport<I: Identifier> {
     /// Bootstrap-from-snapshot orchestration for a late-joiner / fresh
     /// observer.
     ///
-    /// Semantics — single-RPC contract:
+    /// Semantics — re-requesting RPC (one bootstrap, many request
+    /// fan-outs):
     /// 1. Wire up the peer mesh by calling [`Self::connect_to_peers`]
     ///    with `seed`. Transports that pre-wire (channel,
     ///    [`crate::PeerTransport`] mocks) treat this as a no-op.
@@ -344,6 +374,21 @@ pub trait PeerTransport<I: Identifier> {
     ///    at `warn` and dropped — the cluster's CRDT-merge guarantees the
     ///    next live broadcast (or a follow-up snapshot) covers anything
     ///    dropped here.
+    ///
+    ///    The fan-out is RE-SENT on a fixed cadence (`recv_budget / 3`,
+    ///    capped at [`JOIN_REREQUEST_CAP`]) until the deadline, skipping
+    ///    peers that already answered. The first fan-out fires the
+    ///    instant the FIRST leg registers, so it races leg
+    ///    establishment (later seeds get at best a relay whose reply
+    ///    has no return wire yet) and responder-seat churn — a joiner
+    ///    dialing inside a primary-promotion window can lose every
+    ///    first-shot request while gossip keeps arriving. The
+    ///    re-request reaches peers over their now-established direct
+    ///    legs and any newly-seated primary, healing the bootstrap
+    ///    within its own budget. Responders are idempotent under
+    ///    duplicates (digest-keyed snapshot cache + CRDT `PeerJoined`),
+    ///    and duplicate replies from one responder are deduplicated
+    ///    by sender here.
     ///
     /// Returns the COLLECTED snapshot payloads (the `snapshot_json` of
     /// each `ClusterSnapshot` reply) as a `Vec<String>` — at least one on
@@ -415,89 +460,133 @@ pub trait PeerTransport<I: Identifier> {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
 
-            // Step 3+4: send the request to EVERY reachable non-self
-            // seed (multi-responder fan-out). The joiner's cold-start role
-            // table can't resolve `Destination::Primary` yet (no
-            // `PrimaryChanged` observed), and any peer can answer per the
-            // dispatch.rs / primary snapshot handlers. We address the
-            // transport directly by peer-id (no role resolution — the id
-            // IS the host). Fanning to ALL seeds (not first-success) is
-            // the completeness fix: the first reachable seed may be a
-            // secondary holding an incomplete roster, so a single reply
-            // could bootstrap from a partial snapshot. Collecting every
-            // responder's snapshot and `restore()`-ing each (idempotent
-            // lattice) heals — the union is complete iff ANY responder
-            // (the primary above all) was complete. Per-peer send errors
-            // (`no route`, `outgoing channel closed`) are tolerated; a
-            // partially-stale seed (a peer retired between file-write and
-            // this dial) just doesn't get a request, and the remaining
-            // live peers still answer.
-            let mut send_err: Option<String> = None;
-            let mut sent_count: usize = 0;
-            for peer in seed {
-                if peer.secondary_id == local_id {
-                    continue;
-                }
-                let request = DistributedMessage::RequestClusterSnapshot {
-                    target: None,
-                    sender_id: local_id.clone(),
-                    timestamp: timestamp_now(),
-                    // The joiner declares its own role + capability so the
-                    // responder broadcasts a truthful `PeerJoined` rather
-                    // than assuming observer / incapable.
-                    is_observer,
-                    can_be_primary,
-                };
-                match self.send_to_peer(&peer.secondary_id, request).await {
-                    Ok(()) => {
-                        sent_count += 1;
-                    }
-                    Err(e) => {
-                        send_err = Some(e);
-                    }
-                }
-            }
-            if sent_count == 0 {
-                return Err(JoinError::SendFailed(
-                    send_err.unwrap_or_else(|| "no seed peer accepted send".into()),
-                ));
-            }
-
-            // Step 5: collect ClusterSnapshot replies. Gather every reply
-            // that arrives until we have one per peer we sent to OR the
-            // bootstrap budget expires. Non-ClusterSnapshot frames in this
-            // window are dropped with a warn log — see method-doc. A
-            // budget expiry / inbound-close with at least one snapshot
-            // already collected is success (the caller unions them); zero
-            // collected surfaces `Timeout` — the operator-visible signal
-            // is identical to the cold-start no-reply case.
+            // Step 3+4+5: periodic request fan-out + reply collection,
+            // ONE loop until the bootstrap deadline.
+            //
+            // Each fan-out sends the request to EVERY reachable non-self
+            // seed that has not answered yet (multi-responder fan-out).
+            // The joiner's cold-start role table can't resolve
+            // `Destination::Primary` yet (no `PrimaryChanged` observed),
+            // and any peer can answer per the dispatch.rs / primary
+            // snapshot handlers. We address the transport directly by
+            // peer-id (no role resolution — the id IS the host). Fanning
+            // to ALL seeds (not first-success) is the completeness fix:
+            // the first reachable seed may be a secondary holding an
+            // incomplete roster, so a single reply could bootstrap from a
+            // partial snapshot. Collecting every responder's snapshot and
+            // `restore()`-ing each (idempotent lattice) heals — the union
+            // is complete iff ANY responder (the primary above all) was
+            // complete. Per-peer send errors (`no route`, `outgoing
+            // channel closed`) are tolerated; a peer the fan-out misses
+            // (a leg still dialing, a retired seed) is simply retried on
+            // the next round.
+            //
+            // WHY periodic (not one-shot): the first fan-out fires the
+            // instant the FIRST leg registers, racing both leg
+            // establishment (an unconnected seed gets at best a relayed
+            // request whose reply has no return wire to this brand-new
+            // joiner yet) and responder-seat churn (a joiner dialing
+            // inside a primary-promotion window can lose EVERY first-shot
+            // request while gossip keeps arriving). All of those losses
+            // are transient; re-requesting until the deadline heals them
+            // within the SAME bootstrap budget. Responders are idempotent
+            // under duplicate requests (digest-keyed snapshot-serialize
+            // cache + CRDT-idempotent `PeerJoined` origination).
             let recv_budget = timeout.saturating_sub(connect_budget);
             let recv_deadline = tokio::time::Instant::now() + recv_budget;
-            let mut snapshots: Vec<String> = Vec::with_capacity(sent_count);
+            // Cadence: a third of the reply budget so every budget gets
+            // at least two re-request opportunities, capped for long
+            // budgets. The `max(1ms)` floor only guards degenerate
+            // caller-supplied budgets from a zero-interval spin.
+            let rerequest_interval = (recv_budget / 3)
+                .min(JOIN_REREQUEST_CAP)
+                .max(Duration::from_millis(1));
+            let mut next_fan_out = tokio::time::Instant::now();
+            let mut fan_outs: usize = 0;
+            let mut requests_sent: usize = 0;
+            let mut send_err: Option<String> = None;
+            // Distinct peers a request reached (across all fan-outs) —
+            // the completion target — and the per-responder collected
+            // payloads. Keying by responder deduplicates a peer that
+            // answers both the original and a re-request (latest wins;
+            // the caller's restore-union is idempotent anyway) so a
+            // duplicate reply never inflates completion.
+            let mut sent_to: std::collections::HashSet<String> = Default::default();
+            let mut snapshots: std::collections::HashMap<String, String> = Default::default();
             loop {
-                if snapshots.len() >= sent_count {
-                    // Every peer we sent to has answered; no point waiting
+                if !snapshots.is_empty() && snapshots.len() >= sent_to.len() {
+                    // Every peer we reached has answered; no point waiting
                     // out the rest of the budget.
-                    return Ok(snapshots);
+                    return Ok(snapshots.into_values().collect());
                 }
-                let remaining =
-                    recv_deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
+                let now = tokio::time::Instant::now();
+                if now >= recv_deadline {
+                    // Budget expired. At least one snapshot collected is
+                    // success (the caller unions them); zero collected
+                    // surfaces `Timeout` — the operator-visible signal is
+                    // identical to the cold-start no-reply case, and the
+                    // carried counters say how hard the bootstrap tried.
                     return if snapshots.is_empty() {
-                        Err(JoinError::Timeout)
+                        Err(JoinError::Timeout {
+                            requests_sent,
+                            fan_outs,
+                        })
                     } else {
-                        Ok(snapshots)
+                        Ok(snapshots.into_values().collect())
                     };
                 }
+                if now >= next_fan_out {
+                    fan_outs += 1;
+                    for peer in seed {
+                        if peer.secondary_id == local_id
+                            || snapshots.contains_key(&peer.secondary_id)
+                        {
+                            continue;
+                        }
+                        let request = DistributedMessage::RequestClusterSnapshot {
+                            target: None,
+                            sender_id: local_id.clone(),
+                            timestamp: timestamp_now(),
+                            // The joiner declares its own role + capability
+                            // so the responder broadcasts a truthful
+                            // `PeerJoined` rather than assuming observer /
+                            // incapable.
+                            is_observer,
+                            can_be_primary,
+                        };
+                        match self.send_to_peer(&peer.secondary_id, request).await {
+                            Ok(()) => {
+                                requests_sent += 1;
+                                sent_to.insert(peer.secondary_id.clone());
+                            }
+                            Err(e) => {
+                                send_err = Some(e);
+                            }
+                        }
+                    }
+                    // First-shot contract preserved: a FIRST fan-out that
+                    // reaches nobody (e.g. a seed list naming only self)
+                    // fails fast as `SendFailed` instead of burning the
+                    // budget. Later fan-outs are best-effort — a transient
+                    // all-sends-failed round is exactly what the next
+                    // round heals.
+                    if fan_outs == 1 && sent_to.is_empty() {
+                        return Err(JoinError::SendFailed(
+                            send_err.unwrap_or_else(|| "no seed peer accepted send".into()),
+                        ));
+                    }
+                    next_fan_out = now + rerequest_interval;
+                }
+                // Wait for the next reply, bounded by whichever comes
+                // first: the re-request tick or the bootstrap deadline.
+                let wait_until = next_fan_out.min(recv_deadline);
+                let remaining = wait_until.saturating_duration_since(tokio::time::Instant::now());
                 let recv = tokio::time::timeout(remaining, self.recv_peer()).await;
                 match recv {
                     Err(_) => {
-                        // Budget expired mid-recv.
-                        return if snapshots.is_empty() {
-                            Err(JoinError::Timeout)
-                        } else {
-                            Ok(snapshots)
-                        };
+                        // Re-request tick or deadline elapsed mid-recv;
+                        // the loop head decides which.
+                        continue;
                     }
                     Ok(None) => {
                         // Transport's inbound channel closed: no more
@@ -506,9 +595,12 @@ pub trait PeerTransport<I: Identifier> {
                         // operator-visible signal, cause shows up in the
                         // transport's own teardown logs).
                         return if snapshots.is_empty() {
-                            Err(JoinError::Timeout)
+                            Err(JoinError::Timeout {
+                                requests_sent,
+                                fan_outs,
+                            })
                         } else {
-                            Ok(snapshots)
+                            Ok(snapshots.into_values().collect())
                         };
                     }
                     // Accept the reply REGARDLESS of its Phase-C target
@@ -529,9 +621,11 @@ pub trait PeerTransport<I: Identifier> {
                     // budget expired — the gateway late-joiner Test-1a
                     // bootstrap timeout.
                     Ok(Some(DistributedMessage::ClusterSnapshot {
-                        snapshot_json, ..
+                        sender_id,
+                        snapshot_json,
+                        ..
                     })) => {
-                        snapshots.push(snapshot_json);
+                        snapshots.insert(sender_id, snapshot_json);
                         continue;
                     }
                     Ok(Some(other)) => {
