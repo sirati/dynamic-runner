@@ -268,11 +268,43 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// consumer-policy abort → `FatalPolicyExit`); this method is the one
     /// latch-write both classes funnel through.
     fn record_run_fail_outcome(&mut self, outcome: RunError) {
+        // Belt to the emit chokepoint's suspenders: every recorded
+        // outcome implies the dispatch freeze, including paths that
+        // record directly (the phase-floor liveness check) without an
+        // emit. Idempotent.
+        self.run_fail_dispatch_freeze = true;
         if self.worker_mgmt_fail_outcome.is_some() {
             return;
         }
         tracing::warn!(error = %outcome, "worker management: run should fail");
         self.worker_mgmt_fail_outcome = Some(outcome);
+    }
+
+    /// THE run-fail emit chokepoint: SYNCHRONOUSLY latch the dispatch
+    /// freeze, then put the signal on the decoupled worker-management
+    /// bus. Every `RunShouldFail` / `PolicyFatalExit` emission routes
+    /// through here — the bus drain (which records the typed break
+    /// outcome and drives the clean shutdown) stays asynchronous per
+    /// the decoupling law, but the freeze is effective the moment this
+    /// returns: the dispatch-view pipeline's step-0 seam
+    /// (`dispatch_view_for_worker`) reads the latch exactly like the
+    /// graceful-abort freeze, so no dispatch path can assign work in
+    /// the emit→break window. Production smell this closes
+    /// (run_20260611_005220): an `on_phase_end` raise emitted
+    /// `PolicyFatalExit`, the cascade marked the phase done, and 6
+    /// next-phase tasks were assigned before the parked
+    /// worker-management arm consumed the signal.
+    pub(crate) fn emit_run_fail_signal(&mut self, signal: WorkerMgmtSignal) {
+        debug_assert!(
+            matches!(
+                signal,
+                WorkerMgmtSignal::RunShouldFail { .. } | WorkerMgmtSignal::PolicyFatalExit { .. }
+            ),
+            "emit_run_fail_signal is the FAIL-class chokepoint; other \
+             signals go through emit_worker_mgmt directly"
+        );
+        self.run_fail_dispatch_freeze = true;
+        self.cluster_state.emit_worker_mgmt(signal);
     }
 
     /// Count of alive workers across the fleet. A worker is alive iff it

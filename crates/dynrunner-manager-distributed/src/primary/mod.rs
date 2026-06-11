@@ -46,6 +46,7 @@ pub(crate) mod retry_bucket;
 mod secondary_id;
 pub mod staging;
 pub(crate) mod task;
+mod terminal_gate;
 pub mod wire;
 
 #[cfg(test)]

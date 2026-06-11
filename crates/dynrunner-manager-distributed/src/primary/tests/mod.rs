@@ -30,6 +30,7 @@ mod hydrate;
 mod initial_assignment;
 mod injected_spread;
 mod mesh_readiness_gate;
+mod message_phase_ordering;
 mod node_gates;
 mod oom_bucket;
 mod oploop_arm_hunt;

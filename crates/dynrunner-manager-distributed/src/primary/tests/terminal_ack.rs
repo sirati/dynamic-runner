@@ -81,6 +81,8 @@ async fn stamped_terminal_landings_are_acked_per_landing_with_exactly_once_side_
                 task_hash: hash.clone(),
                 result_data: None,
                 delivery_seq: Some(7),
+                // Stamped at the send_to_primary chokepoint (ordering gate).
+                msgs_posted_through: None,
             };
             // Original landing …
             primary
@@ -142,6 +144,8 @@ async fn unstamped_terminal_landing_is_not_acked() {
                 task_hash: "legacy-hash".into(),
                 result_data: None,
                 delivery_seq: None,
+                // Stamped at the send_to_primary chokepoint (ordering gate).
+                msgs_posted_through: None,
             };
             primary
                 .dispatch_message(unstamped, &mut None)
@@ -191,6 +195,8 @@ async fn stamped_backpressure_task_failed_landing_is_acked() {
                 error_type: dynrunner_core::ErrorType::Recoverable,
                 error_message: "worker pipe broken; respawning".into(),
                 delivery_seq: Some(3),
+                // Stamped at the send_to_primary chokepoint (ordering gate).
+                msgs_posted_through: None,
             };
             primary
                 .dispatch_message(backpressure, &mut None)

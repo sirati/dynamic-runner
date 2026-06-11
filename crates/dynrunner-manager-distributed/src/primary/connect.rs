@@ -208,8 +208,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             MessageType::SecondaryWelcome => self.handle_welcome(msg).await,
             MessageType::CertExchange => self.handle_cert_exchange(msg),
             MessageType::TaskRequest => self.handle_task_request(msg, command_rx).await?,
-            MessageType::TaskComplete => self.handle_task_complete(msg, command_rx).await,
-            MessageType::TaskFailed => self.handle_task_failed(msg, command_rx).await,
+            // Wire task terminals route through the terminal-ordering
+            // gate (`terminal_gate.rs`): a terminal whose origin's
+            // causally-prior IMPORTANT custom messages (the
+            // `msgs_posted_through` stamp) are not yet resolved is
+            // PARKED and re-admitted on the custom-message dispatch
+            // cadence — phase-end derives from terminals, so it can
+            // never overtake the messages the phase's own task sent.
+            MessageType::TaskComplete | MessageType::TaskFailed => {
+                self.ingest_task_terminal(msg, command_rx).await
+            }
             // Consumer custom message (F5): droppable → direct handler
             // dispatch; important → CRDT-post + the handler-dispatch
             // decision. The ack echo for an important landing already

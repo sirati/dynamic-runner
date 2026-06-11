@@ -1000,6 +1000,8 @@ async fn drain_pending_messages_updates_completed_set() {
                         task_hash: hash.into(),
                         result_data: None,
                         delivery_seq: None,
+                        // Stamped at the send_to_primary chokepoint (ordering gate).
+                        msgs_posted_through: None,
                     })
                     .unwrap();
             }
