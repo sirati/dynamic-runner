@@ -13,23 +13,8 @@ use std::net::SocketAddr;
 
 use super::super::PeerNetwork;
 use super::TestId;
+use super::alloc_dual_free_port;
 use crate::wss::connect_wss;
-
-/// Allocate a port that is currently free on BOTH protocols (TCP and
-/// UDP) — the same shape the SLURM wrapper's host-side pre-allocation
-/// produces. Retries a handful of OS-picked candidates so a UDP
-/// squatter on a TCP-free port can't flake the test.
-fn alloc_dual_free_port() -> u16 {
-    for _ in 0..16 {
-        let tcp = std::net::TcpListener::bind("0.0.0.0:0").expect("probe tcp bind");
-        let port = tcp.local_addr().expect("probe tcp addr").port();
-        if std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok() {
-            // Both binds succeeded; release them for the network to claim.
-            return port;
-        }
-    }
-    panic!("could not find a port free on both TCP and UDP in 16 attempts");
-}
 
 /// An explicit `bind_port` pins BOTH listeners to the requested port:
 /// the network reports it, the UDP side holds it (QUIC), and a plain
