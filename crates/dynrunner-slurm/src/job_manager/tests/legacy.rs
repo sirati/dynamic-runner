@@ -258,6 +258,7 @@ async fn submit_job_matches_python_invocation_shape() {
             "secondary-0",
             1,
             "/srv/slurm/log/run-1",
+            None,
         )
         .await
         .expect("submit succeeds");
@@ -308,6 +309,20 @@ async fn submit_job_matches_python_invocation_shape() {
         sbatch.contains("--ntasks=1"),
         "--ntasks=1 must be emitted for Python-parity; got: {sbatch}",
     );
+    // (g) --no-requeue on every framework sbatch: SLURM auto-requeue can
+    // only resurrect a killed member as a re-admission-refused ghost
+    // (the framework owns replacement via fresh-identity respawn).
+    assert!(
+        sbatch.contains("--no-requeue"),
+        "every framework sbatch must carry --no-requeue; got: {sbatch}",
+    );
+    // (h) The initial-cohort submit passed `exclude_node = None`, so no
+    // `--exclude` flag is emitted (a blank `--exclude=` hard-errors
+    // sbatch — the None case must omit it cleanly).
+    assert!(
+        !sbatch.contains("--exclude"),
+        "no --exclude when exclude_node is None; got: {sbatch}",
+    );
     // (f) Default-config --signal lead time. `SlurmConfig::default()`
     // sets `signal_lead_seconds = 60`; we assert against the named
     // default rather than the literal `60` so a deliberate default
@@ -337,13 +352,43 @@ async fn submit_job_matches_python_invocation_shape() {
         ..SlurmConfig::default()
     };
     let mut mgr = SlurmJobManager::new(cfg, gw);
-    mgr.submit_job("#!/bin/sh", "j2", "secondary-0", 1, "/srv/slurm/log/run-2")
+    mgr.submit_job("#!/bin/sh", "j2", "secondary-0", 1, "/srv/slurm/log/run-2", None)
         .await
         .expect("submit succeeds");
     let sbatch = mgr.gateway().sbatch_command();
     assert!(
         sbatch.contains("--mem=32G"),
         "expected --mem=32G when memory_per_node is set; got: {sbatch}",
+    );
+}
+
+/// A submit that carries `exclude_node = Some(node)` emits
+/// `--exclude=<node>` (the respawn-onto-a-different-node path), while
+/// `None` omits the flag entirely (asserted in
+/// `submit_job_matches_python_invocation_shape`). One flag, opt-in by
+/// the caller — the respawn provider passes the dead member's node.
+#[tokio::test]
+async fn submit_job_emits_exclude_when_node_known() {
+    let gw = SubmitRecordingGateway::default();
+    let cfg = SlurmConfig {
+        root_folder: "/srv/slurm".into(),
+        ..SlurmConfig::default()
+    };
+    let mut mgr = SlurmJobManager::new(cfg, gw);
+    mgr.submit_job(
+        "#!/bin/sh",
+        "j-respawn",
+        "secondary-5",
+        1,
+        "/srv/slurm/log/run-3",
+        Some("krater07"),
+    )
+    .await
+    .expect("submit succeeds");
+    let sbatch = mgr.gateway().sbatch_command();
+    assert!(
+        sbatch.contains("--exclude=krater07"),
+        "expected --exclude=krater07 when exclude_node is Some; got: {sbatch}",
     );
 }
 
@@ -366,6 +411,7 @@ async fn submit_job_emits_signal_lead_time_flag() {
         "secondary-0",
         1,
         "/srv/slurm/log/run-lead",
+        None,
     )
     .await
     .expect("submit succeeds");
@@ -395,6 +441,7 @@ async fn submit_job_skips_signal_flag_when_lead_seconds_is_zero() {
         "secondary-0",
         1,
         "/srv/slurm/log/run-x",
+        None,
     )
     .await
     .expect("submit succeeds");
@@ -426,6 +473,7 @@ async fn submit_job_anchors_slurm_out_err_in_per_secondary_dir() {
         "secondary-2",
         1,
         "/srv/slurm/log/run-1",
+        None,
     )
     .await
     .expect("submit succeeds");

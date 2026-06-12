@@ -754,6 +754,15 @@ pub enum DistributedMessage<I> {
         /// `SecondarySpawnSpec::primary_pubkey_pem`, relayed verbatim
         /// (same forward-compat contract as `primary_endpoint`).
         primary_pubkey_pem: String,
+        /// `SecondarySpawnSpec::exclude_node` — the dead member's node,
+        /// relayed verbatim so an observer-hosted provider can exclude it
+        /// from the replacement's sbatch (the in-process provider reads it
+        /// off the spec directly). `None` when the primary did not know
+        /// the node; `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged in that case, so an older receiver that
+        /// never reads the field stays byte-compatible.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exclude_node: Option<String>,
     },
     /// Provider-host observer -> primary: the outcome of one
     /// [`Self::RespawnSpawnRequest`], correlated by `new_secondary_id`.

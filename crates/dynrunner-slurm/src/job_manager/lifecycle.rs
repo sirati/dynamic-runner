@@ -73,6 +73,22 @@ impl<G: Gateway> SlurmJobManager<G> {
     /// rendering the wrapper, and the respawn path carries the
     /// replacement id. SLURM's own job id (`%j`) is still resolved by
     /// SLURM at job start and appended to the filename.
+    ///
+    /// Every framework sbatch carries `--no-requeue`: the framework owns
+    /// member replacement (a dead member is replaced by a fresh-identity
+    /// respawn, never resumed under its original id), so SLURM's own
+    /// auto-requeue (`Requeue=1` default on some clusters) can only
+    /// resurrect a killed member's job as a GHOST — refused re-admission
+    /// (not in replicated membership) yet squatting a node until its 600s
+    /// give-up, starving the legitimate respawn. There is no framework
+    /// path that resumes a SLURM job under its original identity, so
+    /// suppressing requeue is always correct.
+    ///
+    /// `exclude_node` is the dead member's node, passed by the respawn
+    /// path when known (the initial cohort passes `None` — no death has
+    /// occurred). When `Some`, the submission carries `--exclude=<node>`
+    /// so a replacement never lands back on the node whose member just
+    /// died (NODE_FAIL / hardware fault). `None` omits the flag cleanly.
     pub async fn submit_job(
         &mut self,
         wrapper_script: &str,
@@ -80,6 +96,7 @@ impl<G: Gateway> SlurmJobManager<G> {
         secondary_id: &str,
         nodes: u32,
         run_log_dir: &str,
+        exclude_node: Option<&str>,
     ) -> Result<String, SlurmError> {
         // The wrapper body is piped to sbatch over STDIN below; escape it
         // once for the `printf '%s' '<body>'` single-quoted literal so
@@ -119,6 +136,12 @@ impl<G: Gateway> SlurmJobManager<G> {
             format!("--cpus-per-task={}", self.config.cpus_per_task),
             format!("--partition={}", self.config.partition),
             format!("--time={}", self.config.time_limit),
+            // The framework owns member replacement; SLURM auto-requeue
+            // (`Requeue=1`) only ever produces a re-admission-refused ghost
+            // that squats a node to its give-up. No framework path resumes
+            // a job under its original identity, so suppress requeue on
+            // every submission (initial cohort + respawn alike).
+            "--no-requeue".to_string(),
         ];
 
         // Pre-SIGKILL warning window: `--signal=B:SIGTERM@<N>` tells
@@ -157,6 +180,14 @@ impl<G: Gateway> SlurmJobManager<G> {
             // `--mail-user` (cosmetic — sbatch is order-insensitive).
             sbatch_args.push("--mail-type=ALL".to_string());
             sbatch_args.push(format!("--mail-user={email}"));
+        }
+
+        // Respawn-only: keep the replacement off the dead member's node
+        // when the caller knows it (a NODE_FAIL/hardware fault that took
+        // the original down would otherwise be re-inherited). The initial
+        // cohort passes `None` (no death yet) and emits no `--exclude`.
+        if let Some(node) = exclude_node {
+            sbatch_args.push(format!("--exclude={node}"));
         }
 
         // No trailing script-path argument: sbatch reads the batch
