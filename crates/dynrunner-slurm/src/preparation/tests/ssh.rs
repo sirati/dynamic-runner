@@ -46,6 +46,12 @@ fn argv_no_auth_uses_proxyjump_dash_j() {
     // remote user@host targets compute01 with the gateway user
     // (preparation defaults remote_user to gateway_user).
     assert!(argv.iter().any(|s| s == "alice@compute01"));
+    // Mux-relevant options pinned OFF: operator ControlMaster/
+    // ControlPersist config must not turn this child into a master
+    // handoff (instant exit 0, listener on an unowned master).
+    assert!(argv.iter().any(|s| s == "ControlPath=none"));
+    assert!(argv.iter().any(|s| s == "ControlMaster=no"));
+    assert!(argv.iter().any(|s| s == "ControlPersist=no"));
 }
 
 /// With auth_options non-empty we MUST NOT use -J (OpenSSH 7.3+

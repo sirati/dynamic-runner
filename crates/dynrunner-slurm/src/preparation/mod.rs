@@ -81,5 +81,5 @@ pub(crate) use escalation::{EscalationVerdict, ReconnectEscalation};
 pub use options::{InfoFileReader, PrepError, PreparationOptions};
 pub use pipeline::SlurmPreparation;
 pub use policy::EstablishmentPolicy;
-pub(crate) use ssh::{terminate_child, verify_tunnel_alive};
+pub(crate) use ssh::terminate_child;
 pub use summary::{TunnelSetupSummary, secondary_id};

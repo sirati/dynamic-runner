@@ -233,3 +233,64 @@ async fn control_socket_alive_false_when_socket_missing() {
     let cfg = ssh_config_with(None, None);
     assert!(!super::control_socket_alive(&cp.to_string_lossy(), &cfg).await);
 }
+
+/// Run-scoping pin: the control path embeds THIS process's PID, so a
+/// stale socket leaked by a DIFFERENT (dead) framework process can
+/// never collide with — or be dialed as — the current run's master.
+/// (The LMU joiner box carried three stale `/tmp/dynrunner-m-*` masters
+/// from killed predecessors; run-scoped naming is what keeps the mux
+/// clients off them.)
+#[test]
+fn control_path_is_scoped_to_this_process() {
+    let cp = generate_master_control_path();
+    let pid_segment = format!("/tmp/dynrunner-m-{}-", std::process::id());
+    assert!(
+        cp.starts_with(&pid_segment),
+        "control path {cp:?} must embed the owning PID ({pid_segment}…)"
+    );
+}
+
+/// The anti-mux pin set: all three mux-relevant options, each
+/// explicitly neutralised, so an operator's ssh_config can never
+/// turn a framework direct dial into a ControlPersist handoff
+/// (instant-exit-rc-0) or park its forward on a foreign master.
+#[test]
+fn no_mux_options_pin_all_three_mux_knobs() {
+    let opts = super::no_mux_options();
+    let joined = opts.join(" ");
+    assert!(joined.contains("ControlPath=none"), "{joined}");
+    assert!(joined.contains("ControlMaster=no"), "{joined}");
+    assert!(joined.contains("ControlPersist=no"), "{joined}");
+    // `-o` form so the pins beat config-file directives.
+    assert_eq!(opts.iter().filter(|o| **o == "-o").count(), 3);
+}
+
+/// The babysitter script shape: wait for the owner PID, then
+/// `exec ssh -O exit` against the master's control socket — with the
+/// gateway's own auth/port chain so the exit command works under the
+/// same credential contract as every other control op.
+#[test]
+fn babysitter_script_waits_for_owner_then_exits_master() {
+    let cfg = SshConfig {
+        host: "gw".into(),
+        port: 2222,
+        user: Some("alice".into()),
+        identity_file: Some("/k/id".into()),
+        config_file: None,
+    };
+    let script = super::master_babysitter_script(4242, "/tmp/dynrunner-m-4242-0.sock", &cfg);
+    assert!(
+        script.contains("while kill -0 4242 2>/dev/null"),
+        "{script}"
+    );
+    assert!(script.contains("sleep 5"), "{script}");
+    assert!(script.contains("exec "), "{script}");
+    assert!(script.contains("-O' 'exit"), "{script}");
+    assert!(
+        script.contains("ControlPath=/tmp/dynrunner-m-4242-0.sock"),
+        "{script}"
+    );
+    assert!(script.contains("alice@gw"), "{script}");
+    assert!(script.contains("'-p' '2222'"), "{script}");
+    assert!(script.contains("'-i' '/k/id'"), "{script}");
+}
