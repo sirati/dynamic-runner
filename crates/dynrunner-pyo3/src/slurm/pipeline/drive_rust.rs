@@ -250,11 +250,23 @@ pub(super) fn drive_rust_primary<'py>(
     if let Ok(rust_handle) = job_manager.getattr("_rust")
         && let Ok(rust_jm) = rust_handle.cast::<crate::slurm::PyRustSlurmJobManager>()
     {
-        let arc: std::sync::Arc<dyn std::any::Any + Send + Sync> = rust_jm.borrow().arc_handle();
-        coord
-            .cast::<crate::managers::primary::PyPrimaryCoordinator>()?
-            .borrow_mut()
-            .set_slurm_job_manager_from_rust(arc);
+        let job_manager_arc = rust_jm.borrow().arc_handle();
+        let arc: std::sync::Arc<dyn std::any::Any + Send + Sync> = job_manager_arc.clone();
+        // Build the observer's job-ledger consult port over the SAME shared
+        // job manager so a relocated submitter→observer can consult squeue
+        // for the run's job ids and render the cluster-empty terminal
+        // verdict (the run_20260612_043357 forever-spin fix). UNCONDITIONAL
+        // on hosting the ledger (the SLURM submitter path) and independent
+        // of `--respawn-policy` — the consult is read-only. Cold-join
+        // observers host no ledger and keep the never-terminal
+        // report-and-retry behaviour.
+        let job_ledger_probe: std::sync::Arc<
+            dyn dynrunner_manager_distributed::observer::JobLedgerProbe,
+        > = std::sync::Arc::new(dynrunner_slurm::SlurmJobLedgerProbe::new(job_manager_arc));
+        let coord_ref = coord.cast::<crate::managers::primary::PyPrimaryCoordinator>()?;
+        let mut coord_mut = coord_ref.borrow_mut();
+        coord_mut.set_slurm_job_manager_from_rust(arc);
+        coord_mut.set_job_ledger_probe_from_rust(job_ledger_probe);
     }
 
     // Wire the observer's transport-recovery port (BUG-B reconnect) onto
