@@ -55,8 +55,15 @@ struct SweepOutcome {
 /// (mirror of `[ -d ]` + `[ -O ]`) AND not held live by a running
 /// wrapper ([`crate::scratch_lock::is_live`]), and the 10s
 /// graceful-stop window precedes the unconditional `rm -af`.
-pub fn run(podman: &str) {
-    run_in(podman, Path::new("/tmp"));
+///
+/// `own_scratch_root` is THIS wrapper's own per-job scratch root
+/// (`layout.rndtmp`). The wrapper holds its OWN `wrapper.lock` for the
+/// whole run (see `main::run` / [`crate::scratch_lock`]), so the
+/// liveness probe would read its own held lock back as a "live sibling"
+/// — the scan MUST exclude the one root it itself owns (see
+/// [`sweep_scratch_roots`]).
+pub fn run(podman: &str, own_scratch_root: &Path) {
+    run_in(podman, Path::new("/tmp"), own_scratch_root);
 }
 
 /// Body of [`run`], parameterised over the scratch-scan root so the
@@ -65,7 +72,10 @@ pub fn run(podman: &str) {
 /// with controlled contents). Phase 2 (default storage) is unscoped and
 /// driven purely by the supplied `podman` binary, so a fake-podman in
 /// the test observes both phases through one call log.
-fn run_in(podman: &str, scan_root: &Path) {
+///
+/// `own_scratch_root` is excluded from the Phase-1 scan (the wrapper
+/// holds its own liveness lock — see [`sweep_scratch_roots`]).
+fn run_in(podman: &str, scan_root: &Path, own_scratch_root: &Path) {
     if std::env::var("DYNRUNNER_DISABLE_PREFLIGHT_PODMAN").as_deref() == Ok("1") {
         tracing::info!(
             target: LOG_TARGET,
@@ -81,7 +91,7 @@ fn run_in(podman: &str, scan_root: &Path) {
 
     // Phase 1: orphan per-job storage roots (liveness-gated per root).
     // The outcome also reports whether ANY root probed live.
-    let sweep = sweep_scratch_roots(podman, scan_root);
+    let sweep = sweep_scratch_roots(podman, scan_root, own_scratch_root);
 
     // Phase 2: user-default rootless storage. UNSCOPED (`podman` with no
     // `--root`/`--runroot`), so unlike Phase 1 it cannot attribute a
@@ -164,14 +174,39 @@ fn run_in(podman: &str, scan_root: &Path) {
 /// `scan_root` is `/tmp` in production; parameterised so tests drive
 /// the sweep against a tempdir with a fake podman.
 ///
+/// `own_scratch_root` is THIS wrapper's own per-job scratch root
+/// (`layout.rndtmp`), excluded UP FRONT: the wrapper holds its own
+/// `wrapper.lock` for the whole run, and a held POSIX advisory lock
+/// conflicts even across two file descriptors in the SAME process — so
+/// without this exclusion the wrapper's own [`crate::scratch_lock::is_live`]
+/// probe reads its OWN held lock back as a "live sibling", spuriously
+/// setting `live_sibling_present` and suppressing the Phase-2
+/// default-storage sweep (run_20260612_094056: a self-lock false
+/// positive deferred the sweep that would have cleared a stale libpod
+/// DB). The own root is neither an orphan nor a sibling — it is us —
+/// so it is skipped before the metadata / ownership / liveness checks.
+///
 /// Returns a [`SweepOutcome`]: whether a running container was stopped
 /// in a swept root, AND whether any root probed LIVE — the latter
 /// gates the Phase-2 default-storage sweep (see [`SweepOutcome`]).
-fn sweep_scratch_roots(podman: &str, scan_root: &Path) -> SweepOutcome {
+fn sweep_scratch_roots(
+    podman: &str,
+    scan_root: &Path,
+    own_scratch_root: &Path,
+) -> SweepOutcome {
     let mut outcome = SweepOutcome::default();
     let euid = nix::unistd::geteuid();
     if let Ok(entries) = std::fs::read_dir(scan_root) {
         for entry in entries.flatten() {
+            // SELF-EXCLUSION: never probe / sweep the root this wrapper
+            // itself owns. Its `wrapper.lock` is held by THIS process, so
+            // the liveness probe below would read it back as a live
+            // sibling (advisory locks conflict across fds within one
+            // process) and suppress the Phase-2 sweep on a false
+            // positive. Compared by path identity (see `same_root`).
+            if same_root(&entry.path(), own_scratch_root) {
+                continue;
+            }
             let storage = entry.path().join("storage");
             // Mirror `[ -d "$orphan_storage" ] || continue`.
             let meta = match std::fs::metadata(&storage) {
@@ -234,44 +269,56 @@ fn sweep_scratch_roots(podman: &str, scan_root: &Path) -> SweepOutcome {
     outcome
 }
 
-/// `<podman> --root <storage> --runroot <runroot> --cgroup-manager=cgroupfs ps -q`.
-fn scoped_ps(podman: &str, storage: &str, runroot: &str) -> String {
+/// Build a `podman` invocation scoped to a per-job scratch root:
+/// `--root <storage> --runroot <runroot> --cgroup-manager=cgroupfs`,
+/// with `XDG_RUNTIME_DIR=<runroot>`.
+///
+/// The `XDG_RUNTIME_DIR` override is HERMETIC-LOAD-CRITICAL, not
+/// cosmetic. libpod derives its `tmp_dir` from `$XDG_RUNTIME_DIR`
+/// (`<XDG_RUNTIME_DIR>/libpod/tmp`), NOT from `--runroot`, and STAMPS
+/// that `tmp_dir` into the state DB it creates inside the graphroot
+/// (`<storage>/libpod/...`). A scan invocation that scopes `--root`/
+/// `--runroot` to a per-job root but inherits the wrapper's AMBIENT
+/// `XDG_RUNTIME_DIR` (the default `/run/user/<uid>`) therefore writes a
+/// DB recording the DEFAULT tmp dir into THAT root's graphroot. When the
+/// root's OWNING wrapper later runs its image load — correctly scoped
+/// with `XDG_RUNTIME_DIR=<its run/>` — podman opens the poisoned DB and
+/// trips the consistency check (`database tmp dir
+/// "/run/user/<uid>/libpod/tmp" does not match our tmp dir
+/// "<root>/run/libpod/tmp"`), killing the load (run_20260612_094056:
+/// secondary dead at startup). Pinning `XDG_RUNTIME_DIR=<runroot>` makes
+/// the recorded tmp dir match the scoped runroot, so a scan can never
+/// poison a (sibling's) graphroot DB — mirrors `teardown::podman_base`
+/// and `image::run_load`, the other scoped per-job podman invocations.
+fn scoped_base(podman: &str, storage: &str, runroot: &str) -> Command {
     let mut cmd = Command::new(podman);
     cmd.arg("--root")
         .arg(storage)
         .arg("--runroot")
         .arg(runroot)
         .arg("--cgroup-manager=cgroupfs")
-        .arg("ps")
-        .arg("-q");
+        .env("XDG_RUNTIME_DIR", runroot);
+    cmd
+}
+
+/// `<scoped_base> ps -q`.
+fn scoped_ps(podman: &str, storage: &str, runroot: &str) -> String {
+    let mut cmd = scoped_base(podman, storage, runroot);
+    cmd.arg("ps").arg("-q");
     run_podman_capture(&mut cmd)
 }
 
-/// `<podman> --root ... --runroot ... --cgroup-manager=cgroupfs stop -t 10 <ids...>`.
+/// `<scoped_base> stop -t 10 <ids...>`.
 fn scoped_stop(podman: &str, storage: &str, runroot: &str, ids: &[String]) {
-    let mut cmd = Command::new(podman);
-    cmd.arg("--root")
-        .arg(storage)
-        .arg("--runroot")
-        .arg(runroot)
-        .arg("--cgroup-manager=cgroupfs")
-        .arg("stop")
-        .arg("-t")
-        .arg("10")
-        .args(ids);
+    let mut cmd = scoped_base(podman, storage, runroot);
+    cmd.arg("stop").arg("-t").arg("10").args(ids);
     run_podman_swallow(&mut cmd);
 }
 
-/// `<podman> --root ... --runroot ... --cgroup-manager=cgroupfs rm -af`.
+/// `<scoped_base> rm -af`.
 fn scoped_rm_af(podman: &str, storage: &str, runroot: &str) {
-    let mut cmd = Command::new(podman);
-    cmd.arg("--root")
-        .arg(storage)
-        .arg("--runroot")
-        .arg(runroot)
-        .arg("--cgroup-manager=cgroupfs")
-        .arg("rm")
-        .arg("-af");
+    let mut cmd = scoped_base(podman, storage, runroot);
+    cmd.arg("rm").arg("-af");
     run_podman_swallow(&mut cmd);
 }
 
@@ -298,6 +345,22 @@ fn parse_container_ids(stdout: &str) -> Vec<String> {
         .split_ascii_whitespace()
         .map(|s| s.to_owned())
         .collect()
+}
+
+/// Do `a` and `b` name the same scratch root? Used to exclude the
+/// wrapper's OWN root from the sweep (see [`sweep_scratch_roots`]).
+///
+/// Compares the canonicalised paths when BOTH resolve (handles `/tmp`
+/// being a symlink, or either side carrying `.`/`..`/trailing-slash
+/// noise), falling back to a lexical equality when canonicalisation
+/// fails for either side (e.g. the own root was already removed). The
+/// fallback never widens the match — only the exact same path string
+/// is treated as self when canonicalisation is unavailable.
+fn same_root(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
 }
 
 #[cfg(test)]
@@ -357,7 +420,7 @@ mod tests {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvGuard::set("DYNRUNNER_DISABLE_PREFLIGHT_PODMAN", "1");
         // The disable path must return without invoking podman or panicking.
-        run("podman");
+        run("podman", Path::new(NO_OWN_ROOT));
     }
 
     use std::io::Write as _;
@@ -368,22 +431,40 @@ mod tests {
     /// argv (one line, space-joined) to `calls_log` and answers `ps -q`
     /// with one fake container id (so the stop path is exercised for
     /// swept roots). Returns the script path.
+    ///
+    /// Each invocation ALSO appends one line `<XDG_RUNTIME_DIR>\t<argv>`
+    /// to a sibling `<calls_log>.env` file (see `env_log_path`) so the
+    /// hermetic-load test can correlate the per-call `XDG_RUNTIME_DIR`
+    /// with that call's `--runroot`. `calls_log` itself stays a pure
+    /// argv-per-line log so the existing argv-substring assertions are
+    /// byte-for-byte unaffected.
     fn write_fake_podman(dir: &Path, calls_log: &Path) -> PathBuf {
         let path = dir.join("fake-podman");
+        let env_log = env_log_path(calls_log);
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(
             f,
             "#!/usr/bin/env bash\n\
              echo \"$@\" >> {log}\n\
+             printf '%s\\t%s\\n' \"${{XDG_RUNTIME_DIR:-<unset>}}\" \"$*\" >> {env}\n\
              for a in \"$@\"; do\n\
                if [ \"$a\" = ps ]; then echo deadbeef; fi\n\
              done",
-            log = calls_log.display()
+            log = calls_log.display(),
+            env = env_log.display(),
         )
         .unwrap();
         drop(f);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    /// Sibling of the argv `calls_log` carrying one
+    /// `<XDG_RUNTIME_DIR>\t<argv>` line per fake-podman invocation.
+    fn env_log_path(calls_log: &Path) -> PathBuf {
+        let mut s = calls_log.as_os_str().to_owned();
+        s.push(".env");
+        PathBuf::from(s)
     }
 
     /// Create a per-job scratch root `<scan>/<name>` with the
@@ -394,6 +475,13 @@ mod tests {
         std::fs::create_dir_all(root.join("run")).unwrap();
         root
     }
+
+    /// An `own_scratch_root` that is NOT one of the scanned roots — for
+    /// the legacy tests that exercise sibling/orphan handling and do not
+    /// involve the wrapper's own root. A path that does not exist
+    /// canonicalises-to-fallback in `same_root` and never matches a real
+    /// scanned entry, so the self-exclusion is a no-op for these tests.
+    const NO_OWN_ROOT: &str = "/nonexistent/preflight-test-own-root";
 
     /// THE production pin (asm-dataset run_20260611_115429): a scratch
     /// root whose wrapper is ALIVE (liveness lock held) must NOT be
@@ -422,7 +510,8 @@ mod tests {
         let orphan = make_scratch_root(&scan, "asm-dead5678");
         drop(crate::scratch_lock::acquire(&orphan).expect("acquire+release orphan lock"));
 
-        let outcome = sweep_scratch_roots(&podman.to_string_lossy(), &scan);
+        let outcome =
+            sweep_scratch_roots(&podman.to_string_lossy(), &scan, Path::new(NO_OWN_ROOT));
 
         let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
         let live_storage = live.join("storage");
@@ -456,6 +545,145 @@ mod tests {
         );
     }
 
+    /// THE defect-(a) pin (run_20260612_094056): the wrapper holds its
+    /// OWN `wrapper.lock` for the whole run, then runs the preflight in
+    /// the SAME process. A POSIX advisory lock conflicts across two file
+    /// descriptors even within one process, so the liveness probe reads
+    /// the wrapper's own held lock back as a "live sibling" — pre-fix
+    /// this set `live_sibling_present` and suppressed the Phase-2
+    /// default-storage sweep on a false positive. With only the OWN root
+    /// present (and its lock genuinely held), the scan must EXCLUDE it:
+    /// `live_sibling_present` stays false and the own root is never
+    /// touched.
+    ///
+    /// Revert-check: drop the `same_root` self-exclusion in
+    /// `sweep_scratch_roots` and the held own-lock re-probes live →
+    /// `live_sibling_present` flips true, failing this test.
+    #[test]
+    fn sweep_excludes_own_held_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        let calls_log = tmp.path().join("calls.log");
+        let podman = write_fake_podman(tmp.path(), &calls_log);
+
+        // The wrapper's OWN scratch root, with its `wrapper.lock` HELD
+        // for the life of the run (exactly as `main::run` does before
+        // calling `preflight::run`).
+        let own = make_scratch_root(&scan, "asm-tokenizer-6c5ea8a6");
+        let _own_guard = crate::scratch_lock::acquire(&own).expect("hold own lock");
+
+        let outcome = sweep_scratch_roots(&podman.to_string_lossy(), &scan, &own);
+
+        assert!(
+            !outcome.live_sibling_present,
+            "the wrapper's OWN held root must NOT count as a live sibling \
+             (self read back through a second fd); else the Phase-2 \
+             default-storage sweep is suppressed on a false positive",
+        );
+        let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        let own_storage = own.join("storage").to_string_lossy().into_owned();
+        assert!(
+            !calls.contains(&own_storage),
+            "the wrapper's own scratch root must never be probed/swept; \
+             calls:\n{calls}",
+        );
+    }
+
+    /// Self-exclusion must NOT weaken protection for a GENUINE foreign
+    /// sibling: the OWN root is excluded, but a DIFFERENT held-lock root
+    /// still reports `live_sibling_present` (the run_20260611_115429
+    /// live-sibling guard stays intact).
+    #[test]
+    fn sweep_excludes_own_but_keeps_foreign_sibling_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        let calls_log = tmp.path().join("calls.log");
+        let podman = write_fake_podman(tmp.path(), &calls_log);
+
+        // OWN root (held) — excluded.
+        let own = make_scratch_root(&scan, "asm-tokenizer-6c5ea8a6");
+        let _own_guard = crate::scratch_lock::acquire(&own).expect("hold own lock");
+        // A GENUINE foreign sibling (held) — must still gate Phase 2.
+        let sibling = make_scratch_root(&scan, "asm-tokenizer-deadbeef");
+        let _sib_guard = crate::scratch_lock::acquire(&sibling).expect("hold sibling lock");
+
+        let outcome = sweep_scratch_roots(&podman.to_string_lossy(), &scan, &own);
+
+        assert!(
+            outcome.live_sibling_present,
+            "a genuine foreign held-lock sibling must still be reported \
+             live so Phase 2 is suppressed — self-exclusion must not \
+             disarm the live-sibling guard",
+        );
+        let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
+        assert!(
+            !calls.contains(&own.join("storage").to_string_lossy().into_owned()),
+            "own root never touched; calls:\n{calls}",
+        );
+        assert!(
+            !calls.contains(&sibling.join("storage").to_string_lossy().into_owned()),
+            "a live foreign sibling's root is never touched either; \
+             calls:\n{calls}",
+        );
+    }
+
+    /// THE defect-(b) pin (run_20260612_094056 hermetic load): every
+    /// SCOPED Phase-1 podman invocation against a (sibling's) per-job
+    /// graphroot must run with `XDG_RUNTIME_DIR=<that root's run/>`.
+    /// libpod derives its `tmp_dir` from `$XDG_RUNTIME_DIR` (NOT from
+    /// `--runroot`) and stamps it into the state DB it writes inside the
+    /// graphroot. A scan that scoped `--root`/`--runroot` but inherited
+    /// the wrapper's AMBIENT default `XDG_RUNTIME_DIR` poisoned the
+    /// scanned graphroot's DB with the default tmp dir; the root's owning
+    /// wrapper then tripped `database tmp dir ... does not match` on its
+    /// correctly-scoped load. Asserts the per-call XDG matches the call's
+    /// own `--runroot`.
+    ///
+    /// Revert-check: drop the `.env("XDG_RUNTIME_DIR", runroot)` from
+    /// `scoped_base` and the swept root's calls log `<default-or-unset>`
+    /// instead of `<root>/run`, failing the match assertion.
+    #[test]
+    fn scoped_scan_pins_xdg_runtime_dir_to_runroot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = tmp.path().join("scan");
+        std::fs::create_dir_all(&scan).unwrap();
+        let calls_log = tmp.path().join("calls.log");
+        let podman = write_fake_podman(tmp.path(), &calls_log);
+
+        // A markerless orphan root: swept (ps + stop + rm), so every
+        // scoped helper runs against it.
+        let orphan = make_scratch_root(&scan, "asm-tokenizer-cafe1234");
+
+        sweep_scratch_roots(&podman.to_string_lossy(), &scan, Path::new(NO_OWN_ROOT));
+
+        // The fake podman logged `<XDG_RUNTIME_DIR>\t<argv>` per call.
+        let env_log = std::fs::read_to_string(env_log_path(&calls_log)).unwrap_or_default();
+        let want_runroot = orphan.join("run").to_string_lossy().into_owned();
+
+        // Every SCOPED call (one carrying `--runroot <orphan>/run`) must
+        // have run with `XDG_RUNTIME_DIR == <orphan>/run`.
+        let scoped: Vec<&str> = env_log
+            .lines()
+            .filter(|l| l.contains(&want_runroot))
+            .collect();
+        assert!(
+            !scoped.is_empty(),
+            "the orphan root must have been swept by scoped calls; \
+             env log:\n{env_log}",
+        );
+        for line in &scoped {
+            let (xdg, _argv) = line.split_once('\t').expect("xdg<TAB>argv");
+            assert_eq!(
+                xdg, want_runroot,
+                "a scoped scan call must run with XDG_RUNTIME_DIR=<runroot> \
+                 so libpod records a tmp dir consistent with the scoped \
+                 runroot (else it poisons the graphroot DB); line:\n{line}",
+            );
+        }
+    }
+
     /// A root with NO liveness marker at all (a wrapper from before
     /// this fix, or the true-orphan shape the sweep was built for)
     /// keeps being swept — the gate must not regress the original
@@ -470,7 +698,7 @@ mod tests {
 
         let orphan = make_scratch_root(&scan, "asm-prefix9abc");
 
-        sweep_scratch_roots(&podman.to_string_lossy(), &scan);
+        sweep_scratch_roots(&podman.to_string_lossy(), &scan, Path::new(NO_OWN_ROOT));
 
         let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
         let storage = orphan.join("storage").to_string_lossy().into_owned();
@@ -538,7 +766,7 @@ mod tests {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _disable_guard = EnvGuard::set("DYNRUNNER_DISABLE_PREFLIGHT_PODMAN", "0");
 
-        run_in(&podman.to_string_lossy(), &scan);
+        run_in(&podman.to_string_lossy(), &scan, Path::new(NO_OWN_ROOT));
 
         let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
 
@@ -562,38 +790,83 @@ mod tests {
         );
     }
 
-    /// Capture every tracing line emitted by `f` (INFO and up) into a
-    /// `String`. The preflight sweep is synchronous and single-threaded,
-    /// so a thread-local `with_default` subscriber sees every event the
-    /// swept code emits without touching the global dispatcher (which
-    /// other tests may own).
+    use std::cell::RefCell;
+    use std::sync::Arc;
+
+    thread_local! {
+        /// The buffer the GLOBAL capture subscriber writes THIS thread's
+        /// events to while a `capture_logs` is active on it; `None`
+        /// otherwise (events are then discarded). Per-thread so parallel
+        /// tests never cross-contaminate each other's captured logs.
+        static CAPTURE_BUF: RefCell<Option<Arc<Mutex<Vec<u8>>>>> = const { RefCell::new(None) };
+    }
+
+    /// Writer the global capture subscriber routes every event through:
+    /// it forwards bytes to the calling thread's `CAPTURE_BUF` when set,
+    /// and drops them otherwise. One process-wide subscriber owns this,
+    /// so callsite interest is cached ONCE as enabled.
+    struct ThreadRouter;
+    impl std::io::Write for ThreadRouter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            CAPTURE_BUF.with(|c| {
+                if let Some(buf) = c.borrow().as_ref() {
+                    buf.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(b);
+                }
+            });
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadRouter {
+        type Writer = ThreadRouter;
+        fn make_writer(&'a self) -> ThreadRouter {
+            ThreadRouter
+        }
+    }
+
+    /// Install the process-wide capture subscriber EXACTLY once.
+    ///
+    /// Why global (not thread-local `with_default`): `tracing` caches
+    /// each callsite's INTEREST globally, computed from the registered
+    /// subscriber's level hint. A thread-local `with_default` is NOT
+    /// consulted by that cache, so when any parallel test hits a sweep
+    /// narration callsite FIRST under the no-op global default, the
+    /// callsite is cached as `never` and a later thread-local capture
+    /// silently sees nothing (the narration asserts then flake under
+    /// `--test-threads>1`). A single permissive (TRACE-level) global
+    /// subscriber caches every callsite as ENABLED; the per-thread
+    /// `CAPTURE_BUF` then decides which thread's events to retain.
+    fn ensure_capture_subscriber() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(ThreadRouter)
+                .finish();
+            // Ignore the result: a test binary that somehow already has a
+            // global default still captures via the thread-local writer if
+            // that default is ours; the narration tests assert on the
+            // buffer, so a lost race here surfaces as an explicit failure,
+            // never a silent pass.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
+    /// Capture every tracing line emitted by `f` (TRACE and up) into a
+    /// `String`, routing only THIS thread's events to the returned
+    /// buffer (see `ensure_capture_subscriber` / `CAPTURE_BUF`).
     fn capture_logs<F: FnOnce()>(f: F) -> String {
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap_or_else(|e| e.into_inner()).write(b)
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
-            type Writer = Buf;
-            fn make_writer(&'a self) -> Buf {
-                self.clone()
-            }
-        }
-
-        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(buf.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let bytes = buf.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        ensure_capture_subscriber();
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        // Bind this thread's capture buffer for the duration of `f`,
+        // restoring the prior binding on exit (supports nesting / repeat).
+        let prev = CAPTURE_BUF.with(|c| c.borrow_mut().replace(buf.clone()));
+        f();
+        CAPTURE_BUF.with(|c| *c.borrow_mut() = prev);
+        let bytes = buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
@@ -618,7 +891,7 @@ mod tests {
         let orphan = make_scratch_root(&scan, "asm-deadbeef");
 
         let logs = capture_logs(|| {
-            sweep_scratch_roots(&podman.to_string_lossy(), &scan);
+            sweep_scratch_roots(&podman.to_string_lossy(), &scan, Path::new(NO_OWN_ROOT));
         });
 
         let storage = orphan.join("storage").to_string_lossy().into_owned();
@@ -661,7 +934,7 @@ mod tests {
 
         // No live sibling: the Phase-2 sweep RUNS and must say so.
         let logs = capture_logs(|| {
-            run_in(&podman.to_string_lossy(), &scan);
+            run_in(&podman.to_string_lossy(), &scan, Path::new(NO_OWN_ROOT));
         });
         assert!(
             logs.lines()
@@ -691,7 +964,7 @@ mod tests {
         let _disable_guard = EnvGuard::set("DYNRUNNER_DISABLE_PREFLIGHT_PODMAN", "0");
 
         let logs = capture_logs(|| {
-            run_in(&podman.to_string_lossy(), &scan);
+            run_in(&podman.to_string_lossy(), &scan, Path::new(NO_OWN_ROOT));
         });
         assert!(
             logs.lines()
@@ -717,7 +990,7 @@ mod tests {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _disable_guard = EnvGuard::set("DYNRUNNER_DISABLE_PREFLIGHT_PODMAN", "0");
 
-        run_in(&podman.to_string_lossy(), &scan);
+        run_in(&podman.to_string_lossy(), &scan, Path::new(NO_OWN_ROOT));
 
         let calls = std::fs::read_to_string(&calls_log).unwrap_or_default();
         assert!(

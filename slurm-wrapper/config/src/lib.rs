@@ -263,7 +263,8 @@ mod tests {
             image_digest: "a1b2c3d4e5f6".to_string(),
             image_name: "asm-tokenizer".to_string(),
             image_tag: "latest".to_string(),
-            load_command: "$PODMAN_BIN --root \"$PODMAN_STORAGE\" load -i \"$LOCAL_IMAGE\""
+            load_command: "$PODMAN_BIN --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" \
+                 --cgroup-manager=cgroupfs load -i \"$LOCAL_IMAGE\""
                 .to_string(),
             container_command: "dynamic_runner._secondary_bootstrap".to_string(),
             cores_spec: "-2".to_string(),
