@@ -720,6 +720,21 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// only liveness fact dispatch consumes, via the two boundary methods).
     pub(super) silence_warn_stage: HashMap<String, usize>,
 
+    /// The set of members whose operational MAIN LOOP has provably run
+    /// this incarnation: a mesh `Keepalive` with the SECONDARY emitter
+    /// role was received from them (the secondary's keepalive arm spins
+    /// up only post-`wait_for_setup`). Owned by the liveness module
+    /// (`primary::heartbeat`). Read by `collect_heartbeat_report` to
+    /// BOUND the Operational-state setup exemption: a pre-Operational
+    /// member is exempt from the silence schedule only while its
+    /// keepalive emitter has not started — once proven, it is judged
+    /// like any Operational member, so a member whose connection
+    /// typestate wedged pre-Operational (while its node kept working)
+    /// cannot die silence-invisible. Entry removed on welcome (a fresh
+    /// incarnation re-earns its exemption) and on requeue (the member
+    /// is gone).
+    pub(super) keepalive_proven: HashSet<String>,
+
     /// Per-secondary backoff timestamps. When a secondary returns
     /// "No idle worker available" Recoverable (its dispatch.rs
     /// `is_idle_state()` check found every worker non-idle —
@@ -1372,6 +1387,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             secondary_keepalives: HashMap::new(),
             own_tick_health,
             silence_judged_marks: HashMap::new(),
+            keepalive_proven: HashSet::new(),
             ingest_gate: super::heartbeat::IngestEdgeGate::new(),
             silence_warn_stage: HashMap::new(),
             backpressured_secondaries: HashMap::new(),
