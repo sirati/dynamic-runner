@@ -49,9 +49,10 @@ pub struct SlurmPreparationTunnelReconnector<R: InfoFileReader + Send + Sync> {
 impl<R: InfoFileReader + Send + Sync> SlurmPreparationTunnelReconnector<R> {
     /// Construct an observer-reconnect binding over a shared
     /// `SlurmPreparation`. Precondition (inherited from
-    /// [`SlurmPreparation::establish_one_tunnel`]): `setup_ssh_tunnels`
-    /// must have run at least once on this instance so the primary's QUIC
-    /// port is captured.
+    /// [`SlurmPreparation::establish_one_tunnel`]): a cohort entry
+    /// (`run_tunnel_cohort` / `setup_ssh_tunnels`) must have STARTED
+    /// at least once on this instance so the primary's QUIC port is
+    /// captured (both record it at entry).
     pub fn new(preparation: Arc<SlurmPreparation>, info_reader: R) -> Self {
         Self {
             preparation,

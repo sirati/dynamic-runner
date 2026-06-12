@@ -17,9 +17,10 @@ use super::opts_for;
 /// Reads info files from a real local directory by polling the
 /// filesystem — exercises the same control flow the real
 /// gateway-backed reader will use, without needing a live SSH
-/// gateway in the unit-test ring.
+/// gateway in the unit-test ring. `pub(super)` so the cohort tests
+/// drive the incremental entry with the same reader.
 #[derive(Clone)]
-struct LocalDirReader;
+pub(super) struct LocalDirReader;
 
 impl InfoFileReader for LocalDirReader {
     // The trait pins `+ 'static` on the returned future; an
