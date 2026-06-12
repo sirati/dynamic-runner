@@ -897,3 +897,468 @@ async fn replacement_join_clears_bookkeeping_and_later_readmission_revokes_nothi
         })
         .await;
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Remote-execution backend (the relocated/promoted-primary topology):
+// the respawn DECISION runs on a primary with NO local provider; the
+// EXECUTION is delegated over the mesh to the provider-host observer
+// process ("setup"). These tests stand up TWO real mesh processes —
+// a promoted primary at "promoted-1" and a provider-hosting observer
+// at "setup" — over paired channel transports, with both production
+// mesh-pumps running, and replay the production sequence end-to-end.
+// ═══════════════════════════════════════════════════════════════════
+
+use crate::observer::{ObserverConfig, ObserverCoordinator, ObserverHandoff};
+use crate::process::{LocalRole, Mesh};
+use dynrunner_protocol_primary_secondary::address::PeerId;
+use dynrunner_protocol_primary_secondary::{
+    ClusterMutation, Destination, DistributedMessage, MessageType,
+};
+use dynrunner_transport_channel::ChannelPeerTransport;
+use std::collections::HashMap as StdHashMap;
+use tokio::sync::mpsc as tokio_mpsc;
+
+/// Two-process rig: the promoted primary (decision) and the
+/// provider-host observer (execution), wired over paired channel
+/// transports with both mesh-pumps live.
+struct RemoteRig {
+    coordinator: PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
+    /// The observer-hosted provider (the execution side's MockSpawner).
+    provider: Arc<MockSpawner>,
+    /// Raw inject into the observer process's inbound wire — used to
+    /// replay a DUPLICATE request (the lost-result re-send) without
+    /// waiting out the stub's 10s re-send window.
+    obs_inject_tx: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    /// Keepalives: pumps + control handles + the observer's run task.
+    _pri_keepalive: PrimaryMeshKeepalive,
+    _obs_control: crate::process::MeshControlHandle<TestId>,
+    _obs_pump: tokio::task::JoinHandle<()>,
+    _obs_run: tokio::task::JoinHandle<()>,
+}
+
+/// Build the two connected processes. The PRIMARY side is built by the
+/// standard `build_test_primary` (node id "promoted-1") over a channel
+/// transport whose single peer is "setup"; the OBSERVER side mirrors
+/// the relocated submitter: an `ObserverCoordinator::from_handoff`
+/// carrying the respawn provider (the process-owned half), its
+/// `current_primary` naming the promoted node, and its OWN production
+/// run loop driving the respawn-execution arm.
+async fn build_remote_rig() -> RemoteRig {
+    // Paired transports: pri("promoted-1") <-> obs("setup").
+    let (to_pri_tx, to_pri_rx) = tokio_mpsc::unbounded_channel();
+    let (to_obs_tx, to_obs_rx) = tokio_mpsc::unbounded_channel();
+    let pri_transport = ChannelPeerTransport::<TestId>::from_raw_channels(
+        "promoted-1".into(),
+        StdHashMap::from([("setup".to_string(), to_obs_tx.clone())]),
+        to_pri_rx,
+    );
+    let obs_transport = ChannelPeerTransport::<TestId>::from_raw_channels(
+        "setup".into(),
+        StdHashMap::from([("promoted-1".to_string(), to_pri_tx)]),
+        to_obs_rx,
+    );
+
+    // Primary process (the promoted decision holder).
+    let config = PrimaryConfig {
+        node_id: "promoted-1".into(),
+        num_secondaries: 1,
+        connect_timeout: Duration::from_secs(1),
+        peer_timeout: Duration::from_secs(60),
+        keepalive_interval: Duration::from_secs(60),
+        uses_file_based_items: false,
+        retry_max_passes: 0,
+        fleet_dead_timeout: Duration::from_secs(60),
+        mesh_ready_timeout: Duration::from_secs(1),
+        ..PrimaryConfig::default()
+    };
+    let (coordinator, pri_keepalive) = build_test_primary(
+        config,
+        pri_transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    // Observer process (the provider host). Mirrors `from_handoff`:
+    // the provider rides the handoff across the submitter's demotion.
+    let mut obs_mesh = Mesh::new(obs_transport);
+    let (obs_slot, obs_client, obs_inbox) =
+        obs_mesh.register_local_role(LocalRole::Observer, PeerId::from("setup"));
+    obs_mesh.publish_membership();
+    let (obs_control, obs_control_rx) = crate::process::pump::control_channel::<TestId>();
+    let obs_pump = tokio::task::spawn_local(async move {
+        let _slot = obs_slot;
+        crate::process::pump::run_pump(obs_mesh, obs_control_rx).await;
+    });
+
+    let mut obs_state = crate::cluster_state::ClusterState::<TestId>::new();
+    obs_state.apply(ClusterMutation::PrimaryChanged {
+        new: "promoted-1".into(),
+        epoch: 1,
+        reason: Default::default(),
+    });
+    let provider = Arc::new(MockSpawner::new());
+    let inherited_dispatcher =
+        tokio::task::spawn_local(async { std::future::pending::<()>().await });
+    let lifecycle_dispatcher =
+        tokio::task::spawn_local(async { std::future::pending::<()>().await });
+    let handoff = ObserverHandoff {
+        client: obs_client,
+        inbox: obs_inbox,
+        cluster_state: obs_state,
+        node_id: "setup".into(),
+        deadlines: ObserverConfig {
+            node_id: "setup".into(),
+            fleet_dead_timeout: Duration::from_secs(60),
+            peer_timeout: Duration::from_secs(60),
+            panik_watcher_paths: Vec::new(),
+            panik_watcher_poll_interval: Duration::from_secs(60),
+            fleet_death_presumption: ObserverConfig::DEFAULT_FLEET_DEATH_PRESUMPTION,
+        },
+        started_phases: std::collections::HashSet::new(),
+        panik_signal_rx: None,
+        task_completed_dispatcher_handle: inherited_dispatcher,
+        lifecycle_dispatcher_handle: lifecycle_dispatcher,
+        holdings: std::collections::HashSet::new(),
+        reconnector: None,
+        respawn_provider: Some(provider.clone() as Arc<dyn SecondarySpawner>),
+    };
+    let mut observer = ObserverCoordinator::from_handoff(handoff);
+    let obs_run = tokio::task::spawn_local(async move {
+        let _ = observer.run().await;
+    });
+
+    RemoteRig {
+        coordinator,
+        provider,
+        obs_inject_tx: to_obs_tx,
+        _pri_keepalive: pri_keepalive,
+        _obs_control: obs_control,
+        _obs_pump: obs_pump,
+        _obs_run: obs_run,
+    }
+}
+
+/// Pump the primary's inbox through `dispatch_message` (what the
+/// operational loop's inbox arm does) until a respawn outcome lands on
+/// the JoinSet or the deadline passes. Returns the drained inbound
+/// message types alongside the outcome for frame-level assertions.
+async fn pump_until_respawn_outcome(
+    coordinator: &mut PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
+    deadline: Duration,
+) -> (Option<RespawnOutcome>, Vec<MessageType>) {
+    let mut seen = Vec::new();
+    let started = tokio::time::Instant::now();
+    loop {
+        while let Some(msg) = coordinator.inbox.try_recv() {
+            seen.push(msg.msg_type());
+            coordinator
+                .dispatch_message(msg, &mut None)
+                .await
+                .expect("dispatch_message must not error in this rig");
+        }
+        if let Some(joined) = coordinator.respawn_tasks.try_join_next() {
+            return (Some(joined.expect("respawn task must not panic")), seen);
+        }
+        if started.elapsed() > deadline {
+            return (None, seen);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// TRACE-REPLAY of the production shape that sat inert: a PROMOTED
+/// primary (relocated off the submitter — NO local provider) with the
+/// on-secondary-death policy sees a member removal. Pre-fix,
+/// `enable_respawn` was never called on this topology, so the respawn
+/// arm was structurally parked (`respawn_lifecycle_rx = None`) and the
+/// `respawn_request` counter sat at 0 forever. Now: the replicated
+/// `RespawnPolicySet` re-arms the decision at promotion-snapshot
+/// hydrate; the removal flows listener → channel → dispatch (the
+/// production path); the EXECUTION crosses the mesh to the observer's
+/// provider; the outcome flows back; the replicated ledger records the
+/// spend.
+#[tokio::test(flavor = "current_thread")]
+async fn promoted_primary_respawns_through_observer_hosted_provider() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut rig = build_remote_rig().await;
+
+            // The promotion snapshot a failed-over secondary inherits:
+            // policy caps + the member that is about to die.
+            let mut origin = crate::cluster_state::ClusterState::<TestId>::new();
+            origin.apply(ClusterMutation::RespawnPolicySet {
+                max_per_secondary: 100,
+                max_total: 100,
+                cooldown_ms: 0,
+            });
+            origin.apply(ClusterMutation::PeerJoined {
+                peer_id: "secondary-0".into(),
+                is_observer: false,
+                can_be_primary: true,
+                cap_version: Default::default(),
+                member_gen: 0,
+            });
+            rig.coordinator
+                .seed_from_promotion_snapshot(origin.snapshot());
+
+            // The structural fact that was FALSE in production: the
+            // promoted primary's respawn arm is ARMED (this is exactly
+            // why respawn_request stayed 0 — the arm had no receiver).
+            assert!(
+                rig.coordinator.respawn_lifecycle_rx.is_some(),
+                "promotion hydrate must re-arm the respawn lifecycle arm",
+            );
+            assert!(
+                rig.coordinator.respawn_budget.is_some(),
+                "promotion hydrate must restore the budget caps",
+            );
+            assert!(
+                rig.coordinator.respawn_spawner.is_some(),
+                "promotion hydrate must install the remote execution backend",
+            );
+
+            // The member dies — replayed through the PRODUCTION path:
+            // replicated removal → registered lifecycle listener →
+            // respawn channel → the operational-loop dispatch.
+            rig.coordinator
+                .cluster_state
+                .apply(ClusterMutation::PeerRemoved {
+                    id: "secondary-0".into(),
+                    cause: RemovalCause::KeepaliveMiss,
+                    member_gen: 0,
+                });
+            let removed = PeerLifecycleEvent::Removed {
+                id: "secondary-0".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            };
+            for listener in &rig.coordinator.peer_lifecycle_listeners {
+                listener.on_event(&removed);
+            }
+            let mut rx = rig
+                .coordinator
+                .respawn_lifecycle_rx
+                .take()
+                .expect("armed above");
+            let event = rx.try_recv().expect("listener must forward the removal");
+            rig.coordinator.dispatch_respawn_lifecycle(event);
+            rig.coordinator.respawn_lifecycle_rx = Some(rx);
+
+            // The spend lands on the replicated ledger AT DISPATCH —
+            // the counter that sat at 0 in production is non-zero the
+            // moment the decision accepts.
+            assert_eq!(
+                rig.coordinator.cluster_state.respawn_events().len(),
+                1,
+                "the accepted respawn must be on the replicated ledger",
+            );
+
+            // EXECUTION crosses the mesh: the observer's arm drives the
+            // provider and the outcome flows back to complete the
+            // primary's spawn future.
+            let (outcome, seen) =
+                pump_until_respawn_outcome(&mut rig.coordinator, Duration::from_secs(10)).await;
+            let outcome = outcome.expect("the remote round trip must complete");
+            assert_eq!(outcome.new_id, "secondary-1");
+            assert!(
+                outcome.result.is_ok(),
+                "observer-side provider success must come back Ok: {:?}",
+                outcome.result,
+            );
+            assert_eq!(rig.provider.call_count(), 1, "provider executed exactly once");
+            assert_eq!(rig.provider.captured_ids(), vec!["secondary-1".to_string()]);
+            assert!(
+                seen.contains(&MessageType::RespawnSpawnResult),
+                "the outcome must arrive as a typed RespawnSpawnResult frame; saw {seen:?}",
+            );
+        })
+        .await;
+}
+
+/// Idempotency at the execution host: a RE-SENT spawn request for the
+/// same replacement id (the lost-result replay — the stub re-sends the
+/// SAME id until a result lands) must NOT double-submit. The observer's
+/// arm dedupes on the id and replays the cached outcome instead.
+#[tokio::test(flavor = "current_thread")]
+async fn duplicate_spawn_request_replays_cached_outcome_without_resubmitting() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut rig = build_remote_rig().await;
+            rig.coordinator.enable_respawn_remote(permissive_budget());
+
+            rig.coordinator.dispatch_respawn_request(RespawnRequest {
+                original_id: "secondary-0".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            });
+            let (outcome, _) =
+                pump_until_respawn_outcome(&mut rig.coordinator, Duration::from_secs(10)).await;
+            assert!(outcome.expect("first round trip").result.is_ok());
+            assert_eq!(rig.provider.call_count(), 1);
+
+            // Replay the EXACT request bytes into the observer process
+            // (what the stub's re-send window would do after 10s).
+            let dup = DistributedMessage::RespawnSpawnRequest {
+                target: None,
+                sender_id: "promoted-1".into(),
+                timestamp: 0.0,
+                new_secondary_id: "secondary-1".into(),
+                primary_endpoint: String::new(),
+                primary_pubkey_pem: String::new(),
+            }
+            .with_target(Destination::Observer(PeerId::from("setup")));
+            rig.obs_inject_tx.send(dup).expect("observer wire open");
+
+            // The duplicate must produce a REPLAYED result frame at the
+            // primary (the lost-result heal) and NO second submission.
+            let started = tokio::time::Instant::now();
+            let mut replayed = false;
+            while started.elapsed() < Duration::from_secs(10) && !replayed {
+                while let Some(msg) = rig.coordinator.inbox.try_recv() {
+                    if msg.msg_type() == MessageType::RespawnSpawnResult {
+                        replayed = true;
+                    }
+                    rig.coordinator
+                        .dispatch_message(msg, &mut None)
+                        .await
+                        .expect("dispatch ok");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(replayed, "the cached outcome must be replayed to the primary");
+            assert_eq!(
+                rig.provider.call_count(),
+                1,
+                "one replacement id must never submit twice",
+            );
+        })
+        .await;
+}
+
+/// Remote revocation parity: a member re-admitted while its
+/// replacement is still pending revokes the squatter THROUGH THE MESH —
+/// the same `SecondarySpawner::revoke` contract the local provider
+/// honours, executed by the observer-hosted provider.
+#[tokio::test(flavor = "current_thread")]
+async fn readmission_revokes_pending_replacement_through_observer_provider() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut rig = build_remote_rig().await;
+            rig.coordinator.enable_respawn_remote(permissive_budget());
+
+            // Member joins, dies, replacement dispatched + completed.
+            rig.coordinator
+                .cluster_state
+                .apply(ClusterMutation::PeerJoined {
+                    peer_id: "sec-x".into(),
+                    is_observer: false,
+                    can_be_primary: true,
+                    cap_version: Default::default(),
+                    member_gen: 0,
+                });
+            rig.coordinator
+                .cluster_state
+                .apply(ClusterMutation::PeerRemoved {
+                    id: "sec-x".into(),
+                    cause: RemovalCause::KeepaliveMiss,
+                    member_gen: 0,
+                });
+            rig.coordinator.dispatch_respawn_request(RespawnRequest {
+                original_id: "sec-x".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            });
+            let (outcome, _) =
+                pump_until_respawn_outcome(&mut rig.coordinator, Duration::from_secs(10)).await;
+            let outcome = outcome.expect("spawn round trip");
+            assert!(outcome.result.is_ok());
+            assert!(
+                rig.coordinator
+                    .pending_replacements
+                    .contains_key("secondary-1"),
+                "the replacement must be pending-until-join",
+            );
+
+            // RE-ADMISSION: the original returns alive at the next
+            // generation; the reconciliation revokes the squatter via
+            // the REMOTE provider.
+            rig.coordinator
+                .cluster_state
+                .apply(ClusterMutation::PeerJoined {
+                    peer_id: "sec-x".into(),
+                    is_observer: false,
+                    can_be_primary: true,
+                    cap_version: Default::default(),
+                    member_gen: 1,
+                });
+            rig.coordinator
+                .dispatch_respawn_lifecycle(PeerLifecycleEvent::Added {
+                    id: "sec-x".into(),
+                    is_observer: false,
+                });
+
+            // The revoke runs detached; pump the primary's inbox (the
+            // revoke RESULT must complete the stub's waiter) until the
+            // observer-side provider records the revocation.
+            let started = tokio::time::Instant::now();
+            while started.elapsed() < Duration::from_secs(10)
+                && rig.provider.revoked_ids.lock().unwrap().is_empty()
+            {
+                while let Some(msg) = rig.coordinator.inbox.try_recv() {
+                    rig.coordinator
+                        .dispatch_message(msg, &mut None)
+                        .await
+                        .expect("dispatch ok");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                rig.provider.revoked_ids.lock().unwrap().clone(),
+                vec!["secondary-1".to_string()],
+                "the pending replacement must be revoked on the provider host",
+            );
+            assert!(
+                rig.coordinator.pending_replacements.is_empty(),
+                "revocation must clear the pending bookkeeping",
+            );
+        })
+        .await;
+}
+
+/// The seed originators replicate the enabled policy caps (the
+/// promoted primary's re-arm source). A coordinator WITHOUT the policy
+/// replicates nothing — every replica keeps `None` ("respawn off").
+#[tokio::test(flavor = "current_thread")]
+async fn seed_origination_replicates_enabled_policy_caps() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Enabled: the relocated-seed originator (the mesh-always
+            // submitter's production path) carries the caps.
+            let (mut enabled, _mesh) = make_coordinator();
+            enabled.enable_respawn(
+                Arc::new(MockSpawner::new()),
+                RespawnBudget {
+                    max_per_secondary: 5,
+                    max_total: 20,
+                    cooldown: Duration::from_secs(45),
+                },
+                "tcp://127.0.0.1:5555".into(),
+                "PEM".into(),
+            );
+            enabled.originate_relocated_seed(std::collections::HashMap::new());
+            let policy = enabled
+                .cluster_state
+                .respawn_policy()
+                .expect("enabled policy must be replicated with the seed");
+            assert_eq!(policy.max_per_secondary, 5);
+            assert_eq!(policy.max_total, 20);
+            assert_eq!(policy.cooldown_ms, 45_000);
+
+            // Disabled: nothing is replicated.
+            let (mut disabled, _mesh2) = make_coordinator();
+            disabled.originate_relocated_seed(std::collections::HashMap::new());
+            assert_eq!(disabled.cluster_state.respawn_policy(), None);
+        })
+        .await;
+}
