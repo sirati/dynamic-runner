@@ -265,7 +265,7 @@ async fn notify_stage_file_emits_wire_message() {
 ///     applied locally so the primary's own ledger converges.
 #[tokio::test(flavor = "current_thread")]
 async fn cluster_state_converges_on_primary_and_secondary() {
-    use crate::process::{LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs};
+    use crate::process::{LocalRole, Mesh, MeshHost, Node, NodeRunInputs, PrimaryRunArgs};
     use dynrunner_protocol_primary_secondary::address::PeerId;
     use dynrunner_transport_channel::peer_mesh;
 
@@ -343,7 +343,7 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                 FixedEstimator(100),
             );
             target.set_bootstrap_primary_id("setup".to_string());
-            let (target_node, target_promo_tx) = Node::new(target_mesh);
+            let (target_node, target_promo_tx) = Node::new(MeshHost::on_local_set(target_mesh));
             target.register_promotion_signal(target_promo_tx);
             let promote = build_test_promote_recipe("sec-0".to_string(), None);
             let target_node = target_node.with_secondary(target, target_slot);
@@ -375,7 +375,7 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-            let (pri_node, _pri_promo_tx) = Node::new(pri_mesh);
+            let (pri_node, _pri_promo_tx) = Node::new(MeshHost::on_local_set(pri_mesh));
             let pri_node = pri_node.with_primary(primary, pri_slot);
             let binaries: Vec<TaskInfo<TestId>> = (0..5)
                 .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))

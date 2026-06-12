@@ -4,10 +4,11 @@
 //!
 //! One OS process hosts the runner's role composition for a single peer:
 //! at most one primary + one secondary + one observer coordinator, the
-//! [`Mesh`] that demuxes the wire to them, and the lifecycle channels that
-//! drive promotion (a secondary becoming primary) and demotion (an old
-//! primary winding down). `Node` OWNS all of that and is the single
-//! teardown lever: dropping a role's [`RoleEntry`] drops its
+//! hosted mesh ([`MeshHost`] — the running pump that demuxes the wire to
+//! them, on whichever executor the composition site picked), and the
+//! lifecycle channels that drive promotion (a secondary becoming primary)
+//! and demotion (an old primary winding down). `Node` OWNS all of that and
+//! is the single teardown lever: dropping a role's [`RoleEntry`] drops its
 //! `Arc<RoleSlot>`, so the mesh `Weak` stops upgrading and the slot
 //! auto-dies (clarification H4).
 //!
@@ -31,7 +32,8 @@
 //!
 //! # Boundary
 //!
-//! `Node` names the [`Mesh`] (which owns the by-value transport) and the
+//! `Node` holds the [`MeshHost`] (the already-running pump over the
+//! by-value transport — the node never sees either) and names the
 //! coordinator types by GENERIC parameter — it never reaches into a
 //! coordinator's internals nor the transport's. A role "exists" iff its
 //! `Option<RoleEntry<_>>` is `Some` (clarification H3: one nullable per
@@ -40,10 +42,10 @@
 use std::sync::Arc;
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{PeerTransport, PrimaryChangeReason};
+use dynrunner_protocol_primary_secondary::PrimaryChangeReason;
 use tokio::sync::mpsc;
 
-use super::mesh::Mesh;
+use super::mesh_host::MeshHost;
 use super::role_slot::RoleSlot;
 use crate::cluster_state::ClusterStateSnapshot;
 
@@ -116,21 +118,20 @@ pub struct PromotionSignal<I: Identifier> {
 
 /// The OS-process role composition shell (see the module docs).
 ///
-/// Generic over the identifier `I`, the transport `Tr` (owned by the
-/// [`Mesh`], never named by a coordinator), and the three coordinator
-/// types `P`/`S`/`O`. The coordinator types are parameters — not the
-/// concrete coordinators — so this skeleton compiles BEFORE the
-/// coordinators drop their transport generic; the node-wiring wave pins
-/// them to the rewired coordinator types.
-pub struct Node<I, Tr, P, S, O>
+/// Generic over the identifier `I` and the three coordinator types
+/// `P`/`S`/`O`. The transport is NOT a parameter: the composition site
+/// hosted it (with the role-demux mesh + pump) inside the [`MeshHost`]
+/// before the node was built, so the node — like the coordinators — only
+/// ever holds channel-backed handles.
+pub struct Node<I, P, S, O>
 where
     I: Identifier,
-    Tr: PeerTransport<I>,
 {
-    /// The role-demux mesh over the by-value transport — the ONLY thing in
-    /// this process that touches the wire. Coordinators reach it solely
-    /// through their `MeshClient` / `RoleInbox`.
-    pub mesh: Mesh<I, Tr>,
+    /// The hosted, already-running mesh — the ONLY thing in this process
+    /// that touches the wire. The node mutates it solely through the host's
+    /// control handle (register/retag/wind-down); coordinators reach it
+    /// solely through their `MeshClient` / `RoleInbox`.
+    pub host: MeshHost<I>,
     /// The primary coordinator, if one runs here. `Some` after a
     /// bootstrap-submitter build or a promotion build.
     // TODO(C-NODE): populated by the node-wiring wave's register + build.
@@ -152,12 +153,12 @@ where
     pub promotion_rx: mpsc::UnboundedReceiver<PromotionSignal<I>>,
 }
 
-impl<I, Tr, P, S, O> Node<I, Tr, P, S, O>
+impl<I, P, S, O> Node<I, P, S, O>
 where
     I: Identifier,
-    Tr: PeerTransport<I>,
 {
-    /// Build a fresh node shell around a `mesh`, with no roles yet live.
+    /// Build a fresh node shell around a hosted `mesh`, with no roles yet
+    /// live.
     ///
     /// Returns the node plus the promotion ingress SENDER it hands out:
     /// `promotion_tx` is installed on the secondary (mirror of
@@ -168,13 +169,13 @@ where
     /// on the bootstrap path, a fresh pair on the promotion-build path) with
     /// the primary coordinator's own `demote_rx`; the node never owns one.
     ///
-    /// The roles start `None`; the node-wiring wave registers them on the
-    /// mesh (minting each `(slot, client, inbox)` trio) and builds the
-    /// coordinators with `client + inbox`.
-    pub fn new(mesh: Mesh<I, Tr>) -> (Self, mpsc::UnboundedSender<PromotionSignal<I>>) {
+    /// The roles start `None`; the composition site registers them through
+    /// the host's control handle (minting each `(slot, client, inbox)` trio)
+    /// and builds the coordinators with `client + inbox`.
+    pub fn new(host: MeshHost<I>) -> (Self, mpsc::UnboundedSender<PromotionSignal<I>>) {
         let (promotion_tx, promotion_rx) = mpsc::unbounded_channel();
         let node = Self {
-            mesh,
+            host,
             primary: None,
             secondary: None,
             observer: None,

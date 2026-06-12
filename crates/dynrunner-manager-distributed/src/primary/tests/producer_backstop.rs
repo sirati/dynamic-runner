@@ -66,7 +66,7 @@ use dynrunner_transport_channel::peer_mesh;
 
 use crate::observer::ObserverCoordinator;
 use crate::primary::command_channel::PrimaryCommand;
-use crate::process::{LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal};
+use crate::process::{LocalRole, Mesh, MeshHost, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal};
 
 /// The promoted-primary recipe type every promotion-capable compute peer
 /// carries in these scenarios.
@@ -74,10 +74,10 @@ type PromoteRecipe =
     crate::process::PromotedPrimaryBuilder<ResourceStealingScheduler, FixedEstimator, TestId>;
 
 /// The fully-typed node composition (one per peer): primary + secondary +
-/// observer role slots over the channel transport.
+/// observer role slots over the channel transport (hosted on the test's
+/// LocalSet via `MeshHost::on_local_set`).
 type BackstopNode = Node<
     TestId,
-    ChannelPeerTransport<TestId>,
     PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
     SecondaryCoordinator<
         dynrunner_transport_channel::ChannelManagerEnd,
@@ -252,7 +252,7 @@ fn compose_compute_node(
         FixedEstimator(100),
     );
     secondary.set_bootstrap_primary_id("setup".to_string());
-    let (node, promo_tx) = Node::new(mesh);
+    let (node, promo_tx) = Node::new(MeshHost::on_local_set(mesh));
     secondary.register_promotion_signal(promo_tx);
     let node = node.with_secondary(secondary, slot);
     let inputs = BackstopInputs {
@@ -290,7 +290,7 @@ fn compose_setup_node(
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
-    let (node, _promo_tx) = Node::new(mesh);
+    let (node, _promo_tx) = Node::new(MeshHost::on_local_set(mesh));
     let node = node.with_primary(primary, slot);
     let inputs = BackstopInputs {
         primary_run_args: Some(PrimaryRunArgs {

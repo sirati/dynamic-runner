@@ -2,7 +2,8 @@ use dynrunner_core::{Identifier, ResourceMap, TaskInfo, WorkerId};
 
 pub mod pending_pool;
 pub use pending_pool::{
-    BucketKey, IngestPartition, PendingPool, PendingPoolError, PhaseState, WorkerView,
+    BucketKey, IngestPartition, PendingPool, PendingPoolError, PhaseState, ViewSelection,
+    WorkerView,
 };
 
 /// Processing phases that the manager cycles through.
@@ -141,21 +142,29 @@ pub trait Scheduler<I: Identifier> {
     fn initial_budget(&self, worker_index: u32, max_resources: &ResourceMap) -> ResourceMap;
 
     /// Called during the initial assignment phase for one worker.
+    ///
+    /// `pending` is an ordered list of BORROWED candidates (the shape a
+    /// clone-free [`WorkerView`] exposes); the scheduler answers with a
+    /// positional `binary_index` into it.
     fn assign_initial(
         &self,
         worker: &WorkerBudgetInfo<I>,
-        pending: &[TaskInfo<I>],
+        pending: &[&TaskInfo<I>],
         total_assigned: &ResourceMap,
         max_resources: &ResourceMap,
         estimator: &dyn ResourceEstimator<I>,
     ) -> AssignmentDecision;
 
     /// Called during the normal phase for one idle worker.
+    ///
+    /// `pending` is an ordered list of BORROWED candidates (the shape a
+    /// clone-free [`WorkerView`] exposes); the scheduler answers with a
+    /// positional `binary_index` into it.
     fn assign_normal(
         &self,
         worker: &WorkerBudgetInfo<I>,
         all_workers: &[WorkerBudgetInfo<I>],
-        pending: &[TaskInfo<I>],
+        pending: &[&TaskInfo<I>],
         max_resources: &ResourceMap,
         estimator: &dyn ResourceEstimator<I>,
         retry_attempt: bool,

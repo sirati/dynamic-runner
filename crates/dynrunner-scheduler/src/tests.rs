@@ -121,6 +121,12 @@ fn initial_budget_worker_4() {
     );
 }
 
+/// Borrow a candidate list the way a clone-free `WorkerView` exposes
+/// it to the scheduler (`&[&TaskInfo<I>]`).
+fn refs<I>(v: &[TaskInfo<I>]) -> Vec<&TaskInfo<I>> {
+    v.iter().collect()
+}
+
 // ── assign_initial tests ──
 
 #[test]
@@ -129,7 +135,7 @@ fn assign_initial_picks_fitting_task() {
     let worker = make_worker(0, 500, true, false);
     let binaries = vec![make_binary("big", 1000), make_binary("small", 100)];
 
-    let decision = s.assign_initial(&worker, &binaries, &mem(0), &mem(1000), &LinearEstimator);
+    let decision = s.assign_initial(&worker, &refs(&binaries), &mem(0), &mem(1000), &LinearEstimator);
     match decision {
         AssignmentDecision::Assign {
             worker_id,
@@ -152,7 +158,7 @@ fn assign_initial_marks_opportunistic_when_exceeding_max() {
     let worker = make_worker(0, 500, true, false);
     let binaries = vec![make_binary("medium", 100)];
 
-    let decision = s.assign_initial(&worker, &binaries, &mem(900), &mem(1000), &LinearEstimator);
+    let decision = s.assign_initial(&worker, &refs(&binaries), &mem(900), &mem(1000), &LinearEstimator);
     match decision {
         AssignmentDecision::Assign { opportunistic, .. } => {
             assert!(opportunistic);
@@ -167,7 +173,7 @@ fn assign_initial_no_fit() {
     let worker = make_worker(0, 100, true, false);
     let binaries = vec![make_binary("huge", 1000)];
 
-    let decision = s.assign_initial(&worker, &binaries, &mem(0), &mem(10000), &LinearEstimator);
+    let decision = s.assign_initial(&worker, &refs(&binaries), &mem(0), &mem(10000), &LinearEstimator);
     assert!(matches!(decision, AssignmentDecision::NoFit));
 }
 
@@ -186,7 +192,7 @@ fn assign_initial_skips_already_assigned() {
     worker.has_initial_assignment = true;
     let binaries = vec![make_binary("a", 10)];
 
-    let decision = s.assign_initial(&worker, &binaries, &mem(0), &mem(1000), &FixedEstimator(10));
+    let decision = s.assign_initial(&worker, &refs(&binaries), &mem(0), &mem(1000), &FixedEstimator(10));
     assert!(matches!(decision, AssignmentDecision::NoFit));
 }
 
@@ -201,7 +207,7 @@ fn assign_normal_picks_fitting_task() {
     let decision = s.assign_normal(
         &workers[0],
         &workers,
-        &binaries,
+        &refs(&binaries),
         &mem(10000),
         &LinearEstimator,
         false,
@@ -229,7 +235,7 @@ fn assign_normal_opportunistic_caps_to_available() {
     let decision = s.assign_normal(
         &workers[0],
         &workers,
-        &binaries,
+        &refs(&binaries),
         &mem(300),
         &LinearEstimator,
         false,
@@ -247,7 +253,7 @@ fn assign_normal_opportunistic_rejects_too_large() {
     let decision = s.assign_normal(
         &workers[0],
         &workers,
-        &binaries,
+        &refs(&binaries),
         &mem(300),
         &LinearEstimator,
         false,
@@ -265,7 +271,7 @@ fn assign_normal_non_idle_worker_returns_no_fit() {
     let decision = s.assign_normal(
         &workers[0],
         &workers,
-        &binaries,
+        &refs(&binaries),
         &mem(10000),
         &FixedEstimator(10),
         false,
@@ -758,7 +764,7 @@ fn assign_normal_temp_factor_ordering() {
     let d0 = s.assign_normal(
         &workers[0],
         &workers,
-        &binaries,
+        &refs(&binaries),
         &mem(600),
         &LinearEstimator,
         false,
@@ -768,7 +774,7 @@ fn assign_normal_temp_factor_ordering() {
     let d1 = s.assign_normal(
         &workers[1],
         &workers,
-        &binaries,
+        &refs(&binaries),
         &mem(600),
         &LinearEstimator,
         false,
@@ -778,7 +784,7 @@ fn assign_normal_temp_factor_ordering() {
     let d2 = s.assign_normal(
         &workers[2],
         &workers,
-        &binaries,
+        &refs(&binaries),
         &mem(600),
         &LinearEstimator,
         false,

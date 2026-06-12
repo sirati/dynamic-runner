@@ -308,7 +308,7 @@ impl<I: Identifier> PendingPool<I> {
     }
 
     /// Notify the pool that a task has been dispatched outside the
-    /// `pop_for_worker` / `take_from_view` path (which already do the
+    /// `pop_for_worker` / `take_selected` path (which already do the
     /// in-flight bookkeeping). Pair with [`on_item_finished`] when the
     /// task completes. Used by the promoted secondary, which
     /// extracts items via [`super::PendingPool::take_first_match`] (a removal primitive

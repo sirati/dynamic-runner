@@ -117,7 +117,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 ..
             } = decision
             {
-                let binary = self.pool_mut().take_from_view(view, binary_index);
+                // Owned consumption ticket — the view's last use,
+                // releasing the pool borrow for the take below.
+                let selection = view.select(binary_index);
+                let binary = self.pool_mut().take_selected(selection);
                 total_assigned_resources.add(&estimated_usage);
 
                 let secondary_id = self.workers[worker_idx].secondary_id.clone();

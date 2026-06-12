@@ -6,9 +6,7 @@ use dynrunner_core::{
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{AssignmentDecision, ProcessingPhase, ResourceEstimator, Scheduler};
 
-use crate::oom::{
-    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_SAMPLE_INTERVAL, OomWatcher, OomWatcherConfig,
-};
+use crate::oom::{DEFAULT_HEARTBEAT_INTERVAL, OomWatcher, OomWatcherConfig, SAMPLE_SWEEP_INTERVAL};
 
 use super::{LocalManager, WorkerFactory};
 
@@ -23,32 +21,37 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         phase: ProcessingPhase,
         factory: &mut impl WorkerFactory<M>,
     ) {
-        // Decouple sample cadence (50ms, fast forensic sampling) from
-        // decision cadence (config-driven, default 100ms). Both ticks
-        // are driven by `OomWatcher` so the secondary's processing
-        // loop can use the same surface. See `crate::oom`.
-        // Derive the workers cgroup `memory.events` path from the
-        // pool's nested cgroup handle (when present). This activates
-        // the OomWatcher's kernel-OOM detection so the disconnect
-        // reclassifier in `handle_event` can upgrade pipe-EOF events
-        // from `Recoverable` to `ResourceExhausted(memory)` whenever
-        // the kernel's `oom_kill` counter incremented in the same
-        // sample window.
+        // The OOM memory accounting runs as ONE self-paced sweep (read
+        // all workers' cgroup charges off the async runtime via
+        // `spawn_blocking`, apply + decide inline), not per-fire timer
+        // arms. See `crate::oom`. Derive the workers cgroup
+        // `memory.events` path from the pool's nested cgroup handle
+        // (when present). This activates the OomWatcher's kernel-OOM
+        // detection so the disconnect reclassifier in `handle_event`
+        // can upgrade pipe-EOF events from `Recoverable` to
+        // `ResourceExhausted(memory)` whenever the kernel's `oom_kill`
+        // counter incremented in the same sweep window.
         let workers_memory_events_path = self
             .pool
             .workers_cgroup()
             .map(|h| h.workers_path().join("memory.events"));
         let mut oom_watcher = OomWatcher::new_with_workers_cgroup(
             OomWatcherConfig {
-                sample_interval: DEFAULT_SAMPLE_INTERVAL,
-                decision_interval: self.config.resource_check_interval,
+                sample_interval: SAMPLE_SWEEP_INTERVAL,
                 heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
                 log_enabled: self.config.log_oom_watcher,
             },
             workers_memory_events_path,
         );
-        let mut sample_interval = oom_watcher.sample_interval_ticker();
-        let mut decision_interval = oom_watcher.decision_interval_ticker();
+        // The sweep's wake deadline. Seeded to NOW so the first sweep
+        // fires immediately; re-armed `sweep_interval` after EACH sweep
+        // completes (await-before-resleep — a slow sweep cannot pile,
+        // the next starts a full interval after the previous returned).
+        // The periodic maintenance (`check_timeouts` / stuck-worker
+        // report) that the old decision tick drove rides this same
+        // sweep at the same cadence.
+        let sweep_interval = oom_watcher.sweep_interval();
+        let mut next_sweep_due = tokio::time::Instant::now();
 
         // Take the command-channel receiver out of `self.command_rx`
         // so we can `recv()` it inside `select!` without borrowing
@@ -139,23 +142,38 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                         self.process_drain_transitions();
                     }
                 }
-                _ = sample_interval.tick() => {
-                    // Fast (default 50ms) sample tick: refreshes per-
-                    // worker RSS, reads host + cgroup state, evaluates
-                    // structured-log triggers. No scheduler call here.
-                    oom_watcher.on_sample(&mut self.pool);
-                }
-                _ = decision_interval.tick() => {
-                    // Decision tick (config-driven, default 100ms):
-                    // periodic maintenance plus the scheduler-driven
-                    // OOM kill check. The watcher drives the pressure
-                    // check itself and records any kill so the next
-                    // log line carries `trigger=kill`.
+                // Self-paced OOM sweep arm. Parks on the stored
+                // `next_sweep_due` deadline; on fire it reads ALL
+                // workers' cgroup charges off the async runtime
+                // (`spawn_blocking`), applies them, runs the pressure
+                // decision inline, then runs the periodic maintenance
+                // and re-arms the deadline. One operational-loop wakeup
+                // per sweep, vs the former per-fire sample + decision
+                // ticks (the 58%-of-wakeups blocking-IO hot path).
+                //
+                // Cancel-safety: `sleep_until` consumes nothing and the
+                // deadline is PERSISTENT local state, so a sibling arm
+                // winning the race merely re-creates the future against
+                // the SAME instant next iteration — the sweep cannot be
+                // starved into never firing by a busy loop.
+                _ = tokio::time::sleep_until(next_sweep_due) => {
+                    // Collect the CURRENT worker set's read inputs
+                    // (respawns / type-shifts picked up each sweep),
+                    // then read off the runtime — no pool borrow held
+                    // across the blocking call.
+                    let inputs = oom_watcher.collect_sweep_inputs(&self.pool);
+                    let sweep = tokio::task::spawn_blocking(move || inputs.read())
+                        .await
+                        .expect("oom charge sweep read panicked");
+                    oom_watcher.apply_sweep(&mut self.pool, sweep);
                     if !self.pool_ref().is_empty() {
                         self.check_resource_pressure_via_watcher(&mut oom_watcher);
                     }
                     self.check_timeouts(active_workers, on_failure_increment_failed, factory).await;
                     self.report_stuck_workers();
+                    // Await-before-resleep: arm the next sweep a full
+                    // interval after THIS one completed.
+                    next_sweep_due = tokio::time::Instant::now() + sweep_interval;
                 }
             }
 
@@ -349,7 +367,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 opportunistic,
                 ..
             } => {
-                let binary = self.pool_mut().take_from_view(view, binary_index);
+                // Owned consumption ticket — the view's last use,
+                // releasing the pool borrow for the take below.
+                let selection = view.select(binary_index);
+                let binary = self.pool_mut().take_selected(selection);
                 let name = binary
                     .path
                     .file_name()
@@ -420,7 +441,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     }
                     Err(e) => {
                         // Put binary back at the front of its bucket — it
-                        // was in-flight (take_from_view bumped in-flight)
+                        // was in-flight (take_selected bumped in-flight)
                         // and now needs to be re-attempted.
                         self.pool_mut().requeue(binary);
                         self.handle_assignment_failure(worker_id, &e, factory).await;

@@ -31,7 +31,7 @@
 
 use super::*;
 
-use crate::process::{LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs};
+use crate::process::{LocalRole, Mesh, MeshHost, Node, NodeRunInputs, PrimaryRunArgs};
 use dynrunner_protocol_primary_secondary::address::PeerId;
 use dynrunner_transport_channel::peer_mesh;
 use std::sync::{Arc, Mutex};
@@ -293,7 +293,7 @@ async fn run_relocate_with_dispatch_target(facet: RelocateStagingFacet) -> (usiz
         FixedEstimator(100),
     );
     sec0.set_bootstrap_primary_id("setup".to_string());
-    let (sec0_node, sec0_promo_tx) = Node::new(sec0_mesh);
+    let (sec0_node, sec0_promo_tx) = Node::new(MeshHost::on_local_set(sec0_mesh));
     sec0.register_promotion_signal(sec0_promo_tx);
     // Capture the relocate-target's LIVE staging-dispatch cell BEFORE
     // `with_secondary` consumes `sec0`. The recipe below threads it in to PROVE
@@ -341,7 +341,7 @@ async fn run_relocate_with_dispatch_target(facet: RelocateStagingFacet) -> (usiz
         FixedEstimator(100),
     );
     sec1.set_bootstrap_primary_id("setup".to_string());
-    let (sec1_node, _sec1_promo_tx) = Node::new(sec1_mesh);
+    let (sec1_node, _sec1_promo_tx) = Node::new(MeshHost::on_local_set(sec1_mesh));
     let sec1_node = sec1_node.with_secondary(sec1, sec1_slot);
     let sec1_inputs: NodeRunInputs<FakeWorkerFactory, _, _, TestId> = NodeRunInputs {
         secondary_factory: Some(FakeWorkerFactory),
@@ -373,7 +373,7 @@ async fn run_relocate_with_dispatch_target(facet: RelocateStagingFacet) -> (usiz
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
-    let (pri_node, _pri_promo_tx) = Node::new(pri_mesh);
+    let (pri_node, _pri_promo_tx) = Node::new(MeshHost::on_local_set(pri_mesh));
     let pri_node = pri_node.with_primary(primary, pri_slot);
     let pri_inputs: NodeRunInputs<FakeWorkerFactory, _, _, TestId> = NodeRunInputs {
         primary_run_args: Some(PrimaryRunArgs {

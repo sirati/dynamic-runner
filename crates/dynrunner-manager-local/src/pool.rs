@@ -968,28 +968,24 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             .and_then(|w| w.loaded_type_id.as_ref())
     }
 
-    /// Update actual resource usage for all workers (charged =
-    /// resident + swap; cgroup-leaf-first with `/proc` fallback —
-    /// see [`crate::monitor::measure_worker_charge`]).
-    pub fn update_all_resource_usage(&mut self) {
-        for worker in &mut self.workers {
-            worker.update_resource_usage();
-        }
-    }
-
-    /// Check resource pressure via the scheduler, kill if needed.
+    /// Decide resource pressure via the scheduler, kill if needed,
+    /// from the workers' ALREADY-POPULATED `actual_usage`.
     ///
-    /// Returns `ResourcePressureResult::Killed` with the displaced binary so
-    /// the caller can decide what to do (requeue locally, report to primary, etc.).
-    /// The worker is marked as killed but NOT restarted — the caller
-    /// must call `restart_worker` if it wants the worker back.
-    pub fn check_resource_pressure<S: Scheduler<I>>(
+    /// Pure decision: it does NOT read `/proc` or cgroup files — the
+    /// self-paced OOM sweep ([`crate::oom::ChargeSweepInputs::read`] →
+    /// [`crate::oom::OomWatcher::apply_sweep`]) is the single owner of
+    /// the blocking charge read, and it populates `actual_usage`
+    /// before this runs. Returns `ResourcePressureResult::Killed` with
+    /// the displaced binary so the caller can decide what to do
+    /// (requeue locally, report to primary, etc.). The worker is
+    /// marked as killed but NOT restarted — the caller must call
+    /// `restart_worker` if it wants the worker back.
+    pub fn decide_resource_pressure<S: Scheduler<I>>(
         &mut self,
         scheduler: &S,
         max_resources: &ResourceMap,
         in_pressure_phase: bool,
     ) -> ResourcePressureResult<I> {
-        self.update_all_resource_usage();
         let infos = self.budget_infos();
         let decision = scheduler.check_resource_pressure(&infos, max_resources, in_pressure_phase);
 
@@ -1998,5 +1994,172 @@ mod startup_crash_backoff_tests {
                 }
             })
             .await;
+    }
+}
+
+/// Sweep → apply → decide data-flow pins: the OOM sweep reads charges
+/// OFF the runtime, [`crate::worker::WorkerHandle::set_memory_charge`]
+/// applies each into `actual_usage`, and
+/// [`WorkerPool::decide_resource_pressure`] hands that pre-applied
+/// `actual_usage` to the scheduler WITHOUT a fresh `/proc` / cgroup
+/// re-read. These tests prove the decision consumes exactly the swept
+/// charge.
+#[cfg(test)]
+mod sweep_decision_tests {
+    use super::*;
+    use crate::monitor::MemoryCharge;
+    use dynrunner_core::{ResourceKind, ResourceMap, TaskInfo};
+    use dynrunner_scheduler_api::{
+        AssignmentDecision, KillReason, ResourceEstimator, ResourcePressureDecision, Scheduler,
+        WorkerBudgetInfo,
+    };
+    use dynrunner_transport_channel::{ChannelManagerEnd, channel_pair};
+    use serde::{Deserialize, Serialize};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    struct TestId(String);
+
+    /// A scheduler that kills the FIRST worker whose `actual_usage`
+    /// memory exceeds `threshold`, and records every `actual_usage`
+    /// value it was handed so the test can assert the decision saw the
+    /// SWEPT charge (not a stale / re-read value).
+    struct ChargeWatchingScheduler {
+        threshold: u64,
+        seen_actual: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl ResourceEstimator<TestId> for ChargeWatchingScheduler {
+        fn estimate(&self, _task: &TaskInfo<TestId>) -> ResourceMap {
+            ResourceMap::new()
+        }
+    }
+
+    impl Scheduler<TestId> for ChargeWatchingScheduler {
+        fn initial_budget(&self, _worker_index: u32, _max: &ResourceMap) -> ResourceMap {
+            ResourceMap::new()
+        }
+        fn assign_initial(
+            &self,
+            _worker: &WorkerBudgetInfo<TestId>,
+            _pending: &[&TaskInfo<TestId>],
+            _total_assigned: &ResourceMap,
+            _max: &ResourceMap,
+            _estimator: &dyn ResourceEstimator<TestId>,
+        ) -> AssignmentDecision {
+            AssignmentDecision::NoPendingTasks
+        }
+        fn assign_normal(
+            &self,
+            _worker: &WorkerBudgetInfo<TestId>,
+            _all: &[WorkerBudgetInfo<TestId>],
+            _pending: &[&TaskInfo<TestId>],
+            _max: &ResourceMap,
+            _estimator: &dyn ResourceEstimator<TestId>,
+            _retry_attempt: bool,
+        ) -> AssignmentDecision {
+            AssignmentDecision::NoPendingTasks
+        }
+        fn check_resource_pressure(
+            &self,
+            workers: &[WorkerBudgetInfo<TestId>],
+            _max: &ResourceMap,
+            _in_pressure_phase: bool,
+        ) -> ResourcePressureDecision {
+            let mem = ResourceKind::memory();
+            let mut seen = self.seen_actual.lock().unwrap();
+            for w in workers {
+                seen.push(w.actual_usage.get(&mem));
+            }
+            for w in workers {
+                if w.actual_usage.get(&mem) > self.threshold {
+                    return ResourcePressureDecision::Kill {
+                        worker_id: w.worker_id,
+                        reason: KillReason::OomOverBudget,
+                    };
+                }
+            }
+            ResourcePressureDecision::NoAction
+        }
+    }
+
+    /// Push `n` channel-backed worker handles into a fresh pool.
+    fn pool_with_workers(n: u32) -> WorkerPool<ChannelManagerEnd, TestId> {
+        let mut pool = WorkerPool::<ChannelManagerEnd, TestId>::new();
+        for i in 0..n {
+            let (manager_end, _runner_end) = channel_pair();
+            let handle =
+                crate::worker::WorkerHandle::new(i, 0, manager_end, pool.event_tx().clone());
+            pool.workers.push(handle);
+        }
+        pool
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// `set_memory_charge` (the apply step) writes the swept charge into
+    /// `actual_usage` as `charged = resident + swap`, and the decision
+    /// consumes exactly that value — no re-read.
+    #[test]
+    fn decision_fires_on_swept_over_budget_charge() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let scheduler = ChargeWatchingScheduler {
+            threshold: 4 * GIB,
+            seen_actual: seen.clone(),
+        };
+        let mut pool = pool_with_workers(2);
+
+        // Worker 0 below threshold; worker 1 over (RSS shrinking, swap
+        // ballooning — the charged sum is what crosses, proving swap is
+        // counted as pressure end-to-end).
+        pool.workers[0].set_memory_charge(MemoryCharge {
+            resident_bytes: 2 * GIB,
+            swap_bytes: 0,
+        });
+        pool.workers[1].set_memory_charge(MemoryCharge {
+            resident_bytes: GIB,
+            swap_bytes: 5 * GIB, // charged = 6 GiB > 4 GiB threshold
+        });
+
+        let result = pool.decide_resource_pressure(&scheduler, &ResourceMap::new(), true);
+        match result {
+            ResourcePressureResult::Killed { worker_id, .. } => assert_eq!(worker_id, 1),
+            ResourcePressureResult::NoAction => {
+                panic!("expected worker 1 killed on swept over-budget charge, got NoAction")
+            }
+        }
+
+        // The scheduler saw the SWEPT actual_usage verbatim (2 GiB,
+        // 6 GiB) — no fresh read overwrote it between apply and decide.
+        let seen = seen.lock().unwrap();
+        assert!(seen.contains(&(2 * GIB)), "worker 0 swept charge reached the decision");
+        assert!(seen.contains(&(6 * GIB)), "worker 1 swept charge reached the decision");
+    }
+
+    /// Below-threshold swept charges → NoAction (the decision does not
+    /// invent pressure that the swept snapshot does not show).
+    #[test]
+    fn decision_no_action_when_swept_charge_under_budget() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let scheduler = ChargeWatchingScheduler {
+            threshold: 4 * GIB,
+            seen_actual: seen.clone(),
+        };
+        let mut pool = pool_with_workers(2);
+        pool.workers[0].set_memory_charge(MemoryCharge {
+            resident_bytes: GIB,
+            swap_bytes: 0,
+        });
+        pool.workers[1].set_memory_charge(MemoryCharge {
+            resident_bytes: 2 * GIB,
+            swap_bytes: GIB, // charged = 3 GiB < 4 GiB
+        });
+        let result = pool.decide_resource_pressure(&scheduler, &ResourceMap::new(), true);
+        assert!(
+            matches!(result, ResourcePressureResult::NoAction),
+            "under-budget swept charges must not trip a kill"
+        );
+        // The decision still inspected both swept charges.
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 }

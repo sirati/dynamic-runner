@@ -584,6 +584,7 @@ name = "dynrunner-scheduler-api"
 version = "0.4.0"
 dependencies = [
  "dynrunner-core",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
