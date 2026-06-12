@@ -86,7 +86,12 @@ pub fn build_run_argv(
     argv.push("--pull=never".to_string());
     argv.push("--network".to_string());
     argv.push("host".to_string());
-    argv.push("--pids-limit=16384".to_string());
+    // Podman's rootless default is pids_limit=2048 (from containers.conf).
+    // Under SLURM, fork-heavy or thread-heavy workloads (JVM, parallel
+    // compilers, autotools) exhaust that cap → clone() EAGAIN. Pass 0
+    // (unlimited) explicitly so the silent builtin default never fires;
+    // the host protections are the RAM cap and nice level.
+    argv.push("--pids-limit=0".to_string());
     argv.push("--ulimit".to_string());
     argv.push("nproc=32768:32768".to_string());
 
@@ -320,7 +325,7 @@ mod tests {
             "--pull=never",
             "--network",
             "host",
-            "--pids-limit=16384",
+            "--pids-limit=0",
             "--ulimit",
             "nproc=32768:32768",
             "--memory=8589934592",
@@ -374,6 +379,12 @@ mod tests {
 
         assert_eq!(argv, expected);
         assert!(argv.contains(&"--log-level=debug".to_string()));
+        // Explicit pids-limit=0: must be present so podman's silent 2048 builtin
+        // default never fires (fork-heavy workloads hit clone() EAGAIN at 2048).
+        assert!(
+            argv.contains(&"--pids-limit=0".to_string()),
+            "--pids-limit=0 must be present in argv"
+        );
         // The dispatcher's task-specific argv now travels over the peer
         // mesh (cold-start fetch), NOT on the launch command line: no
         // `--forwarded-arg` flag and none of its values appear.
@@ -488,7 +499,7 @@ mod tests {
             "--pull=never",
             "--network",
             "host",
-            "--pids-limit=16384",
+            "--pids-limit=0",
             "--ulimit",
             "nproc=32768:32768",
             "-e",
@@ -533,6 +544,12 @@ mod tests {
 
         assert_eq!(argv, expected);
         assert!(argv.contains(&"--log-level=debug".to_string()));
+        // Explicit pids-limit=0: must be present so podman's silent 2048 builtin
+        // default never fires (fork-heavy workloads hit clone() EAGAIN at 2048).
+        assert!(
+            argv.contains(&"--pids-limit=0".to_string()),
+            "--pids-limit=0 must be present in argv"
+        );
         // Empty env values present verbatim.
         assert!(argv.contains(&"PRIMARY_NODE_IPV4=".to_string()));
         assert!(argv.contains(&"PRIMARY_NODE_IPV6=".to_string()));

@@ -297,3 +297,66 @@ def test_upload_artifact_retries_transient_oserror(tmp_path, monkeypatch):
     assert calls == [str(remote), str(remote)]
     assert remote.read_bytes() == b"tarball-bytes"
     assert sleeps == [1.0]
+
+
+# ── get_run_command argv shape ────────────────────────────────────────
+
+
+def test_get_run_command_contains_explicit_pids_limit_zero() -> None:
+    """get_run_command must include ``--pids-limit=0`` so podman's silent
+    rootless default (2048) never fires.  Fork-heavy workloads (JVM, autotools,
+    parallel compilers) exhaust the 2048 cap and receive clone() EAGAIN."""
+    pp = PodmanPackaging(deployment=_TEST_DEPLOYMENT)
+    cmd = pp.get_run_command(
+        image_name="test-image",
+        image_tag="latest",
+        mounts={"/host/src": "/app/src"},
+        ports={8080: 8080},
+        entrypoint_args=["--some-flag"],
+        storage_root="/tmp/storage",
+        run_root="/tmp/run",
+    )
+    tokens = cmd.split()
+    assert "--pids-limit=0" in tokens, (
+        f"--pids-limit=0 must be present in get_run_command output; got: {cmd!r}"
+    )
+
+
+def test_get_run_command_shape() -> None:
+    """Pin the full argv token sequence of get_run_command, including the
+    placement of --pids-limit=0 after --rm and before the volume mounts."""
+    pp = PodmanPackaging(deployment=_TEST_DEPLOYMENT)
+    cmd = pp.get_run_command(
+        image_name="myimage",
+        image_tag="v1",
+        mounts={"/h/src": "/c/src"},
+        ports={9000: 9000},
+        entrypoint_args=["--foo", "bar"],
+        storage_root="/s",
+        run_root="/r",
+    )
+    tokens = cmd.split()
+
+    # Global flags + subcommand prefix
+    assert tokens[0] == "podman"
+    assert "--root" in tokens
+    assert tokens[tokens.index("--root") + 1] == "/s"
+    assert "--runroot" in tokens
+    assert tokens[tokens.index("--runroot") + 1] == "/r"
+    assert "--cgroup-manager=cgroupfs" in tokens
+    assert "run" in tokens
+    assert "--rm" in tokens
+
+    # pids-limit must be 0 (explicit, not 2048 builtin)
+    assert "--pids-limit=0" in tokens
+
+    # Volume and port flags present
+    assert "-v" in tokens
+    assert "/h/src:/c/src" in tokens
+    assert "-p" in tokens
+    assert "9000:9000" in tokens
+
+    # Image ref and entrypoint args at the end
+    assert "myimage:v1" in tokens
+    assert "--foo" in tokens
+    assert "bar" in tokens

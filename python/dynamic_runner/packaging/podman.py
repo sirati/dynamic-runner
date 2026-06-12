@@ -535,6 +535,12 @@ class PodmanPackaging:
             "--cgroup-manager=cgroupfs",
             "run",
             "--rm",
+            # Podman's rootless default is pids_limit=2048 (from containers.conf).
+            # Under SLURM, fork-heavy or thread-heavy workloads (JVM, parallel
+            # compilers, autotools) exhaust that cap → clone() EAGAIN. Pass 0
+            # (unlimited) explicitly so the silent builtin default never fires;
+            # the host protections are the RAM cap and nice level.
+            "--pids-limit=0",
         ]
 
         for host_path, container_path in mounts.items():
