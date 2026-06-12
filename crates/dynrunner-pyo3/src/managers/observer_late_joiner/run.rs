@@ -10,7 +10,9 @@ use dynrunner_manager_distributed::GracefulAbortTrigger;
 use dynrunner_manager_distributed::cluster_state::{ClusterState, ClusterStateSnapshot};
 use dynrunner_manager_distributed::observer::{ObserverConfig, build_cold_join_observer};
 use dynrunner_manager_distributed::primary::RunError;
-use dynrunner_manager_distributed::process::{LocalRole, Mesh, Node, NodeRunInputs, RunTerminal};
+use dynrunner_manager_distributed::process::{
+    LocalRole, MeshHost, Node, NodeRunInputs, RunTerminal,
+};
 use dynrunner_protocol_primary_secondary::address::PeerId;
 use dynrunner_protocol_primary_secondary::{DEFAULT_JOIN_TIMEOUT, PeerTransport};
 use dynrunner_scheduler::ResourceStealingScheduler;
@@ -159,27 +161,60 @@ impl PyObserverLateJoiner {
                     // gateway master) on both the success and error
                     // exits before surfacing the outcome.
                     let run_result: Result<ObserverRunOutcome, PyErr> = async {
-                        // 1. Stand up the real peer transport with our chosen
-                        //    observer-id through the backend-opaque factory.
-                        //    The CN baked into the cert MUST match
-                        //    `observer_id` because every dialing peer
-                        //    validates the SAN against the logical id. The
-                        //    standalone observer holds this mesh transport
-                        //    directly (no cert bundle — it ships no PeerCertInfo).
-                        let mut peer_network =
-                            transport_factory::observer_mesh::<RunnerIdentifier>(&observer_id)
-                                .await
-                                .map_err(|e| {
-                                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                        "observer late-joiner: {e}"
-                                    ))
-                                })?;
+                        // 0b. GATEWAY mode: mint the per-LEG forward-recovery
+                        //     channel (#419) BEFORE the mesh runtime spawns.
+                        //     The SENDER is installed on the transport inside
+                        //     the mesh runtime's construct closure (the
+                        //     transport never leaves that thread); the
+                        //     receive pump + the registry-backed reconnector
+                        //     stay HERE on the coordinator runtime — they
+                        //     drive `ssh -L` children, not transport IO. The
+                        //     transport reports a peer id; the registry
+                        //     decides "id → forward → rebuild" (unknown ids —
+                        //     peers that joined post-bootstrap — are
+                        //     named-and-skipped by the reconnector). Events
+                        //     fired before the pump drains them queue on the
+                        //     unbounded channel; the pump exits when the
+                        //     channel closes (the transport drops when the
+                        //     mesh runtime stops at run end), so it is bound
+                        //     to the run lifetime without a separate teardown
+                        //     lever. Both reconnector consumers hold the same
+                        //     `Arc<LocalForwardTunnels>`, so a still-alive
+                        //     child is never rebuilt twice.
+                        let dial_failure_tx = if let Some(runtime) = &gateway_runtime {
+                            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            let reconnector = dynrunner_slurm::LocalForwardTunnelReconnector::new(
+                                runtime.tunnels.clone(),
+                            );
+                            tokio::task::spawn_local(async move {
+                                use dynrunner_manager_distributed::observer::TunnelReconnector;
+                                while let Some(peer_id) = rx.recv().await {
+                                    reconnector.reconnect(std::slice::from_ref(&peer_id)).await;
+                                }
+                            });
+                            Some(tx)
+                        } else {
+                            None
+                        };
 
-                        // 2. Bootstrap rendezvous: hand the seed list to the
-                        //    trait default impl, which sequences the dial +
-                        //    snapshot request + reply wait. Errors get
+                        // 1+2. Stand up the real peer transport with our
+                        //    chosen observer-id through the backend-opaque
+                        //    factory, ON the dedicated mesh runtime thread
+                        //    (`MeshHost::on_dedicated_thread` — every socket
+                        //    registers with that runtime's IO driver, and
+                        //    wire QoS survives any stall of THIS coordinator
+                        //    runtime). The CN baked into the cert MUST match
+                        //    `observer_id` because every dialing peer
+                        //    validates the SAN against the logical id.
+                        //
+                        //    The bootstrap rendezvous runs there too — it is
+                        //    transport IO: hand the seed list to the trait
+                        //    default impl, which sequences the dial +
+                        //    snapshot request + reply wait; only the
+                        //    `Send` snapshot JSONs cross back. Errors get
                         //    typed strings; we PyErr them with the snapshot
-                        //    JSON context so the operator can correlate.
+                        //    JSON context so the operator can correlate. The
+                        //    construct closure never touches Python.
                         // `is_observer = true`: this late-joiner is a strict
                         // observer. The flag rides the snapshot RPC so the
                         // responder records the joiner's ACTUAL role in the
@@ -203,12 +238,43 @@ impl PyObserverLateJoiner {
                         // rendezvous runs identically regardless of how the
                         // seed was acquired.
                         super::bootstrap_narration::waiting_for_crdt(DEFAULT_JOIN_TIMEOUT);
-                        let snapshot_jsons = peer_network
-                            .join_running_cluster(&seed, DEFAULT_JOIN_TIMEOUT, true, false)
+                        let observer_id_for_mesh = observer_id.clone();
+                        let (mesh_host, snapshot_jsons) =
+                            MeshHost::<RunnerIdentifier>::on_dedicated_thread(
+                                move || async move {
+                                    let mut peer_network = transport_factory::observer_mesh::<
+                                        RunnerIdentifier,
+                                    >(
+                                        &observer_id_for_mesh
+                                    )
+                                    .await?;
+                                    let snapshot_jsons = peer_network
+                                        .join_running_cluster(
+                                            &seed,
+                                            DEFAULT_JOIN_TIMEOUT,
+                                            true,
+                                            false,
+                                        )
+                                        .await
+                                        .map_err(|e| {
+                                            format!("join_running_cluster failed: {e}")
+                                        })?;
+                                    // #419 per-leg recovery (GATEWAY mode):
+                                    // install the persistent-dial-failure
+                                    // sender on the live transport before it
+                                    // is consumed into the mesh; the
+                                    // coordinator-side pump (step 0b) drains
+                                    // the reported peer ids.
+                                    if let Some(tx) = dial_failure_tx {
+                                        peer_network.notify_persistent_dial_failures(tx);
+                                    }
+                                    Ok((peer_network, snapshot_jsons))
+                                },
+                            )
                             .await
                             .map_err(|e| {
                                 pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                    "observer late-joiner: join_running_cluster failed: {e}"
+                                    "observer late-joiner: {e}"
                                 ))
                             })?;
 
@@ -262,57 +328,36 @@ impl PyObserverLateJoiner {
                                 ObserverConfig::DEFAULT_FLEET_DEATH_PRESUMPTION,
                         };
 
-                        // 4b. Gateway mode: arm the per-LEG forward-recovery
-                        //     trigger (#419). The transport's 5s reconnect
-                        //     ticker re-dials each rewritten
-                        //     `127.0.0.1:<local_port>` endpoint, but a single
-                        //     dead `ssh -L` child leaves that endpoint
-                        //     permanently un-connectable — the ticker redials a
-                        //     hole forever (the run-level lost-visibility
-                        //     trigger never fires while the OTHER legs keep the
-                        //     observer Visible). Subscribe the transport's
-                        //     persistent-dial-failure signal and drive the
-                        //     SAME gated forward rebuild the lost-visibility
-                        //     path uses, but for the ONE undialable peer. The
-                        //     transport reports a peer id; the registry decides
-                        //     "id → forward → rebuild" (unknown ids — peers that
-                        //     joined post-bootstrap — are named-and-skipped by
-                        //     the reconnector). Set on the bare `peer_network`
-                        //     BEFORE it is consumed into the mesh below.
-                        if let Some(runtime) = &gateway_runtime {
-                            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-                            peer_network.notify_persistent_dial_failures(tx);
-                            let reconnector = dynrunner_slurm::LocalForwardTunnelReconnector::new(
-                                runtime.tunnels.clone(),
-                            );
-                            // Per-leg recovery pump: drain undialable-peer ids
-                            // and rebuild each one's forward through the SHARED
-                            // registry (same liveness gate + escalation state as
-                            // the observer's all-legs reconnector — both hold the
-                            // same `Arc<LocalForwardTunnels>`, so a still-alive
-                            // child is never rebuilt twice). Exits when the
-                            // channel closes (the transport — owned by the Node
-                            // below — drops at run end), so it is bound to the
-                            // run lifetime without a separate teardown lever.
-                            tokio::task::spawn_local(async move {
-                                use dynrunner_manager_distributed::observer::TunnelReconnector;
-                                while let Some(peer_id) = rx.recv().await {
-                                    reconnector.reconnect(std::slice::from_ref(&peer_id)).await;
-                                }
-                            });
-                        }
+                        // (4b — the per-LEG forward-recovery trigger (#419) —
+                        // moved: the SENDER was installed on the bare
+                        // `peer_network` inside the mesh runtime's construct
+                        // closure above, before the transport was consumed
+                        // into the mesh; the receive pump was spawned at
+                        // step 0b. The transport's 5s reconnect ticker
+                        // re-dials each rewritten `127.0.0.1:<local_port>`
+                        // endpoint, but a single dead `ssh -L` child leaves
+                        // that endpoint permanently un-connectable — the
+                        // trigger drives the SAME gated forward rebuild the
+                        // lost-visibility path uses, for the ONE undialable
+                        // peer.)
 
-                        // 5. Wrap the live mesh transport (the bootstrap
-                        //    rendezvous above already ran on the bare
-                        //    `peer_network`, before it is consumed here) in the
-                        //    role-demux `Mesh` and register the Observer slot,
-                        //    minting the coordinator's `(client, inbox)` ends + the
-                        //    `Arc<RoleSlot>` the `Node` holds as the teardown lever.
-                        let mut mesh = Mesh::new(peer_network);
-                        let (obs_slot, obs_client, obs_inbox) = mesh.register_local_role(
-                            LocalRole::Observer,
-                            PeerId::from(observer_id.as_str()),
-                        );
+                        // 5. Register the Observer slot through the mesh
+                        //    runtime's control channel (the bootstrap
+                        //    rendezvous already ran on the bare transport,
+                        //    before the pump consumed it), minting the
+                        //    coordinator's `(client, inbox)` ends + the
+                        //    `Arc<RoleSlot>` the `Node` holds as the teardown
+                        //    lever.
+                        let (obs_slot, obs_client, obs_inbox) = mesh_host
+                            .control()
+                            .register(LocalRole::Observer, PeerId::from(observer_id.as_str()))
+                            .await
+                            .ok_or_else(|| {
+                                pyo3::exceptions::PyRuntimeError::new_err(
+                                    "observer late-joiner: mesh runtime exited before \
+                                     the observer role registration",
+                                )
+                            })?;
 
                         // 6. Cold-join: build the standalone ObserverCoordinator
                         //    over the mesh ends + the bootstrap snapshot(s). The
@@ -370,9 +415,9 @@ impl PyObserverLateJoiner {
                         //    same `Node::run` as the submitter/compute peers; the
                         //    promotion/demote/swap arms are simply inert (no
                         //    secondary fires promotion, no primary to demote). The
-                        //    `Node` owns the mesh-pump (ingress demux + PeerInfo
+                        //    mesh runtime hosts the mesh-pump (ingress demux + PeerInfo
                         //    dialing) that the observer's ingress depends on.
-                        let (node, _node_promo_tx) = Node::new(mesh);
+                        let (node, _node_promo_tx) = Node::new(mesh_host);
                         let node = node.with_observer(observer, obs_slot);
                         let inputs: NodeRunInputs<
                             crate::subprocess_factory::SubprocessWorkerFactory,

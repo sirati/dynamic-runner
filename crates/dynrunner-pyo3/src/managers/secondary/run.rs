@@ -14,7 +14,8 @@ use pyo3::types::PyList;
 
 use dynrunner_core::TaskInfo;
 use dynrunner_manager_distributed::process::{
-    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, PromotedPrimary, RunTerminal, SeedSource,
+    LocalRole, MeshHost, Node, NodeRunInputs, PrimaryRunArgs, PromotedPrimary, RunTerminal,
+    SeedSource,
 };
 use dynrunner_manager_distributed::{
     PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator,
@@ -395,26 +396,38 @@ impl PySecondaryCoordinator {
                         .unwrap_or("<none>"),
                     "resolved advertised peer-mesh address for this node"
                 );
-                let mesh_bundle = transport_factory::dial_secondary_mesh::<RunnerIdentifier>(
-                    transport_factory::SecondaryDialParams {
-                        addrs,
-                        connect_timeout: dist_connect_timeout,
-                        retry_delay: dist_connect_retry_delay,
-                        secondary_id: &secondary_id,
-                        bootstrap_primary_id: dynrunner_core::SETUP_NODE_ID.to_string(),
-                        ipv4_address: Some(advertised_ipv4),
-                        ipv6_address: advertised_ipv6.map(|(addr, _)| addr),
-                        quic_bind_port,
-                    },
-                )
-                .await
-                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-                let peer_network = mesh_bundle.transport;
-                let secondary_cert_info = mesh_bundle.peer_cert_info;
-                // Cloneable mesh-send capability over the secondary's
-                // peer mesh; the secondary's `can_be_primary` marker
-                // reads `is_some()`. See `MeshSendHandle`.
-                let mesh_send_handle = mesh_bundle.mesh_send;
+                let dial_params = transport_factory::SecondaryDialParams {
+                    addrs,
+                    connect_timeout: dist_connect_timeout,
+                    retry_delay: dist_connect_retry_delay,
+                    secondary_id: secondary_id.clone(),
+                    bootstrap_primary_id: dynrunner_core::SETUP_NODE_ID.to_string(),
+                    ipv4_address: Some(advertised_ipv4),
+                    ipv6_address: advertised_ipv6.map(|(addr, _)| addr),
+                    quic_bind_port,
+                };
+                // The transport is CONSTRUCTED and PUMPED on the dedicated
+                // mesh runtime thread (`MeshHost::on_dedicated_thread`):
+                // every socket/timer it creates registers with that
+                // runtime's IO driver, and wire QoS — keepalive egress,
+                // frame ingest, the accept/dial/redial tickers — survives
+                // any stall of THIS coordinator runtime (the production
+                // coordinator-saturation incident). Only `Send` channel
+                // handles cross back; the construct closure never touches
+                // Python.
+                let (mesh_host, (secondary_cert_info, mesh_send_handle)) =
+                    MeshHost::<RunnerIdentifier>::on_dedicated_thread(move || async move {
+                        let bundle = transport_factory::dial_secondary_mesh::<RunnerIdentifier>(
+                            dial_params,
+                        )
+                        .await?;
+                        // Cloneable mesh-send capability over the secondary's
+                        // peer mesh; the secondary's `can_be_primary` marker
+                        // reads `is_some()`. See `MeshSendHandle`.
+                        Ok((bundle.transport, (bundle.peer_cert_info, bundle.mesh_send)))
+                    })
+                    .await
+                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
                 // Pillar 1 (mesh-always): a network secondary ALWAYS holds a
                 // peer mesh, so it is always primary-capable. The previous
                 // `mesh_send_handle.is_some()` advertisement keyed capability
@@ -490,15 +503,22 @@ impl PySecondaryCoordinator {
                     child_processes: Vec::new(),
                 };
 
-                // Wrap the opaque mesh transport in the role-demux `Mesh`
-                // (the one thing in this process that touches the wire) and
-                // register the Secondary slot, minting the coordinator's
-                // `(client, inbox)` ends + the `Arc<RoleSlot>` the `Node`
-                // holds as the teardown lever. The coordinator never names a
-                // transport — the `Node`'s pump owns the `Mesh`.
-                let mut mesh = Mesh::new(peer_network);
-                let (sec_slot, sec_client, sec_inbox) = mesh
-                    .register_local_role(LocalRole::Secondary, PeerId::from(secondary_id.as_str()));
+                // Register the Secondary slot through the mesh runtime's
+                // control channel, minting the coordinator's `(client,
+                // inbox)` ends + the `Arc<RoleSlot>` the `Node` holds as the
+                // teardown lever. The coordinator never names a transport —
+                // the mesh runtime's pump owns the role-demux `Mesh`, and the
+                // register reply ships only after the pump republished
+                // membership (the R5 first-egress guarantee).
+                let (sec_slot, sec_client, sec_inbox) = mesh_host
+                    .control()
+                    .register(LocalRole::Secondary, PeerId::from(secondary_id.as_str()))
+                    .await
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyRuntimeError::new_err(
+                            "mesh runtime exited before the secondary role registration",
+                        )
+                    })?;
 
                 // Clone the scheduler-tuning + estimator for the SECONDARY's
                 // own coordinator; the originals are moved into the promote
@@ -805,7 +825,7 @@ impl PySecondaryCoordinator {
                 // `promote` recipe (below) is what `Node::run` calls on that
                 // signal to BUILD the snapshot-seeded `PrimaryCoordinator` —
                 // the secondary NEVER constructs a primary (SUPREME-LAW #3).
-                let (node, promotion_tx) = Node::new(mesh);
+                let (node, promotion_tx) = Node::new(mesh_host);
                 secondary.register_promotion_signal(promotion_tx);
 
                 // The promoted primary's build recipe. Captures the config
@@ -2321,6 +2341,7 @@ mod staging_dispatch_flags_tests {
 mod relocated_primary_tests {
     use super::*;
     use crate::managers::run_config::SharedRunConfig;
+    use dynrunner_manager_distributed::process::Mesh;
     use pyo3::types::PyModule;
     use std::sync::{Arc, Mutex};
 

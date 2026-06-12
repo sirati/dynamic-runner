@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use dynrunner_manager_distributed::process::{
-    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal, SeedSource,
+    LocalRole, Mesh, MeshHost, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal, SeedSource,
 };
 use dynrunner_manager_distributed::{
     GracefulAbortTrigger, PrimaryConfig, PrimaryCoordinator, RunError, SecondaryConfig,
@@ -705,7 +705,12 @@ impl PyDistributedManager {
                         // makes `Node::run` invoke the `promote` recipe below to
                         // BUILD the snapshot-seeded same-peer primary (the
                         // secondary NEVER constructs a primary — SUPREME-LAW #3).
-                        let (node, promotion_tx) = Node::new(sec_mesh);
+                        // The pump is hosted on THIS LocalSet (`on_local_set`),
+                        // not the dedicated mesh runtime: the in-process channel
+                        // mesh is pure mpsc with no socket IO, so there is no
+                        // wire QoS for a per-node OS thread to protect.
+                        let (node, promotion_tx) =
+                            Node::new(MeshHost::on_local_set(sec_mesh));
                         secondary.register_promotion_signal(promotion_tx);
 
                         // The shared run-config handle the promote recipe reads
@@ -1043,11 +1048,14 @@ impl PyDistributedManager {
 
                 // Compose the in-process setup peer's `Node` (a pure-primary
                 // node — no co-located secondary; the relocate TARGET is a
-                // separate secondary node). `Node::run` owns the mesh-pump +
+                // separate secondary node). `Node::run` drives the hosted mesh-pump +
                 // runs the primary CONSUMING, so the relocate's demote arm
                 // carries this coordinator out as `Relocated { handoff }` (it
                 // becomes a standalone observer for the rest of the run).
-                let (node, _node_promo_tx) = Node::new(pri_mesh);
+                // Same `on_local_set` hosting decision as the per-secondary
+                // nodes above: a pure-mpsc in-process mesh needs no dedicated
+                // mesh runtime thread.
+                let (node, _node_promo_tx) = Node::new(MeshHost::on_local_set(pri_mesh));
                 let node = node.with_primary(primary, pri_slot);
                 // Construct the typed seed at the boundary from the pre-staged
                 // signal (a construction-site decision, NOT a runtime flag-if
