@@ -1533,8 +1533,17 @@ pub(crate) fn build_promoted_primary_recipe(
         // node runtime thread; this is a one-time PRE-RUN hook (this primary's
         // operational loop / keepalives have not started yet), so it does not
         // stall an in-flight pump.
-        if let Some(ctx) = on_run_start.take() {
-            fire_on_run_start_on_promoted_primary(&ctx);
+        if let Some(ctx) = on_run_start.take()
+            && let Err(reason) = fire_on_run_start_on_promoted_primary(&ctx)
+        {
+            // The consumer's setup hook RAISED — a deliberate run-level fatal,
+            // NOT a swallow-and-continue false-green. Record the abort onto the
+            // promoted coordinator; its post-connection abort gate
+            // (`fire_pre_run_hook_abort`) broadcasts `RunAborted` to the fleet
+            // (secondaries stop) and surfaces a non-zero `FatalPolicyExit` at
+            // this node's run boundary — the promoted-path twin of the
+            // cold-start path's `?`-propagation of an `on_run_start` raise.
+            primary.record_pre_run_hook_abort(reason);
         }
 
         // Take the real phase callbacks into `PrimaryRunArgs` — the channel
@@ -1566,50 +1575,47 @@ pub(crate) fn build_promoted_primary_recipe(
 /// complete-namespace args, this primary's live handle)`. The node-local
 /// `output_dir` is the D↔G converged value [`resolve_node_local_output_root`]
 /// computes from the COMPLETE namespace; the `args` Namespace is that same
-/// complete namespace (the single source of truth shared with discovery). A
-/// resolve/hook failure logs at error and is swallowed at this seam — the run
-/// loop's own honesty signals (the phase-hook raise-latch, discovery's
-/// `Err`-abort) carry genuine terminal failures; a `Python::attach`-side panic
-/// here would unwind across the node runtime thread.
-fn fire_on_run_start_on_promoted_primary(ctx: &OnRunStartContext) {
+/// complete namespace (the single source of truth shared with discovery).
+///
+/// Returns `Err(reason)` when the consumer's setup hook RAISED (or its
+/// run-config/output-dir resolution failed) — the consumer's setup did NOT
+/// complete, so the run MUST fail. The caller records the reason onto the
+/// promoted coordinator (`record_pre_run_hook_abort`), whose post-connection
+/// abort gate broadcasts `RunAborted` to the fleet and surfaces a non-zero
+/// `FatalPolicyExit`. This is the promoted-path twin of the cold-start path's
+/// `?`-propagation of an `on_run_start` raise out before `run()`; absorbing it
+/// here would dispatch items against half-built consumer resources and finish
+/// as a false-green.
+fn fire_on_run_start_on_promoted_primary(ctx: &OnRunStartContext) -> Result<(), String> {
     Python::attach(|py| {
-        let result = (|| -> Result<(), String> {
-            let args_owned = ctx.run_config.resolve_under_gil(py)?;
-            let args = args_owned.bind(py);
-            // `on_run_start` REQUIRES an output_dir (its signature is
-            // positional). The complete namespace always carries `--output`
-            // (a required CLI flag), so the lenient `None` branch is a genuine
-            // misconfiguration here — surface it rather than passing an empty
-            // dir.
-            let output_dir = resolve_node_local_output_root(py, args)?.ok_or_else(|| {
-                "on_run_start: the run-config namespace has no `output` attribute \
-                 to resolve a node-local output_dir from"
-                    .to_string()
-            })?;
-            let handle = ctx
-                .primary_handle
-                .clone()
-                .into_pyobject(py)
-                .map_err(|e| format!("failed to convert PrimaryHandle to a Python object: {e}"))?
-                .into_any()
-                .unbind();
-            crate::managers::lifecycle::fire_on_run_start(
-                ctx.task_definition_py.bind(py),
-                &ctx.source_dir,
-                &output_dir,
-                args,
-                Some(handle),
-            )
-            .map_err(|e| format!("TaskDefinition.on_run_start raised: {e}"))
-        })();
-        if let Err(e) = result {
-            tracing::error!(
-                error = %e,
-                "on_run_start on the relocated primary failed; the consumer's \
-                 lazy-injection setup did not complete"
-            );
-        }
-    });
+        let args_owned = ctx.run_config.resolve_under_gil(py)?;
+        let args = args_owned.bind(py);
+        // `on_run_start` REQUIRES an output_dir (its signature is
+        // positional). The complete namespace always carries `--output`
+        // (a required CLI flag), so the lenient `None` branch is a genuine
+        // misconfiguration here — surface it rather than passing an empty
+        // dir.
+        let output_dir = resolve_node_local_output_root(py, args)?.ok_or_else(|| {
+            "on_run_start: the run-config namespace has no `output` attribute \
+             to resolve a node-local output_dir from"
+                .to_string()
+        })?;
+        let handle = ctx
+            .primary_handle
+            .clone()
+            .into_pyobject(py)
+            .map_err(|e| format!("failed to convert PrimaryHandle to a Python object: {e}"))?
+            .into_any()
+            .unbind();
+        crate::managers::lifecycle::fire_on_run_start(
+            ctx.task_definition_py.bind(py),
+            &ctx.source_dir,
+            &output_dir,
+            args,
+            Some(handle),
+        )
+        .map_err(|e| format!("TaskDefinition.on_run_start raised: {e}"))
+    })
 }
 
 /// Build the consumer's setup-discovery policy closure.
@@ -2366,6 +2372,8 @@ class Task:
         on_run_start_calls.append(
             (source_dir, output_dir, primary_handle is not None, args)
         )
+        if getattr(self, "_raise_on_run_start", False):
+            raise RuntimeError("consumer setup abort from on_run_start")
 
 def finalize_run_config(delivered):
     # The deferred reparse: build the COMPLETE Namespace from the delivered
@@ -2665,6 +2673,108 @@ task = Task()
             // The args are the COMPLETE namespace (selection flag present).
             let platform: String = ns.getattr("platform").unwrap().extract().unwrap();
             assert_eq!(platform, "x64");
+            drop(built.coordinator);
+        });
+    }
+
+    /// Honest on_run_start (run_20260611_221215): a relocated primary whose
+    /// `on_run_start` RAISES must NOT be absorbed into a false-green. The
+    /// recipe records the raise as a pre-run hook abort directive on the
+    /// promoted coordinator (`record_pre_run_hook_abort`), whose
+    /// post-connection abort gate surfaces `RunError::FatalPolicyExit` +
+    /// broadcasts `RunAborted` to the fleet. Reverting the fix (swallow the
+    /// raise at `fire_on_run_start_on_promoted_primary`) leaves the directive
+    /// `None` and the run finishes "Ok".
+    #[test]
+    fn recipe_records_pre_run_hook_abort_when_on_run_start_raises() {
+        Python::attach(|py| {
+            let module = task_module(py);
+            let task = module.getattr("task").unwrap();
+            // Arm the consumer hook to raise so the absorb path is exercised.
+            task.setattr("_raise_on_run_start", true).unwrap();
+            let task_def = task.clone().unbind();
+
+            let on_phase_start: crate::managers::lifecycle::OnPhaseStart =
+                Box::new(crate::managers::lifecycle::make_on_phase_start(task_def.clone_ref(py)));
+            let raise_latch = dynrunner_manager_distributed::PhaseHookRaiseLatch::new();
+            let on_phase_end: crate::managers::lifecycle::OnPhaseEnd =
+                Box::new(crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
+                    task_def.clone_ref(py),
+                    raise_latch.clone(),
+                ));
+
+            // The complete namespace, resolved from the delivered argv.
+            let delivered = Arc::new(Mutex::new(vec![
+                "--platform".to_string(),
+                "x64".to_string(),
+                "--output".to_string(),
+                "/run/out".to_string(),
+            ]));
+            let finalize = module.getattr("finalize_run_config").unwrap().unbind();
+            let run_config = SharedRunConfig::deferred(finalize, delivered);
+
+            let ((tx, rx), handle, mut mesh) = recipe_inputs();
+            let (slot, client, inbox) =
+                mesh.register_local_role(LocalRole::Primary, PeerId::from("primary"));
+            let (_demote_tx, demote_rx) = tokio::sync::mpsc::unbounded_channel();
+            let snapshot = dynrunner_manager_distributed::ClusterState::<RunnerIdentifier>::new()
+                .snapshot();
+            let estimator = PyMemoryEstimatorBridge::from_python(&task, &[]).unwrap();
+
+            let mut recipe = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
+                secondary_id: "primary".to_string(),
+                custom_message_handler_def: None,
+                keepalive_interval: std::time::Duration::from_secs(5),
+                peer_timeout: std::time::Duration::from_secs(30),
+                keepalive_miss_threshold: 3,
+                retry_max_passes: 0,
+                oom_retry_max_passes: 0,
+                scheduler_config: crate::config::scheduler::SchedulerConfig::default(),
+                estimator,
+                command_channel: promoted_command_channel_cell(tx, rx),
+                on_phase_start,
+                on_phase_end,
+                phase_hook_raise_latch: raise_latch,
+                on_run_start: Some(OnRunStartContext {
+                    task_definition_py: task_def,
+                    source_dir: "/local/src".to_string(),
+                    run_config,
+                    primary_handle: handle,
+                }),
+                forwarded_argv: Arc::new(Mutex::new(Vec::new())),
+                uses_file_based_items: true,
+                pre_staged_mode: false,
+                source_pre_staged_root: None,
+                source_dir: None,
+                setup_discovery: None,
+                liveness_ping_rx: None,
+                peer_liveness_addrs: None,
+                op_loop_arm_stats_cell:
+                    dynrunner_manager_distributed::oploop_instrumentation::OpLoopArmStatsCell::new(),
+            });
+
+            let built = recipe(client, inbox, demote_rx, snapshot);
+            let _slot = slot;
+
+            // The hook fired (and raised) once.
+            let calls = module.getattr("on_run_start_calls").unwrap();
+            assert_eq!(
+                calls.len().unwrap(),
+                1,
+                "on_run_start must fire once even when it raises"
+            );
+            // The raise was recorded onto the coordinator as the pre-run hook
+            // abort directive — the run will surface FatalPolicyExit at the
+            // abort gate instead of absorbing the failure.
+            let reason = built
+                .coordinator
+                .pending_pre_run_hook_abort()
+                .expect("a raising on_run_start must record a pre-run hook abort");
+            assert!(
+                reason.contains("on_run_start") && reason.contains("raised"),
+                "the recorded directive must name the raised on_run_start hook; \
+                 got: {reason}"
+            );
             drop(built.coordinator);
         });
     }
