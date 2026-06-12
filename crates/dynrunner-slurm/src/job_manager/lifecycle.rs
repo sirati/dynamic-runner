@@ -8,6 +8,7 @@ use tracing;
 
 use super::types::{
     CancelOutcome, CancelVerifyPolicy, JobStatus, JobStatusInfo, SlurmError, SlurmJobManager,
+    PENDING_SUBMISSION_MARKER,
 };
 
 impl<G: Gateway> SlurmJobManager<G> {
@@ -162,9 +163,31 @@ impl<G: Gateway> SlurmJobManager<G> {
         // script from STDIN, which the `printf '%s' '<body>' |` prefix
         // supplies. One shell command, no gateway-side script file.
         let cmd = format!("printf '%s' '{escaped}' | {}", sbatch_args.join(" "));
-        let result = self.gateway.execute_command(&cmd, None).await?;
+
+        // Push a pending-submission marker BEFORE the sbatch await so that
+        // a task-future cancellation mid-sbatch (e.g. the coordinator's
+        // LocalSet ending while the SSH round-trip is in flight) still
+        // leaves a visible record in `job_ids`.  `cancel_all_jobs_verified`
+        // drains and WARNs on any marker it encounters — the job may be on
+        // the cluster with an unknown ID and must be checked manually.
+        // On every non-cancellation path (success, gateway error, sbatch
+        // failure) the marker is updated to the real ID or removed before
+        // this method returns.
+        let marker_idx = self.job_ids.len();
+        self.job_ids.push(PENDING_SUBMISSION_MARKER.to_string());
+
+        let result = match self.gateway.execute_command(&cmd, None).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Gateway transport error: sbatch never ran; remove the
+                // marker so teardown doesn't spuriously warn.
+                self.job_ids.remove(marker_idx);
+                return Err(e.into());
+            }
+        };
 
         if !result.success() {
+            self.job_ids.remove(marker_idx);
             return Err(SlurmError::Command(format!(
                 "sbatch failed: {}",
                 result.stderr
@@ -173,11 +196,14 @@ impl<G: Gateway> SlurmJobManager<G> {
 
         let job_id = result.stdout.trim().to_string();
         if job_id.is_empty() {
+            self.job_ids.remove(marker_idx);
             return Err(SlurmError::Command("sbatch returned empty job ID".into()));
         }
 
         tracing::info!(job_id = %job_id, job_name, "SLURM job submitted");
-        self.job_ids.push(job_id.clone());
+        // Replace the pending marker with the real job id.  No further
+        // await points follow, so this update is cancellation-safe.
+        self.job_ids[marker_idx] = job_id.clone();
         Ok(job_id)
     }
 
@@ -249,7 +275,40 @@ impl<G: Gateway> SlurmJobManager<G> {
         // released before we start awaiting `cancel_job(&self, ...)`.
         // This snapshot IS the cancel set: the live registry at cancel
         // time, replacements included.
-        let mut survivors: Vec<String> = self.job_ids.drain(..).collect();
+        let drained: Vec<String> = self.job_ids.drain(..).collect();
+
+        // Separate any pending-submission markers from known job ids.
+        // A marker is left behind when a `submit_job` future is
+        // cancelled while its sbatch SSH round-trip was in flight
+        // (task-future drop while holding the manager mutex mid-await).
+        // The sbatch call MAY have been accepted by SLURM before the
+        // cancellation, but we never received the job id back.  We
+        // cannot scancel an unknown id; the operator must check the
+        // queue manually.  Markers on any normal exit path (success,
+        // gateway error, sbatch failure) are cleaned up by `submit_job`
+        // before it returns, so a marker reaching here is always a sign
+        // of an abnormal cancellation.
+        let mut pending_marker_count = 0usize;
+        let mut survivors: Vec<String> = drained
+            .into_iter()
+            .filter(|id| {
+                if id == PENDING_SUBMISSION_MARKER {
+                    pending_marker_count += 1;
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
+        if pending_marker_count > 0 {
+            tracing::warn!(
+                count = pending_marker_count,
+                "sbatch call(s) were in flight when the run ended; the submitted \
+                 SLURM job(s) may be on the cluster with unknown IDs — check the \
+                 queue manually (e.g. `squeue -u $USER`) and cancel any stray jobs",
+            );
+        }
 
         // Initial scancel pass over the whole set.
         for job_id in &survivors {

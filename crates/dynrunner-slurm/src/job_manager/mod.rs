@@ -41,5 +41,6 @@ mod wrapper_binary;
 pub use shutdown_binary::SHUTDOWN_BIN_REMOTE_BASENAME;
 pub use types::{
     CancelOutcome, CancelVerifyPolicy, JobStatus, JobStatusInfo, SlurmError, SlurmJobManager,
+    PENDING_SUBMISSION_MARKER,
 };
 pub use wrapper_binary::WRAPPER_BIN_REMOTE_BASENAME;

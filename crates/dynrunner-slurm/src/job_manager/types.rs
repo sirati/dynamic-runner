@@ -102,6 +102,15 @@ impl Default for CancelVerifyPolicy {
     }
 }
 
+/// Sentinel value pushed to `job_ids` BEFORE the sbatch
+/// `execute_command` await.  Closed the gap where a
+/// task-future cancellation mid-sbatch left a cluster-accepted
+/// job with no recorded ID.  Teardown drains and WARNs on any
+/// marker it encounters; a marker that reaches `cancel_all_jobs`
+/// means sbatch was in-flight when the run ended — the job may
+/// be on the cluster with an unknown ID (check `squeue` manually).
+pub const PENDING_SUBMISSION_MARKER: &str = "__PENDING_SBATCH__";
+
 /// Manages SLURM job submission and lifecycle via a `Gateway`.
 ///
 /// The `gateway` and `job_ids` fields are `pub(super)` so the impl
