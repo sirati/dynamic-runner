@@ -288,6 +288,27 @@ impl<I: Identifier> ClusterState<I> {
                 self.phase_may_be_empty = phases.into_iter().collect();
                 ApplyOutcome::Applied
             }
+            ClusterMutation::RespawnPolicySet {
+                max_per_secondary,
+                max_total,
+                cooldown_ms,
+            } => {
+                // Static config, set-once (mirrors `PhaseMayBeEmptySet`):
+                // the respawn caps are run-constant — originated once by
+                // the submitter primary in the seed batch — so a
+                // re-application once the local policy is seeded is a
+                // no-op (idempotent re-origination / at-least-once
+                // replication). First-write-wins; there is no un-set.
+                if self.respawn_policy.is_some() {
+                    return ApplyOutcome::NoOp;
+                }
+                self.respawn_policy = Some(super::types::ReplicatedRespawnPolicy {
+                    max_per_secondary,
+                    max_total,
+                    cooldown_ms,
+                });
+                ApplyOutcome::Applied
+            }
             ClusterMutation::RunComplete => {
                 if self.run_complete {
                     return ApplyOutcome::NoOp;

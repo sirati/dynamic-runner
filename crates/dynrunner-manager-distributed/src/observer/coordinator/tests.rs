@@ -1042,6 +1042,7 @@ fn build_test_handoff(
         holdings: std::collections::HashSet::new(),
         reconnector: None,
         graceful_abort_trigger: None,
+        respawn_provider: None,
     };
     HandoffTestRig {
         handoff,
@@ -1833,6 +1834,7 @@ async fn lost_visibility_drives_tunnel_reconnect_with_roster() {
                     holdings: std::collections::HashSet::new(),
                     reconnector: Some(reconnector.clone()),
                     graceful_abort_trigger: None,
+                    respawn_provider: None,
                 };
                 let mut observer = ObserverCoordinator::from_handoff(handoff);
 

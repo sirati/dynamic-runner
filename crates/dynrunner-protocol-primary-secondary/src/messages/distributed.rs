@@ -719,6 +719,99 @@ pub enum DistributedMessage<I> {
         /// Whether the responder holds the task in any live bookkeeping.
         held: bool,
     },
+    /// Primary -> provider-host observer: "submit a replacement
+    /// secondary for me". The respawn DECISION (budget, id mint,
+    /// replicated-ledger spend) lives on the primary — wherever it runs;
+    /// the physical spawn PROVIDER (the SLURM job-manager + gateway +
+    /// tunnel pool, or the multi-process child registry) lives in the
+    /// SUBMITTER process only (mesh node-id `"setup"`), which keeps it
+    /// across its own primary→observer demotion. A relocated/promoted
+    /// primary therefore delegates execution over the mesh with this
+    /// frame; a primary with a LOCAL provider never sends it.
+    ///
+    /// Carries exactly the `SecondarySpawnSpec` the provider trait
+    /// consumes. `new_secondary_id` is the cluster-unique id the primary
+    /// minted — it doubles as the request's correlation AND idempotency
+    /// key: a re-sent request (retry while the observer was unreachable,
+    /// or a lost result) re-uses the SAME id and the observer-side
+    /// execution arm dedupes on it, so one id can never double-submit.
+    RespawnSpawnRequest {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant. `#[serde(default, skip_serializing_if)]` keeps
+        /// the wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// The freshly-minted replacement id (correlation + idempotency
+        /// key — see the variant doc).
+        new_secondary_id: String,
+        /// `SecondarySpawnSpec::primary_endpoint`, relayed verbatim.
+        /// The SLURM provider ignores it (the respawned secondary
+        /// fetches its run config over the mesh); carried for the
+        /// provider-trait spec shape, not interpreted in transit.
+        primary_endpoint: String,
+        /// `SecondarySpawnSpec::primary_pubkey_pem`, relayed verbatim
+        /// (same forward-compat contract as `primary_endpoint`).
+        primary_pubkey_pem: String,
+    },
+    /// Provider-host observer -> primary: the outcome of one
+    /// [`Self::RespawnSpawnRequest`], correlated by `new_secondary_id`.
+    /// `error = None` is success; `Some(reason)` feeds the primary's
+    /// existing respawn failure logging/budget exactly as a local
+    /// provider `Err` does. Sent once per completed execution AND
+    /// re-sent from the observer's outcome cache when a duplicate
+    /// request for the same id lands (the lost-result replay).
+    RespawnSpawnResult {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// Echoes the request's `new_secondary_id` verbatim.
+        new_secondary_id: String,
+        /// `None` = the provider spawned successfully; `Some` carries
+        /// the provider's error string.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Primary -> provider-host observer: "revoke the replacement
+    /// previously requested for `new_secondary_id`" — the remote leg of
+    /// [`SecondarySpawner::revoke`]'s re-admission revocation (the
+    /// member the replacement was spawned for came back alive before
+    /// the replacement joined). Idempotent at the provider by the
+    /// trait's contract (Submitted→scancel / not-yet-submitted→tombstone),
+    /// so re-sends and request/revoke races need no observer-side dedup.
+    RespawnRevokeRequest {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// The replacement id whose pending submission is revoked.
+        new_secondary_id: String,
+    },
+    /// Provider-host observer -> primary: the outcome of one
+    /// [`Self::RespawnRevokeRequest`], correlated by `new_secondary_id`.
+    /// `error = None` = revoked (or quietly already-gone, per the
+    /// provider contract); `Some(reason)` = the provider could not reach
+    /// its backend — the primary logs loudly and the provider-side
+    /// run-teardown sweep remains the reclamation backstop.
+    RespawnRevokeResult {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// Echoes the request's `new_secondary_id` verbatim.
+        new_secondary_id: String,
+        /// `None` = revoke succeeded (or was a quiet no-op).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     Keepalive {
         /// Mesh routing target (Phase-C C3): the resolved role-bearing
         /// [`Destination`] the egress stamps so the receiving mesh-pump

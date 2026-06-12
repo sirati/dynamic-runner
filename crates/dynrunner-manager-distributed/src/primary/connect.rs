@@ -334,6 +334,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `handle_task_failed` path. See
             // `primary::reconciliation_probe`.
             MessageType::TaskHoldResponse => self.handle_task_hold_response(msg, command_rx).await,
+            // Remote respawn-execution outcomes: the provider-host
+            // observer's answer to this primary's RespawnSpawnRequest /
+            // RespawnRevokeRequest. Completes the matching waiter inside
+            // the RemoteSecondarySpawner's retry loop. See
+            // `primary::respawn::remote`.
+            MessageType::RespawnSpawnResult | MessageType::RespawnRevokeResult => {
+                self.handle_respawn_exec_result(msg)
+            }
             MessageType::MeshReady => self.handle_mesh_ready(msg),
             // Observer-requested graceful abort: the ONE management command
             // a zero-authority observer may send. The handler originates the
@@ -341,7 +349,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // a re-sent request against an already-latched freeze NoOps).
             // See `lifecycle::graceful_abort`.
             MessageType::GracefulAbortRequest => self.handle_graceful_abort_request(msg).await,
-            MessageType::Keepalive => { /* tracked above, no further action */ }
+            // The death clock was refreshed by the preamble's
+            // `record_keepalive`; additionally record the PROOF that the
+            // sender's operational main loop runs (a secondary-role
+            // keepalive is emitted only post-`wait_for_setup`), which
+            // bounds the silence sweep's pre-Operational setup exemption.
+            MessageType::Keepalive => self.note_secondary_keepalive_frame(&msg),
             MessageType::SecondaryFatalError => self.handle_secondary_fatal_error(msg).await?,
             // Replicated cluster ledger maintenance. Without this arm
             // the demoted local primary cannot observe completions
@@ -578,13 +591,43 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 .find(|r| r.kind == dynrunner_core::ResourceKind::memory())
                 .map(|r| r.amount)
                 .unwrap_or(0);
-            tracing::info!(
-                secondary = %secondary_id,
-                workers = worker_count,
-                ram_gb = ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                is_observer,
-                "secondary connected"
+
+            // Idempotence on the connection TYPESTATE: the secondary's
+            // setup loop retries its welcome on a capped backoff until it
+            // observes the setup trio (the retry is load-bearing —
+            // run_20260611_005927), so a duplicate welcome routinely lands
+            // AFTER the one-shot bring-up walk already advanced this member
+            // past `Handshaking`. Re-inserting a fresh `Handshaking` state
+            // would REGRESS a walked (possibly Operational) member — and the
+            // batch walk phases never re-run, so nothing would ever walk it
+            // back: the member would sit pre-Operational forever, invisible
+            // to the silence schedule's state gate while still working tasks
+            // (the run_20260611_214327 wedge: a wire-dead member was never
+            // declared). Keep the walked state; every side effect below is
+            // idempotent (set-once capacity, generation-gated `PeerJoined`)
+            // or deliberately re-sent (the run-config push — the retry
+            // contract). A fresh or still-handshaking member registers
+            // exactly as before.
+            let fresh_member = matches!(
+                self.secondaries.get(&secondary_id),
+                None | Some(SecondaryConnectionState::AwaitingWelcome(_))
+                    | Some(SecondaryConnectionState::Handshaking(_))
             );
+            if fresh_member {
+                tracing::info!(
+                    secondary = %secondary_id,
+                    workers = worker_count,
+                    ram_gb = ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    is_observer,
+                    "secondary connected"
+                );
+            } else {
+                tracing::debug!(
+                    secondary = %secondary_id,
+                    "duplicate welcome from an already-walked member \
+                     (handshake retry); connection state retained"
+                );
+            }
 
             // Capture the advertised capacity before `resources` is
             // moved into the per-secondary connection state below, so
@@ -593,21 +636,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // batch below). `worker_count` is `Copy`; `resources` is
             // cloned once.
             let advertised_resources = resources.clone();
-            let conn = SecondaryConnection::new(secondary_id.clone());
-            let conn = conn.receive_welcome(
-                worker_count,
-                resources,
-                hostname,
-                0,
-                None,
-                is_observer,
-                can_be_primary,
-            );
-            self.secondaries.insert(
-                secondary_id.clone(),
-                SecondaryConnectionState::Handshaking(conn),
-            );
-            self.seed_keepalive(&secondary_id);
+            if fresh_member {
+                let conn = SecondaryConnection::new(secondary_id.clone());
+                let conn = conn.receive_welcome(
+                    worker_count,
+                    resources,
+                    hostname,
+                    0,
+                    None,
+                    is_observer,
+                    can_be_primary,
+                );
+                self.secondaries.insert(
+                    secondary_id.clone(),
+                    SecondaryConnectionState::Handshaking(conn),
+                );
+                self.seed_keepalive(&secondary_id);
+            }
 
             // Explicit `PeerJoined` origination on accept.
             //

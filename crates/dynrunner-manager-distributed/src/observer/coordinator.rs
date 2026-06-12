@@ -214,6 +214,16 @@ where
     /// never injected one (`from_handoff` then leaves the observer to its own
     /// cold-join arm). See [`crate::graceful_abort_trigger`].
     pub graceful_abort_trigger: Option<crate::GracefulAbortTrigger>,
+    /// The respawn EXECUTION provider (SLURM job-manager bridge /
+    /// multi-process child registry) this PROCESS hosts. The provider
+    /// belongs to the process, not the role: the relocated submitter
+    /// keeps it across its primary→observer demotion and serves the
+    /// promoted primary's `RespawnSpawnRequest` / `RespawnRevokeRequest`
+    /// frames from it (the primary keeps the DECISION; see
+    /// [`crate::primary::respawn::remote`]). `None` when the run
+    /// launched with `--respawn-policy=disabled`. Cold-join observers
+    /// (late-joiner consoles) host no provider.
+    pub respawn_provider: Option<Arc<dyn crate::primary::respawn::SecondarySpawner>>,
 }
 
 /// Terminal of one observer run. Drives the PyO3 boundary's exit-code
@@ -326,6 +336,31 @@ where
     /// is nothing for the observer to drive. The observer NEVER owns ssh —
     /// it calls `reconnect(roster)`; see [`crate::observer::reconnect`].
     reconnector: ReconnectorHandle,
+    /// The respawn EXECUTION provider this PROCESS hosts (`Some` only on
+    /// the relocated-submitter path — the provider rides the
+    /// [`ObserverHandoff`] across the demotion; cold-join observers host
+    /// none). The run loop's respawn-execution arm drives it on the
+    /// promoted primary's `RespawnSpawnRequest` / `RespawnRevokeRequest`
+    /// frames and replies with the outcome. ZERO authority is involved:
+    /// the observer never decides a respawn — it executes the
+    /// primary's already-budgeted decision against the provider only
+    /// this process physically holds.
+    respawn_provider: Option<Arc<dyn crate::primary::respawn::SecondarySpawner>>,
+    /// Idempotency state for the respawn-execution arm, keyed by the
+    /// primary-minted replacement id: `InFlight` absorbs re-sent
+    /// requests while the provider call runs; `Done` caches the outcome
+    /// so a duplicate request (the lost-result replay) re-sends the
+    /// SAME result instead of re-submitting. Bounded by the respawn
+    /// budget (`max_total` ids per run).
+    respawn_exec: std::collections::HashMap<String, RespawnExecState>,
+    /// Sender half of the respawn-exec outbox: the detached provider
+    /// task posts its outcome here; the run loop's outbox arm (owning
+    /// `&mut self`) records it and replies to the primary. Cloned into
+    /// each spawned execution task.
+    respawn_exec_tx: mpsc::UnboundedSender<RespawnExecOutcome>,
+    /// Receiver half, taken by `run` for the loop's outbox arm (the
+    /// `task_completed_rx` take-once shape).
+    respawn_exec_rx: Option<mpsc::UnboundedReceiver<RespawnExecOutcome>>,
     /// The operator's SIGUSR2 graceful-abort trigger. `Some` when the
     /// entry path pre-armed it (the late-joiner arms BEFORE its bootstrap
     /// rendezvous so a pre-seat signal is latched instead of killing the
@@ -334,6 +369,31 @@ where
     /// Either way the run loop consumes the SAME trigger, so a buffered
     /// pre-seat delivery is serviced exactly like a post-seat one.
     graceful_abort_trigger: Option<GracefulAbortTrigger>,
+}
+
+/// Per-replacement-id state of the observer-side respawn execution arm.
+/// `InFlight` = the provider call is running (re-sent requests are
+/// absorbed; the completion will reply). `Done` = outcome cached for
+/// duplicate-request replay.
+enum RespawnExecState {
+    InFlight,
+    Done(Result<(), String>),
+}
+
+/// One completed provider call, posted from the detached execution task
+/// to the run loop's respawn-exec outbox arm (which owns `&mut self`
+/// for the dedup-map update and the reply send) — the same
+/// task-posts/loop-sends shape as the announcer outbox.
+struct RespawnExecOutcome {
+    kind: RespawnExecKind,
+    new_secondary_id: String,
+    result: Result<(), String>,
+}
+
+#[derive(Clone, Copy)]
+enum RespawnExecKind {
+    Spawn,
+    Revoke,
 }
 
 impl<I> ObserverCoordinator<I>
@@ -414,7 +474,12 @@ where
             holdings,
             reconnector,
             graceful_abort_trigger,
+            respawn_provider,
         } = handoff;
+        // Respawn-exec outbox (see the field docs): created at
+        // construction so the tx lives on `self` for the inbound
+        // handlers; `run` takes the rx for its outbox arm.
+        let (respawn_exec_tx, respawn_exec_rx) = mpsc::unbounded_channel::<RespawnExecOutcome>();
         // Install a FRESH task-completed channel on the moved-in
         // `cluster_state`, REPLACING the inherited primary sender (see the
         // reconciliation note above). The receiver feeds the observer's own
@@ -454,6 +519,12 @@ where
             ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             wake_note: WakeNoteSlot::default(),
             reconnector,
+            // The provider this process kept across its demotion (None
+            // when the run's respawn policy is disabled).
+            respawn_provider,
+            respawn_exec: std::collections::HashMap::new(),
+            respawn_exec_tx,
+            respawn_exec_rx: Some(respawn_exec_rx),
             // Carry the relocating primary's pre-armed SIGUSR2 trigger
             // across, so the observer's run loop consumes the SAME stream
             // (latched pre-relocation deliveries surface on its first poll;
@@ -501,6 +572,9 @@ where
         // restore had already fired the hook before any announcer existed.)
         let announcer_handle =
             attach_observer_announcer(&mut cluster_state, holdings, node_id.clone());
+        // Respawn-exec outbox — created unconditionally (the arm is
+        // inert without a provider; requests then get an error reply).
+        let (respawn_exec_tx, respawn_exec_rx) = mpsc::unbounded_channel::<RespawnExecOutcome>();
         Self {
             client,
             inbox,
@@ -518,6 +592,13 @@ where
             ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             wake_note: WakeNoteSlot::default(),
             reconnector,
+            // Cold-join observers (late-joiner consoles) host no respawn
+            // provider; the submitter/observer process is the only
+            // provider host and always arrives via `from_handoff`.
+            respawn_provider: None,
+            respawn_exec: std::collections::HashMap::new(),
+            respawn_exec_tx,
+            respawn_exec_rx: Some(respawn_exec_rx),
             graceful_abort_trigger: None,
         }
     }
@@ -764,6 +845,12 @@ where
         // carries the orphaned primary dispatcher handle only for teardown).
         // So the observer always spawns its OWN dispatcher with the Policy
         // B/D listeners here.
+        // Respawn-exec outbox receiver (the take-once shape of
+        // `task_completed_rx`): drained by the loop's outbox arm below.
+        let mut respawn_exec_rx = self
+            .respawn_exec_rx
+            .take()
+            .expect("respawn_exec_rx is set by both constructors and taken once by run");
         let dispatcher_task = self.task_completed_rx.take().map(|task_rx| {
             let listeners: Vec<Box<dyn TaskCompletedListener>> =
                 vec![invalid_task_listener, aggregation_listener];
@@ -1107,6 +1194,14 @@ where
                         let outcome = self.send_to(Destination::Primary, item.msg).await;
                         let _ = item.reply.send(outcome);
                     }
+                    // Respawn-exec outbox drain: a detached provider call
+                    // finished; this arm owns `&mut self` for the
+                    // idempotency-cache update + the result reply to the
+                    // primary. Never `None`: `self.respawn_exec_tx` keeps
+                    // one sender alive for the coordinator's lifetime.
+                    Some(outcome) = respawn_exec_rx.recv() => {
+                        self.on_respawn_exec_complete(outcome).await;
+                    }
                     // Policy B fatal-exit (item 13): the invalid_task
                     // monitor signalled; the OBSERVER exits non-zero. Typed as
                     // a structured `FatalPolicyExit` (NOT a generic `Other`) so
@@ -1349,11 +1444,215 @@ where
             } => {
                 self.answer_snapshot_request(&sender_id, is_observer).await;
             }
+            // Respawn EXECUTION requests from the primary (the decision
+            // holder): this process physically hosts the provider, so it
+            // executes and replies — zero authority involved. See the
+            // `respawn_provider` field doc.
+            DistributedMessage::RespawnSpawnRequest {
+                new_secondary_id,
+                primary_endpoint,
+                primary_pubkey_pem,
+                ..
+            } => {
+                self.on_respawn_spawn_request(
+                    new_secondary_id,
+                    primary_endpoint,
+                    primary_pubkey_pem,
+                )
+                .await;
+            }
+            DistributedMessage::RespawnRevokeRequest {
+                new_secondary_id, ..
+            } => {
+                self.on_respawn_revoke_request(new_secondary_id).await;
+            }
             // Every other frame is irrelevant to a zero-authority
             // observer (it owns no dispatch / setup / election concern).
             // Silently ignored — the observer only consumes the
             // replication / liveness frames above.
             _ => {}
+        }
+    }
+
+    /// Execute one spawn request against the hosted provider —
+    /// idempotently. The primary-minted `new_secondary_id` is the
+    /// dedup key: `InFlight` absorbs a re-sent request (its result
+    /// reply is already on the way once the provider finishes); `Done`
+    /// replays the cached outcome (the lost-result case — the primary
+    /// re-sends until a result lands). A fresh id marks `InFlight` and
+    /// drives the provider on a detached LocalSet task (the loop never
+    /// blocks on sbatch/tunnel work), whose outcome returns through the
+    /// respawn-exec outbox arm. No provider hosted → an immediate error
+    /// reply (a misdirected request — only the submitter process holds
+    /// a provider) so the primary's budget/logging sees the failure
+    /// instead of retrying forever.
+    async fn on_respawn_spawn_request(
+        &mut self,
+        new_secondary_id: String,
+        primary_endpoint: String,
+        primary_pubkey_pem: String,
+    ) {
+        match self.respawn_exec.get(&new_secondary_id) {
+            Some(RespawnExecState::InFlight) => {
+                tracing::debug!(
+                    target: "dynrunner_respawn",
+                    new_secondary_id = %new_secondary_id,
+                    "duplicate spawn request while execution is in flight; absorbed",
+                );
+                return;
+            }
+            Some(RespawnExecState::Done(result)) => {
+                tracing::debug!(
+                    target: "dynrunner_respawn",
+                    new_secondary_id = %new_secondary_id,
+                    "duplicate spawn request after completion; replaying the cached outcome",
+                );
+                let cached = result.clone();
+                self.send_respawn_result(RespawnExecKind::Spawn, &new_secondary_id, &cached)
+                    .await;
+                return;
+            }
+            None => {}
+        }
+        let Some(provider) = self.respawn_provider.clone() else {
+            tracing::warn!(
+                target: "dynrunner_respawn",
+                new_secondary_id = %new_secondary_id,
+                "spawn request received but this observer hosts no respawn \
+                 provider (only the submitter process does); replying with an \
+                 error",
+            );
+            self.send_respawn_result(
+                RespawnExecKind::Spawn,
+                &new_secondary_id,
+                &Err("this observer hosts no respawn provider".to_string()),
+            )
+            .await;
+            return;
+        };
+        self.respawn_exec
+            .insert(new_secondary_id.clone(), RespawnExecState::InFlight);
+        tracing::info!(
+            target: "dynrunner_respawn",
+            new_secondary_id = %new_secondary_id,
+            event = "respawn_exec_started",
+            "executing the primary's spawn request against the hosted provider",
+        );
+        let spec = crate::primary::respawn::SecondarySpawnSpec {
+            new_secondary_id: new_secondary_id.clone(),
+            primary_endpoint,
+            primary_pubkey_pem,
+        };
+        let tx = self.respawn_exec_tx.clone();
+        tokio::task::spawn_local(async move {
+            let result = provider.spawn(spec).await.map_err(|e| e.to_string());
+            // A closed outbox means the observer is winding down; the
+            // provider's own orphan-safety (job id on its `job_ids`
+            // ledger → run-teardown scancel sweep) covers the job.
+            let _ = tx.send(RespawnExecOutcome {
+                kind: RespawnExecKind::Spawn,
+                new_secondary_id,
+                result,
+            });
+        });
+    }
+
+    /// Execute one revoke request against the hosted provider. No dedup
+    /// map: `SecondarySpawner::revoke` is idempotent and race-tolerant
+    /// by contract (Submitted → scancel; in-flight/not-yet-submitted →
+    /// tombstone), so every (re-)send just drives the provider again
+    /// and replies with its outcome.
+    async fn on_respawn_revoke_request(&mut self, new_secondary_id: String) {
+        let Some(provider) = self.respawn_provider.clone() else {
+            tracing::warn!(
+                target: "dynrunner_respawn",
+                new_secondary_id = %new_secondary_id,
+                "revoke request received but this observer hosts no respawn \
+                 provider; replying with an error",
+            );
+            self.send_respawn_result(
+                RespawnExecKind::Revoke,
+                &new_secondary_id,
+                &Err("this observer hosts no respawn provider".to_string()),
+            )
+            .await;
+            return;
+        };
+        let tx = self.respawn_exec_tx.clone();
+        tokio::task::spawn_local(async move {
+            let result = provider
+                .revoke(&new_secondary_id)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(RespawnExecOutcome {
+                kind: RespawnExecKind::Revoke,
+                new_secondary_id,
+                result,
+            });
+        });
+    }
+
+    /// Record a finished provider call and reply its outcome to the
+    /// primary. Spawn outcomes are cached in the idempotency map so a
+    /// duplicate request replays the SAME result (one id can never
+    /// double-submit); revoke outcomes are not cached (the provider is
+    /// idempotent for revokes).
+    async fn on_respawn_exec_complete(&mut self, outcome: RespawnExecOutcome) {
+        let RespawnExecOutcome {
+            kind,
+            new_secondary_id,
+            result,
+        } = outcome;
+        if let RespawnExecKind::Spawn = kind {
+            self.respawn_exec.insert(
+                new_secondary_id.clone(),
+                RespawnExecState::Done(result.clone()),
+            );
+        }
+        self.send_respawn_result(kind, &new_secondary_id, &result)
+            .await;
+    }
+
+    /// Send one respawn result frame to the primary (whichever host
+    /// currently holds the role — a failover between request and result
+    /// re-resolves; an unmatched result at a successor primary is
+    /// logged-and-ignored there, and the successor's own retry replays
+    /// against this observer's outcome cache). A send failure (no
+    /// current primary visible) is WARNed and NOT retried here: the
+    /// primary's request-side retry is the replay driver, and a
+    /// re-sent request replies again from the cache.
+    async fn send_respawn_result(
+        &mut self,
+        kind: RespawnExecKind,
+        new_secondary_id: &str,
+        result: &Result<(), String>,
+    ) {
+        let error = result.as_ref().err().cloned();
+        let msg = match kind {
+            RespawnExecKind::Spawn => DistributedMessage::RespawnSpawnResult {
+                target: None,
+                sender_id: self.config.node_id.clone(),
+                timestamp: timestamp_now(),
+                new_secondary_id: new_secondary_id.to_owned(),
+                error,
+            },
+            RespawnExecKind::Revoke => DistributedMessage::RespawnRevokeResult {
+                target: None,
+                sender_id: self.config.node_id.clone(),
+                timestamp: timestamp_now(),
+                new_secondary_id: new_secondary_id.to_owned(),
+                error,
+            },
+        };
+        if let Err(e) = self.send_to(Destination::Primary, msg).await {
+            tracing::warn!(
+                target: "dynrunner_respawn",
+                new_secondary_id,
+                error = %e,
+                "could not send the respawn result to the primary (no route); \
+                 the primary's request retry will trigger a replay from the \
+                 outcome cache",
+            );
         }
     }
 
