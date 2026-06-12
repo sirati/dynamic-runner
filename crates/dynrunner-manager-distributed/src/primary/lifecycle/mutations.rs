@@ -708,50 +708,61 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         secondary_ids.sort();
 
         for secondary_id in &secondary_ids {
-            let msg = DistributedMessage::TransferComplete {
-                target: None,
-                sender_id: self.config.node_id.clone(),
-                timestamp: timestamp_now(),
-                total_files: 0,
-                total_bytes: 0,
-            };
-            // A `Destination::Secondary(id)` send is QUEUED to the mesh-pump
-            // (`MeshClient::send`); its only error mode is the egress receiver —
-            // the local mesh-pump — being dropped, i.e. THIS node winding down
-            // (a cluster collapse). The per-peer routing outcome
-            // (direct / relayed / no-route) is resolved LATER inside the pump
-            // and never surfaces here, so a transient "no route to this one
-            // secondary" is NOT a send error — it is logged at the pump and the
-            // peer is recovered via the snapshot/anti-entropy backstop, exactly
-            // as for the directed `InitialAssignment` send. So the `Err` arm is
-            // uniformly the mesh-pump-gone collapse, which `send_to` latches on
-            // `self.mesh_pump_gone` for `run_pipeline`'s post-transfer gate to
-            // route into the strand-classification finalize tail. Warn-and-
-            // continue (uniform with the sibling broadcasts) instead of
-            // `?`-escaping as a raw `RunError::Other`: a node winding down in the
-            // window between a successful initial assignment and transfer-complete
-            // must surface as a clean `ClusterCollapsed` + `RunAborted`, not an
-            // unclassified `Other`. Continue the fan-out so the remaining
-            // secondaries still receive their gate-release on the same dead-pump
-            // pass — the latch is the single collapse signal the caller consults.
-            if let Err(error) = self
-                .send_to(
-                    Destination::Secondary(PeerId::from(secondary_id.clone())),
-                    msg,
-                )
-                .await
-            {
-                tracing::warn!(
-                    secondary_id = %secondary_id,
-                    error = %error,
-                    "TransferComplete delivery failed"
-                );
-            }
+            self.send_transfer_complete_to(secondary_id).await;
         }
         tracing::info!(
             secondaries = secondary_ids.len(),
             "transfer complete sent to all secondaries"
         );
         Ok(())
+    }
+
+    /// The SOLE per-member `TransferComplete` construction + send site,
+    /// shared by the run-start batch fan-out
+    /// ([`Self::send_transfer_complete`]) and the mid-run incremental serve
+    /// (`peer_setup::serve_setup_on_cert_exchange`'s post-run-start
+    /// variant).
+    ///
+    /// A `Destination::Secondary(id)` send is QUEUED to the mesh-pump
+    /// (`MeshClient::send`); its only error mode is the egress receiver —
+    /// the local mesh-pump — being dropped, i.e. THIS node winding down
+    /// (a cluster collapse). The per-peer routing outcome
+    /// (direct / relayed / no-route) is resolved LATER inside the pump
+    /// and never surfaces here, so a transient "no route to this one
+    /// secondary" is NOT a send error — it is logged at the pump and the
+    /// peer is recovered via the snapshot/anti-entropy backstop, exactly
+    /// as for the directed `InitialAssignment` send. So the `Err` arm is
+    /// uniformly the mesh-pump-gone collapse, which `send_to` latches on
+    /// `self.mesh_pump_gone` for `run_pipeline`'s post-transfer gate to
+    /// route into the strand-classification finalize tail. Warn-and-
+    /// continue (uniform with the sibling broadcasts) instead of
+    /// `?`-escaping as a raw `RunError::Other`: a node winding down in the
+    /// window between a successful initial assignment and transfer-complete
+    /// must surface as a clean `ClusterCollapsed` + `RunAborted`, not an
+    /// unclassified `Other`. The batch caller continues its fan-out so the
+    /// remaining secondaries still receive their gate-release on the same
+    /// dead-pump pass — the latch is the single collapse signal the caller
+    /// consults.
+    pub(crate) async fn send_transfer_complete_to(&mut self, secondary_id: &str) {
+        let msg = DistributedMessage::TransferComplete {
+            target: None,
+            sender_id: self.config.node_id.clone(),
+            timestamp: timestamp_now(),
+            total_files: 0,
+            total_bytes: 0,
+        };
+        if let Err(error) = self
+            .send_to(
+                Destination::Secondary(PeerId::from(secondary_id.to_string())),
+                msg,
+            )
+            .await
+        {
+            tracing::warn!(
+                secondary_id = %secondary_id,
+                error = %error,
+                "TransferComplete delivery failed"
+            );
+        }
     }
 }

@@ -201,17 +201,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             let staged_files = staged_per_secondary
                 .remove(secondary_id)
                 .unwrap_or_default();
-            let msg = DistributedMessage::InitialAssignment {
-                target: None,
-                sender_id: self.config.node_id.clone(),
-                timestamp: timestamp_now(),
-                secondary_id: secondary_id.clone(),
-                zip_files,
-                workers_ready,
-                staged_files,
-                pre_staged_mode: self.config.source_pre_staged_root.is_some(),
-                uses_file_based_items: self.config.uses_file_based_items,
-            };
             // A failed send here is a CLUSTER COLLAPSE, not a transient: the
             // destination is a concrete `Secondary(id)` (always resolvable —
             // it carries its own host), so the only way `send_to` errors is
@@ -230,10 +219,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `originate_task_assigned` (no replicated `InFlight` to
             // compensate), no `Operational` transition.
             if self
-                .send_to(
-                    Destination::Secondary(PeerId::from(secondary_id.clone())),
-                    msg,
-                )
+                .send_initial_assignment_to(secondary_id, zip_files, workers_ready, staged_files)
                 .await
                 .is_err()
             {
@@ -315,13 +301,53 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         Ok(InitialAssignmentOutcome::Completed)
     }
 
+    /// The SOLE per-member `InitialAssignment` construction + send site,
+    /// shared by the run-start batch fan-out
+    /// ([`Self::perform_initial_assignment`]) and the mid-run incremental
+    /// serve (`peer_setup::serve_setup_on_cert_exchange`'s post-run-start
+    /// variant, which passes empty payloads — a mid-run joiner holds no
+    /// pre-assigned work and pulls via `TaskRequest` like every member
+    /// post-start). The `PrimaryConfig` dispatch flags (`pre_staged_mode` /
+    /// `uses_file_based_items`) are stamped HERE so every recipient's
+    /// dispatch resolver agrees with the primary regardless of which path
+    /// served it.
+    ///
+    /// The `Err` arm is uniformly the mesh-pump-gone collapse (a directed
+    /// `Destination::Secondary(id)` send has no other error mode — see the
+    /// batch call site's comment); each caller chooses its own collapse
+    /// routing.
+    pub(super) async fn send_initial_assignment_to(
+        &mut self,
+        secondary_id: &str,
+        zip_files: Vec<ZipFileAssignment<I>>,
+        workers_ready: Vec<WorkerReadyInfo>,
+        staged_files: Vec<StagedFileRecord>,
+    ) -> Result<(), String> {
+        let msg = DistributedMessage::InitialAssignment {
+            target: None,
+            sender_id: self.config.node_id.clone(),
+            timestamp: timestamp_now(),
+            secondary_id: secondary_id.to_string(),
+            zip_files,
+            workers_ready,
+            staged_files,
+            pre_staged_mode: self.config.source_pre_staged_root.is_some(),
+            uses_file_based_items: self.config.uses_file_based_items,
+        };
+        self.send_to(
+            Destination::Secondary(PeerId::from(secondary_id.to_string())),
+            msg,
+        )
+        .await
+    }
+
     /// The ONE per-member operational typestate walk:
     /// `InitialAssigning → Operational` ("its `InitialAssignment` has
     /// been sent"), plus the keepalive re-seed. No-op state-wise from
     /// any other state; the keepalive seed always runs (matching the
     /// historical batch, which seeded every CRDT-known id whether or
     /// not a connection typestate existed for it).
-    fn mark_member_operational(&mut self, secondary_id: &str) {
+    pub(super) fn mark_member_operational(&mut self, secondary_id: &str) {
         if let Some(state) = self.secondaries.remove(secondary_id) {
             let new_state = match state {
                 SecondaryConnectionState::InitialAssigning(conn) => {
