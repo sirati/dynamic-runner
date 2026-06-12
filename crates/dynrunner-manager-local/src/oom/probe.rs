@@ -58,7 +58,11 @@ pub struct HostMemoryReading {
 /// inject a deterministic mock. Production wires
 /// [`ProcSysProbe`] (default) which reads the real `/proc/meminfo` and
 /// `/sys/fs/cgroup/memory.*` paths.
-pub trait SystemProbe: Send {
+///
+/// `Send + Sync` so the watcher can hold the probe behind an [`Arc`]
+/// and clone that handle into the `spawn_blocking` closure that runs
+/// the per-sweep reads off the async runtime.
+pub trait SystemProbe: Send + Sync {
     /// Read a fresh snapshot. Cheap (a handful of small file reads on
     /// Linux); called at sample cadence (20Hz by default).
     fn read(&self) -> HostMemoryReading;

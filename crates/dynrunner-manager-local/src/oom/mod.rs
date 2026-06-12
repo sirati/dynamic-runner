@@ -1,51 +1,158 @@
 //! OOM-watcher subsystem.
 //!
 //! Single concern: own the per-host / per-cgroup / per-worker memory
-//! sampling cadence + decision cadence + structured logging triggers for
+//! sampling cadence + decision + structured logging triggers for
 //! both `LocalManager` and `SecondaryCoordinator`. Each caller drives
 //! the watcher through the same API; nothing in this module branches
 //! on caller mode.
 //!
 //! ## Boundary
 //!
-//! - The watcher owns: sample-interval ticker, decision-interval
-//!   ticker, the latest [`OomWatcherSnapshot`], the log-emission
-//!   triggers, and the call into `WorkerPool::check_resource_pressure`.
+//! - The watcher owns: the sweep cadence policy
+//!   ([`OomWatcher::sweep_interval`]), the read-input collection
+//!   ([`OomWatcher::collect_sweep_inputs`]) + the blocking read it
+//!   produces ([`ChargeSweepInputs::read`]), the apply-back
+//!   ([`OomWatcher::apply_sweep`]), the latest [`OomWatcherSnapshot`],
+//!   the log-emission triggers, and the call into
+//!   `WorkerPool::decide_resource_pressure`.
 //! - The watcher does NOT own: the kill-outcome handler. Each caller
 //!   (LocalManager monitor / Secondary resource) keeps its own
 //!   outcome handler — the watcher merely forwards the
 //!   `ResourcePressureResult` and records a "kill happened" event
 //!   so the next log line carries the right `trigger`.
 //!
-//! ## Two ticks
+//! ## One self-paced sweep
 //!
-//! - **Sample tick** (default 50ms, 20Hz): read host RAM, cgroup
-//!   memory.current, swap, tracked worker RSS sum into the snapshot.
-//!   Optionally emit a structured log line if a trigger fires.
-//! - **Decision tick** (caller's existing cadence, default 100ms):
-//!   ask the scheduler whether a worker must be killed. Reads the
-//!   most recent worker-RSS state via
-//!   `WorkerPool::check_resource_pressure` (which internally calls
-//!   `update_all_resource_usage`); the watcher's own snapshot is
-//!   refreshed independently by the sample tick.
+//! The blocking cgroup / `/proc` reads do NOT run on the operational
+//! `select!`. Each sweep:
+//!   1. [`OomWatcher::collect_sweep_inputs`] snapshots the CURRENT
+//!      worker set's (pid, cgroup-leaf) inputs off the pool — picking
+//!      up respawns / type-shifts each sweep — into `'static` data.
+//!   2. [`ChargeSweepInputs::read`] runs on the blocking pool
+//!      (`spawn_blocking`): host RAM / cgroup reading once plus each
+//!      worker's memory charge. A worker that died mid-sweep yields a
+//!      zero charge, never a sweep-fatal error.
+//!   3. [`OomWatcher::apply_sweep`] writes the charges back into each
+//!      slot, refreshes the snapshot, runs kernel-OOM delta detection,
+//!      and emits a structured log line when a trigger fires.
+//!   4. The caller runs the pressure decision inline
+//!      ([`OomWatcher::on_decision`]) on the just-applied charges, then
+//!      `sleep`s [`SAMPLE_SWEEP_INTERVAL`] before the NEXT sweep
+//!      (await-before-resleep: a slow sweep cannot pile).
 //!
-//! Sample updates always run `pool.update_all_resource_usage()` so the
-//! watcher's `tracked_workers_rss_sum` is fresh on every sample tick.
+//! One operational-loop wakeup per sweep replaces the former
+//! per-fire sample + decision timer arms.
 
 pub mod disconnect;
 pub mod probe;
 
 pub use disconnect::{DisconnectFault, classify_disconnect, classify_disconnect_fault};
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{Identifier, ResourceKind, ResourceMap};
+use dynrunner_core::{Identifier, ResourceKind, ResourceMap, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::Scheduler;
 
+use crate::monitor::{MemoryCharge, measure_worker_charge};
 use crate::pool::{ResourcePressureResult, WorkerPool};
 
 use self::probe::{HostMemoryReading, ProcSysProbe, SystemProbe};
+
+/// Default cadence of the self-paced charge sweep: the sweep task
+/// `sleep`s this long after EACH sweep completes (await-before-resleep
+/// — a slow sweep cannot pile, the next starts this interval after the
+/// previous returned). 50ms = the historical 20Hz sample cadence.
+pub const SAMPLE_SWEEP_INTERVAL: Duration = DEFAULT_SAMPLE_INTERVAL;
+
+/// The per-worker inputs the blocking charge read consumes: the slot's
+/// id, its tracked pid (for the `/proc` fallback), and its cgroup-v2
+/// leaf directory (cgroup-first read). Plain owned data so the whole
+/// set can be moved into a `spawn_blocking` closure with NO pool borrow
+/// held across the blocking call.
+#[derive(Debug, Clone)]
+struct WorkerReadInput {
+    worker_id: WorkerId,
+    pid: Option<u32>,
+    cgroup_dir: Option<PathBuf>,
+}
+
+/// Everything one blocking sweep needs, captured as `'static + Send`
+/// owned data: the (shared) probe and the current worker set's read
+/// inputs. Built off the pool on the async side via
+/// [`OomWatcher::collect_sweep_inputs`]; its [`Self::read`] runs on the
+/// blocking pool and touches `/proc` + cgroup files only.
+pub struct ChargeSweepInputs {
+    probe: Arc<dyn SystemProbe>,
+    workers: Vec<WorkerReadInput>,
+}
+
+impl ChargeSweepInputs {
+    /// Perform every blocking file read for this sweep: the host /
+    /// cgroup reading once, plus each worker's memory charge. Pure
+    /// blocking IO — intended to run inside `spawn_blocking`. A
+    /// per-worker read that finds no measurable charge yields a zero
+    /// [`MemoryCharge`] (the historical "nothing measured" disposition
+    /// of [`measure_worker_charge`]); a worker that died mid-sweep
+    /// therefore contributes a zero charge rather than failing the
+    /// whole sweep.
+    pub fn read(self) -> ChargeSweep {
+        let host = self.probe.read();
+        let charges = self
+            .workers
+            .into_iter()
+            .map(|w| {
+                let charge = measure_worker_charge(w.pid, w.cgroup_dir.as_deref());
+                (w.worker_id, charge)
+            })
+            .collect();
+        ChargeSweep { host, charges }
+    }
+
+    /// Test seam: assemble a sweep's inputs directly from
+    /// `(worker_id, pid, cgroup_dir)` triples + a probe, without a
+    /// `WorkerPool` fixture. Lets the read-resilience / cadence tests
+    /// drive [`Self::read`] against tempdir cgroup leaves and a mock /
+    /// slow probe.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        probe: Arc<dyn SystemProbe>,
+        workers: Vec<(WorkerId, Option<u32>, Option<PathBuf>)>,
+    ) -> Self {
+        Self {
+            probe,
+            workers: workers
+                .into_iter()
+                .map(|(worker_id, pid, cgroup_dir)| WorkerReadInput {
+                    worker_id,
+                    pid,
+                    cgroup_dir,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The plain-data result of one [`ChargeSweepInputs::read`]: the host
+/// reading and per-worker `(WorkerId, MemoryCharge)` pairs. Carries no
+/// borrow — it crosses back from the blocking pool to the async side,
+/// where [`OomWatcher::apply_sweep`] writes it into the pool and the
+/// watcher snapshot.
+pub struct ChargeSweep {
+    host: HostMemoryReading,
+    charges: Vec<(WorkerId, MemoryCharge)>,
+}
+
+impl ChargeSweep {
+    /// Test seam: the per-worker `(WorkerId, MemoryCharge)` pairs this
+    /// sweep read, for asserting read resilience without a pool.
+    #[cfg(test)]
+    pub(crate) fn charges_for_test(&self) -> &[(WorkerId, MemoryCharge)] {
+        &self.charges
+    }
+}
 
 /// 1 GiB in bytes. Threshold for the delta-under-pressure log
 /// trigger; locked with the consumer.
@@ -118,15 +225,15 @@ pub struct OomWatcherSnapshot {
 /// substitute a deterministic probe + clock without touching the
 /// per-caller wiring.
 pub struct OomWatcherConfig {
-    /// How often to read host/cgroup state and update per-worker RSS.
+    /// The self-paced sweep cadence: the loop `sleep`s this long after
+    /// EACH sweep completes before starting the next. Surfaced by
+    /// [`OomWatcher::sweep_interval`].
     pub sample_interval: Duration,
-    /// How often to invoke the scheduler's pressure decision.
-    pub decision_interval: Duration,
     /// Cadence of the unconditional heartbeat log line. Only used
     /// when `log_enabled = true`.
     pub heartbeat_interval: Duration,
     /// Master switch for the structured JSON log emission. When
-    /// `false`, the watcher still samples and decides (so the
+    /// `false`, the watcher still sweeps and decides (so the
     /// per-worker RSS stays current and the pool kills as before),
     /// but no `info!(target: "oom_watcher", ...)` events fire.
     pub log_enabled: bool,
@@ -136,41 +243,38 @@ impl Default for OomWatcherConfig {
     fn default() -> Self {
         Self {
             sample_interval: DEFAULT_SAMPLE_INTERVAL,
-            decision_interval: Duration::from_millis(100),
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             log_enabled: false,
         }
     }
 }
 
-/// The watcher itself. Drives sample + decision cadences and emits
-/// the structured log line when a trigger fires.
+/// The watcher itself. Drives the self-paced sweep + the inline
+/// pressure decision and emits the structured log line when a trigger
+/// fires.
 ///
-/// Caller pattern (both LocalManager and Secondary):
+/// Caller pattern (both LocalManager and Secondary): one operational
+/// `select!` arm parks on the sweep's stored deadline; on fire it
+/// collects inputs, runs the blocking read off-runtime, applies, and
+/// decides inline, then re-arms the deadline `sweep_interval` later.
 /// ```ignore
 /// let mut watcher = OomWatcher::new(OomWatcherConfig {
-///     sample_interval: cfg.sample_interval,
-///     decision_interval: cfg.resource_check_interval,
+///     sample_interval: oom::SAMPLE_SWEEP_INTERVAL,
 ///     heartbeat_interval: oom::DEFAULT_HEARTBEAT_INTERVAL,
 ///     log_enabled: cfg.log_oom_watcher,
 /// });
-/// let mut sample_int = watcher.sample_interval_ticker();
-/// let mut decision_int = watcher.decision_interval_ticker();
-/// loop {
-///     tokio::select! {
-///         _ = sample_int.tick() => { watcher.on_sample(&mut pool); }
-///         _ = decision_int.tick() => {
-///             match watcher.on_decision(&mut pool, &scheduler, &max, in_pressure) {
-///                 ResourcePressureResult::Killed { .. } => { /* caller handles */ }
-///                 ResourcePressureResult::NoAction => {}
-///             }
-///         }
-///     }
+/// // ... when the sweep arm fires:
+/// let inputs = watcher.collect_sweep_inputs(&pool);
+/// let sweep = tokio::task::spawn_blocking(move || inputs.read()).await.unwrap();
+/// watcher.apply_sweep(&mut pool, sweep);
+/// match watcher.on_decision(&mut pool, &scheduler, &max, in_pressure) {
+///     ResourcePressureResult::Killed { .. } => { /* caller handles */ }
+///     ResourcePressureResult::NoAction => {}
 /// }
 /// ```
 pub struct OomWatcher {
     config: OomWatcherConfig,
-    probe: Box<dyn SystemProbe>,
+    probe: Arc<dyn SystemProbe>,
     /// Set when `on_decision` returns `Killed` so the next log
     /// emission carries `trigger=kill` instead of heartbeat/delta.
     /// Drained by the next `emit_log_line` call.
@@ -215,7 +319,7 @@ struct TrackedDeltaFields {
 impl OomWatcher {
     /// Construct with the production [`ProcSysProbe`].
     pub fn new(config: OomWatcherConfig) -> Self {
-        Self::with_probe(config, Box::new(ProcSysProbe::new()))
+        Self::with_probe(config, Arc::new(ProcSysProbe::new()))
     }
 
     /// Construct with the production [`ProcSysProbe`] AND a path to
@@ -232,12 +336,12 @@ impl OomWatcher {
         workers_memory_events_path: Option<std::path::PathBuf>,
     ) -> Self {
         let probe = ProcSysProbe::new().with_workers_memory_events(workers_memory_events_path);
-        Self::with_probe(config, Box::new(probe))
+        Self::with_probe(config, Arc::new(probe))
     }
 
     /// Construct with a caller-supplied probe. Used by unit tests to
     /// inject deterministic mock readings without touching `/proc`.
-    pub fn with_probe(config: OomWatcherConfig, probe: Box<dyn SystemProbe>) -> Self {
+    pub fn with_probe(config: OomWatcherConfig, probe: Arc<dyn SystemProbe>) -> Self {
         Self {
             config,
             probe,
@@ -270,15 +374,11 @@ impl OomWatcher {
         }
     }
 
-    /// Build a tokio interval driving the sample tick. The caller
-    /// installs it into its `select!` loop.
-    pub fn sample_interval_ticker(&self) -> tokio::time::Interval {
-        tokio::time::interval(self.config.sample_interval)
-    }
-
-    /// Build a tokio interval driving the decision tick.
-    pub fn decision_interval_ticker(&self) -> tokio::time::Interval {
-        tokio::time::interval(self.config.decision_interval)
+    /// The interval the self-paced sweep `sleep`s between completing
+    /// one sweep and starting the next (await-before-resleep). Driven
+    /// by the operator's [`OomWatcherConfig::sample_interval`] knob.
+    pub fn sweep_interval(&self) -> Duration {
+        self.config.sample_interval
     }
 
     /// Latest captured snapshot. Mostly for debugging / introspection
@@ -288,36 +388,82 @@ impl OomWatcher {
         &self.last_snapshot
     }
 
-    /// Sample tick: refresh per-worker RSS via the pool, read host
-    /// and cgroup state via the probe, evaluate log triggers, emit
-    /// when any fires.
+    /// Collect the per-worker read inputs for ONE sweep off the
+    /// CURRENT pool, plus a cloned handle to the probe — the
+    /// `'static + Send` data a [`spawn_blocking`](tokio::task::spawn_blocking)
+    /// closure runs [`ChargeSweepInputs::read`] on. Reads the live
+    /// worker set each call, so respawns / type-shifts between sweeps
+    /// are picked up automatically and no pool borrow is held across
+    /// the blocking read.
     ///
     /// Generic over the pool's transport/identifier so the same
     /// surface serves both manager modes.
-    pub fn on_sample<M, I>(&mut self, pool: &mut WorkerPool<M, I>)
+    pub fn collect_sweep_inputs<M, I>(&self, pool: &WorkerPool<M, I>) -> ChargeSweepInputs
     where
         M: ManagerEndpoint + 'static,
         I: Identifier,
     {
-        self.on_sample_at(pool, Instant::now())
+        let workers = pool
+            .workers
+            .iter()
+            .map(|w| WorkerReadInput {
+                worker_id: w.worker_id,
+                pid: w.pid,
+                cgroup_dir: w.subcgroup_dir().map(Path::to_path_buf),
+            })
+            .collect();
+        ChargeSweepInputs {
+            probe: Arc::clone(&self.probe),
+            workers,
+        }
     }
 
-    /// Test seam: explicit `now` so unit tests can drive heartbeat
-    /// cadence with a fake clock.
-    pub fn on_sample_at<M, I>(&mut self, pool: &mut WorkerPool<M, I>, now: Instant)
+    /// Apply a completed [`ChargeSweep`] (the blocking read's result)
+    /// to the pool and the watcher: write each worker's charge into
+    /// its `actual_usage` / `actual_swap_bytes`, refresh the snapshot,
+    /// run kernel-OOM delta detection on the sweep's host reading, and
+    /// evaluate the structured-log triggers. The cheap, loop-owned
+    /// half of a sweep — runs on the async runtime with a `&mut pool`
+    /// borrow, NOT on the blocking pool.
+    pub fn apply_sweep<M, I>(&mut self, pool: &mut WorkerPool<M, I>, sweep: ChargeSweep)
     where
         M: ManagerEndpoint + 'static,
         I: Identifier,
     {
-        pool.update_all_resource_usage();
-        let host = self.probe.read();
-        // Kernel-OOM detection: compute the per-sample delta of the
+        self.apply_sweep_at(pool, sweep, Instant::now())
+    }
+
+    /// Test seam: [`Self::apply_sweep`] with an explicit `now` so unit
+    /// tests can drive heartbeat / kernel-OOM cadence with a fake
+    /// clock.
+    pub fn apply_sweep_at<M, I>(
+        &mut self,
+        pool: &mut WorkerPool<M, I>,
+        sweep: ChargeSweep,
+        now: Instant,
+    ) where
+        M: ManagerEndpoint + 'static,
+        I: Identifier,
+    {
+        // Write each measured charge back into its slot. A worker that
+        // was respawned/removed between input collection and apply is
+        // simply skipped (its id no longer indexes a slot); a slot the
+        // sweep had no input for keeps its prior reading until the next
+        // sweep picks it up.
+        for (worker_id, charge) in sweep.charges {
+            if let Some(worker) = pool.workers.get_mut(worker_id as usize) {
+                worker.set_memory_charge(charge);
+            }
+        }
+
+        let host = sweep.host;
+        // Kernel-OOM detection: compute the per-sweep delta of the
         // workers-cgroup `oom_kill` counter. A positive delta means
         // the kernel ran the OOM-killer on that subgroup since the
-        // last sample. The window is wall-clock-based (see
+        // last sweep. The window is wall-clock-based (see
         // `kernel_oom_recent`) so the manager's disconnect
         // reclassifier can correlate a worker pipe-EOF with the
-        // kernel event regardless of how many samples landed
+        // kernel event regardless of how many sweeps landed
         // between them.
         if let Some(current) = host.kernel_oom_kill_count {
             if let Some(prev) = self.last_kernel_oom_count
@@ -346,15 +492,18 @@ impl OomWatcher {
         }
     }
 
-    /// Decision tick: run the scheduler's pressure check via the
-    /// pool. Records "kill happened" so the next log emission
-    /// carries `trigger=kill`, AND emits a kill log immediately
-    /// (regardless of heartbeat / delta cadence) so the forensic
-    /// record captures the kill in the same tick window.
+    /// Run the scheduler's pressure decision via the pool on the
+    /// charges the most recent [`Self::apply_sweep`] populated. Records
+    /// "kill happened" so the next log emission carries `trigger=kill`,
+    /// AND emits a kill log immediately (regardless of heartbeat /
+    /// delta cadence) so the forensic record captures the kill in the
+    /// same sweep window.
     ///
-    /// Returns the pool's verdict verbatim so each caller's outcome
-    /// handler (LocalManager monitor / Secondary resource) can take
-    /// the mode-specific follow-up action.
+    /// Pure decision: no `/proc` / cgroup read happens here — the
+    /// self-paced sweep is the single owner of the blocking charge
+    /// read. Returns the pool's verdict verbatim so each caller's
+    /// outcome handler (LocalManager monitor / Secondary resource) can
+    /// take the mode-specific follow-up action.
     pub fn on_decision<M, S, I>(
         &mut self,
         pool: &mut WorkerPool<M, I>,
@@ -367,16 +516,16 @@ impl OomWatcher {
         S: Scheduler<I>,
         I: Identifier,
     {
-        let result = pool.check_resource_pressure(scheduler, max_resources, in_pressure_phase);
+        let result = pool.decide_resource_pressure(scheduler, max_resources, in_pressure_phase);
         if matches!(result, ResourcePressureResult::Killed { .. }) {
             // Refresh the snapshot's worker counts so the kill log
-            // carries the post-kill state alongside the host
-            // reading. The pool already updated per-worker RSS
-            // inside `check_resource_pressure`; re-summing is cheap
-            // and keeps the log line self-consistent.
-            let host = self.probe.read();
+            // carries the post-kill tracked-worker sums. The host
+            // reading stays the one this sweep already applied (the
+            // decision runs inline right after `apply_sweep`, so it is
+            // fresh) — no re-read on the async runtime. Re-summing the
+            // pool charges is cheap and keeps the kill line
+            // self-consistent with the post-kill worker set.
             let (charged_sum, swap_sum) = sum_worker_charge(pool);
-            self.last_snapshot.host = host;
             self.last_snapshot.tracked_workers_rss_sum = charged_sum.saturating_sub(swap_sum);
             self.last_snapshot.tracked_workers_swap_sum = swap_sum;
             self.last_snapshot.tracked_workers_charged_sum = charged_sum;

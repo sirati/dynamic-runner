@@ -16,7 +16,8 @@ use tracing_subscriber::layer::SubscriberExt;
 
 use super::probe::{HostMemoryReading, SystemProbe};
 use super::{
-    DEFAULT_HEARTBEAT_INTERVAL, LogTrigger, OomWatcher, OomWatcherConfig, OomWatcherSnapshot,
+    ChargeSweepInputs, DEFAULT_HEARTBEAT_INTERVAL, LogTrigger, OomWatcher, OomWatcherConfig,
+    OomWatcherSnapshot, SAMPLE_SWEEP_INTERVAL,
 };
 
 /// Deterministic probe: returns the configured reading on every read.
@@ -114,7 +115,7 @@ impl tracing::field::Visit for StringExtractor {
 /// events. Returns the captured lines so the test can assert
 /// shape + count.
 fn capture<F: FnOnce(&mut OomWatcher)>(
-    probe: Box<dyn SystemProbe>,
+    probe: Arc<dyn SystemProbe>,
     mut config: OomWatcherConfig,
     f: F,
 ) -> LogCapture {
@@ -190,7 +191,7 @@ fn cgroup_unavailable_yields_none_or_zero() {
             log_enabled: false,
             ..Default::default()
         },
-        Box::new(probe),
+        Arc::new(probe),
     );
     // Drive a "manual" snapshot path that doesn't go through
     // `on_sample` (which would need a worker pool); the goal is
@@ -212,7 +213,7 @@ fn cgroup_unavailable_yields_none_or_zero() {
 fn heartbeat_log_fires_on_first_emission_then_every_10s() {
     let reading = reading_with_pressure(GIB, 16 * GIB); // 6.25% pressure
     let (probe, _cell) = MockProbe::new(reading);
-    let cap = capture(Box::new(probe), OomWatcherConfig::default(), |watcher| {
+    let cap = capture(Arc::new(probe), OomWatcherConfig::default(), |watcher| {
         let t0 = Instant::now();
         watcher.set_snapshot_for_test(OomWatcherSnapshot {
             host: reading,
@@ -247,7 +248,7 @@ fn delta_log_under_pressure_fires_on_1gb_jump() {
     // host pressure stays > 80%. Exactly one delta line should fire.
     let initial = reading_with_pressure(13 * GIB, 16 * GIB);
     let (probe, cell) = MockProbe::new(initial);
-    let cap = capture(Box::new(probe), OomWatcherConfig::default(), |watcher| {
+    let cap = capture(Arc::new(probe), OomWatcherConfig::default(), |watcher| {
         let t0 = Instant::now();
         // Seed the heartbeat gate by emitting once at t0.
         watcher.set_snapshot_for_test(OomWatcherSnapshot {
@@ -288,7 +289,7 @@ fn delta_log_below_pressure_does_not_fire() {
     // log — the pressure guard suppresses it.
     let initial = reading_with_pressure(8 * GIB, 16 * GIB);
     let (probe, _cell) = MockProbe::new(initial);
-    let cap = capture(Box::new(probe), OomWatcherConfig::default(), |watcher| {
+    let cap = capture(Arc::new(probe), OomWatcherConfig::default(), |watcher| {
         let t0 = Instant::now();
         watcher.set_snapshot_for_test(OomWatcherSnapshot {
             host: initial,
@@ -323,7 +324,7 @@ fn kill_event_emits_trigger_kill_log() {
     // a thin pass-through verified by the manager-level tests.
     let reading = reading_with_pressure(14 * GIB, 16 * GIB);
     let (probe, _cell) = MockProbe::new(reading);
-    let cap = capture(Box::new(probe), OomWatcherConfig::default(), |watcher| {
+    let cap = capture(Arc::new(probe), OomWatcherConfig::default(), |watcher| {
         watcher.set_snapshot_for_test(OomWatcherSnapshot {
             host: reading,
             tracked_workers_rss_sum: 6 * GIB,
@@ -357,7 +358,7 @@ fn kill_event_emits_trigger_kill_log() {
 fn swap_growth_with_shrinking_rss_fires_delta_and_logs_swap() {
     let initial = reading_with_pressure(13 * GIB, 16 * GIB); // 81.25%
     let (probe, _cell) = MockProbe::new(initial);
-    let cap = capture(Box::new(probe), OomWatcherConfig::default(), |watcher| {
+    let cap = capture(Arc::new(probe), OomWatcherConfig::default(), |watcher| {
         let t0 = Instant::now();
         // Healthy: 4 GiB resident, no swap.
         watcher.set_snapshot_for_test(OomWatcherSnapshot {
@@ -418,7 +419,7 @@ fn log_disabled_emits_nothing() {
             log_enabled: false,
             ..Default::default()
         },
-        Box::new(probe),
+        Arc::new(probe),
     );
     with_default(subscriber, || {
         watcher.set_snapshot_for_test(OomWatcherSnapshot {
@@ -433,4 +434,132 @@ fn log_disabled_emits_nothing() {
         watcher.note_kill();
     });
     assert_eq!(capture.count(), 0, "no logs expected when disabled");
+}
+
+// ── Self-paced sweep tests ──────────────────────────────────────────
+
+/// A probe that sleeps `delay` on each `read()` and counts its reads.
+/// Models a host whose `/proc` + cgroup files are slow to serve so the
+/// cadence test can prove await-before-resleep (the next sweep cannot
+/// start until the previous — slow — read has fully completed).
+struct SlowProbe {
+    reading: HostMemoryReading,
+    delay: Duration,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SystemProbe for SlowProbe {
+    fn read(&self) -> HostMemoryReading {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(self.delay);
+        self.reading
+    }
+}
+
+const GIB_SWEEP: u64 = 1024 * 1024 * 1024;
+
+/// Write a cgroup-v2 leaf (`memory.current` + `memory.swap.current`).
+fn write_leaf(dir: &std::path::Path, current: u64, swap: u64) {
+    std::fs::write(dir.join("memory.current"), format!("{current}\n")).unwrap();
+    std::fs::write(dir.join("memory.swap.current"), format!("{swap}\n")).unwrap();
+}
+
+/// One worker's cgroup leaf reads as its charge; a SECOND worker whose
+/// leaf directory does not exist (died/torn-down mid-sweep) must NOT
+/// fail the whole sweep — it contributes a zero charge and the live
+/// worker's reading still lands. This is the per-worker-failure
+/// resilience the sweep promises.
+#[test]
+fn sweep_per_worker_read_failure_is_not_sweep_fatal() {
+    let live = tempfile::tempdir().unwrap();
+    write_leaf(live.path(), 3 * GIB_SWEEP, GIB_SWEEP);
+    let gone = live.path().join("removed-leaf"); // never created
+
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probe = SlowProbe {
+        reading: reading_with_pressure(GIB_SWEEP, 16 * GIB_SWEEP),
+        delay: Duration::ZERO,
+        reads: reads.clone(),
+    };
+    let inputs = ChargeSweepInputs::for_test(
+        Arc::new(probe),
+        vec![
+            (0, None, Some(live.path().to_path_buf())),
+            // No pid + missing leaf: nothing measurable → zero charge,
+            // not an error.
+            (1, None, Some(gone)),
+        ],
+    );
+    let sweep = inputs.read();
+    let charges = sweep.charges_for_test();
+    assert_eq!(charges.len(), 2, "both workers must be present in the sweep");
+    // Live worker: charged = resident + swap = 4 GiB.
+    let live_charge = charges.iter().find(|(w, _)| *w == 0).unwrap().1;
+    assert_eq!(live_charge.resident_bytes, 3 * GIB_SWEEP);
+    assert_eq!(live_charge.swap_bytes, GIB_SWEEP);
+    assert_eq!(live_charge.charged_bytes(), 4 * GIB_SWEEP);
+    // Dead worker: zero charge, sweep did not abort.
+    let gone_charge = charges.iter().find(|(w, _)| *w == 1).unwrap().1;
+    assert_eq!(gone_charge.charged_bytes(), 0);
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1, "host read once per sweep");
+}
+
+/// The self-paced sweep cannot PILE: with a reader that takes `read_ms`
+/// per sweep and a `sleep` of `interval_ms` between sweeps, the number
+/// of sweeps over a fixed window is bounded by
+/// `window / (read_ms + interval_ms)` — proving the next sweep starts a
+/// full interval AFTER the previous one completed (await-before-resleep),
+/// not at a fixed wall-clock rate that would overlap a slow read.
+#[tokio::test(flavor = "current_thread")]
+async fn sweep_cadence_awaits_before_resleeping() {
+    let read_delay = Duration::from_millis(40);
+    let interval = Duration::from_millis(20);
+    let window = Duration::from_millis(600);
+
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probe: Arc<dyn SystemProbe> = Arc::new(SlowProbe {
+        reading: reading_with_pressure(GIB_SWEEP, 16 * GIB_SWEEP),
+        delay: read_delay,
+        reads: reads.clone(),
+    });
+
+    // Mirror the operational loop's sweep arm: collect inputs (here a
+    // single fixed worker), read OFF the runtime via spawn_blocking,
+    // await it, then sleep `interval` before the next — re-armed only
+    // after the read completes.
+    let start = tokio::time::Instant::now();
+    let mut sweeps = 0usize;
+    let mut next_due = tokio::time::Instant::now();
+    while tokio::time::Instant::now().duration_since(start) < window {
+        tokio::time::sleep_until(next_due).await;
+        let inputs = ChargeSweepInputs::for_test(probe.clone(), vec![(0, None, None)]);
+        let _sweep = tokio::task::spawn_blocking(move || inputs.read())
+            .await
+            .expect("sweep read panicked");
+        sweeps += 1;
+        next_due = tokio::time::Instant::now() + interval;
+    }
+
+    // Per-sweep wall cost ≈ read_delay + interval = 60ms. Over a 600ms
+    // window that is ~10 sweeps. A piling design (fixed 20ms cadence
+    // ignoring the 40ms read) would have run ~30. Bound generously to
+    // stay robust against scheduler jitter while still distinguishing
+    // await-before-resleep from pile-up.
+    let max_no_pileup = (window.as_millis() / (read_delay + interval).as_millis()) as usize + 2;
+    assert!(
+        sweeps <= max_no_pileup,
+        "sweeps={sweeps} exceeds the no-pile-up bound {max_no_pileup}; \
+         a slow read must delay the next sweep (await-before-resleep)"
+    );
+    // Sanity: it did make progress (not deadlocked).
+    assert!(sweeps >= 5, "sweeps={sweeps} too few; the sweep loop made no progress");
+    // Every sweep performed exactly one host read.
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), sweeps);
+}
+
+/// `SAMPLE_SWEEP_INTERVAL` is the historical 20Hz sample cadence —
+/// pinned so an accidental retune is a visible diff.
+#[test]
+fn sample_sweep_interval_is_50ms() {
+    assert_eq!(SAMPLE_SWEEP_INTERVAL, Duration::from_millis(50));
 }

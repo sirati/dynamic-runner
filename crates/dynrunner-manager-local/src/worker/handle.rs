@@ -1005,15 +1005,19 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         self.opportunistic = true;
     }
 
-    /// Update actual resource usage from the worker's memory charge
+    /// Write a previously-measured [`MemoryCharge`](crate::monitor::MemoryCharge)
     /// (resident + swap; cgroup-leaf-first, `/proc` fallback — see
-    /// [`crate::monitor::measure_worker_charge`]). The memory kind in
-    /// `actual_usage` carries the CHARGED bytes so the scheduler's
-    /// pressure decision sees swap growth as pressure; the swap
-    /// component is kept separately for observability
-    /// ([`Self::actual_swap_bytes`]).
-    pub fn update_resource_usage(&mut self) {
-        let charge = crate::monitor::measure_worker_charge(self.pid, self.subcgroup_dir());
+    /// [`crate::monitor::measure_worker_charge`]) into this slot's
+    /// accounting. The memory kind in `actual_usage` carries the
+    /// CHARGED bytes so the scheduler's pressure decision sees swap
+    /// growth as pressure; the swap component is kept separately for
+    /// observability ([`Self::actual_swap_bytes`]).
+    ///
+    /// The charge is read OFF the async runtime by the self-paced OOM
+    /// sweep ([`crate::oom::ChargeSweepInputs::read`]); this slot-write
+    /// half runs on the loop with the `&mut pool` borrow, so the
+    /// blocking file IO never lands on the operational `select!`.
+    pub fn set_memory_charge(&mut self, charge: crate::monitor::MemoryCharge) {
         self.actual_swap_bytes = charge.swap_bytes;
         self.actual_usage = charge.to_resource_map();
     }
