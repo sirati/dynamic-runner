@@ -63,6 +63,39 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // was deleted; this function now reads `self.workers` and never
         // constructs it.
 
+        // BATCH-PAYLOAD ELIGIBILITY: only members this primary itself
+        // walked through the live bring-up handshake to `InitialAssigning`
+        // (welcome → cert → peer-listed → peers-ready) are PROVABLY parked
+        // in `wait_for_setup` awaiting THIS batch — the only receiver state
+        // whose setup loop consumes an `InitialAssignment` payload. A
+        // member whose typestate was RECONSTRUCTED from the replicated
+        // ledger (`reconstruct_secondaries_from_cluster_state`'s
+        // metadata-only `Operational` seed — the promotion/relocate path)
+        // is unprovable: an OPERATIONAL survivor's frame router has no
+        // `InitialAssignment` arm (the frame debug-drops unhandled), so a
+        // task committed onto it sits replicated-`InFlight` with no holder
+        // until the reconciliation probe's ~600s denial recovers it.
+        // Committing payloads on that unprovable assumption was the
+        // post-failover wedge; the failure directions are asymmetric, so
+        // when unsure we must NOT commit:
+        //   * an operational member skipped here is dispatched through the
+        //     OPERATIONAL path (`dispatch_to_idle_workers` /
+        //     `handle_task_request`) behind the real gates —
+        //     mesh-confirmation, backpressure backoff, already-held
+        //     recognition — at its `MeshReady` confirmation edge;
+        //   * a setup-parked member skipped here still gets its gate
+        //     RELEASED by the empty fan below (unchanged), goes
+        //     operational, reports `MeshReady`, and pulls/receives work
+        //     the same way. The duplicate-welcome trio re-serve
+        //     (`re_serve_setup_on_duplicate_welcome`) remains the
+        //     retransmit backstop.
+        let batch_eligible: std::collections::HashSet<String> = self
+            .secondaries
+            .iter()
+            .filter(|(_, s)| matches!(s, SecondaryConnectionState::InitialAssigning(_)))
+            .map(|(id, _)| id.clone())
+            .collect();
+
         // Perform initial assignment for each worker. The pool is
         // pre-sorted by `run()` (size DESC) and bucketed by
         // `(phase, type, affinity)`; per-worker visibility is the
@@ -83,6 +116,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let mut total_assigned_resources = ResourceMap::new();
 
         for worker_idx in super::lifecycle::dispatch_order(&self.workers) {
+            // Payload-eligibility membership gate (see `batch_eligible`
+            // above): never commit a task onto a member that won't consume
+            // the `InitialAssignment` it would ride.
+            if !batch_eligible.contains(&self.workers[worker_idx].secondary_id) {
+                continue;
+            }
             let worker_info = self.workers[worker_idx].budget_info();
             let max_res = self.workers[worker_idx].resource_budgets.clone();
             // The ONE dispatch-shape view pipeline (soft preferred-
@@ -284,6 +323,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
 
         let assigned: usize = assignments_per_secondary.values().map(|v| v.len()).sum();
+        let remaining = self.pool().len();
         // Phase-preparation / task-spawning important event: the initial
         // per-secondary assignment has placed `assigned` tasks across the
         // fleet (`remaining` still queued for the operational loop's
@@ -297,9 +337,27 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         tracing::info!(
             target: super::important_events::IMPORTANT_TARGET,
             assigned,
-            remaining = self.pool().len(),
+            remaining,
             "initial assignment complete"
         );
+
+        // The pool still holds work the batch did NOT place — on the
+        // promoted path that is the whole inherited pool (no member was
+        // batch-eligible), on the live path the over-capacity remainder.
+        // EMIT one `TasksAdded` so the operational dispatch recheck
+        // (`dispatch_to_idle_workers`, behind the mesh-confirmation /
+        // backoff / already-held gates) owns it from here: the pre-loop
+        // `wait_for_mesh_ready` in-wait servicing or the operational-loop
+        // entry sweep drains the bus, and each member's `MeshReady`
+        // confirmation edge fires its own wakeup as it lands. Decoupled
+        // emit, never a direct dispatch call (the dispatch-decoupling
+        // law). Emitted AFTER the fan-out above, so a co-located member's
+        // gate-release trio is queued on its FIFO loopback BEFORE any
+        // recheck can push a `TaskAssignment` at it.
+        if remaining > 0 {
+            self.cluster_state
+                .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
+        }
 
         Ok(InitialAssignmentOutcome::Completed)
     }
