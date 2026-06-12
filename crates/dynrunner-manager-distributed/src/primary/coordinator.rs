@@ -1017,8 +1017,11 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// replacement joins the membership (the legitimate-occupant case
     /// — no revocation) or when its original is re-admitted first (the
     /// squatter case — `SecondarySpawner::revoke` is issued).
-    /// Size is bounded by `RespawnBudget::max_total`.
-    pub(super) pending_replacements: std::collections::HashMap<String, String>,
+    /// Size is bounded by `RespawnBudget::max_total`. Wraps the map with
+    /// the derived "awaiting a join" gate the respawn listener consults to
+    /// drop `Added` events while no replacement is pending (so the respawn
+    /// arm parks instead of busy-waking on membership joins).
+    pub(super) pending_replacements: super::respawn::PendingReplacements,
 
     /// Per-secondary node (the hostname advertised in the welcome).
     /// Recorded at welcome and DELIBERATELY NOT purged on removal — the
@@ -1463,7 +1466,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             tunnel_reconnector: None,
             respawn_lifecycle_tx: None,
             respawn_lifecycle_rx: None,
-            pending_replacements: std::collections::HashMap::new(),
+            pending_replacements: super::respawn::PendingReplacements::default(),
             secondary_nodes: std::collections::HashMap::new(),
             liveness_ping_rx: None,
             beacon_target: crate::liveness::BeaconTarget::new(),
@@ -1937,8 +1940,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `run()` start, so the registration MUST land before the
         // run is entered. Same contract as
         // `register_lifecycle_listener` (which this call delegates
-        // to under the hood).
-        self.register_lifecycle_listener(respawn_dispatcher_listener(tx));
+        // to under the hood). The listener carries the
+        // pending-replacement "awaiting a join" gate so it drops `Added`
+        // events while no replacement is pending (the membership-join
+        // busy-arm fix).
+        let awaiting_join = self.pending_replacements.awaiting_join_gate();
+        self.register_lifecycle_listener(respawn_dispatcher_listener(tx, awaiting_join));
     }
 
     /// Enable the respawn pipeline with the REMOTE execution backend —

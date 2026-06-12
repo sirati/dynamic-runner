@@ -103,12 +103,7 @@ where
         }
         // Case 2: the joiner is the original of pending replacement(s)
         // — the re-admission edge. Revoke every squatter.
-        let squatters: Vec<String> = self
-            .pending_replacements
-            .iter()
-            .filter(|(_, original_id)| original_id.as_str() == joined_id)
-            .map(|(new_id, _)| new_id.clone())
-            .collect();
+        let squatters = self.pending_replacements.replacements_of(joined_id);
         if squatters.is_empty() {
             return;
         }

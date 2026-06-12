@@ -333,19 +333,22 @@ async fn respawn_dispatcher_skips_when_policy_disabled() {
             // throwaway channel just to verify the closure shape; the
             // coordinator's wiring itself is the contract under test.
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PeerLifecycleEvent>();
-            let listener = respawn_dispatcher_listener(tx);
+            // A closed gate (no replacement pending) — a `Removed` is
+            // always relevant, so it must still forward.
+            let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let listener = respawn_dispatcher_listener(tx, gate);
             let removed = PeerLifecycleEvent::Removed {
                 id: "secondary-0".into(),
                 cause: RemovalCause::KeepaliveMiss,
             };
             listener.on_event(&removed);
-            // The free-standing listener does enqueue (it's a pure
-            // forwarder); the coordinator we built simply has no
+            // The free-standing listener does enqueue (a death is always a
+            // spawn trigger); the coordinator we built simply has no
             // listener registered, so its operational-loop arm would
             // never see the event. That's the CCD-5 invariant.
             let event = rx
                 .try_recv()
-                .expect("free-standing listener should still forward");
+                .expect("free-standing listener should still forward a removal");
             assert_eq!(event, removed);
         })
         .await;
