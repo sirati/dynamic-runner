@@ -630,7 +630,10 @@ where
                 Ok(())
             }
             DistributedMessage::StateDigest {
-                digest, sender_id, ..
+                digest,
+                sender_id,
+                sender_is_observer,
+                ..
             } => {
                 // Anti-entropy receive: compare the peer's digest against
                 // ours and pull a snapshot iff we are behind, via the
@@ -638,8 +641,10 @@ where
                 // `wait_for_setup`'s receive loop shares it). The pull's
                 // reply heals via the `ClusterSnapshot` recv arm above
                 // (idempotent restore), so a converged second round matches
-                // and pulls nothing (self-quiescing).
-                self.reconcile_state_digest(&sender_id, &digest).await;
+                // and pulls nothing (self-quiescing). The sender's declared
+                // role rides the frame so the pull is typed off it.
+                self.reconcile_state_digest(&sender_id, sender_is_observer, &digest)
+                    .await;
                 Ok(())
             }
             DistributedMessage::ClusterMutation { mutations, .. } => {

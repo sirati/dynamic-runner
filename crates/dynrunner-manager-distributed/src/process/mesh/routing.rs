@@ -176,6 +176,28 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
                     .unwrap_or(false);
                 if role_has_live_slot {
                     self.deliver_local(role, frame);
+                } else if self.directed_target_is_self(dst) {
+                    // The frame names a role with no live local slot here, but
+                    // its id-bearing target IS this process's own host id —
+                    // the sender unambiguously meant THIS process; only the
+                    // ROLE tag is stale (e.g. an anti-entropy pull addressed
+                    // `Secondary(self)` to a process that runs the observer
+                    // slot, before the sender learned this peer's role). This
+                    // is NOT a genuine mis-address, so we deliver it via the
+                    // local fan at DEBUG instead of the role-miss WARN — and
+                    // the id==self test wins BEFORE the relay so a self-id
+                    // frame is never bounced off this host onto the wire. The
+                    // local fan/hold then hands it to whatever slot IS live
+                    // (the observer responder), exactly as before.
+                    tracing::debug!(
+                        kind = ?frame.msg_type(),
+                        target = ?frame.target(),
+                        "mesh ingress: directed frame names a role with no live \
+                         local slot but its id IS this host (stale sender-side \
+                         role tag for THIS process); fanning locally without a \
+                         mis-address WARN"
+                    );
+                    self.fan_local_or_hold(frame);
                 } else {
                     let Some(frame) = self.try_relay_to_role_holder(frame).await else {
                         // Relayed toward the recognized holder — done here.

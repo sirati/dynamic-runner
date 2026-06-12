@@ -307,13 +307,16 @@ where
     /// Policy B/D listeners. `None` only on the relocation path (the
     /// inherited dispatcher already owns the receiver).
     task_completed_rx: Option<mpsc::UnboundedReceiver<TaskCompletedEvent>>,
-    /// AE-3 recovery-cadence state: the LAST-SEEN [`StateDigest`] of each
-    /// peer that has broadcast one, keyed by sender-id. The timer-driven
-    /// recovery arm intersects this with the live roster (`current_primary`
-    /// ∪ alive secondaries) and asks [`anti_entropy::plan_recovery_pull`]
-    /// whether the replica is still behind any of them — the C9 quiesce
-    /// signal. Updated on every inbound `StateDigest` frame.
-    peer_digests: std::collections::HashMap<String, StateDigest>,
+    /// AE-3 recovery-cadence state: the LAST-SEEN `(declared-observer bit,
+    /// [`StateDigest`])` of each peer that has broadcast one, keyed by
+    /// sender-id. The timer-driven recovery arm intersects this with the
+    /// live roster (`current_primary` ∪ alive secondaries) and asks
+    /// [`anti_entropy::plan_recovery_pull`] whether the replica is still
+    /// behind any of them — the C9 quiesce signal. The declared-observer
+    /// bit rides each peer's digest frame and is stored so the recovery
+    /// pull is typed off the responder's role. Updated on every inbound
+    /// `StateDigest` frame.
+    peer_digests: std::collections::HashMap<String, (bool, StateDigest)>,
     /// AE-3 responder rotation cursor (the different-responder-on-malformed
     /// rotation). Advanced by [`anti_entropy::plan_recovery_pull`] on each
     /// tick that has a candidate, so a malformed-snapshot responder is not
@@ -1665,9 +1668,13 @@ where
                 self.on_cluster_snapshot(&snapshot_json, primary_last_seen);
             }
             DistributedMessage::StateDigest {
-                sender_id, digest, ..
+                sender_id,
+                digest,
+                sender_is_observer,
+                ..
             } => {
-                self.on_state_digest(&sender_id, &digest).await;
+                self.on_state_digest(&sender_id, sender_is_observer, &digest)
+                    .await;
             }
             DistributedMessage::RequestClusterSnapshot {
                 sender_id,
@@ -1972,11 +1979,18 @@ where
     /// against ours and pull a snapshot if behind. Uses the role-agnostic
     /// `reconcile_against_peer` as-is; the observer owns only the `send_to`
     /// edge.
-    async fn on_state_digest(&mut self, sender_id: &str, peer: &StateDigest) {
-        // Record this peer's last-seen digest for the AE-3 recovery cadence
-        // (the C9 quiesce signal: the timer arm pulls iff still behind one
-        // of these). Reactive single-frame reconciliation still runs below.
-        self.peer_digests.insert(sender_id.to_string(), *peer);
+    async fn on_state_digest(
+        &mut self,
+        sender_id: &str,
+        sender_is_observer: bool,
+        peer: &StateDigest,
+    ) {
+        // Record this peer's last-seen digest + declared role for the AE-3
+        // recovery cadence (the C9 quiesce signal: the timer arm pulls iff
+        // still behind one of these, typed off the stored role). Reactive
+        // single-frame reconciliation still runs below.
+        self.peer_digests
+            .insert(sender_id.to_string(), (sender_is_observer, *peer));
         let local = self.cluster_state.digest();
         let requester = RequesterIdentity {
             node_id: &self.config.node_id,
@@ -1987,6 +2001,7 @@ where
             &local,
             peer,
             sender_id,
+            sender_is_observer,
             &requester,
             timestamp_now(),
         ) else {
@@ -2088,8 +2103,17 @@ where
             }
         }
         let digest = self.cluster_state.digest();
-        let msg =
-            anti_entropy::digest_broadcast::<I>(&self.config.node_id, timestamp_now(), digest);
+        // The standalone observer declares `is_observer: true` so a behind
+        // peer that pulls a snapshot FROM this observer types the pull
+        // `Observer(id)` and hits this process's observer-slot ingress demux
+        // (instead of mis-typing `Secondary` and tripping the role-miss fan
+        // WARN once per cadence on every behind peer).
+        let msg = anti_entropy::digest_broadcast::<I>(
+            &self.config.node_id,
+            timestamp_now(),
+            digest,
+            true,
+        );
         if let Err(e) = self.send_to(Destination::All, msg).await
             && let Some(suppressed) = self.ae_digest_warn.permit()
         {
@@ -2125,11 +2149,11 @@ where
         if let Some(p) = self.cluster_state.current_primary() {
             roster.insert(p.to_owned());
         }
-        let peer_digests: Vec<(String, StateDigest)> = self
+        let peer_digests: Vec<(String, bool, StateDigest)> = self
             .peer_digests
             .iter()
             .filter(|(id, _)| roster.contains(id.as_str()))
-            .map(|(id, d)| (id.clone(), *d))
+            .map(|(id, (is_observer, d))| (id.clone(), *is_observer, *d))
             .collect();
         let local = self.cluster_state.digest();
         let requester = RequesterIdentity {

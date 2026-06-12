@@ -665,6 +665,10 @@ where
                             &self.config.secondary_id,
                             timestamp_now(),
                             digest,
+                            // A compute SecondaryCoordinator is never an
+                            // observer (the observer role IS the standalone
+                            // ObserverCoordinator).
+                            false,
                         );
                         if let Err(e) = self.send_to(Destination::All, frame).await {
                             tracing::warn!(
@@ -792,10 +796,14 @@ where
                     // router uses.
                     if let MessageType::StateDigest = msg.msg_type() {
                         if let DistributedMessage::StateDigest {
-                            digest, sender_id, ..
+                            digest,
+                            sender_id,
+                            sender_is_observer,
+                            ..
                         } = msg
                         {
-                            self.reconcile_state_digest(&sender_id, &digest).await;
+                            self.reconcile_state_digest(&sender_id, sender_is_observer, &digest)
+                                .await;
                         }
                         continue;
                     }

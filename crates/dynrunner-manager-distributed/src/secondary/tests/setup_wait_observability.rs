@@ -209,6 +209,7 @@ async fn arrival_at_90s_resets_the_schedule_no_5m_mark() {
                         sender_id: "setup".into(),
                         timestamp: 0.0,
                         digest: ClusterState::<TestId>::new().digest(),
+                        sender_is_observer: false,
                     })
                     .expect("inbound open");
                 tokio::time::sleep(Duration::from_secs(290)).await; // t=380
