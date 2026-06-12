@@ -54,6 +54,7 @@ mod types;
 // (`apply`, `apply_peer`, `apply_tasks`, `accessors`, `events`,
 // `snapshot`, `broadcast`) can read/write them while external callers
 // see only the public method surface.
+pub(crate) use apply_custom::CustomInboxStats;
 pub(crate) use broadcast::{AppliedBatch, apply_locally_for_broadcast};
 pub use snapshot::ClusterStateSnapshot;
 pub use state::ClusterState;

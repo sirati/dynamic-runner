@@ -204,6 +204,15 @@ pub async fn run_pump<I, Tr>(
     let mut ticker = tokio::time::interval(MEMBERSHIP_PUBLISH_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Egress-queue accumulation visibility: the dispatch queue is
+    // deliberately unbounded (a coordinator's `MeshClient::send` must
+    // never block or drop), so a pump that drains slower than the
+    // coordinators produce — the snapshot-flooded-egress production
+    // shape — grows it silently. The watch turns that growth into a
+    // threshold + rate-limited WARN at the owner (this pump).
+    let mut dispatch_depth_watch =
+        dynrunner_protocol_primary_secondary::DepthWatch::with_defaults();
+
     // The egress queue / control channel each close independently; once a
     // `recv()` yields `None` it stays closed forever (left polled it would
     // busy-spin the select), so we gate each arm on its own open flag.
@@ -258,6 +267,17 @@ pub async fn run_pump<I, Tr>(
             maybe_item = dispatch_rx.recv(), if egress_open => {
                 match maybe_item {
                     Some(item) => {
+                        if let Some(depth) = dispatch_depth_watch
+                            .observe(dispatch_rx.len(), std::time::Instant::now())
+                        {
+                            tracing::warn!(
+                                queued_dispatches = depth,
+                                "mesh-pump egress queue is accumulating: the \
+                                 pump drains slower than the coordinators \
+                                 queue (ingress is starving meanwhile); \
+                                 memory grows with every queued frame"
+                            );
+                        }
                         // Capture the envelope identity BEFORE the apply
                         // consumes the item: a failed apply is this frame's
                         // TERMINAL drop (the coordinator's `MeshClient::send`

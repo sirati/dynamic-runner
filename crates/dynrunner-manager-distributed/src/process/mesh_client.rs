@@ -266,4 +266,13 @@ impl<I: Identifier> RoleInbox<I> {
     pub fn try_recv(&mut self) -> Option<DistributedMessage<I>> {
         self.rx.try_recv().ok()
     }
+
+    /// Frames currently queued in this inbox — the accumulation-
+    /// visibility read for the periodic collection-stats line. A
+    /// drained loop holds ~zero; a persistently-growing depth means
+    /// the owning coordinator is starved against its ingress rate
+    /// (every queued frame is retained, cold, until processed).
+    pub fn depth(&self) -> usize {
+        self.rx.len()
+    }
 }
