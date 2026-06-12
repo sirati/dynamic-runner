@@ -201,23 +201,59 @@ impl CleanupGuard {
         self.job_cancel_armed = false;
     }
 
-    /// Apply the run-boundary hand-off rule: disarm IFF `coord.run()`
-    /// returned successfully. This is the single source of truth for
-    /// "when does the setup guard hand the cohort off to fleet
-    /// self-termination" — `run_ok` is the verdict-broadcast proof.
+    /// Apply the run-boundary hand-off rule. `run_ok` (the
+    /// verdict-broadcast proof, mirroring the in-process
+    /// `fire_on_run_end(task, run_outcome.is_ok())`) is the single source
+    /// of truth for whether `coord.run()` reached a terminal:
     ///
-    /// Encapsulating the rule (rather than an inline
-    /// `run_outcome?; disarm_job_cancel()`) makes the ORDERING explicit
-    /// and impossible to regress: the bug it fixes was a disarm sequenced
-    /// BEFORE `run()`, which dropped the still-allocated cohort on a
-    /// bring-up fatal. A `false` here is a no-op — the guard stays armed
-    /// so its `Drop` scancels the stranded ids. Mirrors the in-process
-    /// `fire_on_run_end(task, run_outcome.is_ok())` discriminator the
-    /// caller already computes for the consumer hook.
+    /// * `run_ok == true` — the run reached a verdict-broadcast terminal.
+    ///   The WELCOMED fleet self-terminates off the CRDT terminal, but a
+    ///   never-welcomed PENDING respawn (and any SLURM-requeued ghost)
+    ///   does NOT — it has no mesh leg observing the verdict, so it idles
+    ///   to its 600s give-up, squatting a node. So run the VERIFIED sweep
+    ///   ([`cancel_all_jobs`](crate ... `cancel_all_jobs_verified`)) over
+    ///   the ledger: it squeue-filters first, so a self-terminating member
+    ///   (already COMPLETING/COMPLETED/gone) is skipped, and only the
+    ///   still-queued/running stragglers are scancelled. Then disarm so
+    ///   `Drop` does not re-sweep.
+    /// * `run_ok == false` — an abnormal terminal (BringUpFailed, the
+    ///   cluster-collapse strand, a pre-phase abort). No verdict was
+    ///   broadcast, so leave the guard ARMED: `Drop` scancels the whole
+    ///   stranded cohort. (No-op here.)
+    ///
+    /// The bug the explicit ordering guards against is a disarm sequenced
+    /// BEFORE `run()` — that dropped the still-allocated cohort on a
+    /// bring-up fatal. The sweep runs THROUGH the live gateway, before
+    /// the gateway disconnect in `Drop`.
     pub(super) fn disarm_on_run_success(&mut self, run_ok: bool) {
         if run_ok {
+            self.sweep_clean_completion();
             self.disarm_job_cancel();
         }
+    }
+
+    /// Verified-cancel sweep at CLEAN completion: drain the framework's
+    /// job ledger (the manager's tracked `job_ids` — initial cohort AND
+    /// every respawn replacement, since the respawn provider drives the
+    /// SAME manager), scancel only what squeue still reports
+    /// queued/running, and re-verify. Self-terminated fleet members drop
+    /// out on the first squeue poll (no scancel issued, no wait); the
+    /// PENDING respawn / requeued ghost that never joined the mesh is the
+    /// one thing left squatting a node, and it gets cancelled here instead
+    /// of idling to its give-up. A `None` `job_manager` (remote-podman, no
+    /// sbatch) is a no-op.
+    fn sweep_clean_completion(&self) {
+        let Some(jm) = self.job_manager.as_ref() else {
+            return;
+        };
+        Python::attach(|py| {
+            if let Err(e) = jm.bind(py).call_method0("cancel_all_jobs") {
+                tracing::warn!(
+                    error = ?e,
+                    "clean-completion job_manager.cancel_all_jobs() sweep failed",
+                );
+            }
+        });
     }
 }
 
@@ -412,10 +448,14 @@ mod cleanup_guard_tests {
     //!      before submission) → `Drop` never touches a job manager.
     //!
     //! Run-boundary hand-off rule (`disarm_on_run_success`), pinned by
-    //! [`run_success_disarms_fleet_self_terminates`] and
+    //! [`run_success_sweeps_ledger_for_never_joined_stragglers`] and
     //! [`bringup_fatal_after_preparation_scancels_cohort`]:
-    //!   4. `coord.run()` returned Ok → disarm → `Drop` no-cancel (the
-    //!      verdict-broadcast fleet self-terminates).
+    //!   4. `coord.run()` returned Ok → run the VERIFIED ledger sweep, then
+    //!      disarm. The welcomed fleet self-terminates off the verdict, but
+    //!      a never-joined PENDING respawn / SLURM-requeued ghost does not,
+    //!      so the sweep cancels it (squeue-filtered at the Rust layer:
+    //!      self-terminated members are skipped — pinned in
+    //!      `dynrunner-slurm`'s `cancel_verify.rs`).
     //!   5. `coord.run()` RAISED (BringUpFailed-shaped, after preparation
     //!      succeeded) → guard stays ARMED → `Drop` scancels the cohort.
     //!      This is the run_161034 orphan repro: RED if the disarm is
@@ -423,8 +463,10 @@ mod cleanup_guard_tests {
     //!
     //! Revert-check: case (1) fails if the arm/disarm + Drop step-0 is
     //! removed — an un-armed guard never calls `cancel_all_jobs`, so the
-    //! orphaned-fleet defect resurfaces. Case (5) fails if the disarm
-    //! moves back ahead of (or off the success-conditional of) `run()`.
+    //! orphaned-fleet defect resurfaces. Case (4) fails if the clean-
+    //! completion sweep is dropped (a never-joined respawn idles to its
+    //! give-up). Case (5) fails if the disarm moves back ahead of (or off
+    //! the success-conditional of) `run()`.
     //!
     //! Tests require an embedded CPython interpreter; gated behind the
     //! `test-with-python` feature. Invoke as:
@@ -617,28 +659,48 @@ mod cleanup_guard_tests {
     }
 
     /// RUN-BOUNDARY, SUCCESS: preparation succeeded, the cohort is armed,
-    /// and `coord.run()` returned Ok (a verdict-broadcast terminal — the
-    /// welcomed fleet observes the CRDT terminal and exits on its own).
-    /// `disarm_on_run_success(true)` hands the cohort off, so the
-    /// subsequent `Drop` leaves the self-terminating jobs alone. Pins the
-    /// no-spurious-cancel side of the rule.
+    /// and `coord.run()` returned Ok (a verdict-broadcast terminal). The
+    /// welcomed fleet self-terminates off the CRDT terminal, but a
+    /// never-welcomed PENDING respawn (or a SLURM-requeued ghost) does NOT
+    /// — it has no mesh leg observing the verdict and would idle to its
+    /// give-up. So `disarm_on_run_success(true)` runs the VERIFIED sweep
+    /// over the ledger before disarming. Here the stub's `cancel_all_jobs`
+    /// records every tracked id (it does not model squeue); the real
+    /// sweep squeue-filters so self-terminated members are skipped and
+    /// only still-queued stragglers are scancelled — that discrimination
+    /// is pinned in `dynrunner-slurm`'s `cancel_verify.rs`. This test pins
+    /// the guard's half of the contract: clean completion INVOKES the
+    /// ledger sweep (it no longer leaves the ledger untouched).
     #[test]
-    fn run_success_disarms_fleet_self_terminates() {
+    fn run_success_sweeps_ledger_for_never_joined_stragglers() {
         let (gateway, job_manager, globals) = make_doubles(&["501", "502"]);
         Python::attach(|py| {
             let mut guard = CleanupGuard::new(gateway.clone_ref(py));
             // Armed across `run()` (preparation succeeded, cohort live).
             guard.arm_job_cancel(job_manager.clone_ref(py));
             // `coord.run()` returned Ok → the run-boundary hand-off rule
-            // disarms (mirrors `drive_rust_primary`'s
+            // runs the verified ledger sweep (mirrors `drive_rust_primary`'s
             // `guard.disarm_on_run_success(run_outcome.is_ok())`).
             guard.disarm_on_run_success(true);
-            drop(guard);
 
-            assert!(
-                cancelled_ids(py, &globals).is_empty(),
-                "a run that reached a verdict-broadcast terminal must NOT \
-                 be scancelled — the fleet self-terminates",
+            // The sweep was invoked exactly once at the hand-off (BEFORE
+            // Drop). A second invocation in Drop would duplicate the ids —
+            // assert the single sweep here, then prove Drop adds nothing.
+            assert_eq!(
+                cancelled_ids(py, &globals),
+                vec!["501", "502"],
+                "clean completion must run the verified ledger sweep so a \
+                 never-joined PENDING respawn / ghost is cancelled, not left \
+                 idling to its give-up",
+            );
+
+            drop(guard);
+            // Drop must NOT re-sweep (the guard disarmed after the sweep);
+            // the recorded ids stay exactly the single sweep's set.
+            assert_eq!(
+                cancelled_ids(py, &globals),
+                vec!["501", "502"],
+                "Drop must not double-sweep after the clean-completion sweep",
             );
         });
     }

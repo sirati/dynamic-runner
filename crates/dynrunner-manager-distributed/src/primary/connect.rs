@@ -517,11 +517,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// consults: may proactive dispatch push work to `secondary_id`, or
     /// is it a half-joined member whose mesh leg never confirmed?
     ///
-    /// Returns `true` (assignable) iff the member has confirmed its
-    /// peer-mesh leg formed (`mesh_ready_secondaries` — a `MeshReady`
-    /// was received from it). Nothing else counts: keepalives are
-    /// liveness, not leg confirmation, and "never dispatched to" is not
-    /// proof of a working leg.
+    /// Returns `true` (assignable) iff the member's frames provably
+    /// reach this primary:
+    ///
+    ///   * the member is CO-LOCATED with this primary (its peer-id IS
+    ///     `config.node_id` — the same-host worker-secondary of a
+    ///     promoted/compute-peer primary). Its frames ride the
+    ///     in-process loopback (`Mesh::deliver_local`), so there is no
+    ///     wire leg for a `MeshReady` to prove — co-location is
+    ///     structural confirmation. This mirrors the self-exclusion
+    ///     `wait_for_mesh_ready` applies to its expected set ("a node
+    ///     never emits MeshReady ABOUT ITSELF to itself") — demanding a
+    ///     self round-trip left the lone-survivor acting primary
+    ///     (run_20260612_035452) vetoing the ONLY dispatchable workers
+    ///     until the co-located secondary finished consuming the setup
+    ///     trio and its loopbacked report landed; OR
+    ///   * the member has confirmed its peer-mesh leg formed
+    ///     (`mesh_ready_secondaries` — a `MeshReady` was received from
+    ///     it).
+    ///
+    /// Nothing else counts: keepalives are liveness, not leg
+    /// confirmation, and "never dispatched to" is not proof of a
+    /// working leg.
     ///
     /// # Single owner of the dispatch readiness gate
     ///
@@ -563,7 +580,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///
     /// The SOLE writer of `mesh_ready_secondaries` is
     /// [`Self::handle_mesh_ready`] (unconditional, so a late `MeshReady`
-    /// recovers the member into the assignable set).
+    /// recovers the member into the assignable set). The set is
+    /// deliberately NOT cleared on a member's removal: a re-admission is
+    /// keyed on FRAME INGEST from that member (its frames demonstrably
+    /// reached this primary again), which is the same delivery-proof
+    /// class as a `TaskRequest`'s arrival — so a re-admitted member's
+    /// surviving confirmation is backed by fresh evidence, while the
+    /// member itself (never knowing it was removed) would never re-send
+    /// a `MeshReady` that a cleared entry would wait on.
     ///
     /// Read by [`Self::should_skip_worker_for_dispatch`] — the single
     /// owner of the per-worker dispatch-skip decision — so BOTH
@@ -571,7 +595,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// `handle_task_request`) gate on this ONE predicate without either
     /// site knowing the mesh-readiness rule.
     pub(super) fn member_mesh_confirmed(&self, secondary_id: &str) -> bool {
-        self.mesh_ready_secondaries.contains(secondary_id)
+        secondary_id == self.config.node_id || self.mesh_ready_secondaries.contains(secondary_id)
     }
 
     pub(super) async fn handle_welcome(&mut self, msg: DistributedMessage<I>) {
@@ -636,6 +660,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // batch below). `worker_count` is `Copy`; `resources` is
             // cloned once.
             let advertised_resources = resources.clone();
+            // Record this secondary's node (its advertised hostname) so a
+            // later respawn for it can exclude the node from the
+            // replacement's sbatch. Kept in a map that OUTLIVES the
+            // connection (the death path purges `secondaries` before the
+            // respawn dispatch runs), so this is the surviving source of
+            // the dead member's node. Skip an empty hostname — a blank
+            // `--exclude=` would hard-error sbatch; absence just means the
+            // node is unknown and the replacement places unconstrained.
+            if !hostname.is_empty() {
+                self.secondary_nodes
+                    .insert(secondary_id.clone(), hostname.clone());
+            }
             if fresh_member {
                 let conn = SecondaryConnection::new(secondary_id.clone());
                 let conn = conn.receive_welcome(

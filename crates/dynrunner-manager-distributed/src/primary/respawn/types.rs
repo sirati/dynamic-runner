@@ -14,6 +14,13 @@ pub struct SecondarySpawnSpec {
     pub new_secondary_id: String,
     pub primary_endpoint: String,
     pub primary_pubkey_pem: String,
+    /// The dead member's node, when the primary knows it (recorded from
+    /// the original's welcome and surviving its removal). A provider that
+    /// places jobs on named nodes (the SLURM spawner) excludes it so the
+    /// replacement never re-inherits a NODE_FAIL/hardware-faulty node.
+    /// `None` when the node is unknown — the provider then places without
+    /// constraint. Best-effort: correctness never depends on it.
+    pub exclude_node: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

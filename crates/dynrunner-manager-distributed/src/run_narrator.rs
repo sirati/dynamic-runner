@@ -115,11 +115,10 @@ pub struct RunNarrator {
     failover_seeded: bool,
     /// The currently-known-live REMOTE worker-secondary roster — every
     /// [`ClusterState::alive_secondary_members`] id that is NOT the recognised
-    /// primary (the same `id != current_primary` cut
-    /// [`ClusterState::alive_remote_secondary_count`] applies, so the
-    /// primary's OWN co-located worker-secondary is never narrated as a peer:
-    /// its departure is the primary-left event below, not a secondary
-    /// departure). Maintained across observes so a set-difference against the
+    /// primary (an `id != current_primary` cut owned HERE, purely for
+    /// narration framing: the primary's OWN co-located worker-secondary is
+    /// never narrated as a peer — its departure is the primary-left event
+    /// below, not a secondary departure). Maintained across observes so a set-difference against the
     /// freshly-read live set yields the departures (peer-lost) and the
     /// post-establishment joins (peer-rejoined). The membership ledger is
     /// STICKY (a `PeerRemoved` id is `Dead` forever and can never re-`Alive`),
@@ -465,8 +464,8 @@ impl RunNarrator {
 
         // The REMOTE worker-secondary live set: every alive worker-secondary
         // EXCEPT the recognised primary's own co-located secondary capability
-        // (the `id != current_primary` cut `alive_remote_secondary_count`
-        // applies). So the primary's own departure is the primary-left event,
+        // (an `id != current_primary` cut owned here for narration framing).
+        // So the primary's own departure is the primary-left event,
         // and a secondary's PROMOTION (it leaves this set because it became
         // the primary) is the primary-changed event — neither is ever a
         // secondary departure.

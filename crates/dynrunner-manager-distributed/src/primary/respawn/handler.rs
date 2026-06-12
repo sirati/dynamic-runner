@@ -256,10 +256,16 @@ where
         }
 
         let new_id = self.mint_secondary_id();
+        // The dead member's node, recorded from its welcome and surviving
+        // its removal (`secondary_nodes`). When known, the spawner excludes
+        // it so the replacement never re-inherits a NODE_FAIL/faulty node;
+        // when unknown the replacement places unconstrained (best-effort).
+        let exclude_node = self.secondary_nodes.get(&request.original_id).cloned();
         let spec = SecondarySpawnSpec {
             new_secondary_id: new_id.clone(),
             primary_endpoint: self.respawn_primary_endpoint.clone(),
             primary_pubkey_pem: self.respawn_primary_pubkey_pem.clone(),
+            exclude_node,
         };
 
         // Record the accepted event on the REPLICATED ledger NOW —

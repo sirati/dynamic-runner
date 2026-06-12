@@ -6,7 +6,7 @@
 //!   (a) `rebroadcast_full_roster` re-emits the FULL per-secondary roster
 //!       post-mesh, healing a failover-promoted secondary that inherited
 //!       an INCOMPLETE `secondary_capacities` mirror (so it rebuilds the
-//!       full worker roster + correct `alive_remote_secondary_count`, no
+//!       full worker roster + correct `alive_worker_secondary_count`, no
 //!       premature fleet-dead).
 //!   (b) the primary ANSWERS `RequestClusterSnapshot` (unicasts a
 //!       `ClusterSnapshot` of its complete ledger + originates the
@@ -78,11 +78,11 @@ fn drain_first_cluster_mutation(
 /// (sec-0, sec-1) connect to a complete primary; a promotion-bound sec-0
 /// inherited an INCOMPLETE mirror (it missed sec-1's `SecondaryCapacity`
 /// + `PeerJoined`). Pre-rebroadcast its reconstructed roster undercounts
-/// (only sec-0's workers; `alive_remote_secondary_count` == 0). Running
+/// (only sec-0's workers; `alive_worker_secondary_count` == 0). Running
 /// the complete primary's `rebroadcast_full_roster` ships the full roster;
 /// applying it to sec-0's mirror heals BOTH secondaries, so a promotion
 /// reconstructs the FULL worker roster and the correct
-/// `alive_remote_secondary_count` — no premature fleet-dead.
+/// `alive_worker_secondary_count` — no premature fleet-dead.
 #[tokio::test(flavor = "current_thread")]
 async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
     let local = tokio::task::LocalSet::new();
@@ -172,7 +172,7 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
             }
 
             // Pre-heal: the reconstructed worker roster undercounts (only
-            // sec-0's 2 slots), and `alive_remote_secondary_count` is 0
+            // sec-0's 2 slots), and `alive_worker_secondary_count` is 0
             // (sec-1 not yet a known alive worker-secondary). A promotion
             // here would arm fleet-dead prematurely.
             promoted.reconstruct_workers_from_cluster_state();
@@ -184,9 +184,9 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
             assert_eq!(
                 promoted
                     .cluster_state_for_test()
-                    .alive_remote_secondary_count(),
+                    .alive_worker_secondary_count(),
                 1,
-                "pre-heal only sec-0 is known so the remote-secondary count undercounts \
+                "pre-heal only sec-0 is known so the worker-secondary count undercounts \
                  (sec-1 missing)"
             );
 
@@ -207,7 +207,7 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
 
             // Post-heal: a fresh promotion reconstructs the FULL roster
             // (sec-0's 2 + sec-1's 3 = 5 slots) and the correct
-            // `alive_remote_secondary_count` (both worker-secondaries are
+            // `alive_worker_secondary_count` (both worker-secondaries are
             // now known + alive) — no premature fleet-dead.
             promoted.reconstruct_workers_from_cluster_state();
             assert_eq!(
@@ -218,7 +218,7 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
             assert_eq!(
                 promoted
                     .cluster_state_for_test()
-                    .alive_remote_secondary_count(),
+                    .alive_worker_secondary_count(),
                 2,
                 "post-heal both worker-secondaries are known + alive"
             );

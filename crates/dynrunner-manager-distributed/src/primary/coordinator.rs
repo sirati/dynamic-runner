@@ -749,12 +749,12 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     pub(super) backpressured_secondaries: HashMap<String, Instant>,
 
     /// First moment (operational-loop iteration) where
-    /// `self.secondaries` became empty while the pool still has
-    /// pending work. Cleared whenever a secondary is present
-    /// (handle_welcome reconnect, etc.). After
-    /// `config.fleet_dead_timeout` of continuous emptiness, the
-    /// operational loop exits cleanly with pending tasks moved
-    /// into `failed_tasks`. See `fleet_dead_timeout` docs for the
+    /// `cluster_state.alive_worker_secondary_count()` read zero while
+    /// the pool still has pending work. Cleared whenever an alive
+    /// worker-secondary is present again (re-handshake / partial fleet
+    /// survival). After `config.fleet_dead_timeout` of continuous
+    /// emptiness, the operational loop exits cleanly with the queued
+    /// tasks left stranded. See `fleet_dead_timeout` docs for the
     /// rationale.
     pub(super) fleet_dead_since: Option<Instant>,
 
@@ -1019,6 +1019,18 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// squatter case — `SecondarySpawner::revoke` is issued).
     /// Size is bounded by `RespawnBudget::max_total`.
     pub(super) pending_replacements: std::collections::HashMap<String, String>,
+
+    /// Per-secondary node (the hostname advertised in the welcome).
+    /// Recorded at welcome and DELIBERATELY NOT purged on removal — the
+    /// death path drops the `secondaries` connection entry before the
+    /// respawn request even reaches the operational loop, so a lookup
+    /// against `secondaries` at dispatch time would always miss. This
+    /// map outlives the connection precisely so a respawn dispatch can
+    /// read the dead member's node and exclude it from the replacement's
+    /// sbatch (see `respawn::dispatch_respawn_request`). A re-welcomed id
+    /// overwrites its own entry. Bounded by the lifetime membership set
+    /// (one entry per distinct secondary id the run ever welcomes).
+    pub(super) secondary_nodes: std::collections::HashMap<String, String>,
 
     /// Receiver side of the liveness-beacon listener → operational-loop
     /// channel. The [`crate::liveness::LivenessListener`] (bound on this
@@ -1452,6 +1464,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             respawn_lifecycle_tx: None,
             respawn_lifecycle_rx: None,
             pending_replacements: std::collections::HashMap::new(),
+            secondary_nodes: std::collections::HashMap::new(),
             liveness_ping_rx: None,
             beacon_target: crate::liveness::BeaconTarget::new(),
             peer_liveness_addrs: crate::liveness::PeerLivenessAddrs::new(),

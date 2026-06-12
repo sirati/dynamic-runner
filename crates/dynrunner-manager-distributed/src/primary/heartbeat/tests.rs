@@ -1037,8 +1037,8 @@ async fn oracle_true_when_only_silent_held_work_remains() {
 /// (the host's own secondary is still processing but briefly silent) reporting
 /// self here would yank the self's LIVE in-flight task before the next
 /// keepalive refreshes the clock and before the hard backstop. The identity
-/// filter (`id != current_primary`, the same cut `alive_remote_secondary_count`
-/// uses) excludes that single same-peer entry by IDENTITY. The hard backstop
+/// filter (`id != current_primary`, owned by `silent_secondary_ids` for the
+/// early-requeue concern) excludes that single same-peer entry by IDENTITY. The hard backstop
 /// is deliberately left unfiltered — this guard is the EARLY (WARN-only) path.
 ///
 /// The schedule here puts the hard backstop far above the sleep (HARD at 10x =

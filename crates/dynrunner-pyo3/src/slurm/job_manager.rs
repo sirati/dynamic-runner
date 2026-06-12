@@ -424,6 +424,9 @@ impl PyRustSlurmJobManager {
                         &secondary_id,
                         nodes,
                         &run_log_dir,
+                        // Initial-cohort submission: no member has died,
+                        // so there is no node to exclude.
+                        None,
                     )
                     .await
                     .map_err(slurm_err_to_py)

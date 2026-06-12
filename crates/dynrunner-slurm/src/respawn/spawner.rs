@@ -153,6 +153,10 @@ where
         let tunnel_establisher = Arc::clone(&self.tunnel_establisher);
         let run_log_dir = self.run_log_dir.clone();
         let secondary_id = spec.new_secondary_id.clone();
+        // The dead member's node, carried on the spec — excluded from the
+        // replacement's sbatch when known so it never lands back on a
+        // NODE_FAIL/faulty node. `None` places without constraint.
+        let exclude_node = spec.exclude_node.clone();
         let replacement_jobs = Arc::clone(&self.replacement_jobs);
 
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), SpawnError>>();
@@ -181,6 +185,7 @@ where
                         &secondary_id,
                         1,
                         &run_log_dir,
+                        exclude_node.as_deref(),
                     )
                     .await
                 {

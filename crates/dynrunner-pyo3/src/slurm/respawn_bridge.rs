@@ -54,8 +54,8 @@ impl PySlurmSpawner {
     /// `job_manager` is the same `Arc<Mutex<SlurmJobManager<...>>>` the
     /// initial-cohort sbatch submit-loop drove (parked on the
     /// coordinator via `set_slurm_job_manager_from_rust`).
-    /// `preparation` is the `Arc<SlurmPreparation>` whose
-    /// `setup_ssh_tunnels` populated the initial-cohort tunnel set —
+    /// `preparation` is the `Arc<SlurmPreparation>` whose cohort
+    /// establishment populated the initial-cohort tunnel set —
     /// sharing it means a respawn's `establish_one_tunnel` joins the
     /// same `ssh_tunnels` cleanup Vec and `establish_pool`
     /// rate-limiter. `wrapper_script_generator` synthesises the
@@ -227,6 +227,7 @@ mod tests {
             primary_endpoint: "127.0.0.1:5555".to_owned(),
             primary_pubkey_pem: "-----BEGIN PUBLIC KEY-----\nABC\n-----END PUBLIC KEY-----\n"
                 .to_owned(),
+            exclude_node: None,
         };
         let body = generator(&spec).expect("closure must render");
         assert!(
