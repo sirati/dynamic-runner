@@ -12,7 +12,8 @@ use dynrunner_manager_distributed::process::{
     LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal, SeedSource,
 };
 use dynrunner_manager_distributed::{
-    PrimaryConfig, PrimaryCoordinator, RunError, SecondaryConfig, SecondaryCoordinator,
+    GracefulAbortTrigger, PrimaryConfig, PrimaryCoordinator, RunError, SecondaryConfig,
+    SecondaryCoordinator,
 };
 use dynrunner_protocol_primary_secondary::address::PeerId;
 
@@ -369,6 +370,19 @@ impl PyDistributedManager {
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async {
                 let mut sec_handles = Vec::new();
+
+                // Arm the operator's SIGUSR2 graceful-abort trigger FIRST —
+                // before the mesh build and the fleet bring-up — so a signal
+                // sent during the in-process primary's bootstrap window is
+                // latched instead of killing the process via the kernel's
+                // default disposition. Exactly ONE `user_defined2` stream per
+                // process: armed here, injected into the setup-peer primary
+                // below (`register_graceful_abort_trigger`); the in-process
+                // secondaries never consume it (the primary IS the abort
+                // authority). A latched delivery initiates the graceful abort
+                // on the primary's first poll, and rides the observer handoff
+                // if the setup peer relocates.
+                let mut abort_trigger = Some(GracefulAbortTrigger::arm());
 
                 // Build the FULL N+1-node mpsc peer mesh up front via the
                 // EXISTING all-to-all builder (`transport-channel::peer_mesh`):
@@ -996,6 +1010,15 @@ impl PyDistributedManager {
                     );
                 if let Some(rx) = panik_watcher.take_signal_rx() {
                     primary.register_panik_signal_rx(rx);
+                }
+
+                // Hand the entry-armed SIGUSR2 trigger to the setup-peer
+                // primary (taken exactly once). Its operational loop's
+                // graceful-abort arm consumes it during the pre-relocate
+                // window; on relocation `into_observer_handoff` carries it
+                // onto the standalone observer.
+                if let Some(trigger) = abort_trigger.take() {
+                    primary.register_graceful_abort_trigger(trigger);
                 }
 
                 // Initial staging is now driven by

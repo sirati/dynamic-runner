@@ -43,20 +43,34 @@ use crate::primary::PrimaryCoordinator;
 use super::promotion::RelocationPolicy;
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
-    /// React to an observer's `GracefulAbortRequest` frame: originate the
-    /// replicated [`ClusterMutation::GracefulAbortRequested`] sticky latch
-    /// (apply locally + broadcast fleet-wide) and emit the operator-facing
-    /// important event. Idempotent: a re-sent request against an
-    /// already-latched freeze is a silent NoOp (the apply filter drops it
-    /// off the wire too), so operator re-triggering / at-least-once
-    /// delivery never re-announces.
+    /// React to an observer's `GracefulAbortRequest` frame: delegate to
+    /// [`Self::initiate_graceful_abort`] with the requesting node's id.
+    /// The wire frame is the zero-authority observer's ONE management
+    /// command; a primary that receives the operator's SIGUSR2 directly
+    /// drives the SAME initiation via its signal arm (it IS the abort
+    /// authority — no wire request needed).
     pub(crate) async fn handle_graceful_abort_request(&mut self, msg: DistributedMessage<I>) {
         let DistributedMessage::GracefulAbortRequest { sender_id, .. } = msg else {
             return;
         };
+        self.initiate_graceful_abort(&sender_id).await;
+    }
+
+    /// THE single graceful-abort initiation: originate the replicated
+    /// [`ClusterMutation::GracefulAbortRequested`] sticky latch (apply
+    /// locally + broadcast fleet-wide) and emit the operator-facing
+    /// important event. `requested_by` names the originator (an observer's
+    /// `sender_id` for a wire request, this primary's own node id for a
+    /// SIGUSR2 self-trigger) and rides the milestone log only.
+    ///
+    /// Idempotent: a re-sent request against an already-latched freeze is a
+    /// silent NoOp (the apply filter drops it off the wire too), so operator
+    /// re-triggering / at-least-once delivery / a SIGUSR2 racing a wire
+    /// request never re-announces.
+    pub(crate) async fn initiate_graceful_abort(&mut self, requested_by: &str) {
         if self.cluster_state.graceful_abort_requested() {
             tracing::debug!(
-                requested_by = %sender_id,
+                requested_by = %requested_by,
                 "graceful-abort request received but the freeze is already latched; NoOp"
             );
             return;
@@ -67,7 +81,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // own copy off the replicated latch).
         tracing::warn!(
             target: super::super::important_events::IMPORTANT_TARGET,
-            requested_by = %sender_id,
+            requested_by = %requested_by,
             "graceful abort requested — dispatch frozen; running tasks will \
              complete, each secondary tears down as it drains, and the run \
              ends with the graceful-abort verdict"
