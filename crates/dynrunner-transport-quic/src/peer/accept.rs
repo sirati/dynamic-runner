@@ -21,6 +21,29 @@ use super::{AcceptedPeer, DisconnectedPeer};
 /// Handler-provenance tag carried by the framed-IO pump logs.
 const CTX: &str = "peer-accepted";
 
+/// First-frame identification: the dialer's identity is its first
+/// frame's `sender_id` — the key the connection registers under in
+/// `connections` and the address every directed reply routes by. An
+/// EMPTY sender cannot identify a leg: registering it would key the
+/// connection under peer `""`, silently mis-routing every frame
+/// addressed to the dialer's real id (the anonymous-joiner production
+/// shape). Refuse the connection LOUDLY — a conformant dialer's first
+/// frame always carries its real id, so an empty one is a sender-side
+/// identity bug the mesh must surface, not absorb.
+fn identified_peer_id<I: Identifier>(first_msg: &DistributedMessage<I>) -> Option<String> {
+    let peer_id = first_msg.sender_id();
+    if peer_id.is_empty() {
+        tracing::warn!(
+            kind = ?first_msg.msg_type(),
+            "inbound connection's first frame carries an EMPTY sender_id — \
+             cannot identify the peer; dropping the connection (an anonymous \
+             leg would mis-route every directed frame for the dialer)"
+        );
+        return None;
+    }
+    Some(peer_id.to_string())
+}
+
 // PER-CONNECTION failures never end an accept loop. The pre-fix loops
 // awaited the whole handshake inside `listener.accept()` and broke on
 // ANY `Err` — but that `Err` conflated per-connection faults (a TCP
@@ -88,7 +111,9 @@ async fn handle_accepted_quic<I: Identifier>(
         Some(msg) => msg,
         None => return,
     };
-    let peer_id = first_msg.sender_id().to_string();
+    let Some(peer_id) = identified_peer_id(&first_msg) else {
+        return;
+    };
 
     // Per-connection chunk reassembly, created BEFORE the first frame
     // is resolved: if the dialer's first frame is chunk 0 of an
@@ -163,7 +188,9 @@ async fn handle_accepted_wss<I: Identifier>(
         Some(msg) => msg,
         None => return,
     };
-    let peer_id = first_msg.sender_id().to_string();
+    let Some(peer_id) = identified_peer_id(&first_msg) else {
+        return;
+    };
 
     // Per-connection chunk reassembly across the identify→pump
     // boundary — see `handle_accepted_quic`.

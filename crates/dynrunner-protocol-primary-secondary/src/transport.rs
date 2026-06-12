@@ -68,6 +68,17 @@ pub enum JoinError {
     /// snapshot request. The wrapped string is the transport's
     /// error message verbatim.
     SendFailed(String),
+    /// The transport's [`PeerTransport::local_id`] is EMPTY, so the
+    /// bootstrap RPC has no return address: every responder would reply
+    /// to peer `""` (undeliverable / mis-routed), the joiner's mesh legs
+    /// would be registered ANONYMOUSLY by the receivers' first-frame
+    /// identification, and the responder-originated `PeerJoined` would
+    /// record a phantom `""` member. A join without an identity can only
+    /// produce a half-joined zombie, so it is refused UP FRONT — loud
+    /// and terminal — instead of soaking the bootstrap budget. A
+    /// transport that participates in the snapshot-bootstrap rendezvous
+    /// MUST override `local_id` (see its doc).
+    MissingLocalIdentity,
 }
 
 impl std::fmt::Display for JoinError {
@@ -87,6 +98,12 @@ impl std::fmt::Display for JoinError {
                  unanswered for the whole window)"
             ),
             Self::SendFailed(e) => write!(f, "join_running_cluster: failed to send request: {e}"),
+            Self::MissingLocalIdentity => f.write_str(
+                "join_running_cluster: the transport's local_id() is empty — the bootstrap \
+                 RPC would carry no return address (replies route to peer \"\" and the \
+                 joiner's legs register anonymously); the joining transport must override \
+                 PeerTransport::local_id with its real peer-id",
+            ),
         }
     }
 }
@@ -325,9 +342,16 @@ pub trait PeerTransport<I: Identifier> {
     /// path never needs a self-identifying return address (any
     /// transport that pre-wires its
     /// mesh) compile cleanly without overriding. A transport that
-    /// participates in the snapshot-bootstrap rendezvous overrides to
-    /// return its real id so the responder's `PeerJoined` broadcast
-    /// carries the truthful joiner id.
+    /// participates in the snapshot-bootstrap rendezvous MUST override
+    /// to return its real id: the value is the request's `sender_id` —
+    /// the address every responder REPLIES to, the key the remote
+    /// accept loop registers this node's mesh leg under (first-frame
+    /// identification), and the id the responder's `PeerJoined`
+    /// broadcast records. [`Self::join_running_cluster`] refuses an
+    /// empty identity up front ([`JoinError::MissingLocalIdentity`]):
+    /// a de-role refactor once dropped the QUIC override and production
+    /// joiners bootstrapped as the phantom peer `""` — replies
+    /// undeliverable, membership recording a nameless member.
     fn local_id(&self) -> &str {
         ""
     }
@@ -420,6 +444,19 @@ pub trait PeerTransport<I: Identifier> {
         I: 'static,
     {
         async move {
+            // Step 0: identity gate. The bootstrap RPC's `sender_id` is
+            // the joiner's return address AND the id receivers key its
+            // mesh legs under (first-frame identification) AND the
+            // member id the responders' `PeerJoined` records. An EMPTY
+            // id poisons all three — replies route to peer `""`, the
+            // legs register anonymously, membership records a phantom —
+            // and the failure is otherwise SILENT (a lucky direct leg
+            // can even deliver one reply, sliding the joiner into a
+            // half-joined zombie instead of a loud error). Refuse it
+            // before any wire work.
+            if self.local_id().is_empty() {
+                return Err(JoinError::MissingLocalIdentity);
+            }
             // Step 1: dial. No-op for pre-wired transports (channel
             // mesh, tests); real work for `PeerNetwork`.
             self.connect_to_peers(seed).await;
@@ -643,5 +680,86 @@ pub trait PeerTransport<I: Identifier> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PeerConnectionInfo;
+
+    /// A transport that LOOKS healthy (one connected peer, sends accepted)
+    /// but keeps the trait-default empty `local_id` — the exact shape the
+    /// QUIC `PeerNetwork` regressed into when a de-role refactor deleted
+    /// its override. Records whether any wire work happened so the guard
+    /// test can pin "refused BEFORE the wire".
+    struct AnonymousTransport {
+        sends: usize,
+    }
+
+    impl PeerTransport<String> for AnonymousTransport {
+        async fn broadcast(&mut self, _msg: DistributedMessage<String>) -> Result<(), String> {
+            self.sends += 1;
+            Ok(())
+        }
+        async fn send_to_peer(
+            &mut self,
+            _peer_id: &str,
+            _msg: DistributedMessage<String>,
+        ) -> Result<(), String> {
+            self.sends += 1;
+            Ok(())
+        }
+        async fn recv_peer(&mut self) -> Option<DistributedMessage<String>> {
+            std::future::pending().await
+        }
+        fn try_recv_peer(&mut self) -> Option<DistributedMessage<String>> {
+            None
+        }
+        fn peer_count(&self) -> usize {
+            1
+        }
+        fn has_peer(&self, _id: &PeerId) -> bool {
+            true
+        }
+        async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
+    }
+
+    /// An identity-less transport must be refused at the join ENTRY —
+    /// the typed [`JoinError::MissingLocalIdentity`], zero requests sent,
+    /// no budget soaked. Pre-guard, this shape sent anonymous requests
+    /// (`sender_id: ""`) whose replies could never route back: the
+    /// bootstrap either died `Timeout` at its deadline or — when one
+    /// lucky direct leg delivered a reply addressed to peer `""` — slid
+    /// into a half-joined state under a phantom identity with NO error
+    /// at all (the production silent-failure shape).
+    #[tokio::test]
+    async fn join_refuses_an_empty_local_identity_up_front() {
+        let mut transport = AnonymousTransport { sends: 0 };
+        let seed = vec![PeerConnectionInfo {
+            secondary_id: "secondary-0".into(),
+            cert: String::new(),
+            ipv4: Some("127.0.0.1".into()),
+            ipv6: None,
+            port: 1,
+            is_observer: false,
+            liveness_port: None,
+        }];
+        let started = std::time::Instant::now();
+        let result = transport
+            .join_running_cluster(&seed, Duration::from_secs(30), true, false)
+            .await;
+        assert!(
+            matches!(result, Err(JoinError::MissingLocalIdentity)),
+            "an empty local_id must be refused with the typed error, got {result:?}"
+        );
+        assert_eq!(
+            transport.sends, 0,
+            "the refusal must precede any wire work — no anonymous request may leave"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the refusal is immediate, never a budget soak"
+        );
     }
 }

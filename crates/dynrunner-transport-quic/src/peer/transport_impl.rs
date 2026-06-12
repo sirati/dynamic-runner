@@ -81,6 +81,20 @@ impl<I: Identifier> PeerNetwork<I> {
 }
 
 impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
+    fn local_id(&self) -> &str {
+        // The node's own peer-id — the bootstrap RPC's return address.
+        // `join_running_cluster` stamps it as the request's `sender_id`,
+        // which is BOTH the address every responder replies to AND the
+        // id the remote accept loop keys this node's mesh leg under
+        // (first-frame identification). The trait default returns `""`:
+        // a de-role refactor that dropped this override shipped joiners
+        // whose requests carried an EMPTY return address — replies were
+        // routed to peer `""` and the joiner's legs were registered
+        // anonymously, so the bootstrap either died at its deadline or
+        // slid into a half-joined state under a phantom `""` identity.
+        &self.peer_id
+    }
+
     async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
         self.drain_new_connections();
         // Memory hygiene: even when a node only broadcasts (no
