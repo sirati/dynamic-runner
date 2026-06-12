@@ -51,9 +51,17 @@ which is a comfortable election supermajority.
 Kill timing
 -----------
 
-``_KILL_DELAY_S`` is sized so SOME tasks have completed (some
-``produce-{i}`` files exist in the publish staging dir) AND others
-are mid-flight. The framework's promotion path must:
+The SIGKILL is anchored to OBSERVED cluster progress, not a fixed
+wall-clock delay: the kill fires once the first task output appears
+(the cluster is operational with work in flight), bounded by
+``_KILL_FLOOR_S`` / ``_KILL_CEILING_S`` — see
+``_wait_until_operational_then``. A fixed delay cannot straddle the
+SLURM bring-up variance (a cold container-image build vs a warm cache),
+where a delay short enough for the warm path kills mid-build on a cold
+cache and one long enough for the cold path lets the warm run finish
+before the kill. The progress anchor lands the kill mid-operation in
+both regimes, so SOME tasks have completed AND others are mid-flight.
+The framework's promotion path must:
   - Detect primary disconnect via R1 (5-probe threshold + 30s window)
   - Promote a peer
   - Re-route in-flight tasks: any task that was dispatched to a
@@ -109,22 +117,28 @@ _JOBS = 3
 the peer mesh — comfortable election quorum, not the minimum case.
 Failover with N=2 is exercised separately in unit tests."""
 
-_KILL_DELAY_S = 12.0
-"""Wallclock between dispatch spawn and SIGKILL of the dispatcher.
+_KILL_FLOOR_S = 5.0
+"""Lower bound on time-to-kill: never SIGKILL in the first few seconds
+even if (impossibly) an output appeared, so the kill always lands
+after the dispatch process is fully up and the cluster has begun
+forming — never racing the spawn itself."""
 
-Empirically calibrated so subprocess secondaries have:
-  - Completed setup handshake (Welcome + CertExchange + InitialAssignment)
-  - Started processing their initial 4 tasks
-  - At least one TaskComplete has landed and been forwarded through
-    the (still-alive) primary
-  - At least one task is mid-execution on each secondary
+_KILL_CEILING_S = 180.0
+"""Upper bound on time-to-kill. The kill is normally triggered by the
+first observed task output (see :meth:`run_hook`); this ceiling is the
+fallback for the pathological case where NO output ever appears (the
+cluster never became operational — e.g. a bring-up hang). Killing at
+the ceiling preserves the scenario's "fully unobserved kill" semantics
+without letting the hook wait forever. Sized well above a cold-cache
+SLURM bring-up (container image build + ssh-submit + queue + setup),
+which a fixed wall-clock delay could not straddle: a delay short
+enough for the warm path kills mid-build on a cold cache, and one long
+enough for the cold path lets the warm run finish before the kill."""
 
-Pre-kill state matters: with too-short a delay we kill before
-PromotePrimary infrastructure is even initialised on the peer mesh
-(secondaries haven't broadcast their MeshReady yet, primary hasn't
-sent PeerInfo), and the surviving secondaries can't actually elect.
-12s is the smallest value that reliably puts the cluster in the
-"mid-operational" state on the operator's host."""
+_KILL_PROBE_INTERVAL_S = 1.0
+"""How often the kill trigger polls for the first task output. Tight
+so the SIGKILL lands close to the moment the cluster goes operational
+— while the bulk of the work is still in flight to fail over."""
 
 _POST_KILL_DEADLINE_S = 90.0
 """How long the test waits AFTER dispatcher exit for the cluster to
@@ -144,6 +158,64 @@ dominant cost is R1's threshold delay + the remaining work."""
 _POLL_INTERVAL_S = 2.0
 
 
+def _outputs_present_count(
+    env: DispatchEnv,
+    plan: ScenarioPlan,
+) -> int:
+    """Count task outputs visible so far, mode-aware.
+
+    Mirrors the convergence poll in :meth:`assert_outputs`: local-mode
+    outputs land on the operator host's ``publish_dst``; SLURM-mode
+    outputs land on the gateway's NFS-mounted ``output`` dir, reachable
+    only via ssh. A return ``> 0`` means at least one task has completed
+    and published — i.e. the cluster is OPERATIONAL with work in flight,
+    the moment to land the SIGKILL. Any probe error counts as 0 (not yet
+    operational) so a transient ssh hiccup just defers the kill toward
+    the ceiling rather than firing it early on a false signal.
+    """
+    if env.mode == "slurm":
+        # Count files under the gateway publish dir (cleared at prepare
+        # time, so any file here is from THIS run). NOT the dispatcher's
+        # `--output` arg — SLURM mode does not write there.
+        cmd = (
+            f"find {_gateway_out_dir(env)!s} -mindepth 1 -maxdepth 8 "
+            "-type f 2>/dev/null | wc -l"
+        )
+        try:
+            proc = gateway_ssh(env, cmd, timeout_s=10)
+            if proc.returncode != 0:
+                return 0
+            return int(proc.stdout.strip() or "0")
+        except Exception:
+            return 0
+    return sum(1 for _ in plan.paths.publish_dst.glob("*")) if (
+        plan.paths.publish_dst.is_dir()
+    ) else 0
+
+
+def _wait_until_operational_then(
+    env: DispatchEnv,
+    plan: ScenarioPlan,
+) -> float:
+    """Block until the cluster is operational (first task output seen)
+    or the ceiling elapses, then return the elapsed seconds.
+
+    Anchoring the kill to observed progress — rather than a fixed
+    wall-clock delay — is what makes the SLURM path robust to the wide
+    bring-up-time variance (cold container build vs warm cache): the
+    kill always lands just after the cluster goes operational, with the
+    bulk of the work still in flight to fail over.
+    """
+    start = time.monotonic()
+    while True:
+        elapsed = time.monotonic() - start
+        if elapsed >= _KILL_CEILING_S:
+            return elapsed
+        if elapsed >= _KILL_FLOOR_S and _outputs_present_count(env, plan) > 0:
+            return elapsed
+        time.sleep(_KILL_PROBE_INTERVAL_S)
+
+
 class PrimaryDeathFailoverScenario(Scenario):
     name = "primary-death-failover"
     description = (
@@ -158,6 +230,14 @@ class PrimaryDeathFailoverScenario(Scenario):
         self, env: DispatchEnv, tmp_root: Path
     ) -> list[ScenarioPlan]:
         paths = stage_inputs(tmp_root, _NUM_TASKS_PER_PHASE)
+        # The gateway out dir (`<slurm_root_folder>/out`) is SHARED
+        # across scenario runs. Clear it up-front so both the
+        # operational-detection probe (run_hook) and the convergence
+        # check (assert_outputs) see ONLY this run's outputs — a stale
+        # output would make the probe think the cluster is operational
+        # at t=0 and would let convergence pass on prior-run artefacts.
+        if env.mode == "slurm":
+            _clear_gateway_out_dir(env)
         # Honour the harness's --mode (was previously force-local).
         # In SLURM mode the dispatch goes through the full SLURM
         # packaging pipeline; in local mode the subprocess-secondary
@@ -179,10 +259,14 @@ class PrimaryDeathFailoverScenario(Scenario):
     def run_hook(
         self, env: DispatchEnv, plan: ScenarioPlan, dispatch_pid: int
     ) -> None:
-        del env, plan
-
         def kill_dispatcher() -> None:
-            time.sleep(_KILL_DELAY_S)
+            # Wait until the cluster is operational (first task output
+            # observed) before killing — see
+            # `_wait_until_operational_then`. A fixed wall-clock delay
+            # cannot straddle the SLURM bring-up variance (cold image
+            # build vs warm cache); the progress anchor lands the kill
+            # mid-operation either way.
+            waited = _wait_until_operational_then(env, plan)
             # SIGKILL not SIGTERM: we want the dispatcher gone
             # immediately with no cleanup hooks, exactly mirroring a
             # host crash / OOM-kill / scancel-with-immediate-signal.
@@ -193,7 +277,8 @@ class PrimaryDeathFailoverScenario(Scenario):
                 os.kill(dispatch_pid, signal.SIGKILL)
                 print(
                     f"[primary-death-failover] hook: SIGKILL "
-                    f"dispatcher pid={dispatch_pid} after {_KILL_DELAY_S}s",
+                    f"dispatcher pid={dispatch_pid} after {waited:.1f}s "
+                    f"(cluster operational)",
                     flush=True,
                 )
             except ProcessLookupError:
@@ -233,7 +318,7 @@ class PrimaryDeathFailoverScenario(Scenario):
         # "is the output set complete yet?" check.
         if env.mode == "slurm":
             ok, missing_or_err = _poll_outputs_slurm(
-                env, result.plan.paths.output, expected
+                env, _gateway_out_dir(env), expected
             )
         else:
             ok, missing_or_err = _poll_outputs_local(publish_dst, expected)
@@ -296,33 +381,29 @@ def _poll_outputs_local(
 
 def _poll_outputs_slurm(
     env: DispatchEnv,
-    output_dir: Path,
+    output_dir: str,
     expected: set[str],
 ) -> tuple[bool, list[str]]:
-    """Poll the GATEWAY's output_dir via ssh for the expected output
-    set. The dispatcher is dead, so we can't rely on the framework's
-    own publish pipeline — secondaries write directly to NFS-mounted
-    /app/out-network (bind-mounted from the gateway's output_dir
-    per `wrapper_script.rs`'s `-v "{output_network}:/app/out-network"`).
-    Returns (True, []) on convergence or (False, <error-string>)
-    on timeout."""
-    # `output_dir` here is the path the dispatcher passed via
-    # `--output`; in SLURM mode that's a gateway-side path (e.g.
-    # `/home/<gateway-user>/.../e2e-outputs/...`). The dispatcher
-    # ssh-creates it during preparation. We don't tilde-expand
-    # locally — the gateway-side find walks the literal path.
+    """Poll the GATEWAY's output dir via ssh for the EXPECTED output
+    filenames. The dispatcher is dead, so we can't rely on the
+    framework's own publish pipeline — secondaries write directly to
+    NFS-mounted /app/out-network (bind-mounted from the gateway's
+    ``<slurm_root_folder>/out`` per the wrapper's
+    ``-v "{out_network}:/app/out-network"``). Returns (True, []) on
+    convergence or (False, <missing/error>) on timeout.
+
+    We check for the SPECIFIC ``expected`` filenames (not a raw file
+    count): the gateway out dir is shared across scenario runs, so a
+    count would both undercount (wrong dir) and over-count (stale
+    files from prior runs). The canonical names are deterministic, so
+    a name-set check is the same shape the SCP-then-assert_files_present
+    path uses for the live (non-failover) scenarios."""
     deadline = time.monotonic() + _POST_KILL_DEADLINE_S
     last_err = ""
+    expected_set = set(expected)
+    # One ls of the dir; membership-test the expected names locally.
+    cmd = f"ls -1 {output_dir!s} 2>/dev/null"
     while time.monotonic() < deadline:
-        # Just count regular files under output_dir; the test_consumer
-        # writes one per task. We don't enforce the exact filename
-        # set on the SLURM side because the publish staging tree
-        # is a black box from the ssh assertion's vantage point —
-        # the count is the load-bearing invariant.
-        cmd = (
-            f"find {output_dir!s} -mindepth 1 -maxdepth 8 "
-            "-type f 2>/dev/null | wc -l"
-        )
         try:
             proc = gateway_ssh(env, cmd, timeout_s=10)
         except Exception as e:
@@ -336,20 +417,44 @@ def _poll_outputs_slurm(
             )
             time.sleep(_POLL_INTERVAL_S)
             continue
-        try:
-            count = int(proc.stdout.strip() or "0")
-        except ValueError:
-            last_err = f"unparseable wc -l output: {proc.stdout!r}"
-            time.sleep(_POLL_INTERVAL_S)
-            continue
-        if count >= len(expected):
+        present = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+        missing = sorted(expected_set - present)
+        if not missing:
             return (True, [])
         last_err = (
-            f"only {count} of {len(expected)} expected outputs "
-            f"present on gateway under {output_dir!s}"
+            f"{len(missing)} of {len(expected)} expected outputs still "
+            f"missing on gateway under {output_dir!s}: {missing[:5]}"
+            f"{'...' if len(missing) > 5 else ''}"
         )
         time.sleep(_POLL_INTERVAL_S)
     return (False, [last_err])
+
+
+def _gateway_out_dir(env: DispatchEnv) -> str:
+    """The gateway-side dir where SLURM workers publish their outputs:
+    ``<slurm_root_folder>/out`` (bind-mounted into the worker container
+    as ``/app/out-network``). This is the canonical publish location —
+    the dispatcher's ``--output`` arg is a host-local path that SLURM
+    mode does not write to. Mirrors
+    ``run_e2e._fetch_published_outputs_from_gateway``."""
+    return f"{env.slurm_root_folder}/out"
+
+
+def _clear_gateway_out_dir(env: DispatchEnv) -> None:
+    """Delete every regular file under the gateway out dir so this
+    run's convergence + operational signals are not polluted by prior
+    runs' artefacts. Best-effort: a clear failure surfaces later as a
+    convergence timeout, which is more actionable than a clear error.
+
+    Removes only regular files (``-type f``), never the dir itself —
+    the framework bind-mounts the dir and would fail to start if it
+    vanished."""
+    out_dir = _gateway_out_dir(env)
+    cmd = f"find {out_dir!s} -mindepth 1 -maxdepth 8 -type f -delete 2>/dev/null; true"
+    try:
+        gateway_ssh(env, cmd, timeout_s=15)
+    except Exception:
+        pass
 
 
 SCENARIO = PrimaryDeathFailoverScenario()
