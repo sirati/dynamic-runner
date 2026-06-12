@@ -8,8 +8,8 @@ use dynrunner_protocol_primary_secondary::address::{Destination, PeerId};
 use super::super::mesh::Mesh;
 use super::super::role::LocalRole;
 use super::{
-    TestId, abort_request_frame, frame, frame_to, sender_of, snapshot_request_frame,
-    transport_with_remotes, welcome_frame,
+    TestId, abort_request_frame, frame, frame_to, report_frame, sender_of,
+    snapshot_request_frame, transport_with_remotes, welcome_frame,
 };
 
 /// `broadcast` excludes the ORIGINATING ROLE but includes the OTHER local
@@ -945,6 +945,111 @@ async fn stale_holder_views_cannot_cycle_a_frame() {
         "a revisited process must never relay the same frame again (no cycle)"
     );
     assert!(b_observer_inbox.try_recv().is_none());
+}
+
+/// THE production replay (run_20260612_072807, S-secondary-9): a
+/// reporter whose `Destination::Primary` resolution is stale keeps
+/// landing its CONFIRMABLE task report at a host with no live Primary
+/// slot. The relay (run_20260612_045106 fold) forwards the FIRST
+/// landing to the recognized holder — the authority ingests and acks.
+/// If that one ack is lost, the #352 retention replays the report
+/// BYTE-IDENTICALLY (sticky `delivery_seq`, sticky timestamp — the
+/// retained copy is cloned, never re-stamped) on the ack-timeout
+/// cadence (≥15 s). Pre-fix the relay ring's fingerprint dedup never
+/// expired, so every replay re-landing at the stale host was refused a
+/// relay and RESTED in the local fan — consumed by the secondary's
+/// no-op observation arm, never reaching the authority, never re-acked:
+/// one lost ack became permanent ("UNACKED past the ack timeout ...
+/// replaying with the same seq", attempts 2-5, oldest 258 s, while the
+/// same leg delivered assignments). The loop guard is JOURNEY-scoped:
+/// a fingerprint older than [`super::super::mesh::ROLE_RELAY_RING_TTL`]
+/// (far above any cycle's transit, far below the replay cadence) must
+/// re-admit the relay so the replay reaches the authority and is
+/// re-acked.
+#[tokio::test]
+async fn replayed_confirmable_report_relays_again_after_the_cycle_window() {
+    tokio::time::pause();
+
+    // The authority: a compute peer hosting the live Primary slot.
+    let mut compute = wired_process("secondary-0", HashMap::new());
+    let (_p_slot, mut primary_inbox) = register(&mut compute, LocalRole::Primary, "secondary-0");
+
+    // The stale host the reporter keeps resolving the primary to: a live
+    // SECONDARY slot (whose TaskComplete arm is a no-op observation — the
+    // production absorber), recognition warm (it knows the true holder).
+    let mut stale = wired_process(
+        "stale-host",
+        HashMap::from([("secondary-0".to_string(), compute.in_tx.clone())]),
+    );
+    let (s_slot, s_client, mut s_inbox) = stale
+        .mesh
+        .register_local_role(LocalRole::Secondary, PeerId::from("stale-host"));
+    let _s_slot = s_slot;
+    s_client
+        .role_holder_view()
+        .publish_primary(Some("secondary-0"), 1);
+
+    // Landing 1: the original confirmable report (delivery_seq 1763)
+    // arrives at the stale host and is RELAYED to the authority.
+    stale
+        .in_tx
+        .send(report_frame("S-secondary-9", 1763).with_target(Destination::Primary))
+        .expect("stale inbound open");
+    assert!(stale.mesh.recv_dial_and_route().await);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            compute.mesh.recv_dial_and_route(),
+        )
+        .await
+        .expect("landing 1 must relay to the authority")
+    );
+    assert!(matches!(
+        primary_inbox
+            .try_recv()
+            .expect("the authority must ingest landing 1 (and ack it)"),
+        DistributedMessage::TaskComplete { .. }
+    ));
+
+    // The ack for landing 1 is LOST (any transient). The reporter's
+    // retention replays the SAME BYTES one ack-timeout later.
+    tokio::time::advance(super::super::mesh::ROLE_RELAY_RING_TTL + std::time::Duration::from_millis(1)).await;
+
+    // Landing 2: the byte-identical replay re-lands at the stale host.
+    stale
+        .in_tx
+        .send(report_frame("S-secondary-9", 1763).with_target(Destination::Primary))
+        .expect("stale inbound open");
+    assert!(stale.mesh.recv_dial_and_route().await);
+
+    // REGRESSION PIN: the replay must be RELAYED AGAIN so the authority
+    // can re-ack it — it must NOT rest in the stale host's local fan
+    // (the no-op observation arm), which is the permanent-black-hole
+    // face of run_20260612_072807.
+    assert!(
+        s_inbox.try_recv().is_none(),
+        "the replayed confirmable must NOT rest in the stale host's \
+         local fan (the no-op observation arm) — one lost ack would \
+         become permanent"
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            compute.mesh.recv_dial_and_route(),
+        )
+        .await
+        .expect(
+            "REGRESSION: the post-window replay of a confirmable report \
+             must relay to the authority again (re-ack), not be deduped \
+             by the relay ring forever",
+        )
+    );
+    assert!(matches!(
+        primary_inbox
+            .try_recv()
+            .expect("the authority must ingest the replay (and re-ack it)"),
+        DistributedMessage::TaskComplete { .. }
+    ));
 }
 
 /// Step (3) of the role-miss order is UNCHANGED when the holder is
