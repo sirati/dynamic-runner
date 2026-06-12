@@ -27,22 +27,19 @@ pub(super) async fn quic_accept_loop<I: Identifier>(
     new_conn_tx: mpsc::UnboundedSender<AcceptedPeer<I>>,
     disconnect_tx: mpsc::UnboundedSender<DisconnectedPeer<I>>,
 ) {
-    loop {
-        match listener.accept().await {
-            Ok(conn) => {
-                let incoming_tx = incoming_tx.clone();
-                let new_conn_tx = new_conn_tx.clone();
-                let disconnect_tx = disconnect_tx.clone();
-                tokio::task::spawn_local(async move {
-                    handle_accepted_quic(conn, incoming_tx, new_conn_tx, disconnect_tx).await;
-                });
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "peer QUIC accept loop ended");
-                break;
-            }
+    // Resilient loop (see `crate::accept_loop`): the per-connection
+    // handshake runs on the spawned task, so one aborted/stalled inbound
+    // can never kill or wedge the listener the whole mesh's reconnect
+    // machinery depends on.
+    crate::accept_loop::quic_accept_loop_resilient(listener, CTX, move |conn| {
+        let incoming_tx = incoming_tx.clone();
+        let new_conn_tx = new_conn_tx.clone();
+        let disconnect_tx = disconnect_tx.clone();
+        async move {
+            handle_accepted_quic(conn, incoming_tx, new_conn_tx, disconnect_tx).await;
         }
-    }
+    })
+    .await;
 }
 
 pub(super) async fn wss_accept_loop<I: Identifier>(
@@ -51,22 +48,16 @@ pub(super) async fn wss_accept_loop<I: Identifier>(
     new_conn_tx: mpsc::UnboundedSender<AcceptedPeer<I>>,
     disconnect_tx: mpsc::UnboundedSender<DisconnectedPeer<I>>,
 ) {
-    loop {
-        match listener.accept().await {
-            Ok(conn) => {
-                let incoming_tx = incoming_tx.clone();
-                let new_conn_tx = new_conn_tx.clone();
-                let disconnect_tx = disconnect_tx.clone();
-                tokio::task::spawn_local(async move {
-                    handle_accepted_wss(conn, incoming_tx, new_conn_tx, disconnect_tx).await;
-                });
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "peer WSS accept loop ended");
-                break;
-            }
+    // Resilient loop — see the QUIC twin above.
+    crate::accept_loop::wss_accept_loop_resilient(listener, CTX, move |conn| {
+        let incoming_tx = incoming_tx.clone();
+        let new_conn_tx = new_conn_tx.clone();
+        let disconnect_tx = disconnect_tx.clone();
+        async move {
+            handle_accepted_wss(conn, incoming_tx, new_conn_tx, disconnect_tx).await;
         }
-    }
+    })
+    .await;
 }
 
 async fn handle_accepted_quic<I: Identifier>(

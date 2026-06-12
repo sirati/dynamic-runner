@@ -147,14 +147,44 @@ impl QuicListener {
         self.local_addr.port()
     }
 
-    /// Accept the next incoming connection and open a bi-directional stream.
-    pub async fn accept(&self) -> Result<QuicConnection, String> {
-        let incoming = self.endpoint.accept().await.ok_or("endpoint closed")?;
+    /// Await the next incoming connection attempt WITHOUT driving its
+    /// handshake. `None` means the endpoint is closed (the listener is
+    /// genuinely gone — the only loop-terminal condition).
+    ///
+    /// The split exists for listener survivability: the TLS handshake +
+    /// first bi-stream accept are PER-CONNECTION concerns (they can fail
+    /// on a wrong-trust dialer or stall forever on a blackholed one), so
+    /// an accept loop must run them on the spawned per-connection task —
+    /// never inline on the accept path, where one bad connection would
+    /// surface as an accept error (killing a break-on-error loop) or
+    /// park the listener entirely (the run_20260611_200548
+    /// observer-reconnect wedge). Pair with [`Self::handshake`].
+    pub async fn accept_incoming(&self) -> Option<quinn::Incoming> {
+        self.endpoint.accept().await
+    }
 
+    /// Drive one incoming connection attempt to a usable
+    /// [`QuicConnection`]: complete the QUIC/TLS handshake and accept
+    /// the dialer's first bi-directional stream. Note the bi-stream
+    /// only resolves once the dialer has WRITTEN on it — callers bound
+    /// this with a timeout.
+    pub async fn handshake(incoming: quinn::Incoming) -> Result<QuicConnection, String> {
         let connection = incoming.await.map_err(|e| e.to_string())?;
         let (send, recv) = connection.accept_bi().await.map_err(|e| e.to_string())?;
 
         Ok(QuicConnection::from_streams(send, recv))
+    }
+
+    /// Accept the next incoming connection and open a bi-directional
+    /// stream — [`Self::accept_incoming`] + inline [`Self::handshake`].
+    ///
+    /// Convenience for single-connection callers (tests, fixtures) that
+    /// accept exactly the connection they themselves dial. Production
+    /// accept LOOPS must use the split form via [`crate::accept_loop`]
+    /// so one bad connection cannot kill or wedge the listener.
+    pub async fn accept(&self) -> Result<QuicConnection, String> {
+        let incoming = self.accept_incoming().await.ok_or("endpoint closed")?;
+        Self::handshake(incoming).await
     }
 }
 

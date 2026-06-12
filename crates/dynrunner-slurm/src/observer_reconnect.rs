@@ -65,12 +65,23 @@ impl<R: InfoFileReader + Send + Sync + 'static> TunnelReconnector
     for SlurmPreparationTunnelReconnector<R>
 {
     async fn reconnect(&self, peer_ids: &[String]) {
-        // Rebuild each lost peer's `-R` reverse tunnel. Best-effort +
-        // idempotent: a peer whose tunnel is already healthy simply
-        // re-polls its info file and re-establishes (the observer's loop
-        // retries on the next ~60s cadence tick if any fail). Per-id
+        // Rebuild each lost peer's `-R` reverse tunnel, CONCURRENTLY.
+        // Best-effort + idempotent: a peer whose tunnel is already healthy
+        // simply re-polls its info file and re-establishes (the observer's
+        // loop retries on the next ~60s cadence tick if any fail). Per-id
         // failures are logged, never propagated — an observer carries zero
         // authority and a tunnel rebuild is never a run error.
+        //
+        // CONCURRENT (the mass-disconnect survivor-starvation fix): a
+        // sequential walk pays each DEAD peer's full establishment budget
+        // (up to `per_tunnel_timeout`, 90s) before the next id is even
+        // attempted — six dead peers in the roster starve the live
+        // survivors' rebuilds for many minutes per cadence tick
+        // (run_20260611_200548 specimen 1). Fanned out, every id rides
+        // the shared `establish_pool` rate-limiter concurrently (the same
+        // semaphore the cohort setup uses — sshd-facing concurrency stays
+        // capped), so the survivors rebuild in the FIRST wave while the
+        // dead ids burn their budgets in parallel.
         //
         // `reestablish_one_tunnel` (NOT `establish_one_tunnel`): on an
         // UNGRACEFUL drop (SIGKILL / NIC blip / crash) the worker's sshd
@@ -83,7 +94,7 @@ impl<R: InfoFileReader + Send + Sync + 'static> TunnelReconnector
         // break the worker's `localhost:<tunnel_port>` dial with no
         // re-coordination path). The graceful-close path already has the
         // port free, so the release is a harmless no-op there.
-        for peer_id in peer_ids {
+        futures_util::future::join_all(peer_ids.iter().map(|peer_id| async move {
             match self
                 .preparation
                 .reestablish_one_tunnel(peer_id, self.info_reader.clone())
@@ -104,7 +115,8 @@ impl<R: InfoFileReader + Send + Sync + 'static> TunnelReconnector
                     );
                 }
             }
-        }
+        }))
+        .await;
     }
 }
 

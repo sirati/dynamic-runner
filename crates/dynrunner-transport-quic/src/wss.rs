@@ -107,7 +107,29 @@ impl WssListener {
         self.local_addr.port()
     }
 
-    /// Accept the next incoming WebSocket connection (plain WS, no TLS).
+    /// Accept the next incoming TCP connection WITHOUT performing the
+    /// WebSocket handshake.
+    ///
+    /// The split exists for listener survivability: the handshake is a
+    /// PER-CONNECTION concern (it can fail on garbage bytes or stall
+    /// forever on a blackholed client), so an accept loop must run it on
+    /// the spawned per-connection task — never inline on the accept
+    /// path, where one bad connection would surface as an accept error
+    /// (killing a break-on-error loop) or park the listener entirely
+    /// (the run_20260611_200548 observer-reconnect wedge). Pair with
+    /// [`Self::handshake`].
+    pub async fn accept_raw(&self) -> Result<(TcpStream, SocketAddr), String> {
+        let (tcp_stream, peer_addr) = self
+            .tcp_listener
+            .accept()
+            .await
+            .map_err(|e| e.to_string())?;
+        tracing::debug!(%peer_addr, "WSS TCP connection accepted");
+        Ok((tcp_stream, peer_addr))
+    }
+
+    /// Drive the server-side WebSocket handshake over an accepted TCP
+    /// stream (plain WS, no TLS).
     ///
     /// For production use behind SSH tunnels / internal networks, TLS is
     /// typically handled at the tunnel level. To add native TLS, wrap the
@@ -117,14 +139,7 @@ impl WssListener {
     /// [`crate::framing::wire_ws_config`] (#366) — never tungstenite's
     /// defaults, whose 16 MiB `max_frame_size` silently dropped
     /// legitimate large mesh frames.
-    pub async fn accept(&self) -> Result<WssConnection, String> {
-        let (tcp_stream, peer_addr) = self
-            .tcp_listener
-            .accept()
-            .await
-            .map_err(|e| e.to_string())?;
-        tracing::debug!(%peer_addr, "WSS TCP connection accepted");
-
+    pub async fn handshake(tcp_stream: TcpStream) -> Result<WssConnection, String> {
         let ws_stream = tokio_tungstenite::accept_async_with_config(
             MaybeTlsStream::Plain(tcp_stream),
             Some(crate::framing::wire_ws_config()),
@@ -133,6 +148,18 @@ impl WssListener {
         .map_err(|e| e.to_string())?;
 
         Ok(WssConnection::new(ws_stream))
+    }
+
+    /// Accept the next incoming WebSocket connection — TCP accept +
+    /// inline handshake ([`Self::accept_raw`] then [`Self::handshake`]).
+    ///
+    /// Convenience for single-connection callers (tests, fixtures) that
+    /// accept exactly the connection they themselves dial. Production
+    /// accept LOOPS must use the split form via [`crate::accept_loop`]
+    /// so one bad connection cannot kill or wedge the listener.
+    pub async fn accept(&self) -> Result<WssConnection, String> {
+        let (tcp_stream, _peer_addr) = self.accept_raw().await?;
+        Self::handshake(tcp_stream).await
     }
 }
 

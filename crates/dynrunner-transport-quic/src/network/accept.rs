@@ -40,49 +40,41 @@ const CTX: &str = "network-accepted";
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// QUIC accept loop.
+///
+/// Resilient (see `crate::accept_loop`): the per-connection handshake
+/// runs on the spawned task, so one aborted/stalled inbound can never
+/// kill or wedge the listener the secondaries' redials depend on.
 pub(super) async fn quic_accept_loop<I: Identifier>(
     listener: QuicListener,
     incoming_tx: InboundTap<I>,
     new_conn_tx: RegistrationSink<I>,
 ) {
-    loop {
-        match listener.accept().await {
-            Ok(conn) => {
-                let incoming_tx = incoming_tx.clone();
-                let new_conn_tx = new_conn_tx.clone();
-                tokio::task::spawn_local(async move {
-                    handle_new_quic_connection(conn, incoming_tx, new_conn_tx).await;
-                });
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "QUIC accept error");
-                break;
-            }
+    crate::accept_loop::quic_accept_loop_resilient(listener, CTX, move |conn| {
+        let incoming_tx = incoming_tx.clone();
+        let new_conn_tx = new_conn_tx.clone();
+        async move {
+            handle_new_quic_connection(conn, incoming_tx, new_conn_tx).await;
         }
-    }
+    })
+    .await;
 }
 
 /// WSS accept loop.
+///
+/// Resilient — see the QUIC twin above.
 pub(super) async fn wss_accept_loop<I: Identifier>(
     listener: WssListener,
     incoming_tx: InboundTap<I>,
     new_conn_tx: RegistrationSink<I>,
 ) {
-    loop {
-        match listener.accept().await {
-            Ok(conn) => {
-                let incoming_tx = incoming_tx.clone();
-                let new_conn_tx = new_conn_tx.clone();
-                tokio::task::spawn_local(async move {
-                    handle_new_wss_connection(conn, incoming_tx, new_conn_tx).await;
-                });
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "WSS accept error");
-                break;
-            }
+    crate::accept_loop::wss_accept_loop_resilient(listener, CTX, move |conn| {
+        let incoming_tx = incoming_tx.clone();
+        let new_conn_tx = new_conn_tx.clone();
+        async move {
+            handle_new_wss_connection(conn, incoming_tx, new_conn_tx).await;
         }
-    }
+    })
+    .await;
 }
 
 /// Handle a new QUIC connection: read first message to identify the peer,
