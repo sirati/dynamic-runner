@@ -7,7 +7,9 @@ use std::time::Duration;
 use pyo3::prelude::*;
 
 use dynrunner_manager_distributed::cluster_state::{ClusterState, ClusterStateSnapshot};
-use dynrunner_manager_distributed::observer::{ObserverConfig, build_cold_join_observer};
+use dynrunner_manager_distributed::observer::{
+    GracefulAbortTrigger, ObserverConfig, build_cold_join_observer,
+};
 use dynrunner_manager_distributed::primary::RunError;
 use dynrunner_manager_distributed::process::{LocalRole, Mesh, Node, NodeRunInputs, RunTerminal};
 use dynrunner_protocol_primary_secondary::address::PeerId;
@@ -110,6 +112,23 @@ impl PyObserverLateJoiner {
                     })?;
                 let local = tokio::task::LocalSet::new();
                 rt.block_on(local.run_until(async move {
+                    // Arm the operator's SIGUSR2 graceful-abort trigger
+                    // FIRST — before the gateway/seed acquisition and the
+                    // join rendezvous — so a signal sent during the
+                    // bootstrap window is latched instead of killing the
+                    // process via the kernel's default disposition (the
+                    // CLI documents SIGUSR2-to-this-late-joiner, and even
+                    // advises re-sending during a primary failover —
+                    // exactly the window that used to be lethal). The SAME
+                    // armed trigger is handed to the observer coordinator
+                    // below (step 6b), so a buffered pre-seat delivery is
+                    // consumed by its run loop exactly like a post-seat
+                    // one. Delivery still requires the seat: the request
+                    // routes via `Destination::Primary`, which only
+                    // resolves once the bootstrap snapshot has warmed the
+                    // role cache — there is nothing to send on before then.
+                    let mut abort_trigger = Some(GracefulAbortTrigger::arm());
+
                     // 0. Acquire the seed. LOCAL mode resolved it
                     //    pre-detach; GATEWAY mode connects the gateway,
                     //    mirrors the remote `.info` dir, establishes the
@@ -123,8 +142,16 @@ impl PyObserverLateJoiner {
                         None => {
                             let cfg = gateway_cfg
                                 .expect("gateway mode iff the local pre-read was skipped");
-                            let (seed, runtime) = acquire_gateway_seed(cfg, &peer_info_dir).await?;
-                            (seed, Some(runtime))
+                            match acquire_gateway_seed(cfg, &peer_info_dir).await {
+                                Ok((seed, runtime)) => (seed, Some(runtime)),
+                                Err(e) => {
+                                    // A bootstrap-failure exit like the
+                                    // join body's below: narrate a latched
+                                    // operator abort before surfacing.
+                                    narrate_undelivered_abort(&mut abort_trigger).await;
+                                    return Err(e);
+                                }
+                            }
                         }
                     };
 
@@ -278,6 +305,19 @@ impl PyObserverLateJoiner {
                             snaps,
                             holdings,
                         );
+                        // 6b. Hand the entry-armed SIGUSR2 trigger to the
+                        //     coordinator (taken exactly once; a bootstrap
+                        //     failure before this point leaves it in the
+                        //     outer slot for the undelivered-abort
+                        //     narration below). The run loop's
+                        //     graceful-abort arm consumes it, so a signal
+                        //     latched during the join is delivered to the
+                        //     primary on the first poll.
+                        observer.set_graceful_abort_trigger(
+                            abort_trigger
+                                .take()
+                                .expect("armed once at entry; taken once here"),
+                        );
                         // Gateway mode: the transport's own QUIC/WSS
                         // reconnect ticker re-dials the rewritten
                         // `127.0.0.1:<local_port>` endpoints, which heals
@@ -368,6 +408,15 @@ impl PyObserverLateJoiner {
                     if let Some(runtime) = gateway_runtime {
                         runtime.teardown().await;
                     }
+                    // Bootstrap failed BEFORE the trigger was handed to the
+                    // observer (a seated run consumed it at step 6b): if the
+                    // operator's graceful abort was latched during the
+                    // failed bootstrap, narrate it on the wake stream so the
+                    // intent is never silently lost — the process exits via
+                    // the propagated error either way.
+                    if run_result.is_err() {
+                        narrate_undelivered_abort(&mut abort_trigger).await;
+                    }
                     run_result
                 }))
             });
@@ -411,6 +460,17 @@ impl PyObserverLateJoiner {
     #[getter]
     fn completed(&self) -> u32 {
         self.completed
+    }
+}
+
+/// Failed-bootstrap tail: if the entry-armed SIGUSR2 trigger is still
+/// unconsumed (the observer never seated — every seated run took it at
+/// step 6b), narrate a latched operator graceful-abort on the wake stream
+/// so the intent is never silently lost. The ONE undelivered-abort exit
+/// shared by every bootstrap-failure path in `run`.
+async fn narrate_undelivered_abort(trigger_slot: &mut Option<GracefulAbortTrigger>) {
+    if let Some(trigger) = trigger_slot.take() {
+        trigger.report_undelivered().await;
     }
 }
 
