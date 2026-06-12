@@ -316,23 +316,25 @@ mod tests {
     /// CRDT and report a lie.
     #[test]
     fn decode_bootstrap_snapshots_hard_fails_on_malformed() {
-        let result = decode_bootstrap_snapshots(&["{not valid json".to_string()]);
-        let err = result.expect_err("a malformed bootstrap snapshot must hard-fail");
+        let result = decode_bootstrap_snapshots(&["not even base64!!".to_string()]);
+        let err = result.expect_err("a malformed bootstrap payload must hard-fail");
         assert!(
             err.to_string()
-                .contains("failed to decode ClusterStateSnapshot"),
+                .contains("failed to decode snapshot-stream"),
             "the bootstrap-fatal error must name the decode failure: {err}"
         );
     }
 
-    /// The happy path: well-formed bootstrap snapshot JSON decodes into the
-    /// typed snapshot the cold-join factory restores.
+    /// The happy path: a well-formed bootstrap payload (the production
+    /// base64-CBOR codec) decodes into the typed partial snapshot the
+    /// cold-join factory restores.
     #[test]
     fn decode_bootstrap_snapshots_round_trips_valid_payload() {
-        use dynrunner_manager_distributed::cluster_state::ClusterState;
-        let json = serde_json::to_string(&ClusterState::<RunnerIdentifier>::new().snapshot())
-            .expect("snapshot serializes");
-        let snaps = decode_bootstrap_snapshots(&[json]).expect("valid snapshot decodes");
+        use dynrunner_manager_distributed::cluster_state::{ClusterState, encode_stream_payload};
+        let payload =
+            encode_stream_payload(&ClusterState::<RunnerIdentifier>::new().snapshot())
+                .expect("snapshot encodes");
+        let snaps = decode_bootstrap_snapshots(&[payload]).expect("valid payload decodes");
         assert_eq!(snaps.len(), 1);
     }
 

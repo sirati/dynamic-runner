@@ -16,8 +16,8 @@ use crate::messages::timestamp_now;
 /// cadence (`recv_budget / 3` capped at [`JOIN_REREQUEST_CAP`] = 5 s)
 /// slices into ~9 fan-out rounds. The budget is sized for the REPLY to
 /// LAND, not just for the request to be heard: a production bootstrap
-/// (gateway joiner into a busy run) collects multi-MB `ClusterSnapshot`
-/// payloads that travel as chunked transfers over WAN legs, and the
+/// (gateway joiner into a busy run) collects many multi-MB snapshot
+/// packages over WAN legs, and the
 /// previous 10 s budget (7.5 s recv, 3 fan-outs) expired while replies
 /// were still in flight — the joiner died `Timeout` against responders
 /// that had already answered. A silent responder is still
@@ -40,9 +40,10 @@ pub const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(60);
 /// best a relay) and against responder-seat churn — a joiner dialing
 /// inside a primary-promotion window can lose EVERY first-shot request
 /// while its legs keep delivering gossip. Re-requesting is safe by
-/// design: every responder serializes through a digest-keyed cache and
-/// originates the joiner's `PeerJoined` through idempotent CRDT apply,
-/// so a duplicate request is a cheap re-reply, never a state change.
+/// design: a responder still holding the stream RESUMES it from the
+/// carried cursor, and the joiner's `PeerJoined` originates through
+/// idempotent CRDT apply — a duplicate request is a cheap reposition,
+/// never a state change.
 const JOIN_REREQUEST_CAP: Duration = Duration::from_secs(5);
 
 /// Error from [`PeerTransport::join_running_cluster`].
@@ -507,7 +508,7 @@ pub trait PeerTransport<I: Identifier> {
             // so we drive the rendezvous on cardinality and then
             // (Step 3+4) send the request to EVERY non-self seed
             // (multi-responder fan-out). Any peer can answer per
-            // dispatch.rs's RequestClusterSnapshot handler; collecting
+            // dispatch.rs's RequestSnapshotStream handler; collecting
             // all replies and merging them via the idempotent lattice
             // heals an incomplete responder.
             loop {
