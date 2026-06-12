@@ -74,6 +74,12 @@
 //!   seq-stamped report is delivered + ackable, and the errored accept
 //!   path neither spins nor monopolises the executor.
 //!
+//! - [`accept_resilience`]: listener survival — one aborted / stalled
+//!   / TLS-failed inbound connection must never kill or wedge the
+//!   QUIC/WSS accept loops (the run_20260611_200548 observer-reconnect
+//!   wedge: rebuilt tunnels could never re-seat because the acceptor's
+//!   listener was dead while a fresh process connected instantly).
+//!
 //! The shared [`TestId`] is defined here so every sub-module gets
 //! the same `Identifier` impl via `super::TestId`.
 
@@ -101,6 +107,7 @@ pub(crate) fn alloc_dual_free_port() -> u16 {
 }
 
 mod accept_replace_rejoin;
+mod accept_resilience;
 mod bind_port;
 mod bootstrap_redial;
 mod broadcast_miss;

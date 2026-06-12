@@ -21,13 +21,6 @@ pub struct WssConnection {
 /// conformant dialer upgrades immediately after connect.
 const INBOUND_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Pause between retries when the LISTENER-level `accept(2)` itself
-/// errors (e.g. `ECONNABORTED` under a connection-reset storm, or
-/// `EMFILE`). Keeps an accept loop alive across transient listener
-/// errors without letting a persistent error (fd exhaustion) turn the
-/// loop into a busy-spin. The success path never sleeps.
-pub(crate) const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
-
 /// TCP keepalive idle threshold for every WSS leg — the WSS twin of the
 /// QUIC `KEEP_ALIVE_INTERVAL`/`IDLE_TIMEOUT` pair (`certs.rs`): probes
 /// start after 15s of wire silence.
@@ -203,7 +196,8 @@ impl WssListener {
     /// WebSocket upgrade. An `Err` here is a listener-level `accept(2)`
     /// fault (transient `ECONNABORTED` under a reset storm, `EMFILE`,
     /// …) — an accept loop logs it and keeps accepting (paced by
-    /// [`ACCEPT_ERROR_BACKOFF`]); it is NEVER loop-fatal, because the
+    /// [`crate::accept_loop::ACCEPT_ERROR_BACKOFF`]); it is NEVER
+    /// loop-fatal, because the
     /// listener socket itself is owned and stays bound. Drive the
     /// returned stream through [`WssConnection::accept_handshake`]
     /// inside the per-connection handler task.
@@ -222,8 +216,9 @@ impl WssListener {
     /// must NOT use this: a per-connection upgrade failure is
     /// indistinguishable from a listener failure in the flattened
     /// `Err`, and awaiting the upgrade inline serializes (and, treated
-    /// as fatal, kills) the loop — use `accept_raw` + `accept_handshake`
-    /// in the spawned handler instead.
+    /// as fatal, kills) the loop — use the split form via
+    /// [`crate::accept_loop`] so one bad connection cannot kill or
+    /// wedge the listener.
     ///
     /// For production use behind SSH tunnels / internal networks, TLS is
     /// typically handled at the tunnel level. To add native TLS, wrap the

@@ -200,8 +200,9 @@ impl QuicListener {
     /// LOOP must NOT use this: a per-connection handshake failure is
     /// indistinguishable from a listener failure in the flattened
     /// `Err`, and awaiting the handshake inline serializes (and, treated
-    /// as fatal, kills) the loop — use `accept_raw` + `from_incoming`
-    /// in the spawned handler instead.
+    /// as fatal, kills) the loop — use the split form via
+    /// [`crate::accept_loop`] so one bad connection cannot kill or
+    /// wedge the listener.
     pub async fn accept(&self) -> Result<QuicConnection, String> {
         let incoming = self.accept_raw().await.ok_or("endpoint closed")?;
         QuicConnection::from_incoming(incoming).await

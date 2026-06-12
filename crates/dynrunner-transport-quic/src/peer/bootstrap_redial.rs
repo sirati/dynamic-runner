@@ -74,6 +74,16 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// up (the observer link is restorable at any time).
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Per-attempt budget for one `connect_wss_only` re-dial. A WEDGED
+/// far end — the tunnel's TCP listener accepts into the kernel backlog
+/// but the WebSocket handshake is never answered (a half-dead forward,
+/// or a parked acceptor) — would otherwise hang the supervisor on ONE
+/// attempt FOREVER, ending the retry loop in all but name: the
+/// run_20260611_200548 shape where the observer's rebuilt tunnels had
+/// nothing re-dialing through them. Matches the peer dialer's
+/// per-attempt budget (`peer::dial::ATTEMPT_TIMEOUT`).
+const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The fixed dial target for re-establishing the bootstrap wire. Retained
 /// from the secondary's original startup dial: the `localhost:<tunnel_port>`
 /// the `ssh -R` reverse tunnel terminates at (NOT a LAN address — the
@@ -161,7 +171,23 @@ pub(super) async fn redial_bootstrap_wire<I: Identifier>(
     );
     let mut backoff = INITIAL_BACKOFF;
     loop {
-        match NetworkClient::<I>::connect_wss_only(target.addr).await {
+        // Bound the attempt: an unanswered handshake against a wedged
+        // listener must surface as a failed attempt (then backoff +
+        // retry), never park this supervisor forever.
+        let attempt = tokio::time::timeout(
+            DIAL_ATTEMPT_TIMEOUT,
+            NetworkClient::<I>::connect_wss_only(target.addr),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "dial attempt timed out after {}s (listener wedged or path \
+                 blackholed)",
+                DIAL_ATTEMPT_TIMEOUT.as_secs()
+            )
+        })
+        .and_then(|r| r);
+        match attempt {
             Ok(client) => {
                 tracing::info!(
                     primary = %target.primary_id,

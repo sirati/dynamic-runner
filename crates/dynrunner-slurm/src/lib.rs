@@ -26,6 +26,7 @@ pub use job_manager::{
 };
 pub use local_forward::{
     ForwardTarget, LocalForwardError, LocalForwardTunnelReconnector, LocalForwardTunnels,
+    ReconnectOutcome,
 };
 pub use observer_reconnect::SlurmPreparationTunnelReconnector;
 pub use packaging::{PackagingError, PodmanImageMetadata, PodmanPackaging};

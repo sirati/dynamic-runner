@@ -1102,6 +1102,24 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     pub(super) panik_signal_rx:
         Option<tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>>,
 
+    /// The operator's SIGUSR2 graceful-abort trigger. Injected via
+    /// [`Self::register_graceful_abort_trigger`] before `run()` by the PyO3
+    /// entry path, which arms it at process entry (BEFORE the bootstrap mesh
+    /// bind, so a SIGUSR2 during the primary's bootstrap window is latched
+    /// rather than killing the process via the kernel default). The
+    /// operational `select!` arm consumes it: a PRIMARY receiving SIGUSR2 IS
+    /// the abort authority, so the arm short-circuits straight into
+    /// [`Self::initiate_graceful_abort`] (the SAME latch the wire
+    /// `GracefulAbortRequest` handler drives) — no mesh delivery needed.
+    /// `None` when un-injected (tests / embeddings): the arm parks on
+    /// `pending().await` and the primary NEVER self-arms a second
+    /// `user_defined2` stream (the single-owner rule). NOT taken out into the
+    /// loop's locals — the loop reads it through a disjoint-field borrow so it
+    /// survives a relocation that cancels the loop, and
+    /// [`Self::into_observer_handoff`] carries it onto the relocated observer
+    /// (a delivery latched here surfaces on the observer's first poll).
+    pub(super) graceful_abort_trigger: Option<crate::GracefulAbortTrigger>,
+
     /// Runtime loss-of-primacy signal (BUG-6). The owning
     /// [`crate::process::Node`] installs the receive end; a self→other
     /// `RoleTable.primary` flip (a `PrimaryChanged` / merge / restore
@@ -1426,6 +1444,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             preferred_secondaries_validator:
                 preferred_secondaries::PreferredSecondariesValidator::new(),
             panik_signal_rx: None,
+            graceful_abort_trigger: None,
             demote_rx: Some(demote_rx),
             panik_outcome: None,
             worker_mgmt_rx: Some(worker_mgmt_rx),
@@ -1598,6 +1617,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         rx: tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>,
     ) {
         self.panik_signal_rx = Some(rx);
+    }
+
+    /// Inject the pre-armed operator SIGUSR2 graceful-abort trigger — the
+    /// primary sibling of `ObserverCoordinator::set_graceful_abort_trigger`.
+    /// The PyO3 entry path arms the ONE process trigger at entry (BEFORE the
+    /// bootstrap mesh bind, so a signal received during the primary's
+    /// bootstrap window is latched rather than killing the process) and hands
+    /// it here. The operational loop's graceful-abort arm consumes it; on a
+    /// relocation the trigger rides [`Self::into_observer_handoff`] onto the
+    /// standalone observer (a latched pre-relocation delivery surfaces on the
+    /// observer's first poll). MUST be called before `run()` enters — an
+    /// un-injected primary parks the arm and never self-arms a second stream
+    /// (the single-owner rule).
+    pub fn register_graceful_abort_trigger(&mut self, trigger: crate::GracefulAbortTrigger) {
+        self.graceful_abort_trigger = Some(trigger);
     }
 
     /// Register the BUG-6 demote signal on this primary's own
@@ -3436,6 +3470,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             lifecycle_dispatcher_handle,
             task_completed_dispatcher_handle,
             panik_signal_rx,
+            graceful_abort_trigger,
             tunnel_reconnector,
             respawn_spawner,
             ..
@@ -3461,6 +3496,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             },
             started_phases: phase_started_emitted,
             panik_signal_rx,
+            // The operator's SIGUSR2 trigger rides across the relocation: the
+            // SAME armed stream the primary held now drives the observer's
+            // graceful-abort arm, so a SIGUSR2 latched during the primary
+            // tenure (or arriving on the relocated observer) surfaces on the
+            // observer's first poll rather than hitting the kernel default.
+            // `None` when un-injected (the primary never self-armed one).
+            graceful_abort_trigger,
             // The dispatchers are spawned unconditionally at `run_pipeline`
             // entry (`spawn_run_dispatchers`), so both handles are present
             // at the relocate point. Carried so the observer's

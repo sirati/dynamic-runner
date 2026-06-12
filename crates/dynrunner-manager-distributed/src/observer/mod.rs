@@ -14,10 +14,6 @@
 //!     reporter (the operator's "wake-an-LLM" feed).
 //!   * [`failure_response`] — the terminal-failure policies (error
 //!     aggregation + the invalid_task fatal-exit monitor).
-//!   * [`graceful_abort_trigger`] — the operator's SIGUSR2 channel:
-//!     armed at process entry (so a pre-seat delivery is latched, never
-//!     a default-disposition death) and consumed by the coordinator's
-//!     graceful-abort arm.
 //!   * [`lost_visibility`]  — the report-lost-and-keep-observing state
 //!     machine (visibility loss is reported + retried, NEVER a run verdict).
 //!   * [`reconnect`]        — the transport-recovery port the observer
@@ -35,7 +31,6 @@ pub mod announcer;
 pub mod coordinator;
 pub mod failure_response;
 pub(crate) mod fleet_death;
-pub mod graceful_abort_trigger;
 pub mod lifecycle;
 pub mod lost_visibility;
 pub mod reconnect;
@@ -50,7 +45,6 @@ pub use coordinator::{
     build_cold_join_observer,
 };
 pub use failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
-pub use graceful_abort_trigger::GracefulAbortTrigger;
 pub use lifecycle::{AnnouncerHandle, attach_observer_announcer};
 pub use lost_visibility::{
     EndedOutage, LostVisibilityReporter, MeshLiveness, RetryDirective, Visibility, WakeNoteSlot,
