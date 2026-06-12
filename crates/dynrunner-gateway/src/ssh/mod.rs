@@ -25,11 +25,13 @@ use crate::traits::GatewayError;
 mod argv;
 mod commands;
 mod connect_disconnect;
+mod forwards;
 
 #[cfg(test)]
 mod tests;
 
 use argv::{master_watcher_loop, probe_master_pid, terminate_daemon_blocking};
+pub use forwards::{MasterForward, master_forward_cancel, master_forward_open};
 
 /// Gateway for SSH connections using a persistent ControlMaster connection.
 ///
@@ -84,6 +86,13 @@ pub struct SshGateway {
     /// connect() returns. A `std::thread` outlives any per-call
     /// runtime and only exits on `watcher_cancel` or daemon death.
     pub(super) watcher_thread: Option<std::thread::JoinHandle<()>>,
+    /// The detached owner-death babysitter for OWNED masters (see
+    /// [`spawn_master_babysitter`]): reaps the ControlPersist daemon
+    /// when this process dies without running `Drop` (SIGKILL). Killed
+    /// on the orderly `disconnect()`/`Drop` paths, where the gateway
+    /// tears the master down itself. `None` before `connect()`, after
+    /// teardown, and for adopted masters.
+    pub(super) babysitter: Option<std::process::Child>,
     pub(super) remote_home: Option<String>,
     pub(super) forwarded_ports: Vec<(u16, u16)>,
     /// Whether GatewayPorts is enabled on the remote SSH server.
@@ -117,6 +126,7 @@ impl SshGateway {
             daemon_pid: None,
             watcher_cancel: Arc::new(AtomicBool::new(false)),
             watcher_thread: None,
+            babysitter: None,
             remote_home: None,
             forwarded_ports: Vec::new(),
             gateway_ports_enabled: None,
@@ -139,6 +149,26 @@ impl SshGateway {
     /// Drop-cleans-master (bug (g)) and master-died-observer contracts.
     pub fn master_pid(&self) -> Option<u32> {
         self.daemon_pid
+    }
+
+    /// PID of the owner-death babysitter process, if one is running
+    /// (see [`spawn_master_babysitter`]). `None` before `connect()`,
+    /// after `disconnect()`, and for adopted masters. Primarily for
+    /// the integration tests pinning the babysitter lifecycle.
+    pub fn babysitter_pid(&self) -> Option<u32> {
+        self.babysitter.as_ref().map(std::process::Child::id)
+    }
+
+    /// Kill + reap the owner-death babysitter, if any — the orderly
+    /// counterpart of [`spawn_master_babysitter`]: on the
+    /// `disconnect()`/`Drop` paths the gateway tears the master down
+    /// itself, so the babysitter must not linger for the rest of the
+    /// owner's lifetime. Sync (used from `Drop`); idempotent.
+    pub(super) fn reap_babysitter(&mut self) {
+        if let Some(mut babysitter) = self.babysitter.take() {
+            let _ = babysitter.kill();
+            let _ = babysitter.wait();
+        }
     }
 
     /// Control socket path of the connected master, if any — `None`
@@ -279,12 +309,18 @@ impl Drop for SshGateway {
     /// Order:
     ///   1. Raise `watcher_cancel` so the watcher thread exits
     ///      silently — the daemon is about to die *expectedly*.
-    ///   2. SIGTERM the daemon. Poll `kill(pid, 0)` for up to 200ms.
-    ///   3. SIGKILL on grace expiry.
-    ///   4. Join the watcher thread (blocks at most ~1s for the next
+    ///   2. Kill + reap the owner-death babysitter — this orderly
+    ///      path tears the master down itself.
+    ///   3. SIGTERM the daemon. Poll `kill(pid, 0)` for up to 200ms.
+    ///   4. SIGKILL on grace expiry.
+    ///   5. Join the watcher thread (blocks at most ~1s for the next
     ///      poll tick to observe the cancel flag).
     fn drop(&mut self) {
         self.watcher_cancel.store(true, Ordering::SeqCst);
+        // The babysitter first: we are tearing the master down
+        // ourselves on this orderly path, so the owner-death watcher
+        // must not outlive the gateway object.
+        self.reap_babysitter();
         if let Some(pid) = self.daemon_pid.take() {
             terminate_daemon_blocking(pid);
         }
@@ -324,7 +360,7 @@ pub fn auth_options_for(config: &SshConfig) -> Vec<String> {
 /// `user@host` (or bare `host`) ssh destination for `config` — the
 /// free-function form of [`SshGateway::ssh_target`] (which delegates
 /// here, so the two can never drift).
-fn ssh_target_for(config: &SshConfig) -> String {
+pub(super) fn ssh_target_for(config: &SshConfig) -> String {
     match &config.user {
         Some(user) => format!("{user}@{}", config.host),
         None => config.host.clone(),
@@ -333,7 +369,7 @@ fn ssh_target_for(config: &SshConfig) -> String {
 
 /// Port + auth flag chain for `config` — the free-function form of
 /// [`SshGateway::base_ssh_args`] (which delegates here).
-fn base_ssh_args_for(config: &SshConfig) -> Vec<String> {
+pub(super) fn base_ssh_args_for(config: &SshConfig) -> Vec<String> {
     let mut args = Vec::new();
     if config.port != 22 {
         args.push("-p".into());
@@ -341,6 +377,91 @@ fn base_ssh_args_for(config: &SshConfig) -> Vec<String> {
     }
     args.extend(auth_options_for(config));
     args
+}
+
+/// Pinned anti-mux flags for framework ssh children that must be a
+/// REAL standalone connection: `ControlPath=none ControlMaster=no
+/// ControlPersist=no`.
+///
+/// Without these, an operator's `~/.ssh/config` carrying
+/// `ControlMaster auto` + `ControlPath` + `ControlPersist yes` (a
+/// common desktop setup) silently rewrites the semantics of a
+/// framework `ssh -N` tunnel child: ssh auto-spawns (or joins) the
+/// USER's master, ControlPersist hands the connection off to the
+/// detached daemon, and the foreground child exits 0 within ~100ms —
+/// the forward is alive on a master the framework neither owns nor
+/// tracks, and every child-lifetime assumption (alive-gate, rebuild,
+/// PDEATHSIG reaping) is voided. `-o` flags beat config-file
+/// directives, so pinning all three restores true direct-dial
+/// `ssh -N` behavior regardless of operator config.
+pub fn no_mux_options() -> &'static [&'static str] {
+    &[
+        "-o",
+        "ControlPath=none",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPersist=no",
+    ]
+}
+
+/// Spawn the master BABYSITTER: a detached `sh` loop that waits for
+/// `owner_pid` to die, then tears the master behind `control_path`
+/// down via `ssh -O exit`.
+///
+/// Why this exists: the `ControlPersist` master forks-and-detaches,
+/// so no `Drop`/`kill_on_drop`/PDEATHSIG on anything we hold can
+/// reach it when the OWNING process is SIGKILLed — `Drop` never
+/// runs, and PDEATHSIG is cleared across the daemon's fork. Orphaned
+/// masters then persist indefinitely (`ControlPersist=yes`),
+/// accumulating as stale `/tmp/dynrunner-m-*.sock` daemons on shared
+/// gateways/desktops. The babysitter is the one process shape that
+/// survives the owner's SIGKILL (it must NOT carry PDEATHSIG) and
+/// can still act afterwards.
+///
+/// Lifecycle: spawned by `connect()` for OWNED masters only (an
+/// adopted master belongs to the upstream driver); killed by
+/// `disconnect()`/`Drop` on the orderly paths, where the gateway
+/// tears the master down itself. `kill -0` on a recycled PID keeps
+/// the loop alive harmlessly until the recycled process exits; the
+/// `ssh -O exit` against an already-gone socket fails fast and the
+/// babysitter exits.
+pub fn spawn_master_babysitter(
+    owner_pid: u32,
+    control_path: &str,
+    config: &SshConfig,
+) -> std::io::Result<std::process::Child> {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(master_babysitter_script(owner_pid, control_path, config))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+}
+
+/// The babysitter's shell script (see [`spawn_master_babysitter`]).
+/// Pure so the wait-for-owner-then-`ssh -O exit` shape is
+/// unit-testable.
+pub(super) fn master_babysitter_script(
+    owner_pid: u32,
+    control_path: &str,
+    config: &SshConfig,
+) -> String {
+    let mut exit_argv: Vec<String> = vec!["ssh".into()];
+    exit_argv.extend(base_ssh_args_for(config));
+    exit_argv.extend([
+        "-O".into(),
+        "exit".into(),
+        "-o".into(),
+        format!("ControlPath={control_path}"),
+    ]);
+    exit_argv.push(ssh_target_for(config));
+    format!(
+        "while kill -0 {owner_pid} 2>/dev/null; do sleep 5; done; \
+         exec {} >/dev/null 2>&1",
+        crate::shell::shell_join(&exit_argv)
+    )
 }
 
 /// `true` iff a live ControlMaster daemon answers `ssh -O check`
@@ -354,7 +475,11 @@ fn base_ssh_args_for(config: &SshConfig) -> Vec<String> {
 /// failure (missing socket, unresponsive daemon, ssh spawn failure)
 /// is `false`; the caller owns the fallback policy.
 pub async fn control_socket_alive(control_path: &str, config: &SshConfig) -> bool {
-    probe_master_pid(control_path, &ssh_target_for(config), &base_ssh_args_for(config))
-        .await
-        .is_ok()
+    probe_master_pid(
+        control_path,
+        &ssh_target_for(config),
+        &base_ssh_args_for(config),
+    )
+    .await
+    .is_ok()
 }

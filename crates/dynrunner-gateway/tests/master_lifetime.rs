@@ -454,3 +454,117 @@ async fn master_pid_is_daemon_not_launcher() {
     // Clean up.
     gw.disconnect().await.expect("disconnect");
 }
+
+/// The owner-death babysitter end-to-end: when the process that owns
+/// the master dies WITHOUT any Drop running (SIGKILL — simulated by a
+/// `sleep` stand-in owner, since a test cannot SIGKILL itself), the
+/// babysitter loop tears the orphaned `ControlPersist` daemon down
+/// via `ssh -O exit`. This is the leak that left stale
+/// `/tmp/dynrunner-m-*` masters from killed joiners accumulating on
+/// the LMU gateway box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn babysitter_reaps_master_when_owner_dies() {
+    let _serial = serialise().await;
+    if !sshd_reachable() {
+        eprintln!("[skip] sshd not reachable on localhost:22 — babysitter unverified");
+        return;
+    }
+    let authorized = match AuthorizedKey::provision() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[skip] could not provision authorized_keys: {e}");
+            return;
+        }
+    };
+
+    let mut gw = make_gateway(&authorized);
+    gw.connect().await.expect("connect");
+    let master_pid = gw.master_pid().expect("daemon pid");
+    let control_path = gw.control_path().expect("control path").to_owned();
+
+    // A disposable stand-in owner. Production watches
+    // `std::process::id()` of the connecting process; the mechanism
+    // is identical — only the watched PID differs.
+    let mut fake_owner = StdCommand::new("sleep")
+        .arg("600")
+        .spawn()
+        .expect("spawn fake owner");
+    let config = SshConfig {
+        host: "127.0.0.1".into(),
+        port: 22,
+        user: std::env::var("USER").ok(),
+        identity_file: Some(authorized.private_path.to_string_lossy().into_owned()),
+        config_file: None,
+    };
+    let mut babysitter =
+        dynrunner_gateway::spawn_master_babysitter(fake_owner.id(), &control_path, &config)
+            .expect("spawn babysitter");
+
+    // Owner alive: the master must survive a full poll interval.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(
+        pid_alive(master_pid),
+        "babysitter must not touch the master while the owner lives"
+    );
+
+    // Owner dies unreaped-by-framework (the SIGKILL shape).
+    fake_owner.kill().expect("kill fake owner");
+    fake_owner.wait().expect("reap fake owner");
+
+    // Babysitter polls at 5s cadence; allow two cycles + exit cmd.
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while pid_alive(master_pid) {
+        if Instant::now() >= deadline {
+            // Clean up before failing so the master doesn't leak.
+            let _ = babysitter.kill();
+            drop(gw);
+            panic!("master pid {master_pid} still alive 12s after owner death");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = babysitter.wait();
+
+    // The daemon is gone; the gateway object's own teardown is now a
+    // no-op (terminate ladder fast-paths on ESRCH).
+    drop(gw);
+}
+
+/// The babysitter must not outlive the orderly teardown paths: after
+/// `disconnect()` the gateway has torn the master down itself, so the
+/// owner-death watcher is killed + reaped — no sleeping `sh` parked
+/// for the rest of the owner's lifetime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disconnect_reaps_babysitter() {
+    let _serial = serialise().await;
+    if !sshd_reachable() {
+        eprintln!("[skip] sshd not reachable on localhost:22 — babysitter lifecycle unverified");
+        return;
+    }
+    let authorized = match AuthorizedKey::provision() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[skip] could not provision authorized_keys: {e}");
+            return;
+        }
+    };
+
+    let mut gw = make_gateway(&authorized);
+    gw.connect().await.expect("connect");
+    let babysitter_pid = gw
+        .babysitter_pid()
+        .expect("owned master must have a babysitter");
+    assert!(pid_alive(babysitter_pid), "babysitter alive post-connect");
+
+    gw.disconnect().await.expect("disconnect");
+    assert!(
+        gw.babysitter_pid().is_none(),
+        "disconnect must clear the babysitter"
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while pid_alive(babysitter_pid) {
+        if Instant::now() >= deadline {
+            panic!("babysitter pid {babysitter_pid} still alive 2s after disconnect");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

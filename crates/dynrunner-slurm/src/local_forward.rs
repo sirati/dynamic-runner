@@ -22,31 +22,52 @@
 //!
 //! The per-tunnel lifecycle policy is the `-R` path's, reused verbatim
 //! through the crate-internal seam in [`crate::preparation`]:
-//! [`verify_tunnel_alive`] (3s alive-gate + `ExitOnForwardFailure`),
-//! [`terminate_child`] (SIGTERM → 5s → SIGKILL), and
+//! [`terminate_child`] (SIGTERM → 5s → SIGKILL) for direct legs, and
 //! [`ReconnectEscalation`] (#342's half-dead override: K consecutive
 //! alive-noop reconnect ticks force a rebuild past the liveness gate).
 //! The auth flag chain comes from [`dynrunner_gateway::auth_options_for`]
-//! — the same single source of truth the gateway master uses.
+//! — the same single source of truth the gateway master uses. (The
+//! `-R` path's child-longevity `verify_tunnel_alive` gate is NOT
+//! reused here: under mux, child lifetime says nothing about the
+//! forward — see `# Multiplexing` below.)
 //!
 //! # Multiplexing over the gateway master
 //!
 //! The late-joiner already holds a connected
 //! [`dynrunner_gateway::SshGateway`] ControlMaster when it builds this
-//! registry, so each `ssh -N -L` child is spawned as a MUX CLIENT over
-//! that master's control socket (`-o ControlPath=<sock> -o
-//! ControlMaster=no`): one real TCP+auth session total, near-instant
-//! per-forward establishment, and the gateway sshd's `MaxStartups`
-//! never sees more than the master's single connection — which is what
-//! makes the concurrent fan-out in [`LocalForwardTunnels::establish`]
-//! safe. The spawner probes master liveness
-//! ([`dynrunner_gateway::control_socket_alive`]) per spawn — initial
-//! AND rebuild ride the same seam — and falls back to a direct dial
-//! (WARN) when the master is absent or dead: a joiner must never be
-//! hard-broken by a missing master. The full auth/port flag chain is
-//! kept on mux argvs too, so even a master dying between probe and
-//! spawn degrades to a direct dial (`ControlMaster=no` semantics)
-//! instead of failing.
+//! registry, so each forward is REGISTERED ON the master via `ssh -O
+//! forward -L …` ([`dynrunner_gateway::master_forward_open`]): one
+//! real TCP+auth session total, near-instant per-forward
+//! establishment, ZERO sshd session channels — which is what makes
+//! the concurrent fan-out in [`LocalForwardTunnels::establish`] safe
+//! against both `MaxStartups` (one connection) and `MaxSessions` (no
+//! sessions). It must NOT be an `ssh -N -L` mux client: such a client
+//! asks the master for a real session (sshd runs the login shell, the
+//! null stdin EOFs it, the client exits with the shell's status in
+//! milliseconds while the forward lives on, master-side) — so a
+//! cohort of N clients burns N `MaxSessions` slots (default 10; the
+//! 11th leg gets "Session open refused by peer") and reduces
+//! child-lifetime gating to noise. That was the LMU 11/11 "failure":
+//! every forward was alive on the master while the old child-longevity
+//! gate declared it dead. The establishment gate is therefore the
+//! FORWARD itself — `127.0.0.1:<local_port>` actually LISTENing
+//! ([`gate_forward_listening`]) — never child longevity.
+//!
+//! The leg builder probes master liveness
+//! ([`dynrunner_gateway::control_socket_alive`]) per establishment —
+//! initial AND rebuild ride the same seam — and falls back to a
+//! DIRECT `ssh -N -L` dial (WARN) when the master is absent, dead, or
+//! refuses the registration: a joiner must never be hard-broken by a
+//! missing master. Direct dials are real per-process gateway
+//! connections, so their concurrency is bounded
+//! ([`DIRECT_DIALS_IN_FLIGHT`]) below sshd's `MaxStartups` random-drop
+//! threshold, and every direct argv pins
+//! [`dynrunner_gateway::no_mux_options`] so an operator ssh_config
+//! with `ControlMaster auto`/`ControlPersist yes` cannot silently
+//! turn the dial back into a master handoff (instant rc=0 exit, the
+//! same misread all over again). One failed attempt is retried once
+//! through the full probe-and-build seam (a refused/raced leg must
+//! re-resolve, not die).
 //!
 //! # Rebuilds keep the local port
 //!
@@ -73,13 +94,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
-use dynrunner_gateway::{SshConfig, auth_options_for, control_socket_alive, shell_join};
-use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use std::time::Duration;
 
-use crate::preparation::{
-    EscalationVerdict, PrepError, ReconnectEscalation, terminate_child, verify_tunnel_alive,
+use dynrunner_gateway::{
+    MasterForward, SshConfig, auth_options_for, control_socket_alive, master_forward_cancel,
+    master_forward_open, no_mux_options, shell_join,
 };
+use tokio::process::{Child, Command};
+use tokio::sync::{Mutex, Semaphore};
+
+use crate::preparation::{EscalationVerdict, ReconnectEscalation, terminate_child};
 
 /// One peer's forward target, as harvested from its gateway-side
 /// `.info` record: the compute host (the record's legacy-URI host —
@@ -152,41 +176,40 @@ pub enum ReconnectOutcome {
     Rebuilt { local_port: u16 },
 }
 
-/// The spawn future a [`ForwardSpawner`] produces. `!Send` is fine —
-/// the registry lives on the observer's `LocalSet` (the same provider
-/// physics as the `-R` path's spawner seam).
-type SpawnFuture = Pin<Box<dyn Future<Output = Result<Child, std::io::Error>>>>;
+/// The establish future a [`LegEstablisher`] produces. `!Send` is fine
+/// — the registry lives on the observer's `LocalSet` (the same
+/// provider physics as the `-R` path's spawner seam).
+type LegFuture = Pin<Box<dyn Future<Output = Result<ForwardLeg, LocalForwardError>>>>;
 
 /// DI seam mirroring `preparation`'s spawner closures: tests inject a
-/// fake child factory; production spawns the real `ssh -N -L`.
+/// fake leg factory; production resolves mux-vs-direct, dials, and
+/// gates on the forward actually listening ([`LegBuilder`]).
 /// Args: `(peer_id, local_port, target_host, target_port)`.
-type ForwardSpawner = Box<dyn Fn(&str, u16, &str, u16) -> SpawnFuture + Send + Sync>;
+type LegEstablisher = Box<dyn Fn(&str, u16, &str, u16) -> LegFuture + Send + Sync>;
 
-/// Build the argv for `ssh -N -L 127.0.0.1:<local>:<host>:<port>
-/// <gateway>`. Pure (no I/O) so the shape is unit-testable.
+/// Build the argv for a DIRECT `ssh -N -L
+/// 127.0.0.1:<local>:<host>:<port> <gateway>` dial. Pure (no I/O) so
+/// the shape is unit-testable.
 ///
-/// `mux_control_path: Some(sock)` makes the child a mux client over
-/// the gateway master at `sock` (`-o ControlPath=<sock> -o
-/// ControlMaster=no`) — no fresh TCP/auth, the forward is opened
-/// through the established session. The auth/port flags are kept
-/// regardless: on a mux argv they are inert while the socket answers,
-/// and they carry ssh's own direct-dial degradation if the master
-/// dies between the caller's liveness probe and the spawn
-/// (`ControlMaster=no` = "use the socket if live, else dial direct").
+/// Every mux-relevant option is pinned OFF
+/// ([`dynrunner_gateway::no_mux_options`]): an operator ssh_config
+/// carrying `ControlMaster auto` + `ControlPersist yes` would
+/// otherwise hand this "direct" dial off to an auto-spawned user
+/// master and exit 0 within ~100ms — the forward alive on a master
+/// the framework neither owns nor gates, the child-lifetime contract
+/// (PDEATHSIG reaping, rebuild-by-respawn) silently voided.
 ///
 /// The keepalive floor matches the gateway master's
 /// (`ServerAliveInterval=60 × CountMax=1080 = 18h`) and the `-R`
 /// tunnels' — a long observation must not lose its forwards to a
-/// transient stall (on a mux client the master owns the keepalives;
-/// the flags are inert there). `ExitOnForwardFailure=yes` makes a
-/// failed local bind kill the child inside the 3s alive-gate instead
-/// of leaving a forwardless ssh lingering.
+/// transient stall. `ExitOnForwardFailure=yes` makes a failed local
+/// bind kill the child inside the establishment gate instead of
+/// leaving a forwardless ssh lingering.
 pub(crate) fn build_local_forward_argv(
     local_port: u16,
     target_host: &str,
     target_port: u16,
     gateway: &SshConfig,
-    mux_control_path: Option<&str>,
 ) -> Vec<String> {
     let mut argv: Vec<String> = vec!["ssh".into()];
     argv.extend(auth_options_for(gateway));
@@ -216,22 +239,172 @@ pub(crate) fn build_local_forward_argv(
         "-o".into(),
         "LogLevel=ERROR".into(),
     ]);
-    if let Some(control_path) = mux_control_path {
-        argv.extend([
-            "-o".into(),
-            format!("ControlPath={control_path}"),
-            "-o".into(),
-            "ControlMaster=no".into(),
-        ]);
-    }
+    argv.extend(no_mux_options().iter().map(|o| (*o).to_string()));
     argv
 }
 
-/// Per-spawn transport selection: multiplex over the gateway master
-/// when its control socket answers `ssh -O check`; direct-dial (WARN)
-/// when no master was handed over or it is absent/dead. Probed at
-/// EVERY spawn — initial establishment and the reconnect rebuild share
-/// [`LocalForwardTunnels::spawn_and_gate`], so a master that dies
+/// Establishment budget for a DIRECT dial: full TCP+auth handshake
+/// plus the local bind (the `-R` path's historical 3s window).
+const DIRECT_ESTABLISH_GATE: Duration = Duration::from_secs(3);
+
+/// Establishment budget for a mux registration: the master binds the
+/// local listener before `ssh -O forward` even returns, so this only
+/// absorbs scheduler noise.
+const MUX_ESTABLISH_GATE: Duration = Duration::from_secs(1);
+
+/// Concurrent DIRECT dials in flight. Each is a real unauthenticated
+/// gateway connection until its handshake completes, and sshd's
+/// `MaxStartups` (default `10:30:100`) starts RANDOMLY dropping at 10
+/// — a concurrent 11-peer cohort of direct dials would re-create the
+/// thundering herd the mux path avoids. 4 keeps comfortable headroom
+/// for the master itself plus unrelated operator activity while still
+/// overlapping handshakes. Mux registrations don't take a slot (they
+/// ride the ONE established master connection).
+const DIRECT_DIALS_IN_FLIGHT: usize = 4;
+
+/// `true` while something LISTENs on `127.0.0.1:<port>`.
+///
+/// Bind-probe: try to bind the port ourselves — `AddrInUse` means a
+/// listener (the ssh child or the master daemon) holds it; success
+/// means nothing does (the probe socket is dropped immediately). No
+/// connection is ever made, so probing — establishment gate AND the
+/// ~60s reconnect liveness cadence — never sends a spurious dial
+/// through the tunnel to the peer. Residual: a FOREIGN process
+/// grabbing the reserved port between reservation and ssh's bind
+/// reads as "listening" (the same reservation race the `-R` path
+/// documents); the leg's child then exits loudly and the reconnect
+/// cadence rebuilds.
+pub(crate) fn local_port_listening(port: u16) -> bool {
+    match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+        Ok(_probe) => false,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => true,
+        Err(e) => {
+            tracing::warn!(
+                port,
+                error = %e,
+                "local-forward listen probe failed unexpectedly; treating as not listening"
+            );
+            false
+        }
+    }
+}
+
+/// The establishment gate: the FORWARD is up iff
+/// `127.0.0.1:<local_port>` is LISTENing within `budget` — child
+/// longevity proves nothing (a mux registration has no child at all;
+/// an unpinned mux client exits rc=0 in milliseconds with its forward
+/// alive on the master — the LMU misread).
+///
+/// `child`: the direct-dial ssh, when there is one. Its EXIT before
+/// the port listens is a hard failure (a pinned direct `ssh -N` owns
+/// the listener, so child death == forward death) and its rc/stderr
+/// carry the diagnosis (`ExitOnForwardFailure` makes refused binds
+/// and refused gateways exit here). With no child, only the
+/// port/deadline arms apply.
+pub(crate) async fn gate_forward_listening(
+    peer_id: &str,
+    local_port: u16,
+    mut child: Option<&mut Child>,
+    budget: Duration,
+) -> Result<(), LocalForwardError> {
+    let deadline = Instant::now() + budget;
+    loop {
+        if local_port_listening(local_port) {
+            tracing::info!(peer_id, local_port, "local forward listening");
+            return Ok(());
+        }
+        if let Some(c) = child.as_deref_mut()
+            && let Ok(Some(status)) = c.try_wait()
+        {
+            // Child gone, forward never came up: drain whatever the
+            // ssh wrote before exiting (the write end is closed, so
+            // this returns every buffered byte without racing).
+            let mut stderr = String::new();
+            if let Some(mut pipe) = c.stderr.take() {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                let _ = pipe.read_to_end(&mut buf).await;
+                stderr = String::from_utf8_lossy(&buf).trim().to_owned();
+            }
+            return Err(LocalForwardError::Establish {
+                peer_id: peer_id.to_owned(),
+                rc: status.code(),
+                stderr,
+            });
+        }
+        if Instant::now() >= deadline {
+            return Err(LocalForwardError::Establish {
+                peer_id: peer_id.to_owned(),
+                rc: None,
+                stderr: format!(
+                    "forward did not start listening on 127.0.0.1:{local_port} \
+                     within {budget:?}"
+                ),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// One established forward's transport, owned by the registry from
+/// establishment to release.
+pub(crate) enum ForwardLeg {
+    /// Registered on the gateway ControlMaster via `ssh -O forward`
+    /// — no process of ours carries it; the master holds the local
+    /// listener. Released via the matching `ssh -O cancel` (and
+    /// implicitly by master teardown).
+    Mux {
+        control_path: String,
+        gateway: SshConfig,
+        spec: MasterForward,
+    },
+    /// A direct `ssh -N -L` child of ours; the child owns the local
+    /// listener, so child lifetime is forward lifetime.
+    Direct { child: Child },
+}
+
+impl ForwardLeg {
+    /// Leg liveness for the reconnect gate: a direct child must be
+    /// running; a mux registration must still hold its listener (the
+    /// master dying takes the LISTEN down with it).
+    fn is_alive(&mut self, local_port: u16) -> bool {
+        match self {
+            ForwardLeg::Direct { child } => matches!(child.try_wait(), Ok(None)),
+            ForwardLeg::Mux { .. } => local_port_listening(local_port),
+        }
+    }
+
+    /// Free the leg's local port: reap the direct child (we own the
+    /// process — the local mirror of the `-R` path's remote
+    /// `fuser -k` release), or cancel the master-side registration.
+    /// Best-effort on the mux side: a dead master already released
+    /// the port, and the cancel failing must not block a rebuild.
+    async fn release(&mut self, peer_id: &str) {
+        match self {
+            ForwardLeg::Direct { child } => terminate_child(child).await,
+            ForwardLeg::Mux {
+                control_path,
+                gateway,
+                spec,
+            } => {
+                if let Err(e) = master_forward_cancel(control_path, gateway, spec).await {
+                    tracing::debug!(
+                        peer_id,
+                        error = %e,
+                        "ssh -O cancel for local forward failed (master likely \
+                         gone; its listener died with it)"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Per-establishment transport selection: multiplex over the gateway
+/// master when its control socket answers `ssh -O check`; direct-dial
+/// (WARN) when no master was handed over or it is absent/dead. Probed
+/// at EVERY establishment — initial and the reconnect rebuild share
+/// [`LocalForwardTunnels::establish_leg`], so a master that dies
 /// mid-run degrades the next rebuild instead of breaking it.
 async fn resolve_mux_control_path<'a>(
     control_path: Option<&'a str>,
@@ -252,19 +425,126 @@ async fn resolve_mux_control_path<'a>(
     }
 }
 
-/// The production spawner: spawn the `ssh -N -L` child for one
-/// forward, multiplexed over the gateway master at `control_path`
-/// when it is alive (see [`resolve_mux_control_path`]).
-fn production_spawner(gateway: SshConfig, control_path: Option<String>) -> ForwardSpawner {
-    Box::new(move |peer_id, local_port, target_host, target_port| {
-        let gateway = gateway.clone();
-        let control_path = control_path.clone();
-        let peer_id = peer_id.to_owned();
-        let target_host = target_host.to_owned();
-        Box::pin(async move {
-            let mux = resolve_mux_control_path(control_path.as_deref(), &gateway, &peer_id).await;
+/// Run `work` holding one of the semaphore's slots — the in-flight
+/// bound for direct dials. Tiny and free-standing so the bounding
+/// itself is unit-testable.
+async fn with_dial_slot<T>(slots: &Semaphore, work: impl Future<Output = T>) -> T {
+    let _permit = slots
+        .acquire()
+        .await
+        .expect("dial-slot semaphore is never closed");
+    work.await
+}
+
+/// The production leg builder: resolve mux-vs-direct per
+/// establishment, dial, and gate on the forward LISTENing.
+struct LegBuilder {
+    gateway: SshConfig,
+    control_path: Option<String>,
+    direct_dial_slots: Semaphore,
+}
+
+impl LegBuilder {
+    fn new(gateway: SshConfig, control_path: Option<String>) -> Self {
+        Self {
+            gateway,
+            control_path,
+            direct_dial_slots: Semaphore::new(DIRECT_DIALS_IN_FLIGHT),
+        }
+    }
+
+    async fn establish(
+        &self,
+        peer_id: &str,
+        local_port: u16,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<ForwardLeg, LocalForwardError> {
+        if let Some(cp) =
+            resolve_mux_control_path(self.control_path.as_deref(), &self.gateway, peer_id).await
+        {
+            match self
+                .establish_mux(cp, peer_id, local_port, target_host, target_port)
+                .await
+            {
+                Ok(leg) => return Ok(leg),
+                Err(e) => {
+                    tracing::warn!(
+                        peer_id,
+                        error = %e,
+                        "mux forward registration on the gateway master failed; \
+                         falling back to a direct ssh dial for this forward"
+                    );
+                }
+            }
+        }
+        self.establish_direct(peer_id, local_port, target_host, target_port)
+            .await
+    }
+
+    /// Register the forward ON the master (`ssh -O forward -L …`) —
+    /// sessionless, so a whole cohort can fan out without touching
+    /// sshd's `MaxSessions`/`MaxStartups` — then gate on the master's
+    /// listener being up.
+    async fn establish_mux(
+        &self,
+        control_path: &str,
+        peer_id: &str,
+        local_port: u16,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<ForwardLeg, LocalForwardError> {
+        let spec = MasterForward::Local {
+            bind_addr: "127.0.0.1".into(),
+            bind_port: local_port,
+            dest_host: target_host.to_owned(),
+            dest_port: target_port,
+        };
+        tracing::info!(
+            peer_id,
+            local = %format!("127.0.0.1:{local_port}"),
+            dest = %format!("{target_host}:{target_port}"),
+            via = %format!("mux:{control_path}"),
+            "registering SSH local-forward on the gateway master"
+        );
+        master_forward_open(control_path, &self.gateway, &spec)
+            .await
+            .map_err(|e| LocalForwardError::Establish {
+                peer_id: peer_id.to_owned(),
+                rc: None,
+                stderr: e.to_string(),
+            })?;
+        let leg = ForwardLeg::Mux {
+            control_path: control_path.to_owned(),
+            gateway: self.gateway.clone(),
+            spec,
+        };
+        match gate_forward_listening(peer_id, local_port, None, MUX_ESTABLISH_GATE).await {
+            Ok(()) => Ok(leg),
+            Err(e) => {
+                // Registration claimed success but no listener showed:
+                // unregister so the master doesn't hold a half-leg.
+                let mut leg = leg;
+                leg.release(peer_id).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Direct `ssh -N -L` dial (no master): a real per-process
+    /// gateway connection, in-flight-bounded against `MaxStartups`,
+    /// argv pinned against operator mux config, gated on the child's
+    /// own listener.
+    async fn establish_direct(
+        &self,
+        peer_id: &str,
+        local_port: u16,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<ForwardLeg, LocalForwardError> {
+        with_dial_slot(&self.direct_dial_slots, async {
             let argv =
-                build_local_forward_argv(local_port, &target_host, target_port, &gateway, mux);
+                build_local_forward_argv(local_port, target_host, target_port, &self.gateway);
             tracing::info!(
                 peer_id,
                 local = %format!("127.0.0.1:{local_port}"),
@@ -285,7 +565,29 @@ fn production_spawner(gateway: SshConfig, control_path: Option<String>) -> Forwa
             // late-joiner from orphaning its `ssh -L` legs (#425).
             cmd.kill_on_drop(true);
             crate::child_reaping::link_child_death_to_parent(&mut cmd);
-            cmd.spawn()
+            let mut child = cmd.spawn().map_err(|source| LocalForwardError::Spawn {
+                peer_id: peer_id.to_owned(),
+                source,
+            })?;
+            gate_forward_listening(peer_id, local_port, Some(&mut child), DIRECT_ESTABLISH_GATE)
+                .await?;
+            Ok(ForwardLeg::Direct { child })
+        })
+        .await
+    }
+}
+
+/// The production establisher over [`LegBuilder`].
+fn production_establisher(gateway: SshConfig, control_path: Option<String>) -> LegEstablisher {
+    let builder = Arc::new(LegBuilder::new(gateway, control_path));
+    Box::new(move |peer_id, local_port, target_host, target_port| {
+        let builder = Arc::clone(&builder);
+        let peer_id = peer_id.to_owned();
+        let target_host = target_host.to_owned();
+        Box::pin(async move {
+            builder
+                .establish(&peer_id, local_port, &target_host, target_port)
+                .await
         })
     })
 }
@@ -305,7 +607,7 @@ struct ForwardEntry {
     local_port: u16,
     host: String,
     port: u16,
-    child: Child,
+    leg: ForwardLeg,
 }
 
 struct Inner {
@@ -313,11 +615,11 @@ struct Inner {
     escalation: ReconnectEscalation,
 }
 
-/// The per-peer local-forward registry: owns every `ssh -L` child from
+/// The per-peer local-forward registry: owns every forward leg from
 /// establishment to teardown, keyed by peer id (the `-L` mirror of the
 /// `-R` path's `PerSecondaryTunnelRegistry`).
 pub struct LocalForwardTunnels {
-    spawner: ForwardSpawner,
+    establisher: LegEstablisher,
     inner: Mutex<Inner>,
 }
 
@@ -325,22 +627,26 @@ impl LocalForwardTunnels {
     /// Production registry over the given gateway credentials (the
     /// same `SshConfig` the connected [`dynrunner_gateway::SshGateway`]
     /// holds) and that gateway's master control socket
-    /// ([`dynrunner_gateway::SshGateway::control_path`]): every spawn
-    /// multiplexes over the master while it answers `ssh -O check`,
-    /// and direct-dials (WARN) otherwise. `None` means there is no
-    /// master to share — every spawn direct-dials.
+    /// ([`dynrunner_gateway::SshGateway::control_path`]): every leg
+    /// registers on the master (`ssh -O forward`) while it answers
+    /// `ssh -O check`, and direct-dials (WARN, in-flight-bounded)
+    /// otherwise. `None` means there is no master to share — every
+    /// leg direct-dials.
     pub fn new(gateway: SshConfig, master_control_path: Option<String>) -> Self {
-        Self::with_spawner(
-            production_spawner(gateway, master_control_path),
+        Self::with_establisher(
+            production_establisher(gateway, master_control_path),
             ReconnectEscalation::default(),
         )
     }
 
-    /// DI constructor for tests: inject the child factory and the
+    /// DI constructor for tests: inject the leg factory and the
     /// escalation thresholds.
-    pub(crate) fn with_spawner(spawner: ForwardSpawner, escalation: ReconnectEscalation) -> Self {
+    pub(crate) fn with_establisher(
+        establisher: LegEstablisher,
+        escalation: ReconnectEscalation,
+    ) -> Self {
         Self {
-            spawner,
+            establisher,
             inner: Mutex::new(Inner {
                 entries: HashMap::new(),
                 escalation,
@@ -348,20 +654,17 @@ impl LocalForwardTunnels {
         }
     }
 
-    /// Establish one forward per target, CONCURRENTLY: every tunnel
-    /// rides the same 3s alive-gate, so a sequential walk pays ~3s ×
-    /// N peers before the bootstrap's connect window even opens (~30s
-    /// observed at 11 peers); fanned out, the whole cohort gates in
-    /// ~3s. Concurrency is safe against the gateway sshd's
-    /// `MaxStartups` because the spawner multiplexes every client
-    /// over the ONE established master session (see the module's
-    /// `# Multiplexing` section); the direct-dial fallback stays
-    /// concurrent — a dead master is already the degraded path, and
-    /// breaking the joiner on it is worse than risking sshd
-    /// rate-limits. Per-target failures are WARNed and tolerated —
-    /// `join_running_cluster` fans to every seed, so one dead record
-    /// must not brick the bootstrap — but ZERO successes is a hard,
-    /// loud error.
+    /// Establish one forward per target, CONCURRENTLY: a sequential
+    /// walk pays a full establishment gate per peer before the
+    /// bootstrap's connect window even opens (~30s observed at 11
+    /// peers); fanned out, the whole cohort gates together.
+    /// Concurrency is safe against the gateway sshd because mux legs
+    /// are sessionless registrations on the ONE master connection and
+    /// direct-dial legs are in-flight-bounded below `MaxStartups`
+    /// (see the module's `# Multiplexing` section). Per-target
+    /// failures are WARNed and tolerated — `join_running_cluster`
+    /// fans to every seed, so one dead record must not brick the
+    /// bootstrap — but ZERO successes is a hard, loud error.
     ///
     /// Returns the `peer_id → local_port` endpoint map the caller
     /// substitutes into its seed entries.
@@ -406,11 +709,12 @@ impl LocalForwardTunnels {
     }
 
     /// Establish ONE forward on a freshly-reserved local port and
-    /// register it. Replaces (and reaps) any prior entry for the id.
+    /// register it. Replaces (and releases) any prior entry for the
+    /// id.
     async fn establish_one(&self, target: &ForwardTarget) -> Result<u16, LocalForwardError> {
         let local_port = reserve_local_port(&target.peer_id)?;
-        let child = self
-            .spawn_and_gate(&target.peer_id, local_port, &target.host, target.port)
+        let leg = self
+            .establish_leg(&target.peer_id, local_port, &target.host, target.port)
             .await?;
         let displaced = {
             let mut inner = self.inner.lock().await;
@@ -420,47 +724,39 @@ impl LocalForwardTunnels {
                     local_port,
                     host: target.host.clone(),
                     port: target.port,
-                    child,
+                    leg,
                 },
             )
         };
         if let Some(mut old) = displaced {
-            terminate_child(&mut old.child).await;
+            old.leg.release(&target.peer_id).await;
         }
         Ok(local_port)
     }
 
-    /// Spawn + 3s alive-gate for one forward attempt (shared by the
-    /// establish and rebuild paths so the two cannot drift on policy).
-    async fn spawn_and_gate(
+    /// Build + gate one forward leg (shared by the establish and
+    /// rebuild paths so the two cannot drift on policy), with ONE
+    /// retry through the full seam: a transiently refused or raced
+    /// leg re-resolves its transport (the master may have died — or
+    /// recovered — in between) instead of failing the peer outright.
+    async fn establish_leg(
         &self,
         peer_id: &str,
         local_port: u16,
         host: &str,
         port: u16,
-    ) -> Result<Child, LocalForwardError> {
-        let mut child = (self.spawner)(peer_id, local_port, host, port)
-            .await
-            .map_err(|source| LocalForwardError::Spawn {
-                peer_id: peer_id.to_owned(),
-                source,
-            })?;
-        match verify_tunnel_alive(peer_id, &mut child).await {
-            Ok(()) => Ok(child),
-            Err(PrepError::TunnelFailed {
-                secondary_id,
-                rc,
-                stderr,
-            }) => Err(LocalForwardError::Establish {
-                peer_id: secondary_id,
-                rc,
-                stderr,
-            }),
-            Err(e) => Err(LocalForwardError::Establish {
-                peer_id: peer_id.to_owned(),
-                rc: None,
-                stderr: e.to_string(),
-            }),
+    ) -> Result<ForwardLeg, LocalForwardError> {
+        match (self.establisher)(peer_id, local_port, host, port).await {
+            Ok(leg) => Ok(leg),
+            Err(first) => {
+                tracing::warn!(
+                    peer_id,
+                    local_port,
+                    error = %first,
+                    "local-forward leg failed to establish; retrying once"
+                );
+                (self.establisher)(peer_id, local_port, host, port).await
+            }
         }
     }
 
@@ -478,18 +774,21 @@ impl LocalForwardTunnels {
 
     /// Reconnect-path rebuild for one peer, with the SAME liveness
     /// gate and half-dead escalation as the `-R` path's
-    /// `reestablish_one_tunnel`: an alive child is a no-op (the ~60s
+    /// `reestablish_one_tunnel`: an alive leg is a no-op (the ~60s
     /// lost-visibility cadence must never rebuild its own healthy
     /// forward) until K consecutive alive-noop ticks prove it
-    /// half-dead; a dead child is rebuilt immediately. Rebuilds keep
-    /// the SAME local port (the mesh's dial info is immutable).
+    /// half-dead; a dead leg (direct child exited, or the master —
+    /// and with it the mux registration's listener — gone) is rebuilt
+    /// immediately. Rebuilds keep the SAME local port (the mesh's
+    /// dial info is immutable) and re-resolve their transport, so a
+    /// mux leg orphaned by master death comes back as a direct dial.
     pub async fn reconnect_one(
         &self,
         peer_id: &str,
     ) -> Result<ReconnectOutcome, LocalForwardError> {
         let mut inner = self.inner.lock().await;
         let alive = match inner.entries.get_mut(peer_id) {
-            Some(entry) => matches!(entry.child.try_wait(), Ok(None)),
+            Some(entry) => entry.leg.is_alive(entry.local_port),
             None => {
                 return Err(LocalForwardError::UnknownPeer {
                     peer_id: peer_id.to_owned(),
@@ -519,38 +818,39 @@ impl LocalForwardTunnels {
                 .expect("entry checked present above");
             (entry.local_port, entry.host.clone(), entry.port)
         };
-        // Reap the old child FIRST so the local port is free for the
-        // same-port rebind (we own the process — the local mirror of
-        // the `-R` path's remote `fuser -k` release).
+        // Release the old leg FIRST so the local port is free for the
+        // same-port rebind (direct: reap our child — the local mirror
+        // of the `-R` path's remote `fuser -k` release; mux: cancel
+        // the master-side registration).
         {
             let entry = inner
                 .entries
                 .get_mut(peer_id)
                 .expect("entry checked present above");
-            terminate_child(&mut entry.child).await;
+            entry.leg.release(peer_id).await;
         }
-        let child = self
-            .spawn_and_gate(peer_id, local_port, &host, port)
-            .await?;
+        let leg = self.establish_leg(peer_id, local_port, &host, port).await?;
         inner
             .entries
             .get_mut(peer_id)
             .expect("entry checked present above")
-            .child = child;
+            .leg = leg;
         inner.escalation.on_rebuilt(peer_id);
         Ok(ReconnectOutcome::Rebuilt { local_port })
     }
 
-    /// Reap every tunnel child (SIGTERM → 5s → SIGKILL). Idempotent.
-    /// `kill_on_drop` on the spawned commands backstops the paths that
-    /// never reach this.
+    /// Release every leg (direct: SIGTERM → 5s → SIGKILL; mux:
+    /// `ssh -O cancel`). Idempotent. `kill_on_drop` on direct
+    /// children backstops the paths that never reach this; mux
+    /// registrations are additionally torn down with the master
+    /// itself (gateway disconnect / the master babysitter).
     pub async fn teardown(&self) {
-        let drained: Vec<ForwardEntry> = {
+        let drained: Vec<(String, ForwardEntry)> = {
             let mut inner = self.inner.lock().await;
-            inner.entries.drain().map(|(_, e)| e).collect()
+            inner.entries.drain().collect()
         };
-        for mut entry in drained {
-            terminate_child(&mut entry.child).await;
+        for (peer_id, mut entry) in drained {
+            entry.leg.release(&peer_id).await;
         }
     }
 }
@@ -653,26 +953,46 @@ mod tests {
         cmd.spawn().expect("spawn sleep")
     }
 
-    /// A child that exits immediately, simulating
-    /// `ExitOnForwardFailure` killing a failed forward inside the gate.
-    fn dying_child() -> Child {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", "echo 'remote port forwarding failed' >&2; exit 255"]);
-        cmd.kill_on_drop(true);
-        cmd.spawn().expect("spawn sh")
+    fn healthy_leg() -> ForwardLeg {
+        ForwardLeg::Direct {
+            child: healthy_child(),
+        }
     }
 
-    /// Spawner producing healthy children and counting invocations.
-    fn counting_spawner(count: Arc<AtomicUsize>) -> ForwardSpawner {
+    /// The failure a leg whose dial died inside the gate produces,
+    /// simulating `ExitOnForwardFailure` killing a refused forward.
+    fn dead_leg_error(peer_id: &str) -> LocalForwardError {
+        LocalForwardError::Establish {
+            peer_id: peer_id.to_owned(),
+            rc: Some(255),
+            stderr: "remote port forwarding failed".into(),
+        }
+    }
+
+    /// Establisher producing healthy direct legs and counting
+    /// invocations.
+    fn counting_establisher(count: Arc<AtomicUsize>) -> LegEstablisher {
         Box::new(move |_peer, _lport, _host, _port| {
             count.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(healthy_child()) })
+            Box::pin(async { Ok(healthy_leg()) })
         })
+    }
+
+    /// A currently-free port BELOW the kernel's ephemeral range
+    /// (32768+): ports there are never handed out by `bind :0`, so a
+    /// "nothing listens here" test premise cannot be yanked away by a
+    /// parallel test (or process) receiving the just-freed port —
+    /// which is exactly what `reserve_local_port` ports are exposed
+    /// to inside a many-test binary.
+    fn quiet_port() -> u16 {
+        (23990..24190)
+            .find(|&p| !local_port_listening(p))
+            .expect("a quiet sub-ephemeral port exists")
     }
 
     #[test]
     fn argv_shape_default_port_and_user() {
-        let argv = build_local_forward_argv(15001, "compute7", 51200, &ssh_config(), None);
+        let argv = build_local_forward_argv(15001, "compute7", 51200, &ssh_config());
         assert_eq!(argv[0], "ssh");
         // No auth flags configured, default port 22: no -p.
         assert!(!argv.contains(&"-p".to_string()), "{argv:?}");
@@ -693,40 +1013,19 @@ mod tests {
             argv.contains(&"ServerAliveCountMax=1080".to_string()),
             "{argv:?}"
         );
-        // Direct dial (no master shared): no mux options.
-        assert!(
-            !argv.iter().any(|a| a.starts_with("ControlPath=")),
-            "{argv:?}"
-        );
-        assert!(!argv.contains(&"ControlMaster=no".to_string()), "{argv:?}");
     }
 
-    /// The mux-client shape: a live master's socket rides in as `-o
-    /// ControlPath=<sock> -o ControlMaster=no`, the `-L` spec is
-    /// unchanged, and the auth/keepalive chain stays (inert on a mux
-    /// client; ssh's own direct-dial degradation if the master dies
-    /// between probe and spawn).
+    /// The direct dial pins ALL mux-relevant options off: an operator
+    /// ssh_config with `ControlMaster auto`/`ControlPersist yes` must
+    /// not be able to hand the dial off to a user master (instant
+    /// rc=0 exit, forward parked on an unowned master — the unpinned
+    /// half of the LMU misread).
     #[test]
-    fn argv_mux_client_carries_control_path_and_forward_spec() {
-        let argv = build_local_forward_argv(
-            15001,
-            "compute7",
-            51200,
-            &ssh_config(),
-            Some("/tmp/dynrunner-m-42-7.sock"),
-        );
-        assert!(
-            argv.contains(&"ControlPath=/tmp/dynrunner-m-42-7.sock".to_string()),
-            "{argv:?}"
-        );
+    fn argv_pins_mux_options_off() {
+        let argv = build_local_forward_argv(15001, "compute7", 51200, &ssh_config());
+        assert!(argv.contains(&"ControlPath=none".to_string()), "{argv:?}");
         assert!(argv.contains(&"ControlMaster=no".to_string()), "{argv:?}");
-        let l = argv.iter().position(|a| a == "-L").expect("-L present");
-        assert_eq!(argv[l + 1], "127.0.0.1:15001:compute7:51200");
-        assert_eq!(argv[l + 2], "alice@gw.example.org");
-        assert!(
-            argv.contains(&"ExitOnForwardFailure=yes".to_string()),
-            "{argv:?}"
-        );
+        assert!(argv.contains(&"ControlPersist=no".to_string()), "{argv:?}");
     }
 
     /// The fallback gate: a configured-but-dead master socket resolves
@@ -757,7 +1056,7 @@ mod tests {
             identity_file: Some("/home/x/key".into()),
             config_file: Some("/home/x/cfg".into()),
         };
-        let argv = build_local_forward_argv(1, "h", 2, &gw, None);
+        let argv = build_local_forward_argv(1, "h", 2, &gw);
         // Auth chain is the shared single source of truth.
         let i = argv.iter().position(|a| a == "-i").expect("-i present");
         assert_eq!(argv[i + 1], "/home/x/key");
@@ -777,11 +1076,19 @@ mod tests {
     /// carries exactly the survivors.
     #[tokio::test]
     async fn establish_tolerates_per_peer_failure_keeps_survivors() {
-        let spawner: ForwardSpawner = Box::new(|peer, _l, _h, _p| {
+        let establisher: LegEstablisher = Box::new(|peer, _l, _h, _p| {
             let dead = peer == "secondary-dead";
-            Box::pin(async move { Ok(if dead { dying_child() } else { healthy_child() }) })
+            let peer = peer.to_owned();
+            Box::pin(async move {
+                if dead {
+                    Err(dead_leg_error(&peer))
+                } else {
+                    Ok(healthy_leg())
+                }
+            })
         });
-        let tunnels = LocalForwardTunnels::with_spawner(spawner, ReconnectEscalation::default());
+        let tunnels =
+            LocalForwardTunnels::with_establisher(establisher, ReconnectEscalation::default());
         let targets = vec![
             ForwardTarget {
                 peer_id: "secondary-dead".into(),
@@ -805,9 +1112,12 @@ mod tests {
     /// proceed into the connect window with no dialable endpoint.
     #[tokio::test]
     async fn establish_all_failed_is_loud_error() {
-        let spawner: ForwardSpawner =
-            Box::new(|_peer, _l, _h, _p| Box::pin(async { Ok(dying_child()) }));
-        let tunnels = LocalForwardTunnels::with_spawner(spawner, ReconnectEscalation::default());
+        let establisher: LegEstablisher = Box::new(|peer, _l, _h, _p| {
+            let peer = peer.to_owned();
+            Box::pin(async move { Err(dead_leg_error(&peer)) })
+        });
+        let tunnels =
+            LocalForwardTunnels::with_establisher(establisher, ReconnectEscalation::default());
         let targets = vec![ForwardTarget {
             peer_id: "secondary-0".into(),
             host: "compute1".into(),
@@ -820,23 +1130,24 @@ mod tests {
         );
     }
 
-    /// Establishment is CONCURRENT: every spawn must begin before any
-    /// completes. The barrier-gated spawner releases only once ALL N
-    /// spawn futures are in flight — a sequential walk (the pre-fix
-    /// shape, ~3s × N alive-gates) deadlocks on the barrier and trips
-    /// the timeout.
+    /// Establishment is CONCURRENT: every leg build must begin before
+    /// any completes. The barrier-gated establisher releases only once
+    /// ALL N futures are in flight — a sequential walk (the pre-fix
+    /// shape, one full gate per peer) deadlocks on the barrier and
+    /// trips the timeout.
     #[tokio::test]
     async fn establish_overlaps_all_spawns() {
         const N: usize = 4;
         let barrier = Arc::new(tokio::sync::Barrier::new(N));
-        let spawner: ForwardSpawner = Box::new(move |_peer, _l, _h, _p| {
+        let establisher: LegEstablisher = Box::new(move |_peer, _l, _h, _p| {
             let barrier = barrier.clone();
             Box::pin(async move {
                 barrier.wait().await;
-                Ok(healthy_child())
+                Ok(healthy_leg())
             })
         });
-        let tunnels = LocalForwardTunnels::with_spawner(spawner, ReconnectEscalation::default());
+        let tunnels =
+            LocalForwardTunnels::with_establisher(establisher, ReconnectEscalation::default());
         let targets: Vec<ForwardTarget> = (0..N)
             .map(|i| ForwardTarget {
                 peer_id: format!("secondary-{i}"),
@@ -863,15 +1174,187 @@ mod tests {
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn spawn_log_names_local_dest_and_via() {
-        let spawn = production_spawner(ssh_config(), None);
-        // The log line is emitted before the exec; the child (an ssh
-        // at an unresolvable gateway) is reaped immediately.
-        if let Ok(mut child) = spawn("secondary-0", 15001, "compute7", 51200).await {
-            terminate_child(&mut child).await;
-        }
+        let establisher = production_establisher(ssh_config(), None);
+        // The log line is emitted before the dial; the leg itself
+        // fails fast (an ssh at an unresolvable gateway exits inside
+        // the gate) and any child is reaped via kill_on_drop.
+        let _ = establisher("secondary-0", 15001, "compute7", 51200).await;
         assert!(logs_contain("local=127.0.0.1:15001"));
         assert!(logs_contain("dest=compute7:51200"));
         assert!(logs_contain("via=alice@gw.example.org"));
+    }
+
+    /// The establishment gate verifies the FORWARD, not the child: a
+    /// listener on the local port passes the gate even though the
+    /// dialing child already exited rc=0 — the mux-client shape that
+    /// the old child-longevity gate misread as 10/11 failures on the
+    /// LMU gateway (forward alive on the master, client gone in
+    /// ~300ms).
+    #[tokio::test]
+    async fn gate_passes_on_listener_even_with_dead_child() {
+        let listener =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let mut child = {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "exit 0"]);
+            cmd.stderr(std::process::Stdio::piped());
+            cmd.spawn().expect("spawn")
+        };
+        // Let the child exit first — the gate must STILL pass.
+        let _ = child.wait().await;
+        gate_forward_listening(
+            "secondary-0",
+            port,
+            Some(&mut child),
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("listening forward must pass the gate regardless of child state");
+    }
+
+    /// …and the inverse: no listener fails the gate at the deadline
+    /// even though the child is alive and healthy-looking (a
+    /// handshake that never produces a forward must not be declared
+    /// established).
+    #[tokio::test]
+    async fn gate_fails_without_listener_even_with_live_child() {
+        let port = quiet_port();
+        let mut child = healthy_child();
+        let err = gate_forward_listening(
+            "secondary-0",
+            port,
+            Some(&mut child),
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("no listener must fail the gate");
+        assert!(
+            matches!(&err, LocalForwardError::Establish { rc: None, stderr, .. }
+                if stderr.contains("did not start listening")),
+            "{err:?}"
+        );
+        terminate_child(&mut child).await;
+    }
+
+    /// A direct child dying before its forward listens is a hard
+    /// failure carrying the child's rc and stderr (the
+    /// `ExitOnForwardFailure` diagnosis channel).
+    #[tokio::test]
+    async fn gate_captures_direct_child_exit_diagnostics() {
+        let port = quiet_port();
+        let mut child = {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "echo 'remote port forwarding failed' >&2; exit 255"]);
+            cmd.stderr(std::process::Stdio::piped());
+            cmd.spawn().expect("spawn")
+        };
+        let err = gate_forward_listening(
+            "secondary-0",
+            port,
+            Some(&mut child),
+            Duration::from_secs(3),
+        )
+        .await
+        .expect_err("dead child without listener must fail");
+        assert!(
+            matches!(&err, LocalForwardError::Establish { rc: Some(255), stderr, .. }
+                if stderr.contains("remote port forwarding failed")),
+            "{err:?}"
+        );
+    }
+
+    /// Mux-leg liveness is the local LISTEN state (the master holds
+    /// the listener; master death takes it down) — never a child.
+    #[tokio::test]
+    async fn mux_leg_alive_tracks_listener() {
+        let port = quiet_port();
+        let listener =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).expect("bind");
+        let mut leg = ForwardLeg::Mux {
+            control_path: "/tmp/dynrunner-m-0-0.sock".into(),
+            gateway: ssh_config(),
+            spec: MasterForward::Local {
+                bind_addr: "127.0.0.1".into(),
+                bind_port: port,
+                dest_host: "compute1".into(),
+                dest_port: 51200,
+            },
+        };
+        assert!(leg.is_alive(port), "listener up ⇒ mux leg alive");
+        drop(listener);
+        assert!(!leg.is_alive(port), "listener gone ⇒ mux leg dead");
+    }
+
+    /// The in-flight bound: with K slots, N>K dials never overlap
+    /// more than K deep (the `MaxStartups` guard for the direct
+    /// fallback), and all N still complete.
+    #[tokio::test]
+    async fn dial_slots_bound_concurrency() {
+        const SLOTS: usize = 2;
+        const N: usize = 6;
+        let slots = Arc::new(Semaphore::new(SLOTS));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let high_water = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..N {
+            let slots = slots.clone();
+            let in_flight = in_flight.clone();
+            let high_water = high_water.clone();
+            tasks.push(tokio::spawn(async move {
+                with_dial_slot(&slots, async {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    high_water.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await;
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let peak = high_water.load(Ordering::SeqCst);
+        assert!(
+            peak <= SLOTS,
+            "in-flight peak {peak} exceeded the {SLOTS}-slot bound"
+        );
+    }
+
+    /// One failed leg attempt retries once through the full seam (a
+    /// transiently refused dial must not cost the peer its forward);
+    /// a second failure surfaces.
+    #[tokio::test]
+    async fn establish_retries_failed_leg_once() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let establisher: LegEstablisher = {
+            let count = count.clone();
+            Box::new(move |peer, _l, _h, _p| {
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                let peer = peer.to_owned();
+                Box::pin(async move {
+                    if n == 0 {
+                        Err(dead_leg_error(&peer))
+                    } else {
+                        Ok(healthy_leg())
+                    }
+                })
+            })
+        };
+        let tunnels =
+            LocalForwardTunnels::with_establisher(establisher, ReconnectEscalation::default());
+        let targets = vec![ForwardTarget {
+            peer_id: "secondary-0".into(),
+            host: "compute1".into(),
+            port: 51200,
+        }];
+        let endpoints = tunnels
+            .establish(&targets)
+            .await
+            .expect("retry must recover the leg");
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 2, "exactly one retry");
+        tunnels.teardown().await;
     }
 
     /// The reconnect gate: an alive child is tolerated (no respawn)
@@ -880,8 +1363,8 @@ mod tests {
     #[tokio::test]
     async fn reconnect_gates_alive_child_then_force_rebuilds_same_port() {
         let count = Arc::new(AtomicUsize::new(0));
-        let tunnels = LocalForwardTunnels::with_spawner(
-            counting_spawner(count.clone()),
+        let tunnels = LocalForwardTunnels::with_establisher(
+            counting_establisher(count.clone()),
             // force_after=2 keeps the test short; gap is irrelevant here.
             ReconnectEscalation::new(2, Duration::from_secs(300)),
         );
@@ -927,8 +1410,8 @@ mod tests {
     #[tokio::test]
     async fn reconnect_rebuilds_dead_child_immediately() {
         let count = Arc::new(AtomicUsize::new(0));
-        let tunnels = LocalForwardTunnels::with_spawner(
-            counting_spawner(count.clone()),
+        let tunnels = LocalForwardTunnels::with_establisher(
+            counting_establisher(count.clone()),
             ReconnectEscalation::default(),
         );
         let targets = vec![ForwardTarget {
@@ -943,8 +1426,11 @@ mod tests {
         {
             let mut inner = tunnels.inner.lock().await;
             let entry = inner.entries.get_mut("secondary-0").unwrap();
-            entry.child.start_kill().unwrap();
-            let _ = entry.child.wait().await;
+            let ForwardLeg::Direct { child } = &mut entry.leg else {
+                panic!("test establisher builds direct legs");
+            };
+            child.start_kill().unwrap();
+            let _ = child.wait().await;
         }
 
         let outcome = tunnels.reconnect_one("secondary-0").await.expect("rebuild");
@@ -970,7 +1456,10 @@ mod tests {
     async fn await_pid_gone(pid: u32) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while pid_alive(pid) {
-            assert!(Instant::now() < deadline, "pid {pid} was not reaped in time");
+            assert!(
+                Instant::now() < deadline,
+                "pid {pid} was not reaped in time"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -980,8 +1469,8 @@ mod tests {
     #[tokio::test]
     async fn teardown_reaps_every_child() {
         let count = Arc::new(AtomicUsize::new(0));
-        let tunnels = LocalForwardTunnels::with_spawner(
-            counting_spawner(count.clone()),
+        let tunnels = LocalForwardTunnels::with_establisher(
+            counting_establisher(count.clone()),
             ReconnectEscalation::default(),
         );
         let targets = vec![
@@ -998,11 +1487,14 @@ mod tests {
         ];
         tunnels.establish(&targets).await.expect("established");
         let pids: Vec<u32> = {
-            let inner = tunnels.inner.lock().await;
+            let mut inner = tunnels.inner.lock().await;
             inner
                 .entries
-                .values()
-                .map(|e| e.child.id().expect("child pid"))
+                .values_mut()
+                .map(|e| match &e.leg {
+                    ForwardLeg::Direct { child } => child.id().expect("child pid"),
+                    ForwardLeg::Mux { .. } => panic!("test establisher builds direct legs"),
+                })
                 .collect()
         };
         assert_eq!(pids.len(), 2);
@@ -1024,8 +1516,8 @@ mod tests {
     #[tokio::test]
     async fn dropping_registry_reaps_children_via_kill_on_drop() {
         let count = Arc::new(AtomicUsize::new(0));
-        let tunnels = LocalForwardTunnels::with_spawner(
-            counting_spawner(count.clone()),
+        let tunnels = LocalForwardTunnels::with_establisher(
+            counting_establisher(count.clone()),
             ReconnectEscalation::default(),
         );
         let targets = vec![ForwardTarget {
@@ -1036,10 +1528,10 @@ mod tests {
         tunnels.establish(&targets).await.expect("established");
         let pid = {
             let inner = tunnels.inner.lock().await;
-            inner.entries["secondary-0"]
-                .child
-                .id()
-                .expect("child pid")
+            match &inner.entries["secondary-0"].leg {
+                ForwardLeg::Direct { child } => child.id().expect("child pid"),
+                ForwardLeg::Mux { .. } => panic!("test establisher builds direct legs"),
+            }
         };
         assert!(pid_alive(pid), "child {pid} should be alive before drop");
         // Drop the registry without teardown — `kill_on_drop` fires.
