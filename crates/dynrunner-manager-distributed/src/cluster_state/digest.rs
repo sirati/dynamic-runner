@@ -41,8 +41,8 @@ impl<I: Identifier> ClusterState<I> {
     ///
     /// The fold is O(ledger) (66k+ tasks + outputs + capabilities +
     /// grow-max maps); the anti-entropy receive cadence calls this on EVERY
-    /// inbound `StateDigest` frame and on every `snapshot_json` cache check,
-    /// so an unchanged ledger is folded over and over. The memo
+    /// inbound `StateDigest` frame, so an unchanged ledger is folded over
+    /// and over. The memo
     /// ([`ClusterState::digest_cache`]) collapses that to ONE fold per
     /// ledger generation: a clean read returns the stored value; a cleared
     /// read recomputes once via [`Self::compute_digest`] and re-populates.
@@ -53,7 +53,7 @@ impl<I: Identifier> ClusterState<I> {
     ///
     /// Populates the memo through `&self` (the `Cell` interior mutability),
     /// so the read signature is unchanged and no caller — primary,
-    /// secondary, observer, or `snapshot_json` — learns the memo exists.
+    /// secondary, or observer — learns the memo exists.
     pub fn digest(&self) -> StateDigest {
         if let Some(cached) = self.digest_cache.get() {
             return cached;
@@ -182,17 +182,12 @@ impl<I: Identifier> ClusterState<I> {
             // node-local: the originator's per-hash version counter carries
             // no convergence signal (each replica mints its own).
             task_seq: _task_seq,
-            // node-local: the serialize-once snapshot-JSON cache is a pure
-            // derivation of the replicated fields (keyed on the digest), so
-            // it carries no signal of its own.
-            snapshot_json_cache: _snapshot_json_cache,
             // node-local: the dead-rejoin WARN throttle is a per-node log
             // gate (#416) — carries no convergence signal.
             dead_rejoin_warn: _dead_rejoin_warn,
             // node-local: the digest memo + its fold counter are pure
             // derivations of the replicated fields (the memo IS this fold's
-            // own result), so they carry no convergence signal — same
-            // classification as `snapshot_json_cache`.
+            // own result), so they carry no convergence signal.
             digest_cache: _digest_cache,
             digest_fold_count: _digest_fold_count,
         } = self;
@@ -348,7 +343,7 @@ impl<I: Identifier> ClusterState<I> {
     /// Test seam: the un-memoized fold AND the count of full folds run so
     /// far. The differential pin (`digest_memo_matches_fresh_fold`) asserts
     /// the memoized [`Self::digest`] equals this fresh fold after every
-    /// mutation; the memo-hit pins (`digest`/`snapshot_json_cache` tests)
+    /// mutation; the memo-hit pins (the digest tests)
     /// read the count to prove a clean read skips the fold.
     #[cfg(test)]
     pub(crate) fn fresh_digest_fold(&self) -> StateDigest {

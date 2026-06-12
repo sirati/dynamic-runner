@@ -42,6 +42,7 @@ const ARM_ANTI_ENTROPY: usize = 7;
 const ARM_SECONDARY_CONTROL: usize = 8;
 const ARM_REPORT_REPLAY: usize = 9;
 const ARM_WORKER_RESTART: usize = 10;
+const ARM_SNAPSHOT_STREAM: usize = 11;
 
 /// Arm names, index-aligned with the `ARM_*` ids above (render order of the
 /// compact stats line). The single `oom_sweep` arm counts SWEEPS (one
@@ -59,6 +60,7 @@ const PROCESS_TASKS_ARM_NAMES: &[&str] = &[
     "secondary_control",
     "report_replay",
     "worker_restart",
+    "snapshot_stream",
 ];
 
 impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
@@ -349,6 +351,30 @@ where
                             &mut secondary_control_rx,
                         )
                         .await?;
+                    }
+                }
+                // Snapshot-stream production arm: ONE bounded package per
+                // wakeup (the driver re-enqueues its own token while the
+                // stream has more), so serving a joiner's bootstrap pull
+                // interleaves with every other arm instead of serializing
+                // a 100 MB ledger monolithically on the loop. Borrows
+                // `self.snapshot_streams` only (disjoint from the sibling
+                // arms' fields). Cancel-safe: a single mpsc recv.
+                stream_id = self.snapshot_streams.next_wake() => {
+                    arm_stats.record(ARM_SNAPSHOT_STREAM);
+                    if let Some((dst, frame)) = self.snapshot_streams.emit_next(
+                        &stream_id,
+                        &self.cluster_state,
+                        crate::secondary::wire::timestamp_now(),
+                    ) && let Err(e) = self.send_to(dst, frame).await
+                    {
+                        tracing::warn!(
+                            stream_id = %stream_id,
+                            error = %e,
+                            "snapshot-stream package send failed; dropping stream \
+                             (the requester's pull cadence resumes from its cursor)"
+                        );
+                        self.snapshot_streams.abort_stream(&stream_id);
                     }
                 }
                 // Single mesh inbound arm. There is one role inbound

@@ -825,14 +825,29 @@ where
                         }
                         continue;
                     }
-                    if let MessageType::ClusterSnapshot = msg.msg_type() {
-                        if let DistributedMessage::ClusterSnapshot { snapshot_json, .. } = msg {
-                            self.restore_cluster_snapshot_frame(&snapshot_json);
+                    if let MessageType::SnapshotStreamPackage = msg.msg_type() {
+                        if let DistributedMessage::SnapshotStreamPackage {
+                            sender_id,
+                            stream_id,
+                            cursor,
+                            payload,
+                            done,
+                            ..
+                        } = msg
+                        {
+                            self.restore_snapshot_stream_frame(
+                                &sender_id,
+                                &stream_id,
+                                cursor.as_deref(),
+                                &payload,
+                                done,
+                            );
                         }
-                        // The restored snapshot may carry a terminal latch
-                        // (RunComplete / RunAborted) — re-loop to the single
-                        // terminal-exit check at the loop head, exactly as
-                        // the ClusterMutation arm below does.
+                        // The restored package may carry a terminal latch
+                        // (RunComplete / RunAborted — they ride the stream's
+                        // HEAD package) — re-loop to the single terminal-exit
+                        // check at the loop head, exactly as the
+                        // ClusterMutation arm below does.
                         continue;
                     }
                     // Setup-phase failover-election frames (#420 face (c)):

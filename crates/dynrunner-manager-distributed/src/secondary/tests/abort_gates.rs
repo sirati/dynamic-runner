@@ -205,24 +205,18 @@ async fn missed_abort_broadcast_converges_via_digest() {
                 peer_log
                     .borrow()
                     .iter()
-                    .any(|m| matches!(m, DistributedMessage::RequestClusterSnapshot { .. })),
+                    .any(|m| matches!(m, DistributedMessage::RequestSnapshotStream { .. })),
                 "behind on the verdict bit, the secondary must pull a snapshot"
             );
 
             // The pull reply heals via restore — the verdict latches.
-            let snapshot_json =
-                serde_json::to_string(&donor.snapshot()).expect("donor snapshot serializes");
-            sec.dispatch_message(
-                DistributedMessage::ClusterSnapshot {
-                    target: None,
-                    sender_id: "peer-0".into(),
-                    timestamp: 0.0,
-                    snapshot_json,
-                },
-                &mut FakeWorkerFactory,
-            )
-            .await
-            .expect("ClusterSnapshot dispatch succeeds");
+            for reply in
+                crate::snapshot_stream::stream_frames_for_test(&donor, "peer-0", "worker-a/0")
+            {
+                sec.dispatch_message(reply, &mut FakeWorkerFactory)
+                    .await
+                    .expect("SnapshotStreamPackage dispatch succeeds");
+            }
             let healed = sec
                 .cluster_state
                 .run_aborted()

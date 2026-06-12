@@ -105,6 +105,10 @@ where
         // judgment (the primary-silence backstop, the peer-keepalive reaper,
         // the setup-phase election arm).
         let own_tick_health = crate::own_tick_health::OwnTickHealth::new(config.keepalive_interval);
+        let snapshot_streams =
+            crate::snapshot_stream::SnapshotStreamResponder::new(&config.secondary_id);
+        let inbound_snapshots =
+            crate::snapshot_stream::InboundSnapshotStreams::new(&config.secondary_id);
         let mut this = Self {
             config,
             client,
@@ -143,6 +147,8 @@ where
             fatal_exit: None,
             deposed_primary: false,
             cluster_state: ClusterState::new(),
+            snapshot_streams,
+            inbound_snapshots,
             lifecycle_rx: Some(lifecycle_rx),
             peer_lifecycle_listeners: Vec::new(),
             lifecycle_dispatcher_handle: None,
@@ -805,7 +811,7 @@ where
     }
 
     /// Late-joiner bootstrap entry: install a snapshot received from a
-    /// peer's `RequestClusterSnapshot` response, then mark setup as
+    /// peer's snapshot-stream response, then mark setup as
     /// completed so the next `run_until_setup_or_done` invocation
     /// skips the welcome / cert-exchange / wait-for-setup phases and
     /// enters `process_tasks` directly.

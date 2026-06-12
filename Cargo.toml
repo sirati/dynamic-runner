@@ -74,6 +74,12 @@ signal-hook-registry = "1.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 base64 = "0.22"
+# CBOR codec for the snapshot-stream package payloads (the incremental
+# replacement of the monolithic snapshot-JSON transfer). Apache-2.0 /
+# MIT dual-licensed — compatible with the workspace Apache-2.0. The
+# payload crosses the JSON wire envelope base64-wrapped (serde_json has
+# no raw-bytes representation).
+ciborium = "0.2"
 url = "2"
 zstd = { version = "0.13", default-features = false }
 

@@ -322,6 +322,16 @@ where
     /// tick that has a candidate, so a malformed-snapshot responder is not
     /// retried on the immediately-following tick.
     recovery_cursor: usize,
+    /// Outbound snapshot-stream driver: serves `RequestSnapshotStream`
+    /// pulls one bounded package per run-loop wakeup — see
+    /// `crate::snapshot_stream`. The loop's wake arm drains it; the
+    /// inbound request arm feeds it.
+    snapshot_streams: crate::snapshot_stream::SnapshotStreamResponder,
+    /// Inbound snapshot-stream progress (per responder): lets this
+    /// observer's own pulls (bootstrap recovery, reactive digest,
+    /// AE-3 recovery cadence) RESUME an interrupted stream instead of
+    /// re-pulling from scratch.
+    inbound_snapshots: crate::snapshot_stream::InboundSnapshotStreams,
     /// Rate limit for the digest tick's fault WARNs (empty mesh registry /
     /// failed broadcast). The tick fires every ~20s; during an outage the
     /// SAME fault recurs every tick, so the gate emits at most once per
@@ -536,6 +546,8 @@ where
         // `cluster_state` is already converged (the relocation applied
         // `PrimaryChanged`), so the attach SEEDS the view immediately.
         crate::process::attach_primary_recognition(&mut cluster_state, client.role_holder_view());
+        let snapshot_streams = crate::snapshot_stream::SnapshotStreamResponder::new(&node_id);
+        let inbound_snapshots = crate::snapshot_stream::InboundSnapshotStreams::new(&node_id);
         Self {
             client,
             inbox,
@@ -556,6 +568,8 @@ where
             task_completed_rx: Some(task_rx),
             peer_digests: std::collections::HashMap::new(),
             recovery_cursor: 0,
+            snapshot_streams,
+            inbound_snapshots,
             ae_digest_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             wake_note: WakeNoteSlot::default(),
@@ -630,6 +644,8 @@ where
         // Respawn-exec outbox — created unconditionally (the arm is
         // inert without a provider; requests then get an error reply).
         let (respawn_exec_tx, respawn_exec_rx) = mpsc::unbounded_channel::<RespawnExecOutcome>();
+        let snapshot_streams = crate::snapshot_stream::SnapshotStreamResponder::new(&node_id);
+        let inbound_snapshots = crate::snapshot_stream::InboundSnapshotStreams::new(&node_id);
         Self {
             client,
             inbox,
@@ -643,6 +659,8 @@ where
             task_completed_rx: Some(task_rx),
             peer_digests: std::collections::HashMap::new(),
             recovery_cursor: 0,
+            snapshot_streams,
+            inbound_snapshots,
             ae_digest_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             wake_note: WakeNoteSlot::default(),
@@ -991,14 +1009,20 @@ where
             },
         ));
 
-        // Bootstrap recovery REQUEST half (§6): fire one snapshot request
-        // to `Destination::Primary` at entry, gated on a known primary,
-        // best-effort. The REPLY half is folded into the loop's recv arm.
-        if self.cluster_state.current_primary().is_some() {
-            let req = DistributedMessage::RequestClusterSnapshot {
+        // Bootstrap recovery REQUEST half (§6): fire one snapshot-stream
+        // request to `Destination::Primary` at entry, gated on a known
+        // primary, best-effort. The REPLY half (the packages) is folded
+        // into the loop's recv arm. The stream is tracked per the
+        // primary's id so an interrupted bootstrap stream RESUMES from
+        // its cursor on the recovery cadence.
+        if let Some(primary_id) = self.cluster_state.current_primary().map(str::to_owned) {
+            let (stream_id, resume_after) = self.inbound_snapshots.request_params(&primary_id);
+            let req = DistributedMessage::RequestSnapshotStream {
                 target: None,
                 sender_id: self.config.node_id.clone(),
                 timestamp: timestamp_now(),
+                stream_id,
+                resume_after,
                 is_observer: true,
                 can_be_primary: false,
             };
@@ -1281,6 +1305,28 @@ where
                             visibility_reporter.on_wake_deadline(tokio::time::Instant::now());
                         }
                     }
+                    // Snapshot-stream production arm: ONE bounded package
+                    // per wakeup (the driver re-enqueues its own token
+                    // while the stream has more), so serving a behind
+                    // peer's pull interleaves with every other arm
+                    // instead of serializing the mirror monolithically
+                    // on the loop. Cancel-safe: a single mpsc recv.
+                    stream_id = self.snapshot_streams.next_wake() => {
+                        if let Some((dst, frame)) = self.snapshot_streams.emit_next(
+                            &stream_id,
+                            &self.cluster_state,
+                            timestamp_now(),
+                        ) && let Err(e) = self.send_to(dst, frame).await
+                        {
+                            tracing::warn!(
+                                stream_id = %stream_id,
+                                error = %e,
+                                "observer: snapshot-stream package send failed; dropping \
+                                 stream (the requester resumes from its cursor)"
+                            );
+                            self.snapshot_streams.abort_stream(&stream_id);
+                        }
+                    }
                     // Anti-entropy tick (item 3): broadcast our digest.
                     _ = ae_tick.tick() => {
                         self.on_anti_entropy_tick().await;
@@ -1400,7 +1446,21 @@ where
         //    (distinct from a clean success — work was deliberately left
         //    unscheduled — and from the hard abort above); otherwise a
         //    plain clean exit 0.
-        if self.cluster_state.run_complete() {
+        //
+        //    MID-TRANSFER HOLD: a snapshot STREAM delivers the run
+        //    latches on its HEAD package, BEFORE the task bulk — exiting
+        //    the moment the latch lands would report a complete run off
+        //    a half-merged mirror (zero counts). While a partially-
+        //    applied inbound stream is live, keep observing; the stream's
+        //    `done` (or its responder stalling past the idle TTL — the
+        //    double-fault edge) releases the exit. The hard-abort exit
+        //    above is NOT held: an abort is an operator/fatal verdict
+        //    where leaving promptly beats complete stats.
+        if self.cluster_state.run_complete()
+            && !self
+                .inbound_snapshots
+                .mid_transfer(crate::snapshot_stream::STREAM_IDLE_TTL)
+        {
             if self.cluster_state.graceful_abort_requested() {
                 return Some(ObserverTerminal::GracefulAbort);
             }
@@ -1725,8 +1785,22 @@ where
             } => {
                 self.on_keepalive(&secondary_id, emitter_role, primary_last_seen);
             }
-            DistributedMessage::ClusterSnapshot { snapshot_json, .. } => {
-                self.on_cluster_snapshot(&snapshot_json, primary_last_seen);
+            DistributedMessage::SnapshotStreamPackage {
+                sender_id,
+                stream_id,
+                cursor,
+                payload,
+                done,
+                ..
+            } => {
+                self.on_snapshot_stream_package(
+                    &sender_id,
+                    &stream_id,
+                    cursor.as_deref(),
+                    &payload,
+                    done,
+                    primary_last_seen,
+                );
             }
             DistributedMessage::StateDigest {
                 sender_id,
@@ -1737,12 +1811,19 @@ where
                 self.on_state_digest(&sender_id, sender_is_observer, &digest)
                     .await;
             }
-            DistributedMessage::RequestClusterSnapshot {
+            DistributedMessage::RequestSnapshotStream {
                 sender_id,
+                stream_id,
+                resume_after,
                 is_observer,
                 ..
             } => {
-                self.answer_snapshot_request(&sender_id, is_observer).await;
+                self.answer_snapshot_request(
+                    &sender_id,
+                    is_observer,
+                    &stream_id,
+                    resume_after.as_deref(),
+                );
             }
             // Respawn EXECUTION requests from the primary (the decision
             // holder): this process physically hosts the provider, so it
@@ -2011,16 +2092,29 @@ where
     }
 
     /// Bootstrap-recovery REPLY half + late/anti-entropy snapshot heal
-    /// (§6) with the BUG-5 liveness refresh. Decode + `restore()`
-    /// (idempotent lattice) and refresh `primary_last_seen` if the snapshot
-    /// re-points `current_primary()` (a snapshot that newly names a primary
-    /// is a liveness assertion). A decode failure is WARN-and-ignore in
-    /// steady state — NOT fatal.
-    fn on_cluster_snapshot(&mut self, snapshot_json: &str, primary_last_seen: &mut Instant) {
-        match serde_json::from_str(snapshot_json) {
+    /// (§6) with the BUG-5 liveness refresh. Decode one stream package +
+    /// `restore()` (idempotent lattice — each package is a valid partial
+    /// snapshot) and refresh `primary_last_seen` if it re-points
+    /// `current_primary()` (a package that newly names a primary is a
+    /// liveness assertion; the fact rides the stream's HEAD package). A
+    /// decode failure is WARN-and-ignore in steady state — NOT fatal —
+    /// and does not advance the resume cursor, so the recovery cadence
+    /// re-pulls from before the bad span.
+    fn on_snapshot_stream_package(
+        &mut self,
+        sender_id: &str,
+        stream_id: &str,
+        cursor: Option<&str>,
+        payload: &str,
+        done: bool,
+        primary_last_seen: &mut Instant,
+    ) {
+        match crate::cluster_state::decode_stream_payload::<I>(payload) {
             Ok(snap) => {
                 let before = self.cluster_state.current_primary().map(str::to_owned);
                 self.cluster_state.restore(snap);
+                self.inbound_snapshots
+                    .note_package(sender_id, stream_id, cursor, done);
                 let after = self.cluster_state.current_primary().map(str::to_owned);
                 if after.is_some() && after != before {
                     *primary_last_seen = Instant::now();
@@ -2029,8 +2123,9 @@ where
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "observer: failed to decode ClusterSnapshot frame; ignoring (the next \
-                     live broadcast / anti-entropy pull heals)"
+                    stream_id = %stream_id,
+                    "observer: failed to decode SnapshotStreamPackage; ignoring (the next \
+                     live broadcast / anti-entropy pull heals from the last good cursor)"
                 );
             }
         }
@@ -2064,6 +2159,7 @@ where
             sender_id,
             sender_is_observer,
             &requester,
+            &mut self.inbound_snapshots,
             timestamp_now(),
         ) else {
             // Converged on this peer's digest — nothing to pull.
@@ -2082,55 +2178,38 @@ where
     /// converged mirror.
     ///
     /// READ-ONLY gossip, in-contract for a zero-authority observer: the
-    /// reply is a serialization of the mirror it already holds — no
-    /// mutation is originated (unlike the secondary's responder, NO
-    /// `PeerJoined` is emitted; membership recording stays a compute-role
-    /// concern) and nothing is re-broadcast. Serving is LOAD-BEARING for
-    /// the relocation handoff: after the submitter relocates, this
-    /// observer can be the ONLY replica holding the `PrimaryChanged` fact
-    /// (the live broadcast is one-shot), and its own digest broadcasts
+    /// answer is a STREAM of the mirror it already holds — no mutation is
+    /// originated (unlike the secondary's responder, NO `PeerJoined` is
+    /// emitted; membership recording stays a compute-role concern) and
+    /// nothing is re-broadcast. Serving is LOAD-BEARING for the
+    /// relocation handoff: after the submitter relocates, this observer
+    /// can be the ONLY replica holding the `PrimaryChanged` fact (the
+    /// live broadcast is one-shot), and its own digest broadcasts
     /// (`on_anti_entropy_tick`) are what prove behind peers divergent — a
     /// mute responder would advertise data nobody can pull (the
     /// run_20260610_185621 leaderless wedge).
     ///
-    /// The reply destination is typed off the requester's self-declared
-    /// role (the same `is_observer` field the snapshot responders record)
-    /// via the shared snapshot-RPC reply policy
-    /// ([`anti_entropy::reply_destination`]): `Observer(id)` for an
-    /// observer requester, `Secondary(id)` otherwise.
-    async fn answer_snapshot_request(&mut self, requester: &str, requester_is_observer: bool) {
-        // Serialize-once per state generation (#367): the cache inside
-        // `ClusterState` keys the reply bytes on the anti-entropy
-        // digest, so a burst of pulls against an unchanged ledger does
-        // not re-serialize ~100 MB per request.
-        let snapshot_json = match self.cluster_state.snapshot_json() {
-            Ok(json) => json,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "observer: snapshot serialization failed; cannot answer the pull"
-                );
-                return;
-            }
-        };
-        // The shared snapshot-RPC answer (`anti_entropy::snapshot_reply`):
-        // reply typed off the requester's self-declared role, addressed by
-        // its id — resolvable for a rosterless joiner over its direct leg.
-        let (dst, reply) = anti_entropy::snapshot_reply(
-            &self.config.node_id,
+    /// The handler only REGISTERS (or resumes) the stream; the run
+    /// loop's stream arm produces one bounded package per wakeup, each
+    /// typed off the requester's self-declared role (the same
+    /// `is_observer` field every snapshot responder records) via the
+    /// shared reply policy ([`anti_entropy::reply_destination`]):
+    /// `Observer(id)` for an observer requester, `Secondary(id)`
+    /// otherwise.
+    fn answer_snapshot_request(
+        &mut self,
+        requester: &str,
+        requester_is_observer: bool,
+        stream_id: &str,
+        resume_after: Option<&str>,
+    ) {
+        self.snapshot_streams.accept_request(
+            &self.cluster_state,
             requester,
             requester_is_observer,
-            timestamp_now(),
-            (*snapshot_json).clone(),
+            stream_id,
+            resume_after,
         );
-        if let Err(e) = self.send_to(dst, reply).await {
-            tracing::warn!(
-                requester = %requester,
-                error = %e,
-                "observer: failed to deliver ClusterSnapshot answer; the \
-                 requester's next digest round retries"
-            );
-        }
     }
 
     /// Anti-entropy tick (item 3): broadcast our digest to the mesh.
@@ -2220,6 +2299,7 @@ where
             &peer_digests,
             &mut self.recovery_cursor,
             &requester,
+            &mut self.inbound_snapshots,
             timestamp_now(),
         ) else {
             // C9: converged with every known peer (or none known yet) —
@@ -2308,6 +2388,7 @@ pub fn build_cold_join_observer<I>(
     cluster_state: ClusterState<I>,
     config: ObserverConfig,
     snapshots: Vec<crate::cluster_state::ClusterStateSnapshot<I>>,
+    live_gossip: Vec<DistributedMessage<I>>,
     holdings: HashSet<String>,
 ) -> ObserverCoordinator<I>
 where
@@ -2363,6 +2444,18 @@ where
     );
     for snap in snapshots {
         coordinator.cluster_state.restore(snap);
+    }
+    // Live gossip buffered during the bootstrap window (pre-stream it was
+    // warn-dropped, losing one-shot facts until anti-entropy healed them).
+    // Applied AFTER the restores: by the CRDT join's commutativity +
+    // idempotence this reaches exactly the state concurrent application
+    // would, so no fact observed during the window is lost.
+    for frame in live_gossip {
+        if let DistributedMessage::ClusterMutation { mutations, .. } = frame {
+            for mutation in mutations {
+                coordinator.cluster_state.apply(mutation);
+            }
+        }
     }
     coordinator
 }

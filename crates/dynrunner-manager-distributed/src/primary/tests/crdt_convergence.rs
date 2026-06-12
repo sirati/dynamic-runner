@@ -8,8 +8,8 @@
 //!       an INCOMPLETE `secondary_capacities` mirror (so it rebuilds the
 //!       full worker roster + correct `alive_worker_secondary_count`, no
 //!       premature fleet-dead).
-//!   (b) the primary ANSWERS `RequestClusterSnapshot` (unicasts a
-//!       `ClusterSnapshot` of its complete ledger + originates the
+//!   (b) the primary ANSWERS `RequestSnapshotStream` (streams its
+//!       complete ledger as bounded packages + originates the
 //!       requester's `PeerJoined`).
 
 use super::*;
@@ -333,8 +333,8 @@ async fn rebroadcast_full_roster_reemits_departed_tombstones() {
         .await;
 }
 
-/// (c) The primary answers `RequestClusterSnapshot`: it unicasts a
-/// `ClusterSnapshot` of its complete ledger back to the requester AND
+/// (c) The primary answers `RequestSnapshotStream`: it streams its
+/// complete ledger as bounded packages back to the requester AND
 /// originates the requester's `PeerJoined` (carrying its declared role +
 /// capability). Pre-fix only the secondary router answered; a request
 /// addressed at the primary fell through the catch-all and timed out.
@@ -369,49 +369,57 @@ async fn primary_answers_request_cluster_snapshot() {
             }
 
             // A late-joining WORKER (is_observer=false, can_be_primary=true)
-            // requests a snapshot.
+            // requests a snapshot stream.
             primary
-                .handle_request_cluster_snapshot(DistributedMessage::RequestClusterSnapshot {
+                .handle_request_snapshot_stream(DistributedMessage::RequestSnapshotStream {
                     target: None,
                     sender_id: "sec-0".into(),
                     timestamp: 0.0,
+                    stream_id: "sec-0/0".into(),
+                    resume_after: None,
                     is_observer: false,
                     can_be_primary: true,
                 })
                 .await;
+            primary.drive_snapshot_streams_for_test().await;
 
-            // The requester receives a unicast `ClusterSnapshot` whose
-            // payload restores into the seeded ledger (the task survives).
+            // The requester receives unicast `SnapshotStreamPackage`s
+            // whose payloads union-restore into the seeded ledger (the
+            // task survives).
             let mut got_snapshot = false;
             let mut got_peer_joined = false;
+            let mut restored = crate::cluster_state::ClusterState::<TestId>::new();
             settle_pump().await;
             while let Ok(msg) = requester_inbox.try_recv() {
                 match msg.msg_type() {
-                    MessageType::ClusterSnapshot => {
-                        if let DistributedMessage::ClusterSnapshot {
+                    MessageType::SnapshotStreamPackage => {
+                        if let DistributedMessage::SnapshotStreamPackage {
                             target,
-                            snapshot_json,
+                            payload,
+                            done,
                             ..
                         } = msg
                         {
-                            // The reply is typed off the requester's
+                            // Every package is typed off the requester's
                             // self-declared role: a WORKER requester
-                            // (is_observer=false) gets a Secondary-typed
-                            // reply (the ingress demux selector).
+                            // (is_observer=false) gets Secondary-typed
+                            // packages (the ingress demux selector).
                             assert_eq!(
                                 target,
                                 Some(Destination::Secondary(PeerId::from("sec-0"))),
-                                "a worker requester's snapshot reply must be Secondary-typed"
+                                "a worker requester's packages must be Secondary-typed"
                             );
                             let snap: crate::cluster_state::ClusterStateSnapshot<TestId> =
-                                serde_json::from_str(&snapshot_json).expect("snapshot decodes");
-                            let mut restored = crate::cluster_state::ClusterState::<TestId>::new();
+                                crate::cluster_state::decode_stream_payload(&payload)
+                                    .expect("package decodes");
                             restored.restore(snap);
-                            assert!(
-                                restored.task_state(&hash).is_some(),
-                                "the snapshot must carry the primary's seeded task"
-                            );
-                            got_snapshot = true;
+                            if done {
+                                assert!(
+                                    restored.task_state(&hash).is_some(),
+                                    "the stream must carry the primary's seeded task"
+                                );
+                                got_snapshot = true;
+                            }
                         }
                     }
                     MessageType::ClusterMutation => {
@@ -435,7 +443,7 @@ async fn primary_answers_request_cluster_snapshot() {
                     _ => {}
                 }
             }
-            assert!(got_snapshot, "primary must unicast a ClusterSnapshot reply");
+            assert!(got_snapshot, "primary must stream a complete snapshot reply");
             assert!(
                 got_peer_joined,
                 "primary must originate the requester's PeerJoined (with its declared capability)"
@@ -479,19 +487,22 @@ async fn primary_answers_observer_requester_with_observer_typed_reply() {
 
             // The observer's anti-entropy pull declares its own role.
             primary
-                .handle_request_cluster_snapshot(DistributedMessage::RequestClusterSnapshot {
+                .handle_request_snapshot_stream(DistributedMessage::RequestSnapshotStream {
                     target: None,
                     sender_id: "sec-0".into(),
                     timestamp: 0.0,
+                    stream_id: "sec-0/0".into(),
+                    resume_after: None,
                     is_observer: true,
                     can_be_primary: false,
                 })
                 .await;
+            primary.drive_snapshot_streams_for_test().await;
 
             settle_pump().await;
             let mut reply_target = None;
             while let Ok(msg) = requester_inbox.try_recv() {
-                if let DistributedMessage::ClusterSnapshot { target, .. } = msg {
+                if let DistributedMessage::SnapshotStreamPackage { target, .. } = msg {
                     reply_target = Some(target);
                 }
             }
@@ -759,22 +770,25 @@ async fn primary_answers_target_stamped_snapshot_request() {
                 );
 
                 primary
-                    .handle_request_cluster_snapshot(
-                        DistributedMessage::RequestClusterSnapshot {
+                    .handle_request_snapshot_stream(
+                        DistributedMessage::RequestSnapshotStream {
                             target: None,
                             sender_id: "sec-0".into(),
                             timestamp: 0.0,
+                            stream_id: "sec-0/0".into(),
+                            resume_after: None,
                             is_observer: true,
                             can_be_primary: false,
                         }
                         .with_target(stamp.clone()),
                     )
                     .await;
+                primary.drive_snapshot_streams_for_test().await;
                 settle_pump().await;
 
                 let mut got_snapshot = false;
                 while let Ok(msg) = requester_inbox.try_recv() {
-                    if msg.msg_type() == MessageType::ClusterSnapshot {
+                    if msg.msg_type() == MessageType::SnapshotStreamPackage {
                         got_snapshot = true;
                     }
                 }

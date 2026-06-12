@@ -17,15 +17,18 @@ pub enum MessageType {
     TaskAssignment,
     TransferComplete,
     StageFile,
-    /// Late-joiner / reconnecting node asks any connected peer for a
-    /// full snapshot of the current `ClusterState`. Replaces the
-    /// pre-Phase-B `FullTaskList` broadcast — under continuously-
-    /// replicated state, the only legitimate "ship the full ledger"
-    /// path is on demand from a node that's missing it.
-    RequestClusterSnapshot,
-    /// Response to `RequestClusterSnapshot`: a full `ClusterStateSnapshot`
-    /// the receiver merges into its local mirror via `ClusterState::restore`.
-    ClusterSnapshot,
+    /// Late-joiner / reconnecting / behind node asks one peer to STREAM
+    /// it the replicated `ClusterState` as bounded packages. Replaces
+    /// the pre-Phase-B `FullTaskList` broadcast and the monolithic
+    /// snapshot RPC — under continuously-replicated state, the only
+    /// legitimate "ship the full ledger" path is on demand from a node
+    /// that's missing it, and the ledger ships incrementally (the CRDT
+    /// join needs no consistent cut).
+    RequestSnapshotStream,
+    /// One package of the stream answering `RequestSnapshotStream`: a
+    /// partial `ClusterStateSnapshot` the receiver merges into its local
+    /// mirror via `ClusterState::restore`.
+    SnapshotStreamPackage,
     /// Joining / reconnecting / respawned secondary asks any connected
     /// peer for the cluster-wide run configuration (the consumer's
     /// `forwarded_argv`). Replicated, so any peer can answer; carries no
@@ -36,7 +39,7 @@ pub enum MessageType {
     RunConfig,
     /// Periodic anti-entropy fingerprint (`StateDigest`). Every role
     /// broadcasts it on the convergence cadence; a receiver behind the
-    /// sender pulls a snapshot via `RequestClusterSnapshot`. Detector
+    /// sender pulls a snapshot via `RequestSnapshotStream`. Detector
     /// only — carries no task payloads and triggers no merge by itself.
     StateDigest,
     MeshReady,

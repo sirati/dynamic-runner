@@ -27,6 +27,7 @@ const ARM_RESPAWN_JOIN: usize = 8;
 const ARM_PANIK: usize = 9;
 const ARM_GRACEFUL_ABORT: usize = 10;
 const ARM_TASK_BACKOFF: usize = 11;
+const ARM_SNAPSHOT_STREAM: usize = 12;
 
 /// Arm names, index-aligned with the `ARM_*` ids above. The render order of
 /// the compact stats line.
@@ -43,6 +44,7 @@ const OP_LOOP_ARM_NAMES: &[&str] = &[
     "panik",
     "graceful_abort",
     "task_backoff",
+    "snapshot_stream",
 ];
 
 /// Render a drain-by-`MessageType` tally as a single diagnostic string:
@@ -741,6 +743,31 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                                  classified stranded)"
                             );
                         }
+                    }
+                }
+                stream_id = self.snapshot_streams.next_wake() => {
+                    arm_stats.record(ARM_SNAPSHOT_STREAM);
+                    // Snapshot-stream production arm: ONE bounded package
+                    // per wakeup (the driver re-enqueues its own token
+                    // when the stream has more), so a 100 MB ledger
+                    // streams out interleaved with every other arm
+                    // instead of serializing monolithically on the loop.
+                    // The send awaits like any other egress; a send
+                    // failure drops the stream (the requester resumes
+                    // from its cursor on its next pull).
+                    if let Some((dst, frame)) = self.snapshot_streams.emit_next(
+                        &stream_id,
+                        &self.cluster_state,
+                        crate::primary::wire::timestamp_now(),
+                    ) && let Err(e) = self.send_to(dst, frame).await
+                    {
+                        tracing::warn!(
+                            stream_id = %stream_id,
+                            error = %e,
+                            "snapshot-stream package send failed; dropping stream \
+                             (the requester's pull cadence resumes from its cursor)"
+                        );
+                        self.snapshot_streams.abort_stream(&stream_id);
                     }
                 }
                 _ = heartbeat_tick.tick() => {

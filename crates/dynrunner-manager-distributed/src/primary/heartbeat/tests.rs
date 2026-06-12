@@ -2932,7 +2932,7 @@ fn is_repoint_to(msg: &DistributedMessage<TestId>, new: &str) -> bool {
 /// from its own direct peers while declaring the named primary silent.
 ///
 /// Covers BOTH observer kinds: the LATE-JOINED observer (seated through
-/// the primary's `handle_request_cluster_snapshot` responder, which
+/// the primary's `handle_request_snapshot_stream` responder, which
 /// originates its `PeerJoined { is_observer: true }`) and the RELOCATED
 /// submitter-observer (its observer role recorded in the replicated
 /// capability roster by the responders' `PeerJoined { is_observer:
@@ -2961,10 +2961,12 @@ async fn primary_keepalive_fan_reaches_observer_members_directed() {
             // responder (the production seat path), which originates
             // `PeerJoined { is_observer: true }` for the requester.
             primary
-                .handle_request_cluster_snapshot(DistributedMessage::RequestClusterSnapshot {
+                .handle_request_snapshot_stream(DistributedMessage::RequestSnapshotStream {
                     target: None,
                     sender_id: "obs-late".into(),
                     timestamp: 0.0,
+                    stream_id: "obs-late/0".into(),
+                    resume_after: None,
                     is_observer: true,
                     can_be_primary: false,
                 })

@@ -145,25 +145,30 @@ async fn join_succeeds_through_tcp_forward_endpoint() {
             });
 
             // The cluster peer's responder: answer the first
-            // RequestClusterSnapshot with a canned ClusterSnapshot.
+            // RequestSnapshotStream with a canned single-package stream.
             let responder = tokio::task::spawn_local(async move {
                 loop {
                     let Some(msg) = cluster.recv_peer().await else {
                         panic!("cluster peer transport closed before the snapshot request");
                     };
-                    if let DistributedMessage::RequestClusterSnapshot {
+                    if let DistributedMessage::RequestSnapshotStream {
                         sender_id,
+                        stream_id,
                         is_observer,
                         ..
                     } = msg
                     {
                         assert!(is_observer, "late-joiner observer must declare its role");
                         let reply: DistributedMessage<TestId> =
-                            DistributedMessage::ClusterSnapshot {
+                            DistributedMessage::SnapshotStreamPackage {
                                 target: None,
                                 sender_id: "secondary-0".into(),
                                 timestamp: 0.0,
-                                snapshot_json: "{\"canned\":true}".into(),
+                                stream_id,
+                                seq: 0,
+                                cursor: None,
+                                payload: "{\"canned\":true}".into(),
+                                done: true,
                             };
                         cluster
                             .send_to_peer(&sender_id, reply)
@@ -180,11 +185,11 @@ async fn join_succeeds_through_tcp_forward_endpoint() {
                 PeerNetwork::start("observer-green", None).await.unwrap();
             let seed = vec![seed_entry("secondary-0", "127.0.0.1", forward_port)];
 
-            let snapshots = joiner
+            let bootstrap = joiner
                 .join_running_cluster(&seed, Duration::from_secs(10), true, false)
                 .await
                 .expect("join through the TCP forward endpoint must succeed");
-            assert_eq!(snapshots, vec!["{\"canned\":true}".to_string()]);
+            assert_eq!(bootstrap.payloads, vec!["{\"canned\":true}".to_string()]);
             responder.await.expect("responder completed");
         })
         .await;
@@ -231,8 +236,9 @@ async fn join_accepts_role_stamped_snapshot_reply() {
                     let Some(msg) = cluster.recv_peer().await else {
                         panic!("cluster peer transport closed before the snapshot request");
                     };
-                    if let DistributedMessage::RequestClusterSnapshot {
+                    if let DistributedMessage::RequestSnapshotStream {
                         sender_id,
+                        stream_id,
                         is_observer,
                         ..
                     } = msg
@@ -252,11 +258,15 @@ async fn join_accepts_role_stamped_snapshot_reply() {
                             .await
                             .expect("gossip broadcast reaches the joiner's wire");
                         let reply: DistributedMessage<TestId> =
-                            DistributedMessage::ClusterSnapshot {
+                            DistributedMessage::SnapshotStreamPackage {
                                 target: None,
                                 sender_id: "secondary-0".into(),
                                 timestamp: 0.0,
-                                snapshot_json: "{\"canned\":true}".into(),
+                                stream_id,
+                                seq: 0,
+                                cursor: None,
+                                payload: "{\"canned\":true}".into(),
+                                done: true,
                             }
                             .with_target(Destination::Observer(PeerId::from(sender_id.clone())));
                         cluster
@@ -274,11 +284,11 @@ async fn join_accepts_role_stamped_snapshot_reply() {
                 PeerNetwork::start("observer-stamped", None).await.unwrap();
             let seed = vec![seed_entry("secondary-0", "127.0.0.1", forward_port)];
 
-            let snapshots = joiner
+            let bootstrap = joiner
                 .join_running_cluster(&seed, Duration::from_secs(10), true, false)
                 .await
                 .expect("the role-stamped snapshot reply must be accepted by the bootstrap window");
-            assert_eq!(snapshots, vec!["{\"canned\":true}".to_string()]);
+            assert_eq!(bootstrap.payloads, vec!["{\"canned\":true}".to_string()]);
             responder.await.expect("responder completed");
         })
         .await;
@@ -290,7 +300,7 @@ async fn join_accepts_role_stamped_snapshot_reply() {
 /// joiner's mesh leg under (first-frame identification).
 ///
 /// REVERT-CHECK: a de-role refactor deleted `PeerNetwork`'s `local_id`
-/// override, so production joiners sent `RequestClusterSnapshot {
+/// override, so production joiners sent `RequestSnapshotStream {
 /// sender_id: "" }`: every responder replied to peer `""`, the joiner's
 /// legs registered under the anonymous key, and the responder-originated
 /// `PeerJoined` recorded a phantom `""` member — the cluster could never
@@ -315,7 +325,12 @@ async fn join_request_carries_the_joiner_identity() {
                     let Some(msg) = cluster.recv_peer().await else {
                         panic!("cluster peer transport closed before the snapshot request");
                     };
-                    if let DistributedMessage::RequestClusterSnapshot { sender_id, .. } = msg {
+                    if let DistributedMessage::RequestSnapshotStream {
+                        sender_id,
+                        stream_id,
+                        ..
+                    } = msg
+                    {
                         // THE identity pin: the request's return address
                         // is the joiner's real peer-id, never empty.
                         assert_eq!(
@@ -334,11 +349,15 @@ async fn join_request_carries_the_joiner_identity() {
                         // responder's egress stamps it (the requester's
                         // declared role).
                         let reply: DistributedMessage<TestId> =
-                            DistributedMessage::ClusterSnapshot {
+                            DistributedMessage::SnapshotStreamPackage {
                                 target: None,
                                 sender_id: "secondary-0".into(),
                                 timestamp: 0.0,
-                                snapshot_json: "{\"canned\":true}".into(),
+                                stream_id,
+                                seq: 0,
+                                cursor: None,
+                                payload: "{\"canned\":true}".into(),
+                                done: true,
                             }
                             .with_target(Destination::Observer(PeerId::from(sender_id.clone())));
                         cluster
@@ -354,11 +373,11 @@ async fn join_request_carries_the_joiner_identity() {
                 PeerNetwork::start("observer-mirror", None).await.unwrap();
             let seed = vec![seed_entry("secondary-0", "127.0.0.1", cluster_port)];
 
-            let snapshots = joiner
+            let bootstrap = joiner
                 .join_running_cluster(&seed, Duration::from_secs(10), true, false)
                 .await
                 .expect("the identity-carrying bootstrap must complete");
-            assert_eq!(snapshots, vec!["{\"canned\":true}".to_string()]);
+            assert_eq!(bootstrap.payloads, vec!["{\"canned\":true}".to_string()]);
             responder.await.expect("responder completed");
         })
         .await;

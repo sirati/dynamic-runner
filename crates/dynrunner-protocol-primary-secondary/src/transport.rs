@@ -16,8 +16,8 @@ use crate::messages::timestamp_now;
 /// cadence (`recv_budget / 3` capped at [`JOIN_REREQUEST_CAP`] = 5 s)
 /// slices into ~9 fan-out rounds. The budget is sized for the REPLY to
 /// LAND, not just for the request to be heard: a production bootstrap
-/// (gateway joiner into a busy run) collects multi-MB `ClusterSnapshot`
-/// payloads that travel as chunked transfers over WAN legs, and the
+/// (gateway joiner into a busy run) collects many multi-MB snapshot
+/// packages over WAN legs, and the
 /// previous 10 s budget (7.5 s recv, 3 fan-outs) expired while replies
 /// were still in flight — the joiner died `Timeout` against responders
 /// that had already answered. A silent responder is still
@@ -40,9 +40,10 @@ pub const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(60);
 /// best a relay) and against responder-seat churn — a joiner dialing
 /// inside a primary-promotion window can lose EVERY first-shot request
 /// while its legs keep delivering gossip. Re-requesting is safe by
-/// design: every responder serializes through a digest-keyed cache and
-/// originates the joiner's `PeerJoined` through idempotent CRDT apply,
-/// so a duplicate request is a cheap re-reply, never a state change.
+/// design: a responder still holding the stream RESUMES it from the
+/// carried cursor, and the joiner's `PeerJoined` originates through
+/// idempotent CRDT apply — a duplicate request is a cheap reposition,
+/// never a state change.
 const JOIN_REREQUEST_CAP: Duration = Duration::from_secs(5);
 
 /// Error from [`PeerTransport::join_running_cluster`].
@@ -51,13 +52,14 @@ pub enum JoinError {
     /// `connect_to_peers` ran but no peer became reachable within
     /// the per-peer-connect slice of the bootstrap budget.
     NoReachablePeer,
-    /// At least one peer was reachable and snapshot requests were sent
-    /// — re-fanned periodically until the deadline (see
-    /// [`JOIN_REREQUEST_CAP`]) — but no `ClusterSnapshot` reply ever
-    /// arrived within the budget. The transport may have received other
-    /// live messages during the window — those are dropped (logged at
-    /// `warn`). The carried counters say how hard the bootstrap tried;
-    /// the caller drives any whole-bootstrap retry policy.
+    /// At least one peer was reachable and snapshot-stream requests were
+    /// sent — re-fanned periodically until the deadline (see
+    /// [`JOIN_REREQUEST_CAP`]) — but no `SnapshotStreamPackage` ever
+    /// arrived within the budget. Live `ClusterMutation` gossip received
+    /// in the window is buffered (not dropped), but gossip alone cannot
+    /// bootstrap an empty mirror, so zero packages is still a failed
+    /// join. The carried counters say how hard the bootstrap tried; the
+    /// caller drives any whole-bootstrap retry policy.
     Timeout {
         /// Total individual snapshot requests sent across all fan-outs.
         requests_sent: usize,
@@ -92,7 +94,7 @@ impl std::fmt::Display for JoinError {
                 fan_outs,
             } => write!(
                 f,
-                "join_running_cluster: no ClusterSnapshot reply within the bootstrap timeout \
+                "join_running_cluster: no SnapshotStreamPackage within the bootstrap timeout \
                  ({requests_sent} snapshot requests sent across {fan_outs} fan-outs, re-sent \
                  until the deadline; a cluster mid primary-promotion can leave every request \
                  unanswered for the whole window)"
@@ -109,6 +111,30 @@ impl std::fmt::Display for JoinError {
 }
 
 impl std::error::Error for JoinError {}
+
+/// Successful outcome of [`PeerTransport::join_running_cluster`].
+///
+/// `payloads` are the collected snapshot-stream package payloads
+/// (base64-wrapped CBOR partial snapshots — opaque at this layer; the
+/// protocol crate stays free of `ClusterStateSnapshot<I>`). The caller
+/// decodes each and `restore()`s each — the idempotent lattice unions
+/// duplicates and partials regardless of order.
+///
+/// `live_frames` is the live `ClusterMutation` gossip that arrived
+/// DURING the bootstrap window. Previously these frames were
+/// warn-dropped ("the next broadcast covers it" — except one-shot facts
+/// it never re-covers); now they are returned so the caller applies
+/// them after restoring `payloads`. By the CRDT join's commutativity +
+/// idempotence, apply-after-restore reaches exactly the state
+/// concurrent application would. Cadence / announce traffic
+/// (keepalives, digests, election frames) is still not buffered — a
+/// joiner is not yet a participant in those exchanges and they carry no
+/// replicated facts.
+#[derive(Debug)]
+pub struct JoinBootstrap<I> {
+    pub payloads: Vec<String>,
+    pub live_frames: Vec<DistributedMessage<I>>,
+}
 
 /// Primary-side transport for the legacy per-secondary writer fan-out.
 ///
@@ -334,7 +360,7 @@ pub trait PeerTransport<I: Identifier> {
 
     /// The local node's own peer-id, used as the bootstrap RPC's
     /// return address (the `sender_id` of the
-    /// [`DistributedMessage::RequestClusterSnapshot`] frame
+    /// [`DistributedMessage::RequestSnapshotStream`] frame
     /// [`Self::join_running_cluster`] constructs) and to skip the
     /// joiner's own entry when iterating the seed list.
     ///
@@ -369,18 +395,19 @@ pub trait PeerTransport<I: Identifier> {
     ///    total budget. If no peer is reachable, surface
     ///    [`JoinError::NoReachablePeer`] — the caller decides between
     ///    abort vs. retry-with-a-different-seed.
-    /// 3. Construct a [`DistributedMessage::RequestClusterSnapshot`]
+    /// 3. Construct a [`DistributedMessage::RequestSnapshotStream`]
     ///    envelope tagged with [`Self::local_id`] as the responder's
-    ///    return address and `is_observer` declaring the joiner's own
-    ///    role (so the responder's `PeerJoined` broadcast carries the
-    ///    truth instead of assuming observer).
+    ///    return address, a per-(join, responder) minted `stream_id`,
+    ///    and `is_observer` declaring the joiner's own role (so the
+    ///    responder's `PeerJoined` broadcast carries the truth instead
+    ///    of assuming observer).
     /// 4. Send it via [`Self::send_to_peer`] to EVERY reachable non-self
-    ///    seed id (multi-responder fan-out). The receiver-side handler in
-    ///    `secondary/dispatch.rs` — and now the primary
-    ///    (`primary::task::mutation::handle_request_cluster_snapshot`) —
-    ///    accepts the request from any peer (`cluster_state` is
-    ///    replicated) and replies with a unicast
-    ///    [`DistributedMessage::ClusterSnapshot`].
+    ///    seed id (multi-responder fan-out). The receiver-side stream
+    ///    responders (primary, secondary router, observer) accept the
+    ///    request from any peer (`cluster_state` is replicated) and
+    ///    answer with a sequence of unicast bounded
+    ///    [`DistributedMessage::SnapshotStreamPackage`] frames, one per
+    ///    responder-loop wakeup.
     ///
     ///    The request is addressed by concrete peer-id, not by role: a
     ///    cold-start joiner cannot resolve `Destination::Primary` yet
@@ -388,58 +415,57 @@ pub trait PeerTransport<I: Identifier> {
     ///    rather than the first that accepts — is the primary-preferred /
     ///    completeness fix: the first reachable seed may be a secondary
     ///    whose own roster is incomplete (the pre-mesh
-    ///    `secondary_capacities` desync), so a SINGLE reply could
-    ///    bootstrap the joiner from a partial snapshot. Collecting every
-    ///    responder's snapshot and letting the caller `restore()` each
+    ///    `secondary_capacities` desync), so a SINGLE stream could
+    ///    bootstrap the joiner from a partial mirror. Collecting every
+    ///    responder's packages and letting the caller `restore()` each
     ///    one heals via the idempotent lattice (the union is complete iff
     ///    ANY responder — the primary above all — was complete).
     ///
     /// 5. Drive [`Self::recv_peer`] inside a `tokio::time::timeout`,
-    ///    COLLECTING every [`DistributedMessage::ClusterSnapshot`] that
-    ///    arrives until either one reply per peer the request was sent to
-    ///    has been gathered or the bootstrap budget expires. Messages
-    ///    OTHER than `ClusterSnapshot` received in the window are logged
-    ///    at `warn` and dropped — the cluster's CRDT-merge guarantees the
-    ///    next live broadcast (or a follow-up snapshot) covers anything
-    ///    dropped here.
+    ///    COLLECTING every [`DistributedMessage::SnapshotStreamPackage`]
+    ///    that arrives until either every responder the request reached
+    ///    has delivered its `done` package or the bootstrap budget
+    ///    expires. Live `ClusterMutation` gossip received in the window
+    ///    is BUFFERED and returned on [`JoinBootstrap::live_frames`]
+    ///    (pre-stream it was warn-dropped, which lost one-shot facts);
+    ///    cadence/announce traffic is debug-ignored as before.
     ///
     ///    The fan-out is RE-SENT on a fixed cadence (`recv_budget / 3`,
     ///    capped at [`JOIN_REREQUEST_CAP`]) until the deadline, skipping
-    ///    peers that already answered. The first fan-out fires the
-    ///    instant the FIRST leg registers, so it races leg
-    ///    establishment (later seeds get at best a relay whose reply
-    ///    has no return wire yet) and responder-seat churn — a joiner
-    ///    dialing inside a primary-promotion window can lose every
-    ///    first-shot request while gossip keeps arriving. The
-    ///    re-request reaches peers over their now-established direct
-    ///    legs and any newly-seated primary, healing the bootstrap
-    ///    within its own budget. Responders are idempotent under
-    ///    duplicates (digest-keyed snapshot cache + CRDT `PeerJoined`),
-    ///    and duplicate replies from one responder are deduplicated
-    ///    by sender here.
+    ///    responders whose stream completed. A re-request to a responder
+    ///    with an INCOMPLETE stream repeats the SAME `stream_id` and
+    ///    carries the last seen package `cursor` as `resume_after`, so
+    ///    the responder resumes from where the stream broke instead of
+    ///    restarting (the resume-from-cursor shape of the old re-request
+    ///    cadence). The first fan-out fires the instant the FIRST leg
+    ///    registers, so it races leg establishment and responder-seat
+    ///    churn — re-requesting until the deadline heals both within the
+    ///    same budget. Responders are idempotent under duplicates
+    ///    (per-stream reposition + CRDT `PeerJoined`).
     ///
-    /// Returns the COLLECTED snapshot payloads (the `snapshot_json` of
-    /// each `ClusterSnapshot` reply) as a `Vec<String>` — at least one on
-    /// `Ok`. The caller decodes each into its own concrete
-    /// `ClusterStateSnapshot<I>` and `restore()`s each (the idempotent
-    /// lattice unions them). The protocol crate stays free of
+    /// Returns the collected [`JoinBootstrap`]: every package payload
+    /// (opaque base64-CBOR partial snapshots — at least one on `Ok`)
+    /// plus the buffered live gossip. The caller decodes each payload
+    /// into its own concrete `ClusterStateSnapshot<I>` and `restore()`s
+    /// each, then applies the gossip (the idempotent lattice makes the
+    /// ordering immaterial). The protocol crate stays free of
     /// `ClusterStateSnapshot<I>` — the wire-side `String` keeps `I`
     /// erased at the transport boundary; see the dispatch.rs commentary
     /// on the same direction-of-dependency point.
     ///
-    /// **Single concern**: bootstrap rendezvous + snapshot RPC. The
-    /// caller's concern is cluster-state restoration (one `restore` per
-    /// returned payload) and any retry policy if `Err` comes back. The
-    /// loop above never touches `ClusterState` directly — the dependency
-    /// edge is preserved (protocol crate does not depend on
-    /// manager-distributed).
+    /// **Single concern**: bootstrap rendezvous + snapshot-stream RPC.
+    /// The caller's concern is cluster-state restoration (one `restore`
+    /// per returned payload, then the gossip) and any retry policy if
+    /// `Err` comes back. The loop above never touches `ClusterState`
+    /// directly — the dependency edge is preserved (protocol crate does
+    /// not depend on manager-distributed).
     fn join_running_cluster(
         &mut self,
         seed: &[crate::PeerConnectionInfo],
         timeout: Duration,
         is_observer: bool,
         can_be_primary: bool,
-    ) -> impl std::future::Future<Output = Result<Vec<String>, JoinError>>
+    ) -> impl std::future::Future<Output = Result<JoinBootstrap<I>, JoinError>>
     where
         I: 'static,
     {
@@ -482,7 +508,7 @@ pub trait PeerTransport<I: Identifier> {
             // so we drive the rendezvous on cardinality and then
             // (Step 3+4) send the request to EVERY non-self seed
             // (multi-responder fan-out). Any peer can answer per
-            // dispatch.rs's RequestClusterSnapshot handler; collecting
+            // dispatch.rs's RequestSnapshotStream handler; collecting
             // all replies and merging them via the idempotent lattice
             // heals an incomplete responder.
             loop {
@@ -546,48 +572,99 @@ pub trait PeerTransport<I: Identifier> {
             let mut fan_outs: usize = 0;
             let mut requests_sent: usize = 0;
             let mut send_err: Option<String> = None;
-            // Distinct peers a request reached (across all fan-outs) —
-            // the completion target — and the per-responder collected
-            // payloads. Keying by responder deduplicates a peer that
-            // answers both the original and a re-request (latest wins;
-            // the caller's restore-union is idempotent anyway) so a
-            // duplicate reply never inflates completion.
-            let mut sent_to: std::collections::HashSet<String> = Default::default();
-            let mut snapshots: std::collections::HashMap<String, String> = Default::default();
+            // Per-responder stream progress, keyed by the peer a request
+            // REACHED (entry created on first successful send). Holds the
+            // stream_id minted for that responder (repeated verbatim on
+            // every re-request so a responder still holding the stream
+            // RESUMES instead of restarting), the last package cursor
+            // (echoed as `resume_after`), and the done latch. Packages
+            // answering a stale stream_id (a previous join attempt) still
+            // contribute their payload — restore is idempotent — but
+            // never advance this accounting.
+            struct StreamProgress {
+                stream_id: String,
+                cursor: Option<String>,
+                done: bool,
+            }
+            // Join-epoch mint: unique per call within this process, so a
+            // retried whole-bootstrap never aliases a previous attempt's
+            // stream ids. Combined with the cluster-unique `local_id` +
+            // responder id, the minted id is unique without an RNG (this
+            // deterministic runtime deliberately has none).
+            static JOIN_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let join_epoch = JOIN_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut streams: std::collections::HashMap<String, StreamProgress> = Default::default();
+            let mut payloads: Vec<String> = Vec::new();
+            // Live gossip buffered (not dropped) during the window; see
+            // `JoinBootstrap::live_frames`. Bounded so a pathological
+            // gossip storm cannot balloon the joiner's memory — overflow
+            // degrades to the pre-stream drop behaviour, counted + warned.
+            const JOIN_LIVE_BUFFER_CAP: usize = 8192;
+            let mut live_frames: Vec<DistributedMessage<I>> = Vec::new();
+            let mut live_dropped: usize = 0;
             loop {
-                if !snapshots.is_empty() && snapshots.len() >= sent_to.len() {
-                    // Every peer we reached has answered; no point waiting
-                    // out the rest of the budget.
-                    return Ok(snapshots.into_values().collect());
+                if !streams.is_empty() && streams.values().all(|p| p.done) {
+                    // Every responder we reached has streamed to `done`;
+                    // no point waiting out the rest of the budget.
+                    if live_dropped > 0 {
+                        tracing::warn!(
+                            live_dropped,
+                            "join_running_cluster: live-gossip buffer overflowed; \
+                             dropped frames heal via anti-entropy"
+                        );
+                    }
+                    return Ok(JoinBootstrap {
+                        payloads,
+                        live_frames,
+                    });
                 }
                 let now = tokio::time::Instant::now();
                 if now >= recv_deadline {
-                    // Budget expired. At least one snapshot collected is
-                    // success (the caller unions them); zero collected
-                    // surfaces `Timeout` — the operator-visible signal is
-                    // identical to the cold-start no-reply case, and the
-                    // carried counters say how hard the bootstrap tried.
-                    return if snapshots.is_empty() {
+                    // Budget expired. At least one package collected is
+                    // success (the caller unions the partials and the
+                    // post-join anti-entropy cadence resumes the rest
+                    // from the cursor); zero collected surfaces `Timeout`
+                    // — the operator-visible signal is identical to the
+                    // cold-start no-reply case, and the carried counters
+                    // say how hard the bootstrap tried.
+                    return if payloads.is_empty() {
                         Err(JoinError::Timeout {
                             requests_sent,
                             fan_outs,
                         })
                     } else {
-                        Ok(snapshots.into_values().collect())
+                        Ok(JoinBootstrap {
+                            payloads,
+                            live_frames,
+                        })
                     };
                 }
                 if now >= next_fan_out {
                     fan_outs += 1;
                     for peer in seed {
                         if peer.secondary_id == local_id
-                            || snapshots.contains_key(&peer.secondary_id)
+                            || streams
+                                .get(&peer.secondary_id)
+                                .is_some_and(|p| p.done)
                         {
                             continue;
                         }
-                        let request = DistributedMessage::RequestClusterSnapshot {
+                        // Mint once per responder; a re-request to an
+                        // incomplete stream repeats the SAME id and
+                        // resumes from the last seen cursor.
+                        let (stream_id, resume_after) = match streams.get(&peer.secondary_id) {
+                            Some(p) => (p.stream_id.clone(), p.cursor.clone()),
+                            None => (
+                                format!("{local_id}/join{join_epoch}/{}", peer.secondary_id),
+                                None,
+                            ),
+                        };
+                        let request = DistributedMessage::RequestSnapshotStream {
                             target: None,
                             sender_id: local_id.clone(),
                             timestamp: timestamp_now(),
+                            stream_id: stream_id.clone(),
+                            resume_after,
                             // The joiner declares its own role + capability
                             // so the responder broadcasts a truthful
                             // `PeerJoined` rather than assuming observer /
@@ -598,7 +675,13 @@ pub trait PeerTransport<I: Identifier> {
                         match self.send_to_peer(&peer.secondary_id, request).await {
                             Ok(()) => {
                                 requests_sent += 1;
-                                sent_to.insert(peer.secondary_id.clone());
+                                streams.entry(peer.secondary_id.clone()).or_insert(
+                                    StreamProgress {
+                                        stream_id,
+                                        cursor: None,
+                                        done: false,
+                                    },
+                                );
                             }
                             Err(e) => {
                                 send_err = Some(e);
@@ -611,14 +694,14 @@ pub trait PeerTransport<I: Identifier> {
                     // budget. Later fan-outs are best-effort — a transient
                     // all-sends-failed round is exactly what the next
                     // round heals.
-                    if fan_outs == 1 && sent_to.is_empty() {
+                    if fan_outs == 1 && streams.is_empty() {
                         return Err(JoinError::SendFailed(
                             send_err.unwrap_or_else(|| "no seed peer accepted send".into()),
                         ));
                     }
                     next_fan_out = now + rerequest_interval;
                 }
-                // Wait for the next reply, bounded by whichever comes
+                // Wait for the next frame, bounded by whichever comes
                 // first: the re-request tick or the bootstrap deadline.
                 let wait_until = next_fan_out.min(recv_deadline);
                 let remaining = wait_until.saturating_duration_since(tokio::time::Instant::now());
@@ -635,46 +718,77 @@ pub trait PeerTransport<I: Identifier> {
                         // collected; empty surfaces as timeout (identical
                         // operator-visible signal, cause shows up in the
                         // transport's own teardown logs).
-                        return if snapshots.is_empty() {
+                        return if payloads.is_empty() {
                             Err(JoinError::Timeout {
                                 requests_sent,
                                 fan_outs,
                             })
                         } else {
-                            Ok(snapshots.into_values().collect())
+                            Ok(JoinBootstrap {
+                                payloads,
+                                live_frames,
+                            })
                         };
                     }
-                    // Accept the reply REGARDLESS of its Phase-C target
+                    // Accept the package REGARDLESS of its Phase-C target
                     // stamp. The responder's coordinator egress stamps
                     // every frame with the resolved role-typed return
-                    // address (`anti_entropy::reply_destination` →
-                    // `Some(Destination::Observer(<this id>))` /
-                    // `Some(Destination::Secondary(<this id>))`), and the
-                    // frame's ARRIVAL on this node's wire already
-                    // satisfies the host-addressing — the stamp is only
-                    // the mesh-pump's slot-demux hint, and the bootstrap
-                    // window has no role slots (the same never-drop-on-
-                    // stamp ingress rule as `Mesh::route_incoming`).
-                    // `None` (a pre-stamp transport or test double) is
-                    // equally accepted. A `target: None` pattern here
-                    // dropped every production reply as "non-
-                    // ClusterSnapshot … kind=ClusterSnapshot" until the
-                    // budget expired — the gateway late-joiner Test-1a
-                    // bootstrap timeout.
-                    Ok(Some(DistributedMessage::ClusterSnapshot {
+                    // address, and the frame's ARRIVAL on this node's
+                    // wire already satisfies the host-addressing — the
+                    // stamp is only the mesh-pump's slot-demux hint, and
+                    // the bootstrap window has no role slots (the same
+                    // never-drop-on-stamp ingress rule as
+                    // `Mesh::route_incoming`). `None` (a pre-stamp
+                    // transport or test double) is equally accepted. A
+                    // `target: None` pattern here once dropped every
+                    // production reply until the budget expired — the
+                    // gateway late-joiner Test-1a bootstrap timeout.
+                    Ok(Some(DistributedMessage::SnapshotStreamPackage {
                         sender_id,
-                        snapshot_json,
+                        stream_id,
+                        cursor,
+                        payload,
+                        done,
                         ..
                     })) => {
-                        snapshots.insert(sender_id, snapshot_json);
+                        payloads.push(payload);
+                        // Progress accounting only for the stream WE
+                        // minted for this responder; a stale-stream
+                        // package contributed its payload above and is
+                        // otherwise ignored.
+                        if let Some(p) = streams.get_mut(&sender_id)
+                            && p.stream_id == stream_id
+                        {
+                            if cursor.is_some() {
+                                p.cursor = cursor;
+                            }
+                            p.done |= done;
+                        }
                         continue;
                     }
                     Ok(Some(other)) => {
-                        tracing::warn!(
-                            kind = ?other.msg_type(),
-                            target = ?other.target(),
-                            "join_running_cluster: dropped non-ClusterSnapshot frame in bootstrap window"
-                        );
+                        // Live replicated-state gossip is BUFFERED for the
+                        // caller (pre-stream it was warn-dropped, losing
+                        // one-shot facts until anti-entropy healed them);
+                        // cadence / announce traffic stays ignored — a
+                        // joiner is not yet a participant in those
+                        // exchanges and they carry no replicated facts.
+                        if matches!(
+                            other.msg_type(),
+                            crate::messages::MessageType::ClusterMutation
+                        ) {
+                            if live_frames.len() < JOIN_LIVE_BUFFER_CAP {
+                                live_frames.push(other);
+                            } else {
+                                live_dropped += 1;
+                            }
+                        } else {
+                            tracing::debug!(
+                                kind = ?other.msg_type(),
+                                target = ?other.target(),
+                                "join_running_cluster: ignored non-gossip frame in bootstrap window"
+                            );
+                        }
                         continue;
                     }
                 }

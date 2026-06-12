@@ -38,37 +38,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// exit-counter reads. The CRDT idempotency on `cluster_state`
     /// makes repeated apply safe; `HashSet::insert` is idempotent on
     /// the accounting side.
-    /// Answer a late-joiner's / re-bootstrapping peer's
-    /// `RequestClusterSnapshot` from the primary's authoritative ledger.
+    /// Open (or resume) a snapshot STREAM answering a late-joiner's /
+    /// re-bootstrapping / behind peer's `RequestSnapshotStream` from the
+    /// primary's authoritative ledger.
     ///
     /// Single concern: the snapshot-RPC responder on the primary side.
-    /// Pre-fix only the secondary router answered this request
-    /// (`secondary::dispatch::router`'s `RequestClusterSnapshot` arm);
-    /// the primary's `dispatch_message` had no arm and the request fell
-    /// through the catch-all. A requester that unicast to the primary
-    /// (`Destination::Primary` — the primary-preferred bootstrap target,
-    /// and the only responder guaranteed COMPLETE pre-mesh-convergence)
-    /// got no reply and timed out. The primary's `cluster_state` is the
-    /// authoritative copy of every replicated field, so its snapshot is
-    /// the strongest possible bootstrap payload.
+    /// The primary's `cluster_state` is the authoritative copy of every
+    /// replicated field, so its stream is the strongest possible
+    /// bootstrap source. The handler only REGISTERS the stream (one
+    /// sorted key list + the small tally capture — never a ledger copy
+    /// or a monolithic serialization); the packages are produced one
+    /// per operational-loop wakeup by the loop's stream arm
+    /// (`snapshot_streams.next_wake` → `emit_next`), so a 100 MB ledger
+    /// never holds the loop.
     ///
-    /// Mirrors the secondary responder exactly: snapshot the local
-    /// `cluster_state`, unicast `ClusterSnapshot` back to the requester
-    /// (its return address rides `sender_id`), and originate the
-    /// requester's `PeerJoined` over the canonical broadcast path so
-    /// every replica learns about the joiner. The joiner's declared
-    /// `is_observer` / `can_be_primary` ride the request frame and are
-    /// recorded truthfully (the same role-carrying contract the secondary
-    /// responder honours — `apply_peer_joined`'s observer ratchet keeps a
-    /// re-bootstrapping worker from mis-upgrading to observer).
-    ///
-    /// The wire-side `snapshot_json` keeps the protocol envelope free of
-    /// `ClusterStateSnapshot<I>` (the dependency direction: protocol must
-    /// not depend on manager-distributed). A serialization failure is
-    /// logged and the request is dropped — best-effort, exactly as the
-    /// secondary responder treats its own send failure; the requester's
-    /// bounded recv wait falls back to its own deadline.
-    pub(crate) async fn handle_request_cluster_snapshot(&mut self, msg: DistributedMessage<I>) {
+    /// Mirrors the secondary responder exactly, and additionally
+    /// originates the requester's `PeerJoined` over the canonical
+    /// broadcast path so every replica learns about the joiner. The
+    /// joiner's declared `is_observer` / `can_be_primary` ride the
+    /// request frame and are recorded truthfully (the same role-carrying
+    /// contract the secondary responder honours — `apply_peer_joined`'s
+    /// observer ratchet keeps a re-bootstrapping worker from
+    /// mis-upgrading to observer).
+    pub(crate) async fn handle_request_snapshot_stream(&mut self, msg: DistributedMessage<I>) {
         // ANY routing stamp is accepted: the `target` is the wire
         // envelope's ingress-demux header, never request semantics. Every
         // coordinator-egress pull arrives STAMPED (`Some(Destination::
@@ -79,11 +71,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `target: None` pattern here SILENTLY dropped every stamped
         // shape, so the primary never served anti-entropy / recovery
         // pulls — only a healthy primary answering the joiner's raw
-        // requests masked it (see
-        // `anti_entropy::snapshot_reply`'s contract).
-        let DistributedMessage::RequestClusterSnapshot {
+        // requests masked it.
+        let DistributedMessage::RequestSnapshotStream {
             target: _,
             sender_id,
+            stream_id,
+            resume_after,
             is_observer,
             can_be_primary,
             ..
@@ -93,44 +86,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // never a silent drop of a snapshot pull.
             tracing::error!(
                 kind = ?msg.msg_type(),
-                "handle_request_cluster_snapshot reached with a \
-                 non-RequestClusterSnapshot frame; dropping (dispatch bug)"
+                "handle_request_snapshot_stream reached with a \
+                 non-RequestSnapshotStream frame; dropping (dispatch bug)"
             );
             return;
         };
-        // Serialize-once per state generation (#367): the cache inside
-        // `ClusterState` keys the reply bytes on the anti-entropy
-        // digest, so a burst of pulls against an unchanged ledger does
-        // not re-serialize ~100 MB per request.
-        match self.cluster_state.snapshot_json() {
-            Ok(snapshot_json) => {
-                // The shared snapshot-RPC answer (`anti_entropy::
-                // snapshot_reply`): reply typed off the requester's
-                // self-declared role, addressed by its id — resolvable
-                // for a rosterless joiner over its direct leg.
-                let (dst, response) = crate::anti_entropy::snapshot_reply(
-                    &self.config.node_id,
-                    &sender_id,
-                    is_observer,
-                    timestamp_now(),
-                    (*snapshot_json).clone(),
-                );
-                if let Err(e) = self.send_to(dst, response).await {
-                    tracing::warn!(
-                        target = %sender_id,
-                        error = %e,
-                        "failed to deliver ClusterSnapshot response from primary"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target = %sender_id,
-                    error = %e,
-                    "snapshot serialization failed; dropping RequestClusterSnapshot"
-                );
-            }
-        }
+        self.snapshot_streams.accept_request(
+            &self.cluster_state,
+            &sender_id,
+            is_observer,
+            &stream_id,
+            resume_after.as_deref(),
+        );
         // Originate the requester's `PeerJoined` over the canonical
         // local-apply + broadcast path. The joiner declared its own
         // role + capability on the request frame; record that truth in
@@ -153,6 +120,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         .await;
     }
 
+    /// Test hook: synchronously drain every pending snapshot-stream wake
+    /// token, emitting + sending each package — what the operational
+    /// loop's stream arm does one-per-wakeup, compressed for loop-less
+    /// responder tests.
+    #[cfg(test)]
+    pub(crate) async fn drive_snapshot_streams_for_test(&mut self) {
+        while let Some(stream_id) = self.snapshot_streams.try_next_wake() {
+            if let Some((dst, frame)) =
+                self.snapshot_streams
+                    .emit_next(&stream_id, &self.cluster_state, timestamp_now())
+            {
+                let _ = self.send_to(dst, frame).await;
+            }
+        }
+    }
+
     /// Answer a peer's `RequestRunConfig` from this primary's node-local
     /// `forwarded_argv`.
     ///
@@ -160,7 +143,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// is a PURE READ-ONLY responder — it reads `self.forwarded_argv` and
     /// unicasts exactly ONE `RunConfig` back to the requester (its return
     /// address rides `sender_id`, mirroring the snapshot responder's reply
-    /// edge). Unlike `handle_request_cluster_snapshot`, it does NOT
+    /// edge). Unlike `handle_request_snapshot_stream`, it does NOT
     /// originate `PeerJoined`, does NOT send `SecondaryWelcome`, and never
     /// touches roster / quorum / capacity / CRDT: the run-config is a
     /// node-local launch constant, not lattice data, and answering for it
@@ -293,6 +276,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             &sender_id,
             sender_is_observer,
             &requester,
+            &mut self.inbound_snapshots,
             timestamp_now(),
         ) {
             if let Err(e) = self.send_to(destination, request).await {
@@ -427,65 +411,75 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         true
     }
 
-    /// Ingest the anti-entropy `ClusterSnapshot` pull-reply on the
-    /// primary.
+    /// Ingest one anti-entropy `SnapshotStreamPackage` on the primary.
     ///
     /// Single concern: the snapshot-restore edge of the primary's
     /// anti-entropy receive side. [`Self::handle_state_digest`] REQUESTS a
-    /// snapshot whenever a peer's digest proves this node behind (a higher
+    /// stream whenever a peer's digest proves this node behind (a higher
     /// `primary_epoch`, a latched run verdict, missing task terminals, …);
-    /// this arm ingests the reply. Pre-fix the primary's
-    /// `dispatch_message` had NO arm for it — the reply fell through the
-    /// unhandled-type catch-all, so the pull could never converge: a
-    /// DEPOSED primary starved of direct `PrimaryChanged` announcements
-    /// (the dead-leg topology) kept authoring forever even when a peer's
-    /// digest told it the cluster had moved on (the run_20260610_221140
-    /// zombie split-brain).
+    /// this arm ingests each package incrementally. Pre-fix the primary's
+    /// `dispatch_message` had NO arm for the snapshot reply — the reply
+    /// fell through the unhandled-type catch-all, so the pull could never
+    /// converge: a DEPOSED primary starved of direct `PrimaryChanged`
+    /// announcements (the dead-leg topology) kept authoring forever even
+    /// when a peer's digest told it the cluster had moved on (the
+    /// run_20260610_221140 zombie split-brain).
     ///
-    /// `restore` is the idempotent lattice merge: it adopts a
+    /// Each package is a PARTIAL snapshot and `restore` is the idempotent
+    /// lattice merge, so packages interleave safely with live mutation
+    /// broadcasts (no consistent cut needed): the head package adopts a
     /// higher-epoch `(current_primary, primary_epoch)` register (firing
     /// the role-change hooks — the BUG-6 displaced hook is what demotes a
-    /// zombie out of `run_consuming`), latches the sticky
-    /// `run_complete`/`run_aborted` verdicts (the operational loop's
-    /// stand-down check reads the latter), and union-merges every
-    /// snapshot-healable ledger field. Pool/slot coherence for restored
-    /// task terminals is NOT re-derived here wholesale — the live
-    /// convergence seams (`settle_local_state_on_crdt_terminal` via the
-    /// mutation ingest + the inherited-slot terminal veto) cover the
-    /// per-task residue, and a restore that deposes this primary drops
-    /// the whole pipeline anyway.
+    /// zombie out of `run_consuming`) and latches the sticky
+    /// `run_complete`/`run_aborted` verdicts; the task packages
+    /// union-merge the ledger bulk. Pool/slot coherence for restored task
+    /// terminals is NOT re-derived here wholesale — the live convergence
+    /// seams (`settle_local_state_on_crdt_terminal` via the mutation
+    /// ingest + the inherited-slot terminal veto) cover the per-task
+    /// residue, and a restore that deposes this primary drops the whole
+    /// pipeline anyway.
     ///
-    /// Mirrors the secondary's `restore_cluster_snapshot_frame` decode
-    /// shape: a malformed snapshot is WARN-dropped (the next digest round
-    /// re-triggers the pull).
-    pub(crate) fn handle_cluster_snapshot(&mut self, msg: DistributedMessage<I>) {
-        let DistributedMessage::ClusterSnapshot {
-            target: None,
+    /// ANY routing stamp is accepted (the stamp is the ingress-demux
+    /// header, never reply semantics — the same never-drop-on-stamp rule
+    /// as the request handler). A malformed package is WARN-dropped
+    /// WITHOUT advancing the resume cursor, so the next digest round's
+    /// re-pull resumes from before the bad span.
+    pub(crate) fn handle_snapshot_stream_package(&mut self, msg: DistributedMessage<I>) {
+        let DistributedMessage::SnapshotStreamPackage {
+            target: _,
             sender_id,
-            snapshot_json,
+            stream_id,
+            cursor,
+            payload,
+            done,
             ..
         } = msg
         else {
             return;
         };
-        match serde_json::from_str::<crate::cluster_state::ClusterStateSnapshot<I>>(&snapshot_json)
-        {
+        match crate::cluster_state::decode_stream_payload::<I>(&payload) {
             Ok(snap) => {
                 self.cluster_state.restore(snap);
-                tracing::info!(
-                    peer = %sender_id,
-                    primary_epoch = self.cluster_state.primary_epoch(),
-                    run_aborted = self.cluster_state.run_aborted().is_some(),
-                    "anti-entropy: restored ClusterSnapshot pulled from peer"
-                );
+                self.inbound_snapshots
+                    .note_package(&sender_id, &stream_id, cursor.as_deref(), done);
+                if done {
+                    tracing::info!(
+                        peer = %sender_id,
+                        stream_id = %stream_id,
+                        primary_epoch = self.cluster_state.primary_epoch(),
+                        run_aborted = self.cluster_state.run_aborted().is_some(),
+                        "anti-entropy: snapshot stream pulled from peer fully restored"
+                    );
+                }
             }
             Err(e) => {
                 tracing::warn!(
                     peer = %sender_id,
+                    stream_id = %stream_id,
                     error = %e,
-                    "ClusterSnapshot decode failed on the primary's \
-                     anti-entropy sink; dropped a malformed snapshot (the \
-                     next digest round re-triggers the pull)"
+                    "SnapshotStreamPackage decode failed on the primary's \
+                     anti-entropy sink; dropped a malformed package (the \
+                     next digest round re-pulls from the last good cursor)"
                 );
             }
         }

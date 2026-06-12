@@ -50,19 +50,21 @@ pub(super) fn frame_to(
 pub(super) fn sender_of(msg: &DistributedMessage<TestId>) -> &str {
     match msg {
         DistributedMessage::Keepalive { sender_id, .. } => sender_id,
-        DistributedMessage::RequestClusterSnapshot { sender_id, .. } => sender_id,
+        DistributedMessage::RequestSnapshotStream { sender_id, .. } => sender_id,
         other => panic!("unexpected frame: {other:?}"),
     }
 }
 
-/// A `RequestClusterSnapshot` wire frame — the production frame kind of the
+/// A `RequestSnapshotStream` wire frame — the production frame kind of the
 /// anti-entropy-pull addressing spam (a pull directed at an observer typed
 /// `Secondary(self-id)` by a peer with stale role knowledge).
 pub(super) fn snapshot_request_frame(sender: &str) -> DistributedMessage<TestId> {
-    DistributedMessage::RequestClusterSnapshot {
+    DistributedMessage::RequestSnapshotStream {
         target: None,
         sender_id: sender.to_string(),
         timestamp: 1.0,
+        stream_id: format!("{sender}/0"),
+        resume_after: None,
         is_observer: false,
         can_be_primary: true,
     }

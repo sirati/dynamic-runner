@@ -336,12 +336,15 @@ pub enum DistributedMessage<I> {
         sender_id: String,
         timestamp: f64,
     },
-    /// Late-joiner / reconnecting node asks any connected peer for a
-    /// full snapshot of the current `ClusterState`. Any peer can
-    /// respond — state is replicated, so any responder suffices. The
-    /// originator targets a specific peer via the unicast transport;
-    /// no broadcast (one snapshot is enough).
-    RequestClusterSnapshot {
+    /// Late-joiner / reconnecting / behind node asks one peer to STREAM
+    /// it the replicated `ClusterState` as a sequence of bounded
+    /// [`Self::SnapshotStreamPackage`] frames. Any peer can respond —
+    /// state is replicated, so any responder suffices. The originator
+    /// targets a specific peer via the unicast transport; no broadcast.
+    /// Replaces the monolithic request/snapshot frame pair: the answer
+    /// is produced one bounded package per responder-loop wakeup, so a
+    /// 100 MB ledger never serializes (or transmits) as one frame.
+    RequestSnapshotStream {
         /// Mesh routing target (Phase-C C3): the resolved role-bearing
         /// [`Destination`] the egress stamps so the receiving mesh-pump
         /// demuxes the frame to the right local role-slot WITHOUT a
@@ -353,6 +356,24 @@ pub enum DistributedMessage<I> {
         target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
+        /// Requester-minted stream correlation id (unique per pull:
+        /// `<requester-id>/<counter>` — node ids are cluster-unique and
+        /// the counter is per-process, so the pair is unique without an
+        /// RNG, which this deterministic runtime deliberately avoids).
+        /// Every `SnapshotStreamPackage` answering this request carries
+        /// it back, and a RESUME re-request repeats it so a responder
+        /// still holding the stream repositions instead of restarting.
+        stream_id: String,
+        /// Resume cursor: the canonical task key (the sorted-key total
+        /// order every responder shares) up to which the requester has
+        /// already applied packages. `None` asks for the stream from the
+        /// start; `Some(k)` asks for task entries STRICTLY AFTER `k`.
+        /// Any responder can serve a resume — the cursor is a ledger
+        /// key, not a responder-local offset. `#[serde(default)]` keeps
+        /// pre-field senders wire-compatible (decode as `None` — a
+        /// from-the-start stream, the conservative shape).
+        #[serde(default)]
+        resume_after: Option<String>,
         /// The joiner's own role. The snapshot responder is the first
         /// existing member to observe a late-joiner; it broadcasts a
         /// `ClusterMutation::PeerJoined { is_observer }` so every peer
@@ -377,19 +398,25 @@ pub enum DistributedMessage<I> {
         #[serde(default)]
         can_be_primary: bool,
     },
-    /// Response carrying a full `ClusterStateSnapshot` the receiver
-    /// merges into its local mirror via `ClusterState::restore`. The
-    /// CRDT-merge semantics make the merge idempotent, safe under
-    /// concurrent live broadcasts, and resilient to dropped /
-    /// duplicate snapshots.
+    /// One package of a snapshot STREAM answering
+    /// [`Self::RequestSnapshotStream`]: a partial `ClusterStateSnapshot`
+    /// the receiver merges via the ONE idempotent `ClusterState::restore`
+    /// lattice. The stream replaces the monolithic snapshot frame: the
+    /// CRDT join is idempotent / commutative / monotone, so NO consistent
+    /// cut is needed — each package is a valid partial snapshot on its
+    /// own, packages interleave safely with live mutation broadcasts, and
+    /// anything stale behind the stream's cursor converges through
+    /// gossip / anti-entropy.
     ///
-    /// `snapshot_json` carries the snapshot serialized as JSON (the
-    /// same encoding `ClusterStateSnapshot<I>` uses through serde).
-    /// Wire-side erasure of the generic `I` parameter keeps the
-    /// envelope concrete for routing while preserving exact-roundtrip
-    /// semantics on the receiver, which decodes back into
-    /// `ClusterStateSnapshot<I>` once `I` is known in context.
-    ClusterSnapshot {
+    /// `payload` carries the partial snapshot as base64-wrapped CBOR
+    /// (CBOR for compact, escape-free encode/decode; base64 because the
+    /// wire envelope is JSON, which has no raw-bytes representation).
+    /// Wire-side erasure of the generic `I` parameter keeps the envelope
+    /// concrete for routing — the receiver decodes back into
+    /// `ClusterStateSnapshot<I>` once `I` is known in context (the same
+    /// dependency-direction rule the old JSON field followed: this crate
+    /// never names `ClusterStateSnapshot`).
+    SnapshotStreamPackage {
         /// Mesh routing target (Phase-C C3): the resolved role-bearing
         /// [`Destination`] the egress stamps so the receiving mesh-pump
         /// demuxes the frame to the right local role-slot WITHOUT a
@@ -401,7 +428,31 @@ pub enum DistributedMessage<I> {
         target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
-        snapshot_json: String,
+        /// The correlation id of the `RequestSnapshotStream` this package
+        /// answers (requester-minted; see that field's doc).
+        stream_id: String,
+        /// Responder-side package counter within the stream (0-based,
+        /// monotone per send). Diagnostics + done-accounting only — the
+        /// receiver's merge is order-independent (idempotent lattice), so
+        /// a gap never blocks application; the resume cursor rides the
+        /// canonical TASK KEY, not this counter.
+        seq: u64,
+        /// The canonical-order resume cursor AFTER applying this package:
+        /// the highest task key the package carries, stamped by the
+        /// responder so receivers track resume progress WITHOUT decoding
+        /// the opaque payload (the bootstrap collector lives in this
+        /// crate, which must stay free of `ClusterStateSnapshot`).
+        /// `None` for packages carrying no task entries (the small-field
+        /// head / tail packages). A receiver re-requesting an interrupted
+        /// stream echoes its last seen cursor as `resume_after`.
+        cursor: Option<String>,
+        /// Base64-wrapped CBOR of one partial `ClusterStateSnapshot`.
+        payload: String,
+        /// `true` on the stream's final package. A receiver that saw
+        /// `done` has the full snapshot as of the stream's start (modulo
+        /// the documented tail rules); one that never sees it re-requests
+        /// with its resume cursor on the pull cadence.
+        done: bool,
     },
     /// Joining / reconnecting / respawned secondary asks any connected
     /// peer for the cluster-wide run configuration (the consumer's
@@ -451,7 +502,7 @@ pub enum DistributedMessage<I> {
     /// [`StateDigest`] on the convergence cadence; a receiver compares
     /// the carried digest against its own (`StateDigest::is_behind`) and,
     /// when it finds the sender holds ledger data it is missing, pulls a
-    /// full snapshot via the existing `RequestClusterSnapshot` →
+    /// snapshot stream via the existing `RequestSnapshotStream` →
     /// `ClusterSnapshot` → `restore()` path. The digest is the DETECTOR
     /// only — it carries no task payloads (just per-field counts + `u64`
     /// folds) and triggers no merge by itself, so steady-state cost is a
@@ -477,7 +528,7 @@ pub enum DistributedMessage<I> {
         timestamp: f64,
         digest: StateDigest,
         /// The sender's SELF-DECLARED role (the same `is_observer` bit it
-        /// stamps on a `RequestClusterSnapshot`), carried so a peer that
+        /// stamps on a `RequestSnapshotStream`), carried so a peer that
         /// pulls a snapshot FROM this sender (the proven-ahead responder)
         /// types the pull's [`Destination`] off the sender's role —
         /// `Observer(id)` for an observer sender, `Secondary(id)` for a

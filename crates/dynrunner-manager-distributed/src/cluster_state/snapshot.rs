@@ -62,7 +62,7 @@ mod tuple_keyed_map {
 }
 
 /// Serializable snapshot of an entire `ClusterState`. Used by the
-/// snapshot RPC (`RequestClusterSnapshot` → `ClusterSnapshot`) so a
+/// snapshot RPC (`RequestSnapshotStream` → `SnapshotStreamPackage`) so a
 /// late-joining or reconnecting node can bootstrap its replicated
 /// ledger from any peer.
 ///
@@ -411,21 +411,90 @@ fn migrate_unphased_deps<I>(snap: &mut ClusterStateSnapshot<I>) {
     }
 }
 
+impl<I> Default for ClusterStateSnapshot<I> {
+    /// The EMPTY partial snapshot — every field at its merge-neutral
+    /// value, so `restore()` of a default is a complete no-op. The
+    /// snapshot STREAM builds its partials from this base (a task-batch
+    /// package is `default + tasks + task_outputs`; the tail package is
+    /// `default + phase_event_tallies`), which is exactly why each
+    /// package can route through the ONE `restore` lattice unchanged.
+    /// Hand-written (not derived) so no spurious `I: Default` bound is
+    /// added — every field is a container/latch whose `Default` is
+    /// `I`-independent.
+    fn default() -> Self {
+        Self {
+            tasks: HashMap::new(),
+            current_primary: None,
+            primary_epoch: 0,
+            phase_deps: HashMap::new(),
+            phase_may_be_empty: HashSet::new(),
+            capabilities: HashMap::new(),
+            peer_holdings: HashMap::new(),
+            task_outputs: HashMap::new(),
+            secondary_capacities: HashMap::new(),
+            alive_members: HashSet::new(),
+            member_generations: HashMap::new(),
+            run_complete: false,
+            run_aborted: None,
+            graceful_abort_requested: false,
+            discovery_debt: DiscoveryDebt::default(),
+            phase_event_tallies: HashMap::new(),
+            retry_passes_used: HashMap::new(),
+            unfulfillable_reinject_used: HashMap::new(),
+            respawn_events: HashMap::new(),
+            respawn_policy: None,
+            phases_ended: HashSet::new(),
+            custom_messages: HashMap::new(),
+            custom_terminal_watermarks: HashMap::new(),
+        }
+    }
+}
+
 impl<I: Identifier> ClusterState<I> {
     /// Take a snapshot of the whole state. The snapshot is a deep
     /// clone — applying further mutations to `self` after this call
-    /// does not affect the returned snapshot. Used as the response
-    /// payload to `RequestClusterSnapshot`.
+    /// does not affect the returned snapshot. Composed from the stream
+    /// partitions (head ∪ task entries ∪ tail) so the field
+    /// classification lives ONCE, in [`Self::stream_head`]'s exhaustive
+    /// destructure. Used by the snapshot-stream plan's full-equality
+    /// tests and any in-memory capture; the WIRE transfer is the
+    /// package stream (see `cluster_state::stream`), never one
+    /// monolithic serialization of this value.
     pub fn snapshot(&self) -> ClusterStateSnapshot<I> {
+        let mut snap = self.stream_head();
+        snap.tasks = self.tasks.clone();
+        snap.task_outputs = self.task_outputs.clone();
+        snap.phase_event_tallies = self.phase_event_tallies.clone();
+        snap
+    }
+
+    /// The HEAD partition of the snapshot stream: every replicated
+    /// field EXCEPT the three the stream carries separately —
+    /// `tasks` + `task_outputs` (the O(ledger) bulk, shipped as
+    /// byte-bounded task-batch packages in canonical sorted-key order)
+    /// and `phase_event_tallies` (the join-BUMPED grow-max map, shipped
+    /// in the TAIL package: the #358 states-before-fields order rule
+    /// holds per-STREAM too — a tally import must never precede the
+    /// task states whose events it counts, see
+    /// `cluster_state::stream`).
+    ///
+    /// Shipped FIRST so a joiner learns the control-plane facts
+    /// (current primary, membership, run latches, capabilities) before
+    /// the bulk transfer runs.
+    pub(crate) fn stream_head(&self) -> ClusterStateSnapshot<I> {
         // Exhaustive destructure (NO `..` rest pattern) — the structural
         // completeness guard. Every `ClusterState` field is NAMED here,
         // so adding a future field is a COMPILE ERROR at this site until
-        // the developer explicitly classifies it transfer-vs-node-local.
-        // This is the only mechanism that catches a silently-omitted
-        // replicated field (the bug this exists to prevent).
+        // the developer explicitly classifies it head / task-batch /
+        // tail / node-local. This is the only mechanism that catches a
+        // silently-omitted replicated field (the bug this exists to
+        // prevent); `snapshot()` composes from this same site, so the
+        // full capture and the stream partitions can never diverge.
         let ClusterState {
-            // ── replicated (transferred) ──
-            tasks,
+            // ── task-batch partition: carried by the stream's task
+            // packages (and re-attached by `snapshot()`); NOT part of
+            // the head ──
+            tasks: _tasks,
             current_primary,
             primary_epoch,
             phase_deps,
@@ -438,10 +507,18 @@ impl<I: Identifier> ClusterState<I> {
             peer_state,
             capabilities,
             peer_holdings,
-            task_outputs,
+            // ── task-batch partition: each task's keyed outputs ride in
+            // the SAME package as the task (the restore join reads the
+            // co-present entry) ──
+            task_outputs: _task_outputs,
             secondary_capacities,
-            // Replicated grow-only-MAX maps (F4 + P3).
-            phase_event_tallies,
+            // ── tail partition: the join-BUMPED grow-max map (F4) must
+            // arrive AFTER every task state it counts (#358 order rule
+            // projected onto the stream) ──
+            phase_event_tallies: _phase_event_tallies,
+            // Replicated grow-only-MAX maps (P3) — NOT join-bumped
+            // (originator-API-only writers), so import order vs the task
+            // merge is free and they ride the head.
             retry_passes_used,
             unfulfillable_reinject_used,
             // Replicated grow-only SET (F7).
@@ -470,10 +547,6 @@ impl<I: Identifier> ClusterState<I> {
             // part of the converged ledger (each replica mints its own on
             // origination; a restoring replica cold-starts it).
             task_seq: _task_seq,
-            // node-local: the serialize-once snapshot-JSON cache is a pure
-            // derivation of the replicated fields (keyed on the digest), so
-            // it carries no signal of its own.
-            snapshot_json_cache: _snapshot_json_cache,
             // node-local: the dead-rejoin WARN throttle is a per-node log
             // gate (#416) — each replica throttles its own log stream, so
             // it never crosses the wire.
@@ -481,13 +554,15 @@ impl<I: Identifier> ClusterState<I> {
             // node-local: the digest memo + its fold counter are pure
             // derivations of the replicated fields (the memo IS the digest
             // of this very snapshot's content), so they carry no signal of
-            // their own and never cross the wire — same classification as
-            // `snapshot_json_cache`.
+            // their own and never cross the wire.
             digest_cache: _digest_cache,
             digest_fold_count: _digest_fold_count,
         } = self;
         ClusterStateSnapshot {
-            tasks: tasks.clone(),
+            // Task-batch partition — empty in the head; the stream's
+            // task packages carry the entries (and `snapshot()`
+            // re-attaches the full maps for in-memory captures).
+            tasks: HashMap::new(),
             current_primary: current_primary.clone(),
             primary_epoch: *primary_epoch,
             phase_deps: phase_deps.clone(),
@@ -505,10 +580,10 @@ impl<I: Identifier> ClusterState<I> {
             // contract as `observers` (replaced on restore when
             // local is empty, otherwise kept).
             peer_holdings: peer_holdings.clone(),
-            // Replicated keyed-output cache — carried so a late-joiner
-            // can resolve a dependent's predecessor outputs without
-            // waiting for the prereq's `TaskCompleted` to retransmit.
-            task_outputs: task_outputs.clone(),
+            // Task-batch partition — empty in the head; each output
+            // entry rides the SAME task package as its task so the
+            // restore join reads the co-present entry.
+            task_outputs: HashMap::new(),
             // Per-secondary static capacity — carried so a freshly-
             // promoted primary and late-joining observers reconstruct
             // the full worker roster on snapshot-restore.
@@ -543,10 +618,13 @@ impl<I: Identifier> ClusterState<I> {
             // primary inherits "discovery already settled" and does NOT
             // re-run discovery on failover.
             discovery_debt: *discovery_debt,
-            // Replicated grow-only-MAX maps (F4 + P3) — carried so a
-            // promoted primary inherits the per-phase event tallies and the
-            // retry / reinject used-budgets via max-merge on restore.
-            phase_event_tallies: phase_event_tallies.clone(),
+            // Tail partition — empty in the head: the join-bumped F4
+            // tally map must arrive AFTER every task state it counts
+            // (#358 order rule projected onto the stream).
+            phase_event_tallies: HashMap::new(),
+            // Replicated grow-only-MAX maps (P3) — carried so a promoted
+            // primary inherits the retry / reinject used-budgets via
+            // max-merge on restore. NOT join-bumped, so head-safe.
             retry_passes_used: retry_passes_used.clone(),
             unfulfillable_reinject_used: unfulfillable_reinject_used.clone(),
             // Replicated grow-only SET (F7) — carried so a promoted primary
@@ -567,58 +645,6 @@ impl<I: Identifier> ClusterState<I> {
             custom_messages: custom_messages.clone(),
             custom_terminal_watermarks: custom_terminal_watermarks.clone(),
         }
-    }
-
-    /// The snapshot-RPC reply payload, serialized ONCE per state
-    /// generation (#367's CPU half — the serialize-drop loop): returns
-    /// the cached JSON when the current anti-entropy [`digest`]
-    /// (re-derived from live state on EVERY call) matches the digest
-    /// the cache was serialized under, and re-snapshots + re-serializes
-    /// otherwise. ALL snapshot responders (primary, secondary,
-    /// observer) read this one method, so a burst of digest-driven
-    /// pulls / late-joiner requests against an unchanged ledger costs
-    /// one O(tasks) digest fold each instead of one ~100 MB
-    /// serialization each (the production 67k-task ledger:
-    /// ~1.5 KB/task ⇒ ~100 MB per serialization, ~6800 repetitions in
-    /// run_20260611_115429).
-    ///
-    /// Correctness of the digest key: the digest covers every
-    /// SNAPSHOT-HEALABLE replicated field (the structural-completeness
-    /// guards on both projections pin the classification), so any
-    /// divergence a peer can detect — and therefore any pull this
-    /// reply must heal — invalidates the cache. The snapshot fields
-    /// the digest deliberately excludes (`alive_members` /
-    /// `member_generations` project the honest-liveness `peer_state`;
-    /// `peer_holdings` is best-effort steady-state metadata;
-    /// `phase_may_be_empty` co-converges with `phase_deps`) can be
-    /// stale in a cached reply ONLY between two digest-covered
-    /// changes; their merge rules (first-bootstrap-adopt /
-    /// generation-gated insert) tolerate any older snapshot, and their
-    /// steady-state writers are the LIVE broadcast paths, so a
-    /// slightly-stale value never wedges convergence — the next
-    /// digest-covered change refreshes the cache anyway.
-    ///
-    /// [`digest`]: Self::digest
-    pub fn snapshot_json(&mut self) -> Result<std::sync::Arc<String>, String> {
-        let digest = self.digest();
-        if let Some((cached_digest, json)) = &self.snapshot_json_cache
-            && *cached_digest == digest
-        {
-            tracing::debug!(
-                snapshot_bytes = json.len(),
-                "snapshot-RPC reply served from the serialize-once cache"
-            );
-            return Ok(std::sync::Arc::clone(json));
-        }
-        let json = serde_json::to_string(&self.snapshot()).map_err(|e| e.to_string())?;
-        let json = std::sync::Arc::new(json);
-        tracing::debug!(
-            snapshot_bytes = json.len(),
-            tasks = self.tasks.len(),
-            "snapshot-RPC reply serialized (cache refreshed for this state generation)"
-        );
-        self.snapshot_json_cache = Some((digest, std::sync::Arc::clone(&json)));
-        Ok(json)
     }
 
     /// Merge a snapshot into local state per the CRDT lattice

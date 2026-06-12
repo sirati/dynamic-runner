@@ -839,6 +839,16 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// happens-before constraint) live in `cluster_state.rs`.
     pub(super) cluster_state: ClusterState<I>,
 
+    /// Outbound snapshot-stream driver: serves `RequestSnapshotStream`
+    /// pulls (late joiners, behind peers) one bounded package per
+    /// operational-loop wakeup — see `crate::snapshot_stream`. The
+    /// loop's wake arm drains it; the request handler feeds it.
+    pub(super) snapshot_streams: crate::snapshot_stream::SnapshotStreamResponder,
+    /// Inbound snapshot-stream progress (per responder): lets this
+    /// node's own anti-entropy pulls RESUME an interrupted stream
+    /// (same stream id + cursor) instead of re-pulling from scratch.
+    pub(super) inbound_snapshots: crate::snapshot_stream::InboundSnapshotStreams,
+
     /// Cross-thread / cross-runtime ingress for the
     /// `PrimaryHandle` PyO3 surface. Each handler sits alongside
     /// the coordinator's per-mutation semantics; the receiver
@@ -1435,6 +1445,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 .keepalive_interval
                 .saturating_mul(config.silence_hard_multiple),
         );
+        let snapshot_streams = crate::snapshot_stream::SnapshotStreamResponder::new(&config.node_id);
+        let inbound_snapshots = crate::snapshot_stream::InboundSnapshotStreams::new(&config.node_id);
         let mut this = Self {
             config,
             client,
@@ -1483,6 +1495,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             primary_id: None,
             pending_stage_files: Vec::new(),
             cluster_state: ClusterState::new(),
+            snapshot_streams,
+            inbound_snapshots,
             command_rx: Some(command_rx),
             command_tx,
             lifecycle_rx: Some(lifecycle_rx),

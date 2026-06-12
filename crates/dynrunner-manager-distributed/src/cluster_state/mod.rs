@@ -43,6 +43,7 @@ mod grow_max;
 mod merge;
 mod snapshot;
 mod state;
+mod stream;
 mod types;
 
 // Re-export the public-facing value types and the `ClusterState`
@@ -56,6 +57,11 @@ mod types;
 pub(crate) use broadcast::{AppliedBatch, apply_locally_for_broadcast};
 pub use snapshot::ClusterStateSnapshot;
 pub use state::ClusterState;
+// Snapshot-stream partition policy + payload codec: the plan iterates a
+// ledger as bounded partial-snapshot packages; the codec is the ONE
+// encode/decode pair every responder, receiver, and test uses (pyo3's
+// late-joiner bootstrap decodes through it too).
+pub use stream::{SnapshotStreamPlan, StreamPackage, decode_stream_payload, encode_stream_payload};
 pub use types::{
     ApplyOutcome, CapabilityEntry, CustomMsgState, OutcomeSummary, PeerMembership,
     PeerReadmission, PhaseRollup, PhaseTally, PhaseTaskPartition, ReplicatedRespawnPolicy,

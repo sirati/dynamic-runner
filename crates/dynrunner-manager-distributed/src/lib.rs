@@ -1,5 +1,6 @@
 pub mod anti_entropy;
 pub mod cluster_state;
+pub mod snapshot_stream;
 pub mod discovery;
 pub mod fulfillability_matcher;
 pub mod graceful_abort_trigger;

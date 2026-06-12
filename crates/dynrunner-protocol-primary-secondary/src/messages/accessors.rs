@@ -27,8 +27,8 @@ impl<I> DistributedMessage<I> {
             | Self::TaskAssignment { target, .. }
             | Self::TransferComplete { target, .. }
             | Self::StageFile { target, .. }
-            | Self::RequestClusterSnapshot { target, .. }
-            | Self::ClusterSnapshot { target, .. }
+            | Self::RequestSnapshotStream { target, .. }
+            | Self::SnapshotStreamPackage { target, .. }
             | Self::RequestRunConfig { target, .. }
             | Self::RunConfig { target, .. }
             | Self::StateDigest { target, .. }
@@ -76,8 +76,8 @@ impl<I> DistributedMessage<I> {
             | Self::TaskAssignment { target, .. }
             | Self::TransferComplete { target, .. }
             | Self::StageFile { target, .. }
-            | Self::RequestClusterSnapshot { target, .. }
-            | Self::ClusterSnapshot { target, .. }
+            | Self::RequestSnapshotStream { target, .. }
+            | Self::SnapshotStreamPackage { target, .. }
             | Self::RequestRunConfig { target, .. }
             | Self::RunConfig { target, .. }
             | Self::StateDigest { target, .. }
@@ -139,8 +139,8 @@ impl<I> DistributedMessage<I> {
             | Self::TaskAssignment { target, .. }
             | Self::TransferComplete { target, .. }
             | Self::StageFile { target, .. }
-            | Self::RequestClusterSnapshot { target, .. }
-            | Self::ClusterSnapshot { target, .. }
+            | Self::RequestSnapshotStream { target, .. }
+            | Self::SnapshotStreamPackage { target, .. }
             | Self::RequestRunConfig { target, .. }
             | Self::RunConfig { target, .. }
             | Self::StateDigest { target, .. }
@@ -183,8 +183,8 @@ impl<I> DistributedMessage<I> {
             | Self::TaskAssignment { sender_id, .. }
             | Self::TransferComplete { sender_id, .. }
             | Self::StageFile { sender_id, .. }
-            | Self::RequestClusterSnapshot { sender_id, .. }
-            | Self::ClusterSnapshot { sender_id, .. }
+            | Self::RequestSnapshotStream { sender_id, .. }
+            | Self::SnapshotStreamPackage { sender_id, .. }
             | Self::RequestRunConfig { sender_id, .. }
             | Self::RunConfig { sender_id, .. }
             | Self::StateDigest { sender_id, .. }
@@ -226,8 +226,8 @@ impl<I> DistributedMessage<I> {
             | Self::TaskAssignment { timestamp, .. }
             | Self::TransferComplete { timestamp, .. }
             | Self::StageFile { timestamp, .. }
-            | Self::RequestClusterSnapshot { timestamp, .. }
-            | Self::ClusterSnapshot { timestamp, .. }
+            | Self::RequestSnapshotStream { timestamp, .. }
+            | Self::SnapshotStreamPackage { timestamp, .. }
             | Self::RequestRunConfig { timestamp, .. }
             | Self::RunConfig { timestamp, .. }
             | Self::StateDigest { timestamp, .. }
@@ -429,10 +429,14 @@ impl<I> DistributedMessage<I> {
     /// (#364/#366: the wire cap on consumer payloads —
     /// `TaskComplete.result_data`, `CustomMessage.data` — is a
     /// contract, not a transport shortcoming; chunking them would
-    /// silently relax it). `ClusterSnapshot` is the first and only
-    /// member: its size grows with the replicated ledger (67k tasks ≈
-    /// 100 MB in production), it is framework-internal, and dropping it
-    /// starves anti-entropy / rejoin / promotion-hydrate fleet-wide.
+    /// silently relax it). `SnapshotStreamPackage` is the only member:
+    /// packages are bounded by construction (~2 MiB target), but the
+    /// bound is a soft target — a single oversized task entry rides a
+    /// package alone — so eligibility keeps the wire-cap safety net on
+    /// the framework-internal snapshot path without relaxing any
+    /// consumer-payload contract. (Its monolithic predecessor,
+    /// `ClusterSnapshot`, grew with the whole ledger and was the frame
+    /// this mechanism was built for.)
     /// A `Relay` envelope is eligible iff its INNER frame is, so an
     /// indirect (forwarded) snapshot transfer chunks hop-by-hop exactly
     /// like a direct one.
@@ -443,7 +447,7 @@ impl<I> DistributedMessage<I> {
     /// cannot smuggle a consumer payload past the cap through chunks).
     pub fn chunk_eligible(&self) -> bool {
         match self {
-            Self::ClusterSnapshot { .. } => true,
+            Self::SnapshotStreamPackage { .. } => true,
             Self::Relay { inner, .. } => inner.chunk_eligible(),
             _ => false,
         }
@@ -460,8 +464,8 @@ impl<I> DistributedMessage<I> {
             Self::TaskAssignment { .. } => MessageType::TaskAssignment,
             Self::TransferComplete { .. } => MessageType::TransferComplete,
             Self::StageFile { .. } => MessageType::StageFile,
-            Self::RequestClusterSnapshot { .. } => MessageType::RequestClusterSnapshot,
-            Self::ClusterSnapshot { .. } => MessageType::ClusterSnapshot,
+            Self::RequestSnapshotStream { .. } => MessageType::RequestSnapshotStream,
+            Self::SnapshotStreamPackage { .. } => MessageType::SnapshotStreamPackage,
             Self::RequestRunConfig { .. } => MessageType::RequestRunConfig,
             Self::RunConfig { .. } => MessageType::RunConfig,
             Self::StateDigest { .. } => MessageType::StateDigest,

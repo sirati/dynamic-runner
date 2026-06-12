@@ -185,7 +185,7 @@ where
     /// THE GATE — single source. "This frame proves the current primary is
     /// alive" is true iff its origin is the current primary; a frame from any
     /// OTHER mesh member (a peer secondary's anti-entropy `StateDigest`, the
-    /// submitter's `RequestClusterSnapshot` / `RequestRunConfig`, a relayed
+    /// submitter's `RequestSnapshotStream` / `RequestRunConfig`, a relayed
     /// `ClusterMutation`) is NOT a primary-liveness signal and must NEVER
     /// reset the election. Pre-fix, the operational dispatch path called the
     /// un-gated [`Self::record_primary_message`] for EVERY inbound frame — a

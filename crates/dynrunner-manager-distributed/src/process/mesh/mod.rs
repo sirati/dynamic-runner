@@ -59,7 +59,7 @@ use role_holder::RoleHolderView;
 /// system). An ingress frame fanned in that window would reach nobody and
 /// vanish silently; instead it is HELD here and replayed the instant the next
 /// slot registers. The window is short and the at-risk frames are sparse
-/// control frames (e.g. `RequestClusterSnapshot`), so a small ring suffices;
+/// control frames (e.g. `RequestSnapshotStream`), so a small ring suffices;
 /// overflow drops the OLDEST with a WARN naming kind/target, never silently.
 pub(crate) const SLOTLESS_HOLD_CAPACITY: usize = 64;
 

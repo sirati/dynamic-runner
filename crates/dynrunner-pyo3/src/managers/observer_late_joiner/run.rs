@@ -210,11 +210,12 @@ impl PyObserverLateJoiner {
                         //    The bootstrap rendezvous runs there too — it is
                         //    transport IO: hand the seed list to the trait
                         //    default impl, which sequences the dial +
-                        //    snapshot request + reply wait; only the
-                        //    `Send` snapshot JSONs cross back. Errors get
-                        //    typed strings; we PyErr them with the snapshot
-                        //    JSON context so the operator can correlate. The
-                        //    construct closure never touches Python.
+                        //    snapshot request + reply wait; only the `Send`
+                        //    bootstrap payloads (opaque partial-snapshot
+                        //    packages + the buffered live gossip) cross
+                        //    back. Errors get typed strings; we PyErr them
+                        //    so the operator can correlate. The construct
+                        //    closure never touches Python.
                         // `is_observer = true`: this late-joiner is a strict
                         // observer. The flag rides the snapshot RPC so the
                         // responder records the joiner's ACTUAL role in the
@@ -239,7 +240,7 @@ impl PyObserverLateJoiner {
                         // seed was acquired.
                         super::bootstrap_narration::waiting_for_crdt(DEFAULT_JOIN_TIMEOUT);
                         let observer_id_for_mesh = observer_id.clone();
-                        let (mesh_host, snapshot_jsons) =
+                        let (mesh_host, bootstrap) =
                             MeshHost::<RunnerIdentifier>::on_dedicated_thread(
                                 move || async move {
                                     let mut peer_network = transport_factory::observer_mesh::<
@@ -248,7 +249,7 @@ impl PyObserverLateJoiner {
                                         &observer_id_for_mesh
                                     )
                                     .await?;
-                                    let snapshot_jsons = peer_network
+                                    let bootstrap = peer_network
                                         .join_running_cluster(
                                             &seed,
                                             DEFAULT_JOIN_TIMEOUT,
@@ -268,7 +269,7 @@ impl PyObserverLateJoiner {
                                     if let Some(tx) = dial_failure_tx {
                                         peer_network.notify_persistent_dial_failures(tx);
                                     }
-                                    Ok((peer_network, snapshot_jsons))
+                                    Ok((peer_network, bootstrap))
                                 },
                             )
                             .await
@@ -278,20 +279,22 @@ impl PyObserverLateJoiner {
                                 ))
                             })?;
 
-                        // 3. Decode each snapshot. The wire frame is a String
-                        //    (the protocol crate keeps `I` erased there); we
-                        //    materialise each back into the typed snapshot here.
-                        //    A bootstrap-decode failure is FATAL (the `?`
-                        //    propagates) — the observer requested these snapshots
+                        // 3. Decode each stream-package payload. The wire
+                        //    payload is an opaque String (the protocol crate
+                        //    keeps `I` erased there); we materialise each back
+                        //    into a typed PARTIAL snapshot here. A
+                        //    bootstrap-decode failure is FATAL (the `?`
+                        //    propagates) — the observer requested the stream
                         //    precisely to populate its CRDT, so a malformed
-                        //    bootstrap reply must not be swallowed (continuing on
-                        //    an empty CRDT would report a lie). This is the
+                        //    bootstrap payload must not be swallowed (continuing
+                        //    on an empty CRDT would report a lie). This is the
                         //    BOOTSTRAP discriminator arm — the steady-state decode
                         //    is WARN-and-keep (the AE-3 cadence re-pulls). The
                         //    cold-join factory `restore()`s each — the lattice
-                        //    unions them.
+                        //    unions the partials — then applies the live gossip
+                        //    buffered during the window.
                         let snaps: Vec<ClusterStateSnapshot<RunnerIdentifier>> =
-                            decode_bootstrap_snapshots(&snapshot_jsons)?;
+                            decode_bootstrap_snapshots(&bootstrap.payloads)?;
 
                         // Milestone 3b (LLM-wake): narrate the snapshot the
                         // join landed. `join_running_cluster` fans to every
@@ -375,6 +378,7 @@ impl PyObserverLateJoiner {
                             ClusterState::<RunnerIdentifier>::new(),
                             config,
                             snaps,
+                            bootstrap.live_frames,
                             holdings,
                         );
                         // 6b. Hand the entry-armed SIGUSR2 trigger to the

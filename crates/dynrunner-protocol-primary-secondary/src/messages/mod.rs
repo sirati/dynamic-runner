@@ -26,7 +26,7 @@ pub use state_digest::StateDigest;
 
 /// Unix-epoch wall-clock seconds for use as a wire-frame `timestamp`
 /// field. Single source for envelope construction inside this crate
-/// (e.g. the `RequestClusterSnapshot` envelope built by
+/// (e.g. the `RequestSnapshotStream` envelope built by
 /// `PeerTransport::join_running_cluster`).
 ///
 /// Manager-side `wire.rs` helpers (`secondary/wire.rs`,

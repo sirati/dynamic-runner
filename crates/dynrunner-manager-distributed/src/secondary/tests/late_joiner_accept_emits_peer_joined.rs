@@ -76,17 +76,19 @@ async fn observer_late_joiner_accept_emits_peer_joined_observer_true() {
             );
 
             // The joiner DECLARES its role on the request frame.
-            let req = DistributedMessage::RequestClusterSnapshot {
+            let req = DistributedMessage::RequestSnapshotStream {
                 target: None,
                 sender_id: "late-observer-1".into(),
                 timestamp: 0.0,
+                stream_id: "late-observer-1/0".into(),
+                resume_after: None,
                 is_observer: true,
                 // An observer is never primary-capable.
                 can_be_primary: false,
             };
             sec.dispatch_message(req, &mut FakeWorkerFactory)
                 .await
-                .expect("RequestClusterSnapshot handler succeeds");
+                .expect("RequestSnapshotStream handler succeeds");
             // Flush the queued PeerJoined broadcast / snapshot reply onto the
             // RecordingPeer log (MeshClient::send is queued).
             sec.drain_egress().await;
@@ -106,7 +108,7 @@ async fn observer_late_joiner_accept_emits_peer_joined_observer_true() {
             // The mutation broadcast over the peer mesh carries the
             // joiner's TRUE role.
             let observed = find_peer_joined(&peer_log).expect(
-                "RequestClusterSnapshot accept must originate one \
+                "RequestSnapshotStream accept must originate one \
                  PeerJoined mutation on the peer bus",
             );
             assert_eq!(
@@ -134,10 +136,12 @@ async fn worker_late_joiner_accept_emits_peer_joined_observer_false() {
             let (mut sec, _pri_rx, peer_log) = make_secondary_with_recording_peer("responder");
             sec.enter_operational_for_test();
 
-            let req = DistributedMessage::RequestClusterSnapshot {
+            let req = DistributedMessage::RequestSnapshotStream {
                 target: None,
                 sender_id: "late-worker-1".into(),
                 timestamp: 0.0,
+                stream_id: "late-worker-1/0".into(),
+                resume_after: None,
                 is_observer: false,
                 // A re-bootstrapping compute worker declares it can host the
                 // primary on demand; the relay must carry that truth.
@@ -145,7 +149,7 @@ async fn worker_late_joiner_accept_emits_peer_joined_observer_false() {
             };
             sec.dispatch_message(req, &mut FakeWorkerFactory)
                 .await
-                .expect("RequestClusterSnapshot handler succeeds");
+                .expect("RequestSnapshotStream handler succeeds");
             // Flush the queued PeerJoined broadcast / snapshot reply onto the
             // RecordingPeer log (MeshClient::send is queued).
             sec.drain_egress().await;
@@ -163,7 +167,7 @@ async fn worker_late_joiner_accept_emits_peer_joined_observer_false() {
 
             // The broadcast PeerJoined carries is_observer=false.
             let observed = find_peer_joined(&peer_log).expect(
-                "RequestClusterSnapshot accept must originate one \
+                "RequestSnapshotStream accept must originate one \
                  PeerJoined mutation on the peer bus",
             );
             assert_eq!(

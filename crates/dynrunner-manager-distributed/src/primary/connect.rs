@@ -367,13 +367,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             MessageType::ClusterMutation => self.handle_cluster_mutation(msg, command_rx).await,
             // Snapshot-RPC responder. A late-joiner / re-bootstrapping
             // peer (or a recovering observer) unicasts
-            // `RequestClusterSnapshot` to `Destination::Primary`; the
+            // `RequestSnapshotStream` to `Destination::Primary`; the
             // primary's `cluster_state` is the authoritative copy, so its
-            // snapshot is the strongest bootstrap payload. Pre-fix only
-            // the secondary router answered this — a request addressed at
-            // the primary fell through the catch-all and timed out. See
-            // `handle_request_cluster_snapshot`.
-            MessageType::RequestClusterSnapshot => self.handle_request_cluster_snapshot(msg).await,
+            // stream is the strongest bootstrap source. The handler only
+            // REGISTERS the stream; the operational loop's stream arm
+            // produces one bounded package per wakeup. See
+            // `handle_request_snapshot_stream`.
+            MessageType::RequestSnapshotStream => self.handle_request_snapshot_stream(msg).await,
             // Run-config-RPC responder. A joining / respawned peer (or one
             // re-fetching after promotion) unicasts `RequestRunConfig`; the
             // primary answers from its node-local `forwarded_argv`. PURE
@@ -385,12 +385,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // only if it is somehow behind (almost always a NoOp on the
             // authoritative primary). See `handle_state_digest`.
             MessageType::StateDigest => self.handle_state_digest(msg).await,
-            // Anti-entropy pull-reply arm. The snapshot this primary's own
-            // `handle_state_digest` requested from a proven-ahead peer.
-            // Pre-fix this fell through the catch-all and the pull never
-            // converged — the deposed-zombie starvation (see
-            // `handle_cluster_snapshot`).
-            MessageType::ClusterSnapshot => self.handle_cluster_snapshot(msg),
+            // Anti-entropy pull-reply arm. One package of the stream this
+            // primary's own `handle_state_digest` requested from a
+            // proven-ahead peer. Pre-fix this fell through the catch-all
+            // and the pull never converged — the deposed-zombie
+            // starvation (see `handle_snapshot_stream_package`).
+            MessageType::SnapshotStreamPackage => self.handle_snapshot_stream_package(msg),
             other => {
                 tracing::debug!(?other, "unhandled message type");
             }

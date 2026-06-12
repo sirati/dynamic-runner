@@ -10,7 +10,7 @@
 //! keeps broadcasting its anti-entropy `StateDigest` every ~20s — the
 //! digest carries `primary_epoch` + `current_primary`, so a pull-and-
 //! restore would heal the missed announcement — but a secondary wedged in
-//! `wait_for_setup` used to drop `StateDigest` / `ClusterSnapshot` frames
+//! `wait_for_setup` used to drop `StateDigest` / snapshot-reply frames
 //! in the silent `other =>` arm, so the heal was structurally unreachable
 //! pre-`Operational`: nobody ever promoted and the fleet idled forever.
 //!
@@ -31,7 +31,7 @@
 //!   down cleanly through the loop-head terminal check.
 //!
 //! REVERT-CHECK: pre-fix both tests time out — the digest frames land in
-//! `wait_for_setup`'s drop arm, no `RequestClusterSnapshot` is ever sent,
+//! `wait_for_setup`'s drop arm, no `RequestSnapshotStream` is ever sent,
 //! no promotion fires, and the secondary sits in the trio-wait exactly
 //! like the production fleet.
 
@@ -53,7 +53,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 /// deliberately NEVER delivered (the lost wire frame). From then on it
 /// behaves exactly like the standalone observer the submitter swaps into:
 /// it broadcasts its (ahead) anti-entropy `StateDigest` and answers
-/// `RequestClusterSnapshot` pulls with its converged snapshot.
+/// `RequestSnapshotStream` pulls with its converged snapshot stream.
 ///
 /// `digest_rounds` is the scripted sequence of donor states: each entry is
 /// digested + broadcast, then ONE snapshot pull is answered from it before
@@ -107,17 +107,12 @@ async fn fake_relocated_observer(
         loop {
             match from_secondary.recv().await {
                 Some(msg) => {
-                    if let MessageType::RequestClusterSnapshot = msg.msg_type() {
-                        let snapshot_json = serde_json::to_string(&donor.snapshot())
-                            .expect("donor snapshot serializes");
-                        to_secondary
-                            .send(DistributedMessage::ClusterSnapshot {
-                                target: None,
-                                sender_id: "setup".into(),
-                                timestamp: 0.0,
-                                snapshot_json,
-                            })
-                            .unwrap();
+                    if let DistributedMessage::RequestSnapshotStream { stream_id, .. } = msg {
+                        for reply in crate::snapshot_stream::stream_frames_for_test(
+                            &donor, "setup", &stream_id,
+                        ) {
+                            to_secondary.send(reply).unwrap();
+                        }
                         break;
                     }
                 }
@@ -226,7 +221,7 @@ async fn lost_relocation_announcement_heals_via_setup_anti_entropy() {
                 _ = tokio::time::sleep(Duration::from_secs(10)) => {
                     panic!(
                         "LEADERLESS WEDGE (the production shape): the observer's \
-                         StateDigest/ClusterSnapshot heal never fired the \
+                         StateDigest/snapshot-stream heal never fired the \
                          PromotionSignal — setup-wait dropped the anti-entropy frames"
                     );
                 }
@@ -538,17 +533,12 @@ async fn registration_gated_observer(
         loop {
             match from_secondary.recv().await {
                 Some(msg) => {
-                    if let MessageType::RequestClusterSnapshot = msg.msg_type() {
-                        let snapshot_json = serde_json::to_string(&donor.snapshot())
-                            .expect("donor snapshot serializes");
-                        to_secondary
-                            .send(DistributedMessage::ClusterSnapshot {
-                                target: None,
-                                sender_id: "setup".into(),
-                                timestamp: 0.0,
-                                snapshot_json,
-                            })
-                            .unwrap();
+                    if let DistributedMessage::RequestSnapshotStream { stream_id, .. } = msg {
+                        for reply in crate::snapshot_stream::stream_frames_for_test(
+                            &donor, "setup", &stream_id,
+                        ) {
+                            to_secondary.send(reply).unwrap();
+                        }
                         break;
                     }
                 }
@@ -645,14 +635,43 @@ async fn snapshot_restore_runs_the_primary_identity_seam() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            use super::super::test_helpers::{election_config, make_secondary_recording};
+            use super::super::test_helpers::{
+                RecordingPeer, SecondaryHarness, election_config, make_secondary_recording,
+            };
 
-            // Self-named heal → promotion fires once, idempotent on re-restore.
+            // Self-named heal → promotion fires once, idempotent on
+            // re-restore. The heal arrives as the package stream a
+            // production responder would emit.
             let (mut sec, _log) = make_secondary_recording(election_config("worker-a"), 1);
             let donor = donor_with_primary("worker-a");
-            let json = serde_json::to_string(&donor.snapshot()).unwrap();
+            let frames = crate::snapshot_stream::stream_frames_for_test(&donor, "setup", "wa/0");
+            let restore_all = |sec: &mut SecondaryHarness<RecordingPeer<TestId>>,
+                               frames: &[DistributedMessage<TestId>]|
+             -> bool {
+                let mut advanced = false;
+                for f in frames {
+                    if let DistributedMessage::SnapshotStreamPackage {
+                        sender_id,
+                        stream_id,
+                        cursor,
+                        payload,
+                        done,
+                        ..
+                    } = f
+                    {
+                        advanced |= sec.restore_snapshot_stream_frame(
+                            sender_id,
+                            stream_id,
+                            cursor.as_deref(),
+                            payload,
+                            *done,
+                        );
+                    }
+                }
+                advanced
+            };
             assert!(
-                sec.restore_cluster_snapshot_frame(&json),
+                restore_all(&mut sec, &frames),
                 "the heal advances the primary identity"
             );
             let sig = sec
@@ -661,7 +680,7 @@ async fn snapshot_restore_runs_the_primary_identity_seam() {
                 .expect("self-named snapshot heal fires the PromotionSignal");
             assert_eq!(sig.epoch, 1);
             assert!(
-                !sec.restore_cluster_snapshot_frame(&json),
+                !restore_all(&mut sec, &frames),
                 "an identical re-restore is a NoOp"
             );
             assert!(
@@ -672,8 +691,9 @@ async fn snapshot_restore_runs_the_primary_identity_seam() {
             // Peer-named heal → mirror follows, no promotion.
             let (mut sec_b, _log_b) = make_secondary_recording(election_config("worker-b"), 1);
             let donor_b = donor_with_primary("worker-a");
-            let json_b = serde_json::to_string(&donor_b.snapshot()).unwrap();
-            assert!(sec_b.restore_cluster_snapshot_frame(&json_b));
+            let frames_b =
+                crate::snapshot_stream::stream_frames_for_test(&donor_b, "setup", "wb/0");
+            assert!(restore_all(&mut sec_b, &frames_b));
             assert_eq!(sec_b.cluster_state().current_primary(), Some("worker-a"));
             assert!(
                 sec_b.promotion_rx.try_recv().is_err(),

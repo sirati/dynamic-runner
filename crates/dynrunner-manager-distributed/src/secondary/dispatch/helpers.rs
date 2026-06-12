@@ -332,11 +332,12 @@ where
         self.republish_beacon_target();
     }
 
-    /// Restore an inbound `ClusterSnapshot` frame into the local mirror AND
-    /// run the primary-identity seam if the heal advanced the primary fact.
+    /// Restore one inbound `SnapshotStreamPackage` frame into the local
+    /// mirror AND run the primary-identity seam if the heal advanced the
+    /// primary fact.
     ///
-    /// Shared between the operational dispatch router's `ClusterSnapshot`
-    /// arm and `wait_for_setup`'s receive loop (the same single-writer
+    /// Shared between the operational dispatch router's package arm and
+    /// `wait_for_setup`'s receive loop (the same single-writer
     /// discipline as [`Self::apply_cluster_mutations`]): both sites must
     /// restore with identical semantics, and BOTH must observe a healed
     /// primary-identity advance — pre-fix the restore was a silent lattice
@@ -344,7 +345,13 @@ where
     /// relocation announcement healing through anti-entropy) never fired
     /// the `PromotionSignal` and a peer-named heal never reset the
     /// election. The decode failure stays WARN-and-keep (the steady-state
-    /// discriminator: the next digest round re-pulls).
+    /// discriminator: the next digest round re-pulls) and does NOT advance
+    /// the resume cursor, so the re-pull resumes from before the bad span.
+    ///
+    /// Each package is a PARTIAL snapshot; `restore` is the idempotent
+    /// lattice merge, so packages interleave safely with live broadcasts
+    /// and the primary-identity fact (it rides the stream's HEAD package)
+    /// heals on the first package, before the bulk lands.
     ///
     /// The healed `reason` is [`PrimaryChangeReason::default`]: a snapshot
     /// carries no origination reason (the CRDT is reason-blind), and the
@@ -356,25 +363,30 @@ where
     /// callers react with [`Self::react_to_primary_identity_change`]
     /// (async, pool-touching — the caller's concern, exactly as for
     /// [`Self::apply_cluster_mutations`]).
-    pub(in crate::secondary) fn restore_cluster_snapshot_frame(
+    pub(in crate::secondary) fn restore_snapshot_stream_frame(
         &mut self,
-        snapshot_json: &str,
+        sender_id: &str,
+        stream_id: &str,
+        cursor: Option<&str>,
+        payload: &str,
+        done: bool,
     ) -> bool {
-        let snap = match serde_json::from_str::<crate::cluster_state::ClusterStateSnapshot<I>>(
-            snapshot_json,
-        ) {
+        let snap = match crate::cluster_state::decode_stream_payload::<I>(payload) {
             Ok(snap) => snap,
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "ClusterSnapshot decode failed in the steady-state \
-                     anti-entropy sink; dropped a malformed snapshot (the \
+                    stream_id = %stream_id,
+                    "SnapshotStreamPackage decode failed in the steady-state \
+                     anti-entropy sink; dropped a malformed package (the \
                      next peer StateDigest broadcast will re-trigger \
                      reconciliation via the reactive digest arm)"
                 );
                 return false;
             }
         };
+        self.inbound_snapshots
+            .note_package(sender_id, stream_id, cursor, done);
         let before = (
             self.cluster_state.current_primary().map(str::to_owned),
             self.cluster_state.primary_epoch(),
@@ -409,7 +421,7 @@ where
     /// router's `StateDigest` arm and `wait_for_setup`'s receive loop —
     /// pre-`Operational` participation is what lets a setup-wedged
     /// secondary recover a missed relocation announcement (the pull's
-    /// reply heals via [`Self::restore_cluster_snapshot_frame`]).
+    /// packages heal via [`Self::restore_snapshot_stream_frame`]).
     pub(in crate::secondary) async fn reconcile_state_digest(
         &mut self,
         sender_id: &str,
@@ -432,6 +444,7 @@ where
             sender_id,
             sender_is_observer,
             &requester,
+            &mut self.inbound_snapshots,
             timestamp_now(),
         ) {
             if let Err(e) = self.send_to(destination, request).await {
@@ -447,6 +460,22 @@ where
                     "anti-entropy: local replica behind peer digest; \
                      requested snapshot pull"
                 );
+            }
+        }
+    }
+
+    /// Test hook: synchronously drain every pending snapshot-stream wake
+    /// token, emitting + sending each package — what the process loop's
+    /// stream arm does one-per-wakeup, compressed for loop-less
+    /// responder tests.
+    #[cfg(test)]
+    pub(crate) async fn drive_snapshot_streams_for_test(&mut self) {
+        while let Some(stream_id) = self.snapshot_streams.try_next_wake() {
+            if let Some((dst, frame)) =
+                self.snapshot_streams
+                    .emit_next(&stream_id, &self.cluster_state, timestamp_now())
+            {
+                let _ = self.send_to(dst, frame).await;
             }
         }
     }

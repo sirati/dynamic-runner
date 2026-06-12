@@ -338,6 +338,16 @@ where
     /// `origination::apply_and_broadcast_mutations`).
     pub(super) cluster_state: ClusterState<I>,
 
+    /// Outbound snapshot-stream driver: serves `RequestSnapshotStream`
+    /// pulls (late joiners, behind peers) one bounded package per
+    /// process-loop wakeup — see `crate::snapshot_stream`. The loop's
+    /// wake arm drains it; the router's request arm feeds it.
+    pub(super) snapshot_streams: crate::snapshot_stream::SnapshotStreamResponder,
+    /// Inbound snapshot-stream progress (per responder): lets this
+    /// node's own anti-entropy pulls RESUME an interrupted stream
+    /// (same stream id + cursor) instead of re-pulling from scratch.
+    pub(super) inbound_snapshots: crate::snapshot_stream::InboundSnapshotStreams,
+
     /// Peer-lifecycle dispatcher channel receiver, paired with the
     /// `lifecycle_tx` installed on `cluster_state` at construction.
     /// Taken out at `run_until_setup_or_done`'s first entry and

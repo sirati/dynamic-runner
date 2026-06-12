@@ -281,19 +281,20 @@ fn watermark_compacts_over_failed_tombstones_and_subsumes_replays() {
 }
 
 /// A snapshot carrying an uncompacted `Failed` tombstone survives the
-/// wire JSON and restores: the tombstone lands on the cold replica,
-/// stays off the dispatch read surface, and the digest folds it
+/// wire payload codec and restores: the tombstone lands on the cold
+/// replica, stays off the dispatch read surface, and the digest folds it
 /// distinctly from `Unhandled` AND from `Handled` (anti-entropy sees a
 /// lagging replica in both directions).
 #[test]
-fn failed_survives_snapshot_json_and_digest_distinguishes_it() {
+fn failed_survives_stream_payload_and_digest_distinguishes_it() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
     s.apply(posted("sec-1", 2, "t", b"boom"));
     s.apply(failed("sec-1", 2)); // seq-1 gap → stays resident
 
-    let json = serde_json::to_string(&s.snapshot()).expect("Failed tombstone serializes");
+    let payload = crate::cluster_state::encode_stream_payload(&s.snapshot())
+        .expect("Failed tombstone serializes");
     let decoded: ClusterStateSnapshot<RunnerIdentifier> =
-        serde_json::from_str(&json).expect("snapshot JSON decodes");
+        crate::cluster_state::decode_stream_payload(&payload).expect("payload decodes");
     let mut cold = ClusterState::<RunnerIdentifier>::new();
     cold.restore(decoded);
     assert_eq!(
@@ -320,26 +321,26 @@ fn failed_survives_snapshot_json_and_digest_distinguishes_it() {
 }
 
 /// THE #358 serde lesson, applied to the F5 field: a snapshot with a
-/// NON-EMPTY tuple-keyed `custom_messages` map must survive the actual
-/// wire encoding (serde_json `snapshot_json`) — a plain map field
-/// serializes fine while empty and errors on the first real entry,
-/// silently dropping every snapshot reply. Round-trips through JSON and
-/// restore-merges into a cold replica.
+/// NON-EMPTY tuple-keyed `custom_messages` map must survive the ACTUAL
+/// wire encoding (the snapshot-stream payload codec — the pair-list
+/// adapter keeps tuple keys representable in any serde format).
+/// Round-trips through the codec and restore-merges into a cold
+/// replica.
 #[test]
-fn snapshot_with_nonempty_custom_messages_survives_json_and_restores() {
+fn snapshot_with_nonempty_custom_messages_survives_wire_codec_and_restores() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
     s.apply(posted("sec-1", 1, "t", b"one"));
     s.apply(posted("sec-1", 2, "batch", b"two"));
     s.apply(handled("sec-1", 1)); // compacts → watermark 1
     assert_eq!(s.custom_terminal_watermark("sec-1"), Some(1));
 
-    // THE wire leg: ClusterSnapshot carries `snapshot_json` (serde_json).
-    let json = serde_json::to_string(&s.snapshot()).expect(
+    // THE wire leg: SnapshotStreamPackage carries base64-CBOR payloads.
+    let payload = crate::cluster_state::encode_stream_payload(&s.snapshot()).expect(
         "a non-empty tuple-keyed custom_messages map must serialize \
-         through serde_json (the pair-list adapter)",
+         through the wire payload codec (the pair-list adapter)",
     );
     let decoded: ClusterStateSnapshot<RunnerIdentifier> =
-        serde_json::from_str(&json).expect("snapshot JSON decodes");
+        crate::cluster_state::decode_stream_payload(&payload).expect("payload decodes");
 
     let mut cold = ClusterState::<RunnerIdentifier>::new();
     cold.restore(decoded);
@@ -356,7 +357,7 @@ fn snapshot_with_nonempty_custom_messages_survives_json_and_restores() {
 
     // Idempotent: re-restoring the same snapshot changes nothing.
     let again: ClusterStateSnapshot<RunnerIdentifier> =
-        serde_json::from_str(&json).expect("snapshot JSON decodes twice");
+        crate::cluster_state::decode_stream_payload(&payload).expect("payload decodes twice");
     cold.restore(again);
     assert_eq!(cold.custom_message_count(), 1);
 }

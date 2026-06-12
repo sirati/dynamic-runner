@@ -36,7 +36,7 @@ where
     /// types it owns directly (Keepalive, election frames, role-aware
     /// TaskComplete/TaskFailed, ClusterMutation) carry the
     /// non-authoritative secondary behavior. Frame types it does not
-    /// own (TaskAssignment, StageFile, RequestClusterSnapshot,
+    /// own (TaskAssignment, StageFile, RequestSnapshotStream,
     /// ClusterSnapshot, PeerInfo) fall to the catch-all, which delegates
     /// to [`Self::dispatch_message`] — the wire-frame dispatcher, still
     /// directly callable by tests.
@@ -362,7 +362,7 @@ where
             }
             // Wire-frame / setup / snapshot frames the role-aware base
             // does not own (TaskAssignment, StageFile,
-            // RequestClusterSnapshot, ClusterSnapshot, PeerInfo) delegate
+            // RequestSnapshotStream, SnapshotStreamPackage, PeerInfo) delegate
             // to the wire-frame dispatcher. ONE delegation path — no
             // physical-origin key.
             //
