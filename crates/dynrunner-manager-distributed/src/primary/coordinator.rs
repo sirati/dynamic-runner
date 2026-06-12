@@ -755,6 +755,16 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// only liveness fact dispatch consumes, via the two boundary methods).
     pub(super) silence_warn_stage: HashMap<String, usize>,
 
+    /// Throttle for the primary's OWN egress-keepalive delivery failures
+    /// (`broadcast_primary_keepalive`). A primary whose keepalive sends
+    /// all fail is MUTE — invisible to itself and silently feeding every
+    /// peer's primary-silence suspicion — so the failure path is loud at
+    /// WARN, but throttled (a member mid-disconnect produces one failure
+    /// per tick on an already-handled transition, so an un-throttled WARN
+    /// would spam). The keepalive owns its own narration; the per-send
+    /// debug lines stay for fine-grained tracing.
+    pub(super) keepalive_egress_warn: crate::warn_throttle::WarnThrottle,
+
     /// The set of members whose operational MAIN LOOP has provably run
     /// this incarnation: a mesh `Keepalive` with the SECONDARY emitter
     /// role was received from them (the secondary's keepalive arm spins
@@ -1488,6 +1498,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             ingest_gate: super::heartbeat::IngestEdgeGate::new(),
             collective_silence_gate: super::heartbeat::CollectiveSilenceGate::new(),
             silence_warn_stage: HashMap::new(),
+            keepalive_egress_warn: crate::warn_throttle::WarnThrottle::new(
+                super::heartbeat::KEEPALIVE_EGRESS_WARN_INTERVAL,
+            ),
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,
             mesh_ready_secondaries: HashSet::new(),
@@ -1700,14 +1713,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// A directly-connected observer receives a duplicate; both frame
     /// classes are idempotent at the receiver (a liveness-clock refresh
     /// / an epoch-LWW apply) and the observer count is tiny, so the
-    /// duplication is deliberate and cheap. Delivery failures are
-    /// debug-level for the same reason keepalive broadcast failures are:
-    /// a member mid-disconnect produces one per tick on an
-    /// already-handled transition.
+    /// duplication is deliberate and cheap.
+    ///
+    /// RETURNS the observer ids whose directed send FAILED, leaving the
+    /// log policy to the caller: the keepalive fan folds these into its
+    /// throttled egress-health WARN (a mute primary must be loud about
+    /// its OWN silence), while the `PrimaryChanged` re-point logs them at
+    /// debug (a member mid-disconnect produces one per tick on an
+    /// already-handled transition — the same reason the per-send line
+    /// below them stays debug). The per-send debug line is retained for
+    /// fine-grained tracing regardless of caller.
     pub(super) async fn send_to_each_observer(
         &mut self,
         msg: dynrunner_protocol_primary_secondary::DistributedMessage<I>,
-    ) {
+    ) -> Vec<String> {
         // Name-sorted owned snapshot: deterministic fan order, and the
         // `&self.cluster_state` borrow drops before the `&mut self`
         // sends (the `send_transfer_complete` collect idiom).
@@ -1720,6 +1739,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .cloned()
             .collect();
         observers.sort();
+        let mut failed = Vec::new();
         for id in observers {
             if let Err(error) = self
                 .send_to(
@@ -1735,8 +1755,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     error = %error,
                     "directed observer fan delivery failed"
                 );
+                failed.push(id);
             }
         }
+        failed
     }
 
     /// Register a [`crate::peer_lifecycle::LifecycleListener`] to be

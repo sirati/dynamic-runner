@@ -53,6 +53,13 @@ use super::PrimaryCoordinator;
 use super::wire::timestamp_now;
 use crate::worker_signal::WorkerMgmtSignal;
 
+/// Minimum spacing between two primary egress-keepalive failure WARNs (see
+/// [`PrimaryCoordinator::keepalive_egress_warn`]). 60s matches the
+/// established throttle cadence used across the crate's recurring-fault
+/// reports, so a persistent mute primary surfaces ~once a minute with the
+/// suppressed-occurrence count rather than once per keepalive tick.
+pub(super) const KEEPALIVE_EGRESS_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Outcome of a single periodic heartbeat sweep: the RAW per-secondary
 /// silence ages, one entry per Operational secondary the primary is
 /// tracking. There is no binary dead/alive partition here — the single
@@ -278,6 +285,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 Some(s) => s,
                 None => continue,
             };
+            // A member the replicated membership ledger has
+            // AUTHORITATIVELY removed is never silence-judged: it is not
+            // SILENT, it is GONE. A graceful departure
+            // (`PeerRemoved { SelfDeparture }`, originated by the leaving
+            // node and applied to `cluster_state`) stops the member's
+            // keepalives by design, so its silence age inflates legitimately
+            // — but the apply path that flips the membership ledger to
+            // `RemovedMember` does NOT reap this primary-local roster cache
+            // (`self.secondaries` / `secondary_keepalives` are written only by
+            // the bootstrap handshake + the hydrate rebuild). Pre-filter the
+            // departed-but-still-cached member here, off the SAME authoritative
+            // ledger the hydrate rebuild reads (`live_known_secondaries`), so
+            // the silence schedule never reaches the keepalive-miss removal +
+            // task requeue for a deliberately-departed member (the
+            // run_20260612_094056 face: a member departed cleanly, a promotion
+            // followed, and the promoted primary silence-removed-with-requeue
+            // the gone member two minutes later). A re-admission flips the same
+            // entry back to `AliveMember` and the member is judged again.
+            if self.cluster_state.peer_membership(id)
+                == crate::cluster_state::PeerMembership::RemovedMember
+            {
+                continue;
+            }
             if !matches!(
                 state,
                 crate::state::SecondaryConnectionState::Operational(_)
@@ -345,6 +375,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// independent of broadcast reachability; the directed edge relays
     /// through a connected sibling. A direct-leg observer's duplicate is
     /// an idempotent clock refresh.
+    ///
+    /// EGRESS-HEALTH NARRATION: both fan paths funnel their delivery
+    /// failures into ONE throttled WARN (`keepalive_egress_warn`, ~60s).
+    /// A primary whose keepalive sends all fail is MUTE — invisible to its
+    /// own peers, whose `primary_last_seen` clocks then run down toward a
+    /// spurious failover election — so the failure path is loud rather
+    /// than swallowed at debug. The WARN names how many sends failed and
+    /// to whom (mesh broadcast + named observers) plus the count of
+    /// per-tick failures suppressed since the last emit; a clean tick is
+    /// silent and the per-send debug lines stay for fine-grained tracing.
     pub(super) async fn broadcast_primary_keepalive(&mut self) {
         let msg = DistributedMessage::<I>::Keepalive {
             target: None,
@@ -354,20 +394,44 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             active_workers: self.workers.iter().filter(|w| !w.is_idle()).count() as u32,
             emitter_role: KeepaliveRole::Primary,
         };
-        self.send_to_each_observer(msg.clone()).await;
-        if let Err(error) = self.send_to(Destination::All, msg).await {
-            // Keepalive failures are debug-level: a secondary mid-
-            // disconnect generates one of these per tick until the
-            // heartbeat-monitor declares it dead. Surfacing each at
-            // warn would spam the log on an already-handled state
-            // transition. (Pre-Step-6 the legacy
-            // `transport.broadcast` returned per-secondary failure
-            // tuples; `self.transport.send` collapses them into a
-            // single Err — the heartbeat-monitor is the
-            // per-secondary signal, not this log line.)
-            tracing::debug!(
-                error = %error,
-                "primary keepalive delivery failed"
+        // Fan over BOTH egress paths and collect their failures into one
+        // narration: the directed observer fan
+        // (`Destination::Observer(id)` per roster observer) and the mesh
+        // `Destination::All` broadcast. Both are this primary's keepalive
+        // egress; a mute primary whose sends all fail is INVISIBLE to
+        // itself and silently feeds every peer's primary-silence
+        // suspicion, so the failure path is loud — but throttled.
+        let mut failed_observers = self.send_to_each_observer(msg.clone()).await;
+        let broadcast_err = self.send_to(Destination::All, msg).await.err();
+
+        // Per-send debug lines stay for fine-grained tracing: a secondary
+        // mid-disconnect generates one per tick until the heartbeat-monitor
+        // declares it dead, so the throttled WARN above carries the
+        // operator-facing summary while these remain quiet by default.
+        // (The legacy `transport.broadcast` returned per-secondary failure
+        // tuples; `self.client.send` collapses the mesh fan into a single
+        // Err — the heartbeat-monitor is the per-secondary signal, not
+        // this line.)
+        if let Some(error) = &broadcast_err {
+            tracing::debug!(error = %error, "primary keepalive mesh broadcast failed");
+        }
+
+        // One throttled WARN naming how many keepalive sends failed and to
+        // whom. Emitted only when AT LEAST one egress path failed; a clean
+        // tick stays quiet. The throttle suppresses per-tick spam on an
+        // already-handled disconnect while keeping a persistent mute
+        // primary loud (~once a minute, carrying the suppressed count).
+        let any_failed = broadcast_err.is_some() || !failed_observers.is_empty();
+        if any_failed && let Some(suppressed) = self.keepalive_egress_warn.permit() {
+            failed_observers.sort();
+            tracing::warn!(
+                mesh_broadcast_failed = broadcast_err.is_some(),
+                failed_observers = ?failed_observers,
+                failed_observer_count = failed_observers.len(),
+                suppressed_since_last_warn = suppressed,
+                "primary keepalive egress failing; this primary may be MUTE \
+                 to its peers (their primary-silence clocks are not being \
+                 refreshed)"
             );
         }
     }
@@ -397,6 +461,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// carries neither (it is rebuilt from the address-less CRDT) — the book,
     /// populated by the co-located secondary from `PeerInfo`, is the promoted
     /// primary's only source of its secondaries' beacon addresses.
+    ///
+    /// OBSERVERS ARE DELIBERATELY NOT BEACON TARGETS. An observer process
+    /// binds NO [`crate::liveness::LivenessListener`] (only the secondary
+    /// run path does — see `pyo3::managers::secondary::run`), advertises
+    /// `liveness_port: None`, and detects primary silence purely from mesh
+    /// frames — its `primary_last_seen` clock keys on the Primary-role
+    /// `Keepalive` and the `PrimaryChanged` re-point (observer coordinator
+    /// `on_keepalive` / `on_cluster_mutation`), NOT a UDP beacon. The
+    /// observer's primary-liveness channel is therefore the DIRECTED mesh
+    /// keepalive ([`PrimaryCoordinator::send_to_each_observer`], which the
+    /// transport relays even to a relay-only observer), and a beacon to an
+    /// observer would land on a port nothing listens on. The exclusion is
+    /// already STRUCTURAL — `self.secondaries` carries observer entries, but
+    /// an observer has no `peer_liveness_addrs` book entry (it advertised no
+    /// port), so the `filter_map` resolve drops it — and it is by design: the
+    /// off-runtime beacon thread is the build-starvation fallback for the
+    /// WORKER-secondary mesh-keepalive freeze, a hazard an observer (no local
+    /// worker pool, runtime never build-starved) does not have.
     pub(super) fn publish_beacon_targets(&self) {
         let own_id = self.config.node_id.as_str();
         let addrs: Vec<std::net::SocketAddr> = self
