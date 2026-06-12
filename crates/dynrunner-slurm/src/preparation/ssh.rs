@@ -249,7 +249,7 @@ fn push_oneshot_command_opts(argv: &mut Vec<String>) {
 ///
 /// This is the worker-side mirror of the local teardown's targeted
 /// kill (`pkill 'ssh.*-R [0-9]+:localhost'` in
-/// [`crate::pipeline::pkill_residual_reverse_tunnels`]): both kill
+/// [`crate::pipeline::sweep_residual_reverse_tunnels`]): both kill
 /// exactly the per-secondary reverse-tunnel holder for one port, never
 /// a broad sweep that could hit a live tunnel. `fuser -k` is preferred
 /// (one syscall-precise kill of the socket owner); the `ss`+`kill`

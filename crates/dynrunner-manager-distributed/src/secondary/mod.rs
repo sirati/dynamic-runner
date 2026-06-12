@@ -585,6 +585,14 @@ where
     /// the state owned by whichever regime drives it.
     pub(in crate::secondary) setup_election: Option<election::SetupElection<I>>,
 
+    /// Throttle for the recurring "primary silent past the election threshold
+    /// but zero membership evidence" WARN the setup-election arm emits while
+    /// it declines to arm (a never-welcomed node keeps hitting the arm path
+    /// every keepalive tick once the silence threshold is crossed — loud
+    /// while the fault persists, never per tick). Lives next to the election
+    /// state it narrates.
+    pub(in crate::secondary) setup_election_seedless_warn: crate::warn_throttle::WarnThrottle,
+
     /// The shared own-tick-health authority (`crate::own_tick_health`): the
     /// SAME primitive the primary's heartbeat sweep consumes. The
     /// keepalive-arm tick (and the setup-phase election tick) feeds each
