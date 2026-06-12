@@ -284,6 +284,86 @@ async fn join_accepts_role_stamped_snapshot_reply() {
         .await;
 }
 
+/// The anonymous-joiner replay: the bootstrap request must carry the
+/// JOINER'S REAL IDENTITY — `sender_id` is the address every responder
+/// replies to AND the key the receiving accept loop registers the
+/// joiner's mesh leg under (first-frame identification).
+///
+/// REVERT-CHECK: a de-role refactor deleted `PeerNetwork`'s `local_id`
+/// override, so production joiners sent `RequestClusterSnapshot {
+/// sender_id: "" }`: every responder replied to peer `""`, the joiner's
+/// legs registered under the anonymous key, and the responder-originated
+/// `PeerJoined` recorded a phantom `""` member — the cluster could never
+/// address the joiner's real id (its directed pulls fell to the
+/// role-miss fan WARN, replies relayed to nowhere). The earlier tests in
+/// this file MASKED it: their canned responder echoes to the request's
+/// `sender_id` over the single accepted leg, and a `""`-keyed leg
+/// happily routes a reply addressed to `""`. This test pins the
+/// identity END-TO-END: the responder asserts the carried id, asserts
+/// the leg is registered under it, and replies BY that id.
+#[tokio::test(flavor = "current_thread")]
+async fn join_request_carries_the_joiner_identity() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut cluster: PeerNetwork<TestId> =
+                PeerNetwork::start("secondary-0", None).await.unwrap();
+            let cluster_port = cluster.port();
+
+            let responder = tokio::task::spawn_local(async move {
+                loop {
+                    let Some(msg) = cluster.recv_peer().await else {
+                        panic!("cluster peer transport closed before the snapshot request");
+                    };
+                    if let DistributedMessage::RequestClusterSnapshot { sender_id, .. } = msg {
+                        // THE identity pin: the request's return address
+                        // is the joiner's real peer-id, never empty.
+                        assert_eq!(
+                            sender_id, "observer-mirror",
+                            "the bootstrap request must carry the joiner's real id \
+                             as its return address"
+                        );
+                        // First-frame identification keyed the joiner's
+                        // leg under that SAME id — a directed reply (and
+                        // every later directed frame) routes to it.
+                        assert!(
+                            cluster.has_peer(&PeerId::from(sender_id.as_str())),
+                            "the joiner's leg must be registered under its real id"
+                        );
+                        // Reply BY the carried id, stamped the way a real
+                        // responder's egress stamps it (the requester's
+                        // declared role).
+                        let reply: DistributedMessage<TestId> =
+                            DistributedMessage::ClusterSnapshot {
+                                target: None,
+                                sender_id: "secondary-0".into(),
+                                timestamp: 0.0,
+                                snapshot_json: "{\"canned\":true}".into(),
+                            }
+                            .with_target(Destination::Observer(PeerId::from(sender_id.clone())));
+                        cluster
+                            .send_to_peer(&sender_id, reply)
+                            .await
+                            .expect("reply addressed by the joiner's real id must route");
+                        return;
+                    }
+                }
+            });
+
+            let mut joiner: PeerNetwork<TestId> =
+                PeerNetwork::start("observer-mirror", None).await.unwrap();
+            let seed = vec![seed_entry("secondary-0", "127.0.0.1", cluster_port)];
+
+            let snapshots = joiner
+                .join_running_cluster(&seed, Duration::from_secs(10), true, false)
+                .await
+                .expect("the identity-carrying bootstrap must complete");
+            assert_eq!(snapshots, vec!["{\"canned\":true}".to_string()]);
+            responder.await.expect("responder completed");
+        })
+        .await;
+}
+
 /// The bootstrap deadline is PERSISTENT under constant churn (the
 /// watchdog law): a reachable peer that floods the joiner with gossip
 /// but never answers the snapshot request must NOT push the join
