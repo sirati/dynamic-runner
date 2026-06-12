@@ -734,6 +734,17 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// silent-set read between ticks.
     pub(super) ingest_gate: super::heartbeat::IngestEdgeGate,
 
+    /// Self-suspect gate on the staleness PATTERN (the third
+    /// decider-health guard, covering the WIRE axis the other two
+    /// cannot observe): when EVERY remote judged member is silent
+    /// simultaneously, the sweep suspects this node's own
+    /// ingest/egress before declaring N independent deaths, and
+    /// defers — bounded by the hard silence window. Owned by the
+    /// liveness module (`primary::heartbeat`); fed by each sweep's
+    /// classification, consulted by the dispatch-altitude silent-set
+    /// read between ticks (the same contract as `ingest_gate`).
+    pub(super) collective_silence_gate: super::heartbeat::CollectiveSilenceGate,
+
     /// Per-secondary count of staged silence WARN stages already logged
     /// for the secondary's CURRENT silence streak. Owned by the liveness
     /// module (`primary::heartbeat`); the heartbeat tick reads it to fire
@@ -1463,6 +1474,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             silence_judged_marks: HashMap::new(),
             keepalive_proven: HashSet::new(),
             ingest_gate: super::heartbeat::IngestEdgeGate::new(),
+            collective_silence_gate: super::heartbeat::CollectiveSilenceGate::new(),
             silence_warn_stage: HashMap::new(),
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,
