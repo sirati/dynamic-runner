@@ -1542,14 +1542,14 @@ where
                 new_secondary_id,
                 primary_endpoint,
                 primary_pubkey_pem,
-                exclude_node,
+                dead_member_id,
                 ..
             } => {
                 self.on_respawn_spawn_request(
                     new_secondary_id,
                     primary_endpoint,
                     primary_pubkey_pem,
-                    exclude_node,
+                    dead_member_id,
                 )
                 .await;
             }
@@ -1583,7 +1583,7 @@ where
         new_secondary_id: String,
         primary_endpoint: String,
         primary_pubkey_pem: String,
-        exclude_node: Option<String>,
+        dead_member_id: Option<String>,
     ) {
         match self.respawn_exec.get(&new_secondary_id) {
             Some(RespawnExecState::InFlight) => {
@@ -1635,7 +1635,7 @@ where
             new_secondary_id: new_secondary_id.clone(),
             primary_endpoint,
             primary_pubkey_pem,
-            exclude_node,
+            dead_member_id,
         };
         let tx = self.respawn_exec_tx.clone();
         tokio::task::spawn_local(async move {

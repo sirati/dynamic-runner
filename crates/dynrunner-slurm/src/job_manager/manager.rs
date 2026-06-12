@@ -17,6 +17,7 @@ impl<G: Gateway> SlurmJobManager<G> {
             config,
             gateway,
             job_ids: Vec::new(),
+            secondary_jobs: std::collections::HashMap::new(),
             shutdown_manager_remote_path: None,
             wrapper_bin_remote_path: None,
         }

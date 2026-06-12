@@ -85,7 +85,7 @@ fn spec(new_id: &str) -> SecondarySpawnSpec {
         primary_pubkey_pem: "-----BEGIN PUBLIC KEY-----\nFAKEPEM\n".to_owned(),
         // The multi-process provider ignores node exclusion (it places
         // children on the local host, not named SLURM nodes).
-        exclude_node: None,
+        dead_member_id: None,
     }
 }
 
@@ -253,7 +253,7 @@ fn primary_pubkey_pem_reaches_spawner_spec() {
             new_secondary_id: "sec-a".into(),
             primary_endpoint: endpoint_a.clone(),
             primary_pubkey_pem: pem_a.to_owned(),
-            exclude_node: None,
+            dead_member_id: None,
         })
         .await
         .unwrap();
@@ -261,7 +261,7 @@ fn primary_pubkey_pem_reaches_spawner_spec() {
             new_secondary_id: "sec-b".into(),
             primary_endpoint: endpoint_b.clone(),
             primary_pubkey_pem: pem_b.to_owned(),
-            exclude_node: None,
+            dead_member_id: None,
         })
         .await
         .unwrap();

@@ -392,6 +392,349 @@ async fn submit_job_emits_exclude_when_node_known() {
     );
 }
 
+/// Gateway that REJECTS any sbatch carrying `--exclude` (rc=1, mirroring
+/// SLURM's "Invalid node name specified") and ACCEPTS a bare one. Records
+/// every command so the test can assert the retry happened.
+#[derive(Default)]
+struct ExcludeRejectingGateway {
+    commands: Mutex<Vec<String>>,
+}
+
+impl ExcludeRejectingGateway {
+    fn sbatch_commands(&self) -> Vec<String> {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.contains("| sbatch "))
+            .cloned()
+            .collect()
+    }
+}
+
+impl Gateway for ExcludeRejectingGateway {
+    async fn connect(&mut self) -> Result<(), GatewayError> {
+        Ok(())
+    }
+    async fn disconnect(&mut self) -> Result<(), GatewayError> {
+        Ok(())
+    }
+    async fn execute_command(
+        &self,
+        cmd: &str,
+        _cwd: Option<&str>,
+    ) -> Result<CommandResult, GatewayError> {
+        self.commands.lock().unwrap().push(cmd.to_string());
+        if cmd.contains("| sbatch ") {
+            if cmd.contains("--exclude=") {
+                return Ok(CommandResult {
+                    return_code: 1,
+                    stdout: String::new(),
+                    stderr: "sbatch: error: Batch job submission failed: \
+                             Invalid node name specified"
+                        .into(),
+                });
+            }
+            return Ok(CommandResult {
+                return_code: 0,
+                stdout: "55555".into(),
+                stderr: String::new(),
+            });
+        }
+        Ok(CommandResult {
+            return_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+    async fn transfer_file(&self, _local: &Path, _remote: &str) -> Result<(), GatewayError> {
+        Ok(())
+    }
+    async fn download_file(&self, _remote: &str, _local: &Path) -> Result<(), GatewayError> {
+        Ok(())
+    }
+    async fn create_directory(&self, _remote: &str) -> Result<(), GatewayError> {
+        Ok(())
+    }
+    async fn file_exists(&self, _remote: &str) -> Result<bool, GatewayError> {
+        Ok(false)
+    }
+    fn setup_port_forwarding(&mut self, _l: u16, _r: u16) -> Result<(), GatewayError> {
+        Ok(())
+    }
+}
+
+/// REGRESSION (run_20260612_095601): an sbatch carrying `--exclude=<bad
+/// node>` is rejected outright ("Invalid node name specified") and the
+/// respawn pipeline died with no retry. The submission seam must now
+/// retry ONCE without `--exclude` so the spawn proceeds regardless of
+/// whether the excluded node string is a valid SLURM NodeName.
+#[tokio::test]
+async fn submit_job_retries_bare_when_exclude_submission_fails() {
+    let gw = ExcludeRejectingGateway::default();
+    let cfg = SlurmConfig {
+        root_folder: "/srv/slurm".into(),
+        ..SlurmConfig::default()
+    };
+    let mut mgr = SlurmJobManager::new(cfg, gw);
+    let jid = mgr
+        .submit_job(
+            "#!/bin/sh\necho hi",
+            "j-respawn",
+            "secondary-5",
+            1,
+            "/srv/slurm/log/run-r",
+            // A node string SLURM rejects (e.g. a container hostname /
+            // FQDN that is not the cluster's NodeName).
+            Some("worker3.container.invalid"),
+        )
+        .await
+        .expect("the bare retry must let the spawn succeed");
+    // The bare retry's job id is returned.
+    assert_eq!(jid, "55555");
+
+    let sbatch = mgr.gateway().sbatch_commands();
+    // Exactly two sbatch attempts: the rejected exclusion + the bare
+    // retry.
+    assert_eq!(
+        sbatch.len(),
+        2,
+        "expected one rejected exclusion attempt + one bare retry; got: {sbatch:?}",
+    );
+    assert!(
+        sbatch[0].contains("--exclude=worker3.container.invalid"),
+        "first attempt must carry the exclusion; got: {}",
+        sbatch[0],
+    );
+    assert!(
+        !sbatch[1].contains("--exclude"),
+        "retry must drop --exclude; got: {}",
+        sbatch[1],
+    );
+    // The marker bookkeeping is clean: only the retry's real id is on
+    // `job_ids` (the failed attempt removed its own marker).
+    assert_eq!(
+        mgr.job_ids(),
+        &["55555".to_string()],
+        "only the successful retry's id must be on job_ids",
+    );
+}
+
+/// A submission with NO exclusion that fails has nothing to retry: the
+/// error surfaces directly, no second attempt, and the marker is
+/// cleaned up. Guards against the retry firing on the non-exclusion
+/// path.
+#[tokio::test]
+async fn submit_job_no_retry_when_no_exclusion_present() {
+    // ExcludeRejectingGateway only rejects `--exclude` sbatches; to test
+    // the no-exclusion failure path, drive a gateway that fails ALL
+    // sbatches.
+    #[derive(Default)]
+    struct AllSbatchFailGateway {
+        sbatch_calls: AtomicUsize,
+    }
+    impl Gateway for AllSbatchFailGateway {
+        async fn connect(&mut self) -> Result<(), GatewayError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), GatewayError> {
+            Ok(())
+        }
+        async fn execute_command(
+            &self,
+            cmd: &str,
+            _cwd: Option<&str>,
+        ) -> Result<CommandResult, GatewayError> {
+            if cmd.contains("| sbatch ") {
+                self.sbatch_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok(CommandResult {
+                    return_code: 1,
+                    stdout: String::new(),
+                    stderr: "sbatch: error: simulated".into(),
+                });
+            }
+            Ok(CommandResult {
+                return_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+        async fn transfer_file(&self, _l: &Path, _r: &str) -> Result<(), GatewayError> {
+            Ok(())
+        }
+        async fn download_file(&self, _r: &str, _l: &Path) -> Result<(), GatewayError> {
+            Ok(())
+        }
+        async fn create_directory(&self, _r: &str) -> Result<(), GatewayError> {
+            Ok(())
+        }
+        async fn file_exists(&self, _r: &str) -> Result<bool, GatewayError> {
+            Ok(false)
+        }
+        fn setup_port_forwarding(&mut self, _l: u16, _r: u16) -> Result<(), GatewayError> {
+            Ok(())
+        }
+    }
+
+    let gw = AllSbatchFailGateway::default();
+    let cfg = SlurmConfig {
+        root_folder: "/srv/slurm".into(),
+        ..SlurmConfig::default()
+    };
+    let mut mgr = SlurmJobManager::new(cfg, gw);
+    let err = mgr
+        .submit_job(
+            "#!/bin/sh\necho hi",
+            "j0",
+            "secondary-0",
+            1,
+            "/srv/slurm/log/run-0",
+            None,
+        )
+        .await
+        .expect_err("a no-exclusion submission failure must surface");
+    assert!(matches!(err, SlurmError::Command(_)));
+    // Exactly ONE sbatch attempt — no retry on the no-exclusion path.
+    assert_eq!(
+        mgr.gateway().sbatch_calls.load(Ordering::SeqCst),
+        1,
+        "a no-exclusion failure must not retry",
+    );
+    // The marker was cleaned up on the failure path.
+    assert!(
+        mgr.job_ids().is_empty(),
+        "a failed submission must leave no marker on job_ids",
+    );
+}
+
+/// Gateway answering node-resolution probes from canned outputs:
+/// `squeue -j … -o '%N'` returns `squeue_out`, `sacct … NodeList`
+/// returns `sacct_out`. sbatch is answered with a canned id so a job can
+/// be registered into `secondary_jobs` via a real `submit_job`. Each
+/// probe's rc tracks whether its output is empty (a missing job row is
+/// rc!=0 / empty in the real tools — both map to "no node here").
+struct ResolveGateway {
+    squeue_out: String,
+    sacct_out: String,
+}
+
+impl Gateway for ResolveGateway {
+    async fn connect(&mut self) -> Result<(), GatewayError> {
+        Ok(())
+    }
+    async fn disconnect(&mut self) -> Result<(), GatewayError> {
+        Ok(())
+    }
+    async fn execute_command(
+        &self,
+        cmd: &str,
+        _cwd: Option<&str>,
+    ) -> Result<CommandResult, GatewayError> {
+        if cmd.contains("squeue") && cmd.contains("-o '%N'") {
+            return Ok(CommandResult {
+                return_code: 0,
+                stdout: self.squeue_out.clone(),
+                stderr: String::new(),
+            });
+        }
+        if cmd.contains("sacct") && cmd.contains("NodeList") {
+            return Ok(CommandResult {
+                return_code: 0,
+                stdout: self.sacct_out.clone(),
+                stderr: String::new(),
+            });
+        }
+        let stdout = if cmd.contains("| sbatch ") {
+            "42424".to_string()
+        } else {
+            String::new()
+        };
+        Ok(CommandResult {
+            return_code: 0,
+            stdout,
+            stderr: String::new(),
+        })
+    }
+    async fn transfer_file(&self, _l: &Path, _r: &str) -> Result<(), GatewayError> {
+        Ok(())
+    }
+    async fn download_file(&self, _r: &str, _l: &Path) -> Result<(), GatewayError> {
+        Ok(())
+    }
+    async fn create_directory(&self, _r: &str) -> Result<(), GatewayError> {
+        Ok(())
+    }
+    async fn file_exists(&self, _r: &str) -> Result<bool, GatewayError> {
+        Ok(false)
+    }
+    fn setup_port_forwarding(&mut self, _l: u16, _r: u16) -> Result<(), GatewayError> {
+        Ok(())
+    }
+}
+
+async fn resolve_fixture(squeue_out: &str, sacct_out: &str) -> SlurmJobManager<ResolveGateway> {
+    let gw = ResolveGateway {
+        squeue_out: squeue_out.to_string(),
+        sacct_out: sacct_out.to_string(),
+    };
+    let cfg = SlurmConfig {
+        root_folder: "/srv/slurm".into(),
+        ..SlurmConfig::default()
+    };
+    let mut mgr = SlurmJobManager::new(cfg, gw);
+    // Register `secondary-0`'s job so the resolver can map it.
+    mgr.submit_job(
+        "#!/bin/sh\n",
+        "j0",
+        "secondary-0",
+        1,
+        "/srv/slurm/log/run-x",
+        None,
+    )
+    .await
+    .expect("submit succeeds");
+    mgr
+}
+
+/// squeue still reports the node (the job had not yet been reaped) →
+/// resolution returns it without consulting sacct.
+#[tokio::test]
+async fn resolve_excluded_node_prefers_squeue() {
+    let mgr = resolve_fixture("krater04", "SHOULD-NOT-BE-USED").await;
+    assert_eq!(
+        mgr.resolve_excluded_node("secondary-0").await.as_deref(),
+        Some("krater04"),
+    );
+}
+
+/// squeue is empty (the job left the queue — the common respawn-time
+/// case) → resolution falls through to sacct's NodeList.
+#[tokio::test]
+async fn resolve_excluded_node_falls_back_to_sacct() {
+    let mgr = resolve_fixture("", "krater09").await;
+    assert_eq!(
+        mgr.resolve_excluded_node("secondary-0").await.as_deref(),
+        Some("krater09"),
+    );
+}
+
+/// Neither squeue nor sacct yields a node → `None` (the spawn proceeds
+/// without `--exclude`). The SLURM placeholder `None assigned` is
+/// treated as no node.
+#[tokio::test]
+async fn resolve_excluded_node_none_when_unresolvable() {
+    let mgr = resolve_fixture("", "None assigned").await;
+    assert_eq!(mgr.resolve_excluded_node("secondary-0").await, None);
+}
+
+/// A member the manager never submitted a job for → no `secondary_jobs`
+/// entry → `None` (no job id to probe).
+#[tokio::test]
+async fn resolve_excluded_node_none_for_unknown_member() {
+    let mgr = resolve_fixture("krater04", "krater04").await;
+    assert_eq!(mgr.resolve_excluded_node("secondary-99").await, None);
+}
+
 /// `signal_lead_seconds` is plumbed verbatim into the sbatch flag.
 /// Locks the override path: setting a non-default lead time on the
 /// config must produce `--signal=B:SIGTERM@<that value>` so operators

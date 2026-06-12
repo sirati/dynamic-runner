@@ -256,7 +256,7 @@ impl<I: Identifier> SecondarySpawner for RemoteSecondarySpawner<I> {
                 new_secondary_id: spec.new_secondary_id.clone(),
                 primary_endpoint: spec.primary_endpoint.clone(),
                 primary_pubkey_pem: spec.primary_pubkey_pem.clone(),
-                exclude_node: spec.exclude_node.clone(),
+                dead_member_id: spec.dead_member_id.clone(),
             };
             if let Err(e) = self.send_request(frame) {
                 // Local pump gone — the node is winding down; nothing

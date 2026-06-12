@@ -84,11 +84,19 @@ impl<G: Gateway> SlurmJobManager<G> {
     /// path that resumes a SLURM job under its original identity, so
     /// suppressing requeue is always correct.
     ///
-    /// `exclude_node` is the dead member's node, passed by the respawn
-    /// path when known (the initial cohort passes `None` — no death has
-    /// occurred). When `Some`, the submission carries `--exclude=<node>`
-    /// so a replacement never lands back on the node whose member just
-    /// died (NODE_FAIL / hardware fault). `None` omits the flag cleanly.
+    /// `exclude_node` is a SLURM NodeName the respawn path resolved from
+    /// SLURM's own vocabulary (see [`Self::resolve_excluded_node`]) so a
+    /// replacement never lands back on the node whose member just died
+    /// (NODE_FAIL / hardware fault). The initial cohort passes `None` (no
+    /// death has occurred). When `Some`, the submission carries
+    /// `--exclude=<node>`; a submission that FAILS while excluding a node
+    /// is retried ONCE without `--exclude` (the spawn outranks the
+    /// best-effort placement hint — see the retry seam below). `None`
+    /// omits the flag cleanly.
+    ///
+    /// Every submission's `secondary_id → job id` is recorded on
+    /// `secondary_jobs` so a LATER respawn can resolve THIS member's node
+    /// if it dies.
     pub async fn submit_job(
         &mut self,
         wrapper_script: &str,
@@ -182,18 +190,140 @@ impl<G: Gateway> SlurmJobManager<G> {
             sbatch_args.push(format!("--mail-user={email}"));
         }
 
-        // Respawn-only: keep the replacement off the dead member's node
-        // when the caller knows it (a NODE_FAIL/hardware fault that took
-        // the original down would otherwise be re-inherited). The initial
-        // cohort passes `None` (no death yet) and emits no `--exclude`.
+        // `sbatch_args` above is the EXCLUSION-FREE invocation; the
+        // `--exclude=<node>` flag (respawn-only) is appended per-attempt by
+        // `issue_sbatch` below so a rejected exclusion can be dropped on
+        // retry without re-deriving the rest of the command. The initial
+        // cohort passes `exclude_node = None` and emits no `--exclude`.
+
+        // Submit once with the exclusion. A submission that FAILS while
+        // `--exclude` was passed is retried ONCE without it: the exclusion
+        // is a best-effort placement hint (keep a replacement off a faulty
+        // node), but spawning the replacement at all outranks honouring the
+        // hint. The mesh-advertised node string the hint may carry need not
+        // be a valid SLURM NodeName, in which case sbatch rejects the whole
+        // submission ("Invalid node name specified") — the bare retry lets
+        // the spawn proceed regardless. The SLURM error text varies by
+        // version, so the retry does NOT parse it (it only logs it): ANY
+        // submission failure with an exclusion present triggers the bare
+        // retry. A submission with no exclusion has nothing to retry and
+        // surfaces its error directly.
+        let job_id = match self
+            .issue_sbatch(&escaped, &sbatch_args, exclude_node, job_name)
+            .await
+        {
+            Ok(job_id) => job_id,
+            Err(e) => {
+                let Some(node) = exclude_node else {
+                    return Err(e);
+                };
+                tracing::warn!(
+                    job_name,
+                    excluded_node = %node,
+                    error = %e,
+                    "sbatch submission failed while excluding a node; retrying \
+                     once WITHOUT --exclude (the spawn outranks the placement \
+                     hint — the excluded node string may not be a valid SLURM \
+                     NodeName)",
+                );
+                self.issue_sbatch(&escaped, &sbatch_args, None, job_name).await?
+            }
+        };
+
+        // Record this member's job id so the respawn path can later
+        // resolve its SLURM node from SLURM's own vocabulary (see
+        // `secondary_jobs` / `resolve_excluded_node`). The latest
+        // submission for a re-used id wins.
+        self.secondary_jobs
+            .insert(secondary_id.to_owned(), job_id.clone());
+        Ok(job_id)
+    }
+
+    /// Resolve the SLURM node a member's job is (or was) placed on, from
+    /// SLURM's OWN vocabulary, for a respawn's `--exclude`. Returns the
+    /// node name to keep the replacement off, or `None` when it cannot be
+    /// resolved (the hint is best-effort — a `None` simply omits
+    /// `--exclude`, never blocks or fails a spawn).
+    ///
+    /// Why not the mesh-advertised hostname: a member advertises its
+    /// transport identity (a container hostname, an FQDN), which need not
+    /// equal the SLURM `NodeName`. Feeding that to `--exclude` makes
+    /// sbatch reject the whole submission ("Invalid node name specified").
+    /// The job's own `%N` is, by construction, a name SLURM accepts.
+    ///
+    /// Lookup chain: `secondary_id → job id` (this manager submitted it,
+    /// cohort or respawn) → `squeue -j <id> -h -o %N` (still queued /
+    /// running) → `sacct -j <id> -n -P -o NodeList` (left the queue — the
+    /// common case at respawn time, since the member just died). Each
+    /// step that yields nothing or fails at the gateway falls through to
+    /// the next; an unresolved chain returns `None`. No node string is
+    /// ever parsed beyond trimming — the first non-empty `%N`/`NodeList`
+    /// token is taken as the node to exclude.
+    pub async fn resolve_excluded_node(&self, secondary_id: &str) -> Option<String> {
+        let job_id = self.secondary_jobs.get(secondary_id)?;
+
+        // (1) squeue — the job may still be queued/running (e.g. a
+        // keepalive-miss death whose SLURM job has not yet been reaped).
+        if let Some(node) = self.node_from_squeue(job_id).await {
+            return Some(node);
+        }
+
+        // (2) sacct — the job left the queue (NODE_FAIL / completed /
+        // purged-from-squeue). sacct retains the placement in accounting.
+        self.node_from_sacct(job_id).await
+    }
+
+    /// First node `squeue -j <id> -h -o %N` reports for the job, or `None`
+    /// (no row, gateway failure, or a non-node placeholder like the
+    /// PENDING-state `(Resources)`/`(Priority)` reason squeue prints in
+    /// the `%N` column when nothing is allocated yet).
+    async fn node_from_squeue(&self, job_id: &str) -> Option<String> {
+        let cmd = format!("squeue -j {job_id} -h -o '%N' 2>/dev/null");
+        let result = self.gateway.execute_command(&cmd, None).await.ok()?;
+        if !result.success() {
+            return None;
+        }
+        first_node_token(&result.stdout)
+    }
+
+    /// First node `sacct -j <id> -n -P -o NodeList` reports for the job,
+    /// or `None`. `-P` parsable (pipe-delimited, no padding), `-n` no
+    /// header; the first data line's NodeList holds the allocation.
+    async fn node_from_sacct(&self, job_id: &str) -> Option<String> {
+        let cmd = format!("sacct -j {job_id} -n -P -o NodeList 2>/dev/null");
+        let result = self.gateway.execute_command(&cmd, None).await.ok()?;
+        if !result.success() {
+            return None;
+        }
+        result.stdout.lines().find_map(first_node_token)
+    }
+
+    /// Issue ONE `sbatch` submission for the given exclusion-free base
+    /// args, optionally appending `--exclude=<node>`, and return the
+    /// parsed job id. Owns the pending-submission-marker bookkeeping so
+    /// every attempt (the exclusion attempt AND its bare retry) is
+    /// cancellation-safe and self-cleaning on its own failure path; the
+    /// marker is pushed before the sbatch await and is updated to the real
+    /// id or removed before this returns on every non-cancellation path.
+    async fn issue_sbatch(
+        &mut self,
+        escaped: &str,
+        base_args: &[String],
+        exclude_node: Option<&str>,
+        job_name: &str,
+    ) -> Result<String, SlurmError> {
+        // Append the optional exclusion to this attempt's argv. A `None`
+        // (initial cohort, or the bare retry) emits no `--exclude` flag —
+        // a blank `--exclude=` would itself hard-error sbatch.
+        let mut args = base_args.to_vec();
         if let Some(node) = exclude_node {
-            sbatch_args.push(format!("--exclude={node}"));
+            args.push(format!("--exclude={node}"));
         }
 
         // No trailing script-path argument: sbatch reads the batch
         // script from STDIN, which the `printf '%s' '<body>' |` prefix
         // supplies. One shell command, no gateway-side script file.
-        let cmd = format!("printf '%s' '{escaped}' | {}", sbatch_args.join(" "));
+        let cmd = format!("printf '%s' '{escaped}' | {}", args.join(" "));
 
         // Push a pending-submission marker BEFORE the sbatch await so that
         // a task-future cancellation mid-sbatch (e.g. the coordinator's
@@ -466,6 +596,25 @@ impl<G: Gateway> SlurmJobManager<G> {
             reason,
         })
     }
+}
+
+/// The node token from one line of `squeue %N` / `sacct NodeList`
+/// output, or `None` when the line carries no real placement.
+///
+/// SLURM's `%N` / `NodeList` is a node-LIST expression for the whole
+/// allocation (e.g. `krater04`, or `node[01-03]` for a multi-node job).
+/// `--exclude` accepts the same expression syntax verbatim, so the
+/// token is passed through unaltered rather than expanded. A blank line
+/// or the literal `None assigned` SLURM prints for a job with no
+/// allocation (a still-PENDING squeue row, a sacct batch/extern step) is
+/// dropped — feeding either to `--exclude` would be a no-op at best and
+/// a parse error at worst.
+fn first_node_token(line: &str) -> Option<String> {
+    let token = line.trim();
+    if token.is_empty() || token.eq_ignore_ascii_case("None assigned") {
+        return None;
+    }
+    Some(token.to_owned())
 }
 
 /// Whether a squeue snapshot means the job is STILL holding an
