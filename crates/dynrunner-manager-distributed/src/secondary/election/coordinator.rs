@@ -1596,6 +1596,34 @@ where
             .map(str::to_owned)
             .filter(|id| self.is_mesh_member(id))
             .collect();
+        // ZERO seeded peers means this node holds NO fleet evidence at all: it
+        // was never welcomed, never received a peer list, and never observed a
+        // single membership fact — the `mesh.degraded` gate above cannot catch
+        // this (degraded latches only after a DIAL SWEEP ran; a node that never
+        // got peer info never armed the formation watchdog, so `degraded` is
+        // still its `false` default). Arming here would seed an EMPTY quorum
+        // denominator, `failover_quorum(0) == 1`, and the node would
+        // self-promote into a vacuous zero-task run that exits "successfully"
+        // (run_20260611_221215: all 11 unconfigured secondaries each
+        // self-promoted as a lone survivor and reported clean exits while the
+        // bring-up had in fact failed). With no evidence there is nothing to
+        // rescue; the unconfigured deadline owns the give-up, which surfaces
+        // the honest `BringUpFailed` non-zero exit.
+        if members.is_empty() {
+            if let Some(suppressed) = self.setup_election_seedless_warn.permit() {
+                tracing::warn!(
+                    secondary = %self_id,
+                    silent_secs = silent_for.as_secs(),
+                    suppressed_since_last_warn = suppressed,
+                    "primary silent past the setup-election threshold but this \
+                     node holds ZERO membership evidence (never welcomed; no \
+                     alive mesh-member peers to seed a quorum from) — NOT \
+                     arming a setup-phase election; the unconfigured deadline \
+                     owns the give-up (non-zero exit)"
+                );
+            }
+            return;
+        }
         let mut peer_keepalives: HashMap<String, Instant> = HashMap::new();
         for id in members {
             peer_keepalives.insert(id, now);
