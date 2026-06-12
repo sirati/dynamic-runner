@@ -1415,6 +1415,7 @@ async fn warn_dropped_decode_is_repulled_and_converges_via_recovery() {
                             sender_id: "promoted-sec".into(),
                             timestamp: 0.0,
                             digest: ahead_digest,
+                            sender_is_observer: false,
                         })
                         .expect("inbound open");
 
@@ -1542,6 +1543,7 @@ async fn recovery_cadence_quiesces_when_converged() {
                                 sender_id: "promoted-sec".into(),
                                 timestamp: 0.0,
                                 digest: converged_digest,
+                                sender_is_observer: false,
                             });
                         }
                     });
@@ -1621,10 +1623,10 @@ async fn peer_digests_pruned_on_peer_removed() {
             // Two recorded last-seen digests, one of which is about to depart.
             observer
                 .peer_digests
-                .insert("departing-sec".to_string(), StateDigest::default());
+                .insert("departing-sec".to_string(), (false, StateDigest::default()));
             observer
                 .peer_digests
-                .insert("live-sec".to_string(), StateDigest::default());
+                .insert("live-sec".to_string(), (false, StateDigest::default()));
 
             let mut primary_last_seen = std::time::Instant::now();
             observer.on_cluster_mutation(

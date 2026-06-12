@@ -594,6 +594,7 @@ async fn redialed_bootstrap_wire_reregisters_on_first_frame_and_receives_broadca
                 sender_id: "sec-0".into(),
                 timestamp: 4.0,
                 digest: WireDigest::default(),
+                sender_is_observer: false,
             };
             let mut reregistered = false;
             'outer: for _ in 0..50 {

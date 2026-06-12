@@ -777,6 +777,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         &self.config.node_id,
                         crate::primary::wire::timestamp_now(),
                         digest,
+                        // A PrimaryCoordinator is never an observer.
+                        false,
                     );
                     let _ = self
                         .send_to(

@@ -102,6 +102,9 @@ fn roundtrip_state_digest_payload() {
         sender_id: "sec-7".into(),
         timestamp: 1234.5,
         digest,
+        // The sender's declared role must survive the wire so a pull
+        // directed at it can be typed off its role (the addressing fix).
+        sender_is_observer: true,
     };
 
     let bytes = serialize_message(&msg).unwrap();
@@ -112,11 +115,72 @@ fn roundtrip_state_digest_payload() {
         DistributedMessage::StateDigest {
             sender_id,
             digest: decoded_digest,
+            sender_is_observer,
             ..
         } => {
             assert_eq!(sender_id, "sec-7");
             assert_eq!(decoded_digest, digest);
+            assert!(
+                sender_is_observer,
+                "the sender's declared-observer bit must round-trip on the wire"
+            );
         }
+        _ => panic!("expected StateDigest"),
+    }
+}
+
+/// Wire-shape mirror + backcompat: a `StateDigest` from a pre-field sender
+/// (the `sender_is_observer` key absent entirely, the digest minimal)
+/// decodes with `sender_is_observer == false` — the conservative
+/// compute-role shape. `#[serde(default)]` keeps a rolling upgrade working:
+/// a legacy sender's pull-target typing falls back to `Secondary`, and the
+/// receiver-side id==self fan covers the residual mis-type without noise.
+/// Decoding the OTHER side's literal bytes (not a re-encode of our own
+/// value) catches a tag/field rename that still round-trips against itself.
+#[test]
+fn legacy_state_digest_without_sender_is_observer_decodes_false() {
+    let bytes = r#"{"msg_type":"state_digest","sender_id":"sec-1","timestamp":0.0,"digest":{}}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(bytes).unwrap();
+    match decoded {
+        DistributedMessage::StateDigest {
+            sender_id,
+            sender_is_observer,
+            ..
+        } => {
+            assert_eq!(sender_id, "sec-1");
+            assert!(
+                !sender_is_observer,
+                "a pre-field sender must decode as non-observer (the conservative shape)"
+            );
+        }
+        _ => panic!("expected StateDigest"),
+    }
+}
+
+/// Mirror the OTHER direction: a sender that DOES stamp the field emits
+/// `"sender_is_observer":true` and a peer decodes it verbatim — the
+/// observer-typed pull path. Pins that the encoder writes the field (it is
+/// not `skip_serializing`) so an observer sender's role actually reaches
+/// the wire for the puller to mirror.
+#[test]
+fn state_digest_observer_sender_bit_is_on_the_wire() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::StateDigest {
+        target: None,
+        sender_id: "obs-1".into(),
+        timestamp: 0.0,
+        digest: StateDigest::default(),
+        sender_is_observer: true,
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(
+        json.contains("\"sender_is_observer\":true"),
+        "the observer sender's role bit must be emitted on the wire, got: {json}"
+    );
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(&json).unwrap();
+    match decoded {
+        DistributedMessage::StateDigest {
+            sender_is_observer, ..
+        } => assert!(sender_is_observer),
         _ => panic!("expected StateDigest"),
     }
 }

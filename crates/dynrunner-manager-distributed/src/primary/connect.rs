@@ -133,6 +133,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         &self.config.node_id,
                         super::wire::timestamp_now(),
                         digest,
+                        // A PrimaryCoordinator is never an observer.
+                        false,
                     );
                     if let Err(error) = self
                         .send_to(

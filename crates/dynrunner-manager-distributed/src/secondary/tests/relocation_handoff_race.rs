@@ -100,6 +100,7 @@ async fn fake_relocated_observer(
                 sender_id: "setup".into(),
                 timestamp: 0.0,
                 digest: donor.digest(),
+                sender_is_observer: false,
             })
             .unwrap();
         // Answer exactly one snapshot pull from this round's donor state.
@@ -531,6 +532,7 @@ async fn registration_gated_observer(
                 sender_id: "setup".into(),
                 timestamp: 0.0,
                 digest: donor.digest(),
+                sender_is_observer: false,
             })
             .unwrap();
         loop {
