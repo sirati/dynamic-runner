@@ -479,6 +479,39 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         Err(RunError::DuplicateTaskIdPrePhase { reason })
     }
 
+    /// Broadcast the pending consumer `on_run_start`-raise abort, if one
+    /// was recorded on the promoted-primary path.
+    ///
+    /// The pyo3 promotion recipe fires `on_run_start` synchronously BEFORE
+    /// `run_consuming`; on a raise it records the reason via
+    /// `PrimaryCoordinator::record_pre_run_hook_abort`. Called from
+    /// `run_pipeline` AFTER `wait_for_connections` (the same post-connection
+    /// abort gate as `fire_pending_run_abort`), so the `RunAborted` broadcast
+    /// reaches the connected secondaries — they exit their setup-wait on the
+    /// replicated verdict instead of their deadline, and the observer receives
+    /// it. Returns `Err(RunError::FatalPolicyExit)` so the primary's own PyO3
+    /// boundary surfaces a non-zero exit (the SAME deliberate consumer-policy
+    /// abort an `on_phase_end` raise surfaces); `Ok(())` when no abort is
+    /// pending (the clean path AND every cold-start / non-raising promotion,
+    /// where the directive is `None`). Detected BEFORE the operational loop, so
+    /// — like `fire_pending_run_abort` — the abort is the broadcast + the typed
+    /// return, NOT an `emit_run_fail_signal` (no loop is running to drain the
+    /// worker-management bus). Single read of `pre_run_hook_abort`.
+    pub(crate) async fn fire_pre_run_hook_abort(&mut self) -> Result<(), RunError> {
+        let Some(reason) = self.pre_run_hook_abort.take() else {
+            return Ok(());
+        };
+        tracing::error!(
+            reason = %reason,
+            "consumer on_run_start raised on the promoted primary; aborting run"
+        );
+        self.broadcast_terminal_verdict(ClusterMutation::RunAborted {
+            reason: reason.clone(),
+        })
+        .await;
+        Err(RunError::FatalPolicyExit { reason })
+    }
+
     /// Abort the run on an INVALID COMPOSED GRAPH surfaced by the
     /// authoritative pool builder (`hydrate_from_cluster_state` returned
     /// `Err`) during bring-up.

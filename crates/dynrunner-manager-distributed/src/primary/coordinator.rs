@@ -1190,6 +1190,23 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// abort gate (same discipline as `panik_outcome`).
     pub(super) pending_run_abort: Option<String>,
 
+    /// Set when the consumer's `on_run_start` lifecycle hook RAISED on
+    /// the promoted-primary path (the pyo3 promotion recipe fires the
+    /// hook synchronously BEFORE `run_consuming`, then records the raise
+    /// here via [`Self::record_pre_run_hook_abort`]). Carries the raise
+    /// reason. The bootstrap proceeds far enough to connect secondaries
+    /// (so the `RunAborted` broadcast reaches them), then `run_pipeline`
+    /// reads this at the post-connection abort gate
+    /// ([`crate::primary::ingest`]'s `fire_pre_run_hook_abort`),
+    /// broadcasts `ClusterMutation::RunAborted { reason }`, and returns
+    /// `RunError::FatalPolicyExit` — a deliberate consumer-policy abort,
+    /// the SAME terminal an `on_phase_end` raise surfaces (the cold-start
+    /// path already `?`-propagates an `on_run_start` raise out before
+    /// `run()`; this is the promoted-path twin). `None` when the hook
+    /// did not raise (or was never fired). Write-only at the pre-run hook
+    /// fire, read-once at the abort gate.
+    pub(super) pre_run_hook_abort: Option<String>,
+
     /// OOM-bucket dispatch-shape gate. `true` only while a per-phase
     /// OOM retry bucket is actively reinjecting and draining; `false`
     /// otherwise. The retry-bucket primitive
@@ -1450,6 +1467,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             worker_mgmt_rx: Some(worker_mgmt_rx),
             worker_mgmt_fail_outcome: None,
             pending_run_abort: None,
+            pre_run_hook_abort: None,
             single_worker_mode: false,
             recon_prober,
             forwarded_argv,
@@ -2056,6 +2074,37 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// [`on_phase_end`]: Self::on_phase_end
     pub fn set_phase_hook_raise_latch(&mut self, latch: PhaseHookRaiseLatch) {
         self.phase_hook_raise_latch = latch;
+    }
+
+    /// Record that the consumer's `on_run_start` lifecycle hook RAISED on
+    /// the promoted-primary path, so the run surfaces a fatal exit
+    /// instead of absorbing the failure into a false-green completion.
+    ///
+    /// Pre-run setter (same contract as the other `set_*` installers):
+    /// the pyo3 promotion recipe fires `on_run_start` synchronously
+    /// BEFORE `run_consuming` and, on a raise, calls this with the raise
+    /// reason. `run_pipeline` reads it once at the post-connection abort
+    /// gate (`fire_pre_run_hook_abort`), broadcasts the replicated
+    /// `RunAborted` verdict to the connected fleet, and returns
+    /// `RunError::FatalPolicyExit` — the SAME deliberate consumer-policy
+    /// abort an `on_phase_end` raise surfaces, and the promoted-path twin
+    /// of the cold-start path's `?`-propagation of an `on_run_start`
+    /// raise out before `run()`. First-write-wins (idempotent): a second
+    /// record in the same run does not overwrite the originating cause.
+    pub fn record_pre_run_hook_abort(&mut self, reason: String) {
+        if self.pre_run_hook_abort.is_none() {
+            self.pre_run_hook_abort = Some(reason);
+        }
+    }
+
+    /// The pending consumer pre-run hook abort reason, if one was recorded
+    /// (the directive the abort gate `fire_pre_run_hook_abort` consumes).
+    /// Lets the caller that installed the directive confirm it landed
+    /// before handing the coordinator off to `run_consuming` — the pyo3
+    /// promotion recipe reads it back to prove a raising `on_run_start`
+    /// reached the coordinator rather than being absorbed.
+    pub fn pending_pre_run_hook_abort(&self) -> Option<&str> {
+        self.pre_run_hook_abort.as_deref()
     }
 
     /// Install the consumer custom-message hook (F5) BEFORE `run` (the
@@ -3739,6 +3788,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // would silently strand the doomed run. Hard cluster shutdown — short-
         // circuits before mesh formation, relocation, seeding, or assignment.
         self.fire_pending_run_abort().await?;
+
+        // Consumer `on_run_start`-raise abort gate (UNCONDITIONAL, must precede
+        // the role branch — same placement rationale as `fire_pending_run_abort`
+        // above). The pyo3 promotion recipe fired `on_run_start` BEFORE
+        // `run_consuming` and, on a raise, recorded the reason
+        // (`record_pre_run_hook_abort`); fire it HERE — the first point the
+        // secondaries are connected — so the `RunAborted` broadcast reaches them.
+        // Returns `Err(RunError::FatalPolicyExit)` on the abort path (the
+        // primary's PyO3 boundary surfaces a non-zero exit); a no-op on the clean
+        // path AND on every cold-start / non-raising promotion (the directive is
+        // `None`). The promoted-path twin of the cold-start path's `?`-propagation
+        // of an `on_run_start` raise out before `run()`.
+        self.fire_pre_run_hook_abort().await?;
 
         // ── Peer-mesh formation (UNCONDITIONAL — both roles need a routable
         // mesh). `send_peer_lists` fans out `PeerInfo`; the Node mesh-pump
