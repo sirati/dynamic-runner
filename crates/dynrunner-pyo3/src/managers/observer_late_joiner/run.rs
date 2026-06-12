@@ -6,10 +6,9 @@ use std::time::Duration;
 
 use pyo3::prelude::*;
 
+use dynrunner_manager_distributed::GracefulAbortTrigger;
 use dynrunner_manager_distributed::cluster_state::{ClusterState, ClusterStateSnapshot};
-use dynrunner_manager_distributed::observer::{
-    GracefulAbortTrigger, ObserverConfig, build_cold_join_observer,
-};
+use dynrunner_manager_distributed::observer::{ObserverConfig, build_cold_join_observer};
 use dynrunner_manager_distributed::primary::RunError;
 use dynrunner_manager_distributed::process::{LocalRole, Mesh, Node, NodeRunInputs, RunTerminal};
 use dynrunner_protocol_primary_secondary::address::PeerId;

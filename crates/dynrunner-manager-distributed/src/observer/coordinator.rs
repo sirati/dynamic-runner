@@ -84,7 +84,7 @@ use crate::cluster_state::ClusterState;
 use crate::observer::announcer::{AnnouncerOutboxItem, PeerMeshAnnouncerSender};
 use crate::observer::failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 use crate::observer::fleet_death::{FleetDeathDetector, FleetDeathVerdict};
-use crate::observer::graceful_abort_trigger::GracefulAbortTrigger;
+use crate::graceful_abort_trigger::GracefulAbortTrigger;
 use crate::observer::lifecycle::{AnnouncerHandle, attach_observer_announcer};
 use crate::observer::lost_visibility::{
     EndedOutage, LostVisibilityReporter, MeshLiveness, RetryDirective, Visibility, WakeNoteSlot,
@@ -205,6 +205,15 @@ where
     /// provider supplied — the observer never names ssh. See
     /// [`crate::observer::reconnect`].
     pub reconnector: ReconnectorHandle,
+    /// The operator's SIGUSR2 graceful-abort trigger the relocating primary
+    /// held (armed once at process entry). Carried so the SAME stream drives
+    /// the standalone observer's graceful-abort arm — a SIGUSR2 latched
+    /// during the primary tenure surfaces on the observer's first poll, and
+    /// the relocated observer keeps responding to operator SIGUSR2 instead of
+    /// dying on the kernel default. `None` when the relocating primary was
+    /// never injected one (`from_handoff` then leaves the observer to its own
+    /// cold-join arm). See [`crate::graceful_abort_trigger`].
+    pub graceful_abort_trigger: Option<crate::GracefulAbortTrigger>,
     /// The respawn EXECUTION provider (SLURM job-manager bridge /
     /// multi-process child registry) this PROCESS hosts. The provider
     /// belongs to the process, not the role: the relocated submitter
@@ -327,6 +336,15 @@ where
     /// is nothing for the observer to drive. The observer NEVER owns ssh —
     /// it calls `reconnect(roster)`; see [`crate::observer::reconnect`].
     reconnector: ReconnectorHandle,
+    /// Single-flight latch for the spawned reconnect call. A reconnect
+    /// over a roster with dead peers can run for MINUTES (each dead
+    /// id's rebuild burns its ssh establishment budget); the ~60s
+    /// lost-visibility cadence must not pile a fresh detached
+    /// `reconnect(roster)` on top of a still-running one — overlapping
+    /// calls raced each other's release+rebind on the SAME tunnel
+    /// ports (specimen 1 of run_20260611_200548). `Rc<Cell<_>>`: the
+    /// coordinator and its spawned task live on one `LocalSet` thread.
+    reconnect_in_flight: std::rc::Rc<std::cell::Cell<bool>>,
     /// The respawn EXECUTION provider this PROCESS hosts (`Some` only on
     /// the relocated-submitter path — the provider rides the
     /// [`ObserverHandoff`] across the demotion; cold-join observers host
@@ -355,7 +373,7 @@ where
     /// The operator's SIGUSR2 graceful-abort trigger. `Some` when the
     /// entry path pre-armed it (the late-joiner arms BEFORE its bootstrap
     /// rendezvous so a pre-seat signal is latched instead of killing the
-    /// process — see [`crate::observer::graceful_abort_trigger`]); `None`
+    /// process — see [`crate::graceful_abort_trigger`]); `None`
     /// → [`Self::run`] arms at loop start (every other path's behaviour).
     /// Either way the run loop consumes the SAME trigger, so a buffered
     /// pre-seat delivery is serviced exactly like a post-seat one.
@@ -464,6 +482,7 @@ where
             lifecycle_dispatcher_handle,
             holdings,
             reconnector,
+            graceful_abort_trigger,
             respawn_provider,
         } = handoff;
         // Respawn-exec outbox (see the field docs): created at
@@ -509,13 +528,20 @@ where
             ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             wake_note: WakeNoteSlot::default(),
             reconnector,
+            reconnect_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
             // The provider this process kept across its demotion (None
             // when the run's respawn policy is disabled).
             respawn_provider,
             respawn_exec: std::collections::HashMap::new(),
             respawn_exec_tx,
             respawn_exec_rx: Some(respawn_exec_rx),
-            graceful_abort_trigger: None,
+            // Carry the relocating primary's pre-armed SIGUSR2 trigger
+            // across, so the observer's run loop consumes the SAME stream
+            // (latched pre-relocation deliveries surface on its first poll;
+            // the relocated observer keeps responding to operator SIGUSR2).
+            // `None` when the primary was never injected one — the observer's
+            // own `run`-start arm then takes over (the cold-join behaviour).
+            graceful_abort_trigger,
         }
     }
 
@@ -576,6 +602,7 @@ where
             ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             wake_note: WakeNoteSlot::default(),
             reconnector,
+            reconnect_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
             // Cold-join observers (late-joiner consoles) host no respawn
             // provider; the submitter/observer process is the only
             // provider host and always arrives via `from_handoff`.
@@ -1373,6 +1400,19 @@ where
         let Some(reconnector) = self.reconnector.clone() else {
             return;
         };
+        // SINGLE-FLIGHT: a reconnect over a roster with dead peers can run
+        // for minutes (each dead id's rebuild burns its ssh establishment
+        // budget). Piling a fresh detached call onto a still-running one
+        // every ~60s cadence tick made the overlapping calls race each
+        // other's release+rebind on the SAME tunnel ports — the next
+        // cadence tick after completion retries instead.
+        if self.reconnect_in_flight.get() {
+            tracing::debug!(
+                "observer reconnect still in flight; skipping this cadence tick \
+                 (the next tick after it completes retries)"
+            );
+            return;
+        }
         let mut roster: HashSet<String> = self
             .cluster_state
             .alive_secondary_members()
@@ -1381,20 +1421,70 @@ where
         if let Some(p) = self.cluster_state.current_primary() {
             roster.insert(p.to_owned());
         }
+        // PER-LEG honesty: the reconnector's contract is "the ids I have
+        // LOST". Run-level visibility can be lost for reasons unrelated to
+        // a given leg (a silent named primary, dead sibling peers), so the
+        // roster is filtered by each leg's OWN delivery freshness — a peer
+        // whose frames are arriving is not lost, and handing it over would
+        // make the provider's half-dead escalation force-rebuild a WORKING
+        // tunnel every K ticks (tearing down the only live legs — the
+        // run_20260611_200548 probe churn). The judgment keys on the
+        // inbox's per-peer ingest clocks, never the aggregate verdict.
+        let delivering: Vec<String> = roster
+            .iter()
+            .filter(|id| self.leg_recently_delivered(id))
+            .cloned()
+            .collect();
+        for id in &delivering {
+            roster.remove(id);
+        }
         if roster.is_empty() {
             tracing::debug!(
-                "observer reconnect due but no known roster yet; nothing to rebuild this tick"
+                excluded_delivering = ?delivering,
+                "observer reconnect due but every roster leg is delivering \
+                 (or no roster is known yet); nothing to rebuild this tick"
             );
             return;
         }
         let peer_ids: Vec<String> = roster.into_iter().collect();
         tracing::info!(
             peers = peer_ids.len(),
+            excluded_delivering = ?delivering,
             "observer triggering tunnel rebuild for lost roster (BUG-B reconnect)"
         );
+        self.reconnect_in_flight.set(true);
+        let in_flight = std::rc::Rc::clone(&self.reconnect_in_flight);
         tokio::task::spawn_local(async move {
+            // Reset on EVERY exit of the spawned call — completion,
+            // cancellation (LocalSet teardown), or a panicking
+            // reconnector — so the latch can never stick shut.
+            struct ResetOnDrop(std::rc::Rc<std::cell::Cell<bool>>);
+            impl Drop for ResetOnDrop {
+                fn drop(&mut self) {
+                    self.0.set(false);
+                }
+            }
+            let _reset = ResetOnDrop(in_flight);
             reconnector.reconnect(&peer_ids).await;
         });
+    }
+
+    /// Whether `peer_id`'s leg has DELIVERED a frame recently — the
+    /// per-leg liveness the reconnect roster keys on. Reads the inbox's
+    /// per-peer ingest clocks (slot delivery + the transport arrival
+    /// edge, whichever is fresher) against the same
+    /// [`ObserverConfig::peer_timeout`] silence threshold the
+    /// named-primary visibility check uses: a leg silent past it is
+    /// rebuild-eligible (covers the wired-but-blackholed wire, which
+    /// `has_peer` would wrongly call healthy); anything fresher is a
+    /// working leg the reconnector must not touch.
+    fn leg_recently_delivered(&self, peer_id: &str) -> bool {
+        let now = std::time::Instant::now();
+        let fresh = |t: Option<std::time::Instant>| {
+            t.is_some_and(|t| now.duration_since(t) < self.config.peer_timeout)
+        };
+        fresh(self.inbox.last_ingest_from(peer_id))
+            || fresh(self.inbox.last_transport_arrival_from(peer_id))
     }
 
     /// Dispatch one inbound mesh frame. Apply-only: the observer mirrors

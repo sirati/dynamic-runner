@@ -4,22 +4,33 @@
 //!
 //! Own the process lifecycle of the SIGUSR2 operator channel: install the
 //! handler (which takes the signal off its default terminate-the-process
-//! disposition), latch deliveries, and hand them to the ONE consumer — the
-//! observer run loop's graceful-abort arm. There is exactly one
+//! disposition), latch deliveries, and hand them to the ONE active role
+//! loop's graceful-abort arm. There is exactly one
 //! `SignalKind::user_defined2()` stream per process, owned here; nobody
 //! else may create one (two listeners on one signal would race the latch).
 //!
+//! Which loop consumes it depends on the role the process is currently
+//! running, NOT on this module: a primary that receives SIGUSR2 IS the
+//! abort authority — its arm short-circuits straight into the same
+//! graceful-abort latch the wire `GracefulAbortRequest` handler drives — and
+//! an observer's arm sends a `GracefulAbortRequest` to the recognized
+//! primary. The trigger is armed ONCE at process entry and handed to whoever
+//! is running; a submitter relocation (primary tenure → observer
+//! `from_handoff`) carries the SAME trigger across, so a delivery latched
+//! during the primary tenure surfaces on the relocated observer's first poll.
+//!
 //! # Why arming is split from consumption
 //!
-//! The handler used to be installed inside the observer run loop, so every
-//! moment between process start and the observer seating left SIGUSR2 on
-//! its kernel default — terminate. A late-joiner that received the
-//! CLI-documented graceful-abort signal during its bootstrap window (after
-//! transport bring-up, before `join_running_cluster` returned) died
-//! instantly with zero narration. [`GracefulAbortTrigger::arm`] at process
-//! entry makes that window survivable: the tokio signal stream LATCHES a
-//! delivery received while nobody is consuming, so a pre-seat request is
-//! picked up by the run loop's first poll exactly like a post-seat one.
+//! The handler used to be installed inside each role's run loop, so every
+//! moment between process start and the loop seating left SIGUSR2 on its
+//! kernel default — terminate. A node that received the CLI-documented
+//! graceful-abort signal during its bootstrap window (transport bring-up, a
+//! late-joiner's `join_running_cluster`, a submitter primary's relocation
+//! rendezvous) died instantly with zero narration.
+//! [`GracefulAbortTrigger::arm`] at process entry makes that window
+//! survivable: the tokio signal stream LATCHES a delivery received while
+//! nobody is consuming, so a pre-seat request is picked up by the active
+//! loop's first poll exactly like a post-seat one.
 //!
 //! # Module boundary
 //!
@@ -27,9 +38,11 @@
 //!   handler) as early as a tokio runtime exists, BEFORE any bootstrap
 //!   step that can block. Requires an active runtime with IO/signal
 //!   drivers enabled.
-//! * `ObserverCoordinator::set_graceful_abort_trigger` — inject the
-//!   pre-armed trigger; an un-injected coordinator arms at run start (the
-//!   behaviour every non-late-joiner path keeps).
+//! * `ObserverCoordinator::set_graceful_abort_trigger` /
+//!   `PrimaryCoordinator::register_graceful_abort_trigger` — inject the
+//!   pre-armed trigger into the role loop that will consume it. An
+//!   un-injected observer arms at run start (the cold-join behaviour); an
+//!   un-injected primary parks its arm (it never self-arms a second stream).
 //! * [`GracefulAbortTrigger::recv`] — the run loop's cancel-safe
 //!   consumption arm.
 //! * [`GracefulAbortTrigger::report_undelivered`] — the failed-bootstrap

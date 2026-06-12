@@ -25,6 +25,7 @@ const ARM_RESPAWN_REQUEST: usize = 6;
 const ARM_LIVENESS_PING: usize = 7;
 const ARM_RESPAWN_JOIN: usize = 8;
 const ARM_PANIK: usize = 9;
+const ARM_GRACEFUL_ABORT: usize = 10;
 
 /// Arm names, index-aligned with the `ARM_*` ids above. The render order of
 /// the compact stats line.
@@ -39,6 +40,7 @@ const OP_LOOP_ARM_NAMES: &[&str] = &[
     "liveness_ping",
     "respawn_join",
     "panik",
+    "graceful_abort",
 ];
 
 /// Render a drain-by-`MessageType` tally as a single diagnostic string:
@@ -917,6 +919,39 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             "primary operational loop exiting via panik path"
                         );
                         break;
+                    }
+                }
+                // Operator graceful-abort trigger (SIGUSR2). A PRIMARY that
+                // receives the operator's SIGUSR2 IS the abort authority — it
+                // does NOT send a `GracefulAbortRequest` to itself (the
+                // observer's arm does that); it short-circuits straight into
+                // the SAME `initiate_graceful_abort` latch the wire handler
+                // drives. Idempotent: a re-sent signal against an
+                // already-latched freeze is a NoOp.
+                //
+                // The trigger is consumed through a DISJOINT-FIELD borrow of
+                // `self.graceful_abort_trigger` (the `self.inbox.recv()`
+                // pattern), NOT taken out into a loop local: a graceful-abort
+                // relocation (`graceful_abort_tick` → `relocate_primary_to`)
+                // cancels this loop mid-flight, and a taken-out trigger would
+                // be dropped on that cancellation; left on `self`, it rides
+                // `into_observer_handoff` onto the standalone observer so the
+                // relocated node keeps responding to operator SIGUSR2.
+                // `recv() == None` (stream closed) or `None` trigger
+                // (un-injected) both PARK inside the trigger — never a
+                // hot-loop. Cancel-safety: `GracefulAbortTrigger::recv` is
+                // cancel-safe (see its doc); a sibling arm winning drops and
+                // rebuilds the recv future without losing a queued signal.
+                sig = async {
+                    match self.graceful_abort_trigger.as_mut() {
+                        Some(trigger) => trigger.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    arm_stats.record(ARM_GRACEFUL_ABORT);
+                    if sig.is_some() {
+                        let own_id = self.config.node_id.clone();
+                        self.initiate_graceful_abort(&own_id).await;
                     }
                 }
             }
