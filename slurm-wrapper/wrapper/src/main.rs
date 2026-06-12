@@ -205,7 +205,11 @@ async fn run(cfg: WrapperConfig) -> ExitCode {
     }
 
     // --- 5. pre-flight orphan sweep (generate.rs:452-489) ---
-    preflight::run(&bins.podman);
+    // Pass this wrapper's OWN scratch root so the scan excludes the one
+    // root it itself holds a `wrapper.lock` on — otherwise the liveness
+    // probe reads its own held lock back as a live sibling and suppresses
+    // the default-storage sweep (see `preflight::sweep_scratch_roots`).
+    preflight::run(&bins.podman, &layout.rndtmp);
 
     // --- 6. memory cap (generate.rs:540-569) ---
     let mem_cap = memcap::detect_memory_cap();
