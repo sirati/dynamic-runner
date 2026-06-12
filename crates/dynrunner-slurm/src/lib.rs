@@ -35,7 +35,7 @@ pub use peer_info::{
     PeerInfoVersion, ReadDirError as PeerInfoReadDirError, fetch_dir_v2 as fetch_peer_info_dir_v2,
     parse as parse_peer_info, parse_v1_uri, read_dir_v2 as read_peer_info_dir_v2,
 };
-pub use pipeline::{CleanupSteps, PipelineGuard, PipelineSteps, pkill_residual_reverse_tunnels};
+pub use pipeline::{CleanupSteps, PipelineGuard, PipelineSteps, TunnelSweepScope, sweep_residual_reverse_tunnels};
 pub use preparation::{InfoFileReader, PrepError, PreparationOptions, SlurmPreparation};
 pub use respawn::{
     SlurmPreparationTunnelEstablisher, SlurmSecondarySpawner, TunnelEstablisher,

@@ -168,6 +168,9 @@ where
             // No setup-phase election armed at construction; the setup election
             // driver in `wait_for_setup` populates this on primary-silence.
             setup_election: None,
+            setup_election_seedless_warn: crate::warn_throttle::WarnThrottle::new(
+                std::time::Duration::from_secs(60),
+            ),
             own_tick_health,
             command_rx: Some(command_rx),
             command_tx,
