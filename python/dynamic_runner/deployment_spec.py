@@ -162,7 +162,7 @@ class TaskDeploymentSpec:
     # that's operator policy. If your workload needs more than 32768
     # forks per user across all concurrent containers on a node, the
     # cluster operator must raise pam_limits' nproc and/or the SLURM
-    # cgroup's pids.max. See ``docs/MIGRATION_2026_05_PYTHON_TO_RUST.md``.
+    # cgroup's pids.max.
     #
     # Do NOT set ``--memory`` / ``--memory-swap`` here: the wrapper
     # auto-caps container memory at ``NodeRAM - 2GiB`` (probed at
