@@ -225,6 +225,53 @@ fn sort_by_key_preserves_locator_pairing() {
     }
 }
 
+/// Differential pin for the dispatch RECHECK shape: several workers in
+/// sequence each build a view and take its first item, with the takes
+/// interleaved between the view constructions (exactly what
+/// `dispatch_to_idle_workers` does per idle worker). The taken-item
+/// sequence pins the order-evolution semantics — each worker's view
+/// must observe every pin/affinity mutation the previous workers'
+/// takes performed:
+///   * worker 1 takes alpha#1 and PINS alpha — alpha leaves the typed
+///     class for everyone else;
+///   * worker 2 therefore leads with beta (the only unpinned typed
+///     bucket), takes beta#1, pins beta;
+///   * worker 3 sees no unpinned typed bucket and leads with the free
+///     pool;
+///   * worker 1's second view leads with its pin-class alpha remainder.
+/// Any view implementation that snapshots classification at recheck
+/// start (instead of per worker) breaks this sequence.
+#[test]
+fn sequential_views_with_takes_observe_pin_evolution() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t("P", "T", "alpha", 10),
+        t("P", "T", "alpha", 20),
+        t("P", "T", "beta", 30),
+        t("P", "T", "beta", 40),
+        t("P", "T", "", 50),
+        t("P", "T", "", 60),
+    ])
+    .expect("valid extend");
+
+    let mut taken = Vec::new();
+    for worker in [1, 2, 3, 1] {
+        let view = p.view_for_worker(worker, None);
+        assert!(!view.is_empty(), "worker {worker} must see candidates");
+        taken.push(p.take_from_view(view, 0).size);
+    }
+    assert_eq!(
+        taken,
+        vec![10, 30, 50, 20],
+        "the per-worker first-fit walk must observe each prior take's \
+         pin/affinity mutation"
+    );
+    // Remaining: alpha drained, beta#2 + free#2 still queued.
+    let mut left: Vec<u64> = p.iter().map(|t| t.size).collect();
+    left.sort();
+    assert_eq!(left, vec![40, 60]);
+}
+
 /// A preference predicate passed through `view_for_worker` orders items
 /// *within* a class but never lets a lower-class item overtake a
 /// higher-class one. A pin-class item with a "worst" preference score
