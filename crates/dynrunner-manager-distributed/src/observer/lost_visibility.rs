@@ -526,6 +526,18 @@ impl LostVisibilityReporter {
         self.note.flush_after_host();
     }
 
+    /// The instant of the LAST wake-stream loss emit of the CURRENT
+    /// episode, or `None` if the episode has not yet been logged on the
+    /// wake stream (or visibility is fine). The coordinator's job-ledger
+    /// consult keys on THIS clock: it consults once per wake-loss emit (so
+    /// the two-consecutive-empty double-check is one wake-loss interval
+    /// apart), detecting a fresh emit by this instant advancing — reusing
+    /// the existing wake-loss cadence rather than adding a timer. Reset to
+    /// `None` on regain.
+    pub(crate) fn wake_emit_instant(&self) -> Option<Instant> {
+        self.last_wake_emit
+    }
+
     /// Whether the reporter currently considers visibility lost. Test/
     /// diagnostic accessor — not part of any exit decision.
     #[cfg(test)]

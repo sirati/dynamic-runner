@@ -170,6 +170,17 @@ pub(crate) struct PyPrimaryCoordinator {
     pub(super) tunnel_reconnector:
         Option<Arc<dyn dynrunner_manager_distributed::observer::TunnelReconnector>>,
 
+    /// Job-ledger consult port handed to the observer at relocation
+    /// (cluster-empty terminal verdict). Parked here by the SLURM
+    /// pipeline's `drive_rust_primary`; threaded into the inner
+    /// `PrimaryCoordinator` via `set_job_ledger_probe` at `run()` start,
+    /// which carries it onto the observer tail so a relocated
+    /// submitter→observer can consult squeue for the run's job ids. `None`
+    /// for callers with no job ledger. Held Rust-to-Rust (same rationale as
+    /// `tunnel_reconnector`).
+    pub(super) job_ledger_probe:
+        Option<Arc<dyn dynrunner_manager_distributed::observer::JobLedgerProbe>>,
+
     /// Scheduler tuning forwarded into every `ResourceStealingScheduler`
     /// the coordinator constructs at `run()` start. Sourced from the
     /// caller's `scheduler_config` kwarg (defaulting via
@@ -254,5 +265,18 @@ impl PyPrimaryCoordinator {
         reconnector: Arc<dyn dynrunner_manager_distributed::observer::TunnelReconnector>,
     ) {
         self.tunnel_reconnector = Some(reconnector);
+    }
+
+    /// Park the observer's job-ledger consult port (cluster-empty terminal
+    /// verdict) so the inner `PrimaryCoordinator` carries it onto its
+    /// observer tail at relocation. Called by
+    /// `slurm::pipeline::drive_rust_primary` after `run_preparation` and
+    /// BEFORE `run()` enters. Same Rust-to-Rust hand-off as
+    /// [`Self::set_tunnel_reconnector_from_rust`].
+    pub(crate) fn set_job_ledger_probe_from_rust(
+        &mut self,
+        probe: Arc<dyn dynrunner_manager_distributed::observer::JobLedgerProbe>,
+    ) {
+        self.job_ledger_probe = Some(probe);
     }
 }
