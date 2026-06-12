@@ -1021,6 +1021,7 @@ async fn build_remote_rig() -> RemoteRig {
         holdings: std::collections::HashSet::new(),
         reconnector: None,
         respawn_provider: Some(provider.clone() as Arc<dyn SecondarySpawner>),
+        graceful_abort_trigger: None,
     };
     let mut observer = ObserverCoordinator::from_handoff(handoff);
     let obs_run = tokio::task::spawn_local(async move {

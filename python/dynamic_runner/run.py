@@ -13,6 +13,7 @@ import argparse
 import logging
 from pathlib import Path
 
+from ._fault_dumps import enable_fault_dumps
 from ._forwarded_argv import filter_framework_argv
 from ._shared import (
     print_selection_summary,
@@ -279,7 +280,19 @@ def dispatch(
     unchanged. This is the single chokepoint both framework entry points pass
     through after logging is configured, so the guarantee is composed once
     here, not special-cased per mode.
+
+    Per-process fault dumps (fatal-signal + on-demand ``SIGUSR1``) are
+    installed here too — the same call ``_secondary_bootstrap.main`` makes for
+    a mesh-launched secondary, but for the CLI main paths (submitter,
+    late-joiner observer, local) that ``_secondary_bootstrap`` never runs.
+    Without it the documented operator ``kill -USR1`` (frame dump) lands on
+    SIGUSR1's default disposition and KILLS the main process instead of
+    dumping. Installed at this single chokepoint so every dispatch route
+    inherits it; ``args._boot_argv`` resolves the ``--full-log-dir`` dump
+    target exactly as the secondary's bootstrap argv does (else ``stderr``).
+    Best-effort by the ``_fault_dumps`` contract — it can never break dispatch.
     """
+    enable_fault_dumps(list(getattr(args, "_boot_argv", [])))
     with surface_fatal_errors():
         _dispatch_route(task, args, deployment)
 

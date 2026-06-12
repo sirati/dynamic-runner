@@ -84,7 +84,7 @@ use crate::cluster_state::ClusterState;
 use crate::observer::announcer::{AnnouncerOutboxItem, PeerMeshAnnouncerSender};
 use crate::observer::failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 use crate::observer::fleet_death::{FleetDeathDetector, FleetDeathVerdict};
-use crate::observer::graceful_abort_trigger::GracefulAbortTrigger;
+use crate::graceful_abort_trigger::GracefulAbortTrigger;
 use crate::observer::lifecycle::{AnnouncerHandle, attach_observer_announcer};
 use crate::observer::lost_visibility::{
     EndedOutage, LostVisibilityReporter, MeshLiveness, RetryDirective, Visibility, WakeNoteSlot,
@@ -205,6 +205,15 @@ where
     /// provider supplied — the observer never names ssh. See
     /// [`crate::observer::reconnect`].
     pub reconnector: ReconnectorHandle,
+    /// The operator's SIGUSR2 graceful-abort trigger the relocating primary
+    /// held (armed once at process entry). Carried so the SAME stream drives
+    /// the standalone observer's graceful-abort arm — a SIGUSR2 latched
+    /// during the primary tenure surfaces on the observer's first poll, and
+    /// the relocated observer keeps responding to operator SIGUSR2 instead of
+    /// dying on the kernel default. `None` when the relocating primary was
+    /// never injected one (`from_handoff` then leaves the observer to its own
+    /// cold-join arm). See [`crate::graceful_abort_trigger`].
+    pub graceful_abort_trigger: Option<crate::GracefulAbortTrigger>,
     /// The respawn EXECUTION provider (SLURM job-manager bridge /
     /// multi-process child registry) this PROCESS hosts. The provider
     /// belongs to the process, not the role: the relocated submitter
@@ -364,7 +373,7 @@ where
     /// The operator's SIGUSR2 graceful-abort trigger. `Some` when the
     /// entry path pre-armed it (the late-joiner arms BEFORE its bootstrap
     /// rendezvous so a pre-seat signal is latched instead of killing the
-    /// process — see [`crate::observer::graceful_abort_trigger`]); `None`
+    /// process — see [`crate::graceful_abort_trigger`]); `None`
     /// → [`Self::run`] arms at loop start (every other path's behaviour).
     /// Either way the run loop consumes the SAME trigger, so a buffered
     /// pre-seat delivery is serviced exactly like a post-seat one.
@@ -473,6 +482,7 @@ where
             lifecycle_dispatcher_handle,
             holdings,
             reconnector,
+            graceful_abort_trigger,
             respawn_provider,
         } = handoff;
         // Respawn-exec outbox (see the field docs): created at
@@ -525,7 +535,13 @@ where
             respawn_exec: std::collections::HashMap::new(),
             respawn_exec_tx,
             respawn_exec_rx: Some(respawn_exec_rx),
-            graceful_abort_trigger: None,
+            // Carry the relocating primary's pre-armed SIGUSR2 trigger
+            // across, so the observer's run loop consumes the SAME stream
+            // (latched pre-relocation deliveries surface on its first poll;
+            // the relocated observer keeps responding to operator SIGUSR2).
+            // `None` when the primary was never injected one — the observer's
+            // own `run`-start arm then takes over (the cold-join behaviour).
+            graceful_abort_trigger,
         }
     }
 
