@@ -1,11 +1,15 @@
 //! Python adapter for [`dynrunner_slurm::preparation`].
 //!
 //! Owned concern: bridge the Rust SSH-reverse-tunnel watcher state
-//! machine to Python. The Python `SlurmPreparation` class delegates
-//! `_setup_ssh_tunnels` and `cleanup` here; everything above (image
-//! build, job submit, run-id bookkeeping) stays in Python because
-//! it composes other higher-level Python objects. Single concern at
-//! the bridge: spawn watchers, gather under timeout, teardown.
+//! machine to Python — start the cohort's INCREMENTAL tunnel
+//! establishment on a background driver thread (so the pipeline
+//! proceeds to the welcome-accepting primary while tunnels are still
+//! materializing), and tear everything down on `cleanup`. Everything
+//! above (image build, job submit, run-id bookkeeping) stays in the
+//! pipeline orchestrator because it composes other higher-level
+//! objects. Single concern at the bridge: own the driver thread's
+//! runtime + cancellation; the establishment semantics live in
+//! [`dynrunner_slurm::preparation::SlurmPreparation::run_tunnel_cohort`].
 //!
 //! The InfoFileReader bridge calls back into the Python gateway's
 //! `execute_command(f"cat {path}")` — single source of truth for
@@ -95,15 +99,17 @@ impl InfoFileReader for PyGatewayReader {
     }
 }
 
-/// Python-facing tunnel-lifecycle manager. The Python `SlurmPreparation`
-/// thin shim instantiates one of these per-run and delegates
-/// `_setup_ssh_tunnels` + `cleanup` to it.
+/// Python-facing tunnel-lifecycle manager. The pipeline orchestrator
+/// (`run_preparation`) instantiates one per-run, calls
+/// [`Self::start_ssh_tunnels`] (background, non-blocking) and hands
+/// the instance to the `CleanupGuard`, whose teardown calls
+/// [`Self::cleanup`].
 ///
-/// Send-safe: both fields are `Send` (`SlurmPreparation` holds only
+/// Send-safe: all fields are `Send` (`SlurmPreparation` holds only
 /// owned plain data + `Arc<Mutex<...>>`; `Py<PyAny>` is unconditionally
-/// `Send` per pyo3). Cross-thread use is intentional — the Python
-/// shim drives `setup_ssh_tunnels` via `asyncio.to_thread` so the
-/// surrounding event loop keeps cooperating during the 600s deadline.
+/// `Send` per pyo3; the driver handle is plain thread bookkeeping).
+/// Cross-thread use is intentional — the cohort driver runs on its own
+/// OS thread.
 #[pyclass(name = "RustSlurmPreparation")]
 pub(crate) struct PySlurmPreparation {
     /// Held as `Arc<SlurmPreparation>` so respawn callers (the SLURM
@@ -120,6 +126,27 @@ pub(crate) struct PySlurmPreparation {
     /// sites.
     inner: std::sync::Arc<SlurmPreparation>,
     gateway: Py<PyAny>,
+    /// The background cohort-establishment driver started by
+    /// [`Self::start_ssh_tunnels`]: its OS-thread handle plus the
+    /// cancellation signal [`Self::cleanup`] fires before joining.
+    /// `None` until started (and again after cleanup took it). Plain
+    /// `StdMutex` — held only for the synchronous take/replace, never
+    /// across an await.
+    cohort_driver: std::sync::Mutex<Option<CohortDriver>>,
+}
+
+/// Handle to the in-flight background tunnel-cohort driver thread.
+///
+/// The thread owns a dedicated current-thread tokio runtime + LocalSet
+/// driving `SlurmPreparation::run_tunnel_cohort` — which, by contract,
+/// runs until every member established or the future is dropped. The
+/// `cancel` notify races the cohort inside a `select!`, so firing it
+/// drops the cohort future (JoinSet abort; `kill_on_drop` reaps
+/// un-committed ssh children; committed ones stay in the shared stores
+/// for the subsequent `SlurmPreparation::cleanup` drain).
+struct CohortDriver {
+    thread: std::thread::JoinHandle<()>,
+    cancel: std::sync::Arc<tokio::sync::Notify>,
 }
 
 #[pymethods]
@@ -149,7 +176,7 @@ impl PySlurmPreparation {
         establishment_per_tunnel_timeout_secs = None,
     ))]
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub(crate) fn new(
         gateway: Py<PyAny>,
         run_log_dir: String,
         gateway_host: String,
@@ -204,52 +231,118 @@ impl PySlurmPreparation {
         Ok(Self {
             inner: std::sync::Arc::new(SlurmPreparation::new(opts)),
             gateway,
+            cohort_driver: std::sync::Mutex::new(None),
         })
     }
 
-    /// Spawn one watcher per secondary, gather all readiness reports
-    /// under the configured timeout, return the populated
-    /// `secondary_id -> tunnel_port` map. Raises:
-    /// - `TimeoutError` on outer deadline
-    /// - `RuntimeError` for ssh-tunnel-failure / IO / parse errors
-    fn setup_ssh_tunnels(
+    /// Start the cohort's reverse-tunnel establishment in the
+    /// BACKGROUND and return immediately — the bring-up shape that
+    /// keeps the pipeline moving to the welcome-accepting primary
+    /// while tunnels materialize per-member (see
+    /// [`SlurmPreparation::run_tunnel_cohort`] for the incremental /
+    /// late-join semantics; one PENDING SLURM job must never hold the
+    /// primary's bind — and with it all welcome service — hostage).
+    ///
+    /// The driver is a dedicated OS thread owning a current-thread
+    /// tokio runtime + LocalSet (the watchers use `spawn_local`); the
+    /// gateway reader re-acquires the GIL only for its short
+    /// `execute_command` polls on a blocking thread. [`Self::cleanup`]
+    /// cancels + joins the driver before draining the tunnels.
+    ///
+    /// Raises `RuntimeError` on a double start — one cohort per
+    /// preparation instance.
+    pub(crate) fn start_ssh_tunnels(
         &self,
         py: Python<'_>,
         num_secondaries: usize,
         primary_quic_port: u16,
-    ) -> PyResult<Py<PyDict>> {
+    ) -> PyResult<()> {
+        let mut slot = self
+            .cohort_driver
+            .lock()
+            .expect("cohort_driver mutex poisoned");
+        if slot.is_some() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "ssh tunnel setup already started for this preparation instance",
+            ));
+        }
+
         let reader = PyGatewayReader::new(self.gateway.clone_ref(py));
-        // `SlurmPreparation::setup_ssh_tunnels` is `&self` (every
+        // `SlurmPreparation::run_tunnel_cohort` is `&self` (every
         // mutating field is interior-mutable under
         // `Arc<Mutex<...>>` / `StdMutex<...>`), so the Arc clone
-        // gives us a `'static`-friendly handle without taking out
-        // the GIL-pinned `&mut self` borrow.
+        // gives the driver thread a `'static` handle to the SAME
+        // instance the respawn / reconnect / cleanup paths share.
         let inner = std::sync::Arc::clone(&self.inner);
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        let cancel_bg = std::sync::Arc::clone(&cancel);
 
-        let result: Result<std::collections::HashMap<String, u16>, PrepError> = py.detach(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(PrepError::Io)?;
-            let local = tokio::task::LocalSet::new();
-            rt.block_on(local.run_until(async {
-                inner
-                    .setup_ssh_tunnels(reader, num_secondaries, primary_quic_port)
-                    .await
-            }))
-        });
+        let thread = std::thread::Builder::new()
+            .name("dynrunner-tunnel-cohort".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "tunnel-cohort driver: tokio runtime construction \
+                             failed; NO reverse tunnels will be established"
+                        );
+                        return;
+                    }
+                };
+                let local = tokio::task::LocalSet::new();
+                rt.block_on(local.run_until(async {
+                    tokio::select! {
+                        _ = inner.run_tunnel_cohort(reader, num_secondaries, primary_quic_port) => {}
+                        _ = cancel_bg.notified() => {
+                            tracing::info!(
+                                "tunnel-cohort establishment cancelled (cleanup); \
+                                 in-flight watchers aborted"
+                            );
+                        }
+                    }
+                }));
+                // Bound the runtime teardown: an in-flight blocking
+                // gateway poll (`execute_command` against a wedged
+                // gateway) must not park cleanup forever.
+                rt.shutdown_timeout(Duration::from_secs(10));
+            })
+            .map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!("spawn tunnel-cohort thread: {e}"))
+            })?;
 
-        let map = result.map_err(prep_err_to_pyerr)?;
-        let dict = PyDict::new(py);
-        for (k, v) in map {
-            dict.set_item(k, v)?;
-        }
-        Ok(dict.into())
+        *slot = Some(CohortDriver { thread, cancel });
+        Ok(())
     }
 
     /// Drain all tracked tunnel subprocesses (SIGTERM → 5s wait →
     /// SIGKILL escalation). Idempotent.
-    fn cleanup(&self, py: Python<'_>) -> PyResult<()> {
+    ///
+    /// Stops the background cohort driver FIRST (cancel + join) so no
+    /// watcher can commit a fresh child into the stores while — or
+    /// after — they are drained.
+    pub(crate) fn cleanup(&self, py: Python<'_>) -> PyResult<()> {
+        let driver = self
+            .cohort_driver
+            .lock()
+            .expect("cohort_driver mutex poisoned")
+            .take();
+        if let Some(driver) = driver {
+            driver.cancel.notify_one();
+            // GIL released across the join: the driver's gateway reader
+            // re-acquires the GIL on a blocking thread to finish its
+            // in-flight poll — joining while holding it would deadlock.
+            py.detach(|| {
+                if driver.thread.join().is_err() {
+                    tracing::warn!("tunnel-cohort driver thread panicked before cleanup");
+                }
+            });
+        }
+
         let inner = std::sync::Arc::clone(&self.inner);
         py.detach(|| -> PyResult<()> {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -298,15 +391,3 @@ impl PySlurmPreparation {
     }
 }
 
-/// Convert a `PrepError` to the most appropriate `PyErr`.
-fn prep_err_to_pyerr(e: PrepError) -> PyErr {
-    match e {
-        PrepError::Timeout { .. } => pyo3::exceptions::PyTimeoutError::new_err(e.to_string()),
-        PrepError::Io(io) => pyo3::exceptions::PyOSError::new_err(io.to_string()),
-        PrepError::InfoParse { .. }
-        | PrepError::InfoRead { .. }
-        | PrepError::TunnelFailed { .. }
-        | PrepError::WatcherPanic(_)
-        | PrepError::WatcherLost(_) => pyo3::exceptions::PyRuntimeError::new_err(e.to_string()),
-    }
-}

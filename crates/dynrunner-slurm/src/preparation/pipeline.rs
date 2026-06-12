@@ -1,14 +1,16 @@
 //! [`SlurmPreparation`]: the preparation-phase pipeline. Owns the
 //! shared per-cohort state (info-file path map, ssh-tunnel cleanup
 //! Vec, semaphore, primary-QUIC-port cell) and offers
-//! `setup_ssh_tunnels` (cohort) + `establish_one_tunnel` (respawn) +
-//! `cleanup` (teardown). The actual per-tunnel work (info-file polling,
-//! retry loop, semaphore acquisition) lives in
-//! [`establish`](super::establish); the ssh wire-up primitives live in
-//! [`ssh`](super::ssh). Errors and config types are in
-//! [`options`](super::options).
+//! `run_tunnel_cohort` (incremental cohort — the production bring-up
+//! shape) + `setup_ssh_tunnels` (blocking cohort gate) +
+//! `establish_one_tunnel` (respawn) + `cleanup` (teardown). The actual
+//! per-tunnel work (info-file polling, retry loop, semaphore
+//! acquisition) lives in [`establish`](super::establish); the ssh
+//! wire-up primitives live in [`ssh`](super::ssh). Errors and config
+//! types are in [`options`](super::options).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
@@ -20,7 +22,7 @@ use super::escalation::{EscalationVerdict, ReconnectEscalation};
 use super::establish::establish_one_tunnel_inner;
 use super::options::{InfoFileReader, PrepError, PreparationOptions};
 use super::ssh::{
-    LingerLedger, production_bind_verifier, restore_linger, summarize_linger_enables,
+    BindProbe, LingerLedger, production_bind_verifier, restore_linger, summarize_linger_enables,
     tunnel_spawner,
 };
 use super::store::{PerSecondaryTunnelRegistry, SharedTunnelVec, TunnelStore};
@@ -29,9 +31,9 @@ use super::summary::{TunnelSetupSummary, secondary_id};
 /// Lifecycle for the SLURM preparation phase. Owns spawned `ssh -N -R`
 /// subprocess handles and tears them down on cleanup().
 ///
-/// Construction is cheap (no I/O); call [`Self::setup_ssh_tunnels`]
-/// inside an async context with a [`tokio::task::LocalSet`] active —
-/// the watchers use `spawn_local`.
+/// Construction is cheap (no I/O); call [`Self::run_tunnel_cohort`] /
+/// [`Self::setup_ssh_tunnels`] inside an async context with a
+/// [`tokio::task::LocalSet`] active — the watchers use `spawn_local`.
 pub struct SlurmPreparation {
     opts: PreparationOptions,
     /// Subprocess handles that survive past setup_ssh_tunnels (until
@@ -170,15 +172,208 @@ impl SlurmPreparation {
         // setup. Overwrites any prior value: in practice this is only
         // called once per run, but a re-entry would be against the
         // current QUIC port, not a stale one.
-        *self
-            .primary_quic_port
-            .lock()
-            .expect("primary_quic_port mutex poisoned") = Some(primary_quic_port);
+        self.record_primary_quic_port(primary_quic_port);
 
         // Each watcher signals completion via its own oneshot. Using
         // `JoinSet` for spawn-local + abort-on-drop semantics: when
         // we return from this function (success OR timeout), JoinSet
         // is dropped and aborts any still-running watcher.
+        let (watchers, receivers) = self.spawn_cohort_watchers(
+            reader,
+            num_secondaries,
+            primary_quic_port,
+            production_spawner_factory(&self.opts, primary_quic_port, &self.linger_ledger),
+            production_verifier_factory(&self.opts),
+        );
+
+        // Single-concern handoff: gather oneshot outcomes under the
+        // shared setup deadline, allowing partial success. See
+        // `gather_under_deadline` for the per-receiver timeout
+        // semantics and the zero-vs-partial fleet failure split.
+        let result =
+            gather_under_deadline(receivers, num_secondaries, self.opts.setup_timeout).await;
+
+        // Drop the JoinSet — aborts any in-flight watchers.
+        drop(watchers);
+
+        // Cohort linger-enable VERDICT: one summary line from the
+        // ledger's recorded outcomes (IMPORTANT only when a node
+        // failed). Emitted here — after the gather — so it covers every
+        // watcher that got as far as its enable attempt.
+        summarize_linger_enables(&self.linger_ledger);
+
+        match &result {
+            // Per-tunnel inner already wrote each (id, port) into
+            // the persistent port map under the StdMutex; nothing
+            // to extend here. The returned `map` is the per-call
+            // snapshot built from oneshot outcomes — by construction
+            // it equals what the inner wrote. May be partial when
+            // setup-deadline fired before all watchers reported.
+            Ok(map) => log_cohort_summary(map, num_secondaries),
+            Err(e) => tracing::error!(error = %e, "ssh tunnel setup failed"),
+        }
+        result
+    }
+
+    /// Drive the cohort's reverse-tunnel establishment INCREMENTALLY,
+    /// to completion or caller-side cancellation — the BRING-UP shape
+    /// the SLURM pipeline consumes (via the pyo3 background driver) so
+    /// the welcome-accepting primary starts while tunnels are still
+    /// materializing.
+    ///
+    /// Contrast with [`Self::setup_ssh_tunnels`] (the blocking cohort
+    /// API): that call returns only when every watcher reported or the
+    /// `setup_timeout` deadline fired, and the deadline ABORTS the
+    /// still-pending watchers. Used as the pipeline's gate, that shape
+    /// serialized bring-up behind the slowest member: one SLURM job
+    /// sitting PENDING (its connection-info file never appearing) held
+    /// the primary's bind — and with it ALL welcome service — hostage
+    /// for the full deadline, so the live members' welcome retries went
+    /// unanswered until their own unconfigured give-up
+    /// (run_20260612_035452: one pending job starved three live
+    /// secondaries into fleet loss).
+    ///
+    /// Semantics here:
+    /// * Per-member watchers run exactly the same establishment path
+    ///   (same inner, same stores, same rate-limiter) — each member's
+    ///   tunnel commits the moment ITS job materializes, independent of
+    ///   the others.
+    /// * `setup_timeout` demotes from gate to SUMMARY deadline: when it
+    ///   fires, the honest #278 K-of-N summary is logged (or, at zero
+    ///   ready, a WARN), but pending watchers KEEP RUNNING — a job the
+    ///   queue starts late (or a resubmit) still gets its tunnel + the
+    ///   primary's service on arrival. Fleet-failure verdicts belong to
+    ///   the primary's quorum-proceed window, which sees actual welcomes.
+    /// * The future completes when every watcher finished; with a member
+    ///   that never materializes it runs until the caller cancels (drops
+    ///   the future — JoinSet abort + `kill_on_drop` reap un-committed
+    ///   children; committed ones stay in the shared stores for
+    ///   [`Self::cleanup`]).
+    pub async fn run_tunnel_cohort<R: InfoFileReader>(
+        &self,
+        reader: R,
+        num_secondaries: usize,
+        primary_quic_port: u16,
+    ) {
+        self.run_tunnel_cohort_inner(
+            reader,
+            num_secondaries,
+            primary_quic_port,
+            production_spawner_factory(&self.opts, primary_quic_port, &self.linger_ledger),
+            production_verifier_factory(&self.opts),
+        )
+        .await
+    }
+
+    /// DI seam under [`Self::run_tunnel_cohort`]: identical control flow
+    /// with the per-member spawner/verifier factories injected, so tests
+    /// drive the incremental-cohort semantics without touching ssh.
+    pub(super) async fn run_tunnel_cohort_inner<R, MkS, S, SF, MkV, V, VF>(
+        &self,
+        reader: R,
+        num_secondaries: usize,
+        primary_quic_port: u16,
+        make_spawner: MkS,
+        make_verifier: MkV,
+    ) where
+        R: InfoFileReader,
+        MkS: FnMut(&str) -> S,
+        S: FnMut(String, u16) -> SF + 'static,
+        SF: Future<Output = Result<Child, PrepError>> + 'static,
+        MkV: FnMut(&str) -> V,
+        V: FnMut(String, u16) -> VF + 'static,
+        VF: Future<Output = BindProbe> + 'static,
+    {
+        tracing::info!(
+            num_secondaries,
+            primary_quic_port,
+            "establishing SSH reverse tunnels for {num_secondaries} secondaries \
+             (incremental: each member is served as its job materializes)"
+        );
+
+        // Same respawn/reconnect precondition capture as the blocking
+        // variant — see the comment in `setup_ssh_tunnels`.
+        self.record_primary_quic_port(primary_quic_port);
+
+        let mut watchers = {
+            let (watchers, receivers) = self.spawn_cohort_watchers(
+                reader,
+                num_secondaries,
+                primary_quic_port,
+                make_spawner,
+                make_verifier,
+            );
+
+            // SUMMARY deadline (not a gate): reuse the same gather +
+            // honest-#278 summary the blocking variant emits, but treat
+            // the outcome as pure status — pending watchers are NOT
+            // aborted and keep servicing members whose jobs start late.
+            let result =
+                gather_under_deadline(receivers, num_secondaries, self.opts.setup_timeout).await;
+            summarize_linger_enables(&self.linger_ledger);
+            match &result {
+                Ok(map) => log_cohort_summary(map, num_secondaries),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "tunnel-setup summary deadline reached with no member \
+                     established; watchers keep polling — late-starting jobs \
+                     still get their tunnel on arrival (fleet-failure verdicts \
+                     belong to the primary's quorum-proceed window)"
+                ),
+            }
+            watchers
+        };
+
+        // Keep servicing until every member established (or the caller
+        // cancels by dropping this future). A watcher that already sent
+        // its oneshot result is just joined; one whose member never
+        // materializes keeps polling — that is the late-join contract.
+        while watchers.join_next().await.is_some() {}
+        tracing::info!(
+            num_secondaries,
+            "tunnel cohort establishment finished for all members"
+        );
+    }
+
+    /// Record the primary's QUIC port — the `-R` target every tunnel
+    /// (initial cohort, respawn, reconnect) maps back to. Shared entry
+    /// preamble of both cohort variants.
+    fn record_primary_quic_port(&self, primary_quic_port: u16) {
+        *self
+            .primary_quic_port
+            .lock()
+            .expect("primary_quic_port mutex poisoned") = Some(primary_quic_port);
+    }
+
+    /// Spawn one establishment watcher per secondary onto a `JoinSet`
+    /// (spawn-local + abort-on-drop semantics) and hand back the per-
+    /// watcher oneshot receivers. Shared by the blocking
+    /// ([`Self::setup_ssh_tunnels`]) and incremental
+    /// ([`Self::run_tunnel_cohort`]) cohort entries — the two differ
+    /// only in what they DO with the `JoinSet` after the gather (abort
+    /// vs keep servicing), never in how watchers are built.
+    ///
+    /// `make_spawner` / `make_verifier` are per-member factories
+    /// (production: [`tunnel_spawner`] / [`production_bind_verifier`];
+    /// tests: canned stubs) so the establishment path stays DI-testable
+    /// end to end.
+    fn spawn_cohort_watchers<R, MkS, S, SF, MkV, V, VF>(
+        &self,
+        reader: R,
+        num_secondaries: usize,
+        primary_quic_port: u16,
+        mut make_spawner: MkS,
+        mut make_verifier: MkV,
+    ) -> (JoinSet<()>, Vec<WatcherReceiver>)
+    where
+        R: InfoFileReader,
+        MkS: FnMut(&str) -> S,
+        S: FnMut(String, u16) -> SF + 'static,
+        SF: Future<Output = Result<Child, PrepError>> + 'static,
+        MkV: FnMut(&str) -> V,
+        V: FnMut(String, u16) -> VF + 'static,
+        VF: Future<Output = BindProbe> + 'static,
+    {
         let mut watchers: JoinSet<()> = JoinSet::new();
         let mut receivers: Vec<oneshot::Receiver<Result<(String, u16), PrepError>>> =
             Vec::with_capacity(num_secondaries);
@@ -204,16 +399,10 @@ impl SlurmPreparation {
             // the persistent port map without borrowing `self` (they
             // live on the JoinSet past the borrow).
             let port_map = Arc::clone(&self.secondary_port_map);
-            let linger_ledger = self.linger_ledger.clone();
+            let spawner = make_spawner(&secondary_id);
+            let verifier = make_verifier(&secondary_id);
             let id_for_task = secondary_id.clone();
             watchers.spawn_local(async move {
-                let spawner = tunnel_spawner(
-                    id_for_task.clone(),
-                    opts.clone(),
-                    primary_quic_port,
-                    linger_ledger,
-                );
-                let verifier = production_bind_verifier(id_for_task.clone(), opts.clone());
                 let res = establish_one_tunnel_inner(
                     &id_for_task,
                     &info_path,
@@ -238,56 +427,7 @@ impl SlurmPreparation {
                 let _ = tx.send(outcome);
             });
         }
-
-        // Single-concern handoff: gather oneshot outcomes under the
-        // shared setup deadline, allowing partial success. See
-        // `gather_under_deadline` for the per-receiver timeout
-        // semantics and the zero-vs-partial fleet failure split.
-        let result =
-            gather_under_deadline(receivers, num_secondaries, self.opts.setup_timeout).await;
-
-        // Drop the JoinSet — aborts any in-flight watchers.
-        drop(watchers);
-
-        // Cohort linger-enable VERDICT: one summary line from the
-        // ledger's recorded outcomes (IMPORTANT only when a node
-        // failed). Emitted here — after the gather — so it covers every
-        // watcher that got as far as its enable attempt.
-        summarize_linger_enables(&self.linger_ledger);
-
-        match &result {
-            Ok(map) => {
-                // Per-tunnel inner already wrote each (id, port) into
-                // the persistent port map under the StdMutex; nothing
-                // to extend here. The returned `map` is the per-call
-                // snapshot built from oneshot outcomes — by construction
-                // it equals what the inner wrote. May be partial when
-                // setup-deadline fired before all watchers reported.
-                //
-                // HONEST summary (#278): report established/expected from
-                // what was actually VERIFIED, never a count of spawns.
-                // Partial fleets are WARNed with the missing ids named —
-                // the same `TunnelSetupSummary` the pyo3 operator-log
-                // emit renders, so the two layers cannot drift.
-                let summary = TunnelSetupSummary::new(map, num_secondaries);
-                if summary.is_complete() {
-                    tracing::info!(
-                        ready = summary.established,
-                        total = summary.expected,
-                        "ssh tunnel setup done: {summary}"
-                    );
-                } else {
-                    tracing::warn!(
-                        ready = summary.established,
-                        total = summary.expected,
-                        missing = ?summary.missing,
-                        "ssh tunnel setup done with failures: {summary}"
-                    );
-                }
-            }
-            Err(e) => tracing::error!(error = %e, "ssh tunnel setup failed"),
-        }
-        result
+        (watchers, receivers)
     }
 
     /// Establish ONE reverse tunnel for a just-spawned secondary,
@@ -551,6 +691,78 @@ impl SlurmPreparation {
             .await;
         restore_linger(&self.linger_ledger, &self.opts).await;
         tracing::info!("SLURM preparation cleanup complete");
+    }
+}
+
+/// Boxed per-member spawner shape the production factories hand to
+/// `spawn_cohort_watchers` (a nested `impl FnMut -> impl FnMut` return
+/// type cannot be written unboxed). `pub(super)` so the cohort tests'
+/// stub factories share the shape.
+pub(super) type BoxedSpawner =
+    Box<dyn FnMut(String, u16) -> std::pin::Pin<Box<dyn Future<Output = Result<Child, PrepError>>>>>;
+/// Boxed per-member bind-verifier shape, same rationale.
+type BoxedVerifier =
+    Box<dyn FnMut(String, u16) -> std::pin::Pin<Box<dyn Future<Output = BindProbe>>>>;
+
+/// One per-member watcher's completion report: `(secondary_id,
+/// tunnel_port)` on a verified establishment, the establishment error
+/// otherwise. Receiver half handed from `spawn_cohort_watchers` to the
+/// gather.
+type WatcherReceiver = oneshot::Receiver<Result<(String, u16), PrepError>>;
+
+/// Production per-member spawner factory for the cohort entries: the
+/// same [`tunnel_spawner`] closure the per-watcher tasks historically
+/// built inline. Captured state is cloned per member, exactly as the
+/// inline construction did.
+fn production_spawner_factory(
+    opts: &PreparationOptions,
+    primary_quic_port: u16,
+    linger_ledger: &LingerLedger,
+) -> impl FnMut(&str) -> BoxedSpawner {
+    let opts = opts.clone();
+    let linger_ledger = linger_ledger.clone();
+    move |secondary_id: &str| {
+        Box::new(tunnel_spawner(
+            secondary_id.to_owned(),
+            opts.clone(),
+            primary_quic_port,
+            linger_ledger.clone(),
+        ))
+    }
+}
+
+/// Production per-member bind-verifier factory — the
+/// [`production_bind_verifier`] half of the same seam.
+fn production_verifier_factory(opts: &PreparationOptions) -> impl FnMut(&str) -> BoxedVerifier {
+    let opts = opts.clone();
+    move |secondary_id: &str| {
+        Box::new(production_bind_verifier(
+            secondary_id.to_owned(),
+            opts.clone(),
+        ))
+    }
+}
+
+/// HONEST cohort summary (#278): report established/expected from what
+/// was actually VERIFIED, never a count of spawns. Partial fleets are
+/// WARNed with the missing ids named. Single render site for both
+/// cohort entries (blocking gate / incremental summary deadline) so
+/// the two cannot drift.
+fn log_cohort_summary(map: &HashMap<String, u16>, expected: usize) {
+    let summary = TunnelSetupSummary::new(map, expected);
+    if summary.is_complete() {
+        tracing::info!(
+            ready = summary.established,
+            total = summary.expected,
+            "ssh tunnel setup done: {summary}"
+        );
+    } else {
+        tracing::warn!(
+            ready = summary.established,
+            total = summary.expected,
+            missing = ?summary.missing,
+            "ssh tunnel setup done with failures: {summary}"
+        );
     }
 }
 

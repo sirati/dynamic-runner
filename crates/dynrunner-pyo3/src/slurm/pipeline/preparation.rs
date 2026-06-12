@@ -5,10 +5,7 @@
 //! calls; the inner `run_preparation` is the Rust-callable signature
 //! the orchestrator uses directly.
 
-use std::collections::HashMap;
-
 use dynrunner_core::IMPORTANT_TARGET;
-use dynrunner_slurm::preparation::TunnelSetupSummary;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
@@ -346,13 +343,30 @@ pub(super) fn run_preparation<'py>(
     // Optional reverse-tunnel setup. Owns the per-secondary
     // `ssh -N -R` lifecycle; the watcher state machine + subprocess
     // teardown live in the `RustSlurmPreparation` pyclass.
+    //
+    // STARTED IN THE BACKGROUND, deliberately not awaited: the tunnels
+    // are per-secondary transport legs, not primary prerequisites — the
+    // welcome-accepting primary's own prerequisites are just its QUIC
+    // bind. Blocking here until every member's tunnel existed (the old
+    // shape) serialized bring-up behind the slowest SLURM job: one job
+    // sitting PENDING held the primary's bind — and with it ALL welcome
+    // service — hostage for the full setup deadline, while the live
+    // members' welcome retries went unanswered until their unconfigured
+    // give-up (run_20260612_035452: one pending job starved three live
+    // secondaries into total fleet loss). Each member's tunnel now
+    // attaches the moment its job materializes; the primary's
+    // incremental setup delivery serves it from there. The K-of-N #278
+    // summary is logged by the driver when the (now status-only)
+    // summary deadline passes; fleet-failure verdicts belong to the
+    // primary's quorum-proceed window, which sees actual welcomes.
     let secondary_port_map = PyDict::new(py);
     let ssh_tunnels = pyo3::types::PyList::empty(py);
     let mut tunnel_manager_handle: Option<Py<PyAny>> = None;
     if use_reverse_connection {
         log.call_method1(
             "info",
-            ("Setting up SSH reverse tunnels for reverse connections...",),
+            ("Starting SSH reverse tunnel establishment (background; \
+              the primary accepts welcomes while tunnels come up)...",),
         )?;
 
         let connection_info_dir = format!("{run_log_dir}/connection_info");
@@ -375,49 +389,41 @@ pub(super) fn run_preparation<'py>(
             .extract()
             .unwrap_or_default();
 
-        let native = py.import("dynamic_runner._native")?;
-        let tunnel_cls = native.getattr("RustSlurmPreparation")?;
-        let tunnel_manager = tunnel_cls.call1((
-            gateway,
-            &run_log_dir,
-            &gateway_host,
-            gateway_port,
-            auth_options,
-            extra_forwards,
-            gateway_user,
-        ))?;
+        // Direct Rust construction of the pyclass — the manager is
+        // defined in this crate, so a round-trip through the Python
+        // `dynamic_runner._native` import would only re-enter ourselves.
+        let tunnel_manager = Bound::new(
+            py,
+            crate::slurm::preparation::PySlurmPreparation::new(
+                gateway.clone().unbind(),
+                run_log_dir.clone(),
+                gateway_host.clone(),
+                gateway_port,
+                auth_options,
+                extra_forwards,
+                gateway_user,
+                600.0,
+                2.0,
+                None,
+                None,
+                None,
+                None,
+            )?,
+        )?;
 
-        // Record the tunnel-manager handle BEFORE invoking setup so
-        // a caller that wires the returned handle to a cleanup path
-        // can tear down any partially-spawned tunnels even if
-        // `setup_ssh_tunnels` raises mid-flight.
-        tunnel_manager_handle = Some(tunnel_manager.clone().unbind());
+        // Record the tunnel-manager handle BEFORE starting the cohort
+        // so a caller that wires the returned handle to a cleanup path
+        // can tear down any partially-spawned tunnels even if the
+        // start itself raises.
+        tunnel_manager_handle = Some(tunnel_manager.clone().into_any().unbind());
 
-        let port_map = tunnel_manager
-            .call_method1("setup_ssh_tunnels", (num_secondaries, primary_quic_port))?;
-        // Reflect the port map into the outcome shape; values are
-        // ints in the original Python dataclass.
-        let mut established: HashMap<String, u16> = HashMap::new();
-        for (k, v) in port_map.cast::<PyDict>()?.iter() {
-            let id: String = k.extract()?;
-            let port: u16 = v.extract()?;
-            secondary_port_map.set_item(&id, port)?;
-            established.insert(id, port);
-        }
-        // HONEST summary (#278): `setup_ssh_tunnels` allows K-of-N
-        // partial success by design (late-joiners attach via PeerJoined),
-        // so the headline must report what was actually VERIFIED — never
-        // claim "All N" from the requested count. Partial fleets are
-        // WARNed with the missing ids named; the summary type is the
-        // same one the Rust preparation layer renders, so the two
-        // layers cannot drift.
-        let summary = TunnelSetupSummary::new(&established, num_secondaries as usize);
-        let level = if summary.is_complete() {
-            "info"
-        } else {
-            "warning"
-        };
-        log.call_method1(level, (summary.to_string(),))?;
+        tunnel_manager
+            .borrow()
+            .start_ssh_tunnels(py, num_secondaries as usize, primary_quic_port)?;
+        // `secondary_port_map` stays an empty placeholder in the
+        // outcome shape: the live map belongs to the tunnel manager
+        // (`RustSlurmPreparation.secondary_port_map()`) and fills as
+        // members establish; nothing in-tree reads the outcome copy.
     }
 
     // Random primary entropy. The `secrets` module is the legacy
@@ -542,4 +548,143 @@ pub(crate) fn run_preparation_py<'py>(
     };
     let tuple = PyTuple::new(py, [prep_result, tunnel])?;
     Ok(tuple.unbind())
+}
+
+#[cfg(test)]
+#[cfg(feature = "test-with-python")]
+mod tests {
+    //! Pipeline-level pin for the bring-up serialization bug
+    //! (run_20260612_035452): with EVERY SLURM job still PENDING (no
+    //! connection-info file ever appears), `run_preparation` must
+    //! RETURN — handing control to the welcome-accepting primary —
+    //! instead of blocking on tunnel establishment until the setup
+    //! deadline. Pre-fix, the blocking cohort gate held this function
+    //! for the full 600s while the (in production: live) secondaries'
+    //! welcome retries went unanswered; the RED shape of this test is
+    //! a 600s hang.
+    //!
+    //! Python doubles only — no gateway, no sbatch, no ssh: the mock
+    //! gateway's `execute_command` always reports "no info file yet",
+    //! so zero tunnel spawns ever happen and the background driver
+    //! just polls until `cleanup()` cancels it.
+    //!
+    //! Invoke as:
+    //!   `cargo test -p dynrunner-pyo3 --lib --no-default-features \
+    //!        --features test-with-python run_preparation_returns`
+    use pyo3::prelude::*;
+    use pyo3::types::PyModule;
+
+    /// Compile the doubles module: gateway / job manager / slurm
+    /// config / deployment / log with exactly the surface
+    /// `run_preparation` touches.
+    fn make_doubles(py: Python<'_>) -> Bound<'_, PyModule> {
+        let body = r##"
+class Log:
+    def info(self, *a): pass
+    def warning(self, *a): pass
+
+class Gateway:
+    host = "gw.example"
+    user = None
+    port = 22
+    def auth_options(self):
+        return []
+    def create_directory(self, path):
+        pass
+    def execute_command(self, cmd):
+        # Every job PENDING forever: the info file never appears.
+        return (1, "", "")
+
+class Metadata:
+    remote_path = "/gw/image.tar"
+    image_hash = "deadbeef"
+    uploaded = True
+
+class JobManager:
+    def prepare_directories(self):
+        pass
+    def upload_shutdown_manager_binary(self):
+        return "/gw/bin/shutdown-manager"
+    def upload_wrapper_binary(self):
+        return "/gw/bin/wrapper"
+    def build_and_transfer_images(self, project_root):
+        return Metadata()
+    def generate_wrapper_script(self, **kwargs):
+        return "#!/bin/sh\n"
+    def submit_job(self, wrapper, job_name, secondary_id, run_log_dir=None):
+        return f"job-{secondary_id}"
+
+class SlurmConfig:
+    def get_log_dir(self):
+        return "/tmp/dynrunner-prep-test-logs"
+
+class Deployment:
+    effective_job_name_prefix = "preptest"
+    extra_port_forwards = []
+"##;
+        PyModule::from_code(
+            py,
+            std::ffi::CString::new(body).unwrap().as_c_str(),
+            c"mock_run_preparation.py",
+            c"mock_run_preparation",
+        )
+        .expect("compile run_preparation doubles")
+    }
+
+    /// THE serialization pin: all jobs pending ⇒ `run_preparation`
+    /// still returns promptly (tunnel establishment is a background
+    /// concern), and `cleanup()` joins the background driver without
+    /// hanging.
+    #[test]
+    fn run_preparation_returns_while_all_jobs_pending() {
+        Python::attach(|py| {
+            let m = make_doubles(py);
+            let gateway = m.getattr("Gateway").unwrap().call0().unwrap();
+            let job_manager = m.getattr("JobManager").unwrap().call0().unwrap();
+            let slurm_config = m.getattr("SlurmConfig").unwrap().call0().unwrap();
+            let deployment = m.getattr("Deployment").unwrap().call0().unwrap();
+            let log = m.getattr("Log").unwrap().call0().unwrap();
+            let cert_dir = pyo3::types::PyString::new(py, "/tmp/dynrunner-prep-test-certs");
+
+            let started = std::time::Instant::now();
+            let (outcome, tunnel_manager) = super::run_preparation(
+                py,
+                &gateway,
+                &job_manager,
+                &slurm_config,
+                &deployment,
+                "run_preptest",
+                cert_dir.as_any(),
+                "0",
+                "-2G",
+                3,
+                45123,
+                true,  // use_reverse_connection — the incident topology
+                false, // skip_image_build=false → mocked build path
+                None,
+                &log,
+            )
+            .expect("run_preparation");
+            let elapsed = started.elapsed();
+
+            // Generous CI bound; the pre-fix blocking gate held this
+            // call for the full 600s tunnel setup deadline.
+            assert!(
+                elapsed < std::time::Duration::from_secs(60),
+                "run_preparation must not block on pending jobs' tunnels \
+                 (took {elapsed:?})"
+            );
+            assert_eq!(outcome.num_secondaries, 3);
+
+            // Reverse topology hands back the tunnel manager; its
+            // cleanup must cancel + join the background driver promptly.
+            let mgr = tunnel_manager.expect("reverse mode returns a tunnel manager");
+            let cleanup_started = std::time::Instant::now();
+            mgr.bind(py).call_method0("cleanup").expect("cleanup");
+            assert!(
+                cleanup_started.elapsed() < std::time::Duration::from_secs(60),
+                "cleanup must join the background tunnel driver promptly"
+            );
+        });
+    }
 }
