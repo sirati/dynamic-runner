@@ -35,9 +35,11 @@ mod ingress;
 mod membership;
 mod routing;
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 
 use dynrunner_core::Identifier;
+use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_protocol_primary_secondary::address::PeerId;
 use tokio::sync::mpsc;
@@ -46,6 +48,26 @@ use super::membership::MembershipView;
 use super::mesh_client::{LocalDispatch, MeshClient, RoleInbox};
 use super::role::LocalRole;
 use super::role_slot::RoleSlot;
+
+/// Bound on the slotless-ingress hold buffer (see [`Mesh::slotless_hold`]).
+///
+/// During a promotion / role swap this process can transiently have ZERO
+/// live local slots (the coordinator slot is torn down and recreated through
+/// the pump's serialized control arm — a sub-millisecond window in the wired
+/// system). An ingress frame fanned in that window would reach nobody and
+/// vanish silently; instead it is HELD here and replayed the instant the next
+/// slot registers. The window is short and the at-risk frames are sparse
+/// control frames (e.g. `RequestClusterSnapshot`), so a small ring suffices;
+/// overflow drops the OLDEST with a WARN naming kind/target, never silently.
+pub(crate) const SLOTLESS_HOLD_CAPACITY: usize = 64;
+
+/// Minimum spacing between two ingress diagnostic WARNs (slotless-hold,
+/// overflow, and the role-miss / unstamped fan fallbacks). A frame storm into
+/// a slotless or role-mismatched process (a long swap) would otherwise emit
+/// one WARN per frame at wire rate; this gate surfaces the condition (silence
+/// is the failure mode this fix exists to kill) without spamming, carrying
+/// the suppressed count on each permitted emit.
+const INGRESS_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The role-demux mesh wrapper over a role-agnostic [`PeerTransport`].
 ///
@@ -81,6 +103,23 @@ pub struct Mesh<I: Identifier, Tr: PeerTransport<I>> {
     /// `next_local_dispatch` helper still drains it in place for the
     /// `process/tests` unit harness, which runs no pump.
     local_dispatch_rx: Option<mpsc::UnboundedReceiver<LocalDispatch<I>>>,
+    /// Ingress frames received while NO live local slot existed (a transient
+    /// promotion / role-swap window), held in arrival order and replayed when
+    /// the next slot registers ([`Self::drain_slotless_hold`]). A bounded
+    /// ring; overflow drops the OLDEST with a WARN. Only the ingress fan
+    /// paths ([`Self::route_incoming`]) push here — an EGRESS broadcast never
+    /// holds (a same-host fan with no other local slot legitimately reaches
+    /// only the wire). See [`SLOTLESS_HOLD_CAPACITY`].
+    slotless_hold: VecDeque<DistributedMessage<I>>,
+    /// Min-interval gate for the per-frame slotless-hold WARN so a long swap
+    /// (or a storm of frames into a slotless process) cannot spam one WARN
+    /// per frame at wire rate.
+    slotless_hold_warn: crate::warn_throttle::WarnThrottle,
+    /// Min-interval gate for the ingress fan-fallback WARNs (a directed frame
+    /// naming an absent local role, or an unstamped frame) so a long
+    /// role-swap with a sustained inbound stream cannot spam one WARN per
+    /// frame at wire rate.
+    ingress_fallback_warn: crate::warn_throttle::WarnThrottle,
 }
 
 impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
@@ -105,6 +144,9 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
             membership: MembershipView::new(),
             local_dispatch_tx,
             local_dispatch_rx: Some(local_dispatch_rx),
+            slotless_hold: VecDeque::new(),
+            slotless_hold_warn: crate::warn_throttle::WarnThrottle::new(INGRESS_WARN_INTERVAL),
+            ingress_fallback_warn: crate::warn_throttle::WarnThrottle::new(INGRESS_WARN_INTERVAL),
         }
     }
 
@@ -143,18 +185,18 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
         // on this node without ever touching the transport. `None` for
         // transports that cannot observe arrival pre-`recv_peer`.
         let transport_edges = self.transport.ingest_edges();
-        let weak = Arc::downgrade(&slot);
-        match role {
-            LocalRole::Primary => self.primary = Some(weak),
-            LocalRole::Secondary => self.secondary = Some(weak),
-            LocalRole::Observer => self.observer = Some(weak),
-        }
+        self.set_slot(role, Arc::downgrade(&slot));
         let client = MeshClient::new(
             role,
             self.local_dispatch_tx.clone(),
             self.membership.clone(),
         );
         let inbox = RoleInbox::new(inbound_rx, ingest_liveness, transport_edges);
+        // A freshly-registered slot is the first live local delivery target if
+        // the process was momentarily slotless: replay any ingress frames held
+        // through that window so the new coordinator sees them (the
+        // promotion / role-swap no-drop guarantee).
+        self.drain_slotless_hold();
         (slot, client, inbox)
     }
 
