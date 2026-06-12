@@ -1067,12 +1067,48 @@ fn respawn_spawn_request_serializes_expected_wire_bytes() {
         new_secondary_id: "secondary-5".into(),
         primary_endpoint: "10.0.0.7:5555".into(),
         primary_pubkey_pem: "PEM".into(),
+        // None elides the field entirely (`skip_serializing_if`), so the
+        // wire bytes are unchanged from before the field existed — an
+        // older receiver stays byte-compatible.
+        exclude_node: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert_eq!(
         json,
         r#"{"msg_type":"respawn_spawn_request","sender_id":"secondary-2","timestamp":7.5,"new_secondary_id":"secondary-5","primary_endpoint":"10.0.0.7:5555","primary_pubkey_pem":"PEM"}"#,
     );
+}
+
+/// `exclude_node = Some(node)` puts the field on the wire, and the
+/// mirror decode recovers it. Pins BOTH directions for the populated
+/// case (the elided-None case is covered by the two tests above): a
+/// serializer-side rename fails the byte assertion, a decoder-side
+/// rename fails the round-trip read.
+#[test]
+fn respawn_spawn_request_round_trips_exclude_node() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::RespawnSpawnRequest {
+        target: None,
+        sender_id: "secondary-2".into(),
+        timestamp: 7.5,
+        new_secondary_id: "secondary-5".into(),
+        primary_endpoint: "10.0.0.7:5555".into(),
+        primary_pubkey_pem: "PEM".into(),
+        exclude_node: Some("krater07".into()),
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    assert_eq!(
+        json,
+        r#"{"msg_type":"respawn_spawn_request","sender_id":"secondary-2","timestamp":7.5,"new_secondary_id":"secondary-5","primary_endpoint":"10.0.0.7:5555","primary_pubkey_pem":"PEM","exclude_node":"krater07"}"#,
+    );
+    // Mirror: the EXACT bytes a primary emits decode back to Some(node).
+    let wire = br#"{"msg_type":"respawn_spawn_request","sender_id":"secondary-2","timestamp":7.5,"new_secondary_id":"secondary-5","primary_endpoint":"10.0.0.7:5555","primary_pubkey_pem":"PEM","exclude_node":"krater07"}"#;
+    let decoded: DistributedMessage<TestId> = deserialize_message(wire).unwrap();
+    match decoded {
+        DistributedMessage::RespawnSpawnRequest { exclude_node, .. } => {
+            assert_eq!(exclude_node.as_deref(), Some("krater07"));
+        }
+        _ => panic!("expected RespawnSpawnRequest"),
+    }
 }
 
 /// Wire-shape mirror for the SUCCESS result: the EXACT bytes the

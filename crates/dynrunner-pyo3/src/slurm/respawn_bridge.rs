@@ -227,6 +227,7 @@ mod tests {
             primary_endpoint: "127.0.0.1:5555".to_owned(),
             primary_pubkey_pem: "-----BEGIN PUBLIC KEY-----\nABC\n-----END PUBLIC KEY-----\n"
                 .to_owned(),
+            exclude_node: None,
         };
         let body = generator(&spec).expect("closure must render");
         assert!(
