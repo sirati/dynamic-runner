@@ -553,6 +553,55 @@ impl<G: Gateway> SlurmJobManager<G> {
         still_queued
     }
 
+    /// Whether ANY of this run's submitted jobs is still in the cluster
+    /// queue (PENDING / RUNNING / an unrecognised transient state SLURM
+    /// still tracks). The read-only consult the relocated submitter→observer
+    /// uses to decide whether the run's cluster is GONE — it reuses the
+    /// SAME `get_job_status` probe + `is_still_queued` predicate the
+    /// cancel-verify sweep uses, over the manager's own tracked
+    /// [`Self::job_ids`].
+    ///
+    /// Pending-submission markers ([`PENDING_SUBMISSION_MARKER`]) are
+    /// skipped: a marker means an sbatch was in flight with an unknown id —
+    /// not a queued job this consult can probe. A marker present here is
+    /// CONSERVATIVELY treated as "still present" (returns `true`) so a
+    /// just-launched job with an as-yet-unknown id never reads as a gone
+    /// cluster — the same fail-safe direction as the cancel-verify sweep's
+    /// `Err` arm.
+    ///
+    /// A gateway TRANSPORT failure surfaces as `Err` (the observer's
+    /// double-check treats that as a probe failure — no information — and
+    /// keeps observing, NOT as evidence the cluster is gone). `Ok(true)`
+    /// means at least one job is still queued; `Ok(false)` is positive
+    /// evidence every submitted job has left the queue.
+    ///
+    /// Unlike the cancel-verify sweep's [`Self::retain_still_queued`]
+    /// (which conservatively folds a probe `Err` into "still present" so it
+    /// keeps re-scancelling), this consult must PROPAGATE the transport
+    /// failure so the caller can distinguish "every job is gone" from "the
+    /// probe could not run" — declaring a cluster dead on a flaky gateway
+    /// would be the very bug this consult guards against.
+    pub async fn any_job_still_queued(&self) -> Result<bool, SlurmError> {
+        for id in &self.job_ids {
+            if id == PENDING_SUBMISSION_MARKER {
+                // An sbatch is in flight with an unknown id — the cluster
+                // is demonstrably NOT gone; report still-queued.
+                return Ok(true);
+            }
+            // Propagate a transport `Err` (probe failure) rather than
+            // swallowing it; the SAME `get_job_status` + `is_still_queued`
+            // predicate the cancel-verify sweep applies decides "queued".
+            if is_still_queued(&self.get_job_status(id).await?) {
+                return Ok(true);
+            }
+        }
+        // `false` only when there WERE real ids and every one has left the
+        // queue. An all-marker / empty ledger never reaches here as a
+        // "gone" signal (the marker arm returns `true`; a never-submitted
+        // ledger carries no leave-the-queue evidence and returns `false`).
+        Ok(false)
+    }
+
     /// Query the status of a SLURM job.
     ///
     /// Returns the full state/node/reason snapshot from a single

@@ -24,13 +24,23 @@
 //!     legs, zero inbound) far past every timeout and driven reconnects
 //!     failed — the one verdict the report-and-retry machinery above
 //!     deliberately never renders.
+//!   * [`job_ledger`]       — the job-ledger consult port: the seam a
+//!     relocated submitter→observer crosses to ask "are the run's jobs
+//!     still queued?" (the observer triggers, the provider layer owns
+//!     squeue).
+//!   * [`cluster_gone`]     — the cluster-empty terminal verdict: a
+//!     bounded terminal when two consecutive job-ledger consults show the
+//!     run's jobs have all left the queue (the relocated-submitter ground
+//!     truth the fleet-death PRESUMPTION need not be used for).
 //!
 //! See each submodule's header for its concern.
 
 pub mod announcer;
+pub(crate) mod cluster_gone;
 pub mod coordinator;
 pub mod failure_response;
 pub(crate) mod fleet_death;
+pub mod job_ledger;
 pub mod lifecycle;
 pub mod lost_visibility;
 pub mod reconnect;
@@ -45,6 +55,7 @@ pub use coordinator::{
     build_cold_join_observer,
 };
 pub use failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
+pub use job_ledger::{JobLedgerProbe, JobLedgerProbeHandle, JobLedgerStatus};
 pub use lifecycle::{AnnouncerHandle, attach_observer_announcer};
 pub use lost_visibility::{
     EndedOutage, LostVisibilityReporter, MeshLiveness, RetryDirective, Visibility, WakeNoteSlot,

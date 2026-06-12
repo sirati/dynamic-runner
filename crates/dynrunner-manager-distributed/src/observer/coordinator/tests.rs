@@ -1043,6 +1043,7 @@ fn build_test_handoff(
         reconnector: None,
         graceful_abort_trigger: None,
         respawn_provider: None,
+        job_ledger: None,
     };
     HandoffTestRig {
         handoff,
@@ -1837,6 +1838,7 @@ async fn lost_visibility_drives_tunnel_reconnect_with_roster() {
                     reconnector: Some(reconnector.clone()),
                     graceful_abort_trigger: None,
                     respawn_provider: None,
+                    job_ledger: None,
                 };
                 let mut observer = ObserverCoordinator::from_handoff(handoff);
 
@@ -2548,4 +2550,375 @@ async fn reconnect_trigger_is_single_flight() {
             );
         })
         .await;
+}
+
+// ── Cluster-empty terminal verdict (the relocated-submitter job-ledger
+//    consult — run_20260612_043357 forever-spin fix) ──
+
+/// Scripted [`JobLedgerProbe`] stub: returns a programmed sequence of
+/// [`JobLedgerStatus`] across consecutive consults (the last value repeats
+/// once the script is exhausted), and counts the consults. Lets a test
+/// drive the two-consecutive-empty double-check at the coordinator level.
+struct ScriptedJobLedger {
+    script: std::sync::Mutex<std::collections::VecDeque<crate::observer::JobLedgerStatus>>,
+    last: crate::observer::JobLedgerStatus,
+    consults: std::sync::Mutex<usize>,
+}
+
+impl ScriptedJobLedger {
+    fn new(script: Vec<crate::observer::JobLedgerStatus>) -> std::sync::Arc<Self> {
+        let last = *script.last().expect("non-empty script");
+        std::sync::Arc::new(Self {
+            script: std::sync::Mutex::new(script.into_iter().collect()),
+            last,
+            consults: std::sync::Mutex::new(0),
+        })
+    }
+    fn consult_count(&self) -> usize {
+        *self.consults.lock().expect("mutex")
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::observer::JobLedgerProbe for ScriptedJobLedger {
+    async fn jobs_still_queued(&self) -> crate::observer::JobLedgerStatus {
+        *self.consults.lock().expect("mutex") += 1;
+        self.script.lock().expect("mutex").pop_front().unwrap_or(self.last)
+    }
+}
+
+/// Build a `from_handoff` observer with a wired `job_ledger` probe (the
+/// relocated-submitter shape) over a zero-peer transport (its `-R` tunnels
+/// dropped — persistent lost visibility), a named primary so the visibility
+/// reason is non-empty. Mirrors `into_observer_handoff` carrying the
+/// submitter's `job_ledger_probe`.
+fn observer_with_ledger(
+    probe: std::sync::Arc<dyn crate::observer::JobLedgerProbe>,
+    config: ObserverConfig,
+) -> ObserverCoordinator<TestId> {
+    let (transport, _inbound, _peers) = transport_with_peers("obs", 0);
+    let mut cs = ClusterState::<TestId>::new();
+    cs.apply(ClusterMutation::PrimaryChanged {
+        new: "sec-0".into(),
+        epoch: 1,
+        reason: PrimaryChangeReason::Transferred,
+    });
+    let (client, inbox, pump) = observer_mesh(transport, "obs");
+    tokio::task::spawn_local(pump);
+    let (inherited_tx, mut inherited_rx) =
+        mpsc::unbounded_channel::<crate::task_completed::TaskCompletedEvent>();
+    cs.install_task_completed_sender(inherited_tx);
+    let inherited_dispatcher = tokio::task::spawn_local(async move {
+        while inherited_rx.recv().await.is_some() {}
+    });
+    let lifecycle_dispatcher =
+        tokio::task::spawn_local(async { std::future::pending::<()>().await });
+    let handoff = super::ObserverHandoff {
+        client,
+        inbox,
+        cluster_state: cs,
+        node_id: "obs".to_string(),
+        deadlines: config,
+        started_phases: std::collections::HashSet::new(),
+        panik_signal_rx: None,
+        task_completed_dispatcher_handle: inherited_dispatcher,
+        lifecycle_dispatcher_handle: lifecycle_dispatcher,
+        holdings: std::collections::HashSet::new(),
+        reconnector: None,
+        graceful_abort_trigger: None,
+        respawn_provider: None,
+        job_ledger: Some(probe),
+    };
+    ObserverCoordinator::from_handoff(handoff)
+}
+
+/// THE run_20260612_043357 replay (at test timescale): a relocated
+/// submitter→observer that hosts the job ledger loses visibility for the
+/// whole run (zero legs, never fed) and the cluster is GONE (every job left
+/// the queue → the ledger returns `Empty`). On TWO consecutive consults
+/// (driven by the 5-min / 15-min wake-loss cadence) the observer renders
+/// the cluster-empty terminal verdict and exits non-zero
+/// (`FatalPolicyExit`) — it does NOT spin forever, and it reaches the
+/// verdict BEFORE the (longer) fleet-death presumption window.
+///
+/// REVERT-CHECK: drop the consult and the 1500s outer bound expires with
+/// the observer still reporting "no reachable peer" — the production
+/// 3.5-hour spin verbatim.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cluster_empty_ledger_consult_renders_bounded_terminal_verdict() {
+    use crate::observer::JobLedgerStatus;
+    use crate::primary::RunError;
+
+    tokio::time::timeout(Duration::from_secs(1500), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let probe = ScriptedJobLedger::new(vec![JobLedgerStatus::Empty]);
+                let mut config = observer_config("obs");
+                config.fleet_dead_timeout = Duration::from_millis(50);
+                // Far longer than the wake-loss cadence (consults at +300s,
+                // +900s), so the GROUND-TRUTH ledger verdict wins ahead of
+                // the indirect fleet-death presumption.
+                config.fleet_death_presumption = Duration::from_secs(100_000);
+                let mut observer =
+                    observer_with_ledger(probe.clone(), config);
+
+                let err = observer.run().await.expect_err(
+                    "an observer that hosts the job ledger and sees the queue empty \
+                     on two consecutive consults must render a BOUNDED cluster-empty \
+                     terminal — never an infinite no-reachable-peer spin",
+                );
+                match err {
+                    RunError::FatalPolicyExit { reason } => {
+                        assert!(
+                            reason.contains("GONE"),
+                            "the verdict carries the distinct cluster-gone wording: {reason}"
+                        );
+                        assert!(
+                            reason.contains("FAILED"),
+                            "the run that reported no completion is treated as failed: {reason}"
+                        );
+                    }
+                    other => panic!(
+                        "the cluster-empty terminal must be the structured \
+                         FatalPolicyExit (the PyO3 boundary raises it non-zero), \
+                         got {other:?}"
+                    ),
+                }
+                assert!(
+                    probe.consult_count() >= 2,
+                    "the verdict requires the queue empty on TWO consecutive \
+                     consults (the double-check); got {}",
+                    probe.consult_count()
+                );
+            })
+            .await;
+    })
+    .await
+    .expect(
+        "BOUNDED terminal: the observer must exit within the wake-loss \
+         cadence window — the pre-fix behaviour spins on lost visibility forever",
+    );
+}
+
+/// The defensive double-check: the queue is empty on the FIRST consult but
+/// jobs REAPPEAR (`Present`) on the second — the streak resets, so NO
+/// verdict is rendered. The observer keeps observing and exits cleanly only
+/// when the primary's `RunComplete` later converges. This is the
+/// empty-but-jobs-pending-resubmission window the brief guards against.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn one_empty_then_jobs_reappear_renders_no_verdict() {
+    use crate::observer::JobLedgerStatus;
+    use dynrunner_protocol_primary_secondary::cluster_mutation::ClusterMutation as CM;
+
+    tokio::time::timeout(Duration::from_secs(2000), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Empty once (streak 1), then Present forever (resets) — the
+                // double-check must never fire.
+                let probe = ScriptedJobLedger::new(vec![
+                    JobLedgerStatus::Empty,
+                    JobLedgerStatus::Present,
+                ]);
+                let (transport, inbound, _peers) = transport_with_peers("obs", 0);
+                let mut cs = ClusterState::<TestId>::new();
+                cs.apply(ClusterMutation::PrimaryChanged {
+                    new: "sec-0".into(),
+                    epoch: 1,
+                    reason: PrimaryChangeReason::Transferred,
+                });
+                let mut config = observer_config("obs");
+                config.fleet_dead_timeout = Duration::from_millis(50);
+                config.fleet_death_presumption = Duration::from_secs(100_000);
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+                let (inherited_tx, mut inherited_rx) =
+                    mpsc::unbounded_channel::<crate::task_completed::TaskCompletedEvent>();
+                cs.install_task_completed_sender(inherited_tx);
+                let inherited_dispatcher = tokio::task::spawn_local(async move {
+                    while inherited_rx.recv().await.is_some() {}
+                });
+                let lifecycle_dispatcher =
+                    tokio::task::spawn_local(async { std::future::pending::<()>().await });
+                let handoff = super::ObserverHandoff {
+                    client,
+                    inbox,
+                    cluster_state: cs,
+                    node_id: "obs".to_string(),
+                    deadlines: config,
+                    started_phases: std::collections::HashSet::new(),
+                    panik_signal_rx: None,
+                    task_completed_dispatcher_handle: inherited_dispatcher,
+                    lifecycle_dispatcher_handle: lifecycle_dispatcher,
+                    holdings: std::collections::HashSet::new(),
+                    reconnector: None,
+                    graceful_abort_trigger: None,
+                    respawn_provider: None,
+                    job_ledger: Some(probe.clone()),
+                };
+                let mut observer = ObserverCoordinator::from_handoff(handoff);
+
+                // Land RunComplete well after both consults have happened
+                // (+300s, +900s) so the test verifies the observer kept
+                // observing (no cluster-gone verdict) and exits cleanly on
+                // the primary's terminal.
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_secs(1000)).await;
+                    let _ = inbound.send(DistributedMessage::ClusterMutation {
+                        target: None,
+                        sender_id: "sec-0".into(),
+                        timestamp: 0.0,
+                        mutations: vec![CM::RunComplete],
+                    });
+                });
+
+                let terminal = observer.run().await.expect(
+                    "with the queue re-populating between consults the double-check \
+                     must NOT render a verdict — the observer keeps observing and \
+                     exits cleanly on the primary's RunComplete",
+                );
+                assert!(
+                    matches!(terminal, ObserverTerminal::Done),
+                    "a reset double-check must let the observer exit on the observed \
+                     RunComplete, never via a cluster-gone Err; got {terminal:?}"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("the observer must terminate on RunComplete within the bound");
+}
+
+/// A cold-join observer hosts NO job ledger (`job_ledger = None`) — it
+/// submitted no jobs and cannot teardown a cluster it did not launch. Its
+/// behaviour is UNCHANGED: persistent lost visibility never renders a
+/// cluster-empty verdict; it keeps observing and exits cleanly on the
+/// primary's `RunComplete`. (The `new`-path constructor wires no ledger.)
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cold_join_observer_without_ledger_keeps_observing() {
+    use dynrunner_protocol_primary_secondary::cluster_mutation::ClusterMutation as CM;
+
+    tokio::time::timeout(Duration::from_secs(2000), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (transport, inbound, _peers) = transport_with_peers("obs", 0);
+                let mut cs = ClusterState::<TestId>::new();
+                cs.apply(ClusterMutation::PrimaryChanged {
+                    new: "sec-0".into(),
+                    epoch: 1,
+                    reason: PrimaryChangeReason::Transferred,
+                });
+                let mut config = observer_config("obs");
+                config.fleet_dead_timeout = Duration::from_millis(50);
+                // Long enough that neither fleet-death nor any verdict trips
+                // before RunComplete lands.
+                config.fleet_death_presumption = Duration::from_secs(100_000);
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+                // The cold-join constructor: no job ledger is wired.
+                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
+
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_secs(1000)).await;
+                    let _ = inbound.send(DistributedMessage::ClusterMutation {
+                        target: None,
+                        sender_id: "sec-0".into(),
+                        timestamp: 0.0,
+                        mutations: vec![CM::RunComplete],
+                    });
+                });
+
+                let terminal = observer.run().await.expect(
+                    "a cold-join observer (no ledger) must keep the never-terminal \
+                     report-and-retry behaviour and exit on the observed RunComplete",
+                );
+                assert!(
+                    matches!(terminal, ObserverTerminal::Done),
+                    "a ledger-less observer must never render a cluster-empty verdict; \
+                     got {terminal:?}"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("the cold-join observer must terminate on RunComplete within the bound");
+}
+
+/// A clean `RunComplete` already observed: the verdict path must NOT
+/// re-classify the run as failed. Even with a job ledger that would report
+/// the queue empty, an observer whose CRDT already carries the primary's
+/// `RunComplete` exits `Done` (the top-of-loop observed-terminal block runs
+/// FIRST, before the ledger consult). Proof the cluster-empty verdict can
+/// never override a clean primary verdict.
+#[tokio::test(flavor = "current_thread")]
+async fn clean_run_complete_is_not_reclassified_by_the_ledger_consult() {
+    use crate::observer::JobLedgerStatus;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // The ledger would say the queue is empty on every consult —
+                // but the run already completed cleanly, so the consult must
+                // never reach a re-classifying verdict.
+                let probe = ScriptedJobLedger::new(vec![JobLedgerStatus::Empty]);
+                let (transport, _inbound, _peers) = transport_with_peers("obs", 0);
+                let mut cs = ClusterState::<TestId>::new();
+                cs.apply(ClusterMutation::PrimaryChanged {
+                    new: "sec-0".into(),
+                    epoch: 1,
+                    reason: PrimaryChangeReason::Transferred,
+                });
+                // The primary's clean verdict is ALREADY converged.
+                cs.apply(ClusterMutation::RunComplete);
+                let config = observer_config("obs");
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+                let (inherited_tx, mut inherited_rx) =
+                    mpsc::unbounded_channel::<crate::task_completed::TaskCompletedEvent>();
+                cs.install_task_completed_sender(inherited_tx);
+                let inherited_dispatcher = tokio::task::spawn_local(async move {
+                    while inherited_rx.recv().await.is_some() {}
+                });
+                let lifecycle_dispatcher =
+                    tokio::task::spawn_local(async { std::future::pending::<()>().await });
+                let handoff = super::ObserverHandoff {
+                    client,
+                    inbox,
+                    cluster_state: cs,
+                    node_id: "obs".to_string(),
+                    deadlines: config,
+                    started_phases: std::collections::HashSet::new(),
+                    panik_signal_rx: None,
+                    task_completed_dispatcher_handle: inherited_dispatcher,
+                    lifecycle_dispatcher_handle: lifecycle_dispatcher,
+                    holdings: std::collections::HashSet::new(),
+                    reconnector: None,
+                    graceful_abort_trigger: None,
+                    respawn_provider: None,
+                    job_ledger: Some(probe.clone()),
+                };
+                let mut observer = ObserverCoordinator::from_handoff(handoff);
+
+                let terminal = observer.run().await.expect(
+                    "a clean RunComplete already in the CRDT must exit Done — the \
+                     ledger consult must never re-classify it as failed",
+                );
+                assert!(
+                    matches!(terminal, ObserverTerminal::Done),
+                    "got {terminal:?}"
+                );
+                assert_eq!(
+                    probe.consult_count(),
+                    0,
+                    "the observed-terminal block runs FIRST: with RunComplete already \
+                     converged the ledger is never consulted at all"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("the observer must exit immediately on the already-converged RunComplete");
 }

@@ -82,6 +82,12 @@ impl PyPrimaryCoordinator {
         // self-healing-transport paths.
         let tunnel_reconnector = self.tunnel_reconnector.take();
 
+        // The observer's job-ledger consult port (cluster-empty terminal
+        // verdict). Parked by the SLURM pipeline; carried onto the observer
+        // tail via `set_job_ledger_probe` below. `None` for callers with no
+        // job ledger.
+        let job_ledger_probe = self.job_ledger_probe.take();
+
         // Materialise the respawn pipeline wiring. Only the
         // (budget, spawner) pair is meaningful — when either is
         // absent the inner coordinator's respawn pipeline stays
@@ -551,6 +557,15 @@ impl PyPrimaryCoordinator {
                 // the job-manager relay above.
                 if let Some(reconnector) = tunnel_reconnector {
                     primary.set_tunnel_reconnector(reconnector);
+                }
+
+                // Carry the observer's job-ledger consult port onto the
+                // coordinator BEFORE `run()` enters — `into_observer_handoff`
+                // reads it at relocation so the relocated submitter→observer
+                // can consult squeue for the run's job ids and render the
+                // cluster-empty terminal verdict. Same pre-run contract.
+                if let Some(probe) = job_ledger_probe {
+                    primary.set_job_ledger_probe(probe);
                 }
 
                 // Wire the respawn pipeline iff both a budget and a
