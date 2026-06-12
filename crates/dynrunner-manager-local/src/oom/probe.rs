@@ -238,10 +238,12 @@ fn read_meminfo() -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
     }
 }
 
-/// Parse a single `/proc/meminfo` line of the form `"<key>: <N> kB"`
-/// into bytes. Returns `None` when the prefix doesn't match or the
-/// numeric body fails to parse.
-fn parse_meminfo_line(line: &str, prefix: &str) -> Option<u64> {
+/// Parse a single `"<key>: <N> kB"` line into bytes — the shape both
+/// `/proc/meminfo` and `/proc/<pid>/status` (`VmSwap:` et al.) use.
+/// Returns `None` when the prefix doesn't match or the numeric body
+/// fails to parse. `pub(crate)` so [`crate::monitor`]'s per-process
+/// swap fallback reuses the same parser instead of growing a copy.
+pub(crate) fn parse_meminfo_line(line: &str, prefix: &str) -> Option<u64> {
     let rest = line.strip_prefix(prefix)?.trim();
     let kb_str = rest
         .strip_suffix("kB")
