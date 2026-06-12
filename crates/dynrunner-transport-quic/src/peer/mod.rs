@@ -363,6 +363,33 @@ pub struct PeerNetwork<I: Identifier> {
     /// Fired on the same `DIAL_SUMMARY_THRESHOLD`/recurrence boundary as
     /// the operator dial-failure summary, so it inherits that throttle.
     persistent_dial_failure_tx: Option<mpsc::UnboundedSender<String>>,
+
+    /// Bootstrap/joining-mode override for the lower-id-dials rule: when
+    /// `true` this node dials EVERY seed it owns dial info for, regardless
+    /// of id order (see [`Self::dials_outbound_to`]). Set ONLY by the
+    /// joining constructor ([`Self::start_joining`]) — the path a
+    /// rosterless late-joiner (a fresh observer, a respawned replacement)
+    /// takes through `join_running_cluster`.
+    ///
+    /// WHY a joiner cannot use the lexicographic rule: the rule is a
+    /// SIMULTANEOUS-dial dedup for steady-state members who all already
+    /// know each other (each pair agrees, by id order, who dials). A late
+    /// joiner is UNKNOWN to the existing fleet — a seed whose id sorts
+    /// BELOW the joiner's would, under the rule, "await the joiner's
+    /// inbound", but it never learns the joiner exists to dial it, so that
+    /// leg parks `awaiting_inbound` forever and the join hangs on relay
+    /// luck. Production happened to survive only because `observer-<uuid>`
+    /// sorts below `secondary-*`, so observers dialed everyone; the gap
+    /// bites the instant the ordering flips.
+    ///
+    /// Crossed-dial safety: once the joiner is admitted and the primary's
+    /// roster broadcast reaches a lower-id seed, THAT seed dials the joiner
+    /// too — a second pipe for an already-live pair. The accept side's
+    /// grace-window dedup ([`Self::register_accepted`] /
+    /// [`ACCEPT_REPLACE_GRACE`]) drops that duplicate against the healthy
+    /// existing wire, so the crossed dial converges to one leg. Steady-
+    /// state members keep `false` and the rule is unchanged for them.
+    dial_all_seeds: bool,
 }
 
 impl<I: Identifier> PeerNetwork<I> {
@@ -378,7 +405,34 @@ impl<I: Identifier> PeerNetwork<I> {
     /// `connection_info/<id>.info` file, and hands it to the in-container
     /// secondary via `--secondary-quic-port`; binding anything else makes
     /// the recorded port a dead address for every peer that dials it.
+    ///
+    /// Starts in STEADY-STATE mode: the lower-id-dials rule applies (this
+    /// node dials only higher-id peers; lower-id peers dial it). A
+    /// rosterless late-joiner must use [`Self::start_joining`] instead.
     pub async fn start(peer_id: &str, bind_port: Option<u16>) -> Result<Self, String> {
+        Self::start_with_mode(peer_id, bind_port, false).await
+    }
+
+    /// Create a peer network for a rosterless late-joiner (a fresh
+    /// observer, a respawned replacement) that bootstraps via
+    /// `join_running_cluster`. Identical to [`Self::start`] but starts in
+    /// JOINING mode: this node dials EVERY seed regardless of id order
+    /// (see [`Self::dial_all_seeds`]). The existing fleet does not yet know
+    /// this node exists, so a seed whose id sorts below it would never dial
+    /// it — the joiner must own every dial itself to form its mesh.
+    pub async fn start_joining(peer_id: &str, bind_port: Option<u16>) -> Result<Self, String> {
+        Self::start_with_mode(peer_id, bind_port, true).await
+    }
+
+    /// Shared constructor body for [`Self::start`] (steady-state) and
+    /// [`Self::start_joining`] (rosterless joiner). `dial_all_seeds` sets
+    /// the dial-direction mode; everything else — cert, listener pair,
+    /// accept loops, reconnect ticker — is identical.
+    async fn start_with_mode(
+        peer_id: &str,
+        bind_port: Option<u16>,
+        dial_all_seeds: bool,
+    ) -> Result<Self, String> {
         let cert = CertPair::generate(peer_id)?;
 
         // Acquire the QUIC(UDP)+WSS(TCP) pair on one port number.
@@ -488,6 +542,7 @@ impl<I: Identifier> PeerNetwork<I> {
             bootstrap_redial_rx,
             bootstrap_redial_tx,
             persistent_dial_failure_tx: None,
+            dial_all_seeds,
         })
     }
 
@@ -839,10 +894,19 @@ impl<I: Identifier> PeerNetwork<I> {
     /// NEVER dials; its mesh leg to the peer exists only if the peer's
     /// inbound dial lands on our accept loop. Consulted by the initial
     /// sweep (`connect_to_peers`), the redial path (`spawn_redial`),
-    /// and the reconnect-summary narration (`process_reconnect_tick`),
-    /// so all three agree by construction.
+    /// the redial-request honor gate (`handle_redial_request`), and the
+    /// reconnect-summary narration (`process_reconnect_tick`), so all
+    /// agree by construction.
+    ///
+    /// JOINING-mode override: a rosterless joiner ([`Self::dial_all_seeds`])
+    /// owns the dial side of EVERY leg, because the existing fleet does not
+    /// yet know it exists — a lower-id seed would never dial it under the
+    /// lexicographic rule, so the leg would park forever. The joiner dialing
+    /// every seed cannot create a stuck duplicate: a later inbound from a
+    /// seed that learned the joiner via roster broadcast is deduped against
+    /// the joiner's already-live wire (`register_accepted`'s grace window).
     fn dials_outbound_to(&self, peer_id: &str) -> bool {
-        self.peer_id.as_str() < peer_id
+        self.dial_all_seeds || self.peer_id.as_str() < peer_id
     }
 
     /// THE single registration disposition for one accepted/dialed

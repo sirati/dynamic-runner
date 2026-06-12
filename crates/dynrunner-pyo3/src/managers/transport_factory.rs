@@ -538,7 +538,14 @@ pub(crate) async fn observer_mesh<I: Identifier>(
     // Ephemeral bind (`None`): the late-joiner DIALS the recorded
     // ports of existing peers; nobody dials the late-joiner from a
     // pre-advertised record, so it has no fixed port to honour.
-    PeerNetwork::<I>::start(observer_id, None)
+    //
+    // JOINING mode: the late-joiner is unknown to the running fleet, so a
+    // seed whose id sorts BELOW it would never dial it under the
+    // lower-id-dials rule and that leg would park forever. `start_joining`
+    // makes this node dial every seed regardless of id order; crossed dials
+    // (a lower-id seed later learning the joiner via roster) converge via
+    // the accept-side grace-window dedup.
+    PeerNetwork::<I>::start_joining(observer_id, None)
         .await
         .map_err(|e| format!("failed to start peer network: {e}"))
 }
