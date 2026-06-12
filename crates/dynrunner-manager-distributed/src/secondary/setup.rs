@@ -502,30 +502,42 @@ where
         // preamble in the orchestration): the first attempt fires at entry
         // — the same position in the setup sequence the pre-move
         // coordinator block had, strictly before any frame is consumed —
-        // and a capped-backoff arm below RE-SENDS it while the lifecycle
-        // is still `AwaitingPrimary`. Two production failure shapes make
-        // the retry load-bearing (run_20260611_005927):
-        //   * NO ROUTE at boot — the bootstrap wire has not been folded
-        //     yet (the bring-up dial runs in the background); the attempt
-        //     is absorbed and re-offered until the wire lands.
-        //   * WELCOME LOST on a dying wire — the frame was queued onto a
-        //     wire that died before delivery; the redial restores the
-        //     pipe but nothing else would re-enroll this node. The
-        //     receipt proof that stops the retries is a DIRECTED setup
-        //     frame from the primary (`InitialAssignment` /
-        //     `TransferComplete` — the trio members the primary only
-        //     sends to a secondary it has WELCOMED). A BROADCAST frame
-        //     is NOT proof: the asm-dataset LMU bring-up (15
-        //     secondaries) lost 5 welcomes exactly because the primary's
-        //     `PeerJoined` broadcasts (originated by the OTHER 10
-        //     welcomes) flipped the receivers out of `AwaitingPrimary`
-        //     and the old lifecycle-gated arm disarmed before the first
-        //     post-wire retry — the primary never learned of them and
-        //     proceeded with quorum into a fleet their setup deadlines
-        //     had already killed.
+        // and a capped-backoff arm below RE-SENDS it until the WHOLE setup
+        // trio has landed (the gate this loop waits on). Three production
+        // failure shapes make the retry load-bearing:
+        //   * NO ROUTE at boot (run_20260611_005927) — the bootstrap wire
+        //     has not been folded yet (the bring-up dial runs in the
+        //     background); the attempt is absorbed and re-offered until
+        //     the wire lands.
+        //   * WELCOME LOST on a dying wire (run_20260611_005927) — the
+        //     frame was queued onto a wire that died before delivery; the
+        //     redial restores the pipe but nothing else would re-enroll
+        //     this node. A BROADCAST frame is NOT enrolment proof: the
+        //     asm-dataset LMU bring-up (15 secondaries) lost 5 welcomes
+        //     exactly because the primary's `PeerJoined` broadcasts
+        //     (originated by the OTHER 10 welcomes) flipped the receivers
+        //     out of `AwaitingPrimary` and the old lifecycle-gated arm
+        //     disarmed before the first post-wire retry — the primary
+        //     never learned of them and proceeded with quorum into a
+        //     fleet their setup deadlines had already killed.
+        //   * TRIO FRAME LOST after enrolment (run_20260612_105712) — the
+        //     directed halves landed (proof the welcome was received) but
+        //     the roster broadcast was lost to the joiner's leg-
+        //     registration race, and the old directed-frame disarm
+        //     (`!got_assignment && !got_transfer`) stopped the retries
+        //     with `got_peer_info` still false: the member wedged with NO
+        //     recovery channel and was silence-judged dead. The retry now
+        //     persists for the whole trio-wait: each re-welcome doubles
+        //     as a trio-retransmit request — the primary re-serves the
+        //     trio on a duplicate welcome from a member whose operational
+        //     loop has not provably started (see `primary::peer_setup::
+        //     re_serve_setup_on_duplicate_welcome`) — and the loop
+        //     exiting (trio complete) is what ends the retries.
         // Re-sends are safe: the primary's welcome handling is idempotent
         // (CRDT re-applies NoOp; the run-config re-push delivers the same
-        // value; PeerInfo re-broadcasts are receiver-idempotent).
+        // value; the trio re-serve is receiver-idempotent), and the capped
+        // backoff (≤ one handshake per `HANDSHAKE_RETRY_MAX`) bounds the
+        // steady-state churn.
         let mut handshake_attempts: u32 = 0;
         let mut handshake_backoff = handshake_retry_initial(self.config.keepalive_interval);
         // An operator-tempo floor above the cap is honoured (the cap only
@@ -601,25 +613,30 @@ where
             // host dials/accepts; the manager addresses peers by id and
             // never sees a transport role split.
             //
-            // Handshake retries persist until the primary PROVES it
-            // received the welcome — and the only proof is a DIRECTED
-            // setup frame to THIS secondary: `InitialAssignment` or
-            // `TransferComplete`, the trio members the primary sends
-            // only to secondaries in its welcomed registry. The
-            // lifecycle state is deliberately NOT the gate: the
-            // `AwaitingPrimary → Configuring` announce fires on ANY
+            // Handshake retries persist until the WHOLE trio has landed
+            // (i.e. for this loop's entire wait): a re-welcome is the
+            // trio-retransmit request the primary's duplicate-welcome
+            // re-serve answers. A partial trio is NOT a disarm — the
+            // run_20260612_105712 member had both directed halves
+            // (`got_assignment`/`got_transfer` true, the old disarm) yet
+            // sat at `got_peer_info=false` forever once the retries
+            // stopped, with nothing left to retransmit the lost roster.
+            // The lifecycle state is deliberately NOT the gate either:
+            // the `AwaitingPrimary → Configuring` announce fires on ANY
             // primary-originated frame, including BROADCASTS
             // (`PeerJoined` / `PeerInfo` / cold-seed `ClusterMutation`
             // batches), and receiving a broadcast proves nothing about
             // the welcome having landed (the asm-dataset LMU 5-of-15
-            // welcome loss). `got_assignment` / `got_transfer` can only
-            // change between trio-loop iterations (they flip on a
-            // received frame, which exits the select loop below), so
-            // sampling here is exact. Re-sends stay safe past
-            // `Configuring`: the primary's welcome handling is idempotent
-            // and the immediately-following cert-exchange restores the
-            // connection record the re-welcome resets.
-            let welcome_unproven = !got_assignment && !got_transfer;
+            // welcome loss). The `got_*` flags can only change between
+            // trio-loop iterations (they flip on a received frame, which
+            // exits the select loop below), so sampling here is exact —
+            // and the loop guard makes `trio_incomplete` true on entry;
+            // the explicit gate documents the arm's contract and keeps it
+            // correct under any future loop restructuring. Re-sends stay
+            // safe past `Configuring`: the primary's welcome handling is
+            // idempotent and the immediately-following cert-exchange
+            // restores the connection record the re-welcome resets.
+            let trio_incomplete = !got_peer_info || !got_assignment || !got_transfer;
             let received = loop {
                 tokio::select! {
                     // Cancel-safe: `recv_setup_frame` is a sync backlog
@@ -628,10 +645,11 @@ where
                     frame = self.recv_setup_frame() => break frame,
                     // Welcome/cert handshake retry (see the arming
                     // comment above the trio loop): persistent
-                    // deadline, capped exponential backoff, disabled
-                    // once a DIRECTED setup frame proves the welcome
-                    // landed. `sleep_until` is cancel-safe (tokio docs).
-                    _ = tokio::time::sleep_until(handshake_at), if welcome_unproven => {
+                    // deadline, capped exponential backoff, armed for
+                    // the whole trio-wait — the loop exiting (trio
+                    // complete) is what ends the retries. `sleep_until`
+                    // is cancel-safe (tokio docs).
+                    _ = tokio::time::sleep_until(handshake_at), if trio_incomplete => {
                         handshake_attempts += 1;
                         let delivered =
                             self.try_send_handshake(handshake_attempts).await;
@@ -754,12 +772,12 @@ where
                     // proves it alive): re-arm the pre-`Operational`
                     // deadline so it measures PRIMARY SILENCE, never
                     // slow-fleet assembly. Deliberately a DIFFERENT
-                    // predicate from the welcome-receipt proof above (which
-                    // requires a DIRECTED frame): a broadcast cannot prove
-                    // the welcome landed, but it absolutely proves the
-                    // primary is alive and assembling — exactly what the
-                    // deadline exists to detect the absence of. See
-                    // `setup_deadline.rs` for the LMU fleet-death replay.
+                    // predicate from the trio gate the handshake retry is
+                    // armed on: a frame from the primary proves it alive
+                    // and assembling — exactly what the deadline exists to
+                    // detect the absence of — but proves nothing about the
+                    // trio having fully landed. See `setup_deadline.rs`
+                    // for the LMU fleet-death replay.
                     self.note_setup_primary_liveness(msg.sender_id());
                     // Run-config PUSH is PRE-ANNOUNCE config delivery: it
                     // fires from the primary's welcome handler, BEFORE the

@@ -169,6 +169,10 @@ impl<I: Identifier> ClusterState<I> {
     /// MAX — the snapshot + AE field merge additionally heals any
     /// transition a node never observed.
     pub(crate) fn record_phase_event_tally(&mut self, key: (PhaseId, PhaseTally), count: u32) {
+        // Folded-field mutation seam — clear the digest memo (the lowest-
+        // level `&mut self` originator of `phase_event_tallies`; see
+        // `invalidate_digest_cache`).
+        self.invalidate_digest_cache();
         bump_grow_max(&mut self.phase_event_tallies, key, count);
     }
 
@@ -207,6 +211,9 @@ impl<I: Identifier> ClusterState<I> {
     /// with the new used count the pure core returned. Grow-only MAX —
     /// replicated via snapshot + AE.
     pub(crate) fn record_retry_pass_used(&mut self, key: (PhaseId, BucketKind), used: u32) {
+        // Folded-field mutation seam — clear the digest memo (see
+        // `invalidate_digest_cache`).
+        self.invalidate_digest_cache();
         bump_grow_max(&mut self.retry_passes_used, key, used);
     }
 
@@ -228,6 +235,9 @@ impl<I: Identifier> ClusterState<I> {
     /// `None` cap originates nothing — there is no budget to enforce).
     /// Grow-only MAX — replicated via snapshot + AE.
     pub(crate) fn record_unfulfillable_reinject_used(&mut self, hash: String, used: u32) {
+        // Folded-field mutation seam — clear the digest memo (see
+        // `invalidate_digest_cache`).
+        self.invalidate_digest_cache();
         bump_grow_max(&mut self.unfulfillable_reinject_used, hash, used);
     }
 
@@ -260,6 +270,9 @@ impl<I: Identifier> ClusterState<I> {
     /// the snapshot + AE digest path replicates it. Grow-only SET —
     /// idempotent re-insert, never removes, never mutates a value.
     pub(crate) fn record_respawn_event(&mut self, new_id: String, record: RespawnEventRecord) {
+        // Folded-field mutation seam — clear the digest memo (see
+        // `invalidate_digest_cache`).
+        self.invalidate_digest_cache();
         insert_grow_set(&mut self.respawn_events, new_id, record);
     }
 }

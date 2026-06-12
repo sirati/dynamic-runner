@@ -326,6 +326,44 @@ async fn run_secondary_node_reading<R>(
     reader(&secondary)
 }
 
+/// The ONE `SecondaryConfig` the real-secondary e2e harness runs with
+/// (production-tempo keepalives; the flaky variant overrides its own
+/// deviations after construction). Shared by every `spawn_real_secondary*`
+/// helper and by tests that defer the spawn (a mid-run joiner builds its
+/// config up-front and runs `run_secondary_node` later).
+pub(super) fn real_secondary_config(
+    secondary_id: String,
+    num_workers: u32,
+    max_resources: dynrunner_core::ResourceMap,
+) -> SecondaryConfig {
+    SecondaryConfig {
+        secondary_id,
+        num_workers,
+        max_resources,
+        hostname: "test-host".into(),
+        keepalive_interval: Duration::from_secs(60),
+        src_network: None,
+        src_tmp: None,
+        peer_timeout: Duration::from_secs(120),
+        keepalive_miss_threshold: 3,
+        retry_max_passes: 1,
+        oom_retry_max_passes: 1,
+        primary_link_failure_threshold: 5,
+        primary_link_failure_window: Duration::from_secs(30),
+        primary_silence_backstop: Duration::from_secs(120),
+        unconfigured_deadline: Duration::from_secs(600),
+        can_be_primary: false,
+        resource_check_interval: Duration::from_millis(100),
+        log_oom_watcher: false,
+        promoted_primary_quiesce_grace: Duration::from_millis(100),
+        unfulfillable_reinject_max_per_task: None,
+        mem_manager_reserved_bytes: None,
+        output_dir: None,
+        memuse_log_path: None,
+        forwarded_argv: Vec::new(),
+    }
+}
+
 /// Wire up a real SecondaryCoordinator as a tokio task, connected to the
 /// primary via a channel-backed mesh. Returns the secondary's channel ends
 /// that should be plugged into the primary's `ChannelPeerTransport`.
@@ -354,32 +392,8 @@ pub(super) fn spawn_real_secondary_with_src_network(
     let (pri_to_sec_tx, sec_to_pri_rx, transport) = channel_mesh_secondary_ends(&secondary_id);
 
     let handle = tokio::task::spawn_local(async move {
-        let config = SecondaryConfig {
-            secondary_id,
-            num_workers,
-            max_resources,
-            hostname: "test-host".into(),
-            keepalive_interval: Duration::from_secs(60),
-            src_network,
-            src_tmp: None,
-            peer_timeout: Duration::from_secs(120),
-            keepalive_miss_threshold: 3,
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            primary_link_failure_threshold: 5,
-            primary_link_failure_window: Duration::from_secs(30),
-            primary_silence_backstop: Duration::from_secs(120),
-            unconfigured_deadline: Duration::from_secs(600),
-            can_be_primary: false,
-            resource_check_interval: Duration::from_millis(100),
-            log_oom_watcher: false,
-            promoted_primary_quiesce_grace: Duration::from_millis(100),
-            unfulfillable_reinject_max_per_task: None,
-            mem_manager_reserved_bytes: None,
-            output_dir: None,
-            memuse_log_path: None,
-            forwarded_argv: Vec::new(),
-        };
+        let mut config = real_secondary_config(secondary_id, num_workers, max_resources);
+        config.src_network = src_network;
         run_secondary_node(config, transport, FakeWorkerFactory).await
     });
 
@@ -401,42 +415,50 @@ pub(super) fn spawn_real_secondary_slow(
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
     tokio::task::JoinHandle<usize>,
 ) {
-    let (pri_to_sec_tx, sec_to_pri_rx, transport) = channel_mesh_secondary_ends(&secondary_id);
+    spawn_real_secondary_node(
+        real_secondary_config(secondary_id, num_workers, max_resources),
+        SlowFakeWorkerFactory::with_markers(slow_markers),
+        Vec::new(),
+    )
+}
 
-    let handle = tokio::task::spawn_local(async move {
-        let config = SecondaryConfig {
-            secondary_id,
-            num_workers,
-            max_resources,
-            hostname: "test-host".into(),
-            keepalive_interval: Duration::from_secs(60),
-            src_network: None,
-            src_tmp: None,
-            peer_timeout: Duration::from_secs(120),
-            keepalive_miss_threshold: 3,
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            primary_link_failure_threshold: 5,
-            primary_link_failure_window: Duration::from_secs(30),
-            primary_silence_backstop: Duration::from_secs(120),
-            unconfigured_deadline: Duration::from_secs(600),
-            can_be_primary: false,
-            resource_check_interval: Duration::from_millis(100),
-            log_oom_watcher: false,
-            promoted_primary_quiesce_grace: Duration::from_millis(100),
-            unfulfillable_reinject_max_per_task: None,
-            mem_manager_reserved_bytes: None,
-            output_dir: None,
-            memuse_log_path: None,
-            forwarded_argv: Vec::new(),
-        };
-        run_secondary_node(
-            config,
-            transport,
-            SlowFakeWorkerFactory::with_markers(slow_markers),
-        )
-        .await
-    });
+/// The GENERAL real-secondary spawn primitive: an explicit
+/// [`SecondaryConfig`] (build it with [`real_secondary_config`] and
+/// override the deviations), any worker factory, and optional EXTRA
+/// direct mesh legs (peer-id → that peer's inbox sender) folded into the
+/// secondary's transport before it runs. The legs are ordinary transport
+/// connections: the secondary's Router forwards relays over them like
+/// any leg, and its broadcasts (keepalives, digests) fan over them — so
+/// a scenario can stand up the sibling-forwarder topology a mid-run
+/// joiner's directed frames ride through (the run_20260612_105712
+/// delivery shape, where the joiner had QUIC legs to live siblings but
+/// not yet to the primary's broadcast set).
+pub(super) fn spawn_real_secondary_node<F>(
+    config: SecondaryConfig,
+    factory: F,
+    extra_legs: Vec<(
+        String,
+        tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    )>,
+) -> (
+    tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    tokio::task::JoinHandle<usize>,
+)
+where
+    F: dynrunner_manager_local::WorkerFactory<dynrunner_transport_channel::ChannelManagerEnd>
+        + 'static,
+{
+    let (pri_to_sec_tx, sec_to_pri_rx, mut transport) =
+        channel_mesh_secondary_ends(&config.secondary_id);
+    for (peer_id, leg) in extra_legs {
+        transport.connect_to(peer_id, leg);
+    }
+
+    let handle =
+        tokio::task::spawn_local(
+            async move { run_secondary_node(config, transport, factory).await },
+        );
 
     (pri_to_sec_tx, sec_to_pri_rx, handle)
 }
@@ -488,41 +510,19 @@ where
     let (pri_to_sec_tx, sec_to_pri_rx, transport) = channel_mesh_secondary_ends(&secondary_id);
 
     let handle = tokio::task::spawn_local(async move {
-        let config = SecondaryConfig {
-            secondary_id,
-            num_workers,
-            max_resources,
-            hostname: "test-host".into(),
-            // Tight keepalive so the keepalive-tick backstop fires
-            // quickly enough that tests don't hit the default 60s
-            // wait if any code path needs the periodic drain-check
-            // (the synchronous one in `note_primary_item_failed` is
-            // the primary trigger — this is just defensive).
-            keepalive_interval: Duration::from_millis(50),
-            src_network: None,
-            src_tmp: None,
-            peer_timeout: Duration::from_secs(120),
-            keepalive_miss_threshold: 3,
-            retry_max_passes,
-            // Mirror Recoverable retries: the existing fixture
-            // callers want one budget value passed in for both
-            // channels; the new `oom_retry_max_passes` knob is
-            // unit-tested in `secondary/tests` separately.
-            oom_retry_max_passes: retry_max_passes,
-            primary_link_failure_threshold: 5,
-            primary_link_failure_window: Duration::from_secs(30),
-            primary_silence_backstop: Duration::from_secs(120),
-            unconfigured_deadline: Duration::from_secs(600),
-            can_be_primary: false,
-            resource_check_interval: Duration::from_millis(100),
-            log_oom_watcher: false,
-            promoted_primary_quiesce_grace: Duration::from_millis(100),
-            unfulfillable_reinject_max_per_task: None,
-            mem_manager_reserved_bytes: None,
-            output_dir: None,
-            memuse_log_path: None,
-            forwarded_argv: Vec::new(),
-        };
+        let mut config = real_secondary_config(secondary_id, num_workers, max_resources);
+        // Tight keepalive so the keepalive-tick backstop fires
+        // quickly enough that tests don't hit the default 60s
+        // wait if any code path needs the periodic drain-check
+        // (the synchronous one in `note_primary_item_failed` is
+        // the primary trigger — this is just defensive).
+        config.keepalive_interval = Duration::from_millis(50);
+        config.retry_max_passes = retry_max_passes;
+        // Mirror Recoverable retries: the existing fixture
+        // callers want one budget value passed in for both
+        // channels; the new `oom_retry_max_passes` knob is
+        // unit-tested in `secondary/tests` separately.
+        config.oom_retry_max_passes = retry_max_passes;
         run_secondary_node(config, transport, factory).await
     });
 

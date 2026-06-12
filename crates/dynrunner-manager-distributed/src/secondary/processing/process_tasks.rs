@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use dynrunner_core::{Identifier, WorkerId};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_manager_local::oom::{
-    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_SAMPLE_INTERVAL, OomWatcher, OomWatcherConfig,
+    DEFAULT_HEARTBEAT_INTERVAL, OomWatcher, OomWatcherConfig, SAMPLE_SWEEP_INTERVAL,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{Destination, PeerId};
@@ -35,24 +35,24 @@ const ARM_POOL_EVENT: usize = 0;
 const ARM_INBOX: usize = 1;
 const ARM_ANNOUNCER_OUTBOX: usize = 2;
 const ARM_KEEPALIVE: usize = 3;
-const ARM_OOM_SAMPLE: usize = 4;
-const ARM_OOM_DECISION: usize = 5;
-const ARM_PANIK: usize = 6;
-const ARM_FATAL_EXIT: usize = 7;
-const ARM_ANTI_ENTROPY: usize = 8;
-const ARM_SECONDARY_CONTROL: usize = 9;
-const ARM_REPORT_REPLAY: usize = 10;
-const ARM_WORKER_RESTART: usize = 11;
+const ARM_OOM_SWEEP: usize = 4;
+const ARM_PANIK: usize = 5;
+const ARM_FATAL_EXIT: usize = 6;
+const ARM_ANTI_ENTROPY: usize = 7;
+const ARM_SECONDARY_CONTROL: usize = 8;
+const ARM_REPORT_REPLAY: usize = 9;
+const ARM_WORKER_RESTART: usize = 10;
 
 /// Arm names, index-aligned with the `ARM_*` ids above (render order of the
-/// compact stats line).
+/// compact stats line). The single `oom_sweep` arm counts SWEEPS (one
+/// self-paced read-all-workers + decide pass per ~50ms), NOT the former
+/// per-worker sample / decision fires.
 const PROCESS_TASKS_ARM_NAMES: &[&str] = &[
     "pool_event",
     "inbox",
     "announcer_outbox",
     "keepalive",
-    "oom_sample",
-    "oom_decision",
+    "oom_sweep",
     "panik",
     "fatal_exit",
     "anti_entropy",
@@ -174,12 +174,11 @@ where
         // to exactly one catch-up tick, so liveness resumes at the normal
         // cadence instead of a post-resume storm.
         keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Decouple sample cadence (50ms, 20Hz) from decision cadence
-        // (config-driven, default 100ms). Pre-extraction the decision
-        // cadence was a hardcoded 100ms literal here; now it reads
-        // from `SecondaryConfig::resource_check_interval` so the
-        // secondary and LocalManager use the same operator knob.
-        // Activate kernel-OOM detection by passing the workers cgroup
+        // The OOM memory accounting runs as ONE self-paced sweep (read
+        // all workers' cgroup charges off the async runtime via
+        // `spawn_blocking`, apply + decide inline), not per-fire timer
+        // arms. See `crate::oom` in dynrunner-manager-local. Activate
+        // kernel-OOM detection by passing the workers cgroup
         // `memory.events` path (when the nested workers subgroup was
         // materialised; flat-layout fallback leaves it `None`).
         let workers_memory_events_path = self
@@ -189,15 +188,13 @@ where
             .map(|h| h.workers_path().join("memory.events"));
         let mut oom_watcher = OomWatcher::new_with_workers_cgroup(
             OomWatcherConfig {
-                sample_interval: DEFAULT_SAMPLE_INTERVAL,
-                decision_interval: self.config.resource_check_interval,
+                sample_interval: SAMPLE_SWEEP_INTERVAL,
                 heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
                 log_enabled: self.config.log_oom_watcher,
             },
             workers_memory_events_path,
         );
-        let mut oom_sample_interval = oom_watcher.sample_interval_ticker();
-        let mut oom_decision_interval = oom_watcher.decision_interval_ticker();
+        let oom_sweep_interval = oom_watcher.sweep_interval();
 
         // Tell the primary the peer-mesh has settled so it can release
         // its `PrimaryChanged` announcement. For the single-secondary /
@@ -278,6 +275,14 @@ where
             .op_loop_arm_stats_cell
             .as_ref()
             .map(|cell| cell.publish_scoped("secondary", std::sync::Arc::clone(&arm_stats)));
+
+        // OOM sweep wake deadline. Seeded to NOW so the first sweep
+        // fires immediately; re-armed `oom_sweep_interval` after EACH
+        // sweep completes (await-before-resleep — a slow sweep cannot
+        // pile, the next starts a full interval after the previous
+        // returned). Persistent local state like the replay / restart
+        // deadlines, so a busy loop cannot starve the sweep.
+        let mut next_sweep_due = tokio::time::Instant::now();
 
         loop {
             // Worker-restart wake deadline: the EARLIEST due instant
@@ -508,16 +513,36 @@ where
                         self.fire_local_promotion().await;
                     }
                 }
-                _ = oom_sample_interval.tick() => {
-                    arm_stats.record(ARM_OOM_SAMPLE);
-                    // Fast sample tick: refresh per-worker RSS, read
-                    // host + cgroup state, evaluate structured-log
-                    // triggers. No scheduler call.
-                    oom_watcher.on_sample(&mut self.op_mut().pool);
-                }
-                _ = oom_decision_interval.tick() => {
-                    arm_stats.record(ARM_OOM_DECISION);
+                // Self-paced OOM sweep arm. Parks on the stored
+                // `next_sweep_due` deadline; on fire it reads ALL
+                // workers' cgroup charges off the async runtime
+                // (`spawn_blocking`), applies them, runs the pressure
+                // decision inline, then re-arms the deadline. ONE
+                // operational-loop wakeup per sweep replaces the former
+                // per-fire sample + decision ticks (the 58%-of-wakeups
+                // blocking-IO hot path). The arm-stats `oom_sweep` count
+                // is therefore SWEEPS, not per-worker fires.
+                //
+                // Cancel-safety: `sleep_until` consumes nothing and the
+                // deadline is PERSISTENT local state, so a sibling arm
+                // winning merely re-creates the future against the SAME
+                // instant next iteration — the sweep cannot be starved
+                // into never firing by a busy loop.
+                _ = tokio::time::sleep_until(next_sweep_due) => {
+                    arm_stats.record(ARM_OOM_SWEEP);
+                    // Collect the CURRENT worker set's read inputs
+                    // (respawns / type-shifts picked up each sweep),
+                    // then read off the runtime — no pool borrow held
+                    // across the blocking call.
+                    let inputs = oom_watcher.collect_sweep_inputs(&self.op_mut().pool);
+                    let sweep = tokio::task::spawn_blocking(move || inputs.read())
+                        .await
+                        .expect("oom charge sweep read panicked");
+                    oom_watcher.apply_sweep(&mut self.op_mut().pool, sweep);
                     self.check_resource_pressure_via_watcher(&mut oom_watcher, factory).await;
+                    // Await-before-resleep: arm the next sweep a full
+                    // interval after THIS one completed.
+                    next_sweep_due = tokio::time::Instant::now() + oom_sweep_interval;
                 }
                 // Panik (operator-initiated emergency stop) arm. The
                 // watcher's `oneshot::Receiver<PanikSignal>` resolves
