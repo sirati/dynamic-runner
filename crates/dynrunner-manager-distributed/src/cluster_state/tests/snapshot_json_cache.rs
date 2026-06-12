@@ -42,10 +42,19 @@ fn snapshot_json_serializes_once_per_generation() {
         });
     }
     let first = s.snapshot_json().unwrap();
+    let folds_after_first = s.digest_fold_count();
     let second = s.snapshot_json().unwrap();
     assert!(
         Arc::ptr_eq(&first, &second),
         "an unchanged ledger must serve the cached serialization"
+    );
+    // A snapshot_json cache HIT must NOT re-run the O(ledger) digest fold:
+    // the digest it checks the cache against is served from the memo. Pre-
+    // memo, snapshot_json re-folded the whole ledger on every cache hit.
+    assert_eq!(
+        s.digest_fold_count(),
+        folds_after_first,
+        "a snapshot_json cache hit must reuse the digest memo, not re-fold"
     );
 
     // A digest-covered change (a task completing) must invalidate.
