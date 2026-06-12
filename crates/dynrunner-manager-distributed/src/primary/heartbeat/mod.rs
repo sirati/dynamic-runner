@@ -332,6 +332,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// primary in a slow bring-up window (members connected, no welcome /
     /// hydrate registered yet) fed spurious primary-silence suspicion.
     /// With zero members the mesh fan is simply a no-op.
+    ///
+    /// OBSERVER members additionally get the keepalive DIRECTED
+    /// (`Destination::Observer(id)` per roster observer — see
+    /// [`PrimaryCoordinator::send_to_each_observer`]): the `All` fan is
+    /// the transport's direct-leg broadcast, which a relay-only observer
+    /// (a late joiner behind a gateway leg, or an observer whose direct
+    /// leg died) never receives — the production face where an observer
+    /// ingested live CRDT gossip while declaring the named primary
+    /// silent for 600s. The keepalive is the frame the observer's
+    /// `primary_last_seen` clock keys on, so its delivery must be
+    /// independent of broadcast reachability; the directed edge relays
+    /// through a connected sibling. A direct-leg observer's duplicate is
+    /// an idempotent clock refresh.
     pub(super) async fn broadcast_primary_keepalive(&mut self) {
         let msg = DistributedMessage::<I>::Keepalive {
             target: None,
@@ -341,6 +354,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             active_workers: self.workers.iter().filter(|w| !w.is_idle()).count() as u32,
             emitter_role: KeepaliveRole::Primary,
         };
+        self.send_to_each_observer(msg.clone()).await;
         if let Err(error) = self.send_to(Destination::All, msg).await {
             // Keepalive failures are debug-level: a secondary mid-
             // disconnect generates one of these per tick until the

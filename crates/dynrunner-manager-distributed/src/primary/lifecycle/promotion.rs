@@ -404,14 +404,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             epoch,
             "relocating primary role to compute peer (bootstrap handoff)"
         );
-        self.apply_and_broadcast_cluster_mutations(vec![
-            dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
-                new: chosen,
-                epoch,
-                reason:
-                    dynrunner_protocol_primary_secondary::PrimaryChangeReason::Transferred,
-            },
-        ])
-        .await;
+        let repoint = dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
+            new: chosen,
+            epoch,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Transferred,
+        };
+        self.apply_and_broadcast_cluster_mutations(vec![repoint.clone()])
+            .await;
+        // Directed observer fan of the handoff re-point — the `All`
+        // broadcast is the direct-leg fan only, so a relay-only observer
+        // would otherwise keep recognizing (and silence-judging) the
+        // OLD primary forever. See `fan_repoint_to_observers`.
+        self.fan_repoint_to_observers(repoint).await;
     }
 }

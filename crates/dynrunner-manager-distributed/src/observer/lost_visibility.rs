@@ -230,7 +230,10 @@ pub enum MeshLiveness {
 /// carries a human reason for the operator log (which signal dropped) AND
 /// the CRDT-derived [`MeshLiveness`] evidence the coordinator holds, which
 /// gates whether the reporter may assert the mesh runs autonomously or must
-/// stay neutral (see [`MeshLiveness`]).
+/// stay neutral (see [`MeshLiveness`]). `Degraded` is the data-plane-vetoed
+/// middle state: the named primary's KEEPALIVE class is not reaching this
+/// observer while authenticated frames from the roster's legs ARE arriving
+/// and applying — an addressing / primary-leg gap, NOT a connection loss.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Visibility {
     /// The observer currently sees the run.
@@ -242,6 +245,25 @@ pub enum Visibility {
     Lost {
         reason: String,
         mesh_liveness: MeshLiveness,
+    },
+    /// The observer's DATA PLANE is live (frames arriving + applying —
+    /// the same ingest that feeds its periodic stats) while the named
+    /// primary's keepalive / re-point class is not reaching it past the
+    /// silence threshold. The production face (owner logs 2026-06-11): an
+    /// observer WARNed "connection down for 300s with no successful
+    /// reconnect+sync" in the SAME minute its 10-minute stats printed the
+    /// cluster's fresh task counts. That claim is false — sync IS
+    /// succeeding — so this verdict gets its own honest narration and
+    /// NEVER counts as a loss episode: no loss clock, no wake-LOSS emit
+    /// (the cluster-gone consult keys on those), no [`EndedOutage`]
+    /// bookkeeping. The (freshness-filtered) primary-leg redial cadence
+    /// stays alive — a dead primary→observer leg is one legitimate cause
+    /// of this state and the redial is its heal; the per-leg filter
+    /// guarantees a delivering leg is never touched.
+    Degraded {
+        /// Names the named primary, its keepalive-silence age, and the
+        /// data-plane freshness for the log.
+        reason: String,
     },
 }
 
@@ -306,6 +328,27 @@ pub struct LostVisibilityReporter {
     /// from an `observe` call) carries the same gated wording as the
     /// full-log banner.
     last_lost_context: Option<(String, MeshLiveness)>,
+    /// `Some(t)` while the keepalive-addressing DEGRADED state persists —
+    /// the instant the CURRENT degraded episode began. Mutually exclusive
+    /// with `lost_since` by construction: each verdict arm clears the
+    /// other episode's clocks. NEVER feeds the loss machinery (no
+    /// [`EndedOutage`], no reconnection note, no `last_wake_emit`
+    /// advance) — the cluster-gone consult and the outage bookkeeping
+    /// key on the LOSS clocks only.
+    degraded_since: Option<Instant>,
+    /// The last instant the degraded full-log WARN was emitted, so the
+    /// recurrence fires at most once per [`REPORT_RECURRENCE`].
+    last_degraded_report: Option<Instant>,
+    /// The instant of the LAST wake-stream DEGRADED emit (the honest
+    /// "primary keepalive not reaching this observer; data plane live"
+    /// line), threshold/recurrence-spaced exactly like the loss policy
+    /// but on its OWN clock — it must never advance
+    /// [`Self::wake_emit_instant`], the cluster-gone consult key.
+    last_degraded_wake_emit: Option<Instant>,
+    /// The latest degraded reason observed, so the threshold emit (which
+    /// fires from the deadline arm, between `observe` calls) carries the
+    /// live wording.
+    last_degraded_context: Option<String>,
     /// The shared reconnection-note slot (see [`WakeNoteSlot`]). The
     /// reporter is the single writer; the wake emitters flush it.
     note: WakeNoteSlot,
@@ -345,37 +388,59 @@ impl LostVisibilityReporter {
     pub fn observe(&mut self, visibility: &Visibility, now: Instant) -> ObserveOutcome {
         match visibility {
             Visibility::Visible => {
-                let mut ended_logged_outage = None;
-                if let Some(since) = self.lost_since.take() {
-                    let lost_secs = now.duration_since(since).as_secs();
-                    // FULL-LOG diagnostic — immediate, regardless of the
-                    // wake threshold (the wake stream stays silent here).
-                    tracing::warn!(
-                        lost_secs,
-                        "observer reconnected — visibility regained; resuming passive \
-                         observation of the run"
-                    );
-                    if self.last_wake_emit.is_some() {
-                        // The loss WAS reported on the wake stream, so the
-                        // operator must eventually learn it ended — but a
-                        // reconnection is never a wake event of its own:
-                        // park the note to ride the next wake-stream log,
-                        // and hand the coordinator the ended-outage signal
-                        // for the periodic reporter's late-run decision.
-                        self.note.set(format!(
-                            "observer connection to the run was restored after {lost_secs}s of \
-                             lost visibility (the loss was reported earlier on this stream)"
-                        ));
-                        ended_logged_outage = Some(EndedOutage {
-                            down_since: since.into_std(),
-                        });
-                    }
-                }
-                self.last_wake_emit = None;
-                self.last_lost_context = None;
-                self.last_report = None;
+                let ended_logged_outage = self.end_loss_episode(now);
+                self.clear_degraded_state();
                 ObserveOutcome {
                     directive: RetryDirective::Idle,
+                    ended_logged_outage,
+                }
+            }
+            Visibility::Degraded { reason } => {
+                // Data plane LIVE ⇒ NOT a connection loss: any loss
+                // episode ends here exactly as on a regain — frames
+                // arriving and applying IS the connection — with the same
+                // logged-outage note / late-stats bookkeeping. The
+                // keepalive-class gap is then narrated on its OWN cadence
+                // (full-log WARN per [`REPORT_RECURRENCE`]; the wake
+                // stream only at the threshold marks via
+                // [`Self::on_wake_deadline`], with honest wording and on
+                // a clock the cluster-gone consult never reads). The
+                // redial cadence stays alive: a dead primary→observer
+                // leg is one legitimate cause of this state and the
+                // freshness-filtered roster guarantees the rebuild can
+                // only ever touch non-delivering legs (the
+                // run_20260611_200548 per-leg-honesty contract).
+                let ended_logged_outage = self.end_loss_episode(now);
+                let first = self.degraded_since.is_none();
+                self.degraded_since.get_or_insert(now);
+                self.last_degraded_context = Some(reason.clone());
+                self.on_wake_deadline(now);
+                let due = first
+                    || self
+                        .last_degraded_report
+                        .is_none_or(|last| now.duration_since(last) >= REPORT_RECURRENCE);
+                let directive = if due {
+                    let since = self.degraded_since.expect("set above");
+                    let degraded_secs = now.duration_since(since).as_secs();
+                    // FULL-LOG only; the wake stream learns of a
+                    // persistent gap solely via the threshold emit.
+                    tracing::warn!(
+                        %reason,
+                        degraded_secs,
+                        "primary keepalive not reaching this observer; data plane live — \
+                         frames from the run keep arriving and applying, so this is a \
+                         role-addressing gap or a dead primary→observer leg, NOT a \
+                         connection loss (no reconnect+sync outage is in progress); the \
+                         primary-leg redial keeps retrying on this cadence and never \
+                         touches a delivering leg"
+                    );
+                    self.last_degraded_report = Some(now);
+                    RetryDirective::ReconnectDue
+                } else {
+                    RetryDirective::WaitingToRetry
+                };
+                ObserveOutcome {
+                    directive,
                     ended_logged_outage,
                 }
             }
@@ -383,6 +448,10 @@ impl LostVisibilityReporter {
                 reason,
                 mesh_liveness,
             } => {
+                // A degraded episode that collapses into a real loss (the
+                // data plane went quiet too) starts the loss clocks
+                // fresh; the degraded cadence state is over.
+                self.clear_degraded_state();
                 let first = self.lost_since.is_none();
                 self.lost_since.get_or_insert(now);
                 // Keep the wake-threshold emit's context fresh (the
@@ -451,15 +520,73 @@ impl LostVisibilityReporter {
         }
     }
 
-    /// The NEXT wake-stream loss deadline while the connection is down:
-    /// `Some(lost_since + 5min)` before the episode's first wake emit,
-    /// then `Some(last_emit + 10min)` for each repeat
-    /// ([`WAKE_LOSS_RECURRENCE`]); `None` while visible. Derived from
-    /// STORED instants (the persistent-deadline law): the coordinator's
-    /// select arm rebuilds `sleep_until` from this value every iteration,
-    /// so sibling arm activity never resets the clock.
+    /// End any current LOSS episode (the regain transition shared by the
+    /// `Visible` and `Degraded` arms — frames arriving and applying IS
+    /// the connection): emit the FULL-LOG "reconnected" diagnostic, and
+    /// — iff the loss WAS reported on the wake stream — park the
+    /// reconnection note + return the [`EndedOutage`] signal for the
+    /// periodic reporter's late-run decision. Clears every loss clock;
+    /// a no-op (returning `None`) when no loss episode is open.
+    fn end_loss_episode(&mut self, now: Instant) -> Option<EndedOutage> {
+        let mut ended_logged_outage = None;
+        if let Some(since) = self.lost_since.take() {
+            let lost_secs = now.duration_since(since).as_secs();
+            // FULL-LOG diagnostic — immediate, regardless of the
+            // wake threshold (the wake stream stays silent here).
+            tracing::warn!(
+                lost_secs,
+                "observer reconnected — visibility regained; resuming passive \
+                 observation of the run"
+            );
+            if self.last_wake_emit.is_some() {
+                // The loss WAS reported on the wake stream, so the
+                // operator must eventually learn it ended — but a
+                // reconnection is never a wake event of its own:
+                // park the note to ride the next wake-stream log,
+                // and hand the coordinator the ended-outage signal
+                // for the periodic reporter's late-run decision.
+                self.note.set(format!(
+                    "observer connection to the run was restored after {lost_secs}s of \
+                     lost visibility (the loss was reported earlier on this stream)"
+                ));
+                ended_logged_outage = Some(EndedOutage {
+                    down_since: since.into_std(),
+                });
+            }
+        }
+        self.last_wake_emit = None;
+        self.last_lost_context = None;
+        self.last_report = None;
+        ended_logged_outage
+    }
+
+    /// Clear the degraded-episode cadence state (the `Visible` and
+    /// `Lost` transitions both end a degraded episode). Touches NO loss
+    /// clock.
+    fn clear_degraded_state(&mut self) {
+        self.degraded_since = None;
+        self.last_degraded_report = None;
+        self.last_degraded_wake_emit = None;
+        self.last_degraded_context = None;
+    }
+
+    /// The NEXT wake-stream deadline: while the connection is down, the
+    /// LOSS cadence (`Some(lost_since + 5min)` before the episode's first
+    /// wake emit, then `Some(last_emit + 10min)` for each repeat —
+    /// [`WAKE_LOSS_RECURRENCE`]); while the keepalive-addressing DEGRADED
+    /// state persists, the SAME threshold/recurrence shape on the
+    /// degraded clocks (the two episodes are mutually exclusive); `None`
+    /// while visible. Derived from STORED instants (the
+    /// persistent-deadline law): the coordinator's select arm rebuilds
+    /// `sleep_until` from this value every iteration, so sibling arm
+    /// activity never resets the clock.
     pub fn wake_deadline(&self) -> Option<Instant> {
         match (self.lost_since, self.last_wake_emit) {
+            (Some(since), None) => return Some(since + WAKE_LOSS_THRESHOLD),
+            (Some(_), Some(last_emit)) => return Some(last_emit + WAKE_LOSS_RECURRENCE),
+            (None, _) => {}
+        }
+        match (self.degraded_since, self.last_degraded_wake_emit) {
             (Some(since), None) => Some(since + WAKE_LOSS_THRESHOLD),
             (Some(_), Some(last_emit)) => Some(last_emit + WAKE_LOSS_RECURRENCE),
             (None, _) => None,
@@ -484,10 +611,37 @@ impl LostVisibilityReporter {
         if now < deadline {
             return;
         }
+        let Some(since) = self.lost_since else {
+            // DEGRADED episode (the two are mutually exclusive): the
+            // honest wake line, threshold/recurrence-spaced on the
+            // degraded clock. Deliberately NOT `last_wake_emit` — that
+            // is the LOSS clock the cluster-gone consult and the
+            // outage/note bookkeeping key on, and a degraded state is
+            // not an outage.
+            let since = self
+                .degraded_since
+                .expect("wake_deadline() is Some only while lost or degraded");
+            self.last_degraded_wake_emit = Some(now);
+            let degraded_secs = now.duration_since(since).as_secs();
+            let reason = self
+                .last_degraded_context
+                .clone()
+                .unwrap_or_else(|| "primary keepalive-silent".to_string());
+            tracing::warn!(
+                target: IMPORTANT_TARGET,
+                %reason,
+                degraded_secs,
+                "primary keepalive not reaching this observer; data plane live — the \
+                 named primary's keepalive/re-point class has not reached this observer \
+                 for {degraded_secs}s while CRDT sync continues over the delivering legs \
+                 (a role-addressing gap or a dead primary→observer leg, NOT a connection \
+                 loss); the primary-leg redial keeps retrying"
+            );
+            // A wake-stream host like any other: a pending note rides it.
+            self.note.flush_after_host();
+            return;
+        };
         self.last_wake_emit = Some(now);
-        let since = self
-            .lost_since
-            .expect("wake_deadline() is Some only while lost");
         let lost_secs = now.duration_since(since).as_secs();
         let (reason, mesh_liveness) = self
             .last_lost_context
@@ -543,6 +697,13 @@ impl LostVisibilityReporter {
     #[cfg(test)]
     pub fn is_lost(&self) -> bool {
         self.lost_since.is_some()
+    }
+
+    /// Whether the reporter is currently in the keepalive-addressing
+    /// DEGRADED state. Test/diagnostic accessor.
+    #[cfg(test)]
+    pub(crate) fn is_degraded(&self) -> bool {
+        self.degraded_since.is_some()
     }
 
     /// Whether the CURRENT loss episode has been reported on the wake
@@ -1083,6 +1244,159 @@ mod tests {
             elapsed < WAKE_LOSS_THRESHOLD + Duration::from_secs(1),
             "fires AT the mark despite constant sibling ticks (a resettable \
              sleep would never fire): {elapsed:?}"
+        );
+    }
+
+    // ── the keepalive-addressing DEGRADED state (the late-joined-
+    //    observer keepalive blackout, owner logs 2026-06-11) ──
+
+    fn degraded(reason: &str) -> Visibility {
+        Visibility::Degraded {
+            reason: reason.to_string(),
+        }
+    }
+
+    /// A degraded observation is NOT a loss: no loss episode opens, the
+    /// honest full-log WARN fires once per [`REPORT_RECURRENCE`] (never
+    /// per tick), and the redial cadence stays alive (ReconnectDue on the
+    /// same recurrence — the run_20260611_200548 per-leg heal must keep
+    /// firing; its roster filter guarantees only non-delivering legs are
+    /// ever rebuilt).
+    #[test]
+    fn degraded_warns_honestly_on_recurrence_and_keeps_redial_cadence() {
+        let t0 = Instant::now();
+        let events = capture_all(|| {
+            let mut r = LostVisibilityReporter::new(WakeNoteSlot::default());
+            let first = r.observe(&degraded("keepalive gap"), t0);
+            assert_eq!(
+                first.directive,
+                RetryDirective::ReconnectDue,
+                "the first degraded loop drives the primary-leg redial"
+            );
+            assert!(!r.is_lost(), "degraded is NOT a loss episode");
+            assert!(r.is_degraded());
+            // Inside the recurrence window: wait, no re-warn, no re-fire.
+            let second = r.observe(&degraded("keepalive gap"), at(t0, 1));
+            assert_eq!(second.directive, RetryDirective::WaitingToRetry);
+            // Past the recurrence: warn + redial again.
+            let third = r.observe(&degraded("keepalive gap"), at(t0, 61));
+            assert_eq!(third.directive, RetryDirective::ReconnectDue);
+        });
+        let warns: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.message
+                    .contains("primary keepalive not reaching this observer")
+            })
+            .collect();
+        assert_eq!(
+            warns.len(),
+            2,
+            "one honest WARN per recurrence window, never per tick: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.message.contains("lost connection")),
+            "a degraded state must never narrate as a connection loss: {events:?}"
+        );
+    }
+
+    /// The escalation VETO pin: a degraded episode's wake emit rides its
+    /// OWN clock — [`LostVisibilityReporter::wake_emit_instant`] (the
+    /// cluster-gone consult key, and the gate for the outage/note
+    /// bookkeeping) must NEVER advance, and the wake line must carry the
+    /// honest wording, never the "has been down for" outage claim.
+    #[test]
+    fn degraded_wake_emit_never_advances_the_cluster_gone_consult_key() {
+        let t0 = Instant::now();
+        let note = WakeNoteSlot::default();
+        let wake = capture_important(|| {
+            let mut r = LostVisibilityReporter::new(note.clone());
+            r.observe(&degraded("keepalive gap"), t0);
+            // Before the threshold: wake-silent.
+            r.on_wake_deadline(at(t0, 299));
+            assert_eq!(
+                r.wake_emit_instant(),
+                None,
+                "no LOSS wake emit exists in a degraded episode"
+            );
+            // The threshold mark: the degraded wake line fires…
+            r.observe(&degraded("keepalive gap"), at(t0, 300));
+            r.on_wake_deadline(at(t0, 300));
+            // …and the LOSS wake-emit clock (the cluster-gone consult
+            // key) still reads None.
+            assert_eq!(
+                r.wake_emit_instant(),
+                None,
+                "the cluster-gone consult key must NOT advance on a degraded \
+                 wake emit"
+            );
+            // Self-spacing on the degraded clock: nothing inside the
+            // 10-minute window repeats.
+            r.on_wake_deadline(at(t0, 400));
+            r.on_wake_deadline(at(t0, 899));
+        });
+        assert_eq!(
+            wake.len(),
+            1,
+            "exactly one degraded wake line per cadence window: {wake:?}"
+        );
+        assert!(
+            wake[0]
+                .message
+                .contains("primary keepalive not reaching this observer"),
+            "the wake line carries the honest addressing-gap wording: {wake:?}"
+        );
+        assert!(
+            !wake[0].message.contains("has been down for"),
+            "the wake line must never claim a connection outage: {wake:?}"
+        );
+        assert!(!note.is_pending(), "no reconnection note — nothing was lost");
+    }
+
+    /// A LOGGED loss that transitions into the degraded state (frames
+    /// started arriving again, keepalives still missing) ENDS the outage
+    /// exactly like a regain: the [`EndedOutage`] signal fires, the
+    /// reconnection note is parked, and the loss clocks clear — the data
+    /// plane IS the connection.
+    #[test]
+    fn logged_loss_ending_in_degraded_parks_note_and_signals_ended_outage() {
+        let t0 = Instant::now();
+        let note = WakeNoteSlot::default();
+        let mut r = LostVisibilityReporter::new(note.clone());
+        r.observe(&lost("fleet empty"), t0);
+        r.on_wake_deadline(at(t0, 300)); // loss logged on the wake stream
+        let outcome = r.observe(&degraded("keepalive gap"), at(t0, 400));
+        assert!(
+            outcome.ended_logged_outage.is_some(),
+            "frames arriving again ends the logged outage"
+        );
+        assert!(note.is_pending(), "the reconnection note is parked");
+        assert!(!r.is_lost());
+        assert!(r.is_degraded());
+    }
+
+    /// The reverse transition: a degraded episode that collapses into a
+    /// genuine loss (the data plane went quiet too) starts the loss
+    /// clocks FRESH — the connection-down age counts from the
+    /// transition, and the degraded cadence state is over.
+    #[test]
+    fn degraded_collapsing_into_loss_starts_a_fresh_loss_episode() {
+        let t0 = Instant::now();
+        let mut r = LostVisibilityReporter::new(WakeNoteSlot::default());
+        r.observe(&degraded("keepalive gap"), t0);
+        let d = r.observe(&lost("fleet empty"), at(t0, 100)).directive;
+        assert_eq!(
+            d,
+            RetryDirective::ReconnectDue,
+            "the first lost loop after a degraded episode re-fires the rebuild"
+        );
+        assert!(r.is_lost());
+        assert!(!r.is_degraded(), "the degraded episode is over");
+        assert_eq!(
+            r.wake_deadline(),
+            Some(at(t0, 100) + WAKE_LOSS_THRESHOLD),
+            "the loss wake threshold counts from the TRANSITION instant, \
+             not from the degraded episode's start"
         );
     }
 }
