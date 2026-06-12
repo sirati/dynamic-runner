@@ -40,6 +40,10 @@ impl<I> DistributedMessage<I> {
             | Self::CustomMessage { target, .. }
             | Self::TaskHoldQuery { target, .. }
             | Self::TaskHoldResponse { target, .. }
+            | Self::RespawnSpawnRequest { target, .. }
+            | Self::RespawnSpawnResult { target, .. }
+            | Self::RespawnRevokeRequest { target, .. }
+            | Self::RespawnRevokeResult { target, .. }
             | Self::Keepalive { target, .. }
             | Self::TimeoutDetected { target, .. }
             | Self::TimeoutQuery { target, .. }
@@ -85,6 +89,10 @@ impl<I> DistributedMessage<I> {
             | Self::CustomMessage { target, .. }
             | Self::TaskHoldQuery { target, .. }
             | Self::TaskHoldResponse { target, .. }
+            | Self::RespawnSpawnRequest { target, .. }
+            | Self::RespawnSpawnResult { target, .. }
+            | Self::RespawnRevokeRequest { target, .. }
+            | Self::RespawnRevokeResult { target, .. }
             | Self::Keepalive { target, .. }
             | Self::TimeoutDetected { target, .. }
             | Self::TimeoutQuery { target, .. }
@@ -144,6 +152,10 @@ impl<I> DistributedMessage<I> {
             | Self::CustomMessage { target, .. }
             | Self::TaskHoldQuery { target, .. }
             | Self::TaskHoldResponse { target, .. }
+            | Self::RespawnSpawnRequest { target, .. }
+            | Self::RespawnSpawnResult { target, .. }
+            | Self::RespawnRevokeRequest { target, .. }
+            | Self::RespawnRevokeResult { target, .. }
             | Self::Keepalive { target, .. }
             | Self::TimeoutDetected { target, .. }
             | Self::TimeoutQuery { target, .. }
@@ -184,6 +196,10 @@ impl<I> DistributedMessage<I> {
             | Self::CustomMessage { sender_id, .. }
             | Self::TaskHoldQuery { sender_id, .. }
             | Self::TaskHoldResponse { sender_id, .. }
+            | Self::RespawnSpawnRequest { sender_id, .. }
+            | Self::RespawnSpawnResult { sender_id, .. }
+            | Self::RespawnRevokeRequest { sender_id, .. }
+            | Self::RespawnRevokeResult { sender_id, .. }
             | Self::Keepalive { sender_id, .. }
             | Self::TimeoutDetected { sender_id, .. }
             | Self::TimeoutQuery { sender_id, .. }
@@ -223,6 +239,10 @@ impl<I> DistributedMessage<I> {
             | Self::CustomMessage { timestamp, .. }
             | Self::TaskHoldQuery { timestamp, .. }
             | Self::TaskHoldResponse { timestamp, .. }
+            | Self::RespawnSpawnRequest { timestamp, .. }
+            | Self::RespawnSpawnResult { timestamp, .. }
+            | Self::RespawnRevokeRequest { timestamp, .. }
+            | Self::RespawnRevokeResult { timestamp, .. }
             | Self::Keepalive { timestamp, .. }
             | Self::TimeoutDetected { timestamp, .. }
             | Self::TimeoutQuery { timestamp, .. }
@@ -453,6 +473,10 @@ impl<I> DistributedMessage<I> {
             Self::CustomMessage { .. } => MessageType::CustomMessage,
             Self::TaskHoldQuery { .. } => MessageType::TaskHoldQuery,
             Self::TaskHoldResponse { .. } => MessageType::TaskHoldResponse,
+            Self::RespawnSpawnRequest { .. } => MessageType::RespawnSpawnRequest,
+            Self::RespawnSpawnResult { .. } => MessageType::RespawnSpawnResult,
+            Self::RespawnRevokeRequest { .. } => MessageType::RespawnRevokeRequest,
+            Self::RespawnRevokeResult { .. } => MessageType::RespawnRevokeResult,
             Self::Keepalive { .. } => MessageType::Keepalive,
             Self::TimeoutDetected { .. } => MessageType::TimeoutDetected,
             Self::TimeoutQuery { .. } => MessageType::TimeoutQuery,

@@ -160,6 +160,9 @@ fn stamp_versions<I: Identifier>(
             | ClusterMutation::PrimaryChanged { .. }
             | ClusterMutation::PhaseDepsSet { .. }
             | ClusterMutation::PhaseMayBeEmptySet { .. }
+            // `RespawnPolicySet` is version-LESS: a run-constant set-once
+            // fact (first-write-wins apply), like `PhaseMayBeEmptySet`.
+            | ClusterMutation::RespawnPolicySet { .. }
             // `PhaseEnded` is version-LESS: a grow-only set-insert fact
             // (join = OR) needs no arbitration — there is no competing
             // writer and no transition out of the set.

@@ -91,6 +91,20 @@ impl Default for RespawnBudget {
     }
 }
 
+/// The replicated caps (`ClusterMutation::RespawnPolicySet`, read off
+/// the CRDT at hydrate) ARE a budget — this is the one conversion site,
+/// so the promoted primary's re-arm and any future reader agree on the
+/// `cooldown_ms` → `Duration` translation.
+impl From<crate::cluster_state::ReplicatedRespawnPolicy> for RespawnBudget {
+    fn from(p: crate::cluster_state::ReplicatedRespawnPolicy) -> Self {
+        Self {
+            max_per_secondary: p.max_per_secondary,
+            max_total: p.max_total,
+            cooldown: std::time::Duration::from_millis(p.cooldown_ms),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RespawnOutcome {
     pub original_id: String,
