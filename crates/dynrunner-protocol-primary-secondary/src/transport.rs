@@ -8,22 +8,26 @@ use crate::messages::timestamp_now;
 
 /// Default bootstrap-RPC budget for [`PeerTransport::join_running_cluster`].
 ///
-/// 10 s matches the pre-Step-8 per-peer QUIC dial budget (cf.
-/// `transport-quic/src/peer/dial.rs`'s happy-eyeballs total) plus
-/// rendezvous slack: a healthy responder hands back a snapshot in
-/// milliseconds once the QUIC handshake completes; the entire
-/// budget is for the rendezvous + handshake to land. Shorter
-/// budgets (5 s) round-tripped fine on a LAN but were tight on
-/// fabric where the first dial attempt's UDP must traverse a
-/// firewall before falling back to WSS — both consumer teams hit
-/// this on Krater (cf. lower-id-dials commentary in
-/// `transport-quic/src/peer/mod.rs`). Longer budgets (>15 s) start
-/// to mask transport bugs (a peer that never replies should be
-/// caller-observable, not silently retried).
+/// 60 s: a quarter goes to the dial rendezvous (`timeout / 4` — covers
+/// the QUIC-then-WSS happy-eyeballs fabric dial both consumer teams
+/// needed on Krater, cf. `transport-quic/src/peer/dial.rs` and the
+/// lower-id-dials commentary in `transport-quic/src/peer/mod.rs`); the
+/// remaining 45 s is the reply-collection window, which the re-request
+/// cadence (`recv_budget / 3` capped at [`JOIN_REREQUEST_CAP`] = 5 s)
+/// slices into ~9 fan-out rounds. The budget is sized for the REPLY to
+/// LAND, not just for the request to be heard: a production bootstrap
+/// (gateway joiner into a busy run) collects multi-MB `ClusterSnapshot`
+/// payloads that travel as chunked transfers over WAN legs, and the
+/// previous 10 s budget (7.5 s recv, 3 fan-outs) expired while replies
+/// were still in flight — the joiner died `Timeout` against responders
+/// that had already answered. A silent responder is still
+/// caller-observable, not masked: the `Timeout` error carries
+/// `requests_sent` / `fan_outs`, and every fan-out round names its
+/// per-peer send failures.
 ///
 /// Caller-overridable via the `timeout` parameter on
 /// [`PeerTransport::join_running_cluster`].
-pub const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Cap on the bootstrap re-request cadence inside
 /// [`PeerTransport::join_running_cluster`]'s reply-wait window.

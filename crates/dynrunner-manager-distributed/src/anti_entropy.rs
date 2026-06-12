@@ -17,7 +17,8 @@
 //! policy: the request side ([`RequesterIdentity`] — the role facts a
 //! pulling node stamps on its `RequestClusterSnapshot`) and the reply
 //! side ([`reply_destination`] — the responder types its `ClusterSnapshot`
-//! answer off the requester's self-declared role), so no responder
+//! answer off the requester's self-declared role — composed into the full
+//! answer construction by [`snapshot_reply`]), so no responder
 //! re-implements either.
 //!
 //! This module holds NO merge logic. The pull it requests is the EXISTING
@@ -124,6 +125,52 @@ pub fn reply_destination(requester_id: &str, requester_is_observer: bool) -> Des
     } else {
         Destination::Secondary(id)
     }
+}
+
+/// The complete snapshot-RPC ANSWER for one `RequestClusterSnapshot`:
+/// the `(destination, ClusterSnapshot)` pair a responder sends back.
+///
+/// Single owner of the reply CONSTRUCTION, composed with
+/// [`reply_destination`] (the typing policy) so the three responders
+/// (primary, secondary router, observer) share ONE answer shape instead
+/// of each hand-building the frame. The contract every responder
+/// honours through this point:
+///
+///   - ANY live peer answers from its own replica — `cluster_state` is
+///     replicated, so any responder's snapshot is a valid bootstrap /
+///     anti-entropy payload; role never gates serving.
+///   - The request's routing `target` stamp is IRRELEVANT to the answer:
+///     the stamp is the wire envelope's ingress-demux header (`None` from
+///     a raw transport-level joiner send, `Some(..)` from every
+///     coordinator egress), never request semantics. Responders must not
+///     filter on it.
+///   - The reply is addressed by the requester's ID (its return address
+///     rides the request's `sender_id`) and typed off its SELF-DECLARED
+///     role — resolvable for a ROSTERLESS joiner too, because id-bearing
+///     destinations resolve at the transport (the direct leg), not
+///     through any roster.
+///
+/// `snapshot_json` is the responder's digest-keyed serialize-once cache
+/// payload (`ClusterState::snapshot_json` — never re-serialized per
+/// request); reading it stays with the caller because the cache borrow
+/// is the caller's `&mut` concern. The caller owns only its `send_to`
+/// edge for the returned pair.
+pub fn snapshot_reply<I: dynrunner_core::Identifier>(
+    responder_id: &str,
+    requester_id: &str,
+    requester_is_observer: bool,
+    timestamp: f64,
+    snapshot_json: String,
+) -> (Destination, DistributedMessage<I>) {
+    (
+        reply_destination(requester_id, requester_is_observer),
+        DistributedMessage::ClusterSnapshot {
+            target: None,
+            sender_id: responder_id.to_string(),
+            timestamp,
+            snapshot_json,
+        },
+    )
 }
 
 /// Receive-side decision for one peer digest. Given the LOCAL digest, the

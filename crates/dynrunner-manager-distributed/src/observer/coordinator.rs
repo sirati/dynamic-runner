@@ -1469,13 +1469,16 @@ where
                 return;
             }
         };
-        let reply = DistributedMessage::ClusterSnapshot {
-            target: None,
-            sender_id: self.config.node_id.clone(),
-            timestamp: timestamp_now(),
-            snapshot_json: (*snapshot_json).clone(),
-        };
-        let dst = anti_entropy::reply_destination(requester, requester_is_observer);
+        // The shared snapshot-RPC answer (`anti_entropy::snapshot_reply`):
+        // reply typed off the requester's self-declared role, addressed by
+        // its id — resolvable for a rosterless joiner over its direct leg.
+        let (dst, reply) = anti_entropy::snapshot_reply(
+            &self.config.node_id,
+            requester,
+            requester_is_observer,
+            timestamp_now(),
+            (*snapshot_json).clone(),
+        );
         if let Err(e) = self.send_to(dst, reply).await {
             tracing::warn!(
                 requester = %requester,
