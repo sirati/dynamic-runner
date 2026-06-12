@@ -657,6 +657,30 @@ def _select_scenarios(arg: str) -> list[Scenario]:
     raise SystemExit(2)
 
 
+def plan_exit_failures(results: list[ScenarioResult]) -> list[str]:
+    """Failure messages for plans that exited non-zero WITHOUT declaring
+    it expected (``ScenarioPlan.allows_nonzero_exit``).
+
+    This is the scenario verdict's plan-exit gate: a non-empty return
+    forces the scenario to FAIL even when ``assert_outputs`` passed —
+    output-file assertions can be satisfied by stale artifacts of an
+    earlier run, so a failed dispatch must never yield PASS. Pure
+    function so the gate is unit-testable (see
+    ``test_plan_exit_gate.py``).
+    """
+    failures: list[str] = []
+    for r in results:
+        if r.exit_code == 0 or r.plan.allows_nonzero_exit:
+            continue
+        label_suffix = f"-{r.plan.label}" if r.plan.label else ""
+        failures.append(
+            f"plan{label_suffix} exited non-zero ({r.exit_code}); the plan "
+            f"exit gates the verdict (declare allows_nonzero_exit on the "
+            f"ScenarioPlan if this is expected)"
+        )
+    return failures
+
+
 def _run_one_scenario(
     scenario: Scenario,
     env: DispatchEnv,
@@ -734,11 +758,14 @@ def _run_one_scenario(
                     f"non-zero: {result.exit_code}",
                     flush=True,
                 )
-                # Continue into assertion — the assertion may
-                # treat non-zero as expected (e.g. negative-test
-                # scenarios). For currently-implemented scenarios
-                # this is always a failure, and the assertion will
-                # report it.
+                # Continue into assertion for its failure detail,
+                # but the verdict is already decided unless the plan
+                # declared the non-zero exit expected
+                # (``ScenarioPlan.allows_nonzero_exit``): the
+                # plan-exit gate below forces FAIL. Assertions alone
+                # must never rescue a failed plan — output files can
+                # be satisfied by stale artifacts of an earlier run
+                # (the reverse-mode false-PASS anatomy).
 
         # In SLURM mode the worker publishes to the gateway's
         # `<slurm_root_folder>/out` (bind-mounted as `/app/out-network`
@@ -752,6 +779,14 @@ def _run_one_scenario(
                 _fetch_published_outputs_from_gateway(env, r.plan.paths.publish_dst)
 
         ok, failures = scenario.assert_outputs(env, results)
+
+        # Plan-exit gate: an undeclared non-zero plan exit FAILS the
+        # scenario regardless of the assertion verdict. The teardown
+        # checks below stay additional criteria.
+        exit_failures = plan_exit_failures(results)
+        if exit_failures:
+            ok = False
+            failures = exit_failures + list(failures)
 
         # Cluster-teardown verification: after the scenario's
         # assertions run, no worker job belonging to our SSH user may

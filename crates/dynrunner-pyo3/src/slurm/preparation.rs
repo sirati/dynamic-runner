@@ -138,15 +138,87 @@ pub(crate) struct PySlurmPreparation {
 /// Handle to the in-flight background tunnel-cohort driver thread.
 ///
 /// The thread owns a dedicated current-thread tokio runtime + LocalSet
-/// driving `SlurmPreparation::run_tunnel_cohort` — which, by contract,
-/// runs until every member established or the future is dropped. The
-/// `cancel` notify races the cohort inside a `select!`, so firing it
-/// drops the cohort future (JoinSet abort; `kill_on_drop` reaps
-/// un-committed ssh children; committed ones stay in the shared stores
-/// for the subsequent `SlurmPreparation::cleanup` drain).
+/// driving `SlurmPreparation::run_tunnel_cohort`, and it lives until
+/// `cancel` fires — NOT merely until the cohort completes. The park is
+/// load-bearing: every `ssh -N -R` child the cohort spawns is
+/// PDEATHSIG-linked to THIS thread (`dynrunner_slurm::child_reaping`
+/// arms `PR_SET_PDEATHSIG`, and the kernel delivers the death signal
+/// when the SPAWNING THREAD exits, not the process), so a thread that
+/// exited at cohort completion would have the kernel SIGTERM every
+/// just-verified tunnel — run_20260612_084041: all 4 verified
+/// listeners died within the driver's exit window and 0/4 secondaries
+/// ever welcomed. See [`drive_cohort_until_cancelled`].
+///
+/// Firing `cancel` drops the cohort future (JoinSet abort;
+/// `kill_on_drop` reaps un-committed ssh children; committed ones stay
+/// in the shared stores for the subsequent `SlurmPreparation::cleanup`
+/// drain, which runs after the join — the thread-exit PDEATHSIG and
+/// the drain's SIGTERM ladder are the same orderly teardown signal).
 struct CohortDriver {
     thread: std::thread::JoinHandle<()>,
     cancel: std::sync::Arc<tokio::sync::Notify>,
+}
+
+/// Body of the cohort-driver thread: drive `cohort` to completion on a
+/// dedicated current-thread runtime + LocalSet, then PARK until
+/// `cancel` fires.
+///
+/// The park (rather than returning when the cohort completes) is the
+/// PDEATHSIG-lifetime contract: the tunnel children spawned while
+/// polling `cohort` are death-linked to the calling thread, so this
+/// function returning is the kernel's cue to SIGTERM all of them. It
+/// must therefore only return once the caller has decided the tunnels'
+/// lifetime is over (`cleanup()` fires `cancel` and then drains the
+/// children explicitly).
+///
+/// Free function (rather than inlined in the `thread::spawn` closure)
+/// so the park contract is testable without ssh: the regression test
+/// drives an instantly-completing cohort and asserts the thread is
+/// still parked afterwards.
+fn drive_cohort_until_cancelled<F>(cohort: F, cancel: std::sync::Arc<tokio::sync::Notify>)
+where
+    F: std::future::Future<Output = ()>,
+{
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "tunnel-cohort driver: tokio runtime construction \
+                 failed; NO reverse tunnels will be established"
+            );
+            return;
+        }
+    };
+    let local = tokio::task::LocalSet::new();
+    rt.block_on(local.run_until(async {
+        // Cohort, then park: completion of the cohort must NOT end
+        // this thread (PDEATHSIG — see the function doc), so the arm
+        // pends forever once the cohort is done and only `cancel`
+        // resolves the select.
+        let parked_cohort = async {
+            cohort.await;
+            std::future::pending::<()>().await
+        };
+        tokio::select! {
+            _ = parked_cohort => {
+                unreachable!("the parked cohort future never completes")
+            }
+            _ = cancel.notified() => {
+                tracing::info!(
+                    "tunnel-cohort driver cancelled (cleanup); \
+                     in-flight watchers aborted"
+                );
+            }
+        }
+    }));
+    // Bound the runtime teardown: an in-flight blocking gateway poll
+    // (`execute_command` against a wedged gateway) must not park
+    // cleanup forever.
+    rt.shutdown_timeout(Duration::from_secs(10));
 }
 
 #[pymethods]
@@ -246,8 +318,12 @@ impl PySlurmPreparation {
     /// The driver is a dedicated OS thread owning a current-thread
     /// tokio runtime + LocalSet (the watchers use `spawn_local`); the
     /// gateway reader re-acquires the GIL only for its short
-    /// `execute_command` polls on a blocking thread. [`Self::cleanup`]
-    /// cancels + joins the driver before draining the tunnels.
+    /// `execute_command` polls on a blocking thread. The thread PARKS
+    /// after the cohort completes and lives until [`Self::cleanup`]
+    /// cancels + joins it — the tunnel children are PDEATHSIG-linked
+    /// to it, so its exit is the kernel's cue to SIGTERM every tunnel
+    /// (see [`CohortDriver`] / [`drive_cohort_until_cancelled`]).
+    /// Cleanup then drains the children explicitly.
     ///
     /// Raises `RuntimeError` on a double start — one cohort per
     /// preparation instance.
@@ -280,36 +356,14 @@ impl PySlurmPreparation {
         let thread = std::thread::Builder::new()
             .name("dynrunner-tunnel-cohort".into())
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "tunnel-cohort driver: tokio runtime construction \
-                             failed; NO reverse tunnels will be established"
-                        );
-                        return;
-                    }
-                };
-                let local = tokio::task::LocalSet::new();
-                rt.block_on(local.run_until(async {
-                    tokio::select! {
-                        _ = inner.run_tunnel_cohort(reader, num_secondaries, primary_quic_port) => {}
-                        _ = cancel_bg.notified() => {
-                            tracing::info!(
-                                "tunnel-cohort establishment cancelled (cleanup); \
-                                 in-flight watchers aborted"
-                            );
-                        }
-                    }
-                }));
-                // Bound the runtime teardown: an in-flight blocking
-                // gateway poll (`execute_command` against a wedged
-                // gateway) must not park cleanup forever.
-                rt.shutdown_timeout(Duration::from_secs(10));
+                drive_cohort_until_cancelled(
+                    async move {
+                        inner
+                            .run_tunnel_cohort(reader, num_secondaries, primary_quic_port)
+                            .await;
+                    },
+                    cancel_bg,
+                );
             })
             .map_err(|e| {
                 pyo3::exceptions::PyOSError::new_err(format!("spawn tunnel-cohort thread: {e}"))
@@ -391,3 +445,75 @@ impl PySlurmPreparation {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    //! Driver-thread lifetime pin for the PDEATHSIG-linked tunnel
+    //! children (run_20260612_084041): the cohort driver thread must
+    //! PARK after the cohort completes and exit only on cancel.
+    //!
+    //! Replays the production sequence that killed the fleet: the
+    //! cohort finished fast (all 4 tunnels verified within seconds),
+    //! the driver thread exited, and the kernel's parent-death signal
+    //! — armed per SPAWNING THREAD by
+    //! `dynrunner_slurm::child_reaping`, not per process — SIGTERMed
+    //! every just-verified `ssh -N -R` child, erasing the worker-side
+    //! listeners before any secondary dialed. The pdeathsig→child-kill
+    //! half is pinned in `child_reaping`'s own test; this test pins
+    //! the OTHER half of the contract: the thread that spawned the
+    //! children stays alive until cleanup cancels it.
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::drive_cohort_until_cancelled;
+
+    /// RED on the regression (driver returned at cohort completion):
+    /// the thread must still be parked well after an
+    /// instantly-completing cohort, and must exit promptly on cancel.
+    #[test]
+    fn cohort_driver_parks_after_cohort_completion_until_cancelled() {
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        let cancel_for_thread = Arc::clone(&cancel);
+        let (cohort_done_tx, cohort_done_rx) = std::sync::mpsc::channel::<()>();
+
+        let thread = std::thread::Builder::new()
+            .name("test-tunnel-cohort".into())
+            .spawn(move || {
+                drive_cohort_until_cancelled(
+                    async move {
+                        let _ = cohort_done_tx.send(());
+                    },
+                    cancel_for_thread,
+                );
+            })
+            .expect("spawn driver thread");
+
+        // The cohort itself completed...
+        cohort_done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("cohort future never ran");
+
+        // ...but the driver thread must STAY parked: its exit is the
+        // kernel's cue to SIGTERM every PDEATHSIG-linked tunnel child.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !thread.is_finished(),
+            "cohort driver thread exited at cohort completion — the kernel \
+             would deliver PDEATHSIG to every established ssh tunnel child \
+             (run_20260612_084041: 0/4 SecondaryWelcome)"
+        );
+
+        // Cancel = cleanup's signal that the tunnels' lifetime is over;
+        // only now may the thread exit.
+        cancel.notify_one();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !thread.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cohort driver thread did not exit after cancel"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        thread.join().expect("driver thread panicked");
+    }
+}

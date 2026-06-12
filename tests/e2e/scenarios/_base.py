@@ -139,6 +139,14 @@ class ScenarioPlan:
     """Sub-label distinguishing multiple plans within one scenario
     (e.g. ``initial`` / ``rerun`` for already-done). Empty when
     a scenario emits exactly one plan."""
+    allows_nonzero_exit: bool = False
+    """Declare that this plan's dispatch may legitimately exit
+    non-zero (e.g. primary-death-failover SIGKILLs the dispatcher and
+    judges convergence out-of-band). The driver FAILS the scenario on
+    any undeclared non-zero plan exit, regardless of what
+    ``assert_outputs`` concludes — output files alone can be satisfied
+    by stale artifacts from an earlier run, so a failed plan must
+    never produce a PASS verdict."""
 
 
 @dataclass

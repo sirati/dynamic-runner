@@ -170,7 +170,11 @@ class PrimaryDeathFailoverScenario(Scenario):
             num_tasks=_NUM_TASKS_PER_PHASE,
             jobs=_JOBS,
         )
-        return [ScenarioPlan(argv=argv, paths=paths)]
+        # The dispatcher is SIGKILLed mid-run by design, so its exit
+        # code is the signal, never 0 — declare that to the driver's
+        # plan-exit gate; convergence is judged out-of-band in
+        # assert_outputs (post-kill publish_dst polling).
+        return [ScenarioPlan(argv=argv, paths=paths, allows_nonzero_exit=True)]
 
     def run_hook(
         self, env: DispatchEnv, plan: ScenarioPlan, dispatch_pid: int
