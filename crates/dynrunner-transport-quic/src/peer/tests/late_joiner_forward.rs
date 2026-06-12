@@ -283,3 +283,65 @@ async fn join_accepts_role_stamped_snapshot_reply() {
         })
         .await;
 }
+
+/// The bootstrap deadline is PERSISTENT under constant churn (the
+/// watchdog law): a reachable peer that floods the joiner with gossip
+/// but never answers the snapshot request must NOT push the join
+/// deadline back — `join_running_cluster` returns `Timeout` at
+/// (roughly) its budget despite a continuously-active wire. A
+/// reset-on-activity deadline would spin here forever, which is the
+/// probe-observer "never hit its bootstrap deadline" suspicion shape.
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_deadline_fires_under_constant_gossip_churn() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // The cluster peer: answers NOTHING, gossips constantly.
+            let mut cluster: PeerNetwork<TestId> =
+                PeerNetwork::start("secondary-0", None).await.unwrap();
+            let cluster_port = cluster.port();
+            tokio::task::spawn_local(async move {
+                let mut ts = 0.0f64;
+                loop {
+                    ts += 1.0;
+                    let gossip: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+                        target: None,
+                        sender_id: "secondary-0".into(),
+                        timestamp: ts,
+                        secondary_id: "secondary-0".into(),
+                        active_workers: 0,
+                        emitter_role: KeepaliveRole::Secondary,
+                    }
+                    .with_target(Destination::All);
+                    let _ = cluster.broadcast(gossip).await;
+                    // recv_peer drives the accept loop's registrations so
+                    // the joiner's wire stays live (and its request frames
+                    // are consumed, never answered).
+                    let _ =
+                        tokio::time::timeout(Duration::from_millis(10), cluster.recv_peer()).await;
+                }
+            });
+
+            let mut joiner: PeerNetwork<TestId> =
+                PeerNetwork::start("observer-churn", None).await.unwrap();
+            let seed = vec![seed_entry("secondary-0", "127.0.0.1", cluster_port)];
+
+            let budget = Duration::from_secs(3);
+            let started = std::time::Instant::now();
+            let result = joiner
+                .join_running_cluster(&seed, budget, true, false)
+                .await;
+            assert!(
+                matches!(result, Err(JoinError::Timeout { .. })),
+                "an unanswered bootstrap must surface Timeout, got {result:?}"
+            );
+            assert!(
+                started.elapsed() < budget + Duration::from_secs(2),
+                "the bootstrap deadline must fire at ~its budget despite \
+                 constant gossip churn (persistent deadline, never \
+                 activity-reset); took {:?}",
+                started.elapsed()
+            );
+        })
+        .await;
+}

@@ -107,3 +107,90 @@ impl<R: InfoFileReader + Send + Sync + 'static> TunnelReconnector
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::preparation::{PrepError, PreparationOptions, SlurmPreparation};
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Reader whose info files NEVER appear (every rebuild sticks in the
+    /// poll loop forever — the dead-peer shape) while recording which
+    /// ids' paths were polled at all.
+    #[derive(Clone, Default)]
+    struct RecordingStuckReader {
+        polled: Arc<Mutex<HashSet<String>>>,
+    }
+
+    impl crate::preparation::InfoFileReader for RecordingStuckReader {
+        fn read(
+            &self,
+            path: String,
+        ) -> impl std::future::Future<Output = Result<Option<String>, PrepError>> + 'static
+        {
+            let polled = Arc::clone(&self.polled);
+            async move {
+                polled.lock().expect("polled mutex").insert(path);
+                Ok(None)
+            }
+        }
+    }
+
+    /// The mass-disconnect survivor-starvation pin (specimen 1 of
+    /// run_20260611_200548): the per-id rebuilds must run CONCURRENTLY.
+    /// With a roster whose ids all stick in their (unbounded) info-file
+    /// poll, a sequential walk never gets past the FIRST id — the
+    /// remaining ids' info files are never even read, which is exactly
+    /// how six dead peers starved the five live survivors' rebuilds for
+    /// minutes per cadence tick. Concurrent rebuilds poll every id's
+    /// info file within the first poll periods.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rebuilds_run_concurrently_not_sequentially() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut opts = PreparationOptions::new(
+                    "/tmp/dynrunner-obsreconnect-test".into(),
+                    "gw.invalid".into(),
+                    None,
+                    22,
+                    vec![],
+                    vec![],
+                );
+                opts.poll_interval = Duration::from_millis(5);
+                let prep = Arc::new(SlurmPreparation::new(opts));
+                let reader = RecordingStuckReader::default();
+                // Seed the captured primary QUIC port (the reestablish
+                // precondition) without establishing anything: a
+                // zero-secondary cohort touches no ssh.
+                prep.setup_ssh_tunnels(reader.clone(), 0, 51200)
+                    .await
+                    .expect("zero-secondary setup seeds the primary port");
+
+                let reconnector =
+                    SlurmPreparationTunnelReconnector::new(Arc::clone(&prep), reader.clone());
+                let ids: Vec<String> = vec!["sec-0".into(), "sec-1".into(), "sec-2".into()];
+                tokio::task::spawn_local(async move {
+                    reconnector.reconnect(&ids).await;
+                });
+
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let n = reader.polled.lock().expect("polled mutex").len();
+                    if n >= 3 {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "only {n} of 3 ids' info files were ever polled — the \
+                         rebuild walk is sequential and the first (stuck/dead) \
+                         id starves every other rebuild"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+    }
+}
