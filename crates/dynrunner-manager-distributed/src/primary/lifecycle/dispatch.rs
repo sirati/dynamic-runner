@@ -85,7 +85,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 ..
             } = decision
             {
-                let binary = self.pool_mut().take_from_view(view, binary_index);
+                // Extract the owned consumption ticket — the view's last
+                // use, releasing the pool borrow for the take below.
+                let selection = view.select(binary_index);
+                let binary = self.pool_mut().take_selected(selection);
                 let sec_id = self.workers[worker_idx].secondary_id.clone();
                 let local_worker_id = self.local_worker_id_in_secondary(worker_idx);
 
@@ -132,7 +135,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // `await?` returned Err with the worker's
                 // `current_task` set, `is_idle = false`, and the
                 // pool's `in_flight_per_phase` bumped (via the
-                // earlier `take_from_view` call) — but the task
+                // earlier `take_selected` call) — but the task
                 // itself never reached the peer. The primary's
                 // view permanently believed the slot was busy,
                 // `dispatch_order` skipped it forever, and the

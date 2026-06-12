@@ -2569,7 +2569,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     pub(super) fn dispatch_view_for_worker(
         &self,
         worker_idx: usize,
-    ) -> dynrunner_scheduler_api::WorkerView<I> {
+    ) -> dynrunner_scheduler_api::WorkerView<'_, I> {
         let global_wid = self.workers[worker_idx].worker_id;
         let secondary_id = self.workers[worker_idx].secondary_id.as_str();
         let soft_predicate =
@@ -2606,11 +2606,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// Kept as a tiny standalone helper so the active-vs-inactive
     /// gating lives in exactly one place and the dispatch-pipeline
     /// helper above reads as a flat sequence of steps.
-    fn apply_strict_preferred_secondaries(
+    fn apply_strict_preferred_secondaries<'p>(
         &self,
-        view: dynrunner_scheduler_api::WorkerView<I>,
+        view: dynrunner_scheduler_api::WorkerView<'p, I>,
         secondary_id: &str,
-    ) -> dynrunner_scheduler_api::WorkerView<I> {
+    ) -> dynrunner_scheduler_api::WorkerView<'p, I> {
         if !self.single_worker_mode() {
             return view;
         }
@@ -2630,7 +2630,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// `dispatch_to_idle_workers`, `perform_initial_assignment`) routes
     /// through here so the three pieces of "this task is now in flight"
     /// state can never diverge — they are written together or not at
-    /// all. The `take_from_view` that removes the binary from the pool
+    /// all. The `take_selected` that removes the binary from the pool
     /// precedes this call (it yields the owned `task`).
     ///
     /// Reachable only from an `Idle` slot (enforced by
@@ -3107,10 +3107,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .collect()
     }
 
-    pub(super) fn cap_filter_view(
+    pub(super) fn cap_filter_view<'p>(
         &self,
-        view: dynrunner_scheduler_api::WorkerView<I>,
-    ) -> dynrunner_scheduler_api::WorkerView<I> {
+        view: dynrunner_scheduler_api::WorkerView<'p, I>,
+    ) -> dynrunner_scheduler_api::WorkerView<'p, I> {
         if self.config.max_concurrent_per_type.is_empty() {
             return view;
         }

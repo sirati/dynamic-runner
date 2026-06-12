@@ -102,7 +102,7 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
     fn assign_initial(
         &self,
         worker: &WorkerBudgetInfo<I>,
-        pending: &[TaskInfo<I>],
+        pending: &[&TaskInfo<I>],
         total_assigned: &ResourceMap,
         max_resources: &ResourceMap,
         estimator: &dyn ResourceEstimator<I>,
@@ -142,7 +142,7 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
         &self,
         worker: &WorkerBudgetInfo<I>,
         all_workers: &[WorkerBudgetInfo<I>],
-        pending: &[TaskInfo<I>],
+        pending: &[&TaskInfo<I>],
         max_resources: &ResourceMap,
         estimator: &dyn ResourceEstimator<I>,
         _retry_attempt: bool,

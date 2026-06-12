@@ -1,4 +1,4 @@
-//! `view_for_worker` / `take_from_view` / `WorkerView::sort_by_key`
+//! `view_for_worker` / `select`+`take_selected` / `WorkerView::sort_by_key`
 //! tests: priority-class ordering (pin → typed → free → co-pin),
 //! correct take-by-locator-index, blocked-phase skipping, and the
 //! preference-predicate stable sort within each priority class.
@@ -10,7 +10,7 @@ use super::{PhaseState, phase, pool_with, t};
 /// `view_for_worker` produces the same priority order as `pop_for_worker`
 /// for a fresh worker (no affinity, no pins) — typed buckets first,
 /// free-pool last. The scheduler's chosen index commits via
-/// `take_from_view`.
+/// `select` + `take_selected`.
 #[test]
 fn view_for_worker_orders_typed_then_free_pool() {
     let mut p = pool_with(&["P"], &[]);
@@ -30,10 +30,10 @@ fn view_for_worker_orders_typed_then_free_pool() {
     assert!(view.as_slice()[1].affinity_id.is_none());
 }
 
-/// `take_from_view` commits the scheduler's chosen index — soft-pin,
+/// `take_selected` commits the scheduler's chosen index — soft-pin,
 /// in-flight, and drain bookkeeping fire just like `pop_for_worker`.
 #[test]
-fn take_from_view_commits_chosen_index() {
+fn take_selected_commits_chosen_index() {
     let mut p = pool_with(&["P"], &[]);
     p.extend([
         t("P", "T", "alpha", 1),
@@ -49,7 +49,8 @@ fn take_from_view_commits_chosen_index() {
         .iter()
         .position(|t| t.affinity_id.as_ref().unwrap().as_str() == "beta")
         .expect("beta visible");
-    let item = p.take_from_view(view, beta_idx);
+    let selection = view.select(beta_idx);
+    let item = p.take_selected(selection);
     assert_eq!(item.affinity_id.as_ref().unwrap().as_str(), "beta");
     // Worker 1 is now pinned to beta; subsequent pop stays in beta until
     // it drains.
@@ -102,7 +103,7 @@ fn view_for_worker_skips_blocked_phases() {
 }
 
 #[test]
-fn take_from_view_removes_chosen_item_and_records_affinity() {
+fn take_selected_removes_chosen_item_and_records_affinity() {
     let mut p = pool_with(&["P"], &[]);
     p.extend([t("P", "T", "alpha", 1), t("P", "T", "beta", 2)])
         .expect("valid extend");
@@ -111,7 +112,8 @@ fn take_from_view_removes_chosen_item_and_records_affinity() {
     // to verify non-zero index removal.
     assert_eq!(view.as_slice()[0].size, 1);
     assert_eq!(view.as_slice()[1].size, 2);
-    let taken = p.take_from_view(view, 1);
+    let selection = view.select(1);
+    let taken = p.take_selected(selection);
     assert_eq!(taken.size, 2);
     assert_eq!(taken.affinity_id.as_ref().unwrap().as_str(), "beta");
     // Worker 1 is now pinned to beta. Next view starts with the alpha
@@ -124,12 +126,13 @@ fn take_from_view_removes_chosen_item_and_records_affinity() {
 }
 
 #[test]
-fn take_from_view_increments_in_flight_and_drains_phase() {
+fn take_selected_increments_in_flight_and_drains_phase() {
     let mut p = pool_with(&["P"], &[]);
     p.extend([t("P", "T", "alpha", 1)]).expect("valid extend");
     let view = p.view_for_worker(1, None);
     assert_eq!(view.len(), 1);
-    let _ = p.take_from_view(view, 0);
+    let selection = view.select(0);
+    let _ = p.take_selected(selection);
     assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Draining));
     assert_eq!(p.in_flight(&phase("P")), 1);
 }
@@ -146,7 +149,7 @@ fn view_for_worker_empty_when_no_eligible_items() {
 
 /// `WorkerView::sort_by_key` reorders items but never breaks the
 /// `(items[i], locators[i])` pairing — verified by issuing
-/// `take_from_view` against the sorted view and observing that the
+/// `take_selected` against the sorted view and observing that the
 /// item returned by the pool matches the one the view exposes at the
 /// chosen slice index. Random shuffles of distinct sizes exercise
 /// several key orderings against the same input.
@@ -181,7 +184,8 @@ fn sort_by_key_preserves_locator_pairing() {
         // remaining view is invalidated (locators shift), so rebuild a
         // fresh sorted view between takes.
         let target = view.as_slice()[0].size;
-        let taken = p.take_from_view(view, 0);
+        let selection = view.select(0);
+        let taken = p.take_selected(selection);
         assert_eq!(taken.size, target);
     }
 
@@ -198,7 +202,8 @@ fn sort_by_key_preserves_locator_pairing() {
         expected.sort_by(|a, b| b.cmp(a));
         assert_eq!(sizes, expected, "view should be size-descending");
         let target = view.as_slice()[2].size;
-        let taken = p.take_from_view(view, 2);
+        let selection = view.select(2);
+        let taken = p.take_selected(selection);
         assert_eq!(taken.size, target);
     }
 
@@ -217,7 +222,8 @@ fn sort_by_key_preserves_locator_pairing() {
                 .sort_by_key(|t| t.path.display().to_string());
             let expected_path = view.as_slice()[0].path.clone();
             let expected_size = view.as_slice()[0].size;
-            let taken = p.take_from_view(view, 0);
+            let selection = view.select(0);
+            let taken = p.take_selected(selection);
             assert_eq!(taken.path, expected_path);
             assert_eq!(taken.size, expected_size);
         }
@@ -239,6 +245,7 @@ fn sort_by_key_preserves_locator_pairing() {
 ///   * worker 3 sees no unpinned typed bucket and leads with the free
 ///     pool;
 ///   * worker 1's second view leads with its pin-class alpha remainder.
+///
 /// Any view implementation that snapshots classification at recheck
 /// start (instead of per worker) breaks this sequence.
 #[test]
@@ -258,7 +265,8 @@ fn sequential_views_with_takes_observe_pin_evolution() {
     for worker in [1, 2, 3, 1] {
         let view = p.view_for_worker(worker, None);
         assert!(!view.is_empty(), "worker {worker} must see candidates");
-        taken.push(p.take_from_view(view, 0).size);
+        let selection = view.select(0);
+        taken.push(p.take_selected(selection).size);
     }
     assert_eq!(
         taken,
@@ -339,4 +347,78 @@ fn view_for_worker_no_predicate_matches_pre_change_order() {
     // `view_for_worker_orders_pinned_then_typed_then_free_then_copin`
     // test: alpha #2 → beta #3 → free #4.
     assert_eq!(sizes, vec![2, 3, 4]);
+}
+
+/// Perf-shape pin: building a `WorkerView` (and running its
+/// caller-side combinators) clones NO candidate `TaskInfo` — the view
+/// borrows items straight from the pool. Counted through the
+/// identifier's `Clone` impl, which every `TaskInfo` clone must run.
+/// The dispatch recheck builds one view per idle worker per pass, so
+/// a per-candidate clone here multiplies into
+/// O(idle workers × pool size) per recheck — the regression this pins
+/// out.
+#[test]
+fn view_construction_clones_no_candidates() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ID_CLONES: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct CountingId(u64);
+    impl Clone for CountingId {
+        fn clone(&self) -> Self {
+            ID_CLONES.fetch_add(1, Ordering::Relaxed);
+            CountingId(self.0)
+        }
+    }
+
+    let counted = |n: u64, affinity: &str| {
+        let base = t("P", "T", affinity, n);
+        TaskInfo {
+            path: base.path,
+            size: base.size,
+            identifier: CountingId(n),
+            phase_id: base.phase_id,
+            type_id: base.type_id,
+            affinity_id: base.affinity_id,
+            payload: base.payload,
+            task_id: base.task_id,
+            task_depends_on: base.task_depends_on,
+            preferred_secondaries: base.preferred_secondaries,
+            preferred_version: base.preferred_version,
+            resolved_path: base.resolved_path,
+        }
+    };
+
+    let mut p = super::PendingPool::<CountingId>::new(
+        vec![phase("P")],
+        std::collections::HashMap::new(),
+    )
+    .expect("valid graph");
+    p.extend([
+        counted(1, "alpha"),
+        counted(2, "alpha"),
+        counted(3, ""),
+    ])
+    .expect("valid extend");
+
+    let before = ID_CLONES.load(Ordering::Relaxed);
+    let view = p
+        .view_for_worker(1, None)
+        .sort_by_key(|t| t.size)
+        .filter(|_| true);
+    assert_eq!(view.len(), 3, "all candidates visible");
+    let selection = view.select(0);
+    let after = ID_CLONES.load(Ordering::Relaxed);
+    assert_eq!(
+        after - before,
+        0,
+        "view construction + combinators + select must not clone any candidate"
+    );
+    // The take hands out the ORIGINAL pool item — still no clone.
+    let _ = p.take_selected(selection);
+    assert_eq!(
+        ID_CLONES.load(Ordering::Relaxed) - before,
+        0,
+        "take_selected moves the item out of the bucket without cloning"
+    );
 }
