@@ -446,7 +446,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// occupancy undercounts, and — worse — a failover-promoted secondary
     /// rebuilds an INCOMPLETE worker roster off its own
     /// `known_secondaries()` (`reconstruct_workers_from_cluster_state`),
-    /// undercounting `alive_remote_secondary_count` into a premature
+    /// undercounting `alive_worker_secondary_count` into a premature
     /// fleet-dead exit.
     ///
     /// The fix is one post-mesh re-broadcast of the records the primary

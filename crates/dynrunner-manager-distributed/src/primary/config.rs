@@ -266,29 +266,30 @@ pub struct PrimaryConfig {
     /// attempted before the phase advances).
     pub oom_retry_max_passes: u32,
 
-    /// Grace period after the count of alive REMOTE worker-secondaries
-    /// (`ClusterState::alive_remote_secondary_count` — alive
-    /// worker-secondaries other than the recognized primary) reaches zero
-    /// with a non-empty pool, before the operational loop gives up and
-    /// exits cleanly with the still-pending tasks left stranded. Default
-    /// `30s`.
+    /// Grace period after the count of alive worker-secondary members
+    /// (`ClusterState::alive_worker_secondary_count` — every alive
+    /// worker-secondary, the recognized primary's own co-located member
+    /// included) reaches zero with a non-empty pool, before the
+    /// operational loop gives up and exits cleanly with the still-pending
+    /// tasks left stranded. Default `30s`.
     ///
     /// Without this timer the framework idles forever when
-    /// `alive_remote_secondary_count == 0 && pool not empty` — the
+    /// `alive_worker_secondary_count == 0 && pool not empty` — the
     /// existing exit conditions (counter-based + pool-drained)
-    /// never trip because no events arrive (no remote secondary left
+    /// never trip because no events arrive (no secondary left
     /// to send TaskComplete/TaskRequest). Operator pain: have to
     /// `kill` the primary process by hand. Surfaced in tokenizer's
     /// cohort-3 runs where SSH-tunnel blips killed all 5
     /// secondaries simultaneously and the run sat idle for
     /// minutes before the operator noticed.
     ///
-    /// Counting REMOTE secondaries (excluding the recognized primary by
-    /// identity) is what arms this correctly on a host that runs a primary
-    /// alongside its own secondary under one peer-id: the primary's own
-    /// secondary never keeps the timer disarmed, so such a primary cut off
-    /// from every remote secondary still arms and strands rather than
-    /// hanging on its own loopback secondary.
+    /// The primary's own co-located worker-secondary counts: in-process
+    /// dispatch is dispatch, so a primary whose host carries the last
+    /// live workers (the lone-survivor self-quorum path) keeps working
+    /// instead of falsely stranding its pool. A genuinely-dead co-located
+    /// secondary is removed by the keepalive sweep's unfiltered hard
+    /// backstop like any other member, after which the timer arms
+    /// honestly.
     ///
     /// Set to `Duration::ZERO` for fail-fast (exit at the moment
     /// the fleet first goes empty). Set to a long value if a
