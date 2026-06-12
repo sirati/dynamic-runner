@@ -19,6 +19,7 @@
 
 mod already_held;
 mod assembly_beacon;
+mod backpressure_requeue;
 mod basic;
 mod bringup_composition_fatal;
 mod bringup_fatal;
