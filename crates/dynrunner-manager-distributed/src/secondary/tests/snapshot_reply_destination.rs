@@ -116,7 +116,7 @@ async fn worker_requester_gets_secondary_typed_reply() {
 }
 
 /// The secondary responder answers a snapshot pull REGARDLESS of its
-/// routing stamp. Two production stamp shapes:
+/// routing stamp. Three production stamp shapes:
 ///
 ///   - `Some(Destination::Secondary(<responder>))` — the egress-stamped
 ///     anti-entropy pull (`reconcile_against_peer` types every pull
@@ -124,11 +124,21 @@ async fn worker_requester_gets_secondary_typed_reply() {
 ///   - `Some(Destination::Primary)` — a primary-addressed pull the
 ///     mesh-ingress fan-fallback hands to the secondary slot when the
 ///     named role has no live local slot (stale sender-side role
-///     knowledge).
+///     knowledge);
+///   - `Some(Destination::Secondary(<THE REQUESTER'S OWN ID>))` — the
+///     observed anonymous-joiner-era frame shape (production:
+///     `kind=RequestClusterSnapshot target=Secondary(PeerId(
+///     "observer-29b1a066-5f52"))`, the joiner's own id): an AE pull
+///     ADDRESSED TO a peer that hosts no secondary slot is fanned by
+///     the receiver's role-miss fallback, and any process it relays
+///     through sees the requester's own id in the stamp.
 ///
 /// The stamp is the WIRE ENVELOPE's routing header, not request
-/// semantics — the responder serves its replica for every shape. Pins
-/// the masking-refutation half of the starved-primary RCA: the
+/// semantics — the responder serves its replica for every shape, and it
+/// NEVER re-emits (boomerangs) the request itself: a coordinator slot
+/// is a routing TERMINUS, so the only outbound this frame may produce
+/// is the `ClusterSnapshot` answer (+ the `PeerJoined` origination).
+/// Pins the masking-refutation half of the starved-primary RCA: the
 /// SECONDARY dispatch arm was never the stamped-drop site (that was the
 /// primary's `target: None` pattern).
 #[tokio::test(flavor = "current_thread")]
@@ -140,6 +150,9 @@ async fn target_stamped_request_is_answered_not_dropped() {
             for stamp in [
                 Destination::Secondary(PeerId::from("responder")),
                 Destination::Primary,
+                // The production replay: the stamp names the REQUESTER's
+                // own id (the requester here is "peer-0").
+                Destination::Secondary(PeerId::from("peer-0")),
             ] {
                 let (mut sec, peer_log) = make_recording_secondary("responder");
                 sec.enter_operational_for_test();
@@ -165,6 +178,18 @@ async fn target_stamped_request_is_answered_not_dropped() {
                     answered,
                     "the secondary must answer a snapshot pull stamped {stamp:?}; \
                      a silent stamp-filtered drop starves the puller"
+                );
+                // No boomerang: the responder must never re-emit the
+                // REQUEST itself toward the stamp's named peer (the
+                // joiner watching its own request return at its mesh
+                // ingress is always a bug).
+                let boomeranged = peer_log
+                    .borrow()
+                    .iter()
+                    .any(|m| matches!(m, DistributedMessage::RequestClusterSnapshot { .. }));
+                assert!(
+                    !boomeranged,
+                    "the responder must never forward/re-emit the request (stamp {stamp:?})"
                 );
             }
         })

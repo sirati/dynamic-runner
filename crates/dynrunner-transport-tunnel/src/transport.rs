@@ -295,6 +295,16 @@ impl<I: Identifier> TunneledPeerTransport<I> {
 }
 
 impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
+    fn local_id(&self) -> &str {
+        // The node's own id, read from the Router it was seeded into at
+        // construction (`new(local_id)` — the transport keeps no second
+        // copy). Answering truthfully (instead of inheriting the trait's
+        // `""` default) keeps every identity-bearing transport honest:
+        // an empty `local_id` poisons any path that uses it as a wire
+        // return address (see `PeerNetwork::local_id`).
+        self.router.self_id()
+    }
+
     async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
         // ONE broadcast topology, exactly-once. This is a direct
         // fan-out over the SAME Router-backed `outgoing` connection

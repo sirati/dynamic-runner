@@ -90,6 +90,15 @@ impl<I: Identifier> Router<I> {
         }
     }
 
+    /// The node id this Router routes AS — the `self_id` it was
+    /// constructed with. Exposed so a transport that seeds its Router
+    /// with the node's identity (and keeps no separate copy) can answer
+    /// [`crate::PeerTransport::local_id`] truthfully from the one
+    /// stored identity instead of duplicating it.
+    pub fn self_id(&self) -> &str {
+        &self.self_id
+    }
+
     /// Sweep TTL'd state. Idempotent and cheap; safe to call from
     /// every entry point. Pre-fix-baseline: only `send_to_peer` would
     /// prune outgoing_relays, so a node that only *forwarded* (never
