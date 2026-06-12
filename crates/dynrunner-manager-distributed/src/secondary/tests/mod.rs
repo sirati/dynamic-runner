@@ -111,6 +111,7 @@ mod generation_gate;
 mod graceful_drain;
 mod hold_probe_responder;
 mod honest_liveness;
+mod instant_crash_accounting;
 mod keepalive_emission;
 mod keepalive_recognition;
 mod late_joiner_accept_emits_peer_joined;

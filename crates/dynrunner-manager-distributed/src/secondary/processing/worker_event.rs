@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use dynrunner_core::{ErrorType, Identifier, WorkerId};
-use dynrunner_manager_local::oom::{OomWatcher, classify_disconnect};
+use dynrunner_manager_local::oom::{DisconnectFault, OomWatcher, classify_disconnect_fault};
 use dynrunner_manager_local::worker::WorkerEvent;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::DistributedMessage;
@@ -286,6 +286,28 @@ where
                     "worker disconnected"
                 );
 
+                // Disconnect ATTRIBUTION, decided ONCE for everything
+                // this slot was responsible for (the running task
+                // AND/OR the deferred first-bind stash): does the
+                // death evidence prove an EXECUTED-AND-FAILED attempt
+                // (charge the task's retry budget) or an environment
+                // loss (requeue uncharged)? Single owner of the
+                // boundary: [`classify_disconnect_fault`] — upstream-
+                // explicit wire tags, kernel-OOM SIGKILL upgrades,
+                // deterministic-bug signal downgrades, and the
+                // nonzero SELF-EXIT class (the consumer arg-validation
+                // raise that unwinds the worker with exit 1 before any
+                // wire error can be sent — asm-tokenizer
+                // run_20260612_095601) are all charged faults; external
+                // kills / clean exits / missing reaps stay infra.
+                let kernel_oom_recent =
+                    oom_watcher.kernel_oom_recent(KERNEL_OOM_CORRELATION_WINDOW);
+                let fault = classify_disconnect_fault(
+                    result.error_type.clone().unwrap_or(ErrorType::Recoverable),
+                    exit_status.as_ref(),
+                    kernel_oom_recent,
+                );
+
                 // Recover any pending first-bind binary first: the
                 // worker died between `RespawnInProgress` and the
                 // expected `Ready`, so the task held in
@@ -293,16 +315,40 @@ where
                 // contract) never ran. The disconnect is itself a
                 // slot-replacement trigger (the restart loop respawns
                 // the slot afterward), so it drains the deferred stash
-                // through the SAME `reinject_pending_first_bind`
-                // chokepoint every replacement edge uses — popping it
-                // HERE means the later restart-loop sweep finds nothing
-                // (no double-report). The secondary is never the
+                // HERE — meaning the later restart-loop sweep finds
+                // nothing (no double-report). The drain routes on the
+                // fault verdict: a worker that died BY ITS OWN FAULT
+                // was spawned on behalf of this very task, so the
+                // spawn IS the task's execution attempt and the loss
+                // is a COUNTED terminal (`fail_pending_first_bind`);
+                // an environment loss keeps the historical uncharged
+                // backpressure reinject. The secondary is never the
                 // authority, so this is the sole own-worker recovery.
                 // `drained_deferred` records whether this drain resolved a
                 // deferred task, so the no-active-task WARN below stays
                 // silent when the deferred drain is what handled the
                 // disconnect (a swept stash is recovered, not lost).
-                let drained_deferred = self.reinject_pending_first_bind(worker_id).await?;
+                let drained_deferred = match &fault {
+                    DisconnectFault::TaskFault(et) => {
+                        let death = exit_status
+                            .as_ref()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "exit status unavailable".into());
+                        let message = format!(
+                            "worker subprocess died before running its deferred \
+                             first-bind task ({death}): {}",
+                            result
+                                .error_message
+                                .clone()
+                                .unwrap_or_else(|| "no error message".into())
+                        );
+                        self.fail_pending_first_bind(worker_id, et.clone(), message)
+                            .await?
+                    }
+                    DisconnectFault::InfraLoss => {
+                        self.reinject_pending_first_bind(worker_id).await?
+                    }
+                };
 
                 // Find and report the task as failed
                 let file_hash = self
@@ -315,76 +361,54 @@ where
                 if let Some(hash) = file_hash {
                     self.op_mut().active_tasks.remove(&hash);
 
-                    // Discriminate two Disconnected-event shapes:
+                    // Discriminate two Disconnected-event shapes on
+                    // the SAME fault verdict computed above:
                     //
-                    //   A. Worker explicitly reported a real
-                    //      task failure on the wire — Response::
-                    //      Error(NonRecoverable, msg). The
-                    //      communication SUCCEEDED; the message
-                    //      WAS delivered. The task ran (or at
-                    //      least the worker attempted it) and
-                    //      reported a non-recoverable failure.
-                    //      → forward as TaskFailed(NonRecoverable)
-                    //        so the primary records the real
-                    //        failure (consumes retry budget if
-                    //        applicable; surfaces in fail_final
-                    //        per the outcome-class breakdown).
+                    //   A. `TaskFault(et)` — the attempt EXECUTED and
+                    //      FAILED: the worker explicitly reported a
+                    //      wire error before dying, OR the death
+                    //      evidence proves a process fault (kernel-OOM
+                    //      SIGKILL, deterministic-bug signal, nonzero
+                    //      SELF-EXIT — the production class that
+                    //      previously fell through to B and was
+                    //      requeued 24,323 times with zero failure
+                    //      accounting).
+                    //      → forward as a real TaskFailed(et) so the
+                    //        primary records the failure (consumes
+                    //        retry budget; surfaces in the per-class
+                    //        outcome breakdown).
                     //
-                    //   B. Pure transport-level disconnect — no
-                    //      wire-level error response, just an
-                    //      EOF on the manager's read end (the
+                    //   B. `InfraLoss` — environment/transport loss
+                    //      with no process-fault evidence (external
+                    //      kill, clean exit, missing reap; the
                     //      protocol layer at `state.rs:152`
-                    //      synthesises `Recoverable +
-                    //      "transport disconnected"` for this
-                    //      case; `worker.rs:154` synthesises
+                    //      synthesises `Recoverable + "transport
+                    //      disconnected"`, `worker.rs` synthesises
                     //      `Recoverable + "Disconnected before
-                    //      Ready"` for the pre-Ready variant).
-                    //      The communication FAILED; the task
-                    //      may not have run at all.
+                    //      Ready"`). The task may not have run at all
+                    //      and is not at fault for its host dying.
                     //      → forward as backpressure-shaped
-                    //        TaskFailed (Recoverable + the
-                    //        marker the primary's
-                    //        `is_backpressure` predicate
-                    //        recognises) so the primary REQUEUES
-                    //        the task at the pool without
-                    //        consuming retry budget. The next
-                    //        TaskRequest from the respawned
-                    //        worker (or another peer) picks it
-                    //        back up.
+                    //        TaskFailed (Recoverable + the marker the
+                    //        primary's `is_backpressure` predicate
+                    //        recognises) so the primary REQUEUES the
+                    //        task without consuming retry budget. The
+                    //        next TaskRequest from the respawned
+                    //        worker (or another peer) picks it back
+                    //        up.
                     //
-                    // Discriminator is `result.error_type`:
-                    // NonRecoverable → real failure (A); anything
-                    // else (Recoverable + transport-disconnected
-                    // synthesis) → comm failure (B).
-                    //
-                    // Before discrimination, reclassify using the
-                    // exit-status + OOM watcher: a SIGKILL with a
-                    // recent kernel `oom_kill` increment upgrades
-                    // the synthesised `Recoverable` to
-                    // `ResourceExhausted(memory)`; SIGSEGV / SIGABRT
-                    // / SIGBUS / SIGFPE / SIGILL downgrade to
-                    // `NonRecoverable`. See [`classify_disconnect`].
-                    let kernel_oom_recent =
-                        oom_watcher.kernel_oom_recent(KERNEL_OOM_CORRELATION_WINDOW);
-                    let error_type = classify_disconnect(
-                        result.error_type.clone().unwrap_or(ErrorType::Recoverable),
-                        exit_status.as_ref(),
-                        kernel_oom_recent,
-                    );
-                    let is_comm_failure = matches!(error_type, ErrorType::Recoverable);
-
-                    let (wire_error_type, wire_error_message) = if is_comm_failure {
-                        (
+                    // See [`classify_disconnect_fault`] for the full
+                    // boundary table.
+                    let (wire_error_type, wire_error_message) = match &fault {
+                        DisconnectFault::InfraLoss => (
                             ErrorType::Recoverable,
                             "worker pipe broken; respawning".to_string(),
-                        )
-                    } else {
-                        (
-                            error_type,
+                        ),
+                        DisconnectFault::TaskFault(et) => (
+                            et.clone(),
                             result
                                 .error_message
                                 .unwrap_or_else(|| "Worker disconnected".into()),
-                        )
+                        ),
                     };
 
                     // Found → reporting: make the report attempt visible
@@ -674,10 +698,15 @@ where
                             // actual signal/code rather than the
                             // pipe-level error string. Recovery
                             // shape mirrors the same-arm
-                            // [Disconnected] path: the deferred task
-                            // never ran, so report it back to the
-                            // authority as backpressure so it requeues
-                            // + re-dispatches.
+                            // [Disconnected] path, routed on the same
+                            // fault attribution: a worker that died BY
+                            // ITS OWN FAULT (nonzero self-exit /
+                            // bug-signal / OOM kill) makes this a
+                            // COUNTED failure of the deferred task it
+                            // was spawned for; an environment loss
+                            // reports back as backpressure so the
+                            // authority requeues + re-dispatches
+                            // uncharged.
                             let exit_status =
                                 self.op_mut().pool.workers[worker_id as usize].try_reap_exit();
                             tracing::warn!(
@@ -689,8 +718,34 @@ where
                                  deferred task back to the authority"
                             );
                             self.schedule_worker_restart(worker_id);
-                            self.report_deferred_task_lost(worker_id, &log_task_hash)
-                                .await?;
+                            let kernel_oom_recent =
+                                oom_watcher.kernel_oom_recent(KERNEL_OOM_CORRELATION_WINDOW);
+                            match classify_disconnect_fault(
+                                ErrorType::Recoverable,
+                                exit_status.as_ref(),
+                                kernel_oom_recent,
+                            ) {
+                                DisconnectFault::TaskFault(et) => {
+                                    let death = exit_status
+                                        .as_ref()
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| "exit status unavailable".into());
+                                    self.report_deferred_task_failed(
+                                        worker_id,
+                                        &log_task_hash,
+                                        et,
+                                        format!(
+                                            "worker subprocess died before running its \
+                                             deferred first-bind task ({death}): {e}"
+                                        ),
+                                    )
+                                    .await?;
+                                }
+                                DisconnectFault::InfraLoss => {
+                                    self.report_deferred_task_lost(worker_id, &log_task_hash)
+                                        .await?;
+                                }
+                            }
                         }
                     }
                     return Ok(None);

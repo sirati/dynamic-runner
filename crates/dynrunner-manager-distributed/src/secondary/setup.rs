@@ -665,6 +665,10 @@ where
                             &self.config.secondary_id,
                             timestamp_now(),
                             digest,
+                            // A compute SecondaryCoordinator is never an
+                            // observer (the observer role IS the standalone
+                            // ObserverCoordinator).
+                            false,
                         );
                         if let Err(e) = self.send_to(Destination::All, frame).await {
                             tracing::warn!(
@@ -792,10 +796,14 @@ where
                     // router uses.
                     if let MessageType::StateDigest = msg.msg_type() {
                         if let DistributedMessage::StateDigest {
-                            digest, sender_id, ..
+                            digest,
+                            sender_id,
+                            sender_is_observer,
+                            ..
                         } = msg
                         {
-                            self.reconcile_state_digest(&sender_id, &digest).await;
+                            self.reconcile_state_digest(&sender_id, sender_is_observer, &digest)
+                                .await;
                         }
                         continue;
                     }
@@ -1232,12 +1240,61 @@ where
                 .ensure_worker_for_type(wid, &binary.type_id, factory, false)
                 .await
             {
+                // The typed worker died before Ready (or its spawn
+                // failed) with THIS task bound to the attempt. The task
+                // must never be silently skipped (assigned-but-
+                // terminal-less strands the run); report it on the same
+                // fault attribution every deferred-loss edge uses: a
+                // self-inflicted death (nonzero exit / bug signal)
+                // CHARGES the task's retry budget, an environment loss
+                // requeues it uncharged. The dead slot itself is healed
+                // by the operational-entry restart sweep in
+                // `process_tasks` (the restart machinery lives in
+                // operational state and is unreachable here).
+                let exit_status = self.pool_mut().workers[wid as usize].try_reap_exit();
                 tracing::error!(
                     worker_id = wid,
                     error = %e,
+                    exit_status = exit_status.as_ref().map(|s| s.to_string()),
                     type_id = %binary.type_id,
-                    "failed to ensure worker type for initial task; skipping"
+                    "failed to ensure worker type for initial task; reporting \
+                     the task to the authority"
                 );
+                // No OOM watcher exists during setup; `false` keeps an
+                // un-correlated SIGKILL in the uncharged class.
+                let report = match dynrunner_manager_local::oom::classify_disconnect_fault(
+                    dynrunner_core::ErrorType::Recoverable,
+                    exit_status.as_ref(),
+                    false,
+                ) {
+                    dynrunner_manager_local::oom::DisconnectFault::TaskFault(et) => {
+                        let death = exit_status
+                            .as_ref()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "exit status unavailable".into());
+                        self.report_deferred_task_failed(
+                            wid,
+                            &hash,
+                            et,
+                            format!(
+                                "worker subprocess died before running its \
+                                 initial-assignment task ({death}): {e}"
+                            ),
+                        )
+                        .await
+                    }
+                    dynrunner_manager_local::oom::DisconnectFault::InfraLoss => {
+                        self.report_deferred_task_lost(wid, &hash).await
+                    }
+                };
+                if let Err(send_err) = report {
+                    tracing::error!(
+                        worker_id = wid,
+                        error = %send_err,
+                        "failed to send TaskFailed for the initial-assignment \
+                         task whose typed worker did not come up"
+                    );
+                }
                 continue;
             }
             // Snapshot for the sampler hook before the binary

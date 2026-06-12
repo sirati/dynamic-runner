@@ -35,7 +35,7 @@
 pub mod disconnect;
 pub mod probe;
 
-pub use disconnect::classify_disconnect;
+pub use disconnect::{DisconnectFault, classify_disconnect, classify_disconnect_fault};
 
 use std::time::{Duration, Instant};
 

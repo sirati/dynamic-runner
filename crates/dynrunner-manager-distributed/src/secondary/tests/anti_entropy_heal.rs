@@ -134,6 +134,7 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
                 sender_id: "setup".into(),
                 timestamp: 0.0,
                 digest: donor.digest(),
+                sender_is_observer: false,
             };
             sec.dispatch_message(digest_frame, &mut FakeWorkerFactory)
                 .await
@@ -184,6 +185,7 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
                 sender_id: "setup".into(),
                 timestamp: 0.0,
                 digest: donor.digest(),
+                sender_is_observer: false,
             };
             sec.dispatch_message(digest_frame_2, &mut FakeWorkerFactory)
                 .await
@@ -225,8 +227,12 @@ async fn converged_secondary_emits_but_does_not_pull() {
             assert_eq!(sec.cluster_state.digest(), peer.digest());
 
             // The emit path produces an All-addressed digest frame.
-            let frame: DistributedMessage<TestId> =
-                crate::anti_entropy::digest_broadcast("worker-b", 0.0, sec.cluster_state.digest());
+            let frame: DistributedMessage<TestId> = crate::anti_entropy::digest_broadcast(
+                "worker-b",
+                0.0,
+                sec.cluster_state.digest(),
+                false,
+            );
             sec.send_to(Destination::All, frame)
                 .await
                 .expect("digest broadcast send succeeds");
@@ -246,6 +252,7 @@ async fn converged_secondary_emits_but_does_not_pull() {
                 sender_id: "worker-c".into(),
                 timestamp: 0.0,
                 digest: peer.digest(),
+                sender_is_observer: false,
             };
             sec.dispatch_message(digest_frame, &mut FakeWorkerFactory)
                 .await

@@ -26,6 +26,7 @@ const ARM_LIVENESS_PING: usize = 7;
 const ARM_RESPAWN_JOIN: usize = 8;
 const ARM_PANIK: usize = 9;
 const ARM_GRACEFUL_ABORT: usize = 10;
+const ARM_TASK_BACKOFF: usize = 11;
 
 /// Arm names, index-aligned with the `ARM_*` ids above. The render order of
 /// the compact stats line.
@@ -41,6 +42,7 @@ const OP_LOOP_ARM_NAMES: &[&str] = &[
     "respawn_join",
     "panik",
     "graceful_abort",
+    "task_backoff",
 ];
 
 /// Render a drain-by-`MessageType` tally as a single diagnostic string:
@@ -537,6 +539,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 break;
             }
 
+            // Per-task re-dispatch backoff wake deadline, recomputed
+            // each iteration from the pool's PERSISTENT stored
+            // eligible-at stamps (never derived relative to "now" at
+            // the arm — the persistent-deadline law). Computed OUTSIDE
+            // the `select!` so the backoff arm's future does not
+            // borrow `self`.
+            let task_backoff_due = self.next_task_dispatch_backoff_expiry();
+
             // Cancellation safety: `transport.recv_peer` is the
             // mpsc-backed unified inbound demux (cancel-safe — see
             // `TunneledPeerTransport::recv_peer`). The two timer
@@ -777,6 +787,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         &self.config.node_id,
                         crate::primary::wire::timestamp_now(),
                         digest,
+                        // A PrimaryCoordinator is never an observer.
+                        false,
                     );
                     let _ = self
                         .send_to(
@@ -956,6 +968,32 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         let own_id = self.config.node_id.clone();
                         self.initiate_graceful_abort(&own_id).await;
                     }
+                }
+                // Per-task re-dispatch backoff wake. `task_backoff_due`
+                // (computed at the top of this iteration) is the pool's
+                // earliest STORED eligible-at instant across queued
+                // backed-off tasks — a persistent deadline, so parking
+                // on the absolute instant survives sibling arms winning
+                // every iteration (the watchdog law; a relative sleep
+                // would re-arm forever on a busy mesh). When it fires,
+                // a previously-hidden task just became dispatch-
+                // eligible while every worker may already be parked
+                // ("no work" was the answer the whole window) — EMIT a
+                // `TasksAdded` onto the decoupled worker-management bus
+                // (never a direct dispatch call) so the worker-
+                // management arm coalesces it into one batched recheck.
+                // The pool drops expired stamps lazily, so the next
+                // iteration's recompute returns a strictly-future
+                // instant (or None) — this arm can never hot-fire.
+                _ = async {
+                    match task_backoff_due {
+                        Some(due) => tokio::time::sleep_until(due.into()).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    arm_stats.record(ARM_TASK_BACKOFF);
+                    self.cluster_state
+                        .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
                 }
             }
         }

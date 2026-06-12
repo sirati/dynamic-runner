@@ -130,6 +130,12 @@ pub struct PendingPool<I: Identifier> {
     /// distinguishes "phase truly empty" from "phase has blocked
     /// items waiting for unresolved prereqs in another phase".
     pub(super) blocked_per_phase: HashMap<PhaseId, u32>,
+    /// Per-task re-dispatch backoff: stamped by `requeue`/`reinject`,
+    /// consulted by the dispatch read paths so a task whose every
+    /// dispatch bounces (or whose every attempt fails instantly)
+    /// cannot cycle requeue → re-assign at memory speed. See
+    /// [`super::backoff`] for the contract.
+    pub(super) dispatch_backoff: super::backoff::DispatchBackoff,
 }
 
 impl<I: Identifier> PendingPool<I> {
@@ -238,7 +244,32 @@ impl<I: Identifier> PendingPool<I> {
             dormant_tasks: HashSet::new(),
             in_flight_tasks: HashSet::new(),
             blocked_per_phase: HashMap::new(),
+            dispatch_backoff: super::backoff::DispatchBackoff::default(),
         })
+    }
+
+    /// Override the per-task re-dispatch backoff parameters (the
+    /// exponential's base delay and saturation cap). Defaults are
+    /// [`super::backoff::DISPATCH_BACKOFF_BASE`] /
+    /// [`super::backoff::DISPATCH_BACKOFF_CAP`].
+    pub fn set_dispatch_backoff_params(
+        &mut self,
+        base: std::time::Duration,
+        cap: std::time::Duration,
+    ) {
+        self.dispatch_backoff.set_params(base, cap);
+    }
+
+    /// Earliest FUTURE instant at which a currently-backed-off queued
+    /// task becomes dispatch-eligible again, or `None` when no task is
+    /// parked under an unexpired backoff stamp. Event-driven managers
+    /// park a wake on this so a backed-off task is re-checked the
+    /// moment its window expires rather than on the next unrelated
+    /// signal. Expired stamps are lazily dropped, so the returned
+    /// instant is always strictly in the future — a wake parked on it
+    /// can never hot-fire.
+    pub fn next_dispatch_backoff_expiry(&mut self) -> Option<std::time::Instant> {
+        self.dispatch_backoff.next_expiry(std::time::Instant::now())
     }
 
     /// Pre-seed `completed_tasks` with task ids the cluster has

@@ -8,7 +8,8 @@ use dynrunner_protocol_primary_secondary::address::{Destination, PeerId};
 use super::super::mesh::Mesh;
 use super::super::role::LocalRole;
 use super::{
-    TestId, abort_request_frame, frame, frame_to, sender_of, transport_with_remotes, welcome_frame,
+    TestId, abort_request_frame, frame, frame_to, sender_of, snapshot_request_frame,
+    transport_with_remotes, welcome_frame,
 };
 
 /// `broadcast` excludes the ORIGINATING ROLE but includes the OTHER local
@@ -384,6 +385,170 @@ async fn route_incoming_directed_role_miss_falls_back_to_live_slots() {
              back to the live slots, never silently drop"
         )),
         "sec-1"
+    );
+}
+
+/// THE addressing-spam replay (RED pre-fix): a `RequestClusterSnapshot`
+/// targeted `Secondary(self-id)` arriving at an OBSERVER-only process — the
+/// production shape where a behind peer pulls a snapshot FROM this observer
+/// but, lacking the observer's role, types the pull `Secondary(observer-id)`.
+/// The id IS this host, so the sender unambiguously meant THIS process; only
+/// the role tag is stale. The frame must be SERVED via the local fan (the
+/// observer slot is the snapshot responder) WITHOUT the genuine-mis-address
+/// WARN — a DEBUG instead — killing the once-per-cadence-forever spam.
+#[tokio::test]
+async fn route_incoming_self_id_role_miss_serves_without_warn() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let capture = crate::test_capture::TargetCapture::for_target(
+        "dynrunner_manager_distributed::process::mesh::routing",
+    );
+    let subscriber = tracing_subscriber::Registry::default().with(capture.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (transport, _r) = transport_with_remotes("observer-2f2e", &[]);
+    let mut mesh = Mesh::<TestId, _>::new(transport);
+
+    // This process hosts ONLY an observer slot (a late-joined observer).
+    let (_o_slot, _o_client, mut observer_inbox) =
+        mesh.register_local_role(LocalRole::Observer, PeerId::from("observer-2f2e"));
+
+    // The pull arrives mis-typed `Secondary(self-id)` — the bug's frame.
+    mesh.route_incoming(
+        snapshot_request_frame("worker-7").with_target(Destination::Secondary(PeerId::from(
+            "observer-2f2e",
+        ))),
+    )
+    .await;
+
+    // SERVED: the observer slot (the snapshot responder) got the pull.
+    assert_eq!(
+        sender_of(&observer_inbox.try_recv().expect(
+            "a self-id role-miss pull must be served via the local fan, never dropped"
+        )),
+        "worker-7"
+    );
+
+    // NO mis-address WARN — the id==self case is DEBUG, not the role-miss
+    // WARN. This is the spam the fix kills (one WARN per pull, forever).
+    let warns = capture
+        .events()
+        .into_iter()
+        .filter(|e| {
+            e.level == tracing::Level::WARN
+                && e.event
+                    .message
+                    .contains("names a role with no live")
+        })
+        .count();
+    assert_eq!(
+        warns, 0,
+        "a self-id role-miss must NOT emit the genuine-mis-address WARN (it was meant for us)"
+    );
+    // And it IS logged at DEBUG (delivered-without-noise, still observable).
+    let debugs = capture
+        .events()
+        .into_iter()
+        .filter(|e| {
+            e.level == tracing::Level::DEBUG
+                && e.event.message.contains("its id IS this host")
+        })
+        .count();
+    assert_eq!(debugs, 1, "the self-id fan must be logged at DEBUG");
+}
+
+/// The WARN survives for a GENUINE mis-address: a directed frame whose id is
+/// a FOREIGN peer (not this host) with no relayable holder still trips the
+/// role-miss WARN — the fix narrows the no-WARN path to id==self ONLY, it
+/// does not suppress real stale-knowledge diagnostics. (No remote wire is
+/// wired, so the relay to the foreign holder fails-to-no-route and falls
+/// back to the local fan + WARN, exactly the genuine-miss path.)
+#[tokio::test]
+async fn route_incoming_foreign_id_role_miss_keeps_warn() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let capture = crate::test_capture::TargetCapture::for_target(
+        "dynrunner_manager_distributed::process::mesh::routing",
+    );
+    let subscriber = tracing_subscriber::Registry::default().with(capture.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (transport, _r) = transport_with_remotes("observer-2f2e", &[]);
+    let mut mesh = Mesh::<TestId, _>::new(transport);
+    let (_o_slot, _o_client, mut observer_inbox) =
+        mesh.register_local_role(LocalRole::Observer, PeerId::from("observer-2f2e"));
+
+    // A frame for a FOREIGN secondary id — genuinely mis-delivered here.
+    mesh.route_incoming(
+        frame_to("sec-1", Destination::Secondary(PeerId::from("some-other-peer"))),
+    )
+    .await;
+
+    // Still served (no-drop), but the genuine-mis-address WARN fired.
+    assert_eq!(
+        sender_of(&observer_inbox.try_recv().expect("foreign-id miss still fans, never drops")),
+        "sec-1"
+    );
+    let warns = capture
+        .events()
+        .into_iter()
+        .filter(|e| {
+            e.level == tracing::Level::WARN
+                && e.event
+                    .message
+                    .contains("no relayable remote holder")
+        })
+        .count();
+    assert_eq!(
+        warns, 1,
+        "a genuine foreign-id mis-address must KEEP the role-miss WARN"
+    );
+}
+
+/// Relay-guard: a self-id directed frame is NEVER relayed away onto the
+/// wire, even if the holder view would map its (stale) role to ANOTHER
+/// peer. The id==self check in `route_incoming` wins BEFORE the relay, and
+/// the relay's own `is_local_host` guard composes as a second line — so the
+/// frame comes to rest locally. Here the setup process's holder view names
+/// a remote primary, but a frame self-addressed `Observer(self-id)` must
+/// reach THIS process's observer slot, not bounce to the remote.
+#[tokio::test]
+async fn route_incoming_self_id_frame_never_relayed_away() {
+    // The remote that the (stale) holder view points at — if the relay
+    // fired wrongly, the frame would land here.
+    let mut remote = wired_process("remote-host", HashMap::new());
+    let (_p_slot, mut remote_inbox) = register(&mut remote, LocalRole::Primary, "remote-host");
+
+    // The local process: observer slot only, wired to the remote.
+    let mut local = wired_process(
+        "self-host",
+        HashMap::from([("remote-host".to_string(), remote.in_tx.clone())]),
+    );
+    let (o_slot, o_client, mut observer_inbox) = local
+        .mesh
+        .register_local_role(LocalRole::Observer, PeerId::from("self-host"));
+    let _o_slot = o_slot;
+    // A holder view that (staleness) names the remote as the primary —
+    // present to prove a self-id frame is NOT diverted by it.
+    o_client
+        .role_holder_view()
+        .publish_primary(Some("remote-host"), 1);
+
+    // A self-id directed frame whose role (Secondary) has no live local
+    // slot — but the id IS this host. It must be served locally.
+    local
+        .in_tx
+        .send(frame_to("pull", Destination::Secondary(PeerId::from("self-host"))))
+        .expect("local inbound open");
+    assert!(local.mesh.recv_dial_and_route().await);
+
+    // Delivered to THIS process's live slot (the observer fan), never the
+    // remote: the id==self frame is not relayed away.
+    assert_eq!(
+        sender_of(&observer_inbox.try_recv().expect("self-id frame served locally")),
+        "pull"
+    );
+    assert!(
+        remote_inbox.try_recv().is_none(),
+        "a self-id frame must NOT be relayed onto the wire to another peer"
     );
 }
 

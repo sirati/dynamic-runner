@@ -126,7 +126,7 @@ class TaskDeploymentSpec:
     # Additional flags interpolated into the SLURM wrapper's
     # ``podman run`` invocation, BEFORE the ``{image_name}:{image_tag}``
     # argument and AFTER the framework's own flags (``--pull=never``,
-    # ``--network=host``, ``--pids-limit=16384``,
+    # ``--network=host``, ``--pids-limit=0``,
     # ``--ulimit nproc=32768:32768``, the auto-derived ``--memory``
     # cap, the ``-e PRIMARY_NODE_IPV{4,6}`` env hints, the standard
     # ``-v`` volume mounts). Intended as a consumer-controlled escape
@@ -137,13 +137,16 @@ class TaskDeploymentSpec:
     # interpolated, so values containing spaces or
     # shell-metacharacters survive intact.
     #
-    # The framework's ``--pids-limit=16384`` default replaces podman
-    # rootless's 2048 cap, which is too tight for compile-heavy
-    # workloads (autotools + parallel gcc/clang fans out hundreds of
-    # transient PIDs per build) and for JVM-heavy ones (Ghidra spawns
-    # native threads that count against ``pids.max``). To override,
-    # pass ``--pids-limit=<N>`` here; podman takes the LAST value when
-    # the flag appears twice, so the consumer-supplied entry wins.
+    # The framework passes ``--pids-limit=0`` (unlimited) explicitly to
+    # suppress podman rootless's silent 2048 builtin default
+    # (containers.conf ``pids_limit``). The 2048 cap is too tight for
+    # compile-heavy workloads (autotools + parallel gcc/clang fans out
+    # hundreds of transient PIDs per build) and for JVM-heavy ones
+    # (Ghidra spawns native threads that count against ``pids.max``),
+    # causing ``clone() EAGAIN``. The host protections are the RAM cap
+    # and nice level. To impose a limit, pass ``--pids-limit=<N>`` here;
+    # podman takes the LAST value when the flag appears twice, so the
+    # consumer-supplied entry wins.
     #
     # The framework's ``--ulimit nproc=32768:32768`` default overrides
     # the host-side RLIMIT_NPROC podman would otherwise propagate from

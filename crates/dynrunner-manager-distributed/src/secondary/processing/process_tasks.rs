@@ -126,6 +126,32 @@ where
             mut announcer_outbox_rx,
             mut fatal_exit_signal_rx,
         } = latches;
+        // Operational-entry restart sweep: a SETUP-phase typed-spawn
+        // death (the initial-assignment `ensure_worker_for_type` Err
+        // arm) leaves its slot startup-dead with no
+        // `pending_worker_restarts` entry — the restart machinery
+        // lives in operational state and is unreachable during setup.
+        // Sweep every startup-dead slot into the standard backed-off
+        // restart schedule NOW, so no slot enters the operational loop
+        // permanently dead (it would otherwise bounce every future
+        // assignment as "no idle worker" forever).
+        let startup_dead: Vec<dynrunner_core::WorkerId> = self
+            .op_mut()
+            .pool
+            .workers
+            .iter()
+            .filter(|w| w.is_startup_dead())
+            .map(|w| w.worker_id)
+            .collect();
+        for wid in startup_dead {
+            tracing::warn!(
+                worker_id = wid,
+                "slot entered the operational loop startup-dead (setup-phase \
+                 typed-spawn death); scheduling its backed-off restart"
+            );
+            self.schedule_worker_restart(wid);
+        }
+
         // Take the panik-watcher signal receiver out of `self` into a
         // loop-local so the panik arm's `await` can own it across `select!`
         // iterations. A loop-local is required here (it cannot be polled
@@ -625,6 +651,8 @@ where
                         &self.config.secondary_id,
                         crate::secondary::wire::timestamp_now(),
                         digest,
+                        // A compute SecondaryCoordinator is never an observer.
+                        false,
                     );
                     let _ = self.send_to(Destination::All, frame).await;
                 }
