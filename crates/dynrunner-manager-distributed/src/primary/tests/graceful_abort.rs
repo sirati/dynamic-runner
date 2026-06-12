@@ -285,6 +285,85 @@ async fn graceful_abort_request_latches_once() {
         .await;
 }
 
+/// The one-shot important event: `initiate_graceful_abort` emits exactly ONE
+/// important event on the FIRST call (the event-time signal so operators do
+/// not have to wait for the ~120 s periodic arm-stats tick), carrying a
+/// `graceful_abort = 1` structured field (the same grep surface as the
+/// periodic stats line). A duplicate call against an already-latched freeze
+/// is a silent NoOp — the idempotency guard.
+///
+/// Both trigger paths (SIGUSR2 arm and wire `GracefulAbortRequest` handler)
+/// route through `initiate_graceful_abort`, so testing it directly covers
+/// both.
+///
+/// `TargetCapture` is used rather than `capture_important` because the emit
+/// occurs inside an async function: `TargetCapture` installs with
+/// `Interest::always` and is safe to hold across `.await` on a
+/// current-thread runtime (see `test_capture` module docs).
+#[tokio::test(flavor = "current_thread")]
+async fn graceful_abort_armed_emits_one_shot_important_event() {
+    use crate::test_capture::{IMPORTANT_TARGET, TargetCapture};
+    use tracing::subscriber::set_default;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::{Registry};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(0);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let capture = TargetCapture::for_target(IMPORTANT_TARGET);
+            let subscriber = Registry::default().with(capture.clone());
+            let _guard = set_default(subscriber);
+
+            // First call: latch not yet set → must emit exactly ONE important
+            // event carrying `graceful_abort = 1`.
+            primary.initiate_graceful_abort("test-requester").await;
+
+            let events = capture.events();
+            assert_eq!(
+                events.len(),
+                1,
+                "first initiate_graceful_abort must emit exactly one \
+                 important event; got {} events: {events:?}",
+                events.len(),
+            );
+            let ev = &events[0].event;
+            let graceful_abort_field = ev.fields.get("graceful_abort");
+            assert_eq!(
+                graceful_abort_field.map(String::as_str),
+                Some("1"),
+                "the important event must carry `graceful_abort = 1`; \
+                 got fields: {:?}",
+                ev.fields,
+            );
+            assert!(
+                ev.message.contains("graceful abort armed"),
+                "message must mention 'graceful abort armed'; got {:?}",
+                ev.message,
+            );
+
+            // Second call: already latched → silent NoOp, no new events.
+            primary.initiate_graceful_abort("test-requester-dup").await;
+            let events_after_dup = capture.events();
+            assert_eq!(
+                events_after_dup.len(),
+                1,
+                "duplicate initiate_graceful_abort must NOT emit a second \
+                 important event (idempotency); got {} events total: \
+                 {events_after_dup:?}",
+                events_after_dup.len(),
+            );
+        })
+        .await;
+}
+
 /// The `MostActiveWorkers` policy picks the busiest ELIGIBLE secondary:
 /// a busier-but-`can_be_primary=false` candidate and idle candidates are
 /// excluded; with no busy eligible candidate the selection is `None`
