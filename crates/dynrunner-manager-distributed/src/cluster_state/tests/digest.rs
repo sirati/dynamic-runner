@@ -362,3 +362,209 @@ fn discovery_debt_divergence_detected_and_heals() {
     assert_eq!(owed.digest().discovery_debt, settled.digest().discovery_debt);
     assert!(!owed.digest().is_behind(&settled.digest()));
 }
+
+// === digest memoization (the dirty-flag memo) ===
+
+use crate::cluster_state::{PhaseTally, RespawnEventRecord};
+use crate::primary::retry_bucket::BucketKind;
+use dynrunner_protocol_primary_secondary::RemovalCause;
+use std::time::SystemTime;
+
+/// THE critical pin: the memoized `digest()` is byte-identical to a fresh
+/// un-memoized fold after EVERY mutation, across a sequence that exercises
+/// every invalidation seam — the apply chokepoint (many arms), the four
+/// grow-max originators (which mutate folded fields OUTSIDE apply), and the
+/// restore chokepoint. A missed invalidation would let the memo serve a
+/// stale digest, silently breaking anti-entropy convergence (a replica that
+/// never detects it is behind, or one falsely flagged), so this is the
+/// property the memo must never violate.
+#[test]
+fn digest_memo_matches_fresh_fold() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    let t0 = SystemTime::UNIX_EPOCH;
+
+    // After every mutation: the memo (digest) must equal a fresh fold. We
+    // call `digest()` FIRST so the memo is populated, THEN `fresh_digest_fold()`
+    // (which recomputes unconditionally) — if a seam failed to invalidate,
+    // the populated memo would carry the PRE-mutation value and diverge.
+    macro_rules! assert_memo_fresh {
+        () => {{
+            let memo = s.digest();
+            let fresh = s.fresh_digest_fold();
+            assert_eq!(
+                memo, fresh,
+                "memoized digest diverged from a fresh fold — a mutation seam \
+                 failed to invalidate the digest memo"
+            );
+        }};
+    }
+
+    // Pre-warm the memo on the empty ledger, then mutate and re-check.
+    assert_memo_fresh!();
+
+    // --- apply-chokepoint arms (tasks / outputs / primary / phase graph /
+    //     peers+capabilities / custom messages / latches) ---
+    for i in 0..8 {
+        s.apply(ClusterMutation::TaskAdded {
+            hash: format!("t{i}"),
+            task: mk_task(&format!("t{i}")),
+        });
+        assert_memo_fresh!();
+    }
+    s.apply(ClusterMutation::TaskAssigned {
+        hash: "t0".into(),
+        secondary: "s1".into(),
+        worker: 0,
+        version: Default::default(),
+        attempt: 0,
+    });
+    assert_memo_fresh!();
+    s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "t0".into(),
+        // A non-None payload exercises the task_outputs fold via the
+        // internal `record_task_outputs_value` (reached through apply).
+        result_data: Some(serde_json::to_vec(&serde_json::json!({"out": 1})).unwrap()),
+    });
+    assert_memo_fresh!();
+    s.apply(ClusterMutation::TaskFailed {
+        hash: "t1".into(),
+        kind: ErrorType::Recoverable,
+        error: "boom".into(),
+        version: Default::default(),
+        attempt: 0,
+    });
+    assert_memo_fresh!();
+    s.apply(ClusterMutation::TaskRetried {
+        hash: "t1".into(),
+        attempt: 1,
+        version: Default::default(),
+    });
+    assert_memo_fresh!();
+    s.apply(ClusterMutation::PrimaryChanged {
+        new: "s1".into(),
+        epoch: 3,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+    });
+    assert_memo_fresh!();
+    s.apply(ClusterMutation::PeerJoined {
+        peer_id: "obs".into(),
+        is_observer: true,
+        can_be_primary: false,
+        cap_version: Default::default(),
+        member_gen: 0,
+    });
+    assert_memo_fresh!();
+    s.apply(ClusterMutation::SecondaryCapacity {
+        secondary: "s1".into(),
+        worker_count: 4,
+        resources: Default::default(),
+    });
+    assert_memo_fresh!();
+    s.apply(ClusterMutation::CustomMessagePosted {
+        origin: "s1".into(),
+        seq: 1,
+        topic: "topic".into(),
+        data: b"data".to_vec(),
+    });
+    assert_memo_fresh!();
+    s.apply(ClusterMutation::CustomMessageHandled {
+        origin: "s1".into(),
+        seq: 1,
+    });
+    assert_memo_fresh!();
+    s.apply(ClusterMutation::PhaseEnded {
+        phase: PhaseId::from("p0"),
+    });
+    assert_memo_fresh!();
+    s.apply(ClusterMutation::DiscoveryDebtDeclared);
+    assert_memo_fresh!();
+    s.apply(ClusterMutation::RunComplete);
+    assert_memo_fresh!();
+
+    // --- the four grow-max originators (mutate folded fields OUTSIDE the
+    //     apply chokepoint — each must invalidate on its own) ---
+    s.record_phase_event_tally((PhaseId::from("p0"), PhaseTally::Completed), 5);
+    assert_memo_fresh!();
+    s.record_retry_pass_used((PhaseId::from("p0"), BucketKind::Recoverable), 2);
+    assert_memo_fresh!();
+    s.record_unfulfillable_reinject_used("t2".to_string(), 1);
+    assert_memo_fresh!();
+    s.record_respawn_event(
+        "secondary-1".to_string(),
+        RespawnEventRecord {
+            original_id: "secondary-0".to_string(),
+            cause: RemovalCause::KeepaliveMiss,
+            at: t0,
+        },
+    );
+    assert_memo_fresh!();
+
+    // --- the restore chokepoint: merging a divergent peer snapshot must
+    //     invalidate (it mutates many folded fields at once) ---
+    let mut peer = ClusterState::<RunnerIdentifier>::new();
+    for i in 8..12 {
+        peer.apply(ClusterMutation::TaskAdded {
+            hash: format!("t{i}"),
+            task: mk_task(&format!("t{i}")),
+        });
+    }
+    peer.record_phase_event_tally((PhaseId::from("p9"), PhaseTally::Failed), 9);
+    s.restore(peer.snapshot());
+    assert_memo_fresh!();
+
+    // A second restore of the SAME snapshot is a NoOp merge, but still
+    // invalidates (unconditional at the seam) — the re-fold yields the same
+    // value, so the memo stays correct.
+    s.restore(peer.snapshot());
+    assert_memo_fresh!();
+}
+
+/// A clean read serves the memo WITHOUT re-running the O(ledger) fold:
+/// repeated `digest()` calls on an unchanged ledger run the fold exactly
+/// once (the production waste was one full fold per inbound `StateDigest`
+/// frame), and the next mutation invalidates so the following read folds
+/// again.
+#[test]
+fn digest_memo_hit_skips_the_fold() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    for i in 0..16 {
+        s.apply(ClusterMutation::TaskAdded {
+            hash: format!("t{i}"),
+            task: mk_task(&format!("t{i}")),
+        });
+    }
+
+    // First read folds once and populates the memo.
+    let before = s.digest_fold_count();
+    let first = s.digest();
+    assert_eq!(
+        s.digest_fold_count(),
+        before + 1,
+        "the first read after a mutation must run the fold"
+    );
+
+    // A burst of reads against the unchanged ledger — the AE receive-cadence
+    // shape — folds ZERO more times (all served from the memo).
+    for _ in 0..50 {
+        assert_eq!(s.digest(), first, "every clean read returns the memo");
+    }
+    assert_eq!(
+        s.digest_fold_count(),
+        before + 1,
+        "clean reads must NOT re-run the fold (the CPU-waste fix)"
+    );
+
+    // A mutation invalidates; the next read folds exactly once more.
+    s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "t0".into(),
+        result_data: None,
+    });
+    let _ = s.digest();
+    assert_eq!(
+        s.digest_fold_count(),
+        before + 2,
+        "a mutation must invalidate so the next read re-folds"
+    );
+}

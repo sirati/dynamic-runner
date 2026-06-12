@@ -478,6 +478,13 @@ impl<I: Identifier> ClusterState<I> {
             // gate (#416) — each replica throttles its own log stream, so
             // it never crosses the wire.
             dead_rejoin_warn: _dead_rejoin_warn,
+            // node-local: the digest memo + its fold counter are pure
+            // derivations of the replicated fields (the memo IS the digest
+            // of this very snapshot's content), so they carry no signal of
+            // their own and never cross the wire — same classification as
+            // `snapshot_json_cache`.
+            digest_cache: _digest_cache,
+            digest_fold_count: _digest_fold_count,
         } = self;
         ClusterStateSnapshot {
             tasks: tasks.clone(),
@@ -657,6 +664,11 @@ impl<I: Identifier> ClusterState<I> {
         mut snap: ClusterStateSnapshot<I>,
         resumed: &mut Vec<TaskInfo<I>>,
     ) {
+        // The restore chokepoint: this entry (and the per-task
+        // `merge_task_state` join + grow-max field merges it runs below) is
+        // the only path a snapshot merge changes a digest-folded field, so
+        // clear the memo once here. See `invalidate_digest_cache`.
+        self.invalidate_digest_cache();
         // Migration shim (snapshot-ONLY): a legacy snapshot predates the
         // `(phase_id, task_id)` dep identity, so its deps decode with the
         // migration sentinel (empty `PhaseId`). Inject the enclosing

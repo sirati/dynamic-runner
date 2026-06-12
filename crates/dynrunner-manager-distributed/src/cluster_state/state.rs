@@ -433,6 +433,48 @@ pub struct ClusterState<I> {
     /// `snapshot_json_cache`). A cloned / restoring replica cold-starts the
     /// throttle (its first dead-rejoin observation emits immediately).
     pub(super) dead_rejoin_warn: HashMap<String, crate::warn_throttle::WarnThrottle>,
+    /// Node-local memo of the last [`digest`] over the CURRENT generation
+    /// of the replicated ledger. The digest is a pure O(ledger) XOR-fold
+    /// over 66k+ tasks (+ outputs, capabilities, grow-max maps); the
+    /// anti-entropy receive cadence re-derived it from scratch on EVERY
+    /// inbound `StateDigest` frame (two handlers on a co-located node) and
+    /// even on a `snapshot_json` serialize-cache HIT, starving the
+    /// `current_thread` runtime. [`digest`] populates this memo through
+    /// `&self` (interior mutability — a `Cell`, so the read signature is
+    /// unchanged and no caller learns of the memo); the mutation seams
+    /// ([`invalidate_digest_cache`]) clear it. A clean read returns the
+    /// memo; a cleared read recomputes once and re-populates.
+    ///
+    /// INVARIANT (a stale memo silently breaks anti-entropy convergence,
+    /// so this is load-bearing): every `&mut self` API entry that can
+    /// change a digest-folded field clears this memo. Those entries are
+    /// EXACTLY [`apply_with_resumed_blocked`], [`restore_collecting_resumed`],
+    /// and the four grow-max originators ([`record_phase_event_tally`],
+    /// [`record_retry_pass_used`], [`record_unfulfillable_reinject_used`],
+    /// [`record_respawn_event`]). Every other folded-field mutator
+    /// (`apply_custom_*`, `record_task_outputs_value`, `merge_task_state`,
+    /// `apply_peer_*`, …) is an internal `pub(super)` helper reachable ONLY
+    /// through one of those entries, so it is transitively covered — the
+    /// memo is cleared once at the entry, never double-cleared per helper.
+    ///
+    /// A `Cell` (not `RefCell`): [`StateDigest`] is `Copy`, so get/set are
+    /// branch-free and panic-free, and `ClusterState` is single-threaded-
+    /// owned (every coordinator that holds it runs on a `current_thread` /
+    /// `LocalSet` runtime — see the `Rc<Cell<…>>` idiom in
+    /// `secondary/setup_deadline.rs`), so no lock is needed. NOT replicated,
+    /// NOT folded, NOT cloned, NOT snapshotted — a pure derivation of the
+    /// replicated fields, classified node-local in every exhaustive-
+    /// destructure guard alongside `snapshot_json_cache`.
+    pub(super) digest_cache: std::cell::Cell<
+        Option<dynrunner_protocol_primary_secondary::StateDigest>,
+    >,
+    /// Node-local counter of how many times [`digest`] ran the full fold
+    /// (a memo MISS). Bumped through `&self` interior mutability inside the
+    /// recompute branch; read by the `snapshot_json_cache` / digest-memo
+    /// tests to pin "a cache hit does NOT recompute". Carries no
+    /// convergence signal — classified node-local in every destructure
+    /// guard, like `snapshot_json_cache`.
+    pub(super) digest_fold_count: std::cell::Cell<u64>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -490,6 +532,11 @@ where
             // Node-local log-throttle — not cloned (a cloned replica
             // throttles its own log stream from a cold start).
             dead_rejoin_warn: _dead_rejoin_warn,
+            // Node-local digest memo + fold counter — not cloned (a cloned
+            // replica recomputes on its first digest call, from a cold
+            // counter). Bound for the exhaustive-destructure guard.
+            digest_cache: _digest_cache,
+            digest_fold_count: _digest_fold_count,
         } = self;
         Self {
             tasks: tasks.clone(),
@@ -550,6 +597,10 @@ where
             snapshot_json_cache: None,
             // Node-local log-throttle — cold-start on the clone.
             dead_rejoin_warn: HashMap::new(),
+            // Node-local digest memo — cold (the clone recomputes its
+            // digest on first use, so it never inherits the source's memo).
+            digest_cache: std::cell::Cell::new(None),
+            digest_fold_count: std::cell::Cell::new(0),
         }
     }
 }
@@ -596,6 +647,8 @@ where
             custom_terminal_watermarks,
             snapshot_json_cache,
             dead_rejoin_warn,
+            digest_cache,
+            digest_fold_count,
         } = self;
         f.debug_struct("ClusterState")
             .field("tasks", tasks)
@@ -632,6 +685,8 @@ where
             .field("custom_terminal_watermarks", &custom_terminal_watermarks.len())
             .field("snapshot_json_cache", &snapshot_json_cache.is_some())
             .field("dead_rejoin_warn", &dead_rejoin_warn.len())
+            .field("digest_cache", &digest_cache.get().is_some())
+            .field("digest_fold_count", &digest_fold_count.get())
             .finish()
     }
 }
@@ -671,6 +726,8 @@ impl<I> Default for ClusterState<I> {
             custom_terminal_watermarks: HashMap::new(),
             snapshot_json_cache: None,
             dead_rejoin_warn: HashMap::new(),
+            digest_cache: std::cell::Cell::new(None),
+            digest_fold_count: std::cell::Cell::new(0),
         }
     }
 }
@@ -682,5 +739,17 @@ impl<I: Identifier> ClusterState<I> {
 
     pub fn task_count(&self) -> usize {
         self.tasks.len()
+    }
+
+    /// Clear the node-local [`digest`](Self::digest) memo. Called at every
+    /// `&mut self` API entry that can change a digest-folded field (see the
+    /// `digest_cache` field doc for the exhaustive seam inventory and the
+    /// "a stale memo silently breaks anti-entropy" invariant). Cheap +
+    /// idempotent: a no-op-mutation (`ApplyOutcome::NoOp`) caller still
+    /// clears, costing at most one extra fold on the next read — the safe
+    /// trade against ever serving a stale digest (mutations are rare versus
+    /// the per-inbound-frame digest reads the memo exists to spare).
+    pub(super) fn invalidate_digest_cache(&mut self) {
+        self.digest_cache.set(None);
     }
 }

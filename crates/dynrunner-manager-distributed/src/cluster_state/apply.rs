@@ -76,6 +76,12 @@ impl<I: Identifier> ClusterState<I> {
         resumed: &mut Vec<TaskInfo<I>>,
         newly_pending_from_spawn: &mut Vec<TaskInfo<I>>,
     ) -> ApplyOutcome {
+        // The apply chokepoint: this entry (and the delegated apply_peer /
+        // apply_tasks / apply_custom / merge arms it dispatches to) is the
+        // ONLY path a `ClusterMutation` changes a digest-folded field, so
+        // clearing the memo once here covers every arm. Unconditional (a
+        // NoOp arm still clears) — see `invalidate_digest_cache`.
+        self.invalidate_digest_cache();
         match m {
             ClusterMutation::TaskAdded { hash, task } => {
                 if let std::collections::hash_map::Entry::Vacant(e) = self.tasks.entry(hash) {
