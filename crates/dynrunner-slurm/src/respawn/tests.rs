@@ -40,6 +40,11 @@ struct RecordingGateway {
     /// (`Err(GatewayError)`), the shape `revoke` must surface as
     /// `SpawnError`.
     scancel_transport_fails: bool,
+    /// Node name a `squeue -j … -o '%N'` probe answers with (the
+    /// SLURM-vocabulary node the respawn resolves for `--exclude`).
+    /// Empty → squeue reports no node (the resolution falls through to
+    /// sacct, which this gateway also answers empty).
+    squeue_node: String,
 }
 
 impl RecordingGateway {
@@ -74,6 +79,26 @@ impl Gateway for RecordingGateway {
                 return_code: 1,
                 stdout: String::new(),
                 stderr: "scancel: error: Invalid job id specified".into(),
+            });
+        }
+        // Respawn node-resolution probes. `node_from_squeue` issues
+        // `squeue -j … -h -o '%N'` (distinct from cancel-verify's
+        // `-o '%T|%N|%r'`); `node_from_sacct` issues `sacct … NodeList`.
+        // The squeue probe answers with the configured node; sacct
+        // answers empty (the squeue branch covers the resolved case, and
+        // an empty squeue node falls through to an empty sacct → None).
+        if cmd.contains("squeue") && cmd.contains("-o '%N'") {
+            return Ok(CommandResult {
+                return_code: 0,
+                stdout: self.squeue_node.clone(),
+                stderr: String::new(),
+            });
+        }
+        if cmd.contains("sacct") && cmd.contains("NodeList") {
+            return Ok(CommandResult {
+                return_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
             });
         }
         // `submit_job` pipes the wrapper body to sbatch over STDIN
@@ -193,15 +218,15 @@ fn make_spec(id: &str) -> SecondarySpawnSpec {
         new_secondary_id: id.to_owned(),
         primary_endpoint: "primary.test.invalid:9001".to_owned(),
         primary_pubkey_pem: "-----BEGIN PUBLIC KEY-----\nstub\n".to_owned(),
-        exclude_node: None,
+        dead_member_id: None,
     }
 }
 
-/// Build a spec that carries the dead member's node, so the
-/// `--exclude=<node>` propagation can be asserted.
-fn make_spec_excluding(id: &str, dead_node: &str) -> SecondarySpawnSpec {
+/// Build a spec that names a dead member, so the spawner's
+/// resolve-then-`--exclude` propagation can be asserted.
+fn make_spec_with_dead_member(id: &str, dead_member_id: &str) -> SecondarySpawnSpec {
     SecondarySpawnSpec {
-        exclude_node: Some(dead_node.to_owned()),
+        dead_member_id: Some(dead_member_id.to_owned()),
         ..make_spec(id)
     }
 }
@@ -298,12 +323,85 @@ async fn slurm_spawner_submit_job_called_with_new_id() {
         .await;
 }
 
-/// A respawn whose spec carries the dead member's node must put it on
-/// the sbatch as `--exclude=<node>`, so the replacement never lands
-/// back on a NODE_FAIL/faulty node. Pairs with the omit-when-None
-/// assertion in `slurm_spawner_submit_job_called_with_new_id`.
+/// A respawn whose spec NAMES a dead member must resolve that member's
+/// SLURM node from SLURM's own vocabulary (job id → squeue `%N`) and put
+/// it on the replacement's sbatch as `--exclude=<resolved-node>` — NOT a
+/// mesh-advertised hostname. The resolved value (`krater04`) differs
+/// from the dead member's id (`secondary-0`), so the test proves the
+/// argv carries the SLURM name, not the member id. Pairs with the
+/// omit-when-None assertion in `slurm_spawner_submit_job_called_with_new_id`.
 #[tokio::test]
-async fn slurm_spawner_passes_exclude_node_to_sbatch() {
+async fn slurm_spawner_resolves_and_passes_exclude_node_to_sbatch() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let gw = RecordingGateway {
+                squeue_node: "krater04".into(),
+                ..RecordingGateway::default()
+            };
+            let cfg = SlurmConfig {
+                root_folder: "/srv/slurm-test".into(),
+                ..SlurmConfig::default()
+            };
+            let mgr = Arc::new(Mutex::new(SlurmJobManager::new(cfg, gw)));
+            let tunnel = Arc::new(RecordingTunnelEstablisher::ok());
+            let wrap_gen: WrapperScriptGenerator =
+                Arc::new(|spec: &SecondarySpawnSpec| Ok(format!("#!/bin/sh\n# {}\n", spec.new_secondary_id)));
+
+            // Register the dead member's job so the resolver can map
+            // `secondary-0 → job id → squeue %N`, exactly as the initial
+            // cohort submit-loop would have.
+            mgr.lock()
+                .await
+                .submit_job(
+                    "#!/bin/sh\n# dead\n",
+                    "asm-secondary-0",
+                    "secondary-0",
+                    1,
+                    "/srv/slurm-test/log/run-1",
+                    None,
+                )
+                .await
+                .expect("seeding the dead member's job must succeed");
+
+            let spawner = SlurmSecondarySpawner::new(
+                Arc::clone(&mgr),
+                Arc::clone(&tunnel),
+                wrap_gen,
+                "/srv/slurm-test/log/run-1".into(),
+            );
+
+            spawner
+                .spawn(make_spec_with_dead_member("sec-replacement-9", "secondary-0"))
+                .await
+                .expect("spawn must succeed");
+
+            let mgr_locked = mgr.lock().await;
+            let cmds = mgr_locked.gateway().commands();
+            // The replacement's sbatch is the LAST `| sbatch ` (the dead
+            // member's seed-submit is the first).
+            let sbatch = cmds
+                .iter()
+                .rev()
+                .find(|c| c.contains("| sbatch "))
+                .expect("sbatch command must have been issued");
+            assert!(
+                sbatch.contains("--exclude=krater04"),
+                "resolved SLURM node must propagate into sbatch --exclude; got: {sbatch}",
+            );
+            assert!(
+                !sbatch.contains("secondary-0") || !sbatch.contains("--exclude=secondary-0"),
+                "the dead member id must not be used as the exclude node; got: {sbatch}",
+            );
+        })
+        .await;
+}
+
+/// A respawn whose dead member cannot be resolved to a SLURM node (no
+/// `secondary_jobs` entry → no job id → no squeue/sacct node) must NOT
+/// emit `--exclude` and the spawn must still proceed: the exclusion is a
+/// best-effort hint, never a spawn prerequisite.
+#[tokio::test]
+async fn slurm_spawner_omits_exclude_when_dead_member_unresolvable() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let gw = RecordingGateway::default();
@@ -323,10 +421,11 @@ async fn slurm_spawner_passes_exclude_node_to_sbatch() {
                 "/srv/slurm-test/log/run-1".into(),
             );
 
+            // Name a dead member the manager never submitted a job for.
             spawner
-                .spawn(make_spec_excluding("sec-replacement-9", "krater07"))
+                .spawn(make_spec_with_dead_member("sec-replacement-9", "secondary-99"))
                 .await
-                .expect("spawn must succeed");
+                .expect("spawn must succeed even when the node is unresolvable");
 
             let mgr_locked = mgr.lock().await;
             let cmds = mgr_locked.gateway().commands();
@@ -335,8 +434,8 @@ async fn slurm_spawner_passes_exclude_node_to_sbatch() {
                 .find(|c| c.contains("| sbatch "))
                 .expect("sbatch command must have been issued");
             assert!(
-                sbatch.contains("--exclude=krater07"),
-                "dead node must propagate into sbatch --exclude; got: {sbatch}",
+                !sbatch.contains("--exclude"),
+                "an unresolvable dead member must omit --exclude; got: {sbatch}",
             );
         })
         .await;

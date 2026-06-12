@@ -251,16 +251,18 @@ where
         }
 
         let new_id = self.mint_secondary_id();
-        // The dead member's node, recorded from its welcome and surviving
-        // its removal (`secondary_nodes`). When known, the spawner excludes
-        // it so the replacement never re-inherits a NODE_FAIL/faulty node;
-        // when unknown the replacement places unconstrained (best-effort).
-        let exclude_node = self.secondary_nodes.get(&request.original_id).cloned();
+        // Carry the DEAD member's id so the provider can resolve its SLURM
+        // node from SLURM's own vocabulary (job id → squeue/sacct) and
+        // exclude it, keeping the replacement off a NODE_FAIL/faulty node.
+        // The primary is provider-agnostic — it never resolves the node
+        // itself (a non-SLURM provider has no node to exclude); it just
+        // names who died and lets the provider decide. Best-effort: an
+        // unresolvable id places the replacement unconstrained.
         let spec = SecondarySpawnSpec {
             new_secondary_id: new_id.clone(),
             primary_endpoint: self.respawn_primary_endpoint.clone(),
             primary_pubkey_pem: self.respawn_primary_pubkey_pem.clone(),
-            exclude_node,
+            dead_member_id: Some(request.original_id.clone()),
         };
 
         // Record the accepted event on the REPLICATED ledger NOW —

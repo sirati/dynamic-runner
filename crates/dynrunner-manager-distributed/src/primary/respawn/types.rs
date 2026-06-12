@@ -14,13 +14,16 @@ pub struct SecondarySpawnSpec {
     pub new_secondary_id: String,
     pub primary_endpoint: String,
     pub primary_pubkey_pem: String,
-    /// The dead member's node, when the primary knows it (recorded from
-    /// the original's welcome and surviving its removal). A provider that
-    /// places jobs on named nodes (the SLURM spawner) excludes it so the
-    /// replacement never re-inherits a NODE_FAIL/hardware-faulty node.
-    /// `None` when the node is unknown — the provider then places without
-    /// constraint. Best-effort: correctness never depends on it.
-    pub exclude_node: Option<String>,
+    /// The DEAD member's id (`secondary-N`) the replacement is standing
+    /// in for, when this is a replacement spawn. A provider that places
+    /// jobs on named nodes (the SLURM spawner) resolves it to the dead
+    /// member's SLURM node — from SLURM's own vocabulary (job id →
+    /// squeue/sacct), NOT a mesh-advertised hostname — and excludes that
+    /// node so the replacement never re-inherits a NODE_FAIL/hardware-
+    /// faulty node. `None` when there is no dead member to key on; the
+    /// provider then places without constraint. Best-effort: correctness
+    /// never depends on it (an unresolvable id just omits `--exclude`).
+    pub dead_member_id: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
