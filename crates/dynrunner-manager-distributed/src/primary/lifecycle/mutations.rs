@@ -615,14 +615,42 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         } else {
             self.cluster_state.primary_epoch() + 1
         };
-        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
+        let repoint = ClusterMutation::PrimaryChanged {
             new: self.config.node_id.clone(),
             epoch,
             // Self-announce (`new == self`): this host names ITSELF the
             // primary at the bootstrap/failover convergence point.
             reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
-        }])
-        .await;
+        };
+        self.apply_and_broadcast_cluster_mutations(vec![repoint.clone()])
+            .await;
+        // Directed observer fan of the re-point (see `fan_repoint_to_
+        // observers`). Unconditional — even on the already-self re-assert,
+        // which the apply-and-broadcast path NoOp-filters off the wire
+        // entirely: a relay-only observer never received the upstream
+        // one-shot broadcast, so this directed re-emit is its ONLY path
+        // to the authoritative identity from the authority itself.
+        self.fan_repoint_to_observers(repoint).await;
+    }
+
+    /// Directed re-emit of one `PrimaryChanged` re-point to every
+    /// observer-role member (`send_to_each_observer`), as a raw
+    /// already-applied `ClusterMutation` frame — the same receiver-side
+    /// idempotency contract as `rebroadcast_full_roster` (an observer
+    /// that already converged NoOps the apply; one that was behind — or
+    /// that missed the one-shot direct-leg broadcast, the relay-only
+    /// observer face — adopts the identity and refreshes its
+    /// primary-liveness clock). Shared by both re-point origination
+    /// sites: `originate_primary_changed` (bootstrap + every promotion)
+    /// and `relocate_primary_to` (the submitter handoff).
+    pub(crate) async fn fan_repoint_to_observers(&mut self, repoint: ClusterMutation<I>) {
+        let msg = DistributedMessage::ClusterMutation {
+            target: None,
+            sender_id: self.config.node_id.clone(),
+            timestamp: timestamp_now(),
+            mutations: vec![repoint],
+        };
+        self.send_to_each_observer(msg).await;
     }
 
     /// React to a panik-watcher signal on the primary.

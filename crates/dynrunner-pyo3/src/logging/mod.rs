@@ -384,9 +384,13 @@ where
         .boxed()
 }
 
-/// Local-timezone `HH:MM` timer for the operator-facing important-stdio
-/// sink. Replaces the default RFC3339-UTC stamp with a compact local
-/// clock (e.g. a 19:07Z event prints `21:07` at UTC+2).
+/// Local-timezone `HH:MM±hhmm` timer for the operator-facing
+/// important-stdio sink. Replaces the default RFC3339-UTC stamp with a
+/// compact local clock, suffixed with the UTC offset (e.g. a 19:07Z
+/// event prints `21:07+0200` at UTC+2). The offset suffix disambiguates
+/// the operator-facing local stamps against the compute peers' UTC full
+/// logs — pairing the two records (a primary's 09:14 UTC line with the
+/// observer's 11:14 local line) is otherwise guesswork.
 ///
 /// Local offset comes from [`chrono::Local`], which reads it through libc
 /// `localtime_r` and is therefore **thread-safe**. This is the deliberate
@@ -401,7 +405,7 @@ struct LocalHhMm;
 
 impl FormatTime for LocalHhMm {
     fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
-        write!(w, "{}", Local::now().format("%H:%M"))
+        write!(w, "{}", Local::now().format("%H:%M%z"))
     }
 }
 
@@ -871,18 +875,26 @@ mod tests {
         let rest = parts.next().expect("message token");
 
         // The leading timestamp token carries no RFC3339/date/seconds/UTC
-        // noise: no `T` separator, no `Z`, no date `-`, no seconds `.`
-        // (the message itself may legitimately contain `-`, so this is
-        // scoped to the timestamp token, not the whole line).
-        for noise in ['T', 'Z', '-', '.'] {
+        // noise: no `T` separator, no `Z`, no seconds `.` (the `-` of a
+        // negative UTC offset is legitimate, so the date-dash check is
+        // scoped to the clock half below).
+        for noise in ['T', 'Z', '.'] {
             assert!(
                 !ts.contains(noise),
-                "timestamp {ts:?} still carries `{noise}` (date/RFC3339/seconds/UTC noise)"
+                "timestamp {ts:?} still carries `{noise}` (RFC3339/seconds/UTC noise)"
             );
         }
 
-        assert_eq!(ts.len(), 5, "timestamp is not `HH:MM`: {ts:?}");
-        let (hh, mm) = ts.split_once(':').expect("`HH:MM` colon");
+        // Shape: `HH:MM±hhmm` — the compact local clock plus the UTC
+        // offset suffix that disambiguates the operator-facing local
+        // stamps against the compute peers' UTC full logs.
+        assert_eq!(ts.len(), 10, "timestamp is not `HH:MM±hhmm`: {ts:?}");
+        let (clock, offset) = ts.split_at(5);
+        assert!(
+            !clock.contains('-'),
+            "clock half {clock:?} carries a date dash"
+        );
+        let (hh, mm) = clock.split_once(':').expect("`HH:MM` colon");
         assert!(
             hh.len() == 2 && hh.bytes().all(|b| b.is_ascii_digit()),
             "hour is not two digits: {ts:?}"
@@ -891,17 +903,23 @@ mod tests {
             mm.len() == 2 && mm.bytes().all(|b| b.is_ascii_digit()),
             "minute is not two digits: {ts:?}"
         );
+        assert!(
+            (offset.starts_with('+') || offset.starts_with('-'))
+                && offset[1..].bytes().all(|b| b.is_ascii_digit()),
+            "offset is not `±hhmm`: {ts:?}"
+        );
         assert_eq!(level, "INFO", "level token not where expected: {line:?}");
         assert!(
             rest.starts_with("wake-the-llm"),
             "message not directly after level: {line:?}"
         );
 
-        // The stamp is LOCAL time: it must equal one of the local `HH:MM`
-        // values observed across the emit window (handles a minute roll).
+        // The stamp is LOCAL time: it must equal one of the local
+        // `HH:MM±hhmm` values observed across the emit window (handles a
+        // minute roll).
         let expected: Vec<String> = [before, after]
             .iter()
-            .map(|t| t.format("%H:%M").to_string())
+            .map(|t| t.format("%H:%M%z").to_string())
             .collect();
         assert!(
             expected.iter().any(|e| e == ts),
@@ -918,8 +936,8 @@ mod tests {
         if local_now.hour() != utc_now.hour() {
             let utc_ts = utc_now.format("%H:%M").to_string();
             assert_ne!(
-                ts, utc_ts,
-                "timestamp matches UTC {utc_ts:?}, not local — \
+                clock, utc_ts,
+                "clock half matches UTC {utc_ts:?}, not local — \
                  multithreaded fallback-to-UTC regressed: {line:?}"
             );
         }
