@@ -11,6 +11,7 @@ pub(super) use super::{PendingPool, PendingPoolError, PhaseState};
 pub(super) use dynrunner_core::{AffinityId, PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId};
 
 mod bucket_dispatch;
+mod dispatch_backoff;
 mod partition;
 mod phase_graph;
 mod phase_lifecycle;

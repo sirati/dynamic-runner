@@ -488,7 +488,28 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         // `WorkerHandle::abort_poll_task` for the full rationale.
         old.abort_poll_task();
 
-        let preserved_type = self.workers[worker_id as usize].loaded_type_id.clone();
+        // Type carry rule (the untyped-heal half of the startup-crash
+        // machinery, evidence-keyed exactly like
+        // `startup_crash_streak_for_successor`): a generation that
+        // reached Ready keeps its `loaded_type_id` so the respawn's
+        // argv keeps matching (fast same-type rebind). A generation
+        // that DIED BEFORE READY is evidence the typed argv cannot
+        // come up — carrying the type forward would crash-loop the
+        // slot (typed spawn → pre-Ready death → restart → same typed
+        // spawn) forever under the backoff cap, leaving it permanently
+        // unassignable while every task of that type bounces
+        // (asm-tokenizer run_20260612_095601). Heal to the GENERIC
+        // worker instead: the base image proved healthy at pool init,
+        // so the slot reaches Ready and becomes assignable again; the
+        // next assignment re-establishes the type through the normal
+        // `ensure_worker_for_type` edge — and if THAT typed spawn dies
+        // pre-Ready too, the death is bound to a deferred task and
+        // charges its retry budget instead of orphaning the slot.
+        let preserved_type = if self.workers[worker_id as usize].ever_ready {
+            self.workers[worker_id as usize].loaded_type_id.clone()
+        } else {
+            None
+        };
         // Drop the prior slot's `SubcgroupHandle` BEFORE creating
         // the replacement leaf: `SubcgroupHandle::Drop` best-effort
         // rmdirs the previous `worker-<id>/` directory, and the

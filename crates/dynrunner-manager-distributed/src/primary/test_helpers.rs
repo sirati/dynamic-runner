@@ -351,6 +351,83 @@ impl WorkerFactory<ChannelManagerEnd> for SlowFakeWorkerFactory {
     }
 }
 
+/// Worker factory replaying the asm-tokenizer run_20260612_095601
+/// consumer failure: the INITIAL (untyped) worker is healthy — it
+/// Readies and idles like the generic pool-init subprocess — but every
+/// TYPED spawn (the per-type respawn carrying the consumer's worker
+/// module) is backed by a REAL subprocess that dies instantly with a
+/// nonzero exit (`sh -c "exit 1"`, the consumer arg-validation raise),
+/// so the manager observes EOF before `Ready` WITH a reapable
+/// "exited with code 1" status. `typed_spawns` records the spawn
+/// instants so tests can assert both the attempt count (bounded — no
+/// hot spin) and the backoff gaps between attempts.
+///
+/// Single-threaded by construction (`Rc`/`RefCell`); only safe inside
+/// a `tokio::task::LocalSet`.
+pub(super) struct CrashingTypedWorkerFactory {
+    pub(super) typed_spawns: std::rc::Rc<std::cell::RefCell<Vec<std::time::Instant>>>,
+}
+
+impl WorkerFactory<ChannelManagerEnd> for CrashingTypedWorkerFactory {
+    fn spawn_worker(
+        &mut self,
+        _worker_id: u32,
+        _subcgroup: Option<&dynrunner_manager_local::cgroup::SubcgroupHandle>,
+    ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+        // Healthy generic worker: Ready, then idle (it never receives
+        // tasks — every assignment type-shifts into the typed spawn).
+        let (manager_end, runner_end) = channel_pair();
+        tokio::task::spawn_local(async move {
+            let mut runner = runner_end;
+            let _ = runner.send(Response::Ready).await;
+            loop {
+                match MessageReceiver::<Command>::recv(&mut runner).await {
+                    Some(Command::Stop) => break,
+                    Some(Command::Custom { .. }) => {}
+                    Some(Command::ProcessTask { .. }) => {
+                        let _ = runner.send(Response::Done { result_data: None }).await;
+                    }
+                    None => break,
+                }
+            }
+        });
+        Ok((manager_end, None))
+    }
+
+    fn spawn_worker_for_type(
+        &mut self,
+        _worker_id: u32,
+        _type_id: &TypeId,
+        _subcgroup: Option<&dynrunner_manager_local::cgroup::SubcgroupHandle>,
+    ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+        self.typed_spawns
+            .borrow_mut()
+            .push(std::time::Instant::now());
+        // Real dead child with a reapable nonzero exit: the test
+        // process is the parent, so the framework's `try_reap_exit`
+        // (waitpid WNOHANG) collects "exited with code 1" exactly as
+        // in production. The sleep lets the few-ms `sh` die before
+        // the EOF is observed; dropping the handle neither kills nor
+        // reaps it.
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("spawn sh: {e}"))?;
+        let pid = child.id();
+        std::mem::forget(child);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Channel whose runner end is dropped before anything is sent:
+        // the manager observes EOF before Ready (the production pipe
+        // shape), then reaps the real pid above for the death evidence.
+        let (manager_end, runner_end) = channel_pair();
+        drop(runner_end);
+        Ok((manager_end, Some(pid)))
+    }
+}
+
 /// Worker factory that fails the first N Recoverable attempts on each
 /// task whose `relative_path` is in `failure_quotas`, then succeeds.
 /// Tasks not in the map always succeed. Shared state is a single

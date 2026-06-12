@@ -40,14 +40,17 @@ impl<I: Identifier> PendingPool<I> {
     /// becomes empty, its pinned workers' affinity records are
     /// cleared so they fall back to the free pool on subsequent calls.
     pub fn pop_for_worker(&mut self, worker_id: WorkerId) -> Option<TaskInfo<I>> {
-        let key = self.choose_bucket_for(worker_id)?;
-        // Always pop the front item of the chosen bucket. take_at handles
-        // affinity / in-flight bookkeeping and drain transitions.
+        let now = std::time::Instant::now();
+        let key = self.choose_bucket_for(worker_id, now)?;
+        // Pop the first dispatch-ELIGIBLE item of the chosen bucket (a
+        // backed-off item at the front must not block its eligible
+        // siblings, nor be dispatched early). `choose_bucket_for` only
+        // returns buckets with at least one eligible item. take_at
+        // handles affinity / in-flight bookkeeping and drain
+        // transitions.
         let bucket = self.buckets.get(&key)?;
-        if bucket.items.is_empty() {
-            return None;
-        }
-        Some(self.take_at(&key, 0, worker_id))
+        let index = self.first_eligible_index(bucket, now)?;
+        Some(self.take_at(&key, index, worker_id))
     }
 
     /// Affinity-ordered view of items currently eligible for `worker_id`.
@@ -101,11 +104,21 @@ impl<I: Identifier> PendingPool<I> {
         // chunks correspond, in order, to: pin, typed, free-pool, co-pin.
         let mut chunks: [Vec<Paired<I>>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
+        // Re-dispatch backoff filter: an item parked under an
+        // unexpired backoff stamp is invisible to dispatch (it still
+        // counts as queued for the phase machine). Locators index the
+        // ORIGINAL bucket positions, so skipping an item here keeps
+        // every emitted locator valid for `take_from_view`.
+        let now = std::time::Instant::now();
+        let backoff = &self.dispatch_backoff;
         let collect_bucket = |key: &BucketKey,
                               bucket: &Bucket<I>,
                               emitted: &mut HashSet<BucketKey>,
                               sink: &mut Vec<Paired<I>>| {
             for (idx, item) in bucket.items.iter().enumerate() {
+                if !backoff.is_eligible(&item.task_id, now) {
+                    continue;
+                }
                 sink.push((item.clone(), (key.clone(), idx)));
             }
             emitted.insert(key.clone());
@@ -251,6 +264,10 @@ impl<I: Identifier> PendingPool<I> {
             .remove(index)
             .expect("take_at called with out-of-range index");
 
+        // The item left the queue: drop its backoff stamp (the streak
+        // persists — a later requeue keeps doubling).
+        self.dispatch_backoff.note_taken(&item.task_id);
+
         if key.2 != no_aff {
             if !bucket.pinned_workers.contains(&worker_id) {
                 bucket.pinned_workers.push(worker_id);
@@ -286,11 +303,16 @@ impl<I: Identifier> PendingPool<I> {
     /// Pick a bucket for `worker_id` per the soft-pin algorithm,
     /// returning the bucket key (or `None` if nothing is dispatchable).
     /// Pure: doesn't mutate state — `take_at` performs the actual claim.
-    fn choose_bucket_for(&self, worker_id: WorkerId) -> Option<BucketKey> {
+    ///
+    /// A bucket qualifies only when it holds at least one
+    /// dispatch-ELIGIBLE item at `now` (an item parked under an
+    /// unexpired re-dispatch backoff is invisible here, same as in
+    /// [`Self::view_for_worker`]).
+    fn choose_bucket_for(&self, worker_id: WorkerId, now: std::time::Instant) -> Option<BucketKey> {
         let no_aff = no_affinity();
 
         // Step 1: existing affinity, if its phase is Active or Draining
-        // and items remain.
+        // and eligible items remain.
         if let Some(Some(key)) = self.worker_affinity.get(&worker_id) {
             let phase_ok = matches!(
                 self.phase_state.get(&key.0),
@@ -298,15 +320,16 @@ impl<I: Identifier> PendingPool<I> {
             );
             if phase_ok
                 && let Some(bucket) = self.buckets.get(key)
-                && !bucket.items.is_empty()
+                && self.first_eligible_index(bucket, now).is_some()
             {
                 return Some(key.clone());
             }
         }
 
-        // Step 2: unpinned, non-free-pool, Active-phase bucket with items.
+        // Step 2: unpinned, non-free-pool, Active-phase bucket with
+        // eligible items.
         for (key, bucket) in &self.buckets {
-            if bucket.items.is_empty() {
+            if self.first_eligible_index(bucket, now).is_none() {
                 continue;
             }
             if key.2 == no_aff {
@@ -322,7 +345,7 @@ impl<I: Identifier> PendingPool<I> {
 
         // Step 3: free-pool bucket of any Active phase.
         for (key, bucket) in &self.buckets {
-            if bucket.items.is_empty() {
+            if self.first_eligible_index(bucket, now).is_none() {
                 continue;
             }
             if key.2 != no_aff {
@@ -334,9 +357,10 @@ impl<I: Identifier> PendingPool<I> {
             return Some(key.clone());
         }
 
-        // Step 4: any bucket with items in an Active phase (co-pin).
+        // Step 4: any bucket with eligible items in an Active phase
+        // (co-pin).
         for (key, bucket) in &self.buckets {
-            if bucket.items.is_empty() {
+            if self.first_eligible_index(bucket, now).is_none() {
                 continue;
             }
             if self.phase_state.get(&key.0) != Some(&PhaseState::Active) {
@@ -346,5 +370,15 @@ impl<I: Identifier> PendingPool<I> {
         }
 
         None
+    }
+
+    /// Index of the first dispatch-eligible item in `bucket` at `now`
+    /// (`None` when the bucket is empty or every item is parked under
+    /// an unexpired re-dispatch backoff stamp).
+    fn first_eligible_index(&self, bucket: &Bucket<I>, now: std::time::Instant) -> Option<usize> {
+        bucket
+            .items
+            .iter()
+            .position(|item| self.dispatch_backoff.is_eligible(&item.task_id, now))
     }
 }

@@ -306,6 +306,14 @@ async fn dead_secondary_requeues_in_flight_task() {
     let requeued: Vec<_> = primary.pool().iter().collect();
     assert_eq!(requeued[0].identifier.0, "victim");
     assert!(!primary.secondaries.contains_key("dead-sec"));
+    // The infra-distinction contract: a host dying mid-task is NOT the
+    // task's fault — the requeue must not charge the task's retry
+    // budget (no failed-ledger entry, no failure-class outcome).
+    assert_eq!(
+        primary.failed_count(),
+        0,
+        "a dead-host requeue must not consume the task's retry budget"
+    );
 }
 
 /// Multi-secondary transport variant that pre-registers two

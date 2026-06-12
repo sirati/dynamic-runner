@@ -72,6 +72,8 @@ impl<I: Identifier> PendingPool<I> {
         if let Some(id) = task_id {
             self.in_flight_tasks.remove(id);
             self.completed_tasks.insert(id.to_string());
+            // Terminal: forget the task's re-dispatch backoff streak.
+            self.dispatch_backoff.clear(id);
             // Walk dependents and possibly unblock them. Collect ids
             // first to avoid borrowing `self.dependents_of` while we
             // mutate `self.blocked` / `self.task_deps`.
@@ -156,6 +158,8 @@ impl<I: Identifier> PendingPool<I> {
         // this id (the retry-decision-pending state) is superseded.
         self.soft_failed.remove(task_id);
         self.failed_tasks.insert(task_id.to_string());
+        // Terminal: forget the task's re-dispatch backoff streak.
+        self.dispatch_backoff.clear(task_id);
 
         let mut affected_phases: HashSet<PhaseId> = HashSet::new();
         affected_phases.insert(phase_id.clone());
@@ -199,8 +203,10 @@ impl<I: Identifier> PendingPool<I> {
                 }
                 // A cascaded dependent's own pending-retry marker (it
                 // could itself have soft-failed earlier) is superseded
-                // by the cascade's permanence.
+                // by the cascade's permanence. Its re-dispatch backoff
+                // streak (if any) is terminal-cleared with it.
                 self.soft_failed.remove(&dep_id);
+                self.dispatch_backoff.clear(&dep_id);
                 self.task_deps.remove(&dep_id);
                 if let Some(item) = self.blocked.remove(&dep_id) {
                     let dep_phase = item.phase_id.clone();
@@ -290,6 +296,8 @@ impl<I: Identifier> PendingPool<I> {
         for root in roots {
             self.soft_failed.remove(&root);
             self.failed_tasks.insert(root.clone());
+            // Terminal: forget the root's re-dispatch backoff streak.
+            self.dispatch_backoff.clear(&root);
             let cascaded = self.cascade_fail_dependents_of(&root, &mut affected_phases);
             out.push((root, cascaded));
         }
@@ -325,7 +333,25 @@ impl<I: Identifier> PendingPool<I> {
     /// bucket. Decrements the phase's in-flight count (the item was
     /// in-flight and is now back in the queue) and flips the phase
     /// `Draining → Active` if needed.
+    ///
+    /// Every requeue stamps the item's re-dispatch backoff (see
+    /// [`super::backoff`]): the item re-enters the queue immediately
+    /// (it still counts as queued for the phase machine) but is not
+    /// dispatch-ELIGIBLE until its exponential window expires, so a
+    /// bounce loop (assign → backpressure → requeue → re-assign)
+    /// cannot hot-spin.
     pub fn requeue(&mut self, item: TaskInfo<I>) {
+        if let Some(delay) = self
+            .dispatch_backoff
+            .note_requeued(&item.task_id, std::time::Instant::now())
+        {
+            tracing::debug!(
+                task_id = %item.task_id,
+                phase = %item.phase_id,
+                delay_ms = delay.as_millis() as u64,
+                "pool: requeued task under re-dispatch backoff"
+            );
+        }
         let phase_id = item.phase_id.clone();
         if let Some(c) = self.in_flight_per_phase.get_mut(&phase_id) {
             let was = *c;
@@ -368,6 +394,20 @@ impl<I: Identifier> PendingPool<I> {
     /// lifecycle bookkeeping (phase_started_emitted) and decides
     /// whether the second-pass dispatch is observable to consumers.
     pub fn reinject(&mut self, item: TaskInfo<I>) {
+        // A reinject follows a FAILED attempt (retry bucket / operator
+        // revival), so it stamps the same re-dispatch backoff a
+        // requeue does: counted retries must not hot-spin either.
+        if let Some(delay) = self
+            .dispatch_backoff
+            .note_requeued(&item.task_id, std::time::Instant::now())
+        {
+            tracing::debug!(
+                task_id = %item.task_id,
+                phase = %item.phase_id,
+                delay_ms = delay.as_millis() as u64,
+                "pool: reinjected task under re-dispatch backoff"
+            );
+        }
         let phase_id = item.phase_id.clone();
         // Revival: a reinjected task's pending-retry failure marker is
         // void — the retry bucket granted it another pass, so blocked
