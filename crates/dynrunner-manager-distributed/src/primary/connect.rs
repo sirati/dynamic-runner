@@ -653,6 +653,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     "duplicate welcome from an already-walked member \
                      (handshake retry); connection state retained"
                 );
+                // A duplicate welcome from a member WITHOUT operational
+                // proof is a trio-retransmit request: its setup gate has
+                // not released, so a served frame was lost in flight. The
+                // re-serve rule (and the serve itself) is owned by
+                // `peer_setup`; this site only reports the event.
+                self.re_serve_setup_on_duplicate_welcome(&secondary_id)
+                    .await;
             }
 
             // Capture the advertised capacity before `resources` is
