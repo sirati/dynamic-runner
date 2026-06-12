@@ -36,6 +36,13 @@
 //! - [`ingest_edges`]: ingest-edge clock recording over a real wire —
 //!   the read loop stamps ARRIVAL without anyone driving `recv_peer`
 //!   (the starved-pump honesty), DRAINED only on the actual pull.
+//! - [`joiner_dial_order`]: joining-mode dial order — a rosterless
+//!   late-joiner (`start_joining` → `dial_all_seeds`) dials EVERY seed
+//!   regardless of id order, so a leg to a lower-id seed (which never
+//!   learns the joiner to dial it) forms instead of parking
+//!   `awaiting_inbound` forever; the crossed dial from a seed that later
+//!   learns the joiner is deduped against the live wire; steady-state
+//!   members keep the lower-id dedup unchanged.
 //! - [`late_joiner_forward`]: desktop-shaped late-joiner bootstrap —
 //!   the RED repro (compute-internal address unreachable from this
 //!   host ⇒ loud bounded `NoReachablePeer`), the GREEN contract
@@ -117,6 +124,7 @@ mod dial_failure_summary;
 mod dial_sweep;
 mod formation_retry;
 mod ingest_edges;
+mod joiner_dial_order;
 mod late_joiner_forward;
 mod log_capture;
 mod member_leg_redial;
