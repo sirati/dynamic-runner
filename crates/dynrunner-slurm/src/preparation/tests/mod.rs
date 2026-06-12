@@ -10,6 +10,7 @@ use tempfile::TempDir;
 
 use super::options::PreparationOptions;
 
+mod cohort;
 mod escalation;
 mod establish;
 mod gather;
