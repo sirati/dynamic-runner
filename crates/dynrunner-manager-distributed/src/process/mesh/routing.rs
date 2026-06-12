@@ -1,6 +1,7 @@
 //! Role-demux routing for [`Mesh`]: directed loopback-vs-remote
-//! dispatch, the origin-excluded `All` fan, the ingress demux, and the
-//! in-place submitter→observer retag.
+//! dispatch, the origin-excluded `All` fan, the ingress demux (with the
+//! relay-toward-the-role-holder rule), and the in-place
+//! submitter→observer retag.
 //!
 //! # Concern
 //!
@@ -10,7 +11,9 @@
 //! when the submitter-primary relocates. The §14 fix lives in [`Mesh::broadcast`]'s
 //! role-keyed (NEVER peer-keyed) exclusion; the no-re-broadcast invariant
 //! lives in [`Mesh::route_incoming`] (an inbound frame is never re-fanned to
-//! remotes).
+//! remotes — the ONE exception is the directed role-miss RELAY below,
+//! which forwards a single mis-delivered frame toward its role's
+//! recognized holder, never a fan).
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::address::Destination;
@@ -122,15 +125,28 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
     /// — the originator is a remote peer, not a local role.
     ///
     /// - directed `Some(Primary|Secondary|Observer)` → [`Self::deliver_local`]
-    ///   to that one role's slot. When that role has NO live local slot the
-    ///   frame is NOT dropped: it already crossed the wire to the correct
-    ///   HOST, and the role tag is only the SENDER's (possibly stale) belief
-    ///   of which role lives here — e.g. a behind secondary addressing the
-    ///   relocated submitter as `Secondary(setup)` while the submitter
-    ///   swapped its primary into a standalone OBSERVER. Fall back to the
-    ///   documented safe default (fan to every live local slot, WARN) so the
-    ///   receiving role's own handler decides relevance instead of the mesh
-    ///   silently eating the frame.
+    ///   to that one role's slot, resolved IN ORDER when the role has no
+    ///   live local slot here:
+    ///   1. **Live local slot** → deliver locally (the hot path).
+    ///   2. **The role is recognized to live on ANOTHER peer** → RELAY the
+    ///      frame toward the holder ([`Self::try_relay_to_role_holder`]):
+    ///      the id-less `Primary` resolves through the
+    ///      coordinator-published [`super::role_holder::RoleHolderView`]
+    ///      (the SAME role-table fact the `Destination::Primary` egress
+    ///      collapse resolves by); `Secondary(id)`/`Observer(id)` carry
+    ///      their holder in the stamp. This is the run_20260612_045106
+    ///      fix: a respawned secondary's `SecondaryWelcome` (and any other
+    ///      Primary-addressed frame kind, e.g. `GracefulAbortRequest`)
+    ///      that lands at the relocated-away setup process now reaches the
+    ///      promoted primary instead of black-holing in the local hold.
+    ///   3. **Holder genuinely unknown or local-pending** → the documented
+    ///      safe default: fan to every live local slot (WARN) — the
+    ///      receiving role's own handler decides relevance — or HOLD for
+    ///      replay if this process is momentarily slotless (the
+    ///      transient-swap case the hold exists for). E.g. a behind
+    ///      secondary addressing the relocated submitter as
+    ///      `Secondary(setup)`: the stamped holder IS this host, so the
+    ///      frame stays local exactly as before.
     /// - `Some(All)` → local fan to every live slot.
     /// - `None` (transitional: a frame stamped before the egress rewire
     ///   lands) → a LOUD `debug_assert!` + `warn`, then the documented safe
@@ -138,7 +154,7 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
     ///   misses a frame. We never silently drop. Once every egress edge
     ///   stamps `Some(resolved)` (the next coordinator-rewire wave), this
     ///   arm is unreachable and the `debug_assert!` guards that invariant.
-    pub fn route_incoming(&mut self, frame: DistributedMessage<I>) {
+    pub async fn route_incoming(&mut self, frame: DistributedMessage<I>) {
         match frame.target() {
             Some(Destination::All) => self.fan_local_or_hold(frame),
             Some(dst) => {
@@ -146,14 +162,14 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
                 // variants; the `All` arm is handled above.
                 let role = LocalRole::from_destination(dst)
                     .expect("non-All directed Destination always carries a role");
-                // Role-miss no-drop fallback: a directed frame for a role
-                // with no LIVE local slot reflects the sender's stale role
-                // knowledge of this host (the host-level addressing is
-                // already satisfied — the frame arrived here). Fan it to
-                // the live slots instead of dropping. The presence check is
-                // upfront so the hot path (slot present) pays no clone; the
-                // transient "slot present but its inbox just closed" prune
-                // inside `deliver_local` keeps its existing semantics.
+                // Role-miss resolution: a directed frame for a role with no
+                // LIVE local slot is first offered to the relay (the role may
+                // live on ANOTHER peer — the sender's holder belief was
+                // stale); only a frame the relay cannot place falls back to
+                // the local fan/hold. The presence check is upfront so the
+                // hot path (slot present) pays no clone; the transient "slot
+                // present but its inbox just closed" prune inside
+                // `deliver_local` keeps its existing semantics.
                 let role_has_live_slot = self
                     .slot_for(role)
                     .map(|weak| weak.upgrade().is_some())
@@ -161,16 +177,20 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
                 if role_has_live_slot {
                     self.deliver_local(role, frame);
                 } else {
+                    let Some(frame) = self.try_relay_to_role_holder(frame).await else {
+                        // Relayed toward the recognized holder — done here.
+                        return;
+                    };
                     if let Some(suppressed) = self.ingress_fallback_warn.permit() {
                         tracing::warn!(
                             kind = ?frame.msg_type(),
-                            target = ?dst,
+                            target = ?frame.target(),
                             suppressed_since_last_warn = suppressed,
                             "mesh ingress: directed frame names a role with no live \
-                             local slot (stale sender-side role knowledge); fanning \
-                             to every live local slot — or HOLDING it for replay if \
-                             this process is momentarily slotless — rather than \
-                             dropping it"
+                             local slot and no relayable remote holder (stale \
+                             sender-side role knowledge); fanning to every live \
+                             local slot — or HOLDING it for replay if this process \
+                             is momentarily slotless — rather than dropping it"
                         );
                     }
                     self.fan_local_or_hold(frame);
@@ -199,6 +219,144 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
                 self.fan_local_or_hold(frame);
             }
         }
+    }
+
+    /// Try to RELAY a directed role-addressed ingress frame toward the
+    /// peer recognized to host its role (step 2 of the
+    /// [`Self::route_incoming`] role-miss order). Returns `None` when the
+    /// frame was relayed (consumed); `Some(frame)` hands it back for the
+    /// local fan/hold fallback.
+    ///
+    /// Frame-KIND-agnostic by construction: the decision reads only the
+    /// routing stamp, never the message content (production victims so
+    /// far: `SecondaryWelcome`, `CertExchange`, `GracefulAbortRequest` —
+    /// any directed kind mis-delivered here is covered).
+    ///
+    /// The relay fires only when ALL of:
+    /// - the stamp resolves a holder: the id-less `Primary` through the
+    ///   coordinator-published [`super::role_holder::RoleHolderView`]
+    ///   (cold view ⇒ no relay); `Secondary(id)`/`Observer(id)` through
+    ///   the id they carry;
+    /// - the holder is NOT this host (a local-pending role mid-swap must
+    ///   come to rest in the local hold, never bounce onto the wire);
+    /// - this process has at least one LIVE local slot (a slotless
+    ///   process is local-pending for EVERY role — the hold's intended
+    ///   transient-swap case — and may not even know its own peer-id
+    ///   yet);
+    /// - the loop guard admits it (below);
+    /// - the transport accepts the send (a no-route error falls back to
+    ///   the fan/hold — nothing is dropped).
+    ///
+    /// # Loop safety (the relay ring)
+    ///
+    /// Holder views on different processes can transiently diverge (CRDT
+    /// convergence in flight), so a relayed frame could in principle
+    /// ping-pong between two stale processes. The guard is a GENERAL
+    /// rule, not a hop count on the wire: each process remembers the
+    /// fingerprints of frames it already relayed
+    /// ([`super::ROLE_RELAY_RING_CAPACITY`]) and NEVER relays the same
+    /// frame twice — a frame revisiting this ingress comes to rest in
+    /// the documented fan/hold default at this (final) hop. Any cycle
+    /// must revisit a process, so total relay hops are bounded by the
+    /// process count; convergence then heals the views and the sender's
+    /// next retry routes cleanly.
+    async fn try_relay_to_role_holder(
+        &mut self,
+        frame: DistributedMessage<I>,
+    ) -> Option<DistributedMessage<I>> {
+        let holder = match frame.target() {
+            // The id-less Primary resolves through the recognized
+            // routing-holder (role_table.primary), published by the local
+            // coordinators — NEVER a bootstrap fallback, which is exactly
+            // the stale belief that mis-delivered the frame here.
+            Some(Destination::Primary) => self.role_holder.primary(),
+            // Id-bearing stamps carry their holder; a frame that landed on
+            // the wrong host is forwarded to the host it names. Invariant
+            // across hops, so it cannot cycle (at the named host the
+            // holder IS local and the relay never re-fires).
+            Some(Destination::Secondary(id)) | Some(Destination::Observer(id)) => {
+                Some(id.clone())
+            }
+            _ => None,
+        };
+        let Some(holder) = holder else {
+            return Some(frame);
+        };
+        if self.local_peer_id.as_ref() == Some(&holder) || self.is_local_host(&holder) {
+            // Local-pending: the holder is (or is becoming) this host —
+            // the local fan/hold owns the frame.
+            return Some(frame);
+        }
+        if !self.any_live_slot() {
+            // Slotless window: a promotion/role-swap is mid-flight and ANY
+            // role may be about to register here — the hold owns it.
+            return Some(frame);
+        }
+        let Some(fingerprint) = frame_fingerprint(&frame) else {
+            // Unserializable frame (cannot happen for wire frames — they
+            // just decoded); without a fingerprint the loop guard cannot
+            // admit a relay, so rest locally.
+            return Some(frame);
+        };
+        if self.relayed_ring.contains(&fingerprint) {
+            tracing::warn!(
+                kind = ?frame.msg_type(),
+                target = ?frame.target(),
+                holder = %holder,
+                "mesh ingress: directed frame REVISITED this process after a \
+                 relay (divergent holder views); resting it in the local \
+                 fan/hold instead of relaying again — the loop guard"
+            );
+            return Some(frame);
+        }
+        match self
+            .transport
+            .send_to_peer(holder.as_str(), frame.clone())
+            .await
+        {
+            Ok(()) => {
+                if self.relayed_ring.len() == super::ROLE_RELAY_RING_CAPACITY {
+                    self.relayed_ring.pop_front();
+                }
+                self.relayed_ring.push_back(fingerprint);
+                tracing::info!(
+                    kind = ?frame.msg_type(),
+                    target = ?frame.target(),
+                    holder = %holder,
+                    "mesh ingress: directed frame names a role with no live \
+                     local slot; RELAYED it toward the role's recognized \
+                     holder"
+                );
+                None
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    kind = ?frame.msg_type(),
+                    target = ?frame.target(),
+                    holder = %holder,
+                    %reason,
+                    "mesh ingress: relay toward the role's recognized holder \
+                     failed; falling back to the local fan/hold (nothing \
+                     dropped)"
+                );
+                Some(frame)
+            }
+        }
+    }
+
+    /// Whether ANY local role slot is live (its `Arc` still upgrades).
+    /// The relay gate reads this so a slotless process (a transient
+    /// promotion / role-swap window) never relays — every role is
+    /// local-pending there and the slotless hold owns the frame.
+    fn any_live_slot(&self) -> bool {
+        [
+            LocalRole::Primary,
+            LocalRole::Secondary,
+            LocalRole::Observer,
+        ]
+        .into_iter()
+        .filter_map(|r| self.slot_for(r))
+        .any(|w| w.upgrade().is_some())
     }
 
     /// Deliver a frame to every LIVE local slot, optionally excluding one
@@ -348,4 +506,20 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
         }
         self.set_slot(new, weak);
     }
+}
+
+/// Exact identity of one wire frame for the relay loop guard: a hash of
+/// its serialized bytes. A frame is unchanged across relay hops (the
+/// mesh forwards it verbatim), so a revisit hashes identically; two
+/// DISTINCT frames (even same kind/sender, e.g. a welcome and the cert
+/// exchange sent in the same instant, or a later re-send with a fresh
+/// timestamp) differ in bytes and never collide on content. The relay
+/// path is cold (mis-delivered directed frames only), so the
+/// serialization cost is irrelevant.
+fn frame_fingerprint<I: Identifier>(frame: &DistributedMessage<I>) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = serde_json::to_vec(frame).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
 }

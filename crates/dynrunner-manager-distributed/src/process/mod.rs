@@ -84,6 +84,7 @@ mod tests;
 pub use ingest_liveness::IngestLiveness;
 pub use membership::MembershipView;
 pub use mesh::Mesh;
+pub use mesh::role_holder::{RoleHolderView, attach_primary_recognition};
 pub use mesh_client::{LocalDispatch, MeshClient, RoleInbox};
 pub use node::{Node, PromotionSignal, RoleEntry};
 pub use pump::{MeshControl, MeshControlHandle};

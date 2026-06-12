@@ -1517,13 +1517,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // through the dispatcher channel from this point onward.
         this.cluster_state
             .install_task_completed_sender(task_completed_tx);
-        // NOTE: no transport role-cache attachment (mirrors
-        // `SecondaryCoordinator::new`). `Destination::Primary` is
-        // resolved at THIS edge (`Self::send_to` reads
+        // Recognition→routing publish (mirrors `SecondaryCoordinator::new`):
+        // the role-change hook publishes `role_table.primary` into the
+        // mesh's `RoleHolderView` for the INGRESS relay. EGRESS resolution
+        // is unchanged and stays at this edge (`Self::send_to` reads
         // `cluster_state.current_primary()` with the primary's own
-        // `node_id` as the bootstrap fallback); the transport is
-        // `PeerId`-only and never mirrors the role table. The former
-        // `transport.register_with_cluster_state(..)` wiring is removed.
+        // `node_id` as the bootstrap fallback); the transport stays
+        // `PeerId`-only and never mirrors the role table.
+        crate::process::attach_primary_recognition(
+            &mut this.cluster_state,
+            this.client.role_holder_view(),
+        );
         // Subscribe the primary-side "important" (LLM-wake-worthy)
         // emission for `PrimaryChanged` to the same role-change hook
         // fabric. Self-contained observability concern: it reads only
