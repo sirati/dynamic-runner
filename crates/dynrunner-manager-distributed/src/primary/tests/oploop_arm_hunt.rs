@@ -983,3 +983,121 @@ async fn inbox_closed_mid_run_breaks_loop_no_zombie_no_spin() {
         })
         .await;
 }
+
+// ─── the RESPAWN-ARM membership-join busy-wake (run_20260612_035105) ───
+//
+// Production signature on a promoted (remote-respawn) primary: the
+// `respawn_request` arm-stat climbed ~50/min (7398→7797 in 8.4 min) with
+// ZERO spawns, ZERO dead members, the fleet fully healthy. Mechanism: the
+// respawn lifecycle listener forwarded EVERY `PeerLifecycleEvent::Added`
+// (membership joins / re-admission echoes the busy mesh emits continuously)
+// onto the respawn channel. With no replacement pending, each `Added` woke
+// the respawn arm to a guaranteed-no-op `reconcile_replacements_on_join`,
+// incrementing `respawn_request` per join while doing no respawn work — the
+// third always-ready-arm instance (membership joins are real events, but
+// not respawn-relevant while idle).
+//
+// Fix: the listener drops `Added` events while no replacement is pending
+// (the `pending_replacements` "awaiting a join" gate), so the arm parks
+// instead of busy-waking. `Removed` events are always forwarded (a death is
+// a spawn trigger), and when a replacement IS pending the gate opens so the
+// reconcile path still observes the join in apply order.
+
+/// Read `arm_name`'s win count off a retained promoted primary's live
+/// arm-stats snapshot. Panics if the loop already unpublished (resolved).
+fn arm_count_of(
+    primary: &PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
+    arm_name: &str,
+) -> u64 {
+    let snap = primary
+        .op_loop_arm_stats
+        .as_ref()
+        .map(|s| s.snapshot())
+        .expect("the operational loop must still be live (the inherited ghost task keeps it open)");
+    snap.counts
+        .iter()
+        .find(|(name, _)| *name == arm_name)
+        .map(|(_, n)| *n)
+        .unwrap_or_else(|| panic!("{arm_name} arm is instrumented; snap=[{snap}]"))
+}
+
+/// Stream a window of generation-advancing `PeerJoined` frames for an
+/// already-live peer into the running primary's wire inbound. Each is a
+/// state-changing apply → an `Added` lifecycle event — the membership-join
+/// churn the production busy-arm woke on. Returns once every frame is sent.
+fn spawn_added_churn(wire_tx: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>) {
+    tokio::task::spawn_local(async move {
+        tokio::time::sleep(StdDuration::from_millis(1200)).await;
+        for g in 100u64..140 {
+            let _ = wire_tx.send(DistributedMessage::ClusterMutation {
+                target: None,
+                sender_id: "sec-0".into(),
+                timestamp: 0.0,
+                mutations: vec![ClusterMutation::PeerJoined {
+                    peer_id: "sec-0".into(),
+                    is_observer: false,
+                    can_be_primary: false,
+                    cap_version: Default::default(),
+                    member_gen: g,
+                }],
+            });
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    });
+}
+
+/// ── repro: membership-join `Added` churn must NOT wake the respawn arm ──
+///
+/// A promoted (remote-respawn) primary with NO replacement pending receives
+/// a window of 40 generation-advancing `Added` events.
+///
+/// RED (pre-fix): every `Added` reaches the respawn arm, each one a no-op
+/// reconcile that still increments `respawn_request` — the count tracks the
+/// join rate (≈40 here), the production busy-arm signature.
+///
+/// GREEN (post-fix): the listener drops `Added` while idle, so the arm
+/// parks — `respawn_request` stays at zero across the whole churn window.
+#[tokio::test(flavor = "current_thread")]
+async fn respawn_arm_parks_through_membership_join_churn() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let real = make_binary("bin_real", 50);
+            let ghost = make_binary("bin_ghost", 60);
+            // The inherited ghost in-flight task keeps the run open for the
+            // whole observation window (`run_complete_check` cannot trip).
+            let fixture = ghost_fixture(vec![real, ghost.clone()], Some(ghost));
+            let GhostFixture {
+                mut primary,
+                mesh_keepalive: _mesh,
+                wire_tx,
+                _sec_handle,
+            } = fixture;
+            primary.enable_respawn_remote(crate::primary::respawn::RespawnBudget {
+                max_per_secondary: 100,
+                max_total: 100,
+                cooldown: StdDuration::ZERO,
+            });
+
+            spawn_added_churn(wire_tx);
+
+            {
+                let (_deps, ops, ope) = noop_phase_args();
+                let run = primary.run(SeedSource::PromotionSnapshot, ops, ope);
+                tokio::pin!(run);
+                let _ = tokio::time::timeout(StdDuration::from_secs(5), &mut run).await;
+            }
+
+            let respawn_wins = arm_count_of(&primary, "respawn_request");
+            assert_eq!(
+                respawn_wins, 0,
+                "RESPAWN-ARM JOIN BUSY-WAKE: 40 membership-join `Added` events \
+                 woke the respawn arm {respawn_wins} times with no replacement \
+                 pending (each a no-op reconcile). The arm must park on \
+                 join churn while idle (the run_20260612_035105 signature).",
+            );
+        })
+        .await;
+}
+
