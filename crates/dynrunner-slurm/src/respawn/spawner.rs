@@ -153,10 +153,13 @@ where
         let tunnel_establisher = Arc::clone(&self.tunnel_establisher);
         let run_log_dir = self.run_log_dir.clone();
         let secondary_id = spec.new_secondary_id.clone();
-        // The dead member's node, carried on the spec — excluded from the
-        // replacement's sbatch when known so it never lands back on a
-        // NODE_FAIL/faulty node. `None` places without constraint.
-        let exclude_node = spec.exclude_node.clone();
+        // The DEAD member's id, carried on the spec. The SLURM node to
+        // exclude is resolved from it inside the inner task (job id →
+        // squeue/sacct, SLURM's own vocabulary) while the manager lock is
+        // held — NOT a mesh-advertised hostname, which sbatch may reject.
+        // `None` means there is no dead member to key on; the replacement
+        // then places without constraint.
+        let dead_member_id = spec.dead_member_id.clone();
         let replacement_jobs = Arc::clone(&self.replacement_jobs);
 
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), SpawnError>>();
@@ -178,6 +181,16 @@ where
             // the existing pipeline contract.
             let job_id = {
                 let mut mgr = job_manager.lock().await;
+                // Resolve the dead member's SLURM node from SLURM's own
+                // vocabulary (job id → squeue/sacct), under the same lock
+                // that drives the submission. An unresolvable id yields
+                // `None` and the submission carries no `--exclude` — the
+                // exclusion is a best-effort placement hint, never a spawn
+                // prerequisite.
+                let exclude_node = match &dead_member_id {
+                    Some(id) => mgr.resolve_excluded_node(id).await,
+                    None => None,
+                };
                 match mgr
                     .submit_job(
                         &wrapper_script,

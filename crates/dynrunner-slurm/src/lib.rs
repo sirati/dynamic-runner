@@ -12,6 +12,7 @@ pub(crate) mod child_reaping;
 pub mod config;
 pub mod job_manager;
 pub mod local_forward;
+pub mod observer_job_ledger;
 pub mod observer_reconnect;
 pub mod packaging;
 pub mod peer_info;
@@ -28,6 +29,7 @@ pub use local_forward::{
     ForwardTarget, LocalForwardError, LocalForwardTunnelReconnector, LocalForwardTunnels,
     ReconnectOutcome,
 };
+pub use observer_job_ledger::SlurmJobLedgerProbe;
 pub use observer_reconnect::SlurmPreparationTunnelReconnector;
 pub use packaging::{PackagingError, PodmanImageMetadata, PodmanPackaging};
 pub use peer_info::{

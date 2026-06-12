@@ -1546,16 +1546,16 @@ pub(super) fn setup_test(
 /// were revoked. Shared between the respawn pipeline tests and the
 /// heartbeat chronic-starvation replay (identifier-agnostic — the
 /// `SecondarySpawner` trait carries no `Identifier` parameter).
-/// Recorded `(new_secondary_id, exclude_node)` spawn pairs.
-type CapturedExcludeNodes = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+/// Recorded `(new_secondary_id, dead_member_id)` spawn pairs.
+type CapturedDeadMembers = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
 
 pub(super) struct MockSpawner {
     pub(super) calls: Arc<std::sync::atomic::AtomicU32>,
     pub(super) captured_ids: Arc<std::sync::Mutex<Vec<String>>>,
-    /// Per-spawn `(new_secondary_id, exclude_node)` pairs, so tests can
-    /// pin that the coordinator populated `spec.exclude_node` from the
-    /// dead member's recorded node (and left it `None` when unknown).
-    pub(super) captured_exclude_nodes: CapturedExcludeNodes,
+    /// Per-spawn `(new_secondary_id, dead_member_id)` pairs, so tests can
+    /// pin that the coordinator named the dead member on the spec (and
+    /// left it `None` when there was none to key on).
+    pub(super) captured_dead_members: CapturedDeadMembers,
     pub(super) revoked_ids: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
@@ -1564,7 +1564,7 @@ impl MockSpawner {
         Self {
             calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             captured_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
-            captured_exclude_nodes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            captured_dead_members: Arc::new(std::sync::Mutex::new(Vec::new())),
             revoked_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -1579,16 +1579,16 @@ impl MockSpawner {
         self.captured_ids.lock().unwrap().clone()
     }
 
-    /// The `exclude_node` the coordinator put on the spec for `id`, if
+    /// The `dead_member_id` the coordinator put on the spec for `id`, if
     /// the spawner saw a spawn for it.
     #[allow(dead_code)]
-    pub(super) fn exclude_node_for(&self, id: &str) -> Option<String> {
-        self.captured_exclude_nodes
+    pub(super) fn dead_member_for(&self, id: &str) -> Option<String> {
+        self.captured_dead_members
             .lock()
             .unwrap()
             .iter()
             .find(|(sid, _)| sid == id)
-            .and_then(|(_, node)| node.clone())
+            .and_then(|(_, dead)| dead.clone())
     }
 }
 
@@ -1599,10 +1599,10 @@ impl crate::primary::respawn::SecondarySpawner for MockSpawner {
         spec: crate::primary::respawn::SecondarySpawnSpec,
     ) -> Result<(), crate::primary::respawn::SpawnError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.captured_exclude_nodes
+        self.captured_dead_members
             .lock()
             .unwrap()
-            .push((spec.new_secondary_id.clone(), spec.exclude_node));
+            .push((spec.new_secondary_id.clone(), spec.dead_member_id));
         self.captured_ids
             .lock()
             .unwrap()

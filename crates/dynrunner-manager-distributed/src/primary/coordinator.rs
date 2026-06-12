@@ -734,6 +734,17 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// silent-set read between ticks.
     pub(super) ingest_gate: super::heartbeat::IngestEdgeGate,
 
+    /// Self-suspect gate on the staleness PATTERN (the third
+    /// decider-health guard, covering the WIRE axis the other two
+    /// cannot observe): when EVERY remote judged member is silent
+    /// simultaneously, the sweep suspects this node's own
+    /// ingest/egress before declaring N independent deaths, and
+    /// defers — bounded by the hard silence window. Owned by the
+    /// liveness module (`primary::heartbeat`); fed by each sweep's
+    /// classification, consulted by the dispatch-altitude silent-set
+    /// read between ticks (the same contract as `ingest_gate`).
+    pub(super) collective_silence_gate: super::heartbeat::CollectiveSilenceGate,
+
     /// Per-secondary count of staged silence WARN stages already logged
     /// for the secondary's CURRENT silence streak. Owned by the liveness
     /// module (`primary::heartbeat`); the heartbeat tick reads it to fire
@@ -1003,6 +1014,17 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// `respawn_spawner`. See [`crate::observer::reconnect`].
     pub(super) tunnel_reconnector: crate::observer::ReconnectorHandle,
 
+    /// The job-ledger consult port for the observer's cluster-empty
+    /// terminal verdict. The submitter primary never uses it itself — it
+    /// carries it ONLY so that when this primary relocates onto a compute
+    /// peer and steps down into a standalone observer, the observer can
+    /// consult squeue for the run's job ids and render a terminal verdict
+    /// when the whole cluster has left the queue. `None` on backends with
+    /// no job ledger (e.g. `--multi-computer local`). Wired from the
+    /// deployment layer via [`Self::set_job_ledger_probe`], symmetric with
+    /// `tunnel_reconnector`. See [`crate::observer::job_ledger`].
+    pub(super) job_ledger_probe: crate::observer::JobLedgerProbeHandle,
+
     /// Sender side of the dispatcher → operational-loop respawn
     /// lifecycle channel (carries the full
     /// [`crate::peer_lifecycle::PeerLifecycleEvent`] stream:
@@ -1046,18 +1068,6 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// drop `Added` events while no replacement is pending (so the respawn
     /// arm parks instead of busy-waking on membership joins).
     pub(super) pending_replacements: super::respawn::PendingReplacements,
-
-    /// Per-secondary node (the hostname advertised in the welcome).
-    /// Recorded at welcome and DELIBERATELY NOT purged on removal — the
-    /// death path drops the `secondaries` connection entry before the
-    /// respawn request even reaches the operational loop, so a lookup
-    /// against `secondaries` at dispatch time would always miss. This
-    /// map outlives the connection precisely so a respawn dispatch can
-    /// read the dead member's node and exclude it from the replacement's
-    /// sbatch (see `respawn::dispatch_respawn_request`). A re-welcomed id
-    /// overwrites its own entry. Bounded by the lifetime membership set
-    /// (one entry per distinct secondary id the run ever welcomes).
-    pub(super) secondary_nodes: std::collections::HashMap<String, String>,
 
     /// Receiver side of the liveness-beacon listener → operational-loop
     /// channel. The [`crate::liveness::LivenessListener`] (bound on this
@@ -1464,6 +1474,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             silence_judged_marks: HashMap::new(),
             keepalive_proven: HashSet::new(),
             ingest_gate: super::heartbeat::IngestEdgeGate::new(),
+            collective_silence_gate: super::heartbeat::CollectiveSilenceGate::new(),
             silence_warn_stage: HashMap::new(),
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,
@@ -1489,10 +1500,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             respawn_budget: None,
             remote_respawn_pending: None,
             tunnel_reconnector: None,
+            job_ledger_probe: None,
             respawn_lifecycle_tx: None,
             respawn_lifecycle_rx: None,
             pending_replacements: super::respawn::PendingReplacements::default(),
-            secondary_nodes: std::collections::HashMap::new(),
             liveness_ping_rx: None,
             beacon_target: crate::liveness::BeaconTarget::new(),
             peer_liveness_addrs: crate::liveness::PeerLivenessAddrs::new(),
@@ -1921,6 +1932,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// path). See [`crate::observer::reconnect`].
     pub fn set_tunnel_reconnector(&mut self, reconnector: Arc<dyn crate::observer::TunnelReconnector>) {
         self.tunnel_reconnector = Some(reconnector);
+    }
+
+    /// Park the job-ledger consult port the primary hands to its observer
+    /// tail at relocation (the cluster-empty-verdict sibling of
+    /// [`Self::set_tunnel_reconnector`]). The submitter never consults it
+    /// itself — pure forward-wiring: when the primary relocates onto a
+    /// compute peer and `into_observer_handoff` runs, the observer inherits
+    /// this handle and consults squeue for the run's job ids on a long
+    /// lost-visibility episode. Must be set BEFORE `run()` enters (same
+    /// pre-run wiring contract as `set_tunnel_reconnector`). Absence leaves
+    /// the observer with no ledger (the never-terminal report-and-retry
+    /// path). See [`crate::observer::job_ledger`].
+    pub fn set_job_ledger_probe(&mut self, probe: Arc<dyn crate::observer::JobLedgerProbe>) {
+        self.job_ledger_probe = Some(probe);
     }
 
     /// Read the parked deployment-mode job manager. Returns `None`
@@ -3581,6 +3606,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             panik_signal_rx,
             graceful_abort_trigger,
             tunnel_reconnector,
+            job_ledger_probe,
             respawn_spawner,
             ..
         } = self;
@@ -3635,6 +3661,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `primary::respawn::remote`). `None` when the run launched
             // with the policy disabled.
             respawn_provider: respawn_spawner,
+            // The job-ledger consult port: the relocated submitter keeps
+            // the SAME `SlurmJobManager` it submitted the cohort from, so
+            // the observer it steps down into can consult squeue for the
+            // run's job ids and render the cluster-empty terminal verdict.
+            // `None` on backends with no job ledger.
+            job_ledger: job_ledger_probe,
         }
     }
 

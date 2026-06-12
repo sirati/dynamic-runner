@@ -82,8 +82,10 @@ use tracing::Instrument;
 use crate::anti_entropy::{self, RequesterIdentity};
 use crate::cluster_state::ClusterState;
 use crate::observer::announcer::{AnnouncerOutboxItem, PeerMeshAnnouncerSender};
+use crate::observer::cluster_gone::{ClusterGoneDetector, ClusterGoneVerdict};
 use crate::observer::failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 use crate::observer::fleet_death::{FleetDeathDetector, FleetDeathVerdict};
+use crate::observer::job_ledger::JobLedgerProbeHandle;
 use crate::graceful_abort_trigger::GracefulAbortTrigger;
 use crate::observer::lifecycle::{AnnouncerHandle, attach_observer_announcer};
 use crate::observer::lost_visibility::{
@@ -224,6 +226,15 @@ where
     /// launched with `--respawn-policy=disabled`. Cold-join observers
     /// (late-joiner consoles) host no provider.
     pub respawn_provider: Option<Arc<dyn crate::primary::respawn::SecondarySpawner>>,
+    /// The job-ledger consult port (cluster-empty terminal verdict).
+    /// `Some` on the relocated submitter→observer path, which physically
+    /// hosts the `SlurmJobManager` it submitted the cohort from — so it
+    /// can consult squeue for the run's job ids and render a terminal
+    /// verdict when the whole cluster has left the queue. `None` for a
+    /// cold-join observer (it submitted no jobs and cannot teardown a
+    /// cluster it did not launch — current behaviour preserved). See
+    /// [`crate::observer::job_ledger`].
+    pub job_ledger: JobLedgerProbeHandle,
 }
 
 /// Terminal of one observer run. Drives the PyO3 boundary's exit-code
@@ -355,6 +366,15 @@ where
     /// primary's already-budgeted decision against the provider only
     /// this process physically holds.
     respawn_provider: Option<Arc<dyn crate::primary::respawn::SecondarySpawner>>,
+    /// The job-ledger consult port (`Some` only on the relocated-submitter
+    /// path that hosts the `SlurmJobManager`). The lost-visibility
+    /// escalation seam consults it once per wake-loss cadence emit; two
+    /// consecutive empty-queue results render the cluster-empty terminal
+    /// verdict + teardown + non-zero exit. `None` on a cold-join observer
+    /// — it cannot teardown a cluster it did not submit, so it keeps the
+    /// never-terminal report-and-retry behaviour. See
+    /// [`crate::observer::job_ledger`] + [`crate::observer::cluster_gone`].
+    job_ledger: JobLedgerProbeHandle,
     /// Idempotency state for the respawn-execution arm, keyed by the
     /// primary-minted replacement id: `InFlight` absorbs re-sent
     /// requests while the provider call runs; `Done` caches the outcome
@@ -484,6 +504,7 @@ where
             reconnector,
             graceful_abort_trigger,
             respawn_provider,
+            job_ledger,
         } = handoff;
         // Respawn-exec outbox (see the field docs): created at
         // construction so the tx lives on `self` for the inbound
@@ -540,6 +561,11 @@ where
             // The provider this process kept across its demotion (None
             // when the run's respawn policy is disabled).
             respawn_provider,
+            // The job-ledger consult port the relocating primary held —
+            // the SAME `SlurmJobManager` this process submitted the cohort
+            // from, kept across the demotion. `None` on a backend with no
+            // ledger (the cold-join path constructs via `with_pieces`).
+            job_ledger,
             respawn_exec: std::collections::HashMap::new(),
             respawn_exec_tx,
             respawn_exec_rx: Some(respawn_exec_rx),
@@ -623,6 +649,12 @@ where
             // provider; the submitter/observer process is the only
             // provider host and always arrives via `from_handoff`.
             respawn_provider: None,
+            // Cold-join observers host no job ledger either — they
+            // submitted no jobs and cannot teardown a cluster they did not
+            // launch, so they keep the never-terminal report-and-retry
+            // behaviour. Only the relocated submitter (via `from_handoff`)
+            // carries a ledger.
+            job_ledger: None,
             respawn_exec: std::collections::HashMap::new(),
             respawn_exec_tx,
             respawn_exec_rx: Some(respawn_exec_rx),
@@ -644,6 +676,19 @@ where
         reconnector: Arc<dyn crate::observer::TunnelReconnector>,
     ) {
         self.reconnector = Some(reconnector);
+    }
+
+    /// Wire (or replace) the job-ledger consult port AFTER construction —
+    /// the cluster-empty-verdict sibling of [`Self::set_tunnel_reconnector`].
+    /// Only the process that hosts the job ledger (the relocated submitter)
+    /// has one; absence keeps the never-terminal report-and-retry behaviour
+    /// (the cold-join observer cannot teardown a cluster it did not submit).
+    /// See [`crate::observer::job_ledger`].
+    pub fn set_job_ledger_probe(
+        &mut self,
+        probe: Arc<dyn crate::observer::job_ledger::JobLedgerProbe>,
+    ) {
+        self.job_ledger = Some(probe);
     }
 
     /// Inject a pre-armed operator graceful-abort trigger AFTER
@@ -988,6 +1033,22 @@ where
             // snapshot.
             let mut fleet_death =
                 FleetDeathDetector::new(self.config.fleet_death_presumption);
+            // Cluster-empty terminal verdict (see `cluster_gone.rs`): when
+            // this process hosts the job ledger (the relocated-submitter
+            // path), a long lost-visibility episode triggers a squeue
+            // consult for the run's job ids; two consecutive empty results
+            // PROVE the cluster is gone (a ground truth the fleet-death
+            // PRESUMPTION need not be used for). Driven once per wake-loss
+            // cadence emit — keyed on `last_consulted_wake_emit` advancing
+            // — so the double-check is one wake-loss interval apart and no
+            // new timer is introduced. Inert (never consulted) when the
+            // observer hosts no ledger.
+            let mut cluster_gone = ClusterGoneDetector::new();
+            // The wake-loss emit instant the job ledger was last consulted
+            // for. The consult fires when the reporter's wake-emit instant
+            // ADVANCES past this (a fresh 5-min-threshold / 10-min-recurrence
+            // emit), reusing the existing wake-loss cadence.
+            let mut last_consulted_wake_emit: Option<tokio::time::Instant> = None;
             // When the observer last received ANYTHING from ANY member
             // (every inbound frame, regardless of type/sender). Seeded at
             // loop entry so the presumption clock starts from "now", not
@@ -1126,6 +1187,31 @@ where
                     let err = RunError::FatalPolicyExit { reason };
                     self.emit_terminal_reason_important(&err.to_string());
                     return Err(err);
+                }
+
+                // Cluster-empty terminal verdict (the relocated-submitter
+                // ground truth). Consult the hosted job ledger ONCE per
+                // wake-loss cadence emit — keyed on the reporter's wake-emit
+                // instant advancing past the last consulted one, so it
+                // reuses the existing 5-min-threshold / 10-min-recurrence
+                // cadence (no new timer) and the two-consecutive-empty
+                // double-check is one wake-loss interval apart. Conditional
+                // on hosting a ledger (`Some`): a cold-join observer keeps
+                // the never-terminal report-and-retry behaviour. On the
+                // verdict: the same single wake-stream terminal-reason emit
+                // + structured non-zero `FatalPolicyExit` every local
+                // terminal uses (which routes through the single-teardown
+                // below, exactly like the fleet-death exit above).
+                let wake_emit = visibility_reporter.wake_emit_instant();
+                if wake_emit.is_some() && wake_emit != last_consulted_wake_emit {
+                    last_consulted_wake_emit = wake_emit;
+                    if let Some(ClusterGoneVerdict::Gone { reason }) =
+                        self.consult_job_ledger(&mut cluster_gone).await
+                    {
+                        let err = RunError::FatalPolicyExit { reason };
+                        self.emit_terminal_reason_important(&err.to_string());
+                        return Err(err);
+                    }
                 }
 
                 // 3. Await events.
@@ -1370,6 +1456,62 @@ where
         Visibility::Visible
     }
 
+    /// Consult the hosted job ledger for the cluster-empty terminal
+    /// verdict — the relocated-submitter ground truth.
+    ///
+    /// Single concern at this seam: cross the
+    /// [`crate::observer::job_ledger::JobLedgerProbe`] port to ask "are the
+    /// run's jobs still queued?", feed the result into the
+    /// [`ClusterGoneDetector`]'s two-consecutive-empty double-check, and
+    /// return its verdict. The observer never names squeue — the provider
+    /// layer owns the query.
+    ///
+    /// CONDITIONAL on hosting a ledger: a cold-join observer (no probe
+    /// wired) returns `None` and keeps the never-terminal report-and-retry
+    /// behaviour (it cannot teardown a cluster it did not submit). On
+    /// `Some(Gone)` the caller renders the terminal reason + the non-zero
+    /// `FatalPolicyExit`, whose return drives the existing pipeline-guard
+    /// teardown (the #451 clean-completion job sweep + tunnel teardown — the
+    /// SAME path the normal exit's `cancel_all_jobs` runs) and the
+    /// non-zero exit.
+    ///
+    /// The verdict line carries the observer's last-known run state from its
+    /// converged CRDT (the last narrated phase, or that no terminal
+    /// converged) so the operator learns what the run was doing when its
+    /// cluster vanished — what is DERIVABLE, distinct from the verdict.
+    async fn consult_job_ledger(
+        &self,
+        detector: &mut ClusterGoneDetector,
+    ) -> Option<ClusterGoneVerdict> {
+        let probe = self.job_ledger.as_ref()?;
+        let status = probe.jobs_still_queued().await;
+        Some(detector.observe(status, &self.last_known_run_state()))
+    }
+
+    /// A human description of the run's last-known state from the
+    /// observer's converged CRDT, for the cluster-empty verdict line. The
+    /// primary's verdict (`RunComplete` / `RunAborted`) is checked FIRST at
+    /// top-of-loop, so reaching the consult means neither converged — this
+    /// reports the phase progress the observer last saw, which is what is
+    /// DERIVABLE about a run whose cluster left the queue without a
+    /// completion verdict of its own.
+    fn last_known_run_state(&self) -> String {
+        let counts = self.cluster_state.outcome_counts();
+        let done = counts.succeeded;
+        let failed = counts.fail_retry + counts.fail_oom + counts.fail_final;
+        match self.cluster_state.current_primary() {
+            Some(primary) => format!(
+                "no run-terminal converged (last recognized primary {primary}); \
+                 {done} task(s) completed, {failed} failed in the observer's last \
+                 converged ledger"
+            ),
+            None => format!(
+                "no run-terminal converged and no primary is named in the last \
+                 converged ledger; {done} task(s) completed, {failed} failed"
+            ),
+        }
+    }
+
     /// CRDT-derived evidence of whether the compute mesh is still alive,
     /// for the [`LostVisibilityReporter`]'s reassurance gate. This is the
     /// ONLY signal that distinguishes an ssh-link blip (mesh fine, banner
@@ -1542,14 +1684,14 @@ where
                 new_secondary_id,
                 primary_endpoint,
                 primary_pubkey_pem,
-                exclude_node,
+                dead_member_id,
                 ..
             } => {
                 self.on_respawn_spawn_request(
                     new_secondary_id,
                     primary_endpoint,
                     primary_pubkey_pem,
-                    exclude_node,
+                    dead_member_id,
                 )
                 .await;
             }
@@ -1583,7 +1725,7 @@ where
         new_secondary_id: String,
         primary_endpoint: String,
         primary_pubkey_pem: String,
-        exclude_node: Option<String>,
+        dead_member_id: Option<String>,
     ) {
         match self.respawn_exec.get(&new_secondary_id) {
             Some(RespawnExecState::InFlight) => {
@@ -1635,7 +1777,7 @@ where
             new_secondary_id: new_secondary_id.clone(),
             primary_endpoint,
             primary_pubkey_pem,
-            exclude_node,
+            dead_member_id,
         };
         let tx = self.respawn_exec_tx.clone();
         tokio::task::spawn_local(async move {

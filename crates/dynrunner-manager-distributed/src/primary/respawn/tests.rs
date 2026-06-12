@@ -11,12 +11,12 @@ fn spawn_spec_constructs() {
         new_secondary_id: "sec-replacement-1".to_owned(),
         primary_endpoint: "127.0.0.1:5555".to_owned(),
         primary_pubkey_pem: "-----BEGIN PUBLIC KEY-----\n...\n".to_owned(),
-        exclude_node: Some("krater07".to_owned()),
+        dead_member_id: Some("secondary-0".to_owned()),
     };
     assert_eq!(spec.new_secondary_id, "sec-replacement-1");
     assert_eq!(spec.primary_endpoint, "127.0.0.1:5555");
     assert!(spec.primary_pubkey_pem.starts_with("-----BEGIN"));
-    assert_eq!(spec.exclude_node.as_deref(), Some("krater07"));
+    assert_eq!(spec.dead_member_id.as_deref(), Some("secondary-0"));
 }
 
 #[test]
@@ -175,13 +175,14 @@ async fn respawn_dispatcher_fires_spawner_on_peer_removed() {
         .await;
 }
 
-/// A respawn for a member whose node the coordinator recorded (from its
-/// welcome, surviving its removal) must carry that node on the spec as
-/// `exclude_node`, so the SLURM spawner keeps the replacement off the
-/// dead member's node. When no node was recorded the spec carries
-/// `None` and the replacement places unconstrained.
+/// A respawn must carry the DEAD member's id on the spec as
+/// `dead_member_id`, so the (provider-agnostic) coordinator names who
+/// died and lets the provider resolve the SLURM node to exclude from
+/// SLURM's own vocabulary. The coordinator no longer holds a node map —
+/// it always names the dead member; an unresolvable id is the
+/// provider's best-effort omit, not the coordinator's concern.
 #[tokio::test(flavor = "current_thread")]
-async fn respawn_spec_carries_dead_node_for_exclusion() {
+async fn respawn_spec_names_dead_member_for_exclusion() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -194,12 +195,6 @@ async fn respawn_spec_carries_dead_node_for_exclusion() {
                 "-----BEGIN PUBLIC KEY-----\nFAKE\n".into(),
             );
 
-            // The death path purges `secondaries`, but the node record
-            // survives — seed it as the welcome handler would.
-            coordinator
-                .secondary_nodes
-                .insert("secondary-0".into(), "krater07".into());
-
             coordinator.dispatch_respawn_request(RespawnRequest {
                 original_id: "secondary-0".into(),
                 cause: RemovalCause::KeepaliveMiss,
@@ -211,49 +206,12 @@ async fn respawn_spec_carries_dead_node_for_exclusion() {
                 .expect("respawn task present")
                 .expect("respawn task should not panic");
             assert!(outcome.result.is_ok());
-            // The minted replacement is `secondary-1`; its spec must carry
-            // the dead member's node.
+            // The minted replacement is `secondary-1`; its spec must name
+            // the dead member it stands in for.
             assert_eq!(
-                spawner.exclude_node_for("secondary-1").as_deref(),
-                Some("krater07"),
-                "the replacement spec must exclude the dead member's node",
-            );
-        })
-        .await;
-}
-
-/// No recorded node for the dead member → the spec carries
-/// `exclude_node = None` (the replacement places without constraint).
-#[tokio::test(flavor = "current_thread")]
-async fn respawn_spec_has_no_exclusion_when_node_unknown() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (mut coordinator, _mesh) = make_coordinator();
-            let spawner = Arc::new(MockSpawner::new());
-            coordinator.enable_respawn(
-                spawner.clone(),
-                permissive_budget(),
-                "tcp://127.0.0.1:5555".into(),
-                "-----BEGIN PUBLIC KEY-----\nFAKE\n".into(),
-            );
-
-            // No `secondary_nodes` entry for the dead member.
-            coordinator.dispatch_respawn_request(RespawnRequest {
-                original_id: "secondary-0".into(),
-                cause: RemovalCause::KeepaliveMiss,
-            });
-            let outcome = coordinator
-                .respawn_tasks
-                .join_next()
-                .await
-                .expect("respawn task present")
-                .expect("respawn task should not panic");
-            assert!(outcome.result.is_ok());
-            assert_eq!(
-                spawner.exclude_node_for("secondary-1"),
-                None,
-                "an unknown dead node must leave exclude_node None",
+                spawner.dead_member_for("secondary-1").as_deref(),
+                Some("secondary-0"),
+                "the replacement spec must name the dead member to exclude",
             );
         })
         .await;
@@ -1111,6 +1069,7 @@ async fn build_remote_rig() -> RemoteRig {
         reconnector: None,
         respawn_provider: Some(provider.clone() as Arc<dyn SecondarySpawner>),
         graceful_abort_trigger: None,
+        job_ledger: None,
     };
     let mut observer = ObserverCoordinator::from_handoff(handoff);
     let obs_run = tokio::task::spawn_local(async move {
@@ -1295,7 +1254,7 @@ async fn duplicate_spawn_request_replays_cached_outcome_without_resubmitting() {
                 new_secondary_id: "secondary-1".into(),
                 primary_endpoint: String::new(),
                 primary_pubkey_pem: String::new(),
-                exclude_node: None,
+                dead_member_id: None,
             }
             .with_target(Destination::Observer(PeerId::from("setup")));
             rig.obs_inject_tx.send(dup).expect("observer wire open");

@@ -34,8 +34,11 @@
 //! tracking, drops the connection state, and notifies surviving peers via
 //! `TimeoutDetected`).
 
+mod collective_silence;
 mod ingest_gate;
 
+pub(super) use collective_silence::CollectiveSilenceGate;
+use collective_silence::SilenceObservation;
 pub(super) use ingest_gate::IngestEdgeGate;
 
 use std::time::{Duration, Instant};
@@ -642,6 +645,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// `secondaries`, so the fleet-dead arm would never arm and a fully-
     /// silent fleet would hang forever.
     ///
+    /// SELF-SUSPECT gate (the third decider-health guard — see
+    /// [`CollectiveSilenceGate`]): before executing the hard
+    /// declarations, the sweep's per-member classification is folded
+    /// into the collective-silence tracker. When EVERY remote judged
+    /// member is silent simultaneously (and there are at least two),
+    /// the parsimonious hypothesis is that THIS node's wire is deaf —
+    /// not that N peers died independently (the run_20260612_043357
+    /// face: a saturated primary's QUIC legs collapsed and it declared
+    /// all three live remotes dead) — so the declarations are deferred:
+    /// WARN stages still narrate, but no removal is authored until a
+    /// remote frame proves the wire or the gate's bounded escalation
+    /// window elapses (the hard backstop stays load-bearing for a
+    /// genuinely all-dead fleet). The co-located same-peer member is
+    /// not wire evidence and never counts toward the inference.
+    ///
     /// [`Self::declare_silent_secondaries_dead`] wraps the existing
     /// [`Self::requeue_dead_secondary`] primitive, which already emits
     /// `WorkerMgmtSignal::TasksAdded` after requeueing — so this method
@@ -662,6 +680,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let judged_now = self.own_tick_health.judged_elapsed();
 
         let mut hard_dead: Vec<DeadSecondary> = Vec::new();
+        let mut observations: Vec<SilenceObservation> = Vec::new();
         for s in report.silences {
             // Maintain the judged mark on EVERY sweep (not just escalated
             // ones) so the escalation has per-member history the moment it
@@ -683,7 +702,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             } else {
                 s.silence
             };
-            match silence_stage(silence, interval, &warn_multiples, hard_multiple) {
+            let stage = silence_stage(silence, interval, &warn_multiples, hard_multiple);
+            observations.push(SilenceObservation {
+                // The co-located same-peer member's frames ride the
+                // in-process loopback — they prove nothing about the
+                // wire, so it never counts toward (or against) the
+                // collective-silence inference.
+                remote: s.secondary_id != self.config.node_id,
+                silent: stage.is_some(),
+                hard: matches!(stage, Some(Stage::Hard)),
+            });
+            match stage {
                 None => continue,
                 Some(Stage::Hard) => {
                     hard_dead.push(DeadSecondary {
@@ -695,6 +724,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     self.log_silence_warn_once(&s.secondary_id, idx, silence);
                 }
             }
+        }
+
+        // Self-suspect gate: fold this sweep's classification in; while
+        // it defers, author NO removal (the WARN stages above already
+        // narrated the silences; the gate's own WARN names the
+        // suspicion). The escalation window is the hard silence window —
+        // the same bound the chronic tick-lag escalation uses, derived
+        // from the one cadence authority rather than a new config knob.
+        let escalation_window = interval.saturating_mul(hard_multiple);
+        if self
+            .collective_silence_gate
+            .observe(&observations, Instant::now(), escalation_window)
+            .is_some()
+        {
+            return Ok(());
         }
 
         self.declare_silent_secondaries_dead(hard_dead, RemovalCause::KeepaliveMiss)
@@ -745,15 +789,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// consumes. Stays `pub(super)` so the silent-id set never leaks past
     /// the `primary` module boundary into dispatch.
     pub(super) fn silent_secondary_ids(&self) -> std::collections::HashSet<String> {
-        // Decider-health gate, mirrored from `process_heartbeat_tick`:
-        // while the ingest path is backlogged, every staleness reading
-        // is suspect, so the dispatch-altitude early-requeue path (the
-        // only other author of staleness-based `PeerRemoved`s, via
-        // `only_silent_held_work_remains` → `declare_silent_secondaries_
-        // dead`) must see NO silent peers either. Reads the most recent
-        // sweep's verdict (at most one tick stale — the same staleness
-        // class as the keepalive clocks this method samples anyway).
-        if self.ingest_gate.deferring().is_some() {
+        // Decider-health gates, mirrored from `process_heartbeat_tick` /
+        // `decide_dead_secondaries`: while the ingest path is backlogged
+        // OR the self-suspect collective-silence gate defers, every
+        // staleness reading is suspect, so the dispatch-altitude
+        // early-requeue path (the only other author of staleness-based
+        // `PeerRemoved`s, via `only_silent_held_work_remains` →
+        // `declare_silent_secondaries_dead`) must see NO silent peers
+        // either. Reads the most recent sweep's verdicts (at most one
+        // tick stale — the same staleness class as the keepalive clocks
+        // this method samples anyway).
+        if self.ingest_gate.deferring().is_some()
+            || self.collective_silence_gate.deferring().is_some()
+        {
             return std::collections::HashSet::new();
         }
         let report = self.collect_heartbeat_report();

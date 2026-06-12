@@ -2109,6 +2109,15 @@ async fn ingest_backlog_defers_staleness_removals_until_drained() {
             .await
     );
     tokio::time::sleep(Duration::from_millis(60)).await;
+    // Keep the survivor genuinely live across the sweep (the same
+    // refresh-before-tick shape the kickstart test uses): in production
+    // noisy-sec keeps sending keepalives, so it never reads as silent.
+    // Without it, this test's compressed schedule (WARN(0) at 1× = 50ms)
+    // would classify the 60ms-old drained evidence as stage-0 silence,
+    // and with BOTH remotes silent the collective-silence self-suspect
+    // gate would (correctly, per its contract) defer the removal — a
+    // fixture artifact, not the defer-not-amnesty contract under test.
+    primary.record_keepalive("noisy-sec");
     primary.process_heartbeat_tick().await.unwrap();
     assert!(
         !primary.secondaries.contains_key("buried-sec"),
@@ -2520,4 +2529,293 @@ async fn duplicate_welcome_does_not_regress_walked_state() {
          member's typestate — the batch walk never re-runs, so a regressed \
          member would sit pre-Operational (and silence-invisible) forever"
     );
+}
+
+// ======================================================================
+// Collective-silence self-suspect gate (run_20260612_043357 replay)
+// ======================================================================
+
+/// Register the production topology of run_20260612_043357: the
+/// primary's own co-located same-peer member (`"setup"` — the default
+/// `node_id`, whose frames ride the in-process loopback) plus three
+/// remote members, each holding one in-flight task.
+fn register_colocated_plus_three_remotes<S, E>(primary: &mut PrimaryCoordinator<S, E, TestId>)
+where
+    S: Scheduler<TestId>,
+    E: ResourceEstimator<TestId>,
+{
+    register_operational_secondary(primary, "setup", 0, "victim-self");
+    register_operational_secondary(primary, "krater13", 1, "victim-13");
+    register_operational_secondary(primary, "krater14", 2, "victim-14");
+    register_operational_secondary(primary, "krater15", 3, "victim-15");
+    // Seed the replicated membership (PeerJoined → Alive) so the
+    // assertions on `is_peer_alive` exercise the real ledger flip on
+    // removal, mirroring the lifecycle fixtures.
+    for id in ["setup", "krater13", "krater14", "krater15"] {
+        let _ = primary
+            .cluster_state_mut_for_test()
+            .apply(ClusterMutation::PeerJoined {
+                peer_id: id.to_string(),
+                is_observer: false,
+                can_be_primary: false,
+                cap_version: Default::default(),
+                member_gen: 0,
+            });
+    }
+}
+
+/// One heartbeat round of the replay: sleep `gap`, refresh ONLY the
+/// co-located member's death clock (its workers kept completing tasks
+/// in the production run — in-process evidence, not wire evidence),
+/// then drive the sweep.
+async fn sweep_with_fresh_local<S, E>(
+    primary: &mut PrimaryCoordinator<S, E, TestId>,
+    gap: Duration,
+) where
+    S: Scheduler<TestId>,
+    E: ResourceEstimator<TestId>,
+{
+    tokio::time::sleep(gap).await;
+    primary.record_keepalive("setup");
+    primary.process_heartbeat_tick().await.unwrap();
+}
+
+/// REPLAY (run_20260612_043357, the false mass-removal face): a primary
+/// whose runtime is BURSTY-starved — isolated lagged ticks (each
+/// deferred ACUTE by the own-tick gate, never two in a row, so the
+/// chronic escalation never engages) interleaved with on-cadence ticks
+/// — while its wire to ALL THREE remotes is deaf (no frame arrives at
+/// any edge) and its co-located member keeps producing in-process
+/// evidence. The on-cadence sweeps between the bursts judge wall-clock
+/// silences that cross the hard backstop for every remote
+/// simultaneously; pre-fix the first such sweep declared all three LIVE
+/// remotes dead (then fleet-dead aborted the run). The self-suspect
+/// gate must defer: all-remotes-silent is ONE local wire failure, not
+/// three independent deaths.
+#[tokio::test(flavor = "current_thread")]
+async fn bursty_starved_deaf_primary_defers_mass_removal() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _sec_rx, _kept) = empty_transport();
+            // interval 50ms → own-tick starvation threshold 150ms (3×);
+            // hard backstop 8× = 400ms (and thus a 400ms gate
+            // escalation window), so every assertion below sits ≥140ms
+            // clear of a boundary.
+            let mut cfg = config(Duration::from_millis(50), 2);
+            cfg.silence_hard_multiple = 8;
+            let (mut primary, _mesh) = build_primary(
+                cfg,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+            install_default_pool(&mut primary);
+            register_colocated_plus_three_remotes(&mut primary);
+
+            // Baseline on-cadence tick (seeds the own-tick clock; every
+            // member fresh). From here NO remote frame ever arrives —
+            // the wire is deaf in both directions.
+            primary.process_heartbeat_tick().await.unwrap();
+
+            // The production burst pattern: healthy ticks with isolated
+            // >threshold gaps in between (the two ACUTE WARNs, ~100s
+            // apart, chronic=false). Lagged ticks defer themselves; the
+            // healthy ticks in between are the ones that judged — and
+            // pre-fix killed — the fleet.
+            for gap_ms in [60u64, 200, 60, 60, 60, 200, 60] {
+                sweep_with_fresh_local(&mut primary, Duration::from_millis(gap_ms)).await;
+            }
+
+            // The wall silences have crossed the hard backstop for every
+            // remote (total elapsed ≈ 700ms ≫ 400ms)...
+            let report = primary.collect_heartbeat_report();
+            let hard = Duration::from_millis(400);
+            assert!(
+                report
+                    .silences
+                    .iter()
+                    .filter(|s| s.secondary_id != "setup")
+                    .all(|s| s.silence > hard),
+                "precondition: every remote's raw silence is past the hard backstop"
+            );
+            // ...yet NO remote was declared dead: all-silent-at-once is
+            // self-suspect, and the deferral is visible to the
+            // dispatch-altitude consumers too.
+            for id in ["krater13", "krater14", "krater15"] {
+                assert!(
+                    primary.secondaries.contains_key(id),
+                    "{id} must NOT be declared dead while EVERY remote is \
+                     silent simultaneously (the run_20260612_043357 false \
+                     mass-removal: the primary was deaf, the remotes were \
+                     alive)"
+                );
+                assert!(
+                    primary.cluster_state.is_peer_alive(id),
+                    "{id}'s replicated membership must stay Alive under the deferral"
+                );
+            }
+            assert!(
+                primary.silent_secondary_ids().is_empty(),
+                "the dispatch-altitude silent set must be empty while the \
+                 self-suspect gate defers (no early lazy-requeue either)"
+            );
+            assert!(
+                !primary.only_silent_held_work_remains(),
+                "the lazy-requeue oracle must not fire off a self-suspect sweep"
+            );
+        })
+        .await;
+}
+
+/// Recovery half of the replay: ONE remote frame proves the local wire
+/// works, the collective episode ends, and the schedule resumes — the
+/// still-silent remotes are then declared on the very next sweep (no
+/// permanent amnesty), while the revived member and the co-located
+/// member survive.
+#[tokio::test(flavor = "current_thread")]
+async fn remote_evidence_ends_deferral_and_remaining_silent_are_declared() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _sec_rx, _kept) = empty_transport();
+            // hard backstop 2× = 100ms: short enough that the
+            // post-recovery declarations land within a few sweeps.
+            let (mut primary, _mesh) = build_primary(
+                config(Duration::from_millis(50), 2),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+            install_default_pool(&mut primary);
+            register_colocated_plus_three_remotes(&mut primary);
+
+            primary.process_heartbeat_tick().await.unwrap();
+
+            // Two on-cadence sweeps with every remote silent past the
+            // 100ms hard backstop: deferred (collective).
+            sweep_with_fresh_local(&mut primary, Duration::from_millis(60)).await;
+            sweep_with_fresh_local(&mut primary, Duration::from_millis(60)).await;
+            assert!(
+                ["krater13", "krater14", "krater15"]
+                    .iter()
+                    .all(|id| primary.secondaries.contains_key(*id)),
+                "all remotes deferred while the collective episode holds"
+            );
+
+            // krater13's frame lands (the wire heals / was never the
+            // remotes' fault): the episode is over. The OTHER two are
+            // still genuinely silent past the backstop, and with live
+            // remote evidence in hand the schedule must declare them —
+            // bounded sweeps, no permanent amnesty.
+            let mut declared = false;
+            for _ in 0..8 {
+                primary.record_keepalive("krater13");
+                sweep_with_fresh_local(&mut primary, Duration::from_millis(60)).await;
+                if !primary.secondaries.contains_key("krater14")
+                    && !primary.secondaries.contains_key("krater15")
+                {
+                    declared = true;
+                    break;
+                }
+            }
+            assert!(
+                declared,
+                "once a remote frame proves the wire, the still-silent \
+                 remotes must be declared dead on the normal schedule"
+            );
+            assert!(
+                primary.secondaries.contains_key("krater13"),
+                "the revived remote survives"
+            );
+            assert!(
+                primary.secondaries.contains_key("setup"),
+                "the co-located member survives"
+            );
+        })
+        .await;
+}
+
+/// BOUNDED deferral (the hard backstop stays load-bearing): a fleet
+/// whose every remote is GENUINELY dead (the cohort-3 face — tunnel
+/// blips killed all secondaries at once) is still fully declared after
+/// the gate's escalation window, so requeue/respawn/fleet-dead all
+/// remain reachable. The sweep defers first (the gate engaged), then
+/// escalates and declares.
+#[tokio::test(flavor = "current_thread")]
+async fn collective_silence_escalates_and_declares_after_bounded_window() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _sec_rx, _kept) = empty_transport();
+            // hard 2× = 100ms; escalation window = the same 100ms.
+            let (mut primary, _mesh) = build_primary(
+                config(Duration::from_millis(50), 2),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+            install_default_pool(&mut primary);
+            register_colocated_plus_three_remotes(&mut primary);
+
+            primary.process_heartbeat_tick().await.unwrap();
+
+            // Drive on-cadence sweeps with the co-located member fresh
+            // and every remote permanently silent. The gate must defer
+            // at least one hard-due sweep (proof it engaged), then
+            // escalate within a bounded number of sweeps and let the
+            // schedule declare the whole remote fleet.
+            let mut deferred_a_hard_due_sweep = false;
+            let mut all_declared_at = None;
+            for tick in 0..20 {
+                sweep_with_fresh_local(&mut primary, Duration::from_millis(60)).await;
+                let remotes_present = ["krater13", "krater14", "krater15"]
+                    .iter()
+                    .filter(|id| primary.secondaries.contains_key(**id))
+                    .count();
+                let report = primary.collect_heartbeat_report();
+                let past_hard = report
+                    .silences
+                    .iter()
+                    .filter(|s| s.secondary_id != "setup")
+                    .filter(|s| s.silence > Duration::from_millis(100))
+                    .count();
+                if remotes_present == 3 && past_hard == 3 {
+                    deferred_a_hard_due_sweep = true;
+                }
+                if remotes_present == 0 {
+                    all_declared_at = Some(tick);
+                    break;
+                }
+            }
+            assert!(
+                deferred_a_hard_due_sweep,
+                "the gate must first DEFER a sweep where every remote is \
+                 past the hard backstop (otherwise this test is not \
+                 exercising the escalation at all)"
+            );
+            assert!(
+                all_declared_at.is_some(),
+                "a genuinely all-dead remote fleet must still be fully \
+                 declared once the bounded escalation window elapses — \
+                 the hard backstop is the load-bearing forward-progress \
+                 guarantee (fleet-dead must stay reachable)"
+            );
+            for id in ["krater13", "krater14", "krater15"] {
+                assert!(
+                    !primary.cluster_state.is_peer_alive(id),
+                    "{id}'s replicated membership must be Dead after escalation"
+                );
+            }
+            assert!(
+                primary.secondaries.contains_key("setup"),
+                "the co-located member (fresh evidence every round) survives"
+            );
+            assert_eq!(
+                primary.pool().iter().count(),
+                3,
+                "the three remote-held in-flight tasks are requeued on declaration"
+            );
+        })
+        .await;
 }

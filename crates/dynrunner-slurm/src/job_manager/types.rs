@@ -120,6 +120,17 @@ pub struct SlurmJobManager<G: Gateway> {
     pub config: SlurmConfig,
     pub(super) gateway: G,
     pub(super) job_ids: Vec<String>,
+    /// `secondary_id → sbatch job id` for every submission this manager
+    /// drove — the initial cohort AND every respawn replacement (both
+    /// route through [`SlurmJobManager::submit_job`], which carries the
+    /// `secondary_id`). The respawn path reads it to resolve a DEAD
+    /// member's SLURM node from SLURM's own vocabulary (job id → squeue /
+    /// sacct `%N`) for the replacement's `--exclude`, instead of the
+    /// mesh-advertised hostname (which need not be a valid SLURM
+    /// NodeName). A re-welcomed/re-submitted id overwrites its own entry
+    /// (the latest job is the one that just died). Bounded by the
+    /// lifetime membership set, the same story as `job_ids`.
+    pub(super) secondary_jobs: std::collections::HashMap<String, String>,
     /// Remote (gateway-side) absolute path of the uploaded
     /// `dynrunner-slurm-shutdown` binary, or `None` until
     /// [`SlurmJobManager::upload_shutdown_manager_binary_from`] runs
