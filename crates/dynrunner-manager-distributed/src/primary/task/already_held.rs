@@ -40,6 +40,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///     holder re-answers already-held, and that commit sticks as
     ///     CASE 1 — one extra round trip, no loop, no state surgery;
     ///   * already terminal → there is nothing left to reconcile.
+    ///
     /// Pre-fix this frame fell through to the TERMINAL-failure arm:
     /// retry budget burned, a false replicated `TaskFailed` originated
     /// for a still-running task, and a queued copy reclaimed as failed.
