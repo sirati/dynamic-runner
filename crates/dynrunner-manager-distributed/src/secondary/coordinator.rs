@@ -214,13 +214,19 @@ where
         // installation contract.
         this.cluster_state
             .install_task_completed_sender(task_completed_tx);
-        // NOTE: no transport role-cache attachment. "Who is primary now"
-        // is resolved at THIS edge (`Self::send_to` reads
-        // `cluster_state.current_primary()` / the bootstrap fallback) and
-        // stamped on the frame; the mesh-pump demuxes by that stamp. The
-        // coordinator holds no transport at all — only the `MeshClient` /
-        // `RoleInbox` — so there is nothing to attach a write-through role
-        // cache to. Resolution lives entirely at the edge.
+        // Recognition→routing publish: register the role-change hook that
+        // publishes `role_table.primary` into the mesh's
+        // `RoleHolderView`, so the INGRESS relay can forward a directed
+        // `Primary` frame that lands on a host with no live Primary slot
+        // toward the recognized holder. EGRESS resolution is unchanged and
+        // stays at this edge (`Self::send_to` reads
+        // `cluster_state.current_primary()` / the bootstrap fallback) —
+        // the view carries only the routing-holder fact, never the
+        // bootstrap fallback.
+        crate::process::attach_primary_recognition(
+            &mut this.cluster_state,
+            this.client.role_holder_view(),
+        );
         this
     }
 

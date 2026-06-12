@@ -48,6 +48,7 @@ use tokio::sync::mpsc;
 
 use super::ingest_liveness::IngestLiveness;
 use super::membership::MembershipView;
+use super::mesh::role_holder::RoleHolderView;
 use super::role::LocalRole;
 
 /// One queued egress item from a [`MeshClient`], drained by the mesh-pump
@@ -82,6 +83,13 @@ pub struct MeshClient<I: Identifier> {
     egress: mpsc::UnboundedSender<LocalDispatch<I>>,
     /// Pump-published live-read membership (no shadow counter).
     membership: MembershipView,
+    /// The mesh's coordinator-published Primary-holder view (the
+    /// recognition→routing bridge). The coordinator's constructor
+    /// hands a clone to
+    /// [`super::mesh::role_holder::attach_primary_recognition`] so its
+    /// `ClusterState` role-change hook publishes the routing-holder
+    /// fact the mesh's ingress relay reads.
+    role_holder: RoleHolderView,
 }
 
 impl<I: Identifier> Clone for MeshClient<I> {
@@ -90,6 +98,7 @@ impl<I: Identifier> Clone for MeshClient<I> {
             origin: self.origin,
             egress: self.egress.clone(),
             membership: self.membership.clone(),
+            role_holder: self.role_holder.clone(),
         }
     }
 }
@@ -101,11 +110,13 @@ impl<I: Identifier> MeshClient<I> {
         origin: LocalRole,
         egress: mpsc::UnboundedSender<LocalDispatch<I>>,
         membership: MembershipView,
+        role_holder: RoleHolderView,
     ) -> Self {
         Self {
             origin,
             egress,
             membership,
+            role_holder,
         }
     }
 
@@ -154,6 +165,16 @@ impl<I: Identifier> MeshClient<I> {
     /// formula and the has_route-vs-has_peer consumer split.
     pub fn has_route(&self, id: &PeerId) -> bool {
         self.membership.has_route(id)
+    }
+
+    /// Clone of the mesh's Primary-holder view (the recognition→routing
+    /// bridge). The coordinator's constructor hands this to
+    /// [`super::mesh::role_holder::attach_primary_recognition`] so its
+    /// `ClusterState` publishes the routing-holder fact the mesh's
+    /// ingress relay reads — the coordinator itself never reads or
+    /// writes the view directly.
+    pub fn role_holder_view(&self) -> RoleHolderView {
+        self.role_holder.clone()
     }
 }
 

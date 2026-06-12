@@ -38,7 +38,7 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
             let peers = peers.clone();
             self.connect_to_peers(&peers).await;
         }
-        self.route_incoming(frame);
+        self.route_incoming(frame).await;
         true
     }
 

@@ -504,6 +504,14 @@ where
         // handle.
         let announcer_handle =
             attach_observer_announcer(&mut cluster_state, holdings, node_id.clone());
+        // Recognition→routing publish — THE production wiring for the
+        // run_20260612_045106 zombie: the relocated submitter's observer
+        // process is exactly where a respawned secondary's
+        // Primary-addressed setup frames land, and this attach is what
+        // lets the mesh relay them to the promoted primary. The moved-in
+        // `cluster_state` is already converged (the relocation applied
+        // `PrimaryChanged`), so the attach SEEDS the view immediately.
+        crate::process::attach_primary_recognition(&mut cluster_state, client.role_holder_view());
         Self {
             client,
             inbox,
@@ -582,6 +590,14 @@ where
         // restore had already fired the hook before any announcer existed.)
         let announcer_handle =
             attach_observer_announcer(&mut cluster_state, holdings, node_id.clone());
+        // Recognition→routing publish (the same attach-at-construction
+        // shape as the announcer hook above): the role-change hook
+        // publishes `role_table.primary` into the mesh's
+        // `RoleHolderView`, so this process's INGRESS relay can forward
+        // a directed `Primary` frame toward the recognized holder. The
+        // cold-join factory's restore fires the hook post-attach,
+        // seeding the view from the snapshot's primary fact.
+        crate::process::attach_primary_recognition(&mut cluster_state, client.role_holder_view());
         // Respawn-exec outbox — created unconditionally (the arm is
         // inert without a provider; requests then get an error reply).
         let (respawn_exec_tx, respawn_exec_rx) = mpsc::unbounded_channel::<RespawnExecOutcome>();

@@ -54,6 +54,33 @@ pub(super) fn sender_of(msg: &DistributedMessage<TestId>) -> &str {
     }
 }
 
+/// A `SecondaryWelcome` wire frame as a respawned secondary's setup
+/// handshake produces it — the production victim frame of the
+/// run_20260612_045106 relay regression tests.
+pub(super) fn welcome_frame(sender: &str) -> DistributedMessage<TestId> {
+    DistributedMessage::SecondaryWelcome {
+        target: None,
+        sender_id: sender.to_string(),
+        timestamp: 1.0,
+        secondary_id: sender.to_string(),
+        resources: Vec::new(),
+        worker_count: 2,
+        hostname: "node".to_string(),
+        is_observer: false,
+        can_be_primary: true,
+    }
+}
+
+/// A `GracefulAbortRequest` wire frame — the second confirmed
+/// production victim kind; the relay must be frame-kind-agnostic.
+pub(super) fn abort_request_frame(sender: &str) -> DistributedMessage<TestId> {
+    DistributedMessage::GracefulAbortRequest {
+        target: None,
+        sender_id: sender.to_string(),
+        timestamp: 2.0,
+    }
+}
+
 /// Build a channel transport for `local_id` wired to `remotes`, returning
 /// the transport plus a receiver per remote id so a test can drain what
 /// the mesh sent to the wire.

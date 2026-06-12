@@ -33,6 +33,7 @@
 mod egress;
 mod ingress;
 mod membership;
+pub mod role_holder;
 mod routing;
 
 use std::collections::VecDeque;
@@ -48,6 +49,7 @@ use super::membership::MembershipView;
 use super::mesh_client::{LocalDispatch, MeshClient, RoleInbox};
 use super::role::LocalRole;
 use super::role_slot::RoleSlot;
+use role_holder::RoleHolderView;
 
 /// Bound on the slotless-ingress hold buffer (see [`Mesh::slotless_hold`]).
 ///
@@ -60,6 +62,20 @@ use super::role_slot::RoleSlot;
 /// control frames (e.g. `RequestClusterSnapshot`), so a small ring suffices;
 /// overflow drops the OLDEST with a WARN naming kind/target, never silently.
 pub(crate) const SLOTLESS_HOLD_CAPACITY: usize = 64;
+
+/// Bound on the ingress relay-ring (the role-relay loop guard — see
+/// `routing.rs`).
+///
+/// The ring remembers the fingerprints of frames THIS process has
+/// already ingress-relayed toward a recognized role holder. A frame
+/// seen AGAIN at this ingress (a stale holder view bounced it back, or
+/// a longer relay cycle revisited us) is never relayed twice — it comes
+/// to rest in the documented fan/hold default instead, so divergent
+/// holder views can bound-cycle a frame at most once per process. The
+/// relay path is cold (mis-addressed directed frames only), so a small
+/// ring suffices; eviction is oldest-first and merely re-permits a
+/// (re-)relay, never drops a frame.
+pub(crate) const ROLE_RELAY_RING_CAPACITY: usize = 64;
 
 /// Minimum spacing between two ingress diagnostic WARNs (slotless-hold,
 /// overflow, and the role-miss / unstamped fan fallbacks). A frame storm into
@@ -120,6 +136,24 @@ pub struct Mesh<I: Identifier, Tr: PeerTransport<I>> {
     /// role-swap with a sustained inbound stream cannot spam one WARN per
     /// frame at wire rate.
     ingress_fallback_warn: crate::warn_throttle::WarnThrottle,
+    /// Coordinator-published view of which PEER hosts the id-less
+    /// Primary role (the ROUTING-holder fact). Cloned into every
+    /// [`MeshClient`] at mint so each coordinator's `ClusterState`
+    /// role-change hook can publish into it
+    /// ([`role_holder::attach_primary_recognition`]); read by the
+    /// ingress demux ([`Self::route_incoming`]) to RELAY a directed
+    /// `Primary` frame toward the holder when no live local Primary
+    /// slot exists, instead of black-holing it in the local fan/hold.
+    pub(super) role_holder: RoleHolderView,
+    /// This process's own host peer-id, captured at the first
+    /// [`Self::register_local_role`] (every local slot shares it).
+    /// The ingress relay reads it so a holder that resolves to THIS
+    /// host (a local-pending role mid-swap) is never "relayed" onto
+    /// the wire — the slot-less hold is the correct resting place.
+    pub(super) local_peer_id: Option<PeerId>,
+    /// Fingerprints of frames this process already ingress-relayed (the
+    /// role-relay loop guard — see [`ROLE_RELAY_RING_CAPACITY`]).
+    pub(super) relayed_ring: VecDeque<u64>,
 }
 
 impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
@@ -147,6 +181,9 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
             slotless_hold: VecDeque::new(),
             slotless_hold_warn: crate::warn_throttle::WarnThrottle::new(INGRESS_WARN_INTERVAL),
             ingress_fallback_warn: crate::warn_throttle::WarnThrottle::new(INGRESS_WARN_INTERVAL),
+            role_holder: RoleHolderView::new(),
+            local_peer_id: None,
+            relayed_ring: VecDeque::new(),
         }
     }
 
@@ -168,6 +205,13 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
         peer_id: PeerId,
     ) -> (Arc<RoleSlot<I>>, MeshClient<I>, RoleInbox<I>) {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        // Capture this process's host peer-id on the first registration
+        // (every local slot shares it) — the ingress relay's
+        // "holder-is-local" test reads it even while the process is
+        // momentarily slotless.
+        if self.local_peer_id.is_none() {
+            self.local_peer_id = Some(peer_id.clone());
+        }
         // One ingest-freshness cell per trio: the slot records at its
         // delivery choke point; the inbox reads. Minted here so the pair
         // cannot mismatch (the M3 trio rule).
@@ -190,6 +234,7 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
             role,
             self.local_dispatch_tx.clone(),
             self.membership.clone(),
+            self.role_holder.clone(),
         );
         let inbox = RoleInbox::new(inbound_rx, ingest_liveness, transport_edges);
         // A freshly-registered slot is the first live local delivery target if
