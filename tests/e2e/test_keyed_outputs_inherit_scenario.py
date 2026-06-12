@@ -218,21 +218,24 @@ def test_inherit_consumer_emits_inherit_outputs_edge() -> None:
     by_id = {item.task_id: item for item in items}
     # The A task has no predecessors.
     assert by_id["a"].task_depends_on == ()
-    # The B task has a single bare-string predecessor (legacy shape).
-    assert by_id["b"].task_depends_on == ("a",), (
-        f"B's task_depends_on shape changed: {by_id['b'].task_depends_on!r}"
-    )
-    # The C task carries the load-bearing inherit edge: a bare-string
-    # entry for B (direct predecessor) AND a ``TaskDep`` for A with
-    # ``inherit_outputs=True`` (transitive ancestor). Both shapes must
-    # round-trip through the PyO3 extractor — and the inherit flag is
-    # the whole point of this scenario.
+    # B's predecessor A lives in phase-a, so the dep names that phase
+    # explicitly — a bare string resolves in B's own phase (phase-b)
+    # and the framework rejects it as a missing dependency.
+    assert by_id["b"].task_depends_on == (
+        TaskDep("a", phase_id="phase-a"),
+    ), f"B's task_depends_on shape changed: {by_id['b'].task_depends_on!r}"
+    # The C task carries the load-bearing inherit edge: a cross-phase
+    # entry for B (direct predecessor, phase-b) AND a ``TaskDep`` for A
+    # (transitive ancestor, phase-a) with ``inherit_outputs=True``.
+    # Both name their prerequisite's phase and round-trip through the
+    # PyO3 extractor — and the inherit flag is the whole point of this
+    # scenario.
     c_deps = by_id["c"].task_depends_on
     assert len(c_deps) == 2, (
         f"C's task_depends_on length changed: {c_deps!r}"
     )
-    assert c_deps[0] == "b"
-    assert c_deps[1] == TaskDep("a", inherit_outputs=True), (
+    assert c_deps[0] == TaskDep("b", phase_id="phase-b")
+    assert c_deps[1] == TaskDep("a", phase_id="phase-a", inherit_outputs=True), (
         f"C's transitive ancestor edge shape changed: {c_deps[1]!r}"
     )
     assert c_deps[1].inherit_outputs is True

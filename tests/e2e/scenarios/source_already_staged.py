@@ -24,15 +24,19 @@ For each mode plan:
 2. The published outputs match what the canonical consumer would have
    emitted for ``num_tasks`` items (so a "discovery returned nothing
    silently" regression would surface as a missing-files assertion).
-3. The setup-secondary log shows
-   ``setup-promote discovery complete; ingesting into Rust core``
-   exactly once (the wrapper-side log line emitted by
-   ``crates/dynrunner-pyo3/src/managers/secondary.rs`` when discovery
-   completes).
-4. The Rust-side counterpart ``ingested setup-discovery; primary
-   pool hydrated`` is present (mirror from
-   ``crates/dynrunner-manager-distributed/src/secondary/primary.rs``).
-5. The discovery log does NOT carry ``tasks=0`` — a 0-tasks discovery
+3. ``--source-already-staged`` flipped discovery off the submitter:
+   the framework's ``Pre-staged source mode: deferring task
+   discovery`` line (``python/dynamic_runner/run.py``) is present —
+   the load-bearing behaviour this scenario pins.
+4. Discovery then ran on EXACTLY ONE promoted secondary: the
+   consumer's ``discover_items: N produce + N consume = M items``
+   line (narrated from inside the ``discover_on_promotion`` closure
+   that runs on the chosen setup-secondary) appears exactly once.
+   More than one occurrence would mean we promoted more than one
+   secondary, breaking the "only the chosen setup-secondary runs
+   discovery" contract.
+5. Discovery returned a non-empty corpus — that ``discover_items``
+   line ends in ``= M items`` with ``M > 0``. A 0-item discovery
    would mean the setup-secondary saw an empty bind-mount and the
    run completed via the "nothing to do" path rather than the
    discovery-then-process path the scenario exists to exercise.
@@ -95,14 +99,16 @@ _JOBS = 2
 # Log markers the scenario greps for. Centralised so the assertion
 # block stays declarative and a framework log rename surfaces here,
 # not buried inside a regex.
-_WRAPPER_DISCOVERY_MARKER = (
-    "setup-promote discovery complete; ingesting into Rust core"
-)
-_RUST_INGEST_MARKER = "ingested setup-discovery; primary pool hydrated"
-# A discovery that returns nothing logs ``tasks=0`` in the same
-# line as the wrapper marker. Treated as a soft regression — a
-# misconfigured src_network bind-mount would surface here.
-_ZERO_TASKS_REGEX = re.compile(r"tasks=0\b")
+#
+# ``_DEFER_MARKER`` is the framework's own narration that
+# ``--source-already-staged`` flipped discovery off the submitter
+# (``python/dynamic_runner/run.py``) — the load-bearing behaviour this
+# scenario pins. ``_DISCOVER_ITEMS_REGEX`` then matches the consumer's
+# discovery line that runs on the PROMOTED secondary; its single
+# occurrence proves exactly one secondary was promoted to run
+# discovery, and the captured count feeds the non-empty check.
+_DEFER_MARKER = "Pre-staged source mode: deferring task discovery"
+_DISCOVER_ITEMS_REGEX = re.compile(r"discover_items: .*= (\d+) items")
 
 
 class SourceAlreadyStagedScenario(Scenario):
@@ -187,32 +193,40 @@ class SourceAlreadyStagedScenario(Scenario):
                 )
                 continue
 
-            # Discovery happened on exactly one secondary. Multiple
-            # secondaries running discovery would mean we promoted
-            # more than one and the wire flag's "only the chosen
-            # setup-secondary runs Python discovery" contract broke.
-            wrapper_hits = log_text.count(_WRAPPER_DISCOVERY_MARKER)
-            if wrapper_hits != 1:
+            # `--source-already-staged` flipped discovery off the
+            # submitter — the load-bearing behaviour this scenario
+            # pins. The framework narrates the deferral once per plan.
+            if _DEFER_MARKER not in log_text:
                 failures.append(
-                    f"{prefix} expected exactly 1 occurrence of "
-                    f"'{_WRAPPER_DISCOVERY_MARKER}' in dispatch log; "
-                    f"got {wrapper_hits} (log: {result.log_file})"
+                    f"{prefix} expected '{_DEFER_MARKER}' in dispatch "
+                    f"log; not found — `--source-already-staged` did "
+                    f"not defer discovery off the submitter "
+                    f"(log: {result.log_file})"
                 )
 
-            # The Rust-side ingest log mirrors the wrapper-side
-            # discovery log. Both being present confirms the
-            # round-trip (PyO3 wrapper → Rust core → broadcast)
-            # completed.
-            if _RUST_INGEST_MARKER not in log_text:
+            # Discovery ran on exactly one promoted secondary. The
+            # consumer narrates its discover_items call from inside the
+            # discover_on_promotion closure; a single occurrence proves
+            # only ONE secondary was promoted to run discovery (more
+            # than one would break the "only the chosen setup-secondary
+            # runs discovery" contract). The captured count feeds the
+            # non-empty check.
+            discover_hits = _DISCOVER_ITEMS_REGEX.findall(log_text)
+            if len(discover_hits) != 1:
                 failures.append(
-                    f"{prefix} expected '{_RUST_INGEST_MARKER}' in dispatch "
-                    f"log; not found (log: {result.log_file})"
+                    f"{prefix} expected exactly 1 consumer "
+                    f"'discover_items: ... = M items' line in dispatch "
+                    f"log; got {len(discover_hits)} — discovery did not "
+                    f"run on exactly one promoted secondary "
+                    f"(log: {result.log_file})"
                 )
-
-            # Soft regression: discovery returning zero tasks.
-            if _ZERO_TASKS_REGEX.search(log_text):
+            elif int(discover_hits[0]) == 0:
+                # Discovery returning zero items: the setup-secondary
+                # saw an empty bind-mount and the run finished via the
+                # "nothing to do" path, not the discovery-then-process
+                # path this scenario exercises.
                 failures.append(
-                    f"{prefix} discovery returned tasks=0 — the setup-"
+                    f"{prefix} discovery returned 0 items — the setup-"
                     f"secondary saw an empty bind-mount; check "
                     f"`--source-already-staged` path resolution "
                     f"(log: {result.log_file})"

@@ -11,22 +11,29 @@ Three phases with explicit cross-phase dependency edges::
 
     phase-a ──depends_on──▶ phase-b ──depends_on──▶ phase-c
 
-Each phase contains exactly one task (``a``, ``b``, ``c``). Task
-``b`` carries a plain ``task_depends_on=("a",)`` — direct predecessor,
-no inherit. Task ``c`` carries
-``task_depends_on=("b", TaskDep("a", inherit_outputs=True))``: a direct
+Each phase contains exactly one task (``a``, ``b``, ``c``). Every
+prerequisite here is CROSS-PHASE, so each dep names the
+prerequisite's phase explicitly (a bare ``str`` resolves in the
+declaring task's OWN phase and would be rejected as a missing
+dependency). Task ``b`` carries
+``task_depends_on=(TaskDep("a", phase_id="phase-a"),)`` — direct
+predecessor, no inherit. Task ``c`` carries
+``task_depends_on=(TaskDep("b", phase_id="phase-b"),
+TaskDep("a", phase_id="phase-a", inherit_outputs=True))``: a direct
 predecessor (``b``) plus an explicit transitive-ancestry edge to ``a``
 with the inherit-outputs flag set, requesting that ``a``'s published
 outputs (in addition to ``b``'s) land in ``c``'s
 ``predecessor_outputs`` dict at dispatch time.
 
-Two extra edges live on ``c``'s ``task_depends_on``:
+Two edges live on ``c``'s ``task_depends_on``:
 
-1. ``"b"`` — the direct predecessor. Without ``inherit_outputs=True``
-   the framework only surfaces ``b``'s own outputs to ``c``.
-2. ``TaskDep("a", inherit_outputs=True)`` — the ancestor. The flag
-   asks the framework to walk the dep graph transitively at dispatch
-   time and surface ``a``'s outputs to ``c`` as well.
+1. ``TaskDep("b", phase_id="phase-b")`` — the direct predecessor.
+   Without ``inherit_outputs=True`` the framework only surfaces
+   ``b``'s own outputs to ``c``.
+2. ``TaskDep("a", phase_id="phase-a", inherit_outputs=True)`` — the
+   ancestor. The flag asks the framework to walk the dep graph
+   transitively at dispatch time and surface ``a``'s outputs to ``c``
+   as well.
 
 Per the framework's transitive-ancestry contract, ``c.predecessor_outputs``
 ends up populated with BOTH ``a`` and ``b`` keys. The worker asserts
@@ -61,7 +68,12 @@ from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
 _PHASE_A = "phase-a"
 _PHASE_B = "phase-b"
 _PHASE_C = "phase-c"
-_TYPE_DEFAULT = "default"
+# TypeIds are globally unique across the whole topology (the framework's
+# TypeRegistry keys on type_id alone, with no phase qualification), so
+# each phase declares its own id rather than sharing a single "default".
+_TYPE_A = "phase-a-default"
+_TYPE_B = "phase-b-default"
+_TYPE_C = "phase-c-default"
 _WORKER_MODULE = "tests.e2e.inherit_consumer.worker"
 
 _TASK_A = "a"
@@ -93,20 +105,20 @@ class InheritSyntheticTask:
         a = PhaseSpec(
             phase_id=_PHASE_A,
             types=(
-                TaskTypeSpec(type_id=_TYPE_DEFAULT, worker_module=_WORKER_MODULE),
+                TaskTypeSpec(type_id=_TYPE_A, worker_module=_WORKER_MODULE),
             ),
         )
         b = PhaseSpec(
             phase_id=_PHASE_B,
             types=(
-                TaskTypeSpec(type_id=_TYPE_DEFAULT, worker_module=_WORKER_MODULE),
+                TaskTypeSpec(type_id=_TYPE_B, worker_module=_WORKER_MODULE),
             ),
             depends_on=(_PHASE_A,),
         )
         c = PhaseSpec(
             phase_id=_PHASE_C,
             types=(
-                TaskTypeSpec(type_id=_TYPE_DEFAULT, worker_module=_WORKER_MODULE),
+                TaskTypeSpec(type_id=_TYPE_C, worker_module=_WORKER_MODULE),
             ),
             depends_on=(_PHASE_B,),
         )
@@ -131,6 +143,7 @@ class InheritSyntheticTask:
                 source_dir=source_dir,
                 task_id=_TASK_A,
                 phase_id=_PHASE_A,
+                type_id=_TYPE_A,
                 # No prerequisites — A is the chain's root.
                 task_depends_on=(),
             ),
@@ -138,25 +151,32 @@ class InheritSyntheticTask:
                 source_dir=source_dir,
                 task_id=_TASK_B,
                 phase_id=_PHASE_B,
+                type_id=_TYPE_B,
                 # Direct predecessor only; B reads A's outputs by
-                # virtue of being A's direct child. No inherit flag
-                # needed — direct edges always surface their tail's
-                # outputs.
-                task_depends_on=(_TASK_A,),
+                # virtue of being A's direct child. A lives in
+                # phase-a, so the dep MUST name that phase explicitly
+                # — a bare string would resolve same-phase (phase-b)
+                # and be rejected as a missing dependency. No inherit
+                # flag needed — direct edges always surface their
+                # tail's outputs.
+                task_depends_on=(TaskDep(_TASK_A, phase_id=_PHASE_A),),
             ),
             _build_task(
                 source_dir=source_dir,
                 task_id=_TASK_C,
                 phase_id=_PHASE_C,
+                type_id=_TYPE_C,
                 # The load-bearing dependency: ``b`` is the direct
-                # predecessor (legacy bare-string entry), AND a
-                # transitive edge to ``a`` with ``inherit_outputs=True``
-                # so C's predecessor_outputs ends up carrying BOTH
-                # keys. Without the inherit flag, C would only see B's
-                # outputs — the e2e gates this difference.
+                # predecessor (in phase-b), AND a transitive edge to
+                # ``a`` (in phase-a) with ``inherit_outputs=True`` so
+                # C's predecessor_outputs ends up carrying BOTH keys.
+                # Without the inherit flag, C would only see B's
+                # outputs — the e2e gates this difference. Both deps
+                # are cross-phase, so both name their prerequisite's
+                # phase explicitly.
                 task_depends_on=(
-                    _TASK_B,
-                    TaskDep(_TASK_A, inherit_outputs=True),
+                    TaskDep(_TASK_B, phase_id=_PHASE_B),
+                    TaskDep(_TASK_A, phase_id=_PHASE_A, inherit_outputs=True),
                 ),
             ),
         ]
@@ -243,6 +263,7 @@ def _build_task(
     source_dir: Path,
     task_id: str,
     phase_id: str,
+    type_id: str,
     task_depends_on: tuple,
 ) -> TaskInfo:
     """One TaskInfo for ``input-{task_id}.txt``.
@@ -263,7 +284,7 @@ def _build_task(
             opt_level="O0",
         ),
         phase_id=phase_id,
-        type_id=_TYPE_DEFAULT,
+        type_id=type_id,
         # The worker keys behaviour off task_id (not payload['kind'])
         # because each task is unique in this chain; payload carries
         # only the information the worker can't otherwise derive (the
