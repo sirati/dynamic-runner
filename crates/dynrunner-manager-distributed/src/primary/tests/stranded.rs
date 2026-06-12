@@ -1121,3 +1121,188 @@ async fn clean_run_does_not_false_positive_stranded() {
         })
         .await;
 }
+
+/// Lone-survivor fleet-death false-positive (run_20260612_035452): the
+/// fleet-dead detector must NOT fire while the member CO-LOCATED with
+/// the primary is alive — an alive worker-secondary on the primary's
+/// own host receives dispatch in-process, so the arming premise ("no
+/// living secondary can dispatch the queued tasks") is false.
+///
+/// Production replay: a bootstrap handoff promoted `secondary-1` into a
+/// fleet whose only live member was its own host; the arming quantity
+/// excluded that member by identity, read zero from tick 0, and 30s
+/// later the run aborted ("fleet-dead timeout: every remote secondary
+/// gone with non-empty pool") with both tasks stranded while the
+/// co-located workers were alive and working them.
+///
+/// Construction: the replicated ledger carries the co-located member's
+/// full alive fact set (PeerJoined + SecondaryCapacity + the
+/// PrimaryChanged recognizing its host as primary), the pool holds
+/// queued work, and `fleet_dead_timeout` is ZERO so the buggy arm would
+/// fire on the FIRST loop iteration — before the wire-close exit below
+/// can be observed. Dropping the wire ends closes the inbound, so the
+/// loop (post-fix) exits through the transport-closed arm with the pool
+/// intact instead of draining it as stranded.
+#[tokio::test(flavor = "current_thread")]
+async fn fleet_dead_does_not_fire_while_co_located_member_alive() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, ends) = setup_test(1);
+            let own_id = ends[0].0.clone();
+            let config = PrimaryConfig {
+                // The promoted-primary shape: this primary RUNS ON the
+                // member's host.
+                node_id: own_id.clone(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_secs(60),
+                retry_max_passes: 0,
+                // ZERO: the buggy arm fires on the very first iteration.
+                fleet_dead_timeout: std::time::Duration::ZERO,
+                ..test_primary_config()
+            };
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // The replicated alive fact set for the co-located member +
+            // the recognized-primary identity (its own host) — exactly
+            // the promotion snapshot the acting primary hydrated from.
+            let binaries = vec![make_binary("lone_a", 50), make_binary("lone_b", 60)];
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PeerJoined {
+                    peer_id: own_id.clone(),
+                    is_observer: false,
+                    can_be_primary: true,
+                    cap_version: Default::default(),
+                    member_gen: 0,
+                });
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: own_id.clone(),
+                    worker_count: 2,
+                    resources: vec![dynrunner_core::ResourceAmount {
+                        kind: dynrunner_core::ResourceKind::memory(),
+                        amount: 8 * 1024 * 1024 * 1024,
+                    }],
+                });
+                cs.apply(ClusterMutation::PrimaryChanged {
+                    new: own_id.clone(),
+                    epoch: 1,
+                    reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Transferred,
+                });
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(dynrunner_core::PhaseId::from("default"), vec![])]),
+                });
+                for b in &binaries {
+                    cs.apply(ClusterMutation::TaskAdded {
+                        hash: crate::primary::wire::compute_task_hash(b),
+                        task: b.clone(),
+                    });
+                }
+            }
+            primary
+                .hydrate_from_cluster_state()
+                .expect("test fixture: composed task graph is valid");
+            primary.reconstruct_workers_from_cluster_state();
+
+            // Close the inbound so the loop has a clean exit path that is
+            // NOT the fleet-dead strand (transport-closed).
+            drop(ends);
+
+            primary
+                .operational_loop()
+                .await
+                .expect("operational_loop must exit cleanly via transport-closed");
+
+            assert!(
+                !primary.pool().is_empty(),
+                "the queued pool must NOT be drained as stranded while the \
+                 co-located member is an alive worker-secondary — the \
+                 fleet-dead arm must not fire (the lone-survivor false abort)"
+            );
+            assert!(
+                primary.failed_tasks.is_empty(),
+                "no task may be classified failed by a fleet-dead false fire"
+            );
+        })
+        .await;
+}
+
+/// The honest-arming mirror: a capacity record alone is NOT liveness.
+/// When no worker-secondary is a live MEMBER (the capacity-bearing id
+/// never joined the membership ledger), the fleet genuinely cannot
+/// dispatch — the fleet-dead arm must still fire and strand the queued
+/// pool exactly as before (the tokenizer cohort-3 contract).
+#[tokio::test(flavor = "current_thread")]
+async fn fleet_dead_still_fires_when_no_member_is_membership_alive() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(0);
+            let config = PrimaryConfig {
+                num_secondaries: 0,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_secs(60),
+                retry_max_passes: 0,
+                fleet_dead_timeout: std::time::Duration::ZERO,
+                ..test_primary_config()
+            };
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Capacity advertised, but NO PeerJoined: the id is not a live
+            // member, so it must not keep the fleet-dead arm disarmed.
+            let binaries = vec![make_binary("dead_a", 50)];
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "ghost".into(),
+                    worker_count: 2,
+                    resources: vec![dynrunner_core::ResourceAmount {
+                        kind: dynrunner_core::ResourceKind::memory(),
+                        amount: 8 * 1024 * 1024 * 1024,
+                    }],
+                });
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(dynrunner_core::PhaseId::from("default"), vec![])]),
+                });
+                for b in &binaries {
+                    cs.apply(ClusterMutation::TaskAdded {
+                        hash: crate::primary::wire::compute_task_hash(b),
+                        task: b.clone(),
+                    });
+                }
+            }
+            primary
+                .hydrate_from_cluster_state()
+                .expect("test fixture: composed task graph is valid");
+
+            primary
+                .operational_loop()
+                .await
+                .expect("operational_loop must return Ok on the fleet-dead exit path");
+
+            assert!(
+                primary.pool().is_empty(),
+                "with zero membership-alive worker-secondaries the fleet-dead \
+                 arm must still fire and drain the queued pool (cohort-3 \
+                 contract: capacity records alone are not liveness)"
+            );
+            assert!(
+                primary.failed_tasks.is_empty(),
+                "fleet-dead pending stay un-failed (stranded accounting)"
+            );
+        })
+        .await;
+}

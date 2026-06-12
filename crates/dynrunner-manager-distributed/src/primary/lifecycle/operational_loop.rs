@@ -433,9 +433,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }
 
             // Fleet-dead detection. The arming quantity is the count of
-            // alive worker-secondaries OTHER than the host this node
-            // recognizes as primary
-            // (`cluster_state.alive_remote_secondary_count()`): when it
+            // ALL alive worker-secondary members
+            // (`cluster_state.alive_worker_secondary_count()`): when it
             // reaches zero and the pool still has pending work, no living
             // secondary can dispatch the queued tasks and the loop would
             // otherwise sit forever waiting for events that never arrive.
@@ -443,19 +442,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // after `config.fleet_dead_timeout` of continuous emptiness,
             // exit cleanly with pending tasks left stranded so the
             // operator gets a clear failure rather than a silent idle.
-            // Cleared the moment a remote secondary is present again
+            // Cleared the moment an alive secondary is present again
             // (re-handshake / partial fleet survival).
             //
-            // Counting REMOTE secondaries (excluding the recognized
-            // primary by identity) is what makes the arming honest when
-            // the recognized primary also runs its own secondary: that
-            // secondary never counts, so a primary partitioned from every
-            // remote secondary arms fleet-dead and strands — it does NOT
-            // hang on the strength of its own secondary, and it does NOT
-            // stay alive against a freshly-elected primary (split-brain).
-            // For a submitter primary the recognized primary is not a
-            // worker-secondary, so the count is just "all alive
-            // worker-secondaries" — unchanged behaviour.
+            // The count includes the recognized primary's OWN co-located
+            // worker-secondary: in-process dispatch is dispatch, so a
+            // primary whose own host carries the last live workers (the
+            // lone-survivor self-quorum path) keeps working its pool
+            // instead of falsely stranding it (run_20260612_035452: the
+            // old remote-only count read a healthy one-host fleet as
+            // permanently zero and aborted mid-task). A genuinely-dead
+            // co-located secondary is removed by the keepalive sweep's
+            // unfiltered hard backstop like any other member, after which
+            // the count honestly reads zero and this arm fires. The
+            // split-brain stand-down of a superseded primary is owned by
+            // the epoch mechanisms (the `run_aborted` gate above + the
+            // demote hook on any self→other `PrimaryChanged`), never by
+            // this progress detector.
             //
             // Tokenizer surfaced the original failure on cohort-3 where
             // SSH-tunnel blips killed all 5 secondaries at once and the
@@ -469,7 +472,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // graceful tail as a strand. The graceful tick above owns the
             // drain terminal.
             if !self.cluster_state.graceful_abort_requested()
-                && self.cluster_state.alive_remote_secondary_count() == 0
+                && self.cluster_state.alive_worker_secondary_count() == 0
                 && !self.pool().is_empty()
             {
                 let now = Instant::now();
@@ -495,7 +498,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         elapsed_s = elapsed.as_secs_f64(),
                         timeout_s = self.config.fleet_dead_timeout.as_secs_f64(),
                         marking_stranded = pending.len(),
-                        "fleet-dead timeout: every remote secondary gone with non-empty pool; \
+                        "fleet-dead timeout: every worker-secondary gone with non-empty pool; \
                          pending tasks left stranded and exiting operational loop"
                     );
                     break;
