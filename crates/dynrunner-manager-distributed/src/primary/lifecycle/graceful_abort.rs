@@ -79,10 +79,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // down. Emitted at the importance target so `--important-stdio`
         // surfaces it on the primary host too (the observer narrates its
         // own copy off the replicated latch).
+        //
+        // `graceful_abort = 1` carries the same grep surface as the
+        // periodic arm-stats line (`graceful_abort=N`), providing an
+        // event-time signal for operators who cannot wait 120 s for the
+        // next stats tick (the abort completes in ~9 s and the primary
+        // relocates before the tick ever fires). Emitted exactly ONCE
+        // because this branch is only reached when the latch is NOT yet
+        // set (the idempotency check above returns early on any
+        // duplicate call).
         tracing::warn!(
             target: super::super::important_events::IMPORTANT_TARGET,
             requested_by = %requested_by,
-            "graceful abort requested — dispatch frozen; running tasks will \
+            graceful_abort = 1u32,
+            "graceful abort armed; freezing scheduling — running tasks will \
              complete, each secondary tears down as it drains, and the run \
              ends with the graceful-abort verdict"
         );
