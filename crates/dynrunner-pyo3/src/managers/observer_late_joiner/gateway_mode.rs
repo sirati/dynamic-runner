@@ -126,6 +126,10 @@ pub(super) async fn acquire_gateway_seed(
     let remote_dir_str = remote_dir.to_string_lossy().into_owned();
 
     // 1. Connect (loud: unreachable gateway names the host + cause).
+    //    Milestone 1a (LLM-wake): narrate the gateway-connect stage at
+    //    its boundary so an operator on `--important-stdio-only` sees the
+    //    late-joiner reaching the gateway before the connect blocks.
+    super::bootstrap_narration::connecting_to_gateway(&cfg.host);
     let mut gateway = SshGateway::new(cfg.clone());
     gateway.connect().await.map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -174,6 +178,9 @@ async fn acquire_over_connected_gateway(
     //    the seed — identical code path (and error shapes) to the
     //    local no-gateway mode.
     let records = read_peer_info_dir_v2(mirror.path()).map_err(map_read_dir_error)?;
+    // Milestone 1b (LLM-wake): the info-dir mirror completed — narrate
+    // how many peer records were fetched.
+    super::bootstrap_narration::fetched_peer_records(records.len());
     let mut seed = records_to_seed(&records);
     if seed.is_empty() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -208,9 +215,16 @@ async fn acquire_over_connected_gateway(
         cfg.clone(),
         gateway.control_path().map(str::to_owned),
     ));
+    // Milestone 2a (LLM-wake): narrate the dial-compute-peers stage with
+    // the requested tunnel count, at the boundary before `establish`
+    // (which gates each forward on its local port LISTENing).
+    super::bootstrap_narration::dialing_compute_peers(targets.len());
     let endpoints = tunnels.establish(&targets).await.map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("observer late-joiner: {e}"))
     })?;
+    // Milestone 2b (LLM-wake): the cohort settled — narrate how many of
+    // the requested forwards established (the registry's endpoint count).
+    super::bootstrap_narration::compute_peers_connected(endpoints.len(), targets.len());
 
     // 6. THE rewrite seam.
     rewrite_seed_for_local_forwards(&mut seed, &endpoints);

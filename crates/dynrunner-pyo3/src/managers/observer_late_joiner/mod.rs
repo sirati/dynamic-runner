@@ -74,6 +74,7 @@ use pyo3::types::PyDict;
 
 use crate::config::distributed::DistributedConfig;
 
+mod bootstrap_narration;
 mod gateway_mode;
 mod helpers;
 mod new;

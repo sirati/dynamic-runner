@@ -195,6 +195,14 @@ impl PyObserverLateJoiner {
                         // ing each (idempotent lattice) heals — the union is
                         // complete iff ANY responder (the primary above all)
                         // was complete.
+                        // Milestone 3a (LLM-wake): the bootstrap window is
+                        // opening — narrate the wait with its deadline budget
+                        // so an operator on `--important-stdio-only` knows how
+                        // long the join may block (the failure path already
+                        // errors loudly). Emitted in BOTH modes; the join
+                        // rendezvous runs identically regardless of how the
+                        // seed was acquired.
+                        super::bootstrap_narration::waiting_for_crdt(DEFAULT_JOIN_TIMEOUT);
                         let snapshot_jsons = peer_network
                             .join_running_cluster(&seed, DEFAULT_JOIN_TIMEOUT, true, false)
                             .await
@@ -218,6 +226,26 @@ impl PyObserverLateJoiner {
                         //    unions them.
                         let snaps: Vec<ClusterStateSnapshot<RunnerIdentifier>> =
                             decode_bootstrap_snapshots(&snapshot_jsons)?;
+
+                        // Milestone 3b (LLM-wake): narrate the snapshot the
+                        // join landed. `join_running_cluster` fans to every
+                        // responder and the factory `restore()`s each into
+                        // one unioned CRDT, so report the UNION of distinct
+                        // task ids + capability-roster ids across responders
+                        // (not a per-snapshot sum, which would double-count
+                        // the overlap) — the same union the restore converges.
+                        let task_ids: std::collections::HashSet<&str> = snaps
+                            .iter()
+                            .flat_map(|s| s.tasks.keys().map(String::as_str))
+                            .collect();
+                        let fleet_ids: std::collections::HashSet<&str> = snaps
+                            .iter()
+                            .flat_map(|s| s.capabilities.keys().map(String::as_str))
+                            .collect();
+                        super::bootstrap_narration::crdt_snapshot_received(
+                            task_ids.len(),
+                            fleet_ids.len(),
+                        );
 
                         // 4. Build the standalone observer's config. No
                         //    scheduler / worker / dispatch fields — an observer
