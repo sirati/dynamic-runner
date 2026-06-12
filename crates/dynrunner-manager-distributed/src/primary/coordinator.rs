@@ -2463,6 +2463,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .expect("PendingPool initialised at run() start")
     }
 
+    /// The pool's earliest queued-task re-dispatch backoff expiry (see
+    /// [`PendingPool::next_dispatch_backoff_expiry`]), or `None` when
+    /// nothing is parked OR the pool is not yet initialised (the
+    /// operational loop's backoff wake arm then parks forever, same as
+    /// every other disabled-arm shape).
+    pub(super) fn next_task_dispatch_backoff_expiry(&mut self) -> Option<std::time::Instant> {
+        self.pending
+            .as_mut()
+            .and_then(|p| p.next_dispatch_backoff_expiry())
+    }
+
     /// Build the dispatch-shape worker view for the worker at
     /// `worker_idx`. The pipeline is:
     ///

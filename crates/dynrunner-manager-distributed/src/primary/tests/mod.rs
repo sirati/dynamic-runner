@@ -35,6 +35,7 @@ mod hydrate;
 mod incremental_setup;
 mod initial_assignment;
 mod injected_spread;
+mod instant_crash_run;
 mod invalidation_abort;
 mod mesh_readiness_gate;
 mod message_phase_ordering;
@@ -449,13 +450,40 @@ pub(super) fn spawn_real_secondary_flaky(
 ) -> (
     tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    tokio::task::JoinHandle<usize>,
+) {
+    spawn_real_secondary_with_factory(
+        secondary_id,
+        num_workers,
+        max_resources,
+        flaky,
+        retry_max_passes,
+    )
+}
+
+/// As [`spawn_real_secondary_flaky`] but generic over the worker
+/// factory, so scenario tests can drive the REAL secondary with any
+/// scripted worker behaviour (e.g. the crash-at-typed-spawn factory).
+pub(super) fn spawn_real_secondary_with_factory<F>(
+    secondary_id: String,
+    num_workers: u32,
+    max_resources: dynrunner_core::ResourceMap,
+    factory: F,
+    retry_max_passes: u32,
+) -> (
+    tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
     // Returns the secondary's OWN-worker run count. The authoritative
     // retry-cascade counters (completed / failed-residual / passes-used)
     // live on the PRIMARY now — retry tests read them via the primary's
     // `completed_count()` / `failed_count()` / `retry_passes_used_for_test()`
     // before dropping the primary, not from this secondary handle.
     tokio::task::JoinHandle<usize>,
-) {
+)
+where
+    F: dynrunner_manager_local::WorkerFactory<dynrunner_transport_channel::ChannelManagerEnd>
+        + 'static,
+{
     let (pri_to_sec_tx, sec_to_pri_rx, transport) = channel_mesh_secondary_ends(&secondary_id);
 
     let handle = tokio::task::spawn_local(async move {
@@ -494,7 +522,7 @@ pub(super) fn spawn_real_secondary_flaky(
             memuse_log_path: None,
             forwarded_argv: Vec::new(),
         };
-        run_secondary_node(config, transport, flaky).await
+        run_secondary_node(config, transport, factory).await
     });
 
     (pri_to_sec_tx, sec_to_pri_rx, handle)

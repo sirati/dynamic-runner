@@ -866,6 +866,79 @@ where
         self.send_to_primary(msg).await
     }
 
+    /// Report a deferred (first-bind) task whose worker died BY ITS
+    /// OWN FAULT before the task could run — the worker was spawned ON
+    /// BEHALF of this task and self-destructed (nonzero self-exit,
+    /// deterministic-bug signal, OOM kill), so the spawn IS the task's
+    /// execution attempt and it COUNTS against the task's retry
+    /// budget. The charged twin of [`Self::report_deferred_task_lost`]:
+    /// a regular terminal `TaskFailed` whose `error_message` is the
+    /// death diagnosis — NEVER a marker the authority's
+    /// `is_backpressure` predicate recognises — so the authority's
+    /// `failed_tasks` → retry-bucket → permanence accounting sees the
+    /// attempt (asm-tokenizer run_20260612_095601: the uncharged
+    /// requeue here is what let one broken-args task re-dispatch
+    /// 24,323 times with fail counters flat at zero).
+    ///
+    /// CLASS-1 own-worker report; the authority owns all accounting.
+    pub(in crate::secondary) async fn report_deferred_task_failed(
+        &mut self,
+        worker_id: WorkerId,
+        file_hash: &str,
+        error_type: ErrorType,
+        error_message: String,
+    ) -> Result<(), String> {
+        let msg = DistributedMessage::TaskFailed {
+            target: None,
+            sender_id: self.config.secondary_id.clone(),
+            timestamp: timestamp_now(),
+            secondary_id: self.config.secondary_id.clone(),
+            worker_id,
+            task_hash: file_hash.to_string(),
+            error_type,
+            error_message,
+            // Stamped at the send_to_primary chokepoint (#352).
+            delivery_seq: None,
+            // Stamped at the send_to_primary chokepoint (ordering gate).
+            msgs_posted_through: None,
+        };
+        self.send_to_primary(msg).await
+    }
+
+    /// Drain a `pending_first_bind[worker_id]` stash (if any) into the
+    /// CHARGED terminal path: the slot's subprocess died by its own
+    /// fault while this deferred task was awaiting its `Ready`, so the
+    /// loss counts against the task's retry budget (see
+    /// [`Self::report_deferred_task_failed`]). The fault-attributed
+    /// sibling of [`Self::reinject_pending_first_bind`]; the
+    /// `Disconnected` arm picks between the two on the
+    /// [`dynrunner_manager_local::oom::DisconnectFault`] verdict.
+    /// Returns `true` iff a stash WAS drained (same contract as the
+    /// no-fault sibling).
+    pub(in crate::secondary) async fn fail_pending_first_bind(
+        &mut self,
+        worker_id: WorkerId,
+        error_type: ErrorType,
+        error_message: String,
+    ) -> Result<bool, String> {
+        if let Some(pending) = self.op_mut().pending_first_bind.remove(&worker_id) {
+            let pending_hash = pending.file_hash.clone();
+            tracing::warn!(
+                worker_id,
+                task_hash = %pending_hash,
+                error_type = ?error_type,
+                error = %error_message,
+                "worker died by its own fault while a first-bind task was \
+                 deferred awaiting Ready; reporting the deferred task as a \
+                 COUNTED failure (charges its retry budget)"
+            );
+            self.report_deferred_task_failed(worker_id, &pending_hash, error_type, error_message)
+                .await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Recover whatever a worker slot held before its subprocess is
     /// REPLACED — covering BOTH places a slot's work can live: the
     /// running task in `active_tasks` AND the deferred-awaiting-Ready
