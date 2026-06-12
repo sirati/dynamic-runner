@@ -58,8 +58,8 @@ pub use snapshot::ClusterStateSnapshot;
 pub use state::ClusterState;
 pub use types::{
     ApplyOutcome, CapabilityEntry, CustomMsgState, OutcomeSummary, PeerMembership,
-    PeerReadmission, PhaseRollup, PhaseTally, PhaseTaskPartition, RespawnEventRecord,
-    RoleChangeHook, StateCounts, TaskState,
+    PeerReadmission, PhaseRollup, PhaseTally, PhaseTaskPartition, ReplicatedRespawnPolicy,
+    RespawnEventRecord, RoleChangeHook, StateCounts, TaskState,
 };
 // `DiscoveryDebt` is the wire-format value type for the discovery-debt
 // field; it lives in the protocol crate (it crosses the wire inside

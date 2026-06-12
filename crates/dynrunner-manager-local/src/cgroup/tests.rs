@@ -5,7 +5,7 @@
 //! exercise:
 //!
 //!   * Happy path: creates `workers/`, enables controllers, writes
-//!     tightened `memory.max`, resets `memory.swap.max` to "max".
+//!     tightened `memory.max`, caps `memory.swap.max` to "0" (best-effort).
 //!   * Graceful fallback: cgroup-v1 host, missing memory controller,
 //!     non-writable subtree_control, and any write-phase error. Each
 //!     returns `None` (the orchestrator is infallible).
@@ -74,9 +74,10 @@ fn write_workers_subgroup_happy_path() {
     let mem_max = std::fs::read_to_string(workers_path.join("memory.max")).unwrap();
     assert_eq!(mem_max.trim(), "3770679296");
 
-    // memory.swap.max forced to "max".
+    // memory.swap.max capped to "0" — workers must not swap (a
+    // swapping worker is a death spiral the watcher reads as relief).
     let swap_max = std::fs::read_to_string(workers_path.join("memory.swap.max")).unwrap();
-    assert_eq!(swap_max.trim(), "max");
+    assert_eq!(swap_max.trim(), "0");
 }
 
 #[test]
@@ -105,9 +106,10 @@ fn write_workers_subgroup_parent_unlimited_skips_memory_max() {
         !workers_path.join("memory.max").exists(),
         "workers/memory.max should not be written when parent is unlimited"
     );
-    // But swap.max is still forced (cgroup-v2 children default to 0).
+    // But swap.max is still capped to zero — the no-swap policy is
+    // independent of whether the parent has a concrete RAM cap.
     let swap = std::fs::read_to_string(workers_path.join("memory.swap.max")).unwrap();
-    assert_eq!(swap.trim(), "max");
+    assert_eq!(swap.trim(), "0");
 }
 
 #[test]
@@ -496,7 +498,7 @@ fn prepare_worker_subgroup_creates_leaf_with_swap_max() {
     assert_eq!(sub.cgroup_dir(), expected);
     assert!(expected.is_dir(), "per-worker leaf should be a directory");
     let swap = std::fs::read_to_string(expected.join("memory.swap.max")).unwrap();
-    assert_eq!(swap.trim(), "max");
+    assert_eq!(swap.trim(), "0");
     // Intentional: NO memory.max on per-worker leaf (observability
     // only; aggregate cap lives on the parent workers/).
     assert!(
@@ -614,4 +616,102 @@ fn subcgroup_handle_drop_silent_on_already_gone() {
 
     drop(sub); // must not panic.
     assert!(!leaf_dir.exists());
+}
+
+/// Capture every event at target `cgroup_swap_cap`, recording its
+/// level, so the swap-cap tolerance tests can assert the "info once
+/// per process, debug per occurrence" contract.
+#[derive(Clone, Default)]
+struct SwapCapLogCapture {
+    events: std::sync::Arc<std::sync::Mutex<Vec<tracing::Level>>>,
+}
+
+impl SwapCapLogCapture {
+    fn count_at(&self, level: tracing::Level) -> usize {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| **l == level)
+            .count()
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SwapCapLogCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if event.metadata().target() != "cgroup_swap_cap" {
+            return;
+        }
+        self.events.lock().unwrap().push(*event.metadata().level());
+    }
+}
+
+/// The swap-cap write tolerance contract, on BOTH write sites
+/// (workers/ subgroup and per-worker leaf): a host where the
+/// `memory.swap.max` write fails (EOPNOTSUPP / EBUSY in rootless
+/// podman; simulated here with an EISDIR fixture — the policy
+/// deliberately ignores the errno family) must NOT degrade the
+/// nested setup. The orchestration succeeds, `memory.max` is still
+/// tightened, the per-worker leaf is still created, and the failure
+/// logs once at info (process-global, Once-gated) plus
+/// per-occurrence at debug.
+///
+/// Deliberately ONE test: these are the only call sites in the
+/// binary that drive `cap_swap_best_effort` down its failure branch,
+/// so keeping them in a single (sequential) test makes the info/debug
+/// counts exact. Split across parallel tests, the first hit on the
+/// failure-branch tracing callsites can race their registration from
+/// a subscriber-less sibling thread (events silently dropped) and
+/// the Once is consumed by whichever test runs first.
+#[test]
+fn swap_cap_write_failure_is_non_fatal_and_logged_once() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let leaf = make_fake_leaf(root.path(), "memory pids\n", "1073741824\n");
+    // Pre-create memory.swap.max as a DIRECTORY so fs::write fails.
+    std::fs::create_dir_all(leaf.join("workers").join("memory.swap.max")).unwrap();
+
+    let capture = SwapCapLogCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        // Two setup passes, both hitting the unwritable swap file.
+        let first = super::writer::write_workers_subgroup(&leaf, 0)
+            .expect("swap-cap write failure must not fail the setup");
+        let second = super::writer::write_workers_subgroup(&leaf, 0)
+            .expect("swap-cap write failure must stay non-fatal on re-run");
+        assert_eq!(first, second);
+        // The rest of the setup still happened: memory.max written.
+        let mem_max = std::fs::read_to_string(first.join("memory.max")).unwrap();
+        assert_eq!(mem_max.trim(), "1073741824");
+
+        // Same tolerance on the per-worker leaf: pre-create its
+        // memory.swap.max as a directory; leaf creation must still
+        // succeed so the spawn proceeds.
+        std::fs::create_dir_all(first.join("worker-9").join("memory.swap.max")).unwrap();
+        let handle = NestedCgroupHandle {
+            workers_path: first,
+        };
+        let sub = super::prepare_worker_subgroup(&handle, 9)
+            .expect("per-worker swap-cap failure must not fail leaf creation");
+        assert!(sub.cgroup_dir().is_dir());
+        std::mem::forget(sub);
+    });
+
+    // Exactly one operator-visible info line (Once-gated across the
+    // three failures above) and one debug trace per occurrence.
+    assert_eq!(
+        capture.count_at(tracing::Level::INFO),
+        1,
+        "the operator-visible info line is Once-gated"
+    );
+    assert_eq!(
+        capture.count_at(tracing::Level::DEBUG),
+        3,
+        "each swap-cap write failure must leave a debug trace"
+    );
 }

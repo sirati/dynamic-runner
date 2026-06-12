@@ -343,9 +343,11 @@ impl Drop for SubcgroupHandle {
 ///
 /// `parent` is the existing handle pointing at `<workers>/`. The leaf
 /// inherits `<workers>/memory.max` (no per-worker enforcement cap by
-/// design — observability only). `memory.swap.max` is forced to
-/// `"max"` on the leaf for the same load-bearing reason it's forced
-/// on the parent (cgroup-v2 children default to zero-swap).
+/// design — observability only). `memory.swap.max` is capped to `"0"`
+/// on the leaf (best-effort) for the same policy reason it's capped
+/// on the parent: the worker's working set must stay fully resident —
+/// swap is a death spiral, not headroom (see
+/// `writer::cap_swap_best_effort`).
 ///
 /// Idempotent: re-running with the same `worker_id` against an
 /// already-materialised leaf is a no-op (`create_dir_all` re-entrant,

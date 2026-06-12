@@ -1025,3 +1025,159 @@ fn legacy_redial_request_without_attempts_decodes_zero() {
         _ => panic!("expected RedialRequest"),
     }
 }
+
+/// Wire-shape mirror (NOT symmetric-on-the-wrong-shape): decode the
+/// EXACT JSON bytes a relocated/promoted primary emits for a
+/// `RespawnSpawnRequest` — internally tagged, snake_case, with the
+/// primary-minted replacement id that doubles as the correlation +
+/// idempotency key — rather than re-encoding our own value, so a
+/// tag/field rename that still round-trips against itself is caught
+/// against the other side's actual bytes.
+#[test]
+fn respawn_spawn_request_decodes_literal_sender_bytes() {
+    let wire = br#"{"msg_type":"respawn_spawn_request","sender_id":"secondary-2","timestamp":7.5,"new_secondary_id":"secondary-5","primary_endpoint":"10.0.0.7:5555","primary_pubkey_pem":"-----BEGIN PUBLIC KEY-----\nA\n-----END PUBLIC KEY-----\n"}"#;
+    let decoded: DistributedMessage<TestId> = deserialize_message(wire).unwrap();
+    match decoded {
+        DistributedMessage::RespawnSpawnRequest {
+            sender_id,
+            new_secondary_id,
+            primary_endpoint,
+            primary_pubkey_pem,
+            ..
+        } => {
+            assert_eq!(sender_id, "secondary-2");
+            assert_eq!(new_secondary_id, "secondary-5");
+            assert_eq!(primary_endpoint, "10.0.0.7:5555");
+            assert!(primary_pubkey_pem.starts_with("-----BEGIN"));
+        }
+        _ => panic!("expected RespawnSpawnRequest"),
+    }
+}
+
+/// The sender-side bytes of a `RespawnSpawnRequest` carry the exact
+/// snake_case tag + fields the observer-side decode above mirrors —
+/// pinning the two directions against EACH OTHER (a serializer-side
+/// rename now fails this test, a decoder-side rename fails the mirror).
+#[test]
+fn respawn_spawn_request_serializes_expected_wire_bytes() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::RespawnSpawnRequest {
+        target: None,
+        sender_id: "secondary-2".into(),
+        timestamp: 7.5,
+        new_secondary_id: "secondary-5".into(),
+        primary_endpoint: "10.0.0.7:5555".into(),
+        primary_pubkey_pem: "PEM".into(),
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    assert_eq!(
+        json,
+        r#"{"msg_type":"respawn_spawn_request","sender_id":"secondary-2","timestamp":7.5,"new_secondary_id":"secondary-5","primary_endpoint":"10.0.0.7:5555","primary_pubkey_pem":"PEM"}"#,
+    );
+}
+
+/// Wire-shape mirror for the SUCCESS result: the EXACT bytes the
+/// provider-host observer emits — `error` elided entirely on success
+/// (`skip_serializing_if`), so the decoder must default it to `None`.
+#[test]
+fn respawn_spawn_result_success_decodes_literal_sender_bytes() {
+    let wire = br#"{"msg_type":"respawn_spawn_result","sender_id":"setup","timestamp":9.0,"new_secondary_id":"secondary-5"}"#;
+    let decoded: DistributedMessage<TestId> = deserialize_message(wire).unwrap();
+    match decoded {
+        DistributedMessage::RespawnSpawnResult {
+            sender_id,
+            new_secondary_id,
+            error,
+            ..
+        } => {
+            assert_eq!(sender_id, "setup");
+            assert_eq!(new_secondary_id, "secondary-5");
+            assert_eq!(error, None, "elided error field must decode as success");
+        }
+        _ => panic!("expected RespawnSpawnResult"),
+    }
+}
+
+/// Wire-shape mirror for the FAILURE result: the provider error string
+/// rides back verbatim and feeds the primary's budget/logging exactly
+/// as a local provider `Err` does.
+#[test]
+fn respawn_spawn_result_error_decodes_literal_sender_bytes() {
+    let wire = br#"{"msg_type":"respawn_spawn_result","sender_id":"setup","timestamp":9.0,"new_secondary_id":"secondary-5","error":"sbatch: gateway unreachable"}"#;
+    let decoded: DistributedMessage<TestId> = deserialize_message(wire).unwrap();
+    match decoded {
+        DistributedMessage::RespawnSpawnResult {
+            new_secondary_id,
+            error,
+            ..
+        } => {
+            assert_eq!(new_secondary_id, "secondary-5");
+            assert_eq!(error.as_deref(), Some("sbatch: gateway unreachable"));
+        }
+        _ => panic!("expected RespawnSpawnResult"),
+    }
+}
+
+/// The success result serializes WITHOUT the `error` key (the byte
+/// shape the success mirror above decodes) — pinning the elision.
+#[test]
+fn respawn_spawn_result_serializes_expected_wire_bytes() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::RespawnSpawnResult {
+        target: None,
+        sender_id: "setup".into(),
+        timestamp: 9.0,
+        new_secondary_id: "secondary-5".into(),
+        error: None,
+    };
+    let json = serde_json::to_string(&msg).unwrap();
+    assert_eq!(
+        json,
+        r#"{"msg_type":"respawn_spawn_result","sender_id":"setup","timestamp":9.0,"new_secondary_id":"secondary-5"}"#,
+    );
+}
+
+/// Wire-shape mirror: the EXACT bytes a primary emits to revoke a
+/// still-pending replacement (its original re-admitted).
+#[test]
+fn respawn_revoke_request_decodes_literal_sender_bytes() {
+    let wire = br#"{"msg_type":"respawn_revoke_request","sender_id":"secondary-2","timestamp":3.25,"new_secondary_id":"secondary-5"}"#;
+    let decoded: DistributedMessage<TestId> = deserialize_message(wire).unwrap();
+    match decoded {
+        DistributedMessage::RespawnRevokeRequest {
+            sender_id,
+            new_secondary_id,
+            ..
+        } => {
+            assert_eq!(sender_id, "secondary-2");
+            assert_eq!(new_secondary_id, "secondary-5");
+        }
+        _ => panic!("expected RespawnRevokeRequest"),
+    }
+}
+
+/// Wire-shape mirror for the revoke outcome, error polarity included
+/// (an `Err` means the provider could not reach its backend; the
+/// primary logs loudly and the teardown sweep reclaims).
+#[test]
+fn respawn_revoke_result_decodes_literal_sender_bytes() {
+    let ok_wire = br#"{"msg_type":"respawn_revoke_result","sender_id":"setup","timestamp":4.0,"new_secondary_id":"secondary-5"}"#;
+    let decoded: DistributedMessage<TestId> = deserialize_message(ok_wire).unwrap();
+    match decoded {
+        DistributedMessage::RespawnRevokeResult {
+            new_secondary_id,
+            error,
+            ..
+        } => {
+            assert_eq!(new_secondary_id, "secondary-5");
+            assert_eq!(error, None);
+        }
+        _ => panic!("expected RespawnRevokeResult"),
+    }
+    let err_wire = br#"{"msg_type":"respawn_revoke_result","sender_id":"setup","timestamp":4.0,"new_secondary_id":"secondary-5","error":"scancel: ssh transport failure"}"#;
+    let decoded: DistributedMessage<TestId> = deserialize_message(err_wire).unwrap();
+    match decoded {
+        DistributedMessage::RespawnRevokeResult { error, .. } => {
+            assert_eq!(error.as_deref(), Some("scancel: ssh transport failure"));
+        }
+        _ => panic!("expected RespawnRevokeResult"),
+    }
+}

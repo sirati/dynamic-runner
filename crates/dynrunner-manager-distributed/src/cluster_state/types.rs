@@ -391,6 +391,31 @@ pub struct RespawnEventRecord {
     pub at: std::time::SystemTime,
 }
 
+/// The replicated respawn-policy CAPS (the `--respawn-policy=
+/// on-secondary-death` knobs), set once per run by the submitter
+/// primary via `ClusterMutation::RespawnPolicySet` in the same seed
+/// batch as `PhaseDepsSet` (same run-constant lifecycle).
+///
+/// The sibling [`RespawnEventRecord`] ledger replicates the budget's
+/// SPEND; this replicates the budget's CAPS — together they make the
+/// respawn DECISION fully failover-portable: a promoted primary reads
+/// `Some(policy)` at hydrate and re-arms the respawn pipeline (its
+/// execution delegated over the mesh to the provider-host process).
+/// `None` everywhere means the run launched with the policy disabled.
+///
+/// Merge: set-once / first-write-wins (the policy is run-constant) —
+/// the apply rule NoOps a re-application and `restore` adopts the
+/// snapshot value only when local is `None`, mirroring
+/// `phase_may_be_empty`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicatedRespawnPolicy {
+    pub max_per_secondary: u32,
+    pub max_total: u32,
+    /// Cooldown between accepted respawns of the same family, in
+    /// milliseconds (the integer wire shape `RespawnPolicySet` carries).
+    pub cooldown_ms: u64,
+}
+
 /// Per-message state in the replicated custom-message inbox (F5),
 /// keyed by the per-origin `(origin, seq)` idempotency pair.
 ///
