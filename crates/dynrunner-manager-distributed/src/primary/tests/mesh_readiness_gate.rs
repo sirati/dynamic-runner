@@ -359,3 +359,178 @@ async fn first_dispatch_to_unconfirmed_member_is_withheld_until_mesh_ready() {
         })
         .await;
 }
+
+/// Lone-survivor / co-located member (run_20260612_035452): the member
+/// whose peer-id IS this primary's host needs no `MeshReady` round-trip
+/// — its frames ride the in-process loopback (`Mesh::deliver_local`),
+/// so there is no wire leg for a `MeshReady` to prove. The gate must
+/// treat co-location as structural confirmation (the same self rule
+/// `wait_for_mesh_ready` already applies to its expected set: "a node
+/// never emits MeshReady ABOUT ITSELF to itself").
+///
+/// Production shape: a bootstrap handoff promoted `secondary-1` into a
+/// fleet whose ONLY live member was its own host. The promoted
+/// primary's confirmation set starts empty, the self-MeshReady only
+/// lands once the co-located secondary finishes consuming the setup
+/// trio, and until then every proactive recheck vetoed the ONLY
+/// dispatchable workers ("member remains unassignable until its mesh
+/// leg confirms").
+#[tokio::test(flavor = "current_thread")]
+async fn co_located_member_is_assignable_without_mesh_ready() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(1);
+            // The promoted-primary shape: this primary RUNS ON the
+            // member's host — node_id == the member's peer-id.
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig {
+                    node_id: ends[0].0.clone(),
+                    ..test_primary_config()
+                },
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let own_id = ends[0].0.clone();
+
+            let t0 = one_task("lone0");
+            let t1 = one_task("lone1");
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(PhaseId::from("p"), vec![])]),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: compute_task_hash(&t0),
+                    task: t0,
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: compute_task_hash(&t1),
+                    task: t1,
+                });
+            }
+            primary
+                .hydrate_from_cluster_state()
+                .expect("test fixture: composed task graph is valid");
+            let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
+            primary.register_idle_worker_for_test(own_id.clone(), 0, budget.clone());
+            primary.register_idle_worker_for_test(own_id.clone(), 1, budget);
+
+            // The production promoted-primary state: NO MeshReady has
+            // landed from anyone — the confirmation set is empty.
+            primary.mark_member_mesh_unconfirmed_for_test(&own_id);
+
+            run_dispatch_recheck(&mut primary).await;
+            settle_pump().await;
+
+            let mut got = assigned_ids(&mut ends[0].1);
+            got.sort();
+            assert_eq!(
+                got,
+                vec!["lone0".to_string(), "lone1".to_string()],
+                "the co-located member's workers must be assignable WITHOUT a \
+                 MeshReady round-trip — its mesh leg to the primary is the \
+                 in-process loopback (the lone-survivor self-quorum path must \
+                 actually dispatch)"
+            );
+            assert_eq!(
+                primary.pool().iter().count(),
+                0,
+                "no task may sit queued while the co-located member's workers idle"
+            );
+        })
+        .await;
+}
+
+/// The co-location rule must not leak: in a MULTI-member fleet the
+/// REMOTE members keep the existing gate semantics — a remote member
+/// without a landed `MeshReady` stays unassignable (the strand
+/// prevention), while the co-located member dispatches immediately.
+#[tokio::test(flavor = "current_thread")]
+async fn co_located_rule_does_not_lift_gate_for_remote_members() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(2);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig {
+                    node_id: ends[0].0.clone(),
+                    ..test_primary_config()
+                },
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let own_id = ends[0].0.clone();
+            let remote_id = ends[1].0.clone();
+
+            let t0 = one_task("m0");
+            let t1 = one_task("m1");
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(PhaseId::from("p"), vec![])]),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: compute_task_hash(&t0),
+                    task: t0,
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: compute_task_hash(&t1),
+                    task: t1,
+                });
+            }
+            primary
+                .hydrate_from_cluster_state()
+                .expect("test fixture: composed task graph is valid");
+            let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
+            primary.register_idle_worker_for_test(own_id.clone(), 0, budget.clone());
+            primary.register_idle_worker_for_test(remote_id.clone(), 0, budget);
+
+            // Neither member has a landed MeshReady.
+            primary.mark_member_mesh_unconfirmed_for_test(&own_id);
+            primary.mark_member_mesh_unconfirmed_for_test(&remote_id);
+
+            run_dispatch_recheck(&mut primary).await;
+            settle_pump().await;
+
+            let own_got = assigned_ids(&mut ends[0].1);
+            assert_eq!(
+                own_got.len(),
+                1,
+                "the co-located member's single idle worker takes one task \
+                 (structurally confirmed); got {own_got:?}"
+            );
+            assert!(
+                assigned_ids(&mut ends[1].1).is_empty(),
+                "the REMOTE unconfirmed member keeps the existing gate \
+                 semantics: NO proactive push until its MeshReady lands"
+            );
+            assert!(
+                primary.slot_is_idle_for_test(&remote_id, 0),
+                "the remote member's worker stays idle while unconfirmed"
+            );
+
+            // The remote member's MeshReady lands — the queued task flows
+            // to it (the unchanged late-join recovery).
+            primary.handle_mesh_ready(DistributedMessage::MeshReady {
+                target: None,
+                sender_id: remote_id.clone(),
+                timestamp: 0.0,
+                secondary_id: remote_id.clone(),
+                peer_count: 1,
+            });
+            run_dispatch_recheck(&mut primary).await;
+            settle_pump().await;
+
+            let remote_got = assigned_ids(&mut ends[1].1);
+            assert_eq!(
+                remote_got.len(),
+                1,
+                "after its MeshReady lands the remote member receives the \
+                 queued task; got {remote_got:?}"
+            );
+        })
+        .await;
+}

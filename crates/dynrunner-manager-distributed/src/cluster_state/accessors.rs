@@ -693,37 +693,32 @@ impl<I: Identifier> ClusterState<I> {
             .filter(move |id| self.is_peer_alive(id))
     }
 
-    /// Count of [`Self::alive_secondary_members`] that are NOT the
-    /// recognized primary ([`Self::current_primary`]). The fleet-liveness
-    /// quantity the primary's operational loop arms fleet-dead on: it
-    /// answers "are there any alive worker-secondaries OTHER than the
-    /// host I currently recognize as primary".
+    /// Count of [`Self::alive_secondary_members`] — the fleet-liveness
+    /// quantity the primary's operational loop arms fleet-dead on. It
+    /// answers "is there ANY alive worker-secondary this primary can
+    /// dispatch to": a remote member receives dispatch over the wire, the
+    /// primary's own co-located member (the same-peer worker-secondary of
+    /// a promoted/compute-peer primary) receives it through the in-process
+    /// loopback — both are dispatch capacity, so NEITHER is excluded.
     ///
-    /// The `id != current_primary` cut is the single thing that
-    /// distinguishes this from the raw `alive_secondary_members` count,
-    /// and it is exactly what excludes the recognized primary's OWN
-    /// same-peer secondary capability. When the peer that is recognized as
-    /// primary also advertises a worker-secondary under that same peer-id,
-    /// its id IS `current_primary` AND appears in `alive_secondary_members`.
-    /// The filter excludes that single same-peer entry by IDENTITY — never
-    /// by a magic string and never by counting its own workers — so the
-    /// count drops to zero exactly when every OTHER worker-secondary is
-    /// gone, even though the recognized primary's own secondary is still
-    /// alive. That is the fleet-dead arming condition (run cannot make
-    /// progress) without the split-brain hazard of keeping a superseded
-    /// primary alive on the strength of its own same-peer secondary.
-    ///
-    /// When the recognized primary advertises no worker-secondary under its
-    /// peer-id, it is absent from `alive_secondary_members` and the filter
-    /// is a no-op — the count is simply "all alive worker-secondaries". A
-    /// `None` `current_primary` (pre-`PrimaryChanged`) makes the
-    /// `Some(id) != None` filter universally true, so it is likewise a
-    /// no-op.
-    pub fn alive_remote_secondary_count(&self) -> usize {
-        let current_primary = self.current_primary();
-        self.alive_secondary_members()
-            .filter(|id| Some(*id) != current_primary)
-            .count()
+    /// This deliberately carries NO `id != current_primary` cut. The cut
+    /// once excluded the recognized primary's own same-peer secondary so a
+    /// primary partitioned from every remote would strand-and-exit rather
+    /// than run on its own host — a split-brain worry that is OWNED
+    /// ELSEWHERE: a superseding `PrimaryChanged` fires the demote hook the
+    /// moment it reaches this node, and a replicated `RunAborted` verdict
+    /// stands the loop down at its top. What the cut actually did in
+    /// production (run_20260612_035452) was read a lone-survivor fleet —
+    /// whose ONLY live member was the acting primary's own host, the
+    /// owner-supported self-quorum path — as permanently zero and abort a
+    /// healthy run at the fleet-dead timeout while the co-located workers
+    /// were mid-task. Death of the co-located member is still detected by
+    /// the same machinery as everyone else's: the keepalive sweep's hard
+    /// backstop is deliberately unfiltered, its removal flips the
+    /// membership ledger to `Dead`, and this count then honestly reads
+    /// zero.
+    pub fn alive_worker_secondary_count(&self) -> usize {
+        self.alive_secondary_members().count()
     }
 
     /// Total advertised worker-slot count across every secondary with a

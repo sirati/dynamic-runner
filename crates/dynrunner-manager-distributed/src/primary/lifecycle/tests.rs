@@ -854,19 +854,19 @@ async fn unfulfillable_reinjected_task_can_use_retry_pass() {
         .await;
 }
 
-// ── Fleet-dead arming on `alive_remote_secondary_count` ──────────────
+// ── Fleet-dead arming on `alive_worker_secondary_count` ──────────────
 //
 // These tests pin the honest-liveness arming quantity: the primary arms
-// fleet-dead when the count of alive worker-secondaries OTHER than the
-// host it recognizes as primary reaches zero (with a non-empty pool).
-// The condition reads `cluster_state.alive_remote_secondary_count()`, so
+// fleet-dead when the count of ALL alive worker-secondary members —
+// the recognized primary's own co-located member included — reaches
+// zero (with a non-empty pool). The condition reads
+// `cluster_state.alive_worker_secondary_count()`, so
 // the fixtures seed the replicated `cluster_state` via the real apply
 // path (`PeerJoined` → Alive, `SecondaryCapacity` → the capacity record
 // `alive_secondary_members` reads, `PrimaryChanged` → `current_primary`,
 // `PeerRemoved` → Dead) rather than touching the primary-local
 // `secondaries` map (which the OLD `secondaries.is_empty()` condition
-// keyed off — exactly the field that left a primary running its own
-// secondary unable to ever arm).
+// keyed off).
 
 /// Seed ONE worker-secondary into the coordinator's replicated
 /// `cluster_state`: `PeerJoined` (→ Alive) + `SecondaryCapacity` (→ the
@@ -965,71 +965,85 @@ fn make_fleet_coordinator(
     )
 }
 
-/// (a) A primary running its own secondary, partitioned from EVERY
-/// remote worker-secondary, arms fleet-dead and strands — even though its
-/// OWN secondary is still alive in the cluster ledger. This is the
-/// split-brain-safety invariant: the primary's own secondary (whose id IS
-/// `current_primary`) must NOT keep it alive, because a freshly-elected
-/// primary may already be running the real cluster. The OLD
-/// `secondaries.is_empty()` condition could never trip here (the own
-/// secondary lives in the primary-local map), so the run hung; the
-/// count-based condition arms correctly.
-#[tokio::test(flavor = "current_thread")]
-async fn primary_strands_when_only_own_secondary_alive() {
+/// (a) A primary running its own secondary, with EVERY remote
+/// worker-secondary dead, must NOT arm fleet-dead: its own co-located
+/// member is an alive worker-secondary it dispatches to in-process, so
+/// the run keeps working (the lone-survivor self-quorum path,
+/// run_20260612_035452 — the old identity cut read this fleet as
+/// permanently zero and aborted a healthy run mid-task). The
+/// split-brain stand-down of a superseded primary is owned by the epoch
+/// mechanisms (`run_aborted` gate + the demote hook on a self→other
+/// `PrimaryChanged`), never by this progress detector; a genuinely-dead
+/// co-located secondary is removed by the keepalive sweep's unfiltered
+/// hard backstop, after which the count honestly reads zero (the
+/// fleet-empty arming is pinned by (c) below).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn primary_keeps_working_when_only_own_secondary_alive() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            // Zero timeout so the very first loop iteration's
-            // `elapsed >= fleet_dead_timeout` predicate trips.
-            let (mut primary, _mesh) = make_fleet_coordinator(Duration::ZERO);
+            // Hold an inbound sender so `recv_peer` parks (the loop
+            // genuinely blocks rather than exiting on a closed transport),
+            // mirroring `healthy_fleet_does_not_arm_fleet_dead`.
+            let (transport, secondary_ends) = setup_test(1);
+            let _inbound_keepalive = secondary_ends; // hold the incoming_tx clone
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig {
+                    node_id: "setup".into(),
+                    num_secondaries: 1,
+                    // Were the arm reachable it would fire instantly under
+                    // paused time — but it must never arm: the co-located
+                    // member keeps the count at 1.
+                    fleet_dead_timeout: Duration::ZERO,
+                    keepalive_interval: Duration::from_secs(3600),
+                    ..Default::default()
+                },
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
             // The host advertises BOTH a worker-secondary under its own id
-            // ("primary") AND is the recognized primary.
+            // AND is the recognized primary.
             seed_cluster_secondary(&mut primary, "setup", 4);
             set_current_primary(&mut primary, "setup");
-            // A remote secondary that has since died (partition).
+            // A remote secondary that has since died.
             seed_cluster_secondary(&mut primary, "sec-0", 4);
             kill_cluster_secondary(&mut primary, "sec-0");
 
             // Fixture preconditions: the OWN secondary IS an alive
-            // worker-secondary, but the REMOTE count is zero (the own
-            // entry is excluded by the `id != current_primary` filter).
+            // worker-secondary and it counts — in-process dispatch is
+            // dispatch.
             let state = primary.cluster_state_for_test();
             assert!(
                 state.alive_secondary_members().any(|id| id == "setup"),
                 "the own secondary must be an alive worker-secondary"
             );
             assert_eq!(
-                state.alive_remote_secondary_count(),
-                0,
-                "every REMOTE worker-secondary is gone; only the own \
-                 secondary remains, which the filter excludes"
+                state.alive_worker_secondary_count(),
+                1,
+                "the co-located member keeps the fleet alive: every remote \
+                 worker-secondary is gone but the own host still dispatches"
             );
 
             prime_pool_with_queued(&mut primary, 3);
 
-            primary
-                .operational_loop()
-                .await
-                .expect("operational_loop returns Ok on the fleet-dead exit");
-
-            // Armed + stranded: pool drained, nothing classified failed
-            // (never dispatched), so run-level accounting strands all.
+            // Bounded paused-time wait: with the co-located member alive no
+            // exit condition trips, so the loop is still pending when the
+            // bound elapses → `timeout` returns Err. A premature `Ok(..)`
+            // means the fleet-dead arm fired on the lone survivor — the
+            // production false abort this pins out.
+            let outcome =
+                tokio::time::timeout(Duration::from_secs(120), primary.operational_loop()).await;
             assert!(
-                primary.pool().is_empty(),
-                "the primary must arm fleet-dead and drain the pool \
-                 despite its own secondary being alive"
+                outcome.is_err(),
+                "a primary whose own co-located worker-secondary is alive \
+                 must NOT arm fleet-dead (lone-survivor false abort)"
             );
             assert!(
-                primary.failed_tasks.is_empty(),
-                "never-dispatched tasks must NOT be classified failed"
-            );
-            let stranded = primary
-                .total_tasks
-                .saturating_sub(primary.completed_tasks.len() + primary.failed_tasks.len());
-            assert_eq!(
-                stranded, primary.total_tasks,
-                "every un-dispatched binary surfaces as stranded"
+                !primary.pool().is_empty(),
+                "the queued pool must survive untouched — never drained as \
+                 stranded while the co-located member can work it"
             );
         })
         .await;
@@ -1075,7 +1089,7 @@ async fn healthy_fleet_does_not_arm_fleet_dead() {
             assert_eq!(
                 primary
                     .cluster_state_for_test()
-                    .alive_remote_secondary_count(),
+                    .alive_worker_secondary_count(),
                 2,
                 "two alive remote worker-secondaries must be counted"
             );
@@ -1100,9 +1114,8 @@ async fn healthy_fleet_does_not_arm_fleet_dead() {
 
 /// (c) A submitter primary (no own secondary) whose remote-only fleet has
 /// entirely died arms fleet-dead and strands. The submitter is the
-/// recognized primary but is NOT a worker-secondary, so the
-/// `id != current_primary` filter is a no-op here: the count is simply
-/// "all alive worker-secondaries", which is zero once every remote
+/// recognized primary but is NOT a worker-secondary, so the count —
+/// all alive worker-secondaries — is zero once every remote
 /// secondary is dead.
 #[tokio::test(flavor = "current_thread")]
 async fn submitter_primary_strands_when_remote_fleet_gone() {
@@ -1125,10 +1138,9 @@ async fn submitter_primary_strands_when_remote_fleet_gone() {
                 "every worker-secondary is dead"
             );
             assert_eq!(
-                state.alive_remote_secondary_count(),
+                state.alive_worker_secondary_count(),
                 0,
-                "submitter primary: filter is a no-op, count == all alive \
-                 worker-secondaries == 0"
+                "submitter primary: count == all alive worker-secondaries == 0"
             );
 
             prime_pool_with_queued(&mut primary, 3);
