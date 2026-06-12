@@ -649,3 +649,124 @@ async fn redialed_bootstrap_wire_reregisters_on_first_frame_and_receives_broadca
         })
         .await;
 }
+
+/// Specimen-1 replay (run_20260611_200548, mass-disconnect shape): the
+/// relocated submitter-observer's whole transport view collapses, and
+/// the collapse itself throws aborted mid-handshake connections at the
+/// submitter's WSS listener (dying tunnels, force-rebuilt forwards).
+/// When the secondaries later re-dial through the rebuilt tunnels,
+/// every leg must re-seat and frames must flow — ONE aborted inbound
+/// must not have killed the listener (pre-fix: the inline-handshake
+/// accept loop broke on the first aborted upgrade, the listener
+/// dropped, and every redial got a TCP refusal for 90+ minutes while a
+/// FRESH process bound a fresh listener and connected in seconds).
+#[tokio::test(flavor = "current_thread")]
+async fn submitter_reaccepts_redials_after_aborted_handshake_poisons_listener() {
+    use tokio::io::AsyncWriteExt;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // ── Submitter-observer seat: unified transport + accept loops. ──
+            let (mut transport, _outgoing, inbound, registration) =
+                TunneledPeerTransport::<TestId>::new("setup".into());
+            let server: NetworkServer = NetworkServer::bind::<TestId>(
+                "127.0.0.1:0".parse().unwrap(),
+                "setup",
+                inbound,
+                registration,
+            )
+            .await
+            .unwrap();
+            let server_addr: SocketAddr = format!("127.0.0.1:{}", server.port()).parse().unwrap();
+
+            let keepalive = |sender: &str, ts: f64| -> DistributedMessage<TestId> {
+                DistributedMessage::Keepalive {
+                    target: None,
+                    sender_id: sender.into(),
+                    timestamp: ts,
+                    secondary_id: sender.into(),
+                    active_workers: 1,
+                    emitter_role: KeepaliveRole::Secondary,
+                }
+            };
+
+            // ── Two live "secondaries" dial in and identify. ──
+            let mut clients = Vec::new();
+            for sec in ["sec-0", "sec-1"] {
+                let mut client = NetworkClient::<TestId>::connect_wss_only(server_addr)
+                    .await
+                    .expect("initial dial");
+                MessageSender::send(&mut client, keepalive(sec, 1.0))
+                    .await
+                    .expect("identifying frame");
+                let got = tokio::time::timeout(Duration::from_secs(5), transport.recv_peer())
+                    .await
+                    .expect("frame must arrive")
+                    .expect("transport open");
+                assert_eq!(got.sender_id(), sec);
+                clients.push(client);
+            }
+            assert_eq!(PeerTransport::<TestId>::peer_count(&transport), 2);
+
+            // ── 18:19 — MASS DISCONNECT: every wire dies at once. ──
+            drop(clients);
+            // The broadcast observes the dead writers and prunes them
+            // (the production "broadcast found dead peer writers" sweep).
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let _ = transport.broadcast(keepalive("setup", 2.0)).await;
+                if PeerTransport::<TestId>::peer_count(&transport) == 0 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "dead writers must be pruned — the transport view empties"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            // ── The collapse poisons the listener: an aborted
+            //    mid-handshake connection (garbage instead of the
+            //    WebSocket upgrade, then a hard close). ──
+            {
+                let mut raw = tokio::net::TcpStream::connect(server_addr)
+                    .await
+                    .expect("poison TCP connect");
+                let _ = raw
+                    .write_all(b"\x16\x03\x01 not a websocket upgrade\r\n\r\n")
+                    .await;
+                let _ = raw.shutdown().await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // ── The secondaries' redial supervisors come back through
+            //    the rebuilt tunnels: every leg must RE-SEAT. ──
+            let mut reclients = Vec::new();
+            for sec in ["sec-0", "sec-1"] {
+                let mut client = NetworkClient::<TestId>::connect_wss_only(server_addr)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "the redial after the poisoned accept must connect \
+                             (a fresh process can — so must the reconnect path): {e}"
+                        )
+                    });
+                MessageSender::send(&mut client, keepalive(sec, 3.0))
+                    .await
+                    .expect("re-identifying frame");
+                let got = tokio::time::timeout(Duration::from_secs(5), transport.recv_peer())
+                    .await
+                    .expect("the re-dialed leg's frame must reach the transport")
+                    .expect("transport open");
+                assert_eq!(got.sender_id(), sec);
+                reclients.push(client);
+            }
+            assert_eq!(
+                PeerTransport::<TestId>::peer_count(&transport),
+                2,
+                "both rebuilt legs must be live sessions again"
+            );
+        })
+        .await;
+}

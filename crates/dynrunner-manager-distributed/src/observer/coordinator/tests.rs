@@ -2342,3 +2342,208 @@ async fn fleet_death_terminal_fires_under_flapping_leg_with_no_delivery() {
          forever because each rebuild's transient leg reset the presumption",
     );
 }
+
+/// Per-leg honesty for the reconnect roster (run_20260611_200548
+/// specimen 2): a roster peer whose leg is DELIVERING frames is not
+/// lost — handing it to the [`TunnelReconnector`] makes the provider's
+/// half-dead escalation force-rebuild a WORKING tunnel every K ticks
+/// while run-level visibility stays lost for unrelated reasons (a dead
+/// named primary, dead sibling peers) — the probe-observer's endless
+/// "alive but visibility never recovered — force-rebuilding" churn,
+/// which then tears down the only live legs. The roster the observer
+/// hands the reconnector must contain ONLY ids with no recent
+/// delivery; the per-leg judgment keys on the inbox's per-peer ingest
+/// clocks, never on the aggregate visibility verdict.
+#[tokio::test(flavor = "current_thread")]
+async fn reconnect_roster_excludes_recently_delivering_peers() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // ONE wired, delivering peer ("peer-0") + a named primary
+                // ("sec-0") that is SILENT — visibility is lost via the
+                // primary-silence branch while peer-0 keeps delivering.
+                let (transport, inbound, _peers) = transport_with_peers("obs", 1);
+                let mut cs = ClusterState::<TestId>::new();
+                cs.apply(ClusterMutation::PrimaryChanged {
+                    new: "sec-0".into(),
+                    epoch: 1,
+                    reason: PrimaryChangeReason::Transferred,
+                });
+                cs.apply(ClusterMutation::PeerJoined {
+                    peer_id: "peer-0".into(),
+                    is_observer: false,
+                    can_be_primary: false,
+                    cap_version: Default::default(),
+                    member_gen: 0,
+                });
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "peer-0".into(),
+                    worker_count: 1,
+                    resources: vec![],
+                });
+                assert_eq!(
+                    cs.alive_secondary_members().count(),
+                    1,
+                    "precondition: peer-0 is an alive worker-secondary member"
+                );
+
+                let mut config = observer_config("obs");
+                config.fleet_dead_timeout = Duration::from_millis(10);
+                // Small silence threshold so the named primary goes
+                // silent (and the reconnect cadence fires) quickly. The
+                // same threshold is the per-leg delivery-freshness
+                // window, which peer-0's 40ms keepalives stay well under.
+                config.peer_timeout = Duration::from_millis(150);
+
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+
+                let reconnector = std::sync::Arc::new(RecordingReconnector::default());
+                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
+                observer.set_tunnel_reconnector(reconnector.clone());
+
+                // peer-0 keeps DELIVERING: a keepalive every 40ms.
+                let feeder_inbound = inbound.clone();
+                tokio::task::spawn_local(async move {
+                    let mut ts = 0.0f64;
+                    loop {
+                        ts += 1.0;
+                        if feeder_inbound
+                            .send(DistributedMessage::Keepalive {
+                                target: None,
+                                sender_id: "peer-0".into(),
+                                timestamp: ts,
+                                secondary_id: "peer-0".into(),
+                                active_workers: 1,
+                                emitter_role: KeepaliveRole::Secondary,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                    }
+                });
+
+                // Let several lost-visibility cadence ticks fire, then
+                // end the run.
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                    let _ = inbound.send(DistributedMessage::ClusterMutation {
+                        target: None,
+                        sender_id: "sec-0".into(),
+                        timestamp: 0.0,
+                        mutations: vec![ClusterMutation::RunComplete],
+                    });
+                });
+
+                let terminal = observer
+                    .run()
+                    .await
+                    .expect("observer exits on the observed RunComplete");
+                assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+
+                let calls = reconnector.calls.lock().expect("mutex");
+                assert!(
+                    !calls.is_empty(),
+                    "the silent named primary must have driven ≥1 reconnect"
+                );
+                assert!(
+                    calls.iter().all(|ids| ids.contains(&"sec-0".to_string())),
+                    "every reconnect call targets the silent primary: {calls:?}"
+                );
+                assert!(
+                    calls.iter().all(|ids| !ids.contains(&"peer-0".to_string())),
+                    "a DELIVERING leg must never be handed to the reconnector \
+                     (its tunnel would be force-rebuilt while healthy): {calls:?}"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("test must terminate");
+}
+
+/// Blocking [`TunnelReconnector`] stub for the single-flight pin: every
+/// call records itself, then parks until the test releases it.
+#[derive(Default)]
+struct BlockingReconnector {
+    calls: std::sync::Mutex<u32>,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::observer::TunnelReconnector for BlockingReconnector {
+    async fn reconnect(&self, _peer_ids: &[String]) {
+        *self.calls.lock().expect("calls mutex") += 1;
+        self.release.notified().await;
+    }
+}
+
+/// The reconnect trigger is SINGLE-FLIGHT: while one (slow) reconnect
+/// call is still running, further lost-visibility cadence ticks must
+/// NOT spawn another. Pre-fix every ~60s recurrence spawned a fresh
+/// detached `reconnect(roster)` while the prior one was still mid-ssh
+/// — for a roster with dead peers (each rebuild burning a 90s
+/// establishment budget) the overlapping calls piled up without bound
+/// and raced each other's release+rebind on the SAME tunnel ports
+/// (specimen 1's zero-recovery 90 minutes).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn reconnect_trigger_is_single_flight() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Zero peers ⇒ lost visibility from the first loop; the named
+            // primary gives the roster one id.
+            let (transport, inbound, _peers) = transport_with_peers("obs", 0);
+            let mut cs = ClusterState::<TestId>::new();
+            cs.apply(ClusterMutation::PrimaryChanged {
+                new: "sec-0".into(),
+                epoch: 1,
+                reason: PrimaryChangeReason::Transferred,
+            });
+            let mut config = observer_config("obs");
+            config.fleet_dead_timeout = Duration::from_secs(1);
+
+            let (client, inbox, pump) = observer_mesh(transport, "obs");
+            tokio::task::spawn_local(pump);
+
+            let reconnector = std::sync::Arc::new(BlockingReconnector::default());
+            let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
+            observer.set_tunnel_reconnector(reconnector.clone());
+
+            let driver = {
+                let reconnector = reconnector.clone();
+                tokio::task::spawn_local(async move {
+                    // >2 of the ~60s reconnect recurrences elapse (virtual
+                    // time) while the FIRST reconnect call is still parked.
+                    tokio::time::sleep(Duration::from_secs(130)).await;
+                    let blocked_calls = *reconnector.calls.lock().expect("calls mutex");
+                    // Release the parked call(s) and end the run.
+                    reconnector.release.notify_waiters();
+                    let _ = inbound.send(DistributedMessage::ClusterMutation {
+                        target: None,
+                        sender_id: "sec-0".into(),
+                        timestamp: 0.0,
+                        mutations: vec![ClusterMutation::RunComplete],
+                    });
+                    blocked_calls
+                })
+            };
+
+            let terminal = observer
+                .run()
+                .await
+                .expect("observer exits on the observed RunComplete");
+            assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+
+            let blocked_calls = driver.await.expect("driver task");
+            assert_eq!(
+                blocked_calls, 1,
+                "while one reconnect call is in flight, further cadence \
+                 ticks must not spawn another (single-flight)"
+            );
+        })
+        .await;
+}
