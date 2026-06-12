@@ -140,7 +140,7 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
     ///   arm is unreachable and the `debug_assert!` guards that invariant.
     pub fn route_incoming(&mut self, frame: DistributedMessage<I>) {
         match frame.target() {
-            Some(Destination::All) => self.fan_local(None, frame),
+            Some(Destination::All) => self.fan_local_or_hold(frame),
             Some(dst) => {
                 // `from_destination` is total over the non-`All` directed
                 // variants; the `All` arm is handled above.
@@ -161,14 +161,19 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
                 if role_has_live_slot {
                     self.deliver_local(role, frame);
                 } else {
-                    tracing::warn!(
-                        kind = ?frame.msg_type(),
-                        target = ?dst,
-                        "mesh ingress: directed frame names a role with no live \
-                         local slot (stale sender-side role knowledge); fanning \
-                         to every live local slot rather than dropping it"
-                    );
-                    self.fan_local(None, frame);
+                    if let Some(suppressed) = self.ingress_fallback_warn.permit() {
+                        tracing::warn!(
+                            kind = ?frame.msg_type(),
+                            target = ?dst,
+                            suppressed_since_last_warn = suppressed,
+                            "mesh ingress: directed frame names a role with no live \
+                             local slot (stale sender-side role knowledge); fanning \
+                             to every live local slot — or HOLDING it for replay if \
+                             this process is momentarily slotless — rather than \
+                             dropping it"
+                        );
+                    }
+                    self.fan_local_or_hold(frame);
                 }
             }
             None => {
@@ -181,12 +186,17 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
                 // (which a debug_assert would, killing legitimate raw-frame
                 // test doubles). Production egress still stamps every edge;
                 // this arm is the no-drop backstop, not the happy path.
-                tracing::warn!(
-                    kind = ?frame.msg_type(),
-                    "mesh ingress: frame has no routing target (pre-stamp transitional); \
-                     fanning to every local slot rather than dropping it"
-                );
-                self.fan_local(None, frame);
+                if let Some(suppressed) = self.ingress_fallback_warn.permit() {
+                    tracing::warn!(
+                        kind = ?frame.msg_type(),
+                        suppressed_since_last_warn = suppressed,
+                        "mesh ingress: frame has no routing target (pre-stamp \
+                         transitional); fanning to every local slot — or HOLDING it \
+                         for replay if this process is momentarily slotless — rather \
+                         than dropping it"
+                    );
+                }
+                self.fan_local_or_hold(frame);
             }
         }
     }
@@ -197,8 +207,15 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
     /// egress `All`-fan (`exclude = Some(origin)`, BUG-1) and the ingress
     /// fan (`exclude = None`). It NEVER touches the wire — the remote half
     /// of an egress broadcast is the caller's separate concern.
-    fn fan_local(&mut self, exclude: Option<LocalRole>, frame: DistributedMessage<I>) {
+    ///
+    /// Returns the number of LIVE slots the frame reached. The ingress
+    /// caller ([`Self::route_incoming`]) reads a `0` as "this process is
+    /// momentarily slotless" and HOLDS the frame instead of dropping it; the
+    /// egress broadcast ignores the count (a same-host fan reaching only the
+    /// wire is legitimate).
+    fn fan_local(&mut self, exclude: Option<LocalRole>, frame: DistributedMessage<I>) -> usize {
         let mut to_prune: Vec<LocalRole> = Vec::new();
+        let mut delivered = 0usize;
         for role in [
             LocalRole::Primary,
             LocalRole::Secondary,
@@ -212,6 +229,8 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
                     Some(arc) => {
                         if arc.deliver(frame.clone()).is_err() {
                             to_prune.push(role);
+                        } else {
+                            delivered += 1;
                         }
                     }
                     None => to_prune.push(role),
@@ -220,6 +239,76 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
         }
         for role in to_prune {
             self.clear_slot(role);
+        }
+        delivered
+    }
+
+    /// The ingress fan with the slotless no-drop guarantee: fan to every live
+    /// local slot, and if NONE was live, HOLD the frame so the next slot
+    /// registration replays it ([`Self::hold_slotless`] /
+    /// [`Self::drain_slotless_hold`]). Used by every [`Self::route_incoming`]
+    /// fan path (directed role-miss, `All`, unstamped) so the
+    /// transient-zero-slots window during a promotion / role swap can never
+    /// silently eat a frame. The egress broadcast does NOT route through here
+    /// — its zero-local-slot fan is legitimate (the frame went to the wire).
+    fn fan_local_or_hold(&mut self, frame: DistributedMessage<I>) {
+        if self.fan_local(None, frame.clone()) == 0 {
+            self.hold_slotless(frame);
+        }
+    }
+
+    /// Buffer an ingress frame that arrived while this process had ZERO live
+    /// local slots (a transient promotion / role-swap window), to be replayed
+    /// by [`Self::drain_slotless_hold`] when the next slot registers.
+    ///
+    /// Bounded ([`super::SLOTLESS_HOLD_CAPACITY`]): on overflow the OLDEST
+    /// held frame is evicted with a (throttled) WARN naming its kind/target —
+    /// never a silent drop. The hold itself also WARNs (throttled) so the
+    /// operator sees the slotless window without one WARN per frame at wire
+    /// rate during a long swap.
+    fn hold_slotless(&mut self, frame: DistributedMessage<I>) {
+        if self.slotless_hold.len() == super::SLOTLESS_HOLD_CAPACITY
+            && let Some(evicted) = self.slotless_hold.pop_front()
+        {
+            tracing::warn!(
+                kind = ?evicted.msg_type(),
+                target = ?evicted.target(),
+                capacity = super::SLOTLESS_HOLD_CAPACITY,
+                "mesh ingress: slotless-hold buffer full — dropping the OLDEST \
+                 held frame to admit a newer one (the swap window outran the \
+                 buffer bound)"
+            );
+        }
+        let kind = frame.msg_type();
+        self.slotless_hold.push_back(frame);
+        if let Some(suppressed) = self.slotless_hold_warn.permit() {
+            tracing::warn!(
+                kind = ?kind,
+                held = self.slotless_hold.len(),
+                suppressed_since_last_warn = suppressed,
+                "mesh ingress: directed frame arrived with NO live local slot \
+                 (transient promotion / role-swap window); HOLDING it for replay \
+                 when the next slot registers rather than dropping it"
+            );
+        }
+    }
+
+    /// Replay every held ingress frame through the live local fan, in arrival
+    /// order, then clear the buffer. Called the instant a slot REGISTERS
+    /// ([`super::Mesh::register_local_role`]) — the only event that ends a
+    /// slotless window (a retag merely MOVES an already-live slot between
+    /// fields, so the process was never slotless and the buffer is empty
+    /// there). A frame that STILL finds zero live slots (a pathological race
+    /// where the just-registered slot's `Arc` already died) is re-held by
+    /// `fan_local_or_hold`; the drain takes a snapshot first, so this is a
+    /// single bounded pass, never an unbounded loop.
+    pub(super) fn drain_slotless_hold(&mut self) {
+        if self.slotless_hold.is_empty() {
+            return;
+        }
+        let held: Vec<DistributedMessage<I>> = self.slotless_hold.drain(..).collect();
+        for frame in held {
+            self.fan_local_or_hold(frame);
         }
     }
 
