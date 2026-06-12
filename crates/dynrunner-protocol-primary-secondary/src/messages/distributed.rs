@@ -476,6 +476,23 @@ pub enum DistributedMessage<I> {
         sender_id: String,
         timestamp: f64,
         digest: StateDigest,
+        /// The sender's SELF-DECLARED role (the same `is_observer` bit it
+        /// stamps on a `RequestClusterSnapshot`), carried so a peer that
+        /// pulls a snapshot FROM this sender (the proven-ahead responder)
+        /// types the pull's [`Destination`] off the sender's role —
+        /// `Observer(id)` for an observer sender, `Secondary(id)` for a
+        /// compute peer — instead of guessing `Secondary` for every
+        /// target. This is the inverse of the snapshot-RPC reply policy
+        /// (`reply_destination`): there the request carries the requester's
+        /// role and the reply is typed off it; here the digest carries the
+        /// sender's role and the pull is typed off it. Without it, a pull
+        /// directed at an observer is mis-typed `Secondary`, missing the
+        /// observer's ingress role-slot demux (served by the fan, but with
+        /// a per-pull WARN). `#[serde(default)]` decodes a pre-field peer
+        /// as `false` (the conservative compute-role shape — the receiver-
+        /// side id==self fan covers the residual mis-type without noise).
+        #[serde(default)]
+        sender_is_observer: bool,
     },
     TaskComplete {
         /// Mesh routing target (Phase-C C3): the resolved role-bearing

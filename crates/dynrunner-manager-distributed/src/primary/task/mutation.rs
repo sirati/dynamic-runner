@@ -274,6 +274,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             target: None,
             digest,
             sender_id,
+            sender_is_observer,
             ..
         } = msg
         else {
@@ -290,6 +291,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             &local,
             &digest,
             &sender_id,
+            sender_is_observer,
             &requester,
             timestamp_now(),
         ) {

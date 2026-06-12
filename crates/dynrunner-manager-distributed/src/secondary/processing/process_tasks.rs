@@ -625,6 +625,8 @@ where
                         &self.config.secondary_id,
                         crate::secondary::wire::timestamp_now(),
                         digest,
+                        // A compute SecondaryCoordinator is never an observer.
+                        false,
                     );
                     let _ = self.send_to(Destination::All, frame).await;
                 }

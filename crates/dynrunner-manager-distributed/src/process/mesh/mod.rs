@@ -42,7 +42,7 @@ use std::sync::{Arc, Weak};
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_protocol_primary_secondary::PeerTransport;
-use dynrunner_protocol_primary_secondary::address::PeerId;
+use dynrunner_protocol_primary_secondary::address::{Destination, PeerId};
 use tokio::sync::mpsc;
 
 use super::membership::MembershipView;
@@ -296,5 +296,27 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
         .filter_map(|r| self.slot_for(r))
         .filter_map(|w| w.upgrade())
         .any(|arc| arc.peer_id() == id)
+    }
+
+    /// Whether a directed ingress `Destination` names THIS process by id —
+    /// the id-bearing `Secondary(id)`/`Observer(id)` carrying this host's
+    /// own id (matched against the registered `local_peer_id` OR any live
+    /// local slot's host id via [`Self::is_local_host`], so it holds even in
+    /// the slotless window before a slot re-registers). The id-less
+    /// `Primary` and the `All` fan carry no id, so they are never a self-id
+    /// match here — a local primary frame already takes the live-slot path.
+    ///
+    /// This is the ingress role-miss disambiguator: a self-id frame whose
+    /// ROLE tag is stale (the sender had not yet learned this peer's role)
+    /// was unambiguously meant for THIS process, so it is delivered via the
+    /// local fan WITHOUT the genuine-mis-address WARN — and never relayed
+    /// away onto the wire.
+    pub(super) fn directed_target_is_self(&self, dst: &Destination) -> bool {
+        match dst {
+            Destination::Secondary(id) | Destination::Observer(id) => {
+                self.local_peer_id.as_ref() == Some(id) || self.is_local_host(id)
+            }
+            Destination::Primary | Destination::All => false,
+        }
     }
 }

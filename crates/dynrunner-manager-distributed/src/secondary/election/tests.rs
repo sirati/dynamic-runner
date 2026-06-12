@@ -1211,6 +1211,7 @@ async fn non_primary_frame_does_not_revert_election() {
         sender_id: "peer-observer".into(),
         timestamp: timestamp_now(),
         digest: sec.cluster_state.digest(),
+        sender_is_observer: true,
     };
     sec.dispatch_message(digest, &mut FakeWorkerFactory)
         .await

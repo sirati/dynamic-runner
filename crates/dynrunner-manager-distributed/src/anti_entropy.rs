@@ -73,16 +73,26 @@ pub fn tick_period(node_id: &str) -> Duration {
 /// Build this node's anti-entropy broadcast frame from its current
 /// `digest`. Sent to [`Destination::All`] on each cadence tick so every
 /// peer can compare and pull if behind.
+///
+/// `is_observer` is the sender's SELF-DECLARED role, stamped on the frame
+/// so a behind peer that pulls a snapshot FROM this sender types the pull's
+/// [`Destination`] off the sender's role (`role_destination`) instead of
+/// guessing `Secondary`. The sender knows its own role authoritatively and
+/// unconditionally — no CRDT convergence needed — so the very first digest
+/// already carries the correct typing (the inverse of the
+/// [`RequesterIdentity`] → [`reply_destination`] precedent).
 pub fn digest_broadcast<I>(
     node_id: &str,
     timestamp: f64,
     digest: StateDigest,
+    is_observer: bool,
 ) -> DistributedMessage<I> {
     DistributedMessage::StateDigest {
         target: None,
         sender_id: node_id.to_string(),
         timestamp,
         digest,
+        sender_is_observer: is_observer,
     }
 }
 
@@ -119,8 +129,21 @@ pub struct RequesterIdentity<'a> {
 /// (primary, secondary router, observer) types its reply through this
 /// ONE policy point.
 pub fn reply_destination(requester_id: &str, requester_is_observer: bool) -> Destination {
-    let id = PeerId::from(requester_id.to_string());
-    if requester_is_observer {
+    role_destination(requester_id, requester_is_observer)
+}
+
+/// The role-addressing typing CORE shared by every snapshot-RPC edge: a
+/// peer id plus its declared observer bit → the role-bearing
+/// [`Destination`] (`Observer(id)` for an observer, `Secondary(id)` for a
+/// compute peer) that the receiver-side ingress demux uses to pick the
+/// local role slot. Both the snapshot REPLY ([`reply_destination`], typed
+/// off the requester's declared role) and the anti-entropy PULL
+/// ([`reconcile_against_peer`] / [`plan_recovery_pull`], typed off the
+/// digest sender's declared role) resolve through this ONE point, so the
+/// `(id, is_observer) → Destination` mapping is never re-implemented.
+fn role_destination(id: &str, is_observer: bool) -> Destination {
+    let id = PeerId::from(id.to_string());
+    if is_observer {
         Destination::Observer(id)
     } else {
         Destination::Secondary(id)
@@ -205,6 +228,7 @@ pub fn reconcile_against_peer<I>(
     local: &StateDigest,
     peer: &StateDigest,
     sender_id: &str,
+    sender_is_observer: bool,
     requester: &RequesterIdentity<'_>,
     timestamp: f64,
 ) -> Option<(Destination, DistributedMessage<I>)> {
@@ -221,8 +245,12 @@ pub fn reconcile_against_peer<I>(
     // holds data the local replica lacks; the sender is therefore the
     // authoritative responder regardless of role. A possibly-lagging
     // primary is NOT consulted — it may not hold the missing data — so
-    // there is no primary fallback.
-    let destination = Destination::Secondary(PeerId::from(sender_id.to_string()));
+    // there is no primary fallback. The pull is typed off the sender's
+    // SELF-DECLARED role (carried on its digest frame): `Observer(id)` for
+    // an observer sender, `Secondary(id)` for a compute peer — so a pull
+    // directed at an observer hits its ingress observer-slot demux instead
+    // of mis-typing `Secondary` and tripping the role-miss fan WARN.
+    let destination = role_destination(sender_id, sender_is_observer);
     let request = DistributedMessage::RequestClusterSnapshot {
         target: None,
         sender_id: requester.node_id.to_string(),
@@ -281,15 +309,20 @@ pub fn reconcile_against_peer<I>(
 /// proven-ahead peer is reachable. With a single candidate the rotation
 /// degenerates to re-pulling from it (the best available action).
 ///
-/// `peer_digests` is the caller's `(known-peer-id, last-seen StateDigest)`
-/// view — ALREADY intersected with the live roster by the caller, so this
-/// function never consults membership itself (it owns no liveness concern).
-/// The pull target is `Destination::Secondary(peer_id)` — the same snapshot
-/// responder edge `reconcile_against_peer` pulls through (the responder
-/// coordinator is selected at the INGRESS demux, not by this variant).
+/// `peer_digests` is the caller's `(known-peer-id, peer-declared-observer
+/// bit, last-seen StateDigest)` view — ALREADY intersected with the live
+/// roster by the caller, so this function never consults membership itself
+/// (it owns no liveness concern). The pull target is typed off the chosen
+/// peer's declared role (`role_destination`) — `Observer(id)` for an
+/// observer responder, `Secondary(id)` otherwise — the same role-addressing
+/// `reconcile_against_peer` pulls through (the responder coordinator is
+/// selected at the INGRESS demux). The declared-observer bit rides each
+/// peer's last digest frame and is stored alongside its digest by the
+/// caller, so the timer-driven recovery pull types an observer responder
+/// correctly without re-consulting the capability set.
 pub fn plan_recovery_pull<I>(
     local: &StateDigest,
-    peer_digests: &[(String, StateDigest)],
+    peer_digests: &[(String, bool, StateDigest)],
     cursor: &mut usize,
     requester: &RequesterIdentity<'_>,
     timestamp: f64,
@@ -298,10 +331,12 @@ pub fn plan_recovery_pull<I>(
     // hold ledger data the local replica lacks. A peer we are converged with
     // is not a candidate; if EVERY known peer is converged (or none has a
     // recorded digest), the candidate list is empty and we quiesce (C9).
-    let mut candidates: Vec<&str> = peer_digests
+    // Each candidate carries its declared-observer bit so the chosen target
+    // is typed off the responder's role.
+    let mut candidates: Vec<(&str, bool)> = peer_digests
         .iter()
-        .filter(|(_, peer)| local.is_behind(peer))
-        .map(|(id, _)| id.as_str())
+        .filter(|(_, _, peer)| local.is_behind(peer))
+        .map(|(id, is_observer, _)| (id.as_str(), *is_observer))
         .collect();
     if candidates.is_empty() {
         return None;
@@ -314,14 +349,14 @@ pub fn plan_recovery_pull<I>(
     // the wedge-prevention purpose of the rotation. Sorting by the stable
     // peer id makes `cursor` rotate through DISTINCT responders in a fixed
     // order across consecutive ticks.
-    candidates.sort_unstable();
+    candidates.sort_unstable_by(|a, b| a.0.cmp(b.0));
     // Pick the rotation-current candidate, then ADVANCE the cursor so the
     // next tick targets a different responder (the different-responder-on-
     // malformed rule). The modulo keeps the index in range as the candidate
     // set shrinks across ticks.
-    let target = candidates[*cursor % candidates.len()];
+    let (target, target_is_observer) = candidates[*cursor % candidates.len()];
     *cursor = cursor.wrapping_add(1);
-    let destination = Destination::Secondary(PeerId::from(target.to_string()));
+    let destination = role_destination(target, target_is_observer);
     let request = DistributedMessage::RequestClusterSnapshot {
         target: None,
         sender_id: requester.node_id.to_string(),
@@ -389,7 +424,7 @@ mod tests {
             can_be_primary: true,
         };
         let decision: Option<(Destination, DistributedMessage<u32>)> =
-            reconcile_against_peer(&d, &d, "peer-1", &me, 1.0);
+            reconcile_against_peer(&d, &d, "peer-1", false, &me, 1.0);
         assert!(decision.is_none());
     }
 
@@ -410,7 +445,7 @@ mod tests {
             can_be_primary: false,
         };
         let (dst, req): (Destination, DistributedMessage<u32>) =
-            reconcile_against_peer(&local, &peer, "peer-1", &me, 1.0)
+            reconcile_against_peer(&local, &peer, "peer-1", false, &me, 1.0)
                 .expect("should pull when behind");
         // The proven-ahead sender, NOT `Destination::Primary`.
         assert_eq!(
@@ -433,6 +468,44 @@ mod tests {
         }
     }
 
+    /// The addressing fix (reactive path): a node behind a sender it knows
+    /// to be an OBSERVER types the pull `Observer(id)`, not `Secondary(id)`,
+    /// so the pull hits the observer's ingress observer-slot demux instead
+    /// of mis-typing `Secondary` and tripping the role-miss fan WARN once
+    /// per cadence. A compute sender still types `Secondary(id)`.
+    #[test]
+    fn pull_typed_off_sender_declared_role() {
+        let local = StateDigest::default();
+        let peer = StateDigest {
+            tasks_count: 3,
+            tasks_hash: 0xAB,
+            ..Default::default()
+        };
+        let me = RequesterIdentity {
+            node_id: "me",
+            is_observer: false,
+            can_be_primary: true,
+        };
+        // Sender declared as an observer ⇒ pull typed `Observer(id)`.
+        let (dst_obs, _): (Destination, DistributedMessage<u32>) =
+            reconcile_against_peer(&local, &peer, "observer-2f2e", true, &me, 1.0)
+                .expect("behind an observer sender ⇒ pull");
+        assert_eq!(
+            dst_obs,
+            Destination::Observer(PeerId::from("observer-2f2e".to_string())),
+            "a pull toward a peer known as Observer must be typed Observer(id)"
+        );
+        // Sender declared as a compute peer ⇒ pull typed `Secondary(id)`.
+        let (dst_sec, _): (Destination, DistributedMessage<u32>) =
+            reconcile_against_peer(&local, &peer, "worker-7", false, &me, 1.0)
+                .expect("behind a compute sender ⇒ pull");
+        assert_eq!(
+            dst_sec,
+            Destination::Secondary(PeerId::from("worker-7".to_string())),
+            "a pull toward a compute peer stays Secondary(id)"
+        );
+    }
+
     #[test]
     fn behind_without_primary_pulls_from_sender() {
         let local = StateDigest::default();
@@ -447,7 +520,7 @@ mod tests {
             can_be_primary: true,
         };
         let (dst, _req): (Destination, DistributedMessage<u32>) =
-            reconcile_against_peer(&local, &peer, "peer-7", &me, 1.0)
+            reconcile_against_peer(&local, &peer, "peer-7", false, &me, 1.0)
                 .expect("should pull when behind");
         assert_eq!(
             dst,
@@ -484,7 +557,7 @@ mod tests {
             can_be_primary: true,
         };
         let (dst, _req): (Destination, DistributedMessage<u32>) =
-            reconcile_against_peer(&local, &ahead_sender, "ahead-secondary", &me, 1.0)
+            reconcile_against_peer(&local, &ahead_sender, "ahead-secondary", false, &me, 1.0)
                 .expect("should pull when behind the ahead non-primary sender");
         assert_eq!(
             dst,
@@ -521,7 +594,7 @@ mod tests {
             can_be_primary: true,
         };
         let (dst, req): (Destination, DistributedMessage<u32>) =
-            reconcile_against_peer(&local, &ahead_peer, "ahead-secondary", &me, 1.0)
+            reconcile_against_peer(&local, &ahead_peer, "ahead-secondary", false, &me, 1.0)
                 .expect("a behind primary must still pull from the ahead peer");
         assert_eq!(
             dst,
@@ -569,7 +642,7 @@ mod tests {
     #[test]
     fn recovery_quiesces_when_converged_with_all_known_peers() {
         let d = ahead(3, 0xABCD);
-        let peers = vec![("peer-1".to_string(), d), ("peer-2".to_string(), d)];
+        let peers = vec![("peer-1".to_string(), false, d), ("peer-2".to_string(), false, d)];
         let mut cursor = 0usize;
         let decision: Option<(Destination, DistributedMessage<u32>)> =
             plan_recovery_pull(&d, &peers, &mut cursor, &requester(), 1.0);
@@ -582,7 +655,7 @@ mod tests {
     #[test]
     fn recovery_pulls_from_behind_peer_and_advances_cursor() {
         let local = StateDigest::default();
-        let peers = vec![("peer-ahead".to_string(), ahead(2, 0x9))];
+        let peers = vec![("peer-ahead".to_string(), false, ahead(2, 0x9))];
         let mut cursor = 0usize;
         let (dst, req): (Destination, DistributedMessage<u32>) =
             plan_recovery_pull(&local, &peers, &mut cursor, &requester(), 1.0)
@@ -607,6 +680,26 @@ mod tests {
         }
     }
 
+    /// The addressing fix (recovery path): when the rotation lands on a
+    /// responder the recovery store knows to be an OBSERVER, the pull is
+    /// typed `Observer(id)` — the same role-addressing the reactive
+    /// `reconcile_against_peer` uses — so the timer-driven re-pull at a
+    /// late-joined observer no longer mis-types `Secondary`.
+    #[test]
+    fn recovery_pull_typed_off_responder_declared_role() {
+        let local = StateDigest::default();
+        let peers = vec![("observer-2f2e".to_string(), true, ahead(2, 0x9))];
+        let mut cursor = 0usize;
+        let (dst, _req): (Destination, DistributedMessage<u32>) =
+            plan_recovery_pull(&local, &peers, &mut cursor, &requester(), 1.0)
+                .expect("behind a known observer responder ⇒ pull");
+        assert_eq!(
+            dst,
+            Destination::Observer(PeerId::from("observer-2f2e".to_string())),
+            "a recovery pull toward an observer responder must be typed Observer(id)"
+        );
+    }
+
     /// Different-responder rotation: three ahead peers fed in a NON-sorted
     /// insertion order. Consecutive ticks must rotate through DISTINCT
     /// responders in a DETERMINISTIC (sorted-by-id) order so a single
@@ -621,11 +714,11 @@ mod tests {
         // insertion order is deliberately NOT sorted to prove the rotation
         // does not depend on the input order.
         let peers = vec![
-            ("peer-c".to_string(), ahead(1, 0x3)),
-            ("peer-a".to_string(), ahead(1, 0x1)),
-            ("peer-b".to_string(), ahead(1, 0x2)),
+            ("peer-c".to_string(), false, ahead(1, 0x3)),
+            ("peer-a".to_string(), false, ahead(1, 0x1)),
+            ("peer-b".to_string(), false, ahead(1, 0x2)),
         ];
-        let target_id = |peers: &[(String, StateDigest)], cursor: &mut usize| -> String {
+        let target_id = |peers: &[(String, bool, StateDigest)], cursor: &mut usize| -> String {
             let (dst, _): (Destination, DistributedMessage<u32>) =
                 plan_recovery_pull(&local, peers, cursor, &requester(), 1.0)
                     .expect("still behind ⇒ pull");

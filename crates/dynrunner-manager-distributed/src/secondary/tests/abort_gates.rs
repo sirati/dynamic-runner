@@ -194,6 +194,7 @@ async fn missed_abort_broadcast_converges_via_digest() {
                     sender_id: "peer-0".into(),
                     timestamp: 0.0,
                     digest: donor.digest(),
+                    sender_is_observer: false,
                 },
                 &mut FakeWorkerFactory,
             )

@@ -413,6 +413,7 @@ where
     pub(in crate::secondary) async fn reconcile_state_digest(
         &mut self,
         sender_id: &str,
+        sender_is_observer: bool,
         digest: &dynrunner_protocol_primary_secondary::StateDigest,
     ) {
         let local = self.cluster_state.digest();
@@ -429,6 +430,7 @@ where
             &local,
             digest,
             sender_id,
+            sender_is_observer,
             &requester,
             timestamp_now(),
         ) {

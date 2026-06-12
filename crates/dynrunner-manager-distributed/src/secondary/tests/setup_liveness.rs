@@ -114,6 +114,7 @@ async fn setup_deadline_rearms_on_primary_liveness() {
                             sender_id: "setup".into(),
                             timestamp: 0.0,
                             digest: ClusterState::<TestId>::new().digest(),
+                            sender_is_observer: false,
                         })
                         .expect("inbound open");
                 }
@@ -184,6 +185,7 @@ async fn peer_digest_does_not_extend_setup_deadline() {
                             sender_id: "sec-sibling".into(),
                             timestamp: 0.0,
                             digest: ClusterState::<TestId>::new().digest(),
+                            sender_is_observer: false,
                         })
                         .is_err()
                     {
