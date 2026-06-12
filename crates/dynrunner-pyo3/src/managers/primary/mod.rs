@@ -214,6 +214,13 @@ pub(crate) struct PyPrimaryCoordinator {
     /// a kwarg). Threaded at `run()` entry into `PrimaryConfig.forwarded_argv`
     /// so this primary answers `RequestRunConfig` from its node-local copy.
     pub(super) forwarded_argv: Vec<String>,
+    /// Where this primary persists the roster's peer connection
+    /// credentials (per-peer cert pins) on the LOCAL filesystem —
+    /// threaded at `run()` entry into
+    /// `PrimaryConfig.peer_credentials_path`. Set by the SLURM
+    /// pipeline (`drive_rust_primary`) to a file in the run's local
+    /// cert dir; `None` (the default) persists nothing.
+    pub(super) peer_credentials_path: Option<std::path::PathBuf>,
 }
 
 // Rust-only surface for the SLURM-pipeline orchestrator. Not exposed

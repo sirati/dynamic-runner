@@ -60,6 +60,9 @@ rustls = "0.23"
 rcgen = "0.13"
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 futures-util = "0.3"
+# Raw socket-option access (TCP keepalive on the WSS legs, SO_LINGER in
+# reset-replay tests). Already in the tree transitively via quinn/tokio.
+socket2 = "0.6"
 nix = { version = "0.29", features = ["socket", "process", "signal"] }
 # Raw siginfo_t access (`si_pid()`) for the panik-watcher SIGTERM sender
 # capture. Already in the tree transitively via tokio's signal driver.

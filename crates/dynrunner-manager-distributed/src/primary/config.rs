@@ -361,6 +361,22 @@ pub struct PrimaryConfig {
     /// run with no forwarded args).
     pub forwarded_argv: Vec<String>,
 
+    /// Where to persist the roster's peer connection credentials (the
+    /// per-peer pinned QUIC cert PEMs + dial info) on THIS node's
+    /// LOCAL filesystem — see [`crate::peer_credentials`]. The primary
+    /// stores the roster there at every `PeerInfo` fan-out
+    /// (`send_peer_lists`), so a late-joiner observer spawned on the
+    /// same host can pick the cert pins up and dial the mesh over
+    /// QUIC with valid certs instead of degrading to WSS.
+    ///
+    /// `None` (the default) persists nothing — the right value for
+    /// every primary that is NOT the local setup/submitter (a promoted
+    /// compute-peer primary has no local late-joiner spawn dir to
+    /// serve). The SLURM pipeline sets it to a file inside the run's
+    /// local cert dir (`/tmp/db-runner-cert-<run_id>/`), explicitly
+    /// NOT the shared cluster-visible `connection_info/` dir.
+    pub peer_credentials_path: Option<std::path::PathBuf>,
+
     /// Per-task reconciliation-probe deadline (#308): how long a task
     /// may be in flight with NO terminal before the primary asks its
     /// holder secondary "do you still hold task X?"
@@ -405,6 +421,7 @@ impl Default for PrimaryConfig {
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
             forwarded_argv: Vec::new(),
+            peer_credentials_path: None,
             task_reconciliation_timeout: DEFAULT_TASK_RECONCILIATION_TIMEOUT,
         }
     }
