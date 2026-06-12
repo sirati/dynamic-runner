@@ -650,7 +650,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             timestamp: timestamp_now(),
             mutations: vec![repoint],
         };
-        self.send_to_each_observer(msg).await;
+        // The re-point's per-observer failures are best-effort, already
+        // narrated by the per-send debug line inside the fan; the throttled
+        // egress WARN is the KEEPALIVE concern's, so drop them here.
+        let _ = self.send_to_each_observer(msg).await;
     }
 
     /// React to a panik-watcher signal on the primary.

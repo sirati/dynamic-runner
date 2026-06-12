@@ -316,6 +316,110 @@ async fn dead_secondary_requeues_in_flight_task() {
     );
 }
 
+/// A member that DEPARTED GRACEFULLY (its self-authored
+/// `PeerRemoved { SelfDeparture }` applied to the replicated membership
+/// ledger) must NEVER be silence-judged: its keepalives stopped BY DESIGN,
+/// so its silence age inflates legitimately, but it is GONE — not silent.
+///
+/// REPRO (run_20260612_094056 face): a member departed cleanly, a promotion
+/// followed, and the promoted primary still carried the gone member in its
+/// roster cache (`self.secondaries` / `secondary_keepalives` are not reaped
+/// by the membership apply path — only by the bootstrap handshake + the
+/// hydrate rebuild). Two minutes later the silence schedule crossed the hard
+/// backstop and the promoted primary silence-removed-with-requeue the
+/// departed member, charging a spurious keepalive-miss death + task requeue
+/// against a member that left deliberately.
+///
+/// Post-fix the sweep pre-filters the departed-but-still-cached member off
+/// the SAME authoritative ledger the hydrate rebuild reads, so it never
+/// enters `collect_heartbeat_report` and the requeue path is never reached.
+#[tokio::test(flavor = "current_thread")]
+async fn gracefully_departed_member_is_not_silence_removed() {
+    let (transport, _sec_rx, _kept_alive_for_outgoing_clone) = empty_transport();
+    let (mut primary, _mesh) = build_primary(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+
+    // Register the member at the connection level (Operational) with one
+    // in-flight task — the SAME roster-cache shape a promoted primary
+    // reconstructs from the replicated capacity ledger.
+    let conn = SecondaryConnection::new("departed-sec".into())
+        .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
+        .receive_cert_exchange(String::new(), None, None, 0, None)
+        .begin_peer_discovery()
+        .peers_ready()
+        .assignments_sent();
+    primary.secondaries.insert(
+        "departed-sec".into(),
+        SecondaryConnectionState::Operational(conn),
+    );
+    primary.seed_keepalive("departed-sec");
+    let in_flight = task("victim", &[]);
+    primary.stage_in_flight_for_test("departed-sec".into(), 0, in_flight);
+
+    // The replicated membership facts: the member joined, advertised
+    // capacity, then SELF-DEPARTED gracefully (the leaving node's
+    // `PeerRemoved { SelfDeparture }`). After the apply the membership
+    // ledger reads `RemovedMember` — but the roster cache still holds the
+    // departed member (the apply path does not reap it).
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PeerJoined {
+            peer_id: "departed-sec".into(),
+            is_observer: false,
+            can_be_primary: true,
+            cap_version: Default::default(),
+            member_gen: 0,
+        });
+        cs.apply(ClusterMutation::SecondaryCapacity {
+            secondary: "departed-sec".into(),
+            worker_count: 1,
+            resources: vec![],
+        });
+        cs.apply(ClusterMutation::PeerRemoved {
+            id: "departed-sec".into(),
+            cause: RemovalCause::SelfDeparture(BoundedString::from(
+                "graceful abort: local work drained".to_string(),
+            )),
+            member_gen: 0,
+        });
+    }
+    assert!(
+        !primary.cluster_state_for_test().is_peer_alive("departed-sec"),
+        "the graceful departure flipped the membership ledger to removed"
+    );
+
+    // Sleep WELL past the hard backstop (2x the 50ms interval) — a member
+    // judged by the silence schedule would be declared dead here.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The sweep must NOT include the departed member: it is GONE, not silent.
+    let report = primary.collect_heartbeat_report();
+    assert!(
+        report.silences.is_empty(),
+        "a gracefully-departed member must not enter the silence sweep"
+    );
+
+    // Drive the tick: no removal, no requeue. The in-flight task stays
+    // attributed to the departed member (its terminal/recovery is the
+    // failover-hydrate concern, NOT the silence machinery's).
+    primary.process_heartbeat_tick().await.unwrap();
+    assert_eq!(
+        primary.pool().len(),
+        0,
+        "the silence schedule must NOT requeue the departed member's task"
+    );
+    assert_eq!(
+        primary.failed_count(),
+        0,
+        "no spurious keepalive-miss death is charged against a departed member"
+    );
+}
+
 /// Multi-secondary transport variant that pre-registers two
 /// secondaries on the outgoing map. Used by the mass-death tests
 /// because the singleton `empty_transport` only knows about
