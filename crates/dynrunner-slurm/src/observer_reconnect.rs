@@ -65,12 +65,23 @@ impl<R: InfoFileReader + Send + Sync + 'static> TunnelReconnector
     for SlurmPreparationTunnelReconnector<R>
 {
     async fn reconnect(&self, peer_ids: &[String]) {
-        // Rebuild each lost peer's `-R` reverse tunnel. Best-effort +
-        // idempotent: a peer whose tunnel is already healthy simply
-        // re-polls its info file and re-establishes (the observer's loop
-        // retries on the next ~60s cadence tick if any fail). Per-id
+        // Rebuild each lost peer's `-R` reverse tunnel, CONCURRENTLY.
+        // Best-effort + idempotent: a peer whose tunnel is already healthy
+        // simply re-polls its info file and re-establishes (the observer's
+        // loop retries on the next ~60s cadence tick if any fail). Per-id
         // failures are logged, never propagated — an observer carries zero
         // authority and a tunnel rebuild is never a run error.
+        //
+        // CONCURRENT (the mass-disconnect survivor-starvation fix): a
+        // sequential walk pays each DEAD peer's full establishment budget
+        // (up to `per_tunnel_timeout`, 90s) before the next id is even
+        // attempted — six dead peers in the roster starve the live
+        // survivors' rebuilds for many minutes per cadence tick
+        // (run_20260611_200548 specimen 1). Fanned out, every id rides
+        // the shared `establish_pool` rate-limiter concurrently (the same
+        // semaphore the cohort setup uses — sshd-facing concurrency stays
+        // capped), so the survivors rebuild in the FIRST wave while the
+        // dead ids burn their budgets in parallel.
         //
         // `reestablish_one_tunnel` (NOT `establish_one_tunnel`): on an
         // UNGRACEFUL drop (SIGKILL / NIC blip / crash) the worker's sshd
@@ -83,7 +94,7 @@ impl<R: InfoFileReader + Send + Sync + 'static> TunnelReconnector
         // break the worker's `localhost:<tunnel_port>` dial with no
         // re-coordination path). The graceful-close path already has the
         // port free, so the release is a harmless no-op there.
-        for peer_id in peer_ids {
+        futures_util::future::join_all(peer_ids.iter().map(|peer_id| async move {
             match self
                 .preparation
                 .reestablish_one_tunnel(peer_id, self.info_reader.clone())
@@ -104,6 +115,94 @@ impl<R: InfoFileReader + Send + Sync + 'static> TunnelReconnector
                     );
                 }
             }
+        }))
+        .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::preparation::{PrepError, PreparationOptions, SlurmPreparation};
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Reader whose info files NEVER appear (every rebuild sticks in the
+    /// poll loop forever — the dead-peer shape) while recording which
+    /// ids' paths were polled at all.
+    #[derive(Clone, Default)]
+    struct RecordingStuckReader {
+        polled: Arc<Mutex<HashSet<String>>>,
+    }
+
+    impl crate::preparation::InfoFileReader for RecordingStuckReader {
+        fn read(
+            &self,
+            path: String,
+        ) -> impl std::future::Future<Output = Result<Option<String>, PrepError>> + 'static
+        {
+            let polled = Arc::clone(&self.polled);
+            async move {
+                polled.lock().expect("polled mutex").insert(path);
+                Ok(None)
+            }
         }
+    }
+
+    /// The mass-disconnect survivor-starvation pin (specimen 1 of
+    /// run_20260611_200548): the per-id rebuilds must run CONCURRENTLY.
+    /// With a roster whose ids all stick in their (unbounded) info-file
+    /// poll, a sequential walk never gets past the FIRST id — the
+    /// remaining ids' info files are never even read, which is exactly
+    /// how six dead peers starved the five live survivors' rebuilds for
+    /// minutes per cadence tick. Concurrent rebuilds poll every id's
+    /// info file within the first poll periods.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rebuilds_run_concurrently_not_sequentially() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut opts = PreparationOptions::new(
+                    "/tmp/dynrunner-obsreconnect-test".into(),
+                    "gw.invalid".into(),
+                    None,
+                    22,
+                    vec![],
+                    vec![],
+                );
+                opts.poll_interval = Duration::from_millis(5);
+                let prep = Arc::new(SlurmPreparation::new(opts));
+                let reader = RecordingStuckReader::default();
+                // Seed the captured primary QUIC port (the reestablish
+                // precondition) without establishing anything: a
+                // zero-secondary cohort touches no ssh.
+                prep.setup_ssh_tunnels(reader.clone(), 0, 51200)
+                    .await
+                    .expect("zero-secondary setup seeds the primary port");
+
+                let reconnector =
+                    SlurmPreparationTunnelReconnector::new(Arc::clone(&prep), reader.clone());
+                let ids: Vec<String> = vec!["sec-0".into(), "sec-1".into(), "sec-2".into()];
+                tokio::task::spawn_local(async move {
+                    reconnector.reconnect(&ids).await;
+                });
+
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let n = reader.polled.lock().expect("polled mutex").len();
+                    if n >= 3 {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "only {n} of 3 ids' info files were ever polled — the \
+                         rebuild walk is sequential and the first (stuck/dead) \
+                         id starves every other rebuild"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
     }
 }

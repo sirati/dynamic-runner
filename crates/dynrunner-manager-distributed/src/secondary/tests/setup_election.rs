@@ -272,6 +272,52 @@ async fn setup_phase_never_meshed_does_not_arm_election() {
         .await;
 }
 
+/// NEGATIVE (run_20260611_221215 replay): a NEVER-CONFIGURED secondary — its
+/// bootstrap wire to setup never came up, so it was never welcomed, holds an
+/// EMPTY replicated membership AND an empty mesh — must NOT arm a setup-phase
+/// election no matter how long the primary silence accumulates. Pre-fix it
+/// armed (the `mesh.degraded` gate read its `false` DEFAULT — the formation
+/// watchdog never ran because no peer list ever arrived), seeded a quorum
+/// denominator of ZERO, `failover_quorum(0) == 1`, and self-promoted as a
+/// "single-survivor self-quorum" into a vacuous zero-task run that exited 0
+/// ("completed") — all 11 production secondaries did exactly this instead of
+/// dying loudly at the unconfigured deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn setup_phase_never_configured_does_not_arm_election() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // NO mesh peers, NO seeded membership, NO PrimaryChanged — the
+            // node knows nothing beyond its own config (the bootstrap dial
+            // never landed).
+            let (mut sec, _members) =
+                make_secondary_membership(election_config(SELF_ID), vec![]);
+            assert!(!sec.mesh.degraded, "precondition: the formation watchdog \
+                 never ran, so `degraded` is still the default `false` — the \
+                 exact pre-fix bypass");
+
+            // Silence far past the threshold (the production node waited 300s).
+            sec.maybe_arm_setup_election(Duration::from_secs(300));
+            assert!(
+                sec.setup_election.is_none(),
+                "a never-configured secondary (zero membership evidence, zero \
+                 mesh-member peers) must NOT arm a setup-phase election — \
+                 quorum would be 1 and the node would self-promote into a \
+                 vacuous zero-task run exiting 0; the unconfigured deadline \
+                 owns the give-up"
+            );
+            // And the drive tick stays a no-op — no promotion can ever fire.
+            sec.drive_setup_election_tick().await;
+            assert!(sec.election_state().is_none());
+            assert!(
+                sec.promotion_rx.try_recv().is_err(),
+                "no PromotionSignal may fire for a never-configured node"
+            );
+        })
+        .await;
+}
+
 /// #423 NEGATIVE: under a lagged OWN tick (CPU starvation), the setup-phase
 /// election arm must NOT arm even past the silence threshold. The
 /// `silent_for` the arm reads is the setup-deadline-anchor age; when THIS

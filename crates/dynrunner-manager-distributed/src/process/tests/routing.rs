@@ -382,3 +382,149 @@ async fn route_incoming_directed_role_miss_falls_back_to_live_slots() {
         "sec-1"
     );
 }
+
+/// THE slotless-window bug: an ingress frame arriving while this process has
+/// ZERO live local slots (the transient promotion / role-swap window — the
+/// coordinator slot torn down and not yet recreated) must NOT vanish. The
+/// fan reaches nobody, so the mesh HOLDS the frame; the instant the next
+/// slot registers it is replayed to that slot. The production shape: a
+/// `RequestClusterSnapshot` fanned mid-promotion at zero slots (prod + e2e
+/// WARN evidence) — pre-fix the only ahead replica's reply was lost.
+#[tokio::test]
+async fn route_incoming_holds_frame_while_slotless_then_replays_on_register() {
+    let (transport, _r) = transport_with_remotes("host-a", &[]);
+    let mut mesh = Mesh::<TestId, _>::new(transport);
+
+    // ZERO live local slots: the swap tore the coordinator slot down and the
+    // replacement has not registered yet. A directed frame arrives.
+    mesh.route_incoming(frame_to(
+        "snap-req",
+        Destination::Secondary(PeerId::from("host-a")),
+    ));
+
+    // The replacement coordinator registers its slot — the slotless window
+    // closes. The held frame must replay to the freshly-registered slot.
+    let (_p_slot, _p_client, mut primary_inbox) =
+        mesh.register_local_role(LocalRole::Primary, PeerId::from("host-a"));
+
+    assert_eq!(
+        sender_of(&primary_inbox.try_recv().expect(
+            "a frame received while slotless must be HELD and replayed to the \
+             next registered slot, never silently dropped"
+        )),
+        "snap-req"
+    );
+}
+
+/// The slotless hold covers the `All` fan path too: an `All`-targeted frame
+/// arriving at zero slots is held and replayed on the next slot register
+/// (the fan-to-nobody hole is identical regardless of frame target — the
+/// fix is generic, not per-kind).
+#[tokio::test]
+async fn route_incoming_all_held_while_slotless_then_replayed() {
+    let (transport, _r) = transport_with_remotes("host-a", &[]);
+    let mut mesh = Mesh::<TestId, _>::new(transport);
+
+    mesh.route_incoming(frame_to("all-while-slotless", Destination::All));
+
+    let (_s_slot, _s_client, mut secondary_inbox) =
+        mesh.register_local_role(LocalRole::Secondary, PeerId::from("host-a"));
+
+    assert_eq!(
+        sender_of(
+            &secondary_inbox
+                .try_recv()
+                .expect("an All frame held while slotless must replay on register")
+        ),
+        "all-while-slotless"
+    );
+}
+
+/// A frame is HELD only when the fan reaches ZERO live slots: while ≥1 slot
+/// is live the existing fan delivers it and nothing is buffered, so a later
+/// registration does NOT re-deliver a stale copy (the hold must not double
+/// up the steady path).
+#[tokio::test]
+async fn route_incoming_does_not_hold_when_a_slot_is_live() {
+    let (transport, _r) = transport_with_remotes("host-a", &[]);
+    let mut mesh = Mesh::<TestId, _>::new(transport);
+
+    let (_p_slot, _p_client, mut primary_inbox) =
+        mesh.register_local_role(LocalRole::Primary, PeerId::from("host-a"));
+
+    // A live slot exists: the fan delivers immediately, nothing is held.
+    mesh.route_incoming(frame_to("delivered-now", Destination::All));
+    assert_eq!(
+        sender_of(&primary_inbox.try_recv().expect("delivered to the live slot")),
+        "delivered-now"
+    );
+
+    // Registering a SECOND slot must not replay a phantom held copy.
+    let (_s_slot, _s_client, mut secondary_inbox) =
+        mesh.register_local_role(LocalRole::Secondary, PeerId::from("host-a"));
+    assert!(
+        secondary_inbox.try_recv().is_none(),
+        "no frame was held while a slot was live, so registration replays nothing"
+    );
+    assert!(
+        primary_inbox.try_recv().is_none(),
+        "the already-delivered frame is not re-delivered on a later register"
+    );
+}
+
+/// The hold buffer is BOUNDED: once it is full, admitting a newer held frame
+/// evicts the OLDEST with a WARN naming its kind (never a silent drop). Here
+/// we overrun the bound by one while slotless, then register a slot: every
+/// held frame EXCEPT the evicted oldest replays, in arrival order, and the
+/// overflow WARN fired.
+#[tokio::test]
+async fn slotless_hold_overflow_drops_oldest_with_warn() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let capture = crate::test_capture::TargetCapture::for_target(
+        "dynrunner_manager_distributed::process::mesh::routing",
+    );
+    let subscriber = tracing_subscriber::Registry::default().with(capture.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (transport, _r) = transport_with_remotes("host-a", &[]);
+    let mut mesh = Mesh::<TestId, _>::new(transport);
+
+    // Overrun the bound by one while slotless: CAPACITY + 1 frames, tagged
+    // by arrival index so we can assert which survived.
+    let capacity = super::super::mesh::SLOTLESS_HOLD_CAPACITY;
+    for i in 0..=capacity {
+        mesh.route_incoming(frame_to(
+            &format!("f{i}"),
+            Destination::Secondary(PeerId::from("host-a")),
+        ));
+    }
+
+    // The overflow evicted the OLDEST (`f0`) with a WARN.
+    let overflow_warns = capture
+        .events()
+        .into_iter()
+        .filter(|e| {
+            e.level == tracing::Level::WARN
+                && e.event.message.contains("slotless-hold buffer full")
+        })
+        .count();
+    assert_eq!(
+        overflow_warns, 1,
+        "exactly one overflow eviction WARN must fire (oldest dropped, never silent)"
+    );
+
+    // Register a slot; the surviving CAPACITY frames replay in arrival order,
+    // and `f0` (the evicted oldest) is absent.
+    let (_p_slot, _p_client, mut inbox) =
+        mesh.register_local_role(LocalRole::Primary, PeerId::from("host-a"));
+
+    let mut replayed = Vec::new();
+    while let Some(msg) = inbox.try_recv() {
+        replayed.push(sender_of(&msg).to_string());
+    }
+    let expected: Vec<String> = (1..=capacity).map(|i| format!("f{i}")).collect();
+    assert_eq!(
+        replayed, expected,
+        "the surviving held frames replay in arrival order; the evicted oldest is gone"
+    );
+}

@@ -32,9 +32,10 @@ use dynrunner_transport_channel::ChannelPeerTransport;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use dynrunner_manager_distributed::GracefulAbortTrigger;
 use dynrunner_manager_distributed::cluster_state::ClusterState;
 use dynrunner_manager_distributed::observer::{
-    GracefulAbortTrigger, ObserverConfig, ObserverCoordinator, ObserverTerminal,
+    ObserverConfig, ObserverCoordinator, ObserverTerminal,
 };
 use dynrunner_manager_distributed::process::{LocalRole, Mesh, MeshClient, RoleInbox};
 use dynrunner_protocol_primary_secondary::address::PeerId;

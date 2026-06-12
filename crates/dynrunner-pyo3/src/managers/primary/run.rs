@@ -9,7 +9,9 @@ use pyo3::types::PyList;
 use dynrunner_manager_distributed::process::{
     LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal, SeedSource,
 };
-use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, RunError};
+use dynrunner_manager_distributed::{
+    GracefulAbortTrigger, PrimaryConfig, PrimaryCoordinator, RunError,
+};
 use dynrunner_protocol_primary_secondary::address::PeerId;
 
 use crate::identifier::RunnerIdentifier;
@@ -356,6 +358,22 @@ impl PyPrimaryCoordinator {
 
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async {
+                // Arm the operator's SIGUSR2 graceful-abort trigger FIRST —
+                // before the mesh bind and the fleet bring-up — so a signal
+                // sent during the primary's bootstrap window is latched
+                // instead of killing the process via the kernel's default
+                // disposition (the CLI documents SIGUSR2 to the submitter
+                // primary, and an operator cannot observe the relocation
+                // instant — an early signal used to be lethal for the WHOLE
+                // pre-loop tenure). The SAME armed trigger is injected into
+                // the coordinator below (`register_graceful_abort_trigger`),
+                // so a buffered pre-seat delivery is consumed by whichever
+                // role loop runs — the primary's own arm initiates the
+                // graceful abort directly, and after a relocation it rides the
+                // observer handoff. There is exactly ONE `user_defined2`
+                // stream per process, owned here.
+                let mut abort_trigger = Some(GracefulAbortTrigger::arm());
+
                 // Stand up the submitter primary's mesh-join transport
                 // through the backend-opaque factory: it builds the mesh
                 // transport, binds the listener wiring its accept loops to
@@ -377,6 +395,13 @@ impl PyPrimaryCoordinator {
                         Ok(b) => b,
                         Err(e) => {
                             tracing::error!(error = %e, "failed to start primary mesh transport");
+                            // A bootstrap-failure exit before the trigger was
+                            // injected: narrate a latched operator abort so the
+                            // intent is never silently lost (the late-joiner's
+                            // failed-bootstrap discipline).
+                            if let Some(trigger) = abort_trigger.take() {
+                                trigger.report_undelivered().await;
+                            }
                             return;
                         }
                     };
@@ -596,6 +621,17 @@ impl PyPrimaryCoordinator {
                     );
                 if let Some(rx) = panik_watcher.take_signal_rx() {
                     primary.register_panik_signal_rx(rx);
+                }
+
+                // Hand the entry-armed SIGUSR2 trigger to the coordinator
+                // (taken exactly once — the only consumer after the
+                // mesh-bind success path). The operational loop's
+                // graceful-abort arm consumes it: a signal latched during
+                // bootstrap initiates the graceful abort on the primary's
+                // first poll, and `into_observer_handoff` carries it onto the
+                // observer if the primary relocates.
+                if let Some(trigger) = abort_trigger.take() {
+                    primary.register_graceful_abort_trigger(trigger);
                 }
 
                 for (sec_id, file_hash, content_hash, src, dest) in pending_stage_files {

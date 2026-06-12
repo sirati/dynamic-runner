@@ -14,10 +14,22 @@ use tokio::process::Command;
 
 use crate::traits::GatewayError;
 
-use super::SshGateway;
 use super::argv::{
     build_master_argv, generate_master_control_path, probe_master_pid, terminate_daemon_blocking,
 };
+use super::{MasterForward, SshGateway, master_forward_cancel, master_forward_open};
+
+/// The gateway's registered reverse-forward shape:
+/// `-R 0.0.0.0:<remote>:localhost:<local>` (gateway-side listener
+/// carrying connections back to this host).
+fn reverse_forward(local_port: u16, remote_port: u16) -> MasterForward {
+    MasterForward::Remote {
+        bind_addr: "0.0.0.0".into(),
+        bind_port: remote_port,
+        dest_host: "localhost".into(),
+        dest_port: local_port,
+    }
+}
 
 impl SshGateway {
     pub(super) async fn connect_inner(&mut self) -> Result<(), GatewayError> {
@@ -51,28 +63,18 @@ impl SshGateway {
             // forwarded_ports; OpenSSH supports adding them at
             // runtime through the control socket.
             for &(local_port, remote_port) in &self.forwarded_ports.clone() {
-                let mut cmd = Command::new("ssh");
-                for arg in self.base_ssh_args() {
-                    cmd.arg(&arg);
-                }
-                cmd.args([
-                    "-O",
-                    "forward",
-                    "-o",
-                    &format!("ControlPath={external_cp}"),
-                    "-R",
-                    &format!("0.0.0.0:{remote_port}:localhost:{local_port}"),
-                ]);
-                cmd.arg(self.ssh_target());
-                let output = cmd.output().await?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(GatewayError::CommandFailed(format!(
+                master_forward_open(
+                    &external_cp,
+                    &self.config,
+                    &reverse_forward(local_port, remote_port),
+                )
+                .await
+                .map_err(|e| {
+                    GatewayError::CommandFailed(format!(
                         "Failed to add reverse forward {remote_port}:localhost:{local_port} \
-                         to external master: {}",
-                        stderr.trim()
-                    )));
-                }
+                         to external master: {e}"
+                    ))
+                })?;
                 tracing::info!(
                     local_port,
                     remote_port,
@@ -226,6 +228,22 @@ impl SshGateway {
         // master-death class bug becomes observable instead of silent.
         self.spawn_master_watcher(daemon_pid);
 
+        // Owner-death babysitter: the one teardown layer that still
+        // works when THIS process is SIGKILLed (no Drop runs, and the
+        // ControlPersist daemon detached from anything PDEATHSIG can
+        // reach) — without it the master daemon outlives its owner
+        // indefinitely as a stale /tmp/dynrunner-m-* socket. See
+        // `spawn_master_babysitter`. Spawn failure degrades to the
+        // pre-babysitter world (leak on SIGKILL), not a connect error.
+        match super::spawn_master_babysitter(std::process::id(), &cp, &self.config) {
+            Ok(child) => self.babysitter = Some(child),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "failed to spawn ssh-master babysitter; an unclean kill \
+                 of this process may orphan the master daemon"
+            ),
+        }
+
         // Detect remote home
         let home_result = self.ssh_command("echo $HOME", None).await?;
         if home_result.success() {
@@ -271,35 +289,29 @@ impl SshGateway {
             // mishap is.
             let cp = self.control_path.clone();
             for (local_port, remote_port) in self.forwarded_ports.clone() {
-                let mut cmd = Command::new("ssh");
-                for arg in self.base_ssh_args() {
-                    cmd.arg(&arg);
-                }
-                if let Some(ref cp) = cp {
-                    cmd.args(["-o", &format!("ControlPath={cp}")]);
-                }
-                cmd.args([
-                    "-O",
-                    "cancel",
-                    "-R",
-                    &format!("0.0.0.0:{remote_port}:localhost:{local_port}"),
-                ]);
-                cmd.arg(self.ssh_target());
-                match cmd.output().await {
-                    Ok(output) if output.status.success() => {
+                // Pre-refactor behavior preserved: with no control
+                // path there is nothing to cancel against, and the
+                // resulting ssh failure was tolerated — skip loudly.
+                let Some(ref cp) = cp else {
+                    tracing::warn!(
+                        local_port,
+                        remote_port,
+                        "adopted master has no control path; cannot cancel forward"
+                    );
+                    continue;
+                };
+                match master_forward_cancel(
+                    cp,
+                    &self.config,
+                    &reverse_forward(local_port, remote_port),
+                )
+                .await
+                {
+                    Ok(()) => {
                         tracing::info!(
                             local_port,
                             remote_port,
                             "cancelled reverse forward on adopted master"
-                        );
-                    }
-                    Ok(output) => {
-                        tracing::warn!(
-                            local_port,
-                            remote_port,
-                            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                            "ssh -O cancel returned non-zero on adopted master; \
-                             upstream driver may need to clean up the forward"
                         );
                     }
                     Err(e) => {
@@ -307,7 +319,8 @@ impl SshGateway {
                             local_port,
                             remote_port,
                             error = %e,
-                            "ssh -O cancel failed to launch on adopted master"
+                            "ssh -O cancel failed on adopted master; \
+                             upstream driver may need to clean up the forward"
                         );
                     }
                 }
@@ -325,7 +338,10 @@ impl SshGateway {
         }
 
         // Owned master path (unchanged): polite `ssh -O exit` first,
-        // SIGTERM/SIGKILL ladder fallback.
+        // SIGTERM/SIGKILL ladder fallback. The babysitter goes first —
+        // this orderly path tears the master down itself, so the
+        // owner-death watcher must not linger.
+        self.reap_babysitter();
         let mut cmd = Command::new("ssh");
         for arg in self.base_ssh_args() {
             cmd.arg(&arg);

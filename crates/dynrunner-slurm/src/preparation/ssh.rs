@@ -15,6 +15,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use dynrunner_gateway::no_mux_options;
 use dynrunner_gateway::shell::shell_join;
 use tokio::process::{Child, Command};
 
@@ -209,6 +210,14 @@ pub(super) fn build_ssh_argv(
         "-o".into(),
         "TCPKeepAlive=yes".into(),
     ]);
+    // Pin every mux-relevant option OFF: an operator ssh_config with
+    // `ControlMaster auto` + `ControlPersist yes` would otherwise hand
+    // this child's connection off to an auto-spawned user master and
+    // exit 0 immediately — the `-R` listener alive on a master the
+    // framework neither owns nor gates, and `verify_tunnel_alive`'s
+    // child-longevity contract silently voided (the `-L` path's LMU
+    // misread, mirrored).
+    argv.extend(no_mux_options().iter().map(|o| (*o).to_string()));
     // Diagnostic verbosity for the tunnel child (#415 face (a)). Default
     // OpenSSH `LogLevel` (INFO) is banner-only on these `-N -R` children, so
     // a fleet-wide wire-drop cause (sshd rekey, a MaxSessions channel
@@ -249,7 +258,7 @@ fn push_oneshot_command_opts(argv: &mut Vec<String>) {
 ///
 /// This is the worker-side mirror of the local teardown's targeted
 /// kill (`pkill 'ssh.*-R [0-9]+:localhost'` in
-/// [`crate::pipeline::pkill_residual_reverse_tunnels`]): both kill
+/// [`crate::pipeline::sweep_residual_reverse_tunnels`]): both kill
 /// exactly the per-secondary reverse-tunnel holder for one port, never
 /// a broad sweep that could hit a live tunnel. `fuser -k` is preferred
 /// (one syscall-precise kill of the socket owner); the `ss`+`kill`

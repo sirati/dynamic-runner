@@ -301,38 +301,42 @@ where
     })
 }
 
-/// `pkill -u <uid> -f 'ssh.*-R [0-9]+:localhost'`.
-///
-/// Routed through `dynrunner_slurm::pipeline::pkill_residual_reverse_tunnels`
-/// so a future pure-Rust preparation port (L2.F) calling the same
-/// function gets the c399f5a-tightened regex by construction.
+/// Run-teardown residual sweep: SIGTERM matching `ssh -R` tunnels that
+/// are THIS process's own children (escaped the registry's tracked
+/// cleanup). Routed through
+/// `dynrunner_slurm::pipeline::sweep_residual_reverse_tunnels` so a
+/// future pure-Rust preparation port (L2.F) calling the same function
+/// gets the parentage scoping by construction — a uid-global pkill
+/// here killed CONCURRENT runs' tunnels (run_20260611_221215).
 fn pkill_residual_tunnels(py: Python<'_>) -> PyResult<()> {
     block_on_detached(py, |uid| {
         Box::pin(async move {
-            dynrunner_slurm::pipeline::pkill_residual_reverse_tunnels(uid)
-                .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("pkill: {e}")))
+            dynrunner_slurm::pipeline::sweep_residual_reverse_tunnels(
+                uid,
+                dynrunner_slurm::pipeline::TunnelSweepScope::OwnChildren,
+            )
+            .await
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("tunnel sweep: {e}")))
         })
     })
 }
 
-/// `pkill -u <uid> -f 'ssh.*-R.*localhost'`. Broad-pattern
-/// leftover-cleanup before any new ssh master is started — there
-/// is nothing yet to protect at this point in the lifecycle, so
-/// the pattern is intentionally broader than the post-run
-/// teardown's tightened pattern.
+/// Pipeline-start stray cleanup: SIGTERM matching `ssh -R` tunnel
+/// processes that are ORPHANS (reparented to `init` — their spawning
+/// dispatch died without teardown). Never touches a live run's
+/// tunnels: those are children of that run's still-alive pid. The old
+/// "nothing yet to protect" uid-global pkill was wrong exactly there —
+/// it protected nothing of THIS run but destroyed every CONCURRENT
+/// run's verified tunnels at dispatch start.
 pub(super) fn pkill_leftover_tunnels(py: Python<'_>) -> PyResult<()> {
     block_on_detached(py, |uid| {
         Box::pin(async move {
-            let _ = tokio::process::Command::new("pkill")
-                .arg("-u")
-                .arg(uid.to_string())
-                .arg("-f")
-                .arg(r"ssh.*-R.*localhost")
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await;
-            Ok(())
+            dynrunner_slurm::pipeline::sweep_residual_reverse_tunnels(
+                uid,
+                dynrunner_slurm::pipeline::TunnelSweepScope::Orphans,
+            )
+            .await
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("tunnel sweep: {e}")))
         })
     })
 }

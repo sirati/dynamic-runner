@@ -2,6 +2,7 @@ pub mod anti_entropy;
 pub mod cluster_state;
 pub mod discovery;
 pub mod fulfillability_matcher;
+pub mod graceful_abort_trigger;
 pub mod liveness;
 pub mod message_router;
 pub mod observer;
@@ -32,6 +33,10 @@ pub use primary::{
     derive_connect_timeout,
 };
 pub use discovery::{SetupDiscovery, SetupDiscoveryFn};
+// The operator's SIGUSR2 graceful-abort trigger — armed once at process
+// entry and consumed by whichever role loop (primary or observer) is active
+// (the PyO3 entry paths arm it; see the module header).
+pub use graceful_abort_trigger::GracefulAbortTrigger;
 pub use secondary::{
     DEFAULT_PRIMARY_SILENCE_BACKSTOP, FinalizeRunConfigFn, PeerCertInfo, RunOutcome,
     SecondaryConfig, SecondaryCoordinator, SecondaryTerminal, StagingDispatchContext,
