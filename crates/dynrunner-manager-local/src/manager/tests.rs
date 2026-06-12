@@ -960,7 +960,7 @@ async fn killed_routing_by_kill_reason() {
             .pool_mut()
             .extend(vec![binary.clone()])
             .expect("extend");
-        // Simulate `take_from_view`'s in-flight bump so `requeue`
+        // Simulate `take_selected`'s in-flight bump so `requeue`
         // decrements correctly (requeue saturates at 0 either way,
         // but this matches the production sequencing).
         manager.pool_mut().mark_in_flight(&phase);

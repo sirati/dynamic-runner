@@ -74,7 +74,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 opportunistic,
                 ..
             } => {
-                let binary = self.pool_mut().take_from_view(view, binary_index);
+                // Owned consumption ticket — the view's last use,
+                // releasing the pool borrow for the take below.
+                let selection = view.select(binary_index);
+                let binary = self.pool_mut().take_selected(selection);
                 self.total_assigned_resources.add(&estimated_usage);
                 let estimated_mb = estimated_usage.get(&ResourceKind::memory()) / (1024 * 1024);
                 let name = binary
@@ -144,7 +147,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     }
                     Err(e) => {
                         // Put binary back at the front of its bucket and undo
-                        // resource increment. Item was in-flight (take_from_view
+                        // resource increment. Item was in-flight (take_selected
                         // bumped in-flight) — `requeue` decrements it again.
                         self.pool_mut().requeue(binary);
                         self.total_assigned_resources.sub(&estimated_usage);

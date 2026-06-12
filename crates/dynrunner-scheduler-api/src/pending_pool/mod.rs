@@ -32,8 +32,8 @@
 //! * [`types`] — value types ([`PhaseState`], [`Bucket`],
 //!   [`BucketKey`], [`PreferencePredicate`], [`PendingPoolError`])
 //!   and the affinity sentinel helpers.
-//! * [`view`] — [`WorkerView`] value type and its caller-side
-//!   combinators (`filter`, `sort_by_key`).
+//! * [`view`] — [`WorkerView`] / [`ViewSelection`] value types and the
+//!   view's caller-side combinators (`filter`, `sort_by_key`).
 //! * [`pool`] — the [`PendingPool`] struct definition, constructor
 //!   `new`, and cluster-state pre-seeding (`mark_tasks_completed`,
 //!   `mark_tasks_failed`, `mark_tasks_failed_pending_retry`,
@@ -41,7 +41,7 @@
 //! * [`extend`] — `extend` and its private helpers (`commit_item`,
 //!   `collect_known_task_ids`).
 //! * [`dispatch`] — `pop_for_worker`, `view_for_worker`,
-//!   `take_from_view` and the shared `take_at` / `choose_bucket_for`
+//!   `take_selected` and the shared `take_at` / `choose_bucket_for`
 //!   internals.
 //! * [`lifecycle`] — `on_item_finished`, `on_item_failed_permanent`,
 //!   `mark_in_flight`, `requeue`, `reinject`, `drain_queued`,
@@ -71,7 +71,7 @@ pub use backoff::{DISPATCH_BACKOFF_BASE, DISPATCH_BACKOFF_CAP};
 pub use partition::IngestPartition;
 pub use pool::PendingPool;
 pub use types::{BucketKey, PendingPoolError, PhaseState, PreferencePredicate};
-pub use view::WorkerView;
+pub use view::{ViewSelection, WorkerView};
 
 #[cfg(test)]
 #[path = "../pending_pool_tests/mod.rs"]

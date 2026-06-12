@@ -367,7 +367,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 opportunistic,
                 ..
             } => {
-                let binary = self.pool_mut().take_from_view(view, binary_index);
+                // Owned consumption ticket — the view's last use,
+                // releasing the pool borrow for the take below.
+                let selection = view.select(binary_index);
+                let binary = self.pool_mut().take_selected(selection);
                 let name = binary
                     .path
                     .file_name()
@@ -438,7 +441,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     }
                     Err(e) => {
                         // Put binary back at the front of its bucket — it
-                        // was in-flight (take_from_view bumped in-flight)
+                        // was in-flight (take_selected bumped in-flight)
                         // and now needs to be re-attempted.
                         self.pool_mut().requeue(binary);
                         self.handle_assignment_failure(worker_id, &e, factory).await;

@@ -2042,7 +2042,7 @@ mod sweep_decision_tests {
         fn assign_initial(
             &self,
             _worker: &WorkerBudgetInfo<TestId>,
-            _pending: &[TaskInfo<TestId>],
+            _pending: &[&TaskInfo<TestId>],
             _total_assigned: &ResourceMap,
             _max: &ResourceMap,
             _estimator: &dyn ResourceEstimator<TestId>,
@@ -2053,7 +2053,7 @@ mod sweep_decision_tests {
             &self,
             _worker: &WorkerBudgetInfo<TestId>,
             _all: &[WorkerBudgetInfo<TestId>],
-            _pending: &[TaskInfo<TestId>],
+            _pending: &[&TaskInfo<TestId>],
             _max: &ResourceMap,
             _estimator: &dyn ResourceEstimator<TestId>,
             _retry_attempt: bool,

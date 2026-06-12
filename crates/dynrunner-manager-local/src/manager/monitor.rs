@@ -173,7 +173,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 // the by-value `TaskInfo<I>` is required.
                 if reason.is_no_fault() {
                     // Pool's `requeue` decrements in-flight (set by
-                    // `take_from_view`) and pushes to the bucket front.
+                    // `take_selected`) and pushes to the bucket front.
                     self.pool_mut().requeue(*binary);
                     return;
                 }

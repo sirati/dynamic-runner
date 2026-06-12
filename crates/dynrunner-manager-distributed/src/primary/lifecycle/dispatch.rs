@@ -37,6 +37,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // the authoritative free predicate (`held_task().is_none()`)
         // and sorts by the advisory busy-load count.
         let order = dispatch_order(&self.workers);
+        // Fleet-wide budget snapshot, built ONCE per recheck (not per
+        // idle worker — the rebuild-inside-the-loop shape made the
+        // recheck O(workers²) in `budget_info` clones). The snapshot
+        // stays faithful to a per-worker rebuild because the loop's
+        // only worker-state mutations are `commit_assignment` /
+        // `rollback_assignment` on the CURRENT `worker_idx`, and both
+        // sites below refresh exactly that entry.
+        let mut all_infos: Vec<dynrunner_scheduler_api::WorkerBudgetInfo<I>> =
+            self.workers.iter().map(|w| w.budget_info()).collect();
         for worker_idx in order {
             // Composed dispatch-shape gate: backpressure backoff +
             // OOM-bucket single-worker masking. The predicate lives
@@ -59,13 +68,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             if view.is_empty() {
                 continue;
             }
-            let worker_info = self.workers[worker_idx].budget_info();
-            let all_infos: Vec<dynrunner_scheduler_api::WorkerBudgetInfo<I>> =
-                self.workers.iter().map(|w| w.budget_info()).collect();
             let max_res = self.workers[worker_idx].resource_budgets.clone();
 
             let decision = self.scheduler.assign_normal(
-                &worker_info,
+                &all_infos[worker_idx],
                 &all_infos,
                 view.as_slice(),
                 &max_res,
@@ -79,7 +85,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 ..
             } = decision
             {
-                let binary = self.pool_mut().take_from_view(view, binary_index);
+                // Extract the owned consumption ticket — the view's last
+                // use, releasing the pool borrow for the take below.
+                let selection = view.select(binary_index);
+                let binary = self.pool_mut().take_selected(selection);
                 let sec_id = self.workers[worker_idx].secondary_id.clone();
                 let local_worker_id = self.local_worker_id_in_secondary(worker_idx);
 
@@ -95,6 +104,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     task_hash.clone(),
                     estimated_usage.clone(),
                 );
+                // Keep the hoisted budget snapshot coherent: the commit
+                // just made this slot busy, and later workers' scheduler
+                // calls must see it that way (idle-rank shifts under a
+                // per-worker rebuild would have).
+                all_infos[worker_idx] = self.workers[worker_idx].budget_info();
                 // Resolve the per-edge predecessor-output map from the
                 // replicated `cluster_state.task_outputs` cache. The
                 // helper handles both the direct-dep present-but-empty
@@ -121,7 +135,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // `await?` returned Err with the worker's
                 // `current_task` set, `is_idle = false`, and the
                 // pool's `in_flight_per_phase` bumped (via the
-                // earlier `take_from_view` call) — but the task
+                // earlier `take_selected` call) — but the task
                 // itself never reached the peer. The primary's
                 // view permanently believed the slot was busy,
                 // `dispatch_order` skipped it forever, and the
@@ -158,6 +172,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     // this hash — then requeue the binary.
                     self.rollback_assignment(worker_idx, &task_hash, &binary.type_id);
                     self.pool_mut().requeue(binary);
+                    // The rollback re-idled the slot; refresh its
+                    // snapshot entry so later workers see it free again.
+                    all_infos[worker_idx] = self.workers[worker_idx].budget_info();
                     continue;
                 }
 

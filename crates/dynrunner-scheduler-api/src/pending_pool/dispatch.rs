@@ -6,9 +6,10 @@
 //! Methods in this module:
 //! * [`PendingPool::pop_for_worker`] — single-shot, returns the next
 //!   item the soft-pin algorithm chooses for the worker.
-//! * [`PendingPool::view_for_worker`] — affinity-ordered snapshot for
-//!   the scheduler; pairs items with internal locators.
-//! * [`PendingPool::take_from_view`] — consume one slot of a view.
+//! * [`PendingPool::view_for_worker`] — affinity-ordered borrowed view
+//!   for the scheduler; pairs items with internal locators.
+//! * [`PendingPool::take_selected`] — consume the view slot a
+//!   [`ViewSelection`] ticket names.
 //! * `take_at` (private) — the shared write that updates affinity and
 //!   in-flight counters; called by both entry points.
 //! * `choose_bucket_for` (private) — the read-only soft-pin algorithm.
@@ -19,7 +20,7 @@ use dynrunner_core::{Identifier, PhaseId, TaskInfo, WorkerId};
 
 use super::pool::PendingPool;
 use super::types::{Bucket, BucketKey, PhaseState, PreferencePredicate, no_affinity};
-use super::view::WorkerView;
+use super::view::{ViewSelection, WorkerView};
 
 impl<I: Identifier> PendingPool<I> {
     /// Return the next item this worker should process, or `None`.
@@ -55,10 +56,13 @@ impl<I: Identifier> PendingPool<I> {
 
     /// Affinity-ordered view of items currently eligible for `worker_id`.
     ///
-    /// The returned [`WorkerView`] holds **cloned** `TaskInfo<I>` values so
-    /// the borrow on the pool is released by the time the caller hands the
-    /// slice to a `Scheduler`. To consume the view (and remove the chosen
-    /// item from the underlying bucket) use [`take_from_view`].
+    /// The returned [`WorkerView`] BORROWS the candidate `TaskInfo<I>`
+    /// values from the pool — view construction clones nothing — so the
+    /// borrow checker keeps the pool immutable while the caller hands
+    /// the slice to a `Scheduler`. To consume the chosen item (and
+    /// remove it from the underlying bucket) extract an owned ticket
+    /// with [`WorkerView::select`] — the view's last use, releasing the
+    /// pool borrow — and pass it to [`take_selected`].
     ///
     /// Ordering matches the soft-pin priority of [`pop_for_worker`]:
     /// 1. items in the worker's currently-pinned bucket (if its phase is
@@ -73,11 +77,12 @@ impl<I: Identifier> PendingPool<I> {
     /// bucket appears in at most one priority class.
     ///
     /// **Concurrency note**: this method does not record any reservation;
-    /// the corresponding `take_from_view` must run before any other
+    /// the corresponding `take_selected` must run before any other
     /// mutation to the pool, otherwise the locator indices stored in the
-    /// view may become stale. The local manager's single-threaded loop
-    /// satisfies this; multi-threaded callers must guard the pair with a
-    /// lock.
+    /// selection may become stale. The borrow checker enforces this for
+    /// the view itself; the window between `select` and `take_selected`
+    /// is the caller's (single-threaded-loop) responsibility, guarded by
+    /// `take_selected`'s debug assert.
     ///
     /// When `preference_predicate` is `Some`, the items emitted for each
     /// of the four priority classes (pin, typed, free-pool, co-pin) are
@@ -88,38 +93,38 @@ impl<I: Identifier> PendingPool<I> {
     /// step entirely and produces the same byte-for-byte view a
     /// no-predicate call would have built before this parameter was
     /// introduced.
-    pub fn view_for_worker(
-        &self,
+    pub fn view_for_worker<'p>(
+        &'p self,
         worker_id: WorkerId,
         preference_predicate: Option<&PreferencePredicate<'_, I>>,
-    ) -> WorkerView<I> {
+    ) -> WorkerView<'p, I> {
         // Local alias for the paired `(item, locator)` scratch shape.
         // Kept as a local type binding so it does not leak into the
         // public surface of the module.
-        type Paired<I> = (TaskInfo<I>, (BucketKey, usize));
+        type Paired<'p, I> = (&'p TaskInfo<I>, (BucketKey, usize));
 
         let no_aff = no_affinity();
         let mut emitted: HashSet<BucketKey> = HashSet::new();
         // Per-class chunks of paired (item, locator) entries. The four
         // chunks correspond, in order, to: pin, typed, free-pool, co-pin.
-        let mut chunks: [Vec<Paired<I>>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut chunks: [Vec<Paired<'p, I>>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
         // Re-dispatch backoff filter: an item parked under an
         // unexpired backoff stamp is invisible to dispatch (it still
         // counts as queued for the phase machine). Locators index the
         // ORIGINAL bucket positions, so skipping an item here keeps
-        // every emitted locator valid for `take_from_view`.
+        // every emitted locator valid for `take_selected`.
         let now = std::time::Instant::now();
         let backoff = &self.dispatch_backoff;
         let collect_bucket = |key: &BucketKey,
-                              bucket: &Bucket<I>,
+                              bucket: &'p Bucket<I>,
                               emitted: &mut HashSet<BucketKey>,
-                              sink: &mut Vec<Paired<I>>| {
+                              sink: &mut Vec<Paired<'p, I>>| {
             for (idx, item) in bucket.items.iter().enumerate() {
                 if !backoff.is_eligible(&item.task_id, now) {
                     continue;
                 }
-                sink.push((item.clone(), (key.clone(), idx)));
+                sink.push((item, (key.clone(), idx)));
             }
             emitted.insert(key.clone());
         };
@@ -196,7 +201,7 @@ impl<I: Identifier> PendingPool<I> {
         }
 
         let total: usize = chunks.iter().map(|c| c.len()).sum();
-        let mut items: Vec<TaskInfo<I>> = Vec::with_capacity(total);
+        let mut items: Vec<&'p TaskInfo<I>> = Vec::with_capacity(total);
         let mut locators: Vec<(BucketKey, usize)> = Vec::with_capacity(total);
         for chunk in chunks {
             for (item, locator) in chunk {
@@ -212,37 +217,36 @@ impl<I: Identifier> PendingPool<I> {
         }
     }
 
-    /// Remove the item at `slice_idx` of `view` from its bucket, recording
-    /// the worker's affinity claim and incrementing the in-flight count
-    /// for the phase. Returns the owned `TaskInfo<I>`.
+    /// Remove the item a [`ViewSelection`] ticket names from its bucket,
+    /// recording the worker's affinity claim and incrementing the
+    /// in-flight count for the phase. Returns the owned `TaskInfo<I>`.
     ///
-    /// Panics if `slice_idx` is out of range, or if the underlying bucket
-    /// has shrunk (debug builds only) since the view was constructed —
-    /// callers are required to consume the view before any other pool
-    /// mutation. See [`view_for_worker`].
-    pub fn take_from_view(&mut self, view: WorkerView<I>, slice_idx: usize) -> TaskInfo<I> {
-        let (bucket_key, item_idx) = view
-            .locators
-            .get(slice_idx)
-            .cloned()
-            .expect("slice_idx out of range for WorkerView");
-        let worker_id = view.worker_id;
+    /// Panics (debug builds only) if the underlying bucket has shrunk
+    /// since the view was constructed — callers are required to consume
+    /// the selection before any other pool mutation. See
+    /// [`view_for_worker`].
+    pub fn take_selected(&mut self, selection: ViewSelection) -> TaskInfo<I> {
+        let ViewSelection {
+            bucket_key,
+            item_idx,
+            worker_id,
+        } = selection;
         // The bucket must still hold the same item at the recorded index.
         // This invariant is required for correctness; any caller that
-        // mutated the pool between view construction and take_from_view
+        // mutated the pool between view construction and take_selected
         // is buggy.
         debug_assert!(
             self.buckets
                 .get(&bucket_key)
                 .map(|b| item_idx < b.items.len())
                 .unwrap_or(false),
-            "WorkerView locator points past end of bucket; pool was \
-             mutated between view construction and take_from_view"
+            "ViewSelection locator points past end of bucket; pool was \
+             mutated between view construction and take_selected"
         );
         self.take_at(&bucket_key, item_idx, worker_id)
     }
 
-    // ---- internals shared by pop_for_worker and take_from_view ----
+    // ---- internals shared by pop_for_worker and take_selected ----
 
     /// Remove the item at `index` of bucket `key`, run the same
     /// affinity / in-flight bookkeeping as `take_from_bucket`, and
@@ -282,7 +286,7 @@ impl<I: Identifier> PendingPool<I> {
         tracing::debug!(
             phase = %key.0,
             new_in_flight = *in_flight_count,
-            "pool: in_flight +1 (take_from_view)"
+            "pool: in_flight +1 (take_at)"
         );
 
         if bucket.items.is_empty() {
