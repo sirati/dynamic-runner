@@ -97,6 +97,25 @@ pub(super) fn abort_request_frame(sender: &str) -> DistributedMessage<TestId> {
     }
 }
 
+/// A CONFIRMABLE task report carrying a sticky `delivery_seq` — the
+/// frame shape the secondary's #352 buffered-report-replay re-sends
+/// BYTE-IDENTICALLY (same seq, same timestamp — the retained copy is
+/// cloned, never re-stamped) until the authority's `TerminalAck`
+/// lands. The run_20260612_072807 victim shape.
+pub(super) fn report_frame(sender: &str, seq: u64) -> DistributedMessage<TestId> {
+    DistributedMessage::TaskComplete {
+        target: None,
+        sender_id: sender.to_string(),
+        timestamp: 3.0,
+        secondary_id: sender.to_string(),
+        worker_id: 0,
+        task_hash: "8e0c9c26264bab7e".into(),
+        result_data: None,
+        delivery_seq: Some(seq),
+        msgs_posted_through: None,
+    }
+}
+
 /// Build a channel transport for `local_id` wired to `remotes`, returning
 /// the transport plus a receiver per remote id so a test can drain what
 /// the mesh sent to the wire.

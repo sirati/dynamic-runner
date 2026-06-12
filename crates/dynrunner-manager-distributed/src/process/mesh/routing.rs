@@ -276,12 +276,23 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
     /// ping-pong between two stale processes. The guard is a GENERAL
     /// rule, not a hop count on the wire: each process remembers the
     /// fingerprints of frames it already relayed
-    /// ([`super::ROLE_RELAY_RING_CAPACITY`]) and NEVER relays the same
-    /// frame twice — a frame revisiting this ingress comes to rest in
-    /// the documented fan/hold default at this (final) hop. Any cycle
-    /// must revisit a process, so total relay hops are bounded by the
-    /// process count; convergence then heals the views and the sender's
-    /// next retry routes cleanly.
+    /// ([`super::ROLE_RELAY_RING_CAPACITY`]) and never relays the same
+    /// frame twice WITHIN ONE JOURNEY — a frame revisiting this ingress
+    /// inside the cycle window ([`super::ROLE_RELAY_RING_TTL`]) comes to
+    /// rest in the documented fan/hold default at this (final) hop. Any
+    /// cycle must revisit a process, so total relay hops are bounded by
+    /// the process count; convergence then heals the views and the
+    /// sender's next retry routes cleanly.
+    ///
+    /// The guard is JOURNEY-scoped, never forever: a byte-identical
+    /// re-landing AFTER the window is a NEW journey — the #352
+    /// retention replaying a confirmable report with its sticky
+    /// `delivery_seq` (≥15 s cadence) — and is OBLIGATED to be relayed
+    /// again so the authority can re-ack it. A never-expiring
+    /// fingerprint turned one lost ack into a permanent black hole: the
+    /// replay rested in the local fan, the no-op observation arms
+    /// absorbed it, and the reporter replayed into the same host
+    /// forever (run_20260612_072807 — see [`super::ROLE_RELAY_RING_TTL`]).
     async fn try_relay_to_role_holder(
         &mut self,
         frame: DistributedMessage<I>,
@@ -320,7 +331,18 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
             // admit a relay, so rest locally.
             return Some(frame);
         };
-        if self.relayed_ring.contains(&fingerprint) {
+        // Age out fingerprints past the cycle window FIRST: the guard is
+        // journey-scoped (see the doc above), and entries are appended
+        // in time order, so the expired ones cluster at the front. An
+        // expired entry merely re-permits a relay — it never drops a
+        // frame.
+        let now = tokio::time::Instant::now();
+        while let Some((_, relayed_at)) = self.relayed_ring.front()
+            && now.duration_since(*relayed_at) >= super::ROLE_RELAY_RING_TTL
+        {
+            self.relayed_ring.pop_front();
+        }
+        if self.relayed_ring.iter().any(|(f, _)| *f == fingerprint) {
             tracing::warn!(
                 kind = ?frame.msg_type(),
                 target = ?frame.target(),
@@ -340,7 +362,7 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
                 if self.relayed_ring.len() == super::ROLE_RELAY_RING_CAPACITY {
                     self.relayed_ring.pop_front();
                 }
-                self.relayed_ring.push_back(fingerprint);
+                self.relayed_ring.push_back((fingerprint, now));
                 tracing::info!(
                     kind = ?frame.msg_type(),
                     target = ?frame.target(),

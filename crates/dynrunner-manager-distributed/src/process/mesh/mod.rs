@@ -67,15 +67,41 @@ pub(crate) const SLOTLESS_HOLD_CAPACITY: usize = 64;
 /// `routing.rs`).
 ///
 /// The ring remembers the fingerprints of frames THIS process has
-/// already ingress-relayed toward a recognized role holder. A frame
-/// seen AGAIN at this ingress (a stale holder view bounced it back, or
-/// a longer relay cycle revisited us) is never relayed twice — it comes
-/// to rest in the documented fan/hold default instead, so divergent
-/// holder views can bound-cycle a frame at most once per process. The
-/// relay path is cold (mis-addressed directed frames only), so a small
-/// ring suffices; eviction is oldest-first and merely re-permits a
-/// (re-)relay, never drops a frame.
+/// already ingress-relayed toward a recognized role holder, each with
+/// its relay instant (see [`ROLE_RELAY_RING_TTL`]). A frame seen AGAIN
+/// at this ingress WITHIN the cycle window (a stale holder view bounced
+/// it back, or a longer relay cycle revisited us) is never relayed
+/// twice — it comes to rest in the documented fan/hold default instead,
+/// so divergent holder views can bound-cycle a frame at most once per
+/// process. The relay path is cold (mis-addressed directed frames
+/// only), so a small ring suffices; eviction is oldest-first and merely
+/// re-permits a (re-)relay, never drops a frame.
 pub(crate) const ROLE_RELAY_RING_CAPACITY: usize = 64;
+
+/// How long a relay-ring fingerprint guards against a second relay of
+/// the same frame — the loop guard's JOURNEY scope.
+///
+/// The guard exists to stop a relay CYCLE: divergent holder views
+/// ping-ponging one in-flight frame between processes. A cycle's
+/// revisit transits at wire speed (one hop per process, sub-second
+/// end-to-end even over slow tunnel legs), so a few seconds of memory
+/// catches every genuine cycle.
+///
+/// The guard must NOT outlive the journey, because byte-identical
+/// re-landings are legitimate and OBLIGATED to be re-relayed: a
+/// confirmable report's #352 retention replays the SAME bytes (sticky
+/// `delivery_seq`, sticky timestamp — the retained copy is cloned,
+/// never re-stamped) on the ack-timeout cadence (≥15 s, backing off to
+/// 60 s) until the authority's `TerminalAck` lands. A never-expiring
+/// fingerprint turned ONE lost ack into a PERMANENT black hole
+/// (run_20260612_072807, S-secondary-9: every replay re-landing at a
+/// stale-view host was refused a relay and silently absorbed by the
+/// local no-op observation arm — "UNACKED past the ack timeout ...
+/// replaying with the same seq" for minutes while the same leg
+/// delivered assignments). 5 s sits far above any cycle's transit and
+/// far below the minimum replay spacing, so the two regimes can never
+/// overlap.
+pub(crate) const ROLE_RELAY_RING_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Minimum spacing between two ingress diagnostic WARNs (slotless-hold,
 /// overflow, and the role-miss / unstamped fan fallbacks). A frame storm into
@@ -151,9 +177,14 @@ pub struct Mesh<I: Identifier, Tr: PeerTransport<I>> {
     /// host (a local-pending role mid-swap) is never "relayed" onto
     /// the wire — the slot-less hold is the correct resting place.
     pub(super) local_peer_id: Option<PeerId>,
-    /// Fingerprints of frames this process already ingress-relayed (the
-    /// role-relay loop guard — see [`ROLE_RELAY_RING_CAPACITY`]).
-    pub(super) relayed_ring: VecDeque<u64>,
+    /// Fingerprints of frames this process already ingress-relayed,
+    /// each with its relay instant (the role-relay loop guard — see
+    /// [`ROLE_RELAY_RING_CAPACITY`] / [`ROLE_RELAY_RING_TTL`]). Entries
+    /// are appended in time order, so age-pruning pops expired entries
+    /// from the front. `tokio::time::Instant` so the journey window is
+    /// drivable by the paused-clock tests (std-backed monotonic in
+    /// production).
+    pub(super) relayed_ring: VecDeque<(u64, tokio::time::Instant)>,
 }
 
 impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
