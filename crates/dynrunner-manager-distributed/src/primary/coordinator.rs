@@ -1014,6 +1014,17 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// `respawn_spawner`. See [`crate::observer::reconnect`].
     pub(super) tunnel_reconnector: crate::observer::ReconnectorHandle,
 
+    /// The job-ledger consult port for the observer's cluster-empty
+    /// terminal verdict. The submitter primary never uses it itself — it
+    /// carries it ONLY so that when this primary relocates onto a compute
+    /// peer and steps down into a standalone observer, the observer can
+    /// consult squeue for the run's job ids and render a terminal verdict
+    /// when the whole cluster has left the queue. `None` on backends with
+    /// no job ledger (e.g. `--multi-computer local`). Wired from the
+    /// deployment layer via [`Self::set_job_ledger_probe`], symmetric with
+    /// `tunnel_reconnector`. See [`crate::observer::job_ledger`].
+    pub(super) job_ledger_probe: crate::observer::JobLedgerProbeHandle,
+
     /// Sender side of the dispatcher → operational-loop respawn
     /// lifecycle channel (carries the full
     /// [`crate::peer_lifecycle::PeerLifecycleEvent`] stream:
@@ -1489,6 +1500,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             respawn_budget: None,
             remote_respawn_pending: None,
             tunnel_reconnector: None,
+            job_ledger_probe: None,
             respawn_lifecycle_tx: None,
             respawn_lifecycle_rx: None,
             pending_replacements: super::respawn::PendingReplacements::default(),
@@ -1920,6 +1932,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// path). See [`crate::observer::reconnect`].
     pub fn set_tunnel_reconnector(&mut self, reconnector: Arc<dyn crate::observer::TunnelReconnector>) {
         self.tunnel_reconnector = Some(reconnector);
+    }
+
+    /// Park the job-ledger consult port the primary hands to its observer
+    /// tail at relocation (the cluster-empty-verdict sibling of
+    /// [`Self::set_tunnel_reconnector`]). The submitter never consults it
+    /// itself — pure forward-wiring: when the primary relocates onto a
+    /// compute peer and `into_observer_handoff` runs, the observer inherits
+    /// this handle and consults squeue for the run's job ids on a long
+    /// lost-visibility episode. Must be set BEFORE `run()` enters (same
+    /// pre-run wiring contract as `set_tunnel_reconnector`). Absence leaves
+    /// the observer with no ledger (the never-terminal report-and-retry
+    /// path). See [`crate::observer::job_ledger`].
+    pub fn set_job_ledger_probe(&mut self, probe: Arc<dyn crate::observer::JobLedgerProbe>) {
+        self.job_ledger_probe = Some(probe);
     }
 
     /// Read the parked deployment-mode job manager. Returns `None`
@@ -3569,6 +3595,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             panik_signal_rx,
             graceful_abort_trigger,
             tunnel_reconnector,
+            job_ledger_probe,
             respawn_spawner,
             ..
         } = self;
@@ -3623,6 +3650,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `primary::respawn::remote`). `None` when the run launched
             // with the policy disabled.
             respawn_provider: respawn_spawner,
+            // The job-ledger consult port: the relocated submitter keeps
+            // the SAME `SlurmJobManager` it submitted the cohort from, so
+            // the observer it steps down into can consult squeue for the
+            // run's job ids and render the cluster-empty terminal verdict.
+            // `None` on backends with no job ledger.
+            job_ledger: job_ledger_probe,
         }
     }
 
