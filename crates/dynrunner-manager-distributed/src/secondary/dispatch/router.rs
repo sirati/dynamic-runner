@@ -525,22 +525,19 @@ where
                     .cluster_state
                     .snapshot_json()
                     .map_err(|e| format!("snapshot serialization: {e}"))?;
-                let response = DistributedMessage::ClusterSnapshot {
-                    target: None,
-                    sender_id: self.config.secondary_id.clone(),
-                    timestamp: timestamp_now(),
-                    snapshot_json: (*snapshot_json).clone(),
-                };
-                // Reply typed off the requester's self-declared role (the
-                // request frame's `is_observer`) — the shared snapshot-RPC
-                // reply policy (`anti_entropy::reply_destination`).
-                if let Err(e) = self
-                    .send_to(
-                        crate::anti_entropy::reply_destination(&sender_id, is_observer),
-                        response,
-                    )
-                    .await
-                {
+                // The shared snapshot-RPC answer (`anti_entropy::
+                // snapshot_reply`): reply typed off the requester's
+                // self-declared role (the request frame's `is_observer`),
+                // addressed by its id — resolvable for a rosterless
+                // joiner over its direct leg.
+                let (dst, response) = crate::anti_entropy::snapshot_reply(
+                    &self.config.secondary_id,
+                    &sender_id,
+                    is_observer,
+                    timestamp_now(),
+                    (*snapshot_json).clone(),
+                );
+                if let Err(e) = self.send_to(dst, response).await {
                     tracing::warn!(
                         target = %sender_id,
                         error = %e,

@@ -720,3 +720,123 @@ async fn promoted_primary_answers_request_run_config_with_fetched_argv() {
         })
         .await;
 }
+
+/// (g) The primary answers a snapshot pull REGARDLESS of its routing
+/// stamp. Every coordinator-egress pull arrives target-STAMPED — the
+/// egress edge stamps the resolved `Destination` on the frame
+/// (`send_to` → `msg.with_target(dst)`):
+///
+///   - an observer's bootstrap-recovery pull rides
+///     `Some(Destination::Primary)`;
+///   - an anti-entropy pull addressed at the primary's HOST rides
+///     `Some(Destination::Secondary(<host>))` (the `reconcile_against_peer`
+///     pull typing) and reaches the primary slot via the mesh-ingress
+///     fan-fallback — the production reverse-mode WARN "directed frame
+///     names a role with no live local slot … kind=RequestClusterSnapshot
+///     target=Secondary(PeerId(\"setup\"))".
+///
+/// Pre-fix the handler pattern-matched `target: None` and SILENTLY
+/// dropped every stamped pull, so only raw transport-level joiner
+/// requests (un-stamped) were ever answered — a healthy primary answering
+/// those masked the gap. The stamp is the WIRE ENVELOPE's routing header,
+/// not request semantics; the responder must answer all shapes.
+#[tokio::test(flavor = "current_thread")]
+async fn primary_answers_target_stamped_snapshot_request() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            for stamp in [
+                Destination::Primary,
+                Destination::Secondary(PeerId::from("primary-host")),
+            ] {
+                let (transport, mut ends) = setup_test(1);
+                let mut requester_inbox = ends.remove(0).1;
+                let (mut primary, _mesh) = build_test_primary(
+                    test_primary_config(),
+                    transport,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
+
+                primary
+                    .handle_request_cluster_snapshot(
+                        DistributedMessage::RequestClusterSnapshot {
+                            target: None,
+                            sender_id: "sec-0".into(),
+                            timestamp: 0.0,
+                            is_observer: true,
+                            can_be_primary: false,
+                        }
+                        .with_target(stamp.clone()),
+                    )
+                    .await;
+                settle_pump().await;
+
+                let mut got_snapshot = false;
+                while let Ok(msg) = requester_inbox.try_recv() {
+                    if msg.msg_type() == MessageType::ClusterSnapshot {
+                        got_snapshot = true;
+                    }
+                }
+                assert!(
+                    got_snapshot,
+                    "the primary must answer a snapshot pull stamped {stamp:?} \
+                     (the egress-stamped shape every coordinator pull carries); \
+                     silently dropping it starves anti-entropy and the \
+                     observer bootstrap recovery"
+                );
+            }
+        })
+        .await;
+}
+
+/// (h) Same stamp-agnostic contract for the run-config RPC: the
+/// secondary setup backstop sends `RequestRunConfig` through its egress
+/// edge (`send_to(Destination::Primary, ..)`), so the frame arrives
+/// stamped `Some(Destination::Primary)`. Pre-fix the handler's
+/// `target: None` pattern silently dropped every in-band backstop fetch.
+#[tokio::test(flavor = "current_thread")]
+async fn primary_answers_target_stamped_run_config_request() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(1);
+            let mut requester_inbox = ends.remove(0).1;
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let seeded = vec!["--jobs".to_string(), "8".to_string()];
+            primary.forwarded_argv = seeded.clone();
+
+            primary
+                .handle_request_run_config(
+                    DistributedMessage::RequestRunConfig {
+                        target: None,
+                        sender_id: "sec-0".into(),
+                        timestamp: 0.0,
+                    }
+                    .with_target(Destination::Primary),
+                )
+                .await;
+            settle_pump().await;
+
+            let mut run_configs: Vec<Vec<String>> = Vec::new();
+            while let Ok(msg) = requester_inbox.try_recv() {
+                if let DistributedMessage::RunConfig { forwarded_argv, .. } = msg {
+                    run_configs.push(forwarded_argv);
+                }
+            }
+            assert_eq!(
+                run_configs.len(),
+                1,
+                "the primary must answer a Primary-stamped RequestRunConfig \
+                 (the egress-stamped shape the setup backstop sends); got \
+                 {run_configs:?}"
+            );
+            assert_eq!(run_configs[0], seeded);
+        })
+        .await;
+}

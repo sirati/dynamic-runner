@@ -947,7 +947,9 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             .and_then(|w| w.loaded_type_id.as_ref())
     }
 
-    /// Update actual resource usage for all workers from /proc/[pid]/statm.
+    /// Update actual resource usage for all workers (charged =
+    /// resident + swap; cgroup-leaf-first with `/proc` fallback —
+    /// see [`crate::monitor::measure_worker_charge`]).
     pub fn update_all_resource_usage(&mut self) {
         for worker in &mut self.workers {
             worker.update_resource_usage();

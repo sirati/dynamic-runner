@@ -623,3 +623,139 @@ async fn join_rerequests_until_a_promotion_window_closes() {
     assert_eq!(parsed.primary_epoch, 7);
     assert_eq!(parsed.current_primary.as_deref(), Some("primary-peer"));
 }
+
+/// Pump one healthy secondary whose snapshot reply only LANDS LATE: it
+/// answers a `RequestClusterSnapshot` only from `answers_at` onward
+/// (before that the request is consumed without a reply — the
+/// production shape where the reply bytes exist but do not land inside
+/// a short window: a multi-MB chunked `ClusterSnapshot` still in
+/// flight over a WAN leg, or responder-side churn). Gossip keeps
+/// flowing the whole time, exactly like the production joiner's legs.
+/// The MUTE primary is modelled by `answers_at = None` — it NEVER
+/// answers (the chronically-starved primary of
+/// run_20260611_200548).
+async fn starved_run_pump(
+    transport: &mut ChannelPeerTransport<TestId>,
+    id: &str,
+    snapshot_json: &str,
+    answers_at: Option<tokio::time::Instant>,
+) {
+    let keepalive: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+        target: Some(Destination::All),
+        sender_id: id.to_string(),
+        timestamp: timestamp_now(),
+        secondary_id: id.to_string(),
+        active_workers: 1,
+        emitter_role: KeepaliveRole::Secondary,
+    };
+    let _ = transport.send_to_peer("joiner", keepalive).await;
+    loop {
+        let next = tokio::time::timeout(Duration::from_millis(5), transport.recv_peer()).await;
+        match next {
+            Err(_) => return, // inbox quiescent
+            Ok(None) => return,
+            Ok(Some(DistributedMessage::RequestClusterSnapshot { sender_id, .. })) => {
+                let landed = answers_at
+                    .map(|at| tokio::time::Instant::now() >= at)
+                    .unwrap_or(false);
+                if landed {
+                    let reply: DistributedMessage<TestId> = DistributedMessage::ClusterSnapshot {
+                        // Production-shaped reply stamp: the responder's
+                        // egress types the answer off the requester's
+                        // self-declared role
+                        // (`anti_entropy::reply_destination`).
+                        target: Some(Destination::Observer(PeerId::from(sender_id.clone()))),
+                        sender_id: id.to_string(),
+                        timestamp: timestamp_now(),
+                        snapshot_json: snapshot_json.to_string(),
+                    };
+                    let _ = transport.send_to_peer(&sender_id, reply).await;
+                }
+            }
+            Ok(Some(_other)) => {}
+        }
+    }
+}
+
+/// Production replay (asm-tokenizer run_20260611_200548): a late-joiner
+/// bootstraps into a run whose PRIMARY never answers (chronically
+/// starved/mute), holding live direct legs to HEALTHY secondaries whose
+/// replies only land ~15s after the first request — beyond the old 10s
+/// bootstrap budget (7.5s recv window, 3 fan-outs, zero replies), well
+/// inside a budget sized for real snapshot deliveries.
+///
+/// Contract under test: the default bootstrap budget
+/// (`DEFAULT_JOIN_TIMEOUT`) must be long enough — with the re-request
+/// cadence keeping fan-outs flowing, not just a longer silent wait —
+/// that the joiner seats from a SECONDARY's late-landing reply with the
+/// primary contributing nothing. The pre-fix 10s default replays the
+/// production fatal: "no ClusterSnapshot reply within the bootstrap
+/// timeout (33 snapshot requests sent across 3 fan-outs …)".
+#[tokio::test(start_paused = true)]
+async fn join_seats_from_secondary_reply_when_primary_is_mute() {
+    let peer_ids: Vec<String> = vec![
+        "joiner".into(),
+        "starved-primary".into(),
+        "secondary-1".into(),
+        "secondary-5".into(),
+    ];
+    let mut transports: Vec<ChannelPeerTransport<TestId>> = peer_mesh::<TestId>(&peer_ids);
+    let mut joiner = transports.remove(0);
+    let mut primary = transports.remove(0);
+    let mut sec1 = transports.remove(0);
+    let mut sec5 = transports.remove(0);
+
+    let canned = make_synthetic_snapshot();
+    let canned_json = serde_json::to_string(&canned).expect("synthetic snapshot serializes");
+
+    let seed: Vec<PeerConnectionInfo> = ["starved-primary", "secondary-1", "secondary-5"]
+        .iter()
+        .map(|id| PeerConnectionInfo {
+            secondary_id: (*id).into(),
+            cert: String::new(),
+            ipv4: None,
+            ipv6: None,
+            port: 0,
+            is_observer: false,
+            liveness_port: None,
+        })
+        .collect();
+
+    // The secondaries' replies land 15s after bootstrap entry — past the
+    // OLD default budget entirely (10s), inside the current one.
+    let replies_land_at = tokio::time::Instant::now() + Duration::from_secs(15);
+
+    let join_fut = joiner.join_running_cluster(&seed, DEFAULT_JOIN_TIMEOUT, true, false);
+    tokio::pin!(join_fut);
+
+    // Generous virtual-time watchdog (paused clock auto-advances).
+    let join_result = tokio::time::timeout(Duration::from_secs(300), async {
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut join_fut => break result,
+                _ = starved_run_pump(&mut primary, "starved-primary", &canned_json, None) => {}
+                _ = starved_run_pump(&mut sec1, "secondary-1", &canned_json, Some(replies_land_at)) => {}
+                _ = starved_run_pump(&mut sec5, "secondary-5", &canned_json, Some(replies_land_at)) => {}
+            }
+        }
+    })
+    .await
+    .expect("watchdog: join_running_cluster did not resolve in virtual time");
+
+    let snapshot_jsons = match join_result {
+        Ok(s) => s,
+        Err(e) => panic!(
+            "the joiner must seat from a SECONDARY's late-landing reply \
+             with a mute primary — the bootstrap budget + re-request \
+             cadence must cover real-world reply delivery; instead: {e}"
+        ),
+    };
+    assert!(
+        !snapshot_jsons.is_empty(),
+        "at least one secondary snapshot must be collected"
+    );
+    let parsed: SyntheticSnapshot =
+        serde_json::from_str(&snapshot_jsons[0]).expect("returned snapshot_json round-trips");
+    assert_eq!(parsed.primary_epoch, 7);
+}

@@ -69,14 +69,33 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// secondary responder treats its own send failure; the requester's
     /// bounded recv wait falls back to its own deadline.
     pub(crate) async fn handle_request_cluster_snapshot(&mut self, msg: DistributedMessage<I>) {
+        // ANY routing stamp is accepted: the `target` is the wire
+        // envelope's ingress-demux header, never request semantics. Every
+        // coordinator-egress pull arrives STAMPED (`Some(Destination::
+        // Primary)` from the observer's bootstrap recovery, `Some(
+        // Destination::Secondary(<this host>))` from an anti-entropy pull
+        // the mesh-ingress fan-fallback handed to this slot), while a raw
+        // transport-level joiner request arrives un-stamped. A previous
+        // `target: None` pattern here SILENTLY dropped every stamped
+        // shape, so the primary never served anti-entropy / recovery
+        // pulls — only a healthy primary answering the joiner's raw
+        // requests masked it (see
+        // `anti_entropy::snapshot_reply`'s contract).
         let DistributedMessage::RequestClusterSnapshot {
-            target: None,
+            target: _,
             sender_id,
             is_observer,
             can_be_primary,
             ..
         } = msg
         else {
+            // Unreachable from the `connect.rs` msg-type dispatch; loud,
+            // never a silent drop of a snapshot pull.
+            tracing::error!(
+                kind = ?msg.msg_type(),
+                "handle_request_cluster_snapshot reached with a \
+                 non-RequestClusterSnapshot frame; dropping (dispatch bug)"
+            );
             return;
         };
         // Serialize-once per state generation (#367): the cache inside
@@ -85,22 +104,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // not re-serialize ~100 MB per request.
         match self.cluster_state.snapshot_json() {
             Ok(snapshot_json) => {
-                let response = DistributedMessage::ClusterSnapshot {
-                    target: None,
-                    sender_id: self.config.node_id.clone(),
-                    timestamp: timestamp_now(),
-                    snapshot_json: (*snapshot_json).clone(),
-                };
-                // Reply typed off the requester's self-declared role (the
-                // request frame's `is_observer`) — the shared snapshot-RPC
-                // reply policy (`anti_entropy::reply_destination`).
-                if let Err(e) = self
-                    .send_to(
-                        crate::anti_entropy::reply_destination(&sender_id, is_observer),
-                        response,
-                    )
-                    .await
-                {
+                // The shared snapshot-RPC answer (`anti_entropy::
+                // snapshot_reply`): reply typed off the requester's
+                // self-declared role, addressed by its id — resolvable
+                // for a rosterless joiner over its direct leg.
+                let (dst, response) = crate::anti_entropy::snapshot_reply(
+                    &self.config.node_id,
+                    &sender_id,
+                    is_observer,
+                    timestamp_now(),
+                    (*snapshot_json).clone(),
+                );
+                if let Err(e) = self.send_to(dst, response).await {
                     tracing::warn!(
                         target = %sender_id,
                         error = %e,
@@ -158,12 +173,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// responder treats its own; the requester's bounded recv wait falls
     /// back to its own deadline.
     pub(crate) async fn handle_request_run_config(&mut self, msg: DistributedMessage<I>) {
+        // ANY routing stamp is accepted — same contract as the snapshot
+        // responder above: the setup backstop sends this request through
+        // its egress edge, which stamps `Some(Destination::Primary)`; a
+        // previous `target: None` pattern silently dropped every such
+        // in-band backstop fetch.
         let DistributedMessage::RequestRunConfig {
-            target: None,
+            target: _,
             sender_id,
             ..
         } = msg
         else {
+            // Unreachable from the `connect.rs` msg-type dispatch; loud,
+            // never a silent drop of a run-config fetch.
+            tracing::error!(
+                kind = ?msg.msg_type(),
+                "handle_request_run_config reached with a \
+                 non-RequestRunConfig frame; dropping (dispatch bug)"
+            );
             return;
         };
         let response = DistributedMessage::RunConfig {
