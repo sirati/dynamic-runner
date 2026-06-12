@@ -226,3 +226,70 @@ async fn dropped_bootstrap_wire_is_redialed_and_refolded() {
         })
         .await;
 }
+
+/// A WEDGED listener (TCP accepts into the kernel backlog but the
+/// WebSocket handshake is never answered — the half-dead-forward /
+/// parked-acceptor shape from run_20260611_200548) must not hang the
+/// re-dial supervisor forever: the attempt times out, the supervisor
+/// backs off and RETRIES, and the retry against a now-answering
+/// listener hands the fresh wire back. Pre-fix the supervisor's
+/// un-bounded `connect_wss_only` parked on the first wedged attempt
+/// and the bootstrap link was never restorable again.
+#[tokio::test(flavor = "current_thread")]
+async fn redial_attempt_times_out_against_wedged_listener_and_retries() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Raw TCP listener so the test controls the handshake: the
+            // FIRST connection is held open and never answered (the
+            // wedge); every later connection gets a real WebSocket
+            // handshake (the listener healed).
+            let raw = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind raw listener");
+            let addr: SocketAddr = raw.local_addr().expect("listener addr");
+            tokio::task::spawn_local(async move {
+                let mut wedged = Vec::new();
+                let mut served = Vec::new();
+                let mut first = true;
+                while let Ok((stream, _)) = raw.accept().await {
+                    if first {
+                        first = false;
+                        // The wedge: hold the connection, answer nothing.
+                        wedged.push(stream);
+                        continue;
+                    }
+                    if let Ok(ws) = tokio_tungstenite::accept_async(
+                        tokio_tungstenite::MaybeTlsStream::Plain(stream),
+                    )
+                    .await
+                    {
+                        // Keep the healed wire alive so the handed-back
+                        // client stays open.
+                        served.push(ws);
+                    }
+                }
+            });
+
+            let (tx, mut rx) = mpsc::unbounded_channel::<BootstrapRedial<TestId>>();
+            let target = BootstrapDialTarget {
+                addr,
+                primary_id: "primary".to_string(),
+            };
+            tokio::task::spawn_local(redial_bootstrap_wire::<TestId>(target, tx));
+
+            // The supervisor must survive the wedged first attempt (a
+            // bounded per-attempt timeout), retry, and hand back the
+            // re-dialed wire. Budget: one attempt timeout + backoff +
+            // the healed handshake, with slack.
+            let redial = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+                .await
+                .expect(
+                    "the re-dial supervisor must not hang forever on a wedged \
+                     listener — the attempt needs a bounded timeout + retry",
+                )
+                .expect("redial channel open");
+            assert_eq!(redial.target.addr, addr, "the retry used the FIXED addr");
+        })
+        .await;
+}
