@@ -728,13 +728,20 @@ mod tests {
         assert!(encode_outbound_frames(&oversize, "test", "peer-a").is_empty());
     }
 
-    /// An oversized ClusterSnapshot (the chunk-eligible class).
+    /// An oversized SnapshotStreamPackage (the chunk-eligible class —
+    /// packages are bounded by construction in production, but the bound
+    /// is soft: a single oversized task entry rides a package alone, and
+    /// THIS safety net covers it).
     fn oversize_snapshot() -> DistributedMessage<TestId> {
-        DistributedMessage::ClusterSnapshot {
+        DistributedMessage::SnapshotStreamPackage {
             target: None,
             sender_id: "framing-test".into(),
             timestamp: 0.0,
-            snapshot_json: "s".repeat(MAX_WIRE_FRAME_BYTES + 1024),
+            stream_id: "joiner/0".into(),
+            seq: 0,
+            cursor: None,
+            payload: "s".repeat(MAX_WIRE_FRAME_BYTES + 1024),
+            done: false,
         }
     }
 
@@ -768,16 +775,14 @@ mod tests {
             }
         }
         match delivered.expect("transfer must complete") {
-            DistributedMessage::ClusterSnapshot {
-                sender_id,
-                snapshot_json,
-                ..
+            DistributedMessage::SnapshotStreamPackage {
+                sender_id, payload, ..
             } => {
                 assert_eq!(sender_id, "framing-test");
-                assert_eq!(snapshot_json.len(), MAX_WIRE_FRAME_BYTES + 1024);
-                assert!(snapshot_json.bytes().all(|b| b == b's'));
+                assert_eq!(payload.len(), MAX_WIRE_FRAME_BYTES + 1024);
+                assert!(payload.bytes().all(|b| b == b's'));
             }
-            other => panic!("expected ClusterSnapshot, got {:?}", other.msg_type()),
+            other => panic!("expected SnapshotStreamPackage, got {:?}", other.msg_type()),
         }
     }
 

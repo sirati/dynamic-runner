@@ -176,33 +176,41 @@ pub(super) fn apply_local_peer_credentials(
     }
 }
 
-/// Decode every bootstrap snapshot reply (wire-erased JSON strings) into
-/// the typed [`ClusterStateSnapshot`] the cold-join factory restores.
+/// Decode every bootstrap stream-package payload (wire-erased
+/// base64-CBOR strings) into the typed partial [`ClusterStateSnapshot`]s
+/// the cold-join factory restores — one `restore` per package; the
+/// idempotent lattice unions the partials in any order. The decode
+/// itself is the ONE shared codec
+/// (`dynrunner_manager_distributed::cluster_state::decode_stream_payload`),
+/// never re-implemented here.
 ///
 /// # Single concern + the BOOTSTRAP-decode fatal discriminator (D-C / D3)
 ///
-/// This is the COLD-JOIN bootstrap decode — the observer requested these
-/// snapshots precisely to populate its empty CRDT, so a malformed reply
+/// This is the COLD-JOIN bootstrap decode — the observer requested the
+/// stream precisely to populate its empty CRDT, so a malformed payload
 /// must HARD-FAIL here (an `Err` the constructor propagates with `?`),
 /// never be swallowed: continuing on an un-restored empty CRDT would make
 /// the observer report a lie (premature run-complete / wrong counts). This
 /// is the deliberate counterpart to the STEADY-STATE anti-entropy decode
-/// arm (`secondary/dispatch/router.rs` + the observer's `on_cluster_snapshot`),
-/// which is WARN-and-keep because the AE-3 recovery cadence re-pulls a
-/// fresh snapshot. The discriminator is WHICH FUNCTION the decode lives in:
-/// this bootstrap function = fatal; the steady-state loop arm = WARN.
+/// arm (`secondary/dispatch/router.rs` + the observer's
+/// `on_snapshot_stream_package`), which is WARN-and-keep because the AE-3
+/// recovery cadence re-pulls (resuming from the last good cursor). The
+/// discriminator is WHICH FUNCTION the decode lives in: this bootstrap
+/// function = fatal; the steady-state loop arm = WARN.
 pub(super) fn decode_bootstrap_snapshots(
-    snapshot_jsons: &[String],
+    payloads: &[String],
 ) -> PyResult<Vec<ClusterStateSnapshot<RunnerIdentifier>>> {
-    snapshot_jsons
+    payloads
         .iter()
-        .map(|snapshot_json| {
-            serde_json::from_str(snapshot_json).map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "observer late-joiner: failed to decode ClusterStateSnapshot \
-                     from join_running_cluster reply: {e}"
-                ))
-            })
+        .map(|payload| {
+            dynrunner_manager_distributed::cluster_state::decode_stream_payload(payload).map_err(
+                |e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "observer late-joiner: failed to decode snapshot-stream \
+                         package from join_running_cluster reply: {e}"
+                    ))
+                },
+            )
         })
         .collect()
 }

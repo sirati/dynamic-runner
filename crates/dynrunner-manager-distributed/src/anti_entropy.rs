@@ -15,20 +15,25 @@
 //!
 //! This module also owns BOTH halves of the snapshot-RPC addressing
 //! policy: the request side ([`RequesterIdentity`] — the role facts a
-//! pulling node stamps on its `RequestClusterSnapshot`) and the reply
-//! side ([`reply_destination`] — the responder types its `ClusterSnapshot`
-//! answer off the requester's self-declared role — composed into the full
-//! answer construction by [`snapshot_reply`]), so no responder
-//! re-implements either.
+//! pulling node stamps on its `RequestSnapshotStream`) and the reply
+//! side ([`reply_destination`] — the responder types its stream-package
+//! answers off the requester's self-declared role; the package
+//! construction itself lives with the stream driver,
+//! `crate::snapshot_stream`), so no responder re-implements either.
 //!
 //! This module holds NO merge logic. The pull it requests is the EXISTING
-//! `RequestClusterSnapshot` → `ClusterSnapshot` → `ClusterState::restore`
-//! path; the digest detector ([`StateDigest::is_behind`]) only decides
-//! when to engage it.
+//! `RequestSnapshotStream` → `SnapshotStreamPackage` →
+//! `ClusterState::restore` path; the digest detector
+//! ([`StateDigest::is_behind`]) only decides when to engage it, and the
+//! per-responder stream/resume bookkeeping is the caller's
+//! [`InboundSnapshotStreams`] tracker (passed in so the constructed pull
+//! RESUMES an interrupted stream instead of restarting the transfer).
 
 use std::time::Duration;
 
 use dynrunner_protocol_primary_secondary::{Destination, DistributedMessage, PeerId, StateDigest};
+
+use crate::snapshot_stream::InboundSnapshotStreams;
 
 /// Base anti-entropy cadence. A node broadcasts its [`StateDigest`] once
 /// per (base ± jitter) window. 20s sits in the plan's 15–30s band: long
@@ -96,7 +101,7 @@ pub fn digest_broadcast<I>(
     }
 }
 
-/// The role facts a pulling node stamps on its `RequestClusterSnapshot`
+/// The role facts a pulling node stamps on its `RequestSnapshotStream`
 /// so the snapshot responder records the requester's membership truthfully
 /// (the `PeerJoined` it originates) — the same fields the cold-start
 /// snapshot RPC carries. Each role builds this once from its config:
@@ -112,8 +117,8 @@ pub struct RequesterIdentity<'a> {
 }
 
 /// The REPLY half of the snapshot-RPC addressing policy
-/// ([`RequesterIdentity`] is the request half): the `ClusterSnapshot`
-/// answer to a `RequestClusterSnapshot` is typed off the requester's
+/// ([`RequesterIdentity`] is the request half): every stream-package
+/// answer to a `RequestSnapshotStream` is typed off the requester's
 /// SELF-DECLARED role — the `is_observer` it stamped on the request
 /// frame — `Destination::Observer(id)` for an observer requester,
 /// `Destination::Secondary(id)` for a compute peer.
@@ -150,51 +155,15 @@ fn role_destination(id: &str, is_observer: bool) -> Destination {
     }
 }
 
-/// The complete snapshot-RPC ANSWER for one `RequestClusterSnapshot`:
-/// the `(destination, ClusterSnapshot)` pair a responder sends back.
-///
-/// Single owner of the reply CONSTRUCTION, composed with
-/// [`reply_destination`] (the typing policy) so the three responders
-/// (primary, secondary router, observer) share ONE answer shape instead
-/// of each hand-building the frame. The contract every responder
-/// honours through this point:
-///
-///   - ANY live peer answers from its own replica — `cluster_state` is
-///     replicated, so any responder's snapshot is a valid bootstrap /
-///     anti-entropy payload; role never gates serving.
-///   - The request's routing `target` stamp is IRRELEVANT to the answer:
-///     the stamp is the wire envelope's ingress-demux header (`None` from
-///     a raw transport-level joiner send, `Some(..)` from every
-///     coordinator egress), never request semantics. Responders must not
-///     filter on it.
-///   - The reply is addressed by the requester's ID (its return address
-///     rides the request's `sender_id`) and typed off its SELF-DECLARED
-///     role — resolvable for a ROSTERLESS joiner too, because id-bearing
-///     destinations resolve at the transport (the direct leg), not
-///     through any roster.
-///
-/// `snapshot_json` is the responder's digest-keyed serialize-once cache
-/// payload (`ClusterState::snapshot_json` — never re-serialized per
-/// request); reading it stays with the caller because the cache borrow
-/// is the caller's `&mut` concern. The caller owns only its `send_to`
-/// edge for the returned pair.
-pub fn snapshot_reply<I: dynrunner_core::Identifier>(
-    responder_id: &str,
-    requester_id: &str,
-    requester_is_observer: bool,
-    timestamp: f64,
-    snapshot_json: String,
-) -> (Destination, DistributedMessage<I>) {
-    (
-        reply_destination(requester_id, requester_is_observer),
-        DistributedMessage::ClusterSnapshot {
-            target: None,
-            sender_id: responder_id.to_string(),
-            timestamp,
-            snapshot_json,
-        },
-    )
-}
+// The snapshot-RPC ANSWER construction moved with the transfer model:
+// the monolithic `snapshot_reply` (one `ClusterSnapshot` frame carrying
+// the whole serialized ledger) is gone; a responder now answers with a
+// PACKAGE STREAM driven by `crate::snapshot_stream::
+// SnapshotStreamResponder`, which types every package's destination
+// through [`reply_destination`] — the contract (any live peer answers;
+// the request's routing stamp is irrelevant; the answer is addressed by
+// the requester's id and typed off its self-declared role) is unchanged
+// and now spelled once on that driver.
 
 /// Receive-side decision for one peer digest. Given the LOCAL digest, the
 /// PEER's digest (off the wire frame), the sender's id, and the requester's
@@ -222,14 +191,19 @@ pub fn snapshot_reply<I: dynrunner_core::Identifier>(
 /// primary is not a parameter — a possibly-lagging primary is never the
 /// fallback responder.
 ///
-/// The pulled snapshot answers `RequestClusterSnapshot` with a
-/// `ClusterSnapshot` the caller restores through the existing recv arm.
+/// The pulled stream answers `RequestSnapshotStream` with
+/// `SnapshotStreamPackage` frames the caller restores through the
+/// existing recv arm. `streams` is the caller's per-responder inbound
+/// tracker: the constructed pull RESUMES an interrupted stream toward
+/// this sender (same stream id + `resume_after` cursor) instead of
+/// restarting the transfer.
 pub fn reconcile_against_peer<I>(
     local: &StateDigest,
     peer: &StateDigest,
     sender_id: &str,
     sender_is_observer: bool,
     requester: &RequesterIdentity<'_>,
+    streams: &mut InboundSnapshotStreams,
     timestamp: f64,
 ) -> Option<(Destination, DistributedMessage<I>)> {
     if !local.is_behind(peer) {
@@ -251,10 +225,13 @@ pub fn reconcile_against_peer<I>(
     // directed at an observer hits its ingress observer-slot demux instead
     // of mis-typing `Secondary` and tripping the role-miss fan WARN.
     let destination = role_destination(sender_id, sender_is_observer);
-    let request = DistributedMessage::RequestClusterSnapshot {
+    let (stream_id, resume_after) = streams.request_params(sender_id);
+    let request = DistributedMessage::RequestSnapshotStream {
         target: None,
         sender_id: requester.node_id.to_string(),
         timestamp,
+        stream_id,
+        resume_after,
         is_observer: requester.is_observer,
         can_be_primary: requester.can_be_primary,
     };
@@ -325,6 +302,7 @@ pub fn plan_recovery_pull<I>(
     peer_digests: &[(String, bool, StateDigest)],
     cursor: &mut usize,
     requester: &RequesterIdentity<'_>,
+    streams: &mut InboundSnapshotStreams,
     timestamp: f64,
 ) -> Option<(Destination, DistributedMessage<I>)> {
     // Candidate responders = known peers whose last-seen digest proves they
@@ -357,10 +335,13 @@ pub fn plan_recovery_pull<I>(
     let (target, target_is_observer) = candidates[*cursor % candidates.len()];
     *cursor = cursor.wrapping_add(1);
     let destination = role_destination(target, target_is_observer);
-    let request = DistributedMessage::RequestClusterSnapshot {
+    let (stream_id, resume_after) = streams.request_params(target);
+    let request = DistributedMessage::RequestSnapshotStream {
         target: None,
         sender_id: requester.node_id.to_string(),
         timestamp,
+        stream_id,
+        resume_after,
         is_observer: requester.is_observer,
         can_be_primary: requester.can_be_primary,
     };
@@ -371,6 +352,13 @@ pub fn plan_recovery_pull<I>(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// Fresh per-call tracker: these tests pin target selection +
+    /// frame construction, not resume bookkeeping (the tracker's own
+    /// tests live in `snapshot_stream`).
+    fn test_streams() -> InboundSnapshotStreams {
+        InboundSnapshotStreams::new("me")
+    }
 
     #[test]
     fn tick_period_is_deterministic_and_bounded() {
@@ -424,7 +412,7 @@ mod tests {
             can_be_primary: true,
         };
         let decision: Option<(Destination, DistributedMessage<u32>)> =
-            reconcile_against_peer(&d, &d, "peer-1", false, &me, 1.0);
+            reconcile_against_peer(&d, &d, "peer-1", false, &me, &mut test_streams(), 1.0);
         assert!(decision.is_none());
     }
 
@@ -445,7 +433,7 @@ mod tests {
             can_be_primary: false,
         };
         let (dst, req): (Destination, DistributedMessage<u32>) =
-            reconcile_against_peer(&local, &peer, "peer-1", false, &me, 1.0)
+            reconcile_against_peer(&local, &peer, "peer-1", false, &me, &mut test_streams(), 1.0)
                 .expect("should pull when behind");
         // The proven-ahead sender, NOT `Destination::Primary`.
         assert_eq!(
@@ -454,7 +442,7 @@ mod tests {
         );
         assert_ne!(dst, Destination::Primary);
         match req {
-            DistributedMessage::RequestClusterSnapshot {
+            DistributedMessage::RequestSnapshotStream {
                 sender_id,
                 is_observer,
                 can_be_primary,
@@ -464,7 +452,7 @@ mod tests {
                 assert!(is_observer);
                 assert!(!can_be_primary);
             }
-            _ => panic!("expected RequestClusterSnapshot"),
+            _ => panic!("expected RequestSnapshotStream"),
         }
     }
 
@@ -488,7 +476,7 @@ mod tests {
         };
         // Sender declared as an observer ⇒ pull typed `Observer(id)`.
         let (dst_obs, _): (Destination, DistributedMessage<u32>) =
-            reconcile_against_peer(&local, &peer, "observer-2f2e", true, &me, 1.0)
+            reconcile_against_peer(&local, &peer, "observer-2f2e", true, &me, &mut test_streams(), 1.0)
                 .expect("behind an observer sender ⇒ pull");
         assert_eq!(
             dst_obs,
@@ -497,7 +485,7 @@ mod tests {
         );
         // Sender declared as a compute peer ⇒ pull typed `Secondary(id)`.
         let (dst_sec, _): (Destination, DistributedMessage<u32>) =
-            reconcile_against_peer(&local, &peer, "worker-7", false, &me, 1.0)
+            reconcile_against_peer(&local, &peer, "worker-7", false, &me, &mut test_streams(), 1.0)
                 .expect("behind a compute sender ⇒ pull");
         assert_eq!(
             dst_sec,
@@ -520,7 +508,7 @@ mod tests {
             can_be_primary: true,
         };
         let (dst, _req): (Destination, DistributedMessage<u32>) =
-            reconcile_against_peer(&local, &peer, "peer-7", false, &me, 1.0)
+            reconcile_against_peer(&local, &peer, "peer-7", false, &me, &mut test_streams(), 1.0)
                 .expect("should pull when behind");
         assert_eq!(
             dst,
@@ -557,7 +545,7 @@ mod tests {
             can_be_primary: true,
         };
         let (dst, _req): (Destination, DistributedMessage<u32>) =
-            reconcile_against_peer(&local, &ahead_sender, "ahead-secondary", false, &me, 1.0)
+            reconcile_against_peer(&local, &ahead_sender, "ahead-secondary", false, &me, &mut test_streams(), 1.0)
                 .expect("should pull when behind the ahead non-primary sender");
         assert_eq!(
             dst,
@@ -594,7 +582,7 @@ mod tests {
             can_be_primary: true,
         };
         let (dst, req): (Destination, DistributedMessage<u32>) =
-            reconcile_against_peer(&local, &ahead_peer, "ahead-secondary", false, &me, 1.0)
+            reconcile_against_peer(&local, &ahead_peer, "ahead-secondary", false, &me, &mut test_streams(), 1.0)
                 .expect("a behind primary must still pull from the ahead peer");
         assert_eq!(
             dst,
@@ -603,10 +591,10 @@ mod tests {
         );
         assert_ne!(dst, Destination::Primary);
         match req {
-            DistributedMessage::RequestClusterSnapshot { sender_id, .. } => {
+            DistributedMessage::RequestSnapshotStream { sender_id, .. } => {
                 assert_eq!(sender_id, "me");
             }
-            _ => panic!("expected RequestClusterSnapshot"),
+            _ => panic!("expected RequestSnapshotStream"),
         }
     }
 
@@ -633,7 +621,7 @@ mod tests {
         let local = StateDigest::default();
         let mut cursor = 0usize;
         let decision: Option<(Destination, DistributedMessage<u32>)> =
-            plan_recovery_pull(&local, &[], &mut cursor, &requester(), 1.0);
+            plan_recovery_pull(&local, &[], &mut cursor, &requester(), &mut test_streams(), 1.0);
         assert!(decision.is_none());
         assert_eq!(cursor, 0, "no candidate ⇒ cursor untouched");
     }
@@ -645,7 +633,7 @@ mod tests {
         let peers = vec![("peer-1".to_string(), false, d), ("peer-2".to_string(), false, d)];
         let mut cursor = 0usize;
         let decision: Option<(Destination, DistributedMessage<u32>)> =
-            plan_recovery_pull(&d, &peers, &mut cursor, &requester(), 1.0);
+            plan_recovery_pull(&d, &peers, &mut cursor, &requester(), &mut test_streams(), 1.0);
         assert!(decision.is_none(), "behind nobody ⇒ quiesce");
         assert_eq!(cursor, 0);
     }
@@ -658,7 +646,7 @@ mod tests {
         let peers = vec![("peer-ahead".to_string(), false, ahead(2, 0x9))];
         let mut cursor = 0usize;
         let (dst, req): (Destination, DistributedMessage<u32>) =
-            plan_recovery_pull(&local, &peers, &mut cursor, &requester(), 1.0)
+            plan_recovery_pull(&local, &peers, &mut cursor, &requester(), &mut test_streams(), 1.0)
                 .expect("behind a known peer ⇒ pull");
         assert_eq!(
             dst,
@@ -666,7 +654,7 @@ mod tests {
         );
         assert_eq!(cursor, 1, "cursor advances so the next tick rotates");
         match req {
-            DistributedMessage::RequestClusterSnapshot {
+            DistributedMessage::RequestSnapshotStream {
                 sender_id,
                 is_observer,
                 can_be_primary,
@@ -676,7 +664,7 @@ mod tests {
                 assert!(is_observer);
                 assert!(!can_be_primary);
             }
-            _ => panic!("expected RequestClusterSnapshot"),
+            _ => panic!("expected RequestSnapshotStream"),
         }
     }
 
@@ -691,7 +679,7 @@ mod tests {
         let peers = vec![("observer-2f2e".to_string(), true, ahead(2, 0x9))];
         let mut cursor = 0usize;
         let (dst, _req): (Destination, DistributedMessage<u32>) =
-            plan_recovery_pull(&local, &peers, &mut cursor, &requester(), 1.0)
+            plan_recovery_pull(&local, &peers, &mut cursor, &requester(), &mut test_streams(), 1.0)
                 .expect("behind a known observer responder ⇒ pull");
         assert_eq!(
             dst,
@@ -720,7 +708,7 @@ mod tests {
         ];
         let target_id = |peers: &[(String, bool, StateDigest)], cursor: &mut usize| -> String {
             let (dst, _): (Destination, DistributedMessage<u32>) =
-                plan_recovery_pull(&local, peers, cursor, &requester(), 1.0)
+                plan_recovery_pull(&local, peers, cursor, &requester(), &mut test_streams(), 1.0)
                     .expect("still behind ⇒ pull");
             match dst {
                 Destination::Secondary(p) => p.into_string(),

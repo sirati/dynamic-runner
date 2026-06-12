@@ -120,18 +120,24 @@ fn roundtrip_all_message_types() {
             total_files: 10,
             total_bytes: 1024,
         },
-        DistributedMessage::RequestClusterSnapshot {
+        DistributedMessage::RequestSnapshotStream {
             target: None,
             sender_id: "s".into(),
             timestamp: 0.0,
+            stream_id: "s/0".into(),
+            resume_after: None,
             is_observer: false,
             can_be_primary: true,
         },
-        DistributedMessage::ClusterSnapshot {
+        DistributedMessage::SnapshotStreamPackage {
             target: None,
             sender_id: "p".into(),
             timestamp: 0.0,
-            snapshot_json: "{}".into(),
+            stream_id: "s/0".into(),
+            seq: 0,
+            cursor: Some("crate-000001".into()),
+            payload: "oWE=".into(),
+            done: true,
         },
         DistributedMessage::RequestRunConfig {
             target: None,
@@ -296,5 +302,93 @@ fn roundtrip_all_message_types() {
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded.msg_type(), msg.msg_type());
         assert_eq!(decoded.sender_id(), msg.sender_id());
+    }
+}
+
+/// Wire-shape mirror for `RequestSnapshotStream` (NOT
+/// symmetric-on-the-wrong-shape): decode the EXACT JSON bytes a sender's
+/// framing layer emits, pinning the tag + field names + optional-field
+/// encoding the other side must produce — then re-encode and require the
+/// identical bytes back.
+#[test]
+fn request_snapshot_stream_mirrors_literal_sender_bytes() {
+    let literal = r#"{"msg_type":"request_snapshot_stream","sender_id":"joiner-1","timestamp":3.25,"stream_id":"joiner-1/0","resume_after":"crate-000100","is_observer":true,"can_be_primary":false}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(literal).unwrap();
+    match &decoded {
+        DistributedMessage::RequestSnapshotStream {
+            target,
+            sender_id,
+            timestamp,
+            stream_id,
+            resume_after,
+            is_observer,
+            can_be_primary,
+        } => {
+            assert!(target.is_none());
+            assert_eq!(sender_id, "joiner-1");
+            assert_eq!(*timestamp, 3.25);
+            assert_eq!(stream_id, "joiner-1/0");
+            assert_eq!(resume_after.as_deref(), Some("crate-000100"));
+            assert!(*is_observer);
+            assert!(!*can_be_primary);
+        }
+        other => panic!("expected RequestSnapshotStream, got {:?}", other.msg_type()),
+    }
+    let reencoded = serde_json::to_string(&decoded).unwrap();
+    assert_eq!(reencoded, literal);
+    // A fresh (non-resume) request omits nothing: `resume_after` rides
+    // as an explicit null, and a pre-field sender's frame (no
+    // `resume_after` key at all) decodes as `None` via serde(default).
+    let pre_field = r#"{"msg_type":"request_snapshot_stream","sender_id":"j","timestamp":0.0,"stream_id":"j/0","is_observer":false,"can_be_primary":true}"#;
+    let decoded_pre: DistributedMessage<TestId> = serde_json::from_str(pre_field).unwrap();
+    match decoded_pre {
+        DistributedMessage::RequestSnapshotStream { resume_after, .. } => {
+            assert!(resume_after.is_none());
+        }
+        other => panic!("expected RequestSnapshotStream, got {:?}", other.msg_type()),
+    }
+}
+
+/// Wire-shape mirror for `SnapshotStreamPackage`: the exact bytes the
+/// responder's egress emits — tag, field names, the explicit-null
+/// cursor on head/tail packages, and the base64 payload carried
+/// verbatim as a JSON string.
+#[test]
+fn snapshot_stream_package_mirrors_literal_sender_bytes() {
+    let literal = r#"{"msg_type":"snapshot_stream_package","sender_id":"resp-1","timestamp":4.5,"stream_id":"joiner-1/0","seq":2,"cursor":"crate-000200","payload":"oWE=","done":false}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(literal).unwrap();
+    match &decoded {
+        DistributedMessage::SnapshotStreamPackage {
+            target,
+            sender_id,
+            timestamp,
+            stream_id,
+            seq,
+            cursor,
+            payload,
+            done,
+        } => {
+            assert!(target.is_none());
+            assert_eq!(sender_id, "resp-1");
+            assert_eq!(*timestamp, 4.5);
+            assert_eq!(stream_id, "joiner-1/0");
+            assert_eq!(*seq, 2);
+            assert_eq!(cursor.as_deref(), Some("crate-000200"));
+            assert_eq!(payload, "oWE=");
+            assert!(!*done);
+        }
+        other => panic!("expected SnapshotStreamPackage, got {:?}", other.msg_type()),
+    }
+    let reencoded = serde_json::to_string(&decoded).unwrap();
+    assert_eq!(reencoded, literal);
+    // Head/tail packages carry no cursor (explicit null on the wire).
+    let final_pkg = r#"{"msg_type":"snapshot_stream_package","sender_id":"resp-1","timestamp":4.5,"stream_id":"joiner-1/0","seq":9,"cursor":null,"payload":"oWE=","done":true}"#;
+    let decoded_final: DistributedMessage<TestId> = serde_json::from_str(final_pkg).unwrap();
+    match decoded_final {
+        DistributedMessage::SnapshotStreamPackage { cursor, done, .. } => {
+            assert!(cursor.is_none());
+            assert!(done);
+        }
+        other => panic!("expected SnapshotStreamPackage, got {:?}", other.msg_type()),
     }
 }

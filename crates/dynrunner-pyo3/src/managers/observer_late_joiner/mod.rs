@@ -16,7 +16,7 @@
 //!    into the QUIC cert; peer dialers validate against it).
 //! 3. Drive [`PeerTransport::join_running_cluster`] with the seed and
 //!    the shared default budget; the trait's default impl dials,
-//!    sends `RequestClusterSnapshot` to the first reachable seed peer,
+//!    sends `RequestSnapshotStream` to the first reachable seed peer,
 //!    and returns the serialized snapshot JSON.
 //! 4. Deserialize the snapshot(s) — a decode failure is FATAL — and
 //!    cold-join the standalone

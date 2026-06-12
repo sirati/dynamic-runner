@@ -30,7 +30,7 @@ use dynrunner_protocol_primary_secondary::PrimaryChangeReason;
 /// into the primary's `cluster_state`: the register adopts the higher
 /// epoch + holder, the sticky `run_aborted` verdict latches, and the BUG-6
 /// displaced hook fires the demote signal. Pre-fix the primary's
-/// `dispatch_message` had NO `ClusterSnapshot` arm — the frame fell
+/// `dispatch_message` had NO snapshot-reply arm — the frame fell
 /// through the catch-all, so a dead-leg-starved zombie that DID hear a
 /// digest could request the snapshot but never converge on its reply.
 #[tokio::test(flavor = "current_thread")]
@@ -76,19 +76,14 @@ async fn cluster_snapshot_reply_is_ingested_and_fires_demote() {
             ahead.apply(ClusterMutation::RunAborted {
                 reason: "cluster routing collapsed (replayed verdict)".into(),
             });
-            let snapshot_json =
-                serde_json::to_string(&ahead.snapshot()).expect("snapshot serializes");
-            let reply = DistributedMessage::ClusterSnapshot {
-                target: None,
-                sender_id: "sec-0".into(),
-                timestamp: 0.0,
-                snapshot_json,
-            };
-
-            primary
-                .dispatch_message(reply, &mut None)
-                .await
-                .expect("snapshot reply ingest ok");
+            for reply in
+                crate::snapshot_stream::stream_frames_for_test(&ahead, "sec-0", "prim/0")
+            {
+                primary
+                    .dispatch_message(reply, &mut None)
+                    .await
+                    .expect("snapshot package ingest ok");
+            }
 
             let state = primary.cluster_state_for_test();
             assert_eq!(

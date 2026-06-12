@@ -45,6 +45,11 @@ zip = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Snapshot-stream package payload codec: each package is a partial
+# `ClusterStateSnapshot` encoded as CBOR (compact + no string-escaping
+# cost), then base64-wrapped to ride the JSON wire envelope.
+ciborium = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 dynrunner-transport-tunnel = { workspace = true }

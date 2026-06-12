@@ -2,9 +2,9 @@
 //!
 //! Pins Step 8 of the transport-unification refactor: a fresh
 //! observer / late-joiner uses `join_running_cluster(seed)` to dial a
-//! known peer set, send `RequestClusterSnapshot`, and receive a
-//! `ClusterSnapshot` reply carrying the serialized
-//! `ClusterStateSnapshot<I>` payload.
+//! known peer set, send `RequestSnapshotStream`, and collect the
+//! `SnapshotStreamPackage` frames carrying the (transport-opaque)
+//! partial-snapshot payloads.
 //!
 //! ## Why this lives in the channel-transport crate
 //!
@@ -15,13 +15,19 @@
 //! Putting the test here keeps the dependency graph clean — no
 //! manager-distributed dev-dep, no cycle. The receiver side is
 //! simulated by a hand-rolled responder that pumps the channel
-//! transport's `recv_peer`, recognises `RequestClusterSnapshot`, and
-//! replies with a synthetic `ClusterSnapshot` whose `snapshot_json` is
-//! the test's pre-baked JSON. This mirrors the production responder
-//! at `crates/dynrunner-manager-distributed/src/secondary/dispatch.rs:402-450`
-//! without pulling in the full secondary coordinator (which would
-//! drag the run lifecycle, election state machine, and ResourceEstimator
-//! into a transport-layer test — wrong layer).
+//! transport's `recv_peer`, recognises `RequestSnapshotStream`, and
+//! answers with a short sequence of `SnapshotStreamPackage` frames
+//! whose payloads are the test's pre-baked strings. The payload is
+//! OPAQUE at this layer (production encodes base64-CBOR partial
+//! snapshots; that codec round-trip is pinned in
+//! `cluster_state/tests/stream.rs`), so the fixture payloads stay
+//! plain JSON strings — what this test pins is the transport plumbing:
+//! fan-out, multi-package collection, per-responder done accounting,
+//! re-request/resume, and the gossip buffering. This mirrors the
+//! production responders without pulling in the full secondary
+//! coordinator (which would drag the run lifecycle, election state
+//! machine, and ResourceEstimator into a transport-layer test — wrong
+//! layer).
 //!
 //! ## Architectural assertion
 //!
@@ -147,14 +153,15 @@ fn make_synthetic_snapshot() -> SyntheticSnapshot {
     }
 }
 
-/// Synchronously process whatever is in `responder`'s inbox; reply to
-/// each `RequestClusterSnapshot` with the canned snapshot. Caller
-/// drives this between joiner sends/recvs — we don't `spawn` to keep
-/// the test single-task and deterministic.
+/// Synchronously process whatever is in `responder`'s inbox; answer
+/// each `RequestSnapshotStream` with one package per payload in
+/// `payloads` (the last carries `done`), echoing the request's
+/// `stream_id`. Caller drives this between joiner sends/recvs — we
+/// don't `spawn` to keep the test single-task and deterministic.
 async fn responder_pump(
     responder: &mut ChannelPeerTransport<TestId>,
     responder_id: &str,
-    snapshot_json: &str,
+    payloads: &[String],
 ) {
     // Drain everything currently visible without blocking. The
     // `recv_peer` future is cancel-safe (its only `.await` point is
@@ -166,21 +173,29 @@ async fn responder_pump(
         match next {
             Err(_) => return, // timeout = inbox quiescent
             Ok(None) => return,
-            Ok(Some(DistributedMessage::RequestClusterSnapshot {
+            Ok(Some(DistributedMessage::RequestSnapshotStream {
                 target: None,
                 sender_id,
+                stream_id,
                 ..
             })) => {
-                let reply: DistributedMessage<TestId> = DistributedMessage::ClusterSnapshot {
-                    target: None,
-                    sender_id: responder_id.to_string(),
-                    timestamp: timestamp_now(),
-                    snapshot_json: snapshot_json.to_string(),
-                };
-                // The unicast reply goes back to the joiner via its id
-                // (carried in the request's sender_id). Mirrors the
-                // dispatch.rs receiver path exactly.
-                let _ = responder.send_to_peer(&sender_id, reply).await;
+                for (i, payload) in payloads.iter().enumerate() {
+                    let reply: DistributedMessage<TestId> =
+                        DistributedMessage::SnapshotStreamPackage {
+                            target: None,
+                            sender_id: responder_id.to_string(),
+                            timestamp: timestamp_now(),
+                            stream_id: stream_id.clone(),
+                            seq: i as u64,
+                            cursor: None,
+                            payload: payload.clone(),
+                            done: i == payloads.len() - 1,
+                        };
+                    // The unicast packages go back to the joiner via its
+                    // id (carried in the request's sender_id). Mirrors
+                    // the production responders exactly.
+                    let _ = responder.send_to_peer(&sender_id, reply).await;
+                }
             }
             Ok(Some(_other)) => {
                 // Non-request frames are silently dropped — the
@@ -225,8 +240,21 @@ async fn join_running_cluster_returns_snapshot_with_capabilities() {
     let mut observer = transports.remove(0); // was index 2
     let mut regular = transports.remove(0); // was index 3
 
+    // The canned stream: TWO payloads (the production responder splits
+    // a snapshot into head + batches the same way; payloads are opaque
+    // partials the caller unions). Pin multi-package collection.
     let canned = make_synthetic_snapshot();
-    let canned_json = serde_json::to_string(&canned).expect("synthetic snapshot serializes");
+    let canned_payloads = vec![
+        serde_json::to_string(&canned).expect("synthetic snapshot serializes"),
+        serde_json::to_string(&SyntheticSnapshot {
+            tasks: HashMap::new(),
+            current_primary: canned.current_primary.clone(),
+            primary_epoch: canned.primary_epoch,
+            phase_deps: HashMap::new(),
+            capabilities: canned.capabilities.clone(),
+        })
+        .expect("synthetic tail serializes"),
+    ];
 
     // Seed lists all three live peers. Real PeerConnectionInfo cert
     // / port fields are irrelevant for the channel transport (its
@@ -266,42 +294,47 @@ async fn join_running_cluster_returns_snapshot_with_capabilities() {
             tokio::select! {
                 biased;
                 result = &mut join_fut => break result,
-                _ = responder_pump(&mut primary, "primary-peer", &canned_json) => {
+                _ = responder_pump(&mut primary, "primary-peer", &canned_payloads) => {
                     // Responder ran a pass; loop back to give the
                     // joiner a chance to deliver. Non-target peers
                     // also get a pump pass below so any stray frames
                     // they receive get processed.
                 }
-                _ = responder_pump(&mut observer, "observer-peer", &canned_json) => {}
-                _ = responder_pump(&mut regular, "regular-peer", &canned_json) => {}
+                _ = responder_pump(&mut observer, "observer-peer", &canned_payloads) => {}
+                _ = responder_pump(&mut regular, "regular-peer", &canned_payloads) => {}
             }
         }
     })
     .await
     .expect("test deadline: join_running_cluster did not resolve within 2s");
 
-    let snapshot_jsons = match join_result {
-        Ok(s) => s,
+    let bootstrap = match join_result {
+        Ok(b) => b,
         Err(e) => panic!("join_running_cluster failed: {e}"),
     };
 
-    // Multi-responder bootstrap returns a non-empty Vec; only
-    // primary-peer answers here, so exactly one payload comes back.
+    // Multi-package, multi-responder bootstrap: every responder's
+    // 2-package stream is collected (the caller unions every partial).
     assert!(
-        !snapshot_jsons.is_empty(),
-        "join_running_cluster must return at least one snapshot on Ok"
+        bootstrap.payloads.len() >= 2,
+        "join_running_cluster must collect every package of the stream, got {}",
+        bootstrap.payloads.len()
     );
-    let parsed: SyntheticSnapshot =
-        serde_json::from_str(&snapshot_jsons[0]).expect("returned snapshot_json round-trips");
+    let parsed: Vec<SyntheticSnapshot> = bootstrap
+        .payloads
+        .iter()
+        .map(|p| serde_json::from_str(p).expect("returned payload round-trips"))
+        .collect();
 
-    // Task ledger survives the RPC.
+    // Task ledger survives the RPC (unioned across the partials).
+    let task_union: std::collections::HashSet<String> = parsed
+        .iter()
+        .flat_map(|s| s.tasks.keys().cloned())
+        .collect();
     assert_eq!(
-        parsed
-            .tasks
-            .keys()
-            .collect::<std::collections::HashSet<_>>(),
+        task_union,
         ["task-1".to_string(), "task-2".to_string()]
-            .iter()
+            .into_iter()
             .collect()
     );
 
@@ -325,16 +358,20 @@ async fn join_running_cluster_returns_snapshot_with_capabilities() {
     )]
     .into_iter()
     .collect();
-    assert_eq!(parsed.capabilities, expected_capabilities);
+    let with_caps = parsed
+        .iter()
+        .find(|s| !s.capabilities.is_empty())
+        .expect("some partial carries the capability roster");
+    assert_eq!(with_caps.capabilities, expected_capabilities);
 
     // Primary-epoch carries through (canonical authority for the
     // joiner's role-table on restore).
-    assert_eq!(parsed.primary_epoch, 7);
-    assert_eq!(parsed.current_primary.as_deref(), Some("primary-peer"));
+    assert_eq!(with_caps.primary_epoch, 7);
+    assert_eq!(with_caps.current_primary.as_deref(), Some("primary-peer"));
 }
 
-/// Multi-responder bootstrap: the joiner fans `RequestClusterSnapshot`
-/// to ALL seeds and collects EVERY responder's snapshot (not just the
+/// Multi-responder bootstrap: the joiner fans `RequestSnapshotStream`
+/// to ALL seeds and collects EVERY responder's stream (not just the
 /// first). This is the completeness fix — the first reachable seed may
 /// hold an INCOMPLETE roster, so a single reply could bootstrap from a
 /// partial snapshot. Two responders answer with DISTINCT payloads (one
@@ -378,8 +415,8 @@ async fn join_running_cluster_collects_all_responders_for_union() {
         phase_deps: HashMap::new(),
         capabilities: Default::default(),
     };
-    let incomplete_json = serde_json::to_string(&incomplete_snap).unwrap();
-    let complete_json = serde_json::to_string(&complete_snap).unwrap();
+    let incomplete_payloads = vec![serde_json::to_string(&incomplete_snap).unwrap()];
+    let complete_payloads = vec![serde_json::to_string(&complete_snap).unwrap()];
 
     let seed: Vec<PeerConnectionInfo> = ["incomplete-peer", "complete-peer"]
         .iter()
@@ -402,35 +439,35 @@ async fn join_running_cluster_collects_all_responders_for_union() {
             tokio::select! {
                 biased;
                 result = &mut join_fut => break result,
-                _ = responder_pump(&mut incomplete, "incomplete-peer", &incomplete_json) => {}
-                _ = responder_pump(&mut complete, "complete-peer", &complete_json) => {}
+                _ = responder_pump(&mut incomplete, "incomplete-peer", &incomplete_payloads) => {}
+                _ = responder_pump(&mut complete, "complete-peer", &complete_payloads) => {}
             }
         }
     })
     .await
     .expect("test deadline: join_running_cluster did not resolve within 2s");
 
-    let snapshot_jsons = match join_result {
-        Ok(s) => s,
+    let bootstrap = match join_result {
+        Ok(b) => b,
         Err(e) => panic!("join_running_cluster failed: {e}"),
     };
 
-    // BOTH responders' snapshots are collected (the multi-responder
+    // BOTH responders' streams are collected (the multi-responder
     // contract — first-success-wins would have returned exactly one).
     assert_eq!(
-        snapshot_jsons.len(),
+        bootstrap.payloads.len(),
         2,
-        "both responders' snapshots must be collected, got {}",
-        snapshot_jsons.len()
+        "both responders' payloads must be collected, got {}",
+        bootstrap.payloads.len()
     );
 
     // The union of the returned payloads' task sets is the complete
     // ledger — proving an incomplete responder is healed by a complete
     // one (the idempotent-lattice union the caller performs via restore).
     let mut union: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for json in &snapshot_jsons {
+    for json in &bootstrap.payloads {
         let parsed: SyntheticSnapshot =
-            serde_json::from_str(json).expect("each returned snapshot round-trips");
+            serde_json::from_str(json).expect("each returned payload round-trips");
         union.extend(parsed.tasks.keys().cloned());
     }
     assert_eq!(
@@ -485,20 +522,20 @@ async fn join_running_cluster_empty_seed_errors_fast() {
 /// production joiner's legs carried throughout its bootstrap window),
 /// then drains the inbox:
 ///
-/// - a `RequestClusterSnapshot` received BEFORE `promoted_at` is
+/// - a `RequestSnapshotStream` received BEFORE `promoted_at` is
 ///   DROPPED — the promotion window: the responder seat is churning
 ///   (mid coordinator-swap slot loss / reply legs not yet established),
 ///   so the joiner's first-shot request dies silently;
-/// - after `promoted_at`, the peer holding `snapshot_json = Some(..)`
+/// - after `promoted_at`, the peer holding `payload = Some(..)`
 ///   is the newly-seated responder and answers with a
-///   production-shaped, role-stamped reply
+///   production-shaped, role-stamped single-package stream
 ///   (`Some(Destination::Observer(<joiner>))` — the
 ///   `anti_entropy::reply_destination` stamp); peers with `None` keep
 ///   gossiping and never answer.
 async fn promotion_window_pump(
     transport: &mut ChannelPeerTransport<TestId>,
     id: &str,
-    snapshot_json: Option<&str>,
+    payload: Option<&str>,
     promoted_at: tokio::time::Instant,
 ) {
     let keepalive: DistributedMessage<TestId> = DistributedMessage::Keepalive {
@@ -522,15 +559,24 @@ async fn promotion_window_pump(
         match next {
             Err(_) => return, // inbox quiescent
             Ok(None) => return,
-            Ok(Some(DistributedMessage::RequestClusterSnapshot { sender_id, .. })) => {
+            Ok(Some(DistributedMessage::RequestSnapshotStream {
+                sender_id,
+                stream_id,
+                ..
+            })) => {
                 let seated = tokio::time::Instant::now() >= promoted_at;
-                if let (true, Some(json)) = (seated, snapshot_json) {
-                    let reply: DistributedMessage<TestId> = DistributedMessage::ClusterSnapshot {
-                        target: Some(Destination::Observer(PeerId::from(sender_id.clone()))),
-                        sender_id: id.to_string(),
-                        timestamp: timestamp_now(),
-                        snapshot_json: json.to_string(),
-                    };
+                if let (true, Some(json)) = (seated, payload) {
+                    let reply: DistributedMessage<TestId> =
+                        DistributedMessage::SnapshotStreamPackage {
+                            target: Some(Destination::Observer(PeerId::from(sender_id.clone()))),
+                            sender_id: id.to_string(),
+                            timestamp: timestamp_now(),
+                            stream_id,
+                            seq: 0,
+                            cursor: None,
+                            payload: json.to_string(),
+                            done: true,
+                        };
                     let _ = transport.send_to_peer(&sender_id, reply).await;
                 }
                 // In-window requests (and post-window requests to a
@@ -607,25 +653,33 @@ async fn join_rerequests_until_a_promotion_window_closes() {
     .await
     .expect("test deadline: join_running_cluster did not resolve within 5s");
 
-    let snapshot_jsons = match join_result {
-        Ok(s) => s,
+    let bootstrap = match join_result {
+        Ok(b) => b,
         Err(e) => panic!(
             "bootstrap must re-request and heal once the promotion completes \
              within its own budget; instead it failed: {e}"
         ),
     };
     assert!(
-        !snapshot_jsons.is_empty(),
+        !bootstrap.payloads.is_empty(),
         "the re-request reaching the newly-seated responder must yield a snapshot"
     );
-    let parsed: SyntheticSnapshot =
-        serde_json::from_str(&snapshot_jsons[0]).expect("returned snapshot_json round-trips");
+    let parsed: SyntheticSnapshot = serde_json::from_str(&bootstrap.payloads[0])
+        .expect("returned payload round-trips");
     assert_eq!(parsed.primary_epoch, 7);
     assert_eq!(parsed.current_primary.as_deref(), Some("primary-peer"));
+    // The gossip that kept arriving during the window is BUFFERED for
+    // the caller (the pre-stream join warn-dropped it, losing one-shot
+    // facts): the pumps sent one ClusterMutation per pass.
+    assert!(
+        !bootstrap.live_frames.is_empty(),
+        "live ClusterMutation gossip received during the bootstrap window \
+         must be returned, not dropped"
+    );
 }
 
 /// Pump one healthy secondary whose snapshot reply only LANDS LATE: it
-/// answers a `RequestClusterSnapshot` only from `answers_at` onward
+/// answers a `RequestSnapshotStream` only from `answers_at` onward
 /// (before that the request is consumed without a reply — the
 /// production shape where the reply bytes exist but do not land inside
 /// a short window: a multi-MB chunked `ClusterSnapshot` still in
@@ -637,7 +691,7 @@ async fn join_rerequests_until_a_promotion_window_closes() {
 async fn starved_run_pump(
     transport: &mut ChannelPeerTransport<TestId>,
     id: &str,
-    snapshot_json: &str,
+    payload: &str,
     answers_at: Option<tokio::time::Instant>,
 ) {
     let keepalive: DistributedMessage<TestId> = DistributedMessage::Keepalive {
@@ -654,21 +708,30 @@ async fn starved_run_pump(
         match next {
             Err(_) => return, // inbox quiescent
             Ok(None) => return,
-            Ok(Some(DistributedMessage::RequestClusterSnapshot { sender_id, .. })) => {
+            Ok(Some(DistributedMessage::RequestSnapshotStream {
+                sender_id,
+                stream_id,
+                ..
+            })) => {
                 let landed = answers_at
                     .map(|at| tokio::time::Instant::now() >= at)
                     .unwrap_or(false);
                 if landed {
-                    let reply: DistributedMessage<TestId> = DistributedMessage::ClusterSnapshot {
-                        // Production-shaped reply stamp: the responder's
-                        // egress types the answer off the requester's
-                        // self-declared role
-                        // (`anti_entropy::reply_destination`).
-                        target: Some(Destination::Observer(PeerId::from(sender_id.clone()))),
-                        sender_id: id.to_string(),
-                        timestamp: timestamp_now(),
-                        snapshot_json: snapshot_json.to_string(),
-                    };
+                    let reply: DistributedMessage<TestId> =
+                        DistributedMessage::SnapshotStreamPackage {
+                            // Production-shaped reply stamp: the responder's
+                            // egress types the answer off the requester's
+                            // self-declared role
+                            // (`anti_entropy::reply_destination`).
+                            target: Some(Destination::Observer(PeerId::from(sender_id.clone()))),
+                            sender_id: id.to_string(),
+                            timestamp: timestamp_now(),
+                            stream_id,
+                            seq: 0,
+                            cursor: None,
+                            payload: payload.to_string(),
+                            done: true,
+                        };
                     let _ = transport.send_to_peer(&sender_id, reply).await;
                 }
             }
@@ -743,8 +806,8 @@ async fn join_seats_from_secondary_reply_when_primary_is_mute() {
     .await
     .expect("watchdog: join_running_cluster did not resolve in virtual time");
 
-    let snapshot_jsons = match join_result {
-        Ok(s) => s,
+    let bootstrap = match join_result {
+        Ok(b) => b,
         Err(e) => panic!(
             "the joiner must seat from a SECONDARY's late-landing reply \
              with a mute primary — the bootstrap budget + re-request \
@@ -752,10 +815,10 @@ async fn join_seats_from_secondary_reply_when_primary_is_mute() {
         ),
     };
     assert!(
-        !snapshot_jsons.is_empty(),
-        "at least one secondary snapshot must be collected"
+        !bootstrap.payloads.is_empty(),
+        "at least one secondary payload must be collected"
     );
-    let parsed: SyntheticSnapshot =
-        serde_json::from_str(&snapshot_jsons[0]).expect("returned snapshot_json round-trips");
+    let parsed: SyntheticSnapshot = serde_json::from_str(&bootstrap.payloads[0])
+        .expect("returned payload round-trips");
     assert_eq!(parsed.primary_epoch, 7);
 }

@@ -35,7 +35,7 @@ mod role_table;
 mod run_aborted;
 mod secondary_capacity;
 mod snapshot;
-mod snapshot_json_cache;
+mod stream;
 mod task_outputs;
 
 pub(super) fn mk_task(name: &str) -> TaskInfo<RunnerIdentifier> {

@@ -395,26 +395,6 @@ pub struct ClusterState<I> {
     /// snapshot + AE digest (no mutation of its own — it is derived
     /// from the terminal stream).
     pub(super) custom_terminal_watermarks: HashMap<String, u64>,
-    /// Node-local serialize-once cache for the snapshot-RPC reply
-    /// payload (the #367 wire-cap fix's CPU half): the last
-    /// `snapshot_json()` result keyed by the anti-entropy
-    /// [`StateDigest`] it was serialized under. A 67k-task ledger
-    /// serializes to ~100 MB; pre-cache every digest-driven pull /
-    /// late-joiner request re-ran that serialization (~6800 times in
-    /// run_20260611_115429), starving the runtime. The digest is
-    /// re-derived from CURRENT state on every read (the same
-    /// structural-completeness-guarded projection `digest()` always
-    /// computes), so the cache can never serve bytes whose
-    /// digest-covered content is stale — and digest-covered content is
-    /// exactly what drives anti-entropy pulls, so convergence is
-    /// preserved by construction. See `snapshot_json()` for the
-    /// non-digest-field staleness analysis. Never replicated, never
-    /// cloned (a clone re-serializes on first use), never part of
-    /// `digest()`/`snapshot()`.
-    pub(super) snapshot_json_cache: Option<(
-        dynrunner_protocol_primary_secondary::StateDigest,
-        std::sync::Arc<String>,
-    )>,
     /// Node-local per-peer throttle for the "PeerJoined for dead id at a
     /// non-advancing generation ignored" WARN (#416). A removed-but-alive
     /// peer redials forever; until its transport leg re-admits, EVERY
@@ -429,16 +409,16 @@ pub struct ClusterState<I> {
     /// NOT replicated — a pure node-local diagnostic gate (each replica
     /// throttles its own log stream): skipped from `Clone`, snapshot,
     /// restore, and the digest (classified node-local in the
-    /// exhaustive-destructure guards, like `task_seq` /
-    /// `snapshot_json_cache`). A cloned / restoring replica cold-starts the
+    /// exhaustive-destructure guards, like `task_seq`). A cloned /
+    /// restoring replica cold-starts the
     /// throttle (its first dead-rejoin observation emits immediately).
     pub(super) dead_rejoin_warn: HashMap<String, crate::warn_throttle::WarnThrottle>,
     /// Node-local memo of the last [`digest`] over the CURRENT generation
     /// of the replicated ledger. The digest is a pure O(ledger) XOR-fold
     /// over 66k+ tasks (+ outputs, capabilities, grow-max maps); the
     /// anti-entropy receive cadence re-derived it from scratch on EVERY
-    /// inbound `StateDigest` frame (two handlers on a co-located node) and
-    /// even on a `snapshot_json` serialize-cache HIT, starving the
+    /// inbound `StateDigest` frame (two handlers on a co-located node),
+    /// starving the
     /// `current_thread` runtime. [`digest`] populates this memo through
     /// `&self` (interior mutability — a `Cell`, so the read signature is
     /// unchanged and no caller learns of the memo); the mutation seams
@@ -464,16 +444,15 @@ pub struct ClusterState<I> {
     /// `secondary/setup_deadline.rs`), so no lock is needed. NOT replicated,
     /// NOT folded, NOT cloned, NOT snapshotted — a pure derivation of the
     /// replicated fields, classified node-local in every exhaustive-
-    /// destructure guard alongside `snapshot_json_cache`.
+    /// destructure guard.
     pub(super) digest_cache: std::cell::Cell<
         Option<dynrunner_protocol_primary_secondary::StateDigest>,
     >,
     /// Node-local counter of how many times [`digest`] ran the full fold
     /// (a memo MISS). Bumped through `&self` interior mutability inside the
-    /// recompute branch; read by the `snapshot_json_cache` / digest-memo
-    /// tests to pin "a cache hit does NOT recompute". Carries no
-    /// convergence signal — classified node-local in every destructure
-    /// guard, like `snapshot_json_cache`.
+    /// recompute branch; read by the digest-memo tests to pin "a cache hit
+    /// does NOT recompute". Carries no convergence signal — classified
+    /// node-local in every destructure guard.
     pub(super) digest_fold_count: std::cell::Cell<u64>,
 }
 
@@ -526,9 +505,6 @@ where
             phases_ended,
             custom_messages,
             custom_terminal_watermarks,
-            // Node-local serialize-once cache — not cloned (the clone
-            // re-serializes on its first snapshot_json call).
-            snapshot_json_cache: _snapshot_json_cache,
             // Node-local log-throttle — not cloned (a cloned replica
             // throttles its own log stream from a cold start).
             dead_rejoin_warn: _dead_rejoin_warn,
@@ -593,8 +569,6 @@ where
             // preserves them (replicated CRDT data, like `tasks`).
             custom_messages: custom_messages.clone(),
             custom_terminal_watermarks: custom_terminal_watermarks.clone(),
-            // Node-local serialize-once cache — see the destructure note.
-            snapshot_json_cache: None,
             // Node-local log-throttle — cold-start on the clone.
             dead_rejoin_warn: HashMap::new(),
             // Node-local digest memo — cold (the clone recomputes its
@@ -645,7 +619,6 @@ where
             phases_ended,
             custom_messages,
             custom_terminal_watermarks,
-            snapshot_json_cache,
             dead_rejoin_warn,
             digest_cache,
             digest_fold_count,
@@ -683,7 +656,6 @@ where
             .field("phases_ended", phases_ended)
             .field("custom_messages", &custom_messages.len())
             .field("custom_terminal_watermarks", &custom_terminal_watermarks.len())
-            .field("snapshot_json_cache", &snapshot_json_cache.is_some())
             .field("dead_rejoin_warn", &dead_rejoin_warn.len())
             .field("digest_cache", &digest_cache.get().is_some())
             .field("digest_fold_count", &digest_fold_count.get())
@@ -724,7 +696,6 @@ impl<I> Default for ClusterState<I> {
             phases_ended: HashSet::new(),
             custom_messages: HashMap::new(),
             custom_terminal_watermarks: HashMap::new(),
-            snapshot_json_cache: None,
             dead_rejoin_warn: HashMap::new(),
             digest_cache: std::cell::Cell::new(None),
             digest_fold_count: std::cell::Cell::new(0),

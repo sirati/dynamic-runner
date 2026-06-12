@@ -76,11 +76,14 @@ fn oversize_snapshot_json() -> String {
     s
 }
 
-/// RED→GREEN for the production defect: a ClusterSnapshot larger than
-/// the wire cap must cross the mesh INTACT (chunked + reassembled),
-/// not be serialize-dropped in a loop.
+/// The wire-cap safety net for the snapshot path: a (pathological)
+/// SnapshotStreamPackage larger than the wire cap must cross the mesh
+/// INTACT (chunked + reassembled), not be serialize-dropped in a loop.
+/// Production packages are bounded ~2 MiB by construction; the bound is
+/// soft (a single oversized task entry rides a package alone), so the
+/// chunk eligibility stays — this pins it end-to-end.
 #[tokio::test(flavor = "current_thread")]
-async fn oversize_cluster_snapshot_crosses_the_mesh() {
+async fn oversize_snapshot_package_crosses_the_mesh() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -92,11 +95,15 @@ async fn oversize_cluster_snapshot_crosses_the_mesh() {
             let sent_checksum =
                 dynrunner_protocol_primary_secondary::chunking::fnv1a64(snapshot_json.as_bytes());
 
-            let msg: DistributedMessage<TestId> = DistributedMessage::ClusterSnapshot {
+            let msg: DistributedMessage<TestId> = DistributedMessage::SnapshotStreamPackage {
                 target: None,
                 sender_id: "peer-a".into(),
                 timestamp: 1.0,
-                snapshot_json,
+                stream_id: "joiner/0".into(),
+                seq: 3,
+                cursor: Some("task-999".into()),
+                payload: snapshot_json,
+                done: false,
             };
             peer_a.send_to_peer("peer-b", msg).await.unwrap();
 
@@ -108,22 +115,25 @@ async fn oversize_cluster_snapshot_crosses_the_mesh() {
                 .expect("transport closed before the snapshot arrived");
 
             match received {
-                DistributedMessage::ClusterSnapshot {
+                DistributedMessage::SnapshotStreamPackage {
                     sender_id,
-                    snapshot_json,
+                    payload,
+                    seq,
+                    done,
                     ..
                 } => {
                     assert_eq!(sender_id, "peer-a");
-                    assert_eq!(snapshot_json.len(), sent_len, "payload length must survive");
+                    assert_eq!((seq, done), (3, false), "frame fields must survive");
+                    assert_eq!(payload.len(), sent_len, "payload length must survive");
                     assert_eq!(
                         dynrunner_protocol_primary_secondary::chunking::fnv1a64(
-                            snapshot_json.as_bytes()
+                            payload.as_bytes()
                         ),
                         sent_checksum,
                         "payload bytes must survive verbatim"
                     );
                 }
-                other => panic!("expected ClusterSnapshot, got {:?}", other.msg_type()),
+                other => panic!("expected SnapshotStreamPackage, got {:?}", other.msg_type()),
             }
         })
         .await;

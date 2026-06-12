@@ -54,7 +54,7 @@ fn make_recording_secondary(
     make_secondary_recording(election_config(secondary_id), 1)
 }
 
-/// Count `RequestClusterSnapshot` frames in the recorded peer-bus log
+/// Count `RequestSnapshotStream` frames in the recorded peer-bus log
 /// (the anti-entropy pull uses `send_to(Destination::Primary, ..)`, which
 /// the `RecordingPeer` collates into the same log).
 fn count_snapshot_requests(
@@ -65,7 +65,7 @@ fn count_snapshot_requests(
         .filter(|m| {
             matches!(
                 m,
-                DistributedMessage::RequestClusterSnapshot { target: _, .. }
+                DistributedMessage::RequestSnapshotStream { target: _, .. }
             )
         })
         .count()
@@ -150,18 +150,16 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
                 "behind a peer digest, the secondary must request exactly one snapshot"
             );
 
-            // ── The pull reply: the peer answers with its snapshot. ──
-            let snapshot_json =
-                serde_json::to_string(&donor.snapshot()).expect("donor snapshot serializes");
-            let reply = DistributedMessage::ClusterSnapshot {
-                target: None,
-                sender_id: "setup".into(),
-                timestamp: 0.0,
-                snapshot_json,
-            };
-            sec.dispatch_message(reply, &mut FakeWorkerFactory)
-                .await
-                .expect("ClusterSnapshot dispatch succeeds");
+            // ── The pull reply: the peer answers with its package
+            // stream (built by the SAME plan + codec a production
+            // responder uses). ──
+            for reply in
+                crate::snapshot_stream::stream_frames_for_test(&donor, "setup", "worker-a/0")
+            {
+                sec.dispatch_message(reply, &mut FakeWorkerFactory)
+                    .await
+                    .expect("SnapshotStreamPackage dispatch succeeds");
+            }
 
             // Healed: the dropped completion is now reflected, via the
             // EXISTING restore() lattice (no new merge logic).

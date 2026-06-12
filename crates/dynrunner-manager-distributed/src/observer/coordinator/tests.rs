@@ -703,7 +703,7 @@ async fn observer_rides_through_failover_and_exits_on_run_complete() {
 }
 
 /// Bootstrap recovery (§6 / item 2): an empty observer with a named
-/// primary recovers from a `ClusterSnapshot` reply fed over the inbound,
+/// primary recovers from a snapshot-stream reply fed over the inbound,
 /// restoring the completed-task count + the RunComplete latch ⇒ exit `Ok`.
 #[tokio::test(flavor = "current_thread")]
 async fn observer_recovers_from_snapshot_reply() {
@@ -711,8 +711,8 @@ async fn observer_recovers_from_snapshot_reply() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                // Donor snapshot: two completed tasks + RunComplete.
-                let snapshot_json = {
+                // Donor snapshot stream: two completed tasks + RunComplete.
+                let snapshot_frames = {
                     let mut donor = ClusterState::<TestId>::new();
                     for name in ["t1", "t2"] {
                         let t = task("p", name, &[]);
@@ -720,7 +720,11 @@ async fn observer_recovers_from_snapshot_reply() {
                         complete(&mut donor, name);
                     }
                     donor.apply(ClusterMutation::RunComplete);
-                    serde_json::to_string(&donor.snapshot()).expect("snapshot serializes")
+                    crate::snapshot_stream::stream_frames_for_test(
+                        &donor,
+                        "promoted-sec",
+                        "obs/0",
+                    )
                 };
 
                 // Observer transport: a `"promoted-sec"`-keyed outbox so the
@@ -740,16 +744,11 @@ async fn observer_recovers_from_snapshot_reply() {
                     reason: PrimaryChangeReason::Election,
                 });
 
-                // Pre-feed the snapshot reply so the loop's recv arm picks
-                // it up immediately on entry.
-                inbound_tx
-                    .send(DistributedMessage::ClusterSnapshot {
-                        target: None,
-                        sender_id: "promoted-sec".into(),
-                        timestamp: 0.0,
-                        snapshot_json,
-                    })
-                    .unwrap();
+                // Pre-feed the snapshot packages so the loop's recv arm
+                // picks them up immediately on entry.
+                for frame in snapshot_frames {
+                    inbound_tx.send(frame).unwrap();
+                }
 
                 let (client, inbox, pump) = observer_mesh(transport, "obs");
                 tokio::task::spawn_local(pump);
@@ -841,6 +840,7 @@ async fn observer_panik_arm_returns_panik_terminal() {
                     ClusterState::<TestId>::new(),
                     config,
                     Vec::new(),
+                    Vec::new(),
                     std::collections::HashSet::new(),
                 );
 
@@ -888,7 +888,7 @@ async fn observer_refreshes_primary_clock_on_restore_repoint() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let snapshot_json = {
+                let snapshot_frames = {
                     let mut donor = ClusterState::<TestId>::new();
                     let t = task("p", "t1", &[]);
                     add(&mut donor, &t);
@@ -902,7 +902,11 @@ async fn observer_refreshes_primary_clock_on_restore_repoint() {
                     // the named primary so the silence backstop is the
                     // hazard the refresh must defuse, then a later
                     // RunComplete provides the clean exit.
-                    serde_json::to_string(&donor.snapshot()).expect("snapshot serializes")
+                    crate::snapshot_stream::stream_frames_for_test(
+                        &donor,
+                        "promoted-sec",
+                        "obs/0",
+                    )
                 };
 
                 let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
@@ -929,14 +933,9 @@ async fn observer_refreshes_primary_clock_on_restore_repoint() {
                     // silence backstop, and the BUG-5 refresh resets the
                     // clock to "now".
                     tokio::time::sleep(Duration::from_millis(60)).await;
-                    inbound_tx
-                        .send(DistributedMessage::ClusterSnapshot {
-                            target: None,
-                            sender_id: "promoted-sec".into(),
-                            timestamp: 0.0,
-                            snapshot_json,
-                        })
-                        .expect("inbound open");
+                    for frame in snapshot_frames {
+                        inbound_tx.send(frame).expect("inbound open");
+                    }
                     // Past the ORIGINAL 80ms window measured from t=0: if
                     // the restore had not refreshed the clock the backstop
                     // would already have fired Err. A later RunComplete
@@ -1240,12 +1239,13 @@ async fn cold_join_announces_initial_holdings_after_restore() {
                     ClusterState::<TestId>::new(),
                     config,
                     vec![snapshot],
+                    Vec::new(),
                     holdings,
                 );
 
                 // Drain frames to the primary until the restore-driven
                 // holdings announce arrives, then complete the run. The
-                // observer also fires a bootstrap `RequestClusterSnapshot` to
+                // observer also fires a bootstrap `RequestSnapshotStream` to
                 // the named primary at loop entry (§6); skip it — only the
                 // `PeerResourceHoldingsUpdated` announce is under test.
                 tokio::task::spawn_local(async move {
@@ -1254,7 +1254,7 @@ async fn cold_join_announces_initial_holdings_after_restore() {
                             "the restore-driven initial announce must reach the primary outbox",
                         );
                         match frame {
-                            DistributedMessage::RequestClusterSnapshot { .. } => continue,
+                            DistributedMessage::RequestSnapshotStream { .. } => continue,
                             DistributedMessage::ClusterMutation { mutations, .. } => {
                                 assert_eq!(mutations.len(), 1, "one mutation per announce");
                                 match &mutations[0] {
@@ -1333,15 +1333,16 @@ async fn warn_dropped_decode_is_repulled_and_converges_via_recovery() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                // The good donor snapshot the recovery re-pull heals from:
-                // one completed task + RunComplete.
-                let good_snapshot_json = {
+                // The good donor the recovery re-pull heals from: one
+                // completed task + RunComplete (streamed by the same plan
+                // + codec a production responder uses).
+                let good_donor = {
                     let mut donor = ClusterState::<TestId>::new();
                     let t = task("p", "t1", &[]);
                     add(&mut donor, &t);
                     complete(&mut donor, "t1");
                     donor.apply(ClusterMutation::RunComplete);
-                    serde_json::to_string(&donor.snapshot()).expect("snapshot serializes")
+                    donor
                 };
                 // The (single) digest the named primary broadcasts — ahead of
                 // the observer's empty ledger, so the observer is `is_behind`.
@@ -1355,7 +1356,7 @@ async fn warn_dropped_decode_is_repulled_and_converges_via_recovery() {
 
                 // `promoted-sec`-keyed outbox so BOTH the reactive pull
                 // (Destination::Secondary(promoted-sec)) and the recovery pull
-                // resolve + send; we capture each RequestClusterSnapshot.
+                // resolve + send; we capture each RequestSnapshotStream.
                 let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
                 let (to_primary_tx, mut to_primary_rx) = mpsc::unbounded_channel();
                 let mut outgoing = HashMap::new();
@@ -1433,22 +1434,33 @@ async fn warn_dropped_decode_is_repulled_and_converges_via_recovery() {
                     // no third pull and the test hangs to its 5s timeout.
                     let mut non_timer_pulls_left = 2u8;
                     while let Some(frame) = to_primary_rx.recv().await {
-                        if let DistributedMessage::RequestClusterSnapshot { target: _, .. } = frame
+                        if let DistributedMessage::RequestSnapshotStream { stream_id, .. } = frame
                         {
-                            let reply = if non_timer_pulls_left > 0 {
+                            if non_timer_pulls_left > 0 {
                                 non_timer_pulls_left -= 1;
-                                "{ this is not valid snapshot json".to_string()
+                                // A MALFORMED package (WARN-dropped; the
+                                // cursor never advances past it).
+                                inbound_for_driver
+                                    .send(DistributedMessage::SnapshotStreamPackage {
+                                        target: None,
+                                        sender_id: "promoted-sec".into(),
+                                        timestamp: 0.0,
+                                        stream_id,
+                                        seq: 0,
+                                        cursor: None,
+                                        payload: "not even base64!!".to_string(),
+                                        done: true,
+                                    })
+                                    .expect("inbound open");
                             } else {
-                                good_snapshot_json.clone()
-                            };
-                            inbound_for_driver
-                                .send(DistributedMessage::ClusterSnapshot {
-                                    target: None,
-                                    sender_id: "promoted-sec".into(),
-                                    timestamp: 0.0,
-                                    snapshot_json: reply,
-                                })
-                                .expect("inbound open");
+                                for reply in crate::snapshot_stream::stream_frames_for_test(
+                                    &good_donor,
+                                    "promoted-sec",
+                                    &stream_id,
+                                ) {
+                                    inbound_for_driver.send(reply).expect("inbound open");
+                                }
+                            }
                         }
                     }
                     keepalive_pump.abort();
@@ -1555,7 +1567,7 @@ async fn recovery_cadence_quiesces_when_converged() {
                     // bootstrap request (1), never a recovery re-pull.
                     let count_task = tokio::task::spawn_local(async move {
                         while let Some(frame) = to_primary_rx.recv().await {
-                            if let DistributedMessage::RequestClusterSnapshot {
+                            if let DistributedMessage::RequestSnapshotStream {
                                 target: _, ..
                             } = frame
                             {
@@ -1933,43 +1945,53 @@ async fn observer_answers_snapshot_pull_from_behind_secondary() {
                 // The behind secondary's anti-entropy pull (its reactive
                 // digest arm targets the proven-ahead SENDER — this observer).
                 inbound_tx
-                    .send(DistributedMessage::RequestClusterSnapshot {
+                    .send(DistributedMessage::RequestSnapshotStream {
                         target: None,
                         sender_id: "sec-1".into(),
                         timestamp: 0.0,
+                        stream_id: "sec-1/0".into(),
+                        resume_after: None,
                         is_observer: false,
                         can_be_primary: true,
                     })
                     .expect("inbound open");
 
-                // The observer MUST answer with its snapshot, carrying the
-                // relocation fact the requester is missing.
-                let (reply, reply_target) = loop {
+                // The observer MUST answer with its snapshot stream,
+                // carrying the relocation fact the requester is missing.
+                let mut healed = ClusterState::<TestId>::new();
+                let mut reply_target = None;
+                loop {
                     let frame = sec1_rx
                         .recv()
                         .await
                         .expect("observer transport stays open");
-                    if let DistributedMessage::ClusterSnapshot {
+                    if let DistributedMessage::SnapshotStreamPackage {
                         target,
-                        snapshot_json,
+                        payload,
+                        done,
                         ..
                     } = frame
                     {
-                        break (snapshot_json, target);
+                        if reply_target.is_none() {
+                            reply_target = Some(target);
+                        }
+                        let snap: crate::cluster_state::ClusterStateSnapshot<TestId> =
+                            crate::cluster_state::decode_stream_payload(&payload)
+                                .expect("served package decodes");
+                        healed.restore(snap);
+                        if done {
+                            break;
+                        }
                     }
-                };
-                // The reply is typed off the requester's self-declared role:
-                // a WORKER requester (is_observer=false) gets a
-                // Secondary-typed reply (the ingress demux selector).
+                }
+                // Every package is typed off the requester's self-declared
+                // role: a WORKER requester (is_observer=false) gets
+                // Secondary-typed packages (the ingress demux selector).
                 assert_eq!(
                     reply_target,
-                    Some(Destination::Secondary(PeerId::from("sec-1"))),
-                    "a worker requester's snapshot reply must be Secondary-typed"
+                    Some(Some(Destination::Secondary(PeerId::from("sec-1")))),
+                    "a worker requester's packages must be Secondary-typed"
                 );
-                let snap: crate::cluster_state::ClusterStateSnapshot<TestId> =
-                    serde_json::from_str(&reply).expect("served snapshot decodes");
-                let mut healed = ClusterState::<TestId>::new();
-                healed.restore(snap);
                 assert_eq!(
                     healed.current_primary(),
                     Some("sec-0"),
@@ -2028,10 +2050,12 @@ async fn observer_answers_observer_requester_with_observer_typed_reply() {
                 // The behind peer observer's anti-entropy pull declares its
                 // own role on the request frame.
                 inbound_tx
-                    .send(DistributedMessage::RequestClusterSnapshot {
+                    .send(DistributedMessage::RequestSnapshotStream {
                         target: None,
                         sender_id: "obs-1".into(),
                         timestamp: 0.0,
+                        stream_id: "obs-1/0".into(),
+                        resume_after: None,
                         is_observer: true,
                         can_be_primary: false,
                     })
@@ -2042,7 +2066,7 @@ async fn observer_answers_observer_requester_with_observer_typed_reply() {
                         .recv()
                         .await
                         .expect("observer transport stays open");
-                    if let DistributedMessage::ClusterSnapshot { target, .. } = frame {
+                    if let DistributedMessage::SnapshotStreamPackage { target, .. } = frame {
                         break target;
                     }
                 };

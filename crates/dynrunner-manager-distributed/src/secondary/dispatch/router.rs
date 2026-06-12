@@ -34,7 +34,7 @@ where
 {
     /// Wire-frame dispatcher for the frame types the role-aware
     /// `handle_inbound` base does not own directly (TaskAssignment,
-    /// StageFile, RequestClusterSnapshot, ClusterSnapshot, PeerInfo,
+    /// StageFile, RequestSnapshotStream, SnapshotStreamPackage, PeerInfo,
     /// ClusterMutation, plus the test-reachable TaskComplete/TaskFailed
     /// arms). The secondary holds NO authority: every arm here is either
     /// own-worker management, a CRDT mirror apply, or a CLASS-1 report to
@@ -497,57 +497,41 @@ where
                 tracing::trace!(task_hash, "observed TaskFailed report (no-op)");
                 Ok(())
             }
-            DistributedMessage::RequestClusterSnapshot {
+            DistributedMessage::RequestSnapshotStream {
                 sender_id,
+                stream_id,
+                resume_after,
                 is_observer,
                 can_be_primary,
                 ..
             } => {
                 // Any peer can answer — `cluster_state` is replicated,
-                // so any responder's snapshot is a valid bootstrap
-                // payload. The merge semantics on the receiver
+                // so any responder's stream is a valid bootstrap
+                // source. The merge semantics on the receiver
                 // (`ClusterState::restore`) reconcile partial /
-                // overlapping snapshots, so a duplicate response from
-                // multiple peers is harmless.
+                // overlapping packages, so duplicate streams from
+                // multiple peers are harmless.
                 //
-                // Wire-side `snapshot_json` carries the snapshot
-                // serialized via serde_json so the protocol envelope
-                // stays free of the manager-distributed crate's
-                // `ClusterStateSnapshot<I>` (which is the right-side
-                // dependency direction; the protocol crate must not
-                // depend on the manager crate).
-                // Serialize-once per state generation (#367): the cache
-                // inside `ClusterState` keys the reply bytes on the
-                // anti-entropy digest, so a burst of pulls against an
-                // unchanged ledger does not re-serialize ~100 MB per
-                // request.
-                let snapshot_json = self
-                    .cluster_state
-                    .snapshot_json()
-                    .map_err(|e| format!("snapshot serialization: {e}"))?;
-                // The shared snapshot-RPC answer (`anti_entropy::
-                // snapshot_reply`): reply typed off the requester's
-                // self-declared role (the request frame's `is_observer`),
-                // addressed by its id — resolvable for a rosterless
-                // joiner over its direct leg.
-                let (dst, response) = crate::anti_entropy::snapshot_reply(
-                    &self.config.secondary_id,
+                // The arm only REGISTERS (or resumes) the stream — one
+                // sorted key list + the small tally capture, never a
+                // ledger copy or a monolithic serialization. The
+                // packages are produced one per loop wakeup by the
+                // process-loop's stream arm (`snapshot_streams.
+                // next_wake` → `emit_next`), each typed off the
+                // requester's self-declared role and addressed by its
+                // id — resolvable for a rosterless joiner over its
+                // direct leg.
+                self.snapshot_streams.accept_request(
+                    &self.cluster_state,
                     &sender_id,
                     is_observer,
-                    timestamp_now(),
-                    (*snapshot_json).clone(),
+                    &stream_id,
+                    resume_after.as_deref(),
                 );
-                if let Err(e) = self.send_to(dst, response).await {
-                    tracing::warn!(
-                        target = %sender_id,
-                        error = %e,
-                        "failed to deliver ClusterSnapshot response"
-                    );
-                }
                 // Explicit `PeerJoined` origination on late-joiner accept.
                 //
                 // Late-joiners enter the cluster by sending
-                // `RequestClusterSnapshot`; the responder is the first
+                // `RequestSnapshotStream`; the responder is the first
                 // existing member to observe the joiner. Apply locally
                 // and broadcast over the canonical origination path so
                 // receivers learn about the joiner via the
@@ -589,30 +573,38 @@ where
                     .await;
                 Ok(())
             }
-            DistributedMessage::ClusterSnapshot { snapshot_json, .. } => {
+            DistributedMessage::SnapshotStreamPackage {
+                sender_id,
+                stream_id,
+                cursor,
+                payload,
+                done,
+                ..
+            } => {
                 // Lattice-merge into the local mirror via the shared
                 // single-writer restore helper (`ClusterState::restore` +
                 // the primary-identity seam — see
-                // `restore_cluster_snapshot_frame`; `wait_for_setup`'s
-                // receive loop shares it). Idempotent on duplicates and
+                // `restore_snapshot_stream_frame`; `wait_for_setup`'s
+                // receive loop shares it). Each package is a PARTIAL
+                // snapshot; the merge is idempotent on duplicates and
                 // safe under concurrent live broadcasts (joiner may have
-                // already applied mutations the snapshot also contains;
+                // already applied mutations a package also contains;
                 // the merge keeps the strictly stronger of each).
                 //
                 // Per-frame fatality discriminator (D-C / D3): this arm is
                 // the STEADY-STATE anti-entropy / late-heal pull sink — it
                 // runs inside the operational loop (`dispatch_message`), NOT
-                // the bootstrap constructor. A malformed snapshot here is
+                // the bootstrap constructor. A malformed package here is
                 // WARN-and-keep, NOT fatal: the secondary re-converges
                 // REACTIVELY — the next peer `StateDigest` broadcast feeds the
-                // digest arm below, which re-pulls a fresh snapshot iff the
-                // replica is still behind, so one bad frame cannot wedge or
-                // corrupt the replica. (The secondary has NO AE-3 timer
-                // cadence — that recovery-tick cadence is the OBSERVER's;
-                // here the inbound digest arm is the heal trigger.) The
-                // BOOTSTRAP decode (cold-join
-                // constructor) stays FATAL — a malformed INITIAL snapshot
-                // genuinely leaves the node with no starting state and must
+                // digest arm below, which re-pulls iff the replica is still
+                // behind (resuming from the last good cursor), so one bad
+                // frame cannot wedge or corrupt the replica. (The secondary
+                // has NO AE-3 timer cadence — that recovery-tick cadence is
+                // the OBSERVER's; here the inbound digest arm is the heal
+                // trigger.) The BOOTSTRAP decode (cold-join constructor)
+                // stays FATAL — a malformed INITIAL payload genuinely
+                // leaves the node with no starting state and must
                 // hard-fail there. The discriminator is WHICH FUNCTION the
                 // decode lives in (steady-state loop arm = WARN, bootstrap
                 // constructor = fatal); there is no latch.
@@ -624,7 +616,13 @@ where
                 // snapshot-healed primary flip must re-announce MeshReady /
                 // reset backoff / repoll exactly like a broadcast-delivered
                 // one.
-                if self.restore_cluster_snapshot_frame(&snapshot_json) {
+                if self.restore_snapshot_stream_frame(
+                    &sender_id,
+                    &stream_id,
+                    cursor.as_deref(),
+                    &payload,
+                    done,
+                ) {
                     self.react_to_primary_identity_change().await;
                 }
                 Ok(())
@@ -717,7 +715,7 @@ where
                 // node-local `forwarded_argv` and unicast exactly ONE
                 // `RunConfig` back (its return address rides `sender_id`,
                 // mirroring the snapshot responder's reply edge). Unlike the
-                // `RequestClusterSnapshot` arm above, it does NOT originate
+                // `RequestSnapshotStream` arm above, it does NOT originate
                 // `PeerJoined`, does NOT send any welcome, and never touches
                 // roster / capacity / CRDT: the run-config is a node-local
                 // launch constant, not lattice data, so answering for it is

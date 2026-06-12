@@ -11,11 +11,15 @@ use crate::codec;
 struct TestId(String);
 
 fn snapshot_msg(payload: &str) -> DistributedMessage<TestId> {
-    DistributedMessage::ClusterSnapshot {
+    DistributedMessage::SnapshotStreamPackage {
         target: None,
         sender_id: "holder-1".into(),
         timestamp: 12.5,
-        snapshot_json: payload.into(),
+        stream_id: "joiner/0".into(),
+        seq: 0,
+        cursor: None,
+        payload: payload.into(),
+        done: false,
     }
 }
 
@@ -81,10 +85,10 @@ fn split_and_reassemble_round_trip() {
     assert_eq!(bytes, json);
     let decoded: DistributedMessage<TestId> = codec::deserialize_message(&bytes).unwrap();
     match decoded {
-        DistributedMessage::ClusterSnapshot { snapshot_json, .. } => {
-            assert_eq!(snapshot_json.len(), 10_000);
+        DistributedMessage::SnapshotStreamPackage { payload, .. } => {
+            assert_eq!(payload.len(), 10_000);
         }
-        other => panic!("expected ClusterSnapshot, got {:?}", other.msg_type()),
+        other => panic!("expected SnapshotStreamPackage, got {:?}", other.msg_type()),
     }
     assert!(!reasm.in_progress());
 }
