@@ -2,9 +2,9 @@
 //!
 //! Single concern: given a writable, memory-controller-bearing leaf
 //! cgroup directory, materialise `<leaf>/workers/` with `memory.max`
-//! tightened by `reserved_bytes` and `memory.swap.max` reset to
-//! `"max"`. Idempotent — re-running against an already-prepared
-//! subgroup is a no-op.
+//! tightened by `reserved_bytes` and `memory.swap.max` capped to
+//! `"0"` (best-effort — see [`cap_swap_best_effort`]). Idempotent —
+//! re-running against an already-prepared subgroup is a no-op.
 //!
 //! The orchestration (cgroup-v2 detection, controller probing,
 //! writability check, warn-line on graceful fallback) lives in
@@ -93,11 +93,18 @@ fn compute_workers_memory_max(
 ///   3. `<workers>/memory.max` — computed via
 ///      [`compute_workers_memory_max`]. Skipped when the parent
 ///      container has no concrete cap (logged at info level).
-///   4. `<workers>/memory.swap.max` — explicitly written as `"max"`
-///      because cgroup-v2 children inherit `0` (no swap) by default
-///      regardless of the parent's `--memory-swap=-1`. Per the
-///      design contract: workers must have all swap available so
-///      ResourceStealingScheduler's swap-aware budget math holds.
+///   4. `<workers>/memory.swap.max` — written as `"0"` (no swap),
+///      best-effort. A worker whose working set leaves RAM is a
+///      death spiral, not a graceful degradation (JVM GC touching
+///      swapped pages thrashes forever while its shrinking RSS
+///      reads as relief) — the working set must stay fully
+///      resident; overshoot should trip the workers-subgroup
+///      kernel-OOM instead. See [`cap_swap_best_effort`] for the
+///      non-fatal tolerance contract. (This deliberately reverses
+///      the earlier "unlimited swap" policy: production showed
+///      swap-thrash is strictly worse than a clean OOM kill for
+///      the JVM/Ghidra workloads, and the scheduler never grew the
+///      swap-aware budget math the old comment appealed to.)
 ///   5. `+memory +pids` writes to `<workers>/cgroup.subtree_control`
 ///      so per-worker children inherit those controllers and the
 ///      memprofile sampler can read each worker's `memory.current`.
@@ -160,13 +167,12 @@ pub(super) fn write_workers_subgroup(
         }
     }
 
-    // LOAD-BEARING: cgroup-v2 children's `memory.swap.max` defaults
-    // to 0 (no swap) regardless of the parent's swap config. Write
-    // `"max"` explicitly so the workers see whatever swap the
-    // kernel exposes to the parent — the secondary's own
-    // `--memory-swap=-1` is otherwise silently overridden.
-    let swap_path = workers_path.join("memory.swap.max");
-    std::fs::write(&swap_path, "max").map_err(CgroupSetupError::io_at("write", &swap_path))?;
+    // Cap swap to zero on the workers tree (best-effort, never
+    // fatal): a swapping worker is a death spiral the watcher reads
+    // as relief — overshoot must surface as workers-subgroup
+    // kernel-OOM instead. See the step-4 rustdoc above for the
+    // policy rationale.
+    cap_swap_best_effort(&workers_path);
 
     if workers_cgroup_procs_has_pids(&workers_path)? {
         tracing::warn!(
@@ -196,9 +202,10 @@ pub(super) fn write_workers_subgroup(
 ///
 /// Intentionally writes NO `memory.max`: per-worker enforcement is
 /// out of scope; the aggregate cap lives on `workers/memory.max`.
-/// `memory.swap.max=max` is written for the same load-bearing reason
-/// documented on [`write_workers_subgroup`] — cgroup-v2 children
-/// default to zero-swap and must be told otherwise explicitly.
+/// `memory.swap.max=0` is written (best-effort) for the same policy
+/// reason documented on [`write_workers_subgroup`] step 4 — a
+/// worker's working set must stay fully resident; swap is a death
+/// spiral, not headroom.
 ///
 /// Returns the absolute path to the worker leaf so the caller can
 /// hand it (or its `cgroup.procs` child) to the spawn site.
@@ -209,9 +216,47 @@ pub(super) fn write_worker_subgroup(
     let worker_path = workers_path.join(format!("worker-{worker_id}"));
     std::fs::create_dir_all(&worker_path)
         .map_err(CgroupSetupError::io_at("mkdir", &worker_path))?;
-    let swap_path = worker_path.join("memory.swap.max");
-    std::fs::write(&swap_path, "max").map_err(CgroupSetupError::io_at("write", &swap_path))?;
+    cap_swap_best_effort(&worker_path);
     Ok(worker_path)
+}
+
+/// Write `memory.swap.max = 0` on a workers-tree cgroup, tolerating
+/// failure.
+///
+/// Single owner of the swap-cap write AND its tolerance contract:
+/// nested-cgroup writes fail with `EOPNOTSUPP` / `EBUSY` (rootless
+/// podman on some hosts) or `ENOENT` (kernel without swap
+/// accounting never creates the file), and none of that is worth
+/// degrading the nested layout over — the cap only ADDS protection
+/// on hosts that permit it. Failure is reported once per process at
+/// info (operator-visible) and per-occurrence at debug; it is never
+/// an error, mirroring the wider setup module's infallibility
+/// contract.
+fn cap_swap_best_effort(cgroup_dir: &Path) {
+    let path = cgroup_dir.join("memory.swap.max");
+    match std::fs::write(&path, "0") {
+        Ok(()) => {}
+        Err(e) => {
+            static SWAP_CAP_FAILED_ONCE: std::sync::Once = std::sync::Once::new();
+            SWAP_CAP_FAILED_ONCE.call_once(|| {
+                tracing::info!(
+                    target: "cgroup_swap_cap",
+                    path = %path.display(),
+                    error = %e,
+                    "memory.swap.max=0 write failed (non-fatal); workers on this \
+                     host may be able to swap. Operator hint: a swapping worker \
+                     thrashes instead of OOM-killing cleanly — prefer a host/scope \
+                     where the swap controller is delegated."
+                );
+            });
+            tracing::debug!(
+                target: "cgroup_swap_cap",
+                path = %path.display(),
+                error = %e,
+                "memory.swap.max=0 write failed (non-fatal)"
+            );
+        }
+    }
 }
 
 /// Move our own pid into `<leaf>/secondary/` so the leaf becomes

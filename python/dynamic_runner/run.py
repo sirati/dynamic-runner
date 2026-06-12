@@ -862,6 +862,10 @@ def _dispatch_late_joiner(task, args, logger) -> None:
         gateway_url=gateway_url,
         ssh_identity_file=getattr(args, "ssh_identity_file", None),
         ssh_config_file=getattr(args, "ssh_config", None),
+        # Local-mode QUIC cert pins: explicit file, or (None) the
+        # Rust side derives the run's conventional local cert dir and
+        # probes it — absent means today's WSS fallback, unchanged.
+        mesh_credentials_path=getattr(args, "observer_mesh_credentials", None),
         **_panik_kwargs(args),
     )
     logger.info(f"Observer Completed (observed): {result['completed']}")

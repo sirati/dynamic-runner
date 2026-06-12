@@ -295,6 +295,42 @@ class GatewayModeTests(unittest.TestCase):
         self.assertIsNone(recorded["gateway_url"])
         self.assertIsNone(recorded["ssh_identity_file"])
         self.assertIsNone(recorded["ssh_config_file"])
+        # Local-mode credentials default: passed as None so the Rust
+        # side derives the run's conventional local cert dir and probes
+        # it (the per-layer plumbing gap is exactly what this test
+        # class exists to catch).
+        self.assertIsNone(recorded["mesh_credentials_path"])
+
+    def test_dispatcher_forwards_explicit_mesh_credentials(self) -> None:
+        # An explicit --observer-mesh-credentials value must reach the
+        # Rust pyfunction verbatim (local mode; the gateway combination
+        # is rejected by the Rust constructor up-front).
+        run_mod = _load_run_module()
+        recorded: dict = {}
+
+        def fake_run_observer_late_joiner(peer_info_dir, **kwargs):
+            recorded["peer_info_dir"] = peer_info_dir
+            recorded.update(kwargs)
+            return {"completed": 0}
+
+        pkg = sys.modules["dynamic_runner"]
+        pkg.run_observer_late_joiner = fake_run_observer_late_joiner
+        try:
+            args = _parse(
+                [
+                    "--observer-join-from-peer-info-dir",
+                    "/tmp/ci",
+                    "--observer-mesh-credentials",
+                    "/tmp/db-runner-cert-run_x/peer_credentials.json",
+                ]
+            )
+            run_mod._dispatch_late_joiner(None, args, _SilentLogger())
+        finally:
+            del pkg.run_observer_late_joiner
+        self.assertEqual(
+            recorded["mesh_credentials_path"],
+            "/tmp/db-runner-cert-run_x/peer_credentials.json",
+        )
 
 
 class _SilentLogger:
@@ -320,6 +356,60 @@ def _load_run_module():
     sys.modules[fullname] = module
     spec.loader.exec_module(module)
     return module
+
+
+class MeshCredentialsFlagTests(unittest.TestCase):
+    """`--observer-mesh-credentials` — the submitter-persisted peer
+    cert pins the LOCAL-mode late-joiner overlays onto its seed so
+    peer dials authenticate over QUIC. The flag is INPUT to the
+    late-joiner's seed construction only, so it requires the
+    late-joiner mode flag; absent, the Rust side derives the run's
+    conventional local cert dir and probes it (backward compatible:
+    nothing found means today's WSS fallback).
+    """
+
+    def test_flag_absent_default_is_none(self) -> None:
+        args = _parse([])
+        self.assertIsNone(args.observer_mesh_credentials)
+
+    def test_flag_stores_path_string(self) -> None:
+        args = _parse(
+            [
+                "--observer-join-from-peer-info-dir",
+                "/tmp/ci",
+                "--observer-mesh-credentials",
+                "/tmp/db-runner-cert-run_x/peer_credentials.json",
+            ]
+        )
+        self.assertEqual(
+            args.observer_mesh_credentials,
+            "/tmp/db-runner-cert-run_x/peer_credentials.json",
+        )
+
+    def test_with_late_joiner_flag_validates(self) -> None:
+        args = _parse_and_validate(
+            [
+                "--observer-join-from-peer-info-dir",
+                "/tmp/ci",
+                "--observer-mesh-credentials",
+                "/tmp/creds.json",
+            ]
+        )
+        self.assertEqual(args.observer_mesh_credentials, "/tmp/creds.json")
+
+    def test_without_late_joiner_flag_rejected(self) -> None:
+        # The credentials file is only ever read by the late-joiner's
+        # seed construction; supplying it without the mode flag is an
+        # operator error surfaced up-front, never silently ignored.
+        parser = cli.build_arg_parser("test")
+        args = parser.parse_args(["--observer-mesh-credentials", "/tmp/creds.json"])
+        stderr_buf = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, redirect_stderr(stderr_buf):
+            cli.validate_parsed_args(args, parser)
+        self.assertEqual(cm.exception.code, 2)
+        msg = stderr_buf.getvalue()
+        self.assertIn("--observer-mesh-credentials", msg)
+        self.assertIn("--observer-join-from-peer-info-dir", msg)
 
 
 if __name__ == "__main__":

@@ -185,18 +185,19 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         // tick task (`peer/mod.rs`). If that task ever ends (panic, or the
         // runtime tearing it down), `reconnect_tick_rx` closes and a closed
         // `UnboundedReceiver::recv()` resolves `None` SYNCHRONOUSLY on every
-        // poll, making this arm always-ready: the inner `loop` then re-polls
-        // the `select!` without ever parking, burning ~100% CPU (the
+        // poll, making this arm always-ready: the inner `loop` would then
+        // re-poll the `select!` without ever parking, burning ~100% CPU (the
         // lifetime-heat half of the livelock RCA — see
-        // `tests/recv_tick_closed_spins.rs`). Flipping this bool on the first
-        // `None` disables the arm (`, if !tick_closed`) for the rest of this
-        // `recv_peer` call, mirroring the `transport_closed` one-shot gate the
-        // operational loop uses for its own inbound arm. The reconnect cadence
-        // is lost for the remainder of the call (the tick task is gone), but
-        // redials still fire on the authoritative disconnect arm + Router's
-        // own redial pulse — correctness is preserved, only the periodic
-        // backstop is dropped, and the WARN names the regression.
-        let mut tick_closed = false;
+        // `tests/recv_tick_closed_spins.rs`). The first `None` latches
+        // `self.reconnect_tick_closed` and disables the arm
+        // (`, if !self.reconnect_tick_closed`) PERMANENTLY — the latch lives
+        // on the struct, not a local, because the caller re-creates this
+        // `recv_peer` future per delivered frame and a local would reset
+        // each call (one always-ready poll + one WARN per frame, forever).
+        // The reconnect cadence is lost (the tick task is gone), but redials
+        // still fire on the authoritative disconnect arm + Router's own
+        // redial pulse — correctness is preserved, only the periodic
+        // backstop is dropped, and the one WARN names the regression.
         loop {
             // All three select arms poll cancel-safe channel
             // receivers via disjoint-field borrows of `self`. The
@@ -292,7 +293,7 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                     }
                     None
                 }
-                tick = self.reconnect_tick_rx.recv(), if !tick_closed => {
+                tick = self.reconnect_tick_rx.recv(), if !self.reconnect_tick_closed => {
                     match tick {
                         Some(()) => {
                             // Periodic reconnect-tick. The tracker
@@ -321,12 +322,12 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                             // The 5 s tick task ended, closing the channel.
                             // A closed receiver resolves `None` forever and
                             // synchronously, so leaving the arm enabled would
-                            // hot-loop the `select!` at ~100% CPU. Gate it off
-                            // for the rest of this call (see the `tick_closed`
-                            // declaration above). One WARN names the
-                            // regression so the lost reconnect backstop is
-                            // visible in the operator log.
-                            tick_closed = true;
+                            // hot-loop the `select!` at ~100% CPU. Latch it
+                            // off permanently (struct-level — see the field
+                            // doc). One WARN names the regression so the
+                            // lost reconnect backstop is visible in the
+                            // operator log.
+                            self.reconnect_tick_closed = true;
                             tracing::warn!(
                                 "reconnect-tick channel closed (the 5s tick task ended); \
                                  disabling the tick arm for the remainder of this recv_peer \

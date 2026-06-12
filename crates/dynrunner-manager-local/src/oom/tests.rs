@@ -198,6 +198,8 @@ fn cgroup_unavailable_yields_none_or_zero() {
     watcher.set_snapshot_for_test(OomWatcherSnapshot {
         host: reading,
         tracked_workers_rss_sum: 0,
+        tracked_workers_swap_sum: 0,
+        tracked_workers_charged_sum: 0,
         tracked_workers_count: 0,
         captured_at: Some(Instant::now()),
     });
@@ -215,6 +217,8 @@ fn heartbeat_log_fires_on_first_emission_then_every_10s() {
         watcher.set_snapshot_for_test(OomWatcherSnapshot {
             host: reading,
             tracked_workers_rss_sum: 0,
+            tracked_workers_swap_sum: 0,
+            tracked_workers_charged_sum: 0,
             tracked_workers_count: 0,
             captured_at: Some(t0),
         });
@@ -249,6 +253,8 @@ fn delta_log_under_pressure_fires_on_1gb_jump() {
         watcher.set_snapshot_for_test(OomWatcherSnapshot {
             host: initial,
             tracked_workers_rss_sum: 4 * GIB,
+            tracked_workers_swap_sum: 0,
+            tracked_workers_charged_sum: 4 * GIB,
             tracked_workers_count: 2,
             captured_at: Some(t0),
         });
@@ -259,6 +265,8 @@ fn delta_log_under_pressure_fires_on_1gb_jump() {
         watcher.set_snapshot_for_test(OomWatcherSnapshot {
             host: initial,
             tracked_workers_rss_sum: 4 * GIB + (3 * GIB / 2),
+            tracked_workers_swap_sum: 0,
+            tracked_workers_charged_sum: 4 * GIB + (3 * GIB / 2),
             tracked_workers_count: 2,
             captured_at: Some(t0 + Duration::from_millis(100)),
         });
@@ -285,6 +293,8 @@ fn delta_log_below_pressure_does_not_fire() {
         watcher.set_snapshot_for_test(OomWatcherSnapshot {
             host: initial,
             tracked_workers_rss_sum: 2 * GIB,
+            tracked_workers_swap_sum: 0,
+            tracked_workers_charged_sum: 2 * GIB,
             tracked_workers_count: 2,
             captured_at: Some(t0),
         });
@@ -293,6 +303,8 @@ fn delta_log_below_pressure_does_not_fire() {
         watcher.set_snapshot_for_test(OomWatcherSnapshot {
             host: initial,
             tracked_workers_rss_sum: 4 * GIB,
+            tracked_workers_swap_sum: 0,
+            tracked_workers_charged_sum: 4 * GIB,
             tracked_workers_count: 2,
             captured_at: Some(t0 + Duration::from_millis(100)),
         });
@@ -315,6 +327,8 @@ fn kill_event_emits_trigger_kill_log() {
         watcher.set_snapshot_for_test(OomWatcherSnapshot {
             host: reading,
             tracked_workers_rss_sum: 6 * GIB,
+            tracked_workers_swap_sum: 0,
+            tracked_workers_charged_sum: 6 * GIB,
             tracked_workers_count: 2,
             captured_at: Some(Instant::now()),
         });
@@ -329,7 +343,66 @@ fn kill_event_emits_trigger_kill_log() {
     let line = kill_lines[0];
     assert!(line.contains("\"host_ram_used_bytes\":"), "{line}");
     assert!(line.contains("\"tracked_workers_rss_sum\":"), "{line}");
+    assert!(line.contains("\"tracked_workers_swap_sum\":"), "{line}");
+    assert!(line.contains("\"tracked_workers_charged_sum\":"), "{line}");
     assert!(line.contains("\"tracked_workers_count\":2"), "{line}");
+}
+
+/// Swap-blindness pin at the watcher level: tracked-worker RSS
+/// SHRINKS while swap GROWS (pages migrating out as the worker
+/// dies) — the charged sum grows, so the delta-under-pressure
+/// trigger MUST fire and the log line must carry the swap share.
+/// Pre-fix (RSS-keyed delta) this read as relief and stayed silent.
+#[test]
+fn swap_growth_with_shrinking_rss_fires_delta_and_logs_swap() {
+    let initial = reading_with_pressure(13 * GIB, 16 * GIB); // 81.25%
+    let (probe, _cell) = MockProbe::new(initial);
+    let cap = capture(Box::new(probe), OomWatcherConfig::default(), |watcher| {
+        let t0 = Instant::now();
+        // Healthy: 4 GiB resident, no swap.
+        watcher.set_snapshot_for_test(OomWatcherSnapshot {
+            host: initial,
+            tracked_workers_rss_sum: 4 * GIB,
+            tracked_workers_swap_sum: 0,
+            tracked_workers_charged_sum: 4 * GIB,
+            tracked_workers_count: 2,
+            captured_at: Some(t0),
+        });
+        let first = watcher.evaluate_and_emit_for_test(t0);
+        assert_eq!(first, Some(LogTrigger::Heartbeat));
+        // Dying: RSS collapsed to 1 GiB, 5 GiB migrated to swap.
+        // Charged: 4 GiB → 6 GiB (Δ = 2 GiB ≥ 1 GiB).
+        watcher.set_snapshot_for_test(OomWatcherSnapshot {
+            host: initial,
+            tracked_workers_rss_sum: GIB,
+            tracked_workers_swap_sum: 5 * GIB,
+            tracked_workers_charged_sum: 6 * GIB,
+            tracked_workers_count: 2,
+            captured_at: Some(t0 + Duration::from_millis(100)),
+        });
+        let fired = watcher.evaluate_and_emit_for_test(t0 + Duration::from_millis(100));
+        assert_eq!(
+            fired,
+            Some(LogTrigger::DeltaUnderPressure),
+            "swap growth past the RSS shrink is PRESSURE and must trip the delta trigger"
+        );
+    });
+    let delta_lines: Vec<String> = cap
+        .lines()
+        .iter()
+        .filter(|l| l.contains("\"trigger\":\"delta_1gb_under_pressure\""))
+        .cloned()
+        .collect();
+    assert_eq!(delta_lines.len(), 1, "exactly one delta line expected");
+    let line = &delta_lines[0];
+    assert!(
+        line.contains(&format!("\"tracked_workers_swap_sum\":{}", 5 * GIB)),
+        "{line}"
+    );
+    assert!(
+        line.contains(&format!("\"tracked_workers_charged_sum\":{}", 6 * GIB)),
+        "{line}"
+    );
 }
 
 #[test]
@@ -351,6 +424,8 @@ fn log_disabled_emits_nothing() {
         watcher.set_snapshot_for_test(OomWatcherSnapshot {
             host: reading,
             tracked_workers_rss_sum: 6 * GIB,
+            tracked_workers_swap_sum: 0,
+            tracked_workers_charged_sum: 6 * GIB,
             tracked_workers_count: 2,
             captured_at: Some(Instant::now()),
         });
