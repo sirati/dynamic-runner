@@ -442,7 +442,7 @@ async fn router_first_bind_sweeps_prior_stash_and_keeps_fresh() {
 /// Returns the live slot generation at the post-assign point so the caller
 /// can stamp a same-generation terminal. This is the EXACT state the
 /// production INFO "pending first-bind assigned post-Ready" marks.
-async fn drive_to_post_ready_assigned<P: PeerTransport<test_helpers::TestId>>(
+pub(super) async fn drive_to_post_ready_assigned<P: PeerTransport<test_helpers::TestId>>(
     secondary: &mut super::super::test_helpers::SecondaryHarness<P>,
     oom: &OomWatcher,
     binary: &dynrunner_core::TaskInfo<test_helpers::TestId>,

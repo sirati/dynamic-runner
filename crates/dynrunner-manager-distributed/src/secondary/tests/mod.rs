@@ -101,6 +101,7 @@ mod anti_entropy_heal;
 mod custom_messages;
 mod dead_worker_spin;
 mod deferrer_membership_death;
+mod duplicate_assignment;
 mod failover_beacon_union;
 mod failover_lone_survivor;
 mod failover_membership;
