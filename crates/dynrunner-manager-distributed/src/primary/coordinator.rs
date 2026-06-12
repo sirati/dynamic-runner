@@ -1660,6 +1660,71 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         result
     }
 
+    /// Directed fan of one primary-originated frame to every
+    /// OBSERVER-role member of the replicated roster
+    /// (`RoleTable.observers` — alive-filtered by `reproject_roles`,
+    /// covering BOTH observer kinds: the relocated submitter-observer
+    /// and a late-joined observer, each recorded via `PeerJoined {
+    /// is_observer: true }`), excluding this host.
+    ///
+    /// WHY a directed fan exists at all: `Destination::All` resolves to
+    /// the transport's broadcast — a fire-once fan over the DIRECT
+    /// connection table, with no relay (the same delivery gap
+    /// `send_transfer_complete` documents for the setup trio). An
+    /// observer reachable only through a forwarder (a late-joined
+    /// observer behind a gateway leg, or any observer whose direct leg
+    /// to this host died) silently misses EVERY broadcast-class frame
+    /// while its data plane stays healthy over anti-entropy with its own
+    /// direct peers — the production face: an observer ingesting live
+    /// CRDT mutations while declaring the named primary silent for 600s.
+    /// The PRIMARY-class frames the observer's liveness judgment keys on
+    /// — the keepalive ([`Self::broadcast_primary_keepalive`]) and the
+    /// `PrimaryChanged` re-point — must therefore ALSO ride the directed
+    /// `Destination::Observer(id)` edge, which the transport router
+    /// relays toward a not-directly-connected target.
+    ///
+    /// A directly-connected observer receives a duplicate; both frame
+    /// classes are idempotent at the receiver (a liveness-clock refresh
+    /// / an epoch-LWW apply) and the observer count is tiny, so the
+    /// duplication is deliberate and cheap. Delivery failures are
+    /// debug-level for the same reason keepalive broadcast failures are:
+    /// a member mid-disconnect produces one per tick on an
+    /// already-handled transition.
+    pub(super) async fn send_to_each_observer(
+        &mut self,
+        msg: dynrunner_protocol_primary_secondary::DistributedMessage<I>,
+    ) {
+        // Name-sorted owned snapshot: deterministic fan order, and the
+        // `&self.cluster_state` borrow drops before the `&mut self`
+        // sends (the `send_transfer_complete` collect idiom).
+        let mut observers: Vec<String> = self
+            .cluster_state
+            .role_table()
+            .observers
+            .iter()
+            .filter(|id| *id != &self.config.node_id)
+            .cloned()
+            .collect();
+        observers.sort();
+        for id in observers {
+            if let Err(error) = self
+                .send_to(
+                    dynrunner_protocol_primary_secondary::Destination::Observer(
+                        dynrunner_protocol_primary_secondary::PeerId::from(id.as_str()),
+                    ),
+                    msg.clone(),
+                )
+                .await
+            {
+                tracing::debug!(
+                    observer = %id,
+                    error = %error,
+                    "directed observer fan delivery failed"
+                );
+            }
+        }
+    }
+
     /// Register a [`crate::peer_lifecycle::LifecycleListener`] to be
     /// invoked off the apply path for every `PeerJoined`/`PeerRemoved`
     /// state transition. Must be called BEFORE `run()` enters; calls

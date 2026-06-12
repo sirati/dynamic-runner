@@ -1266,10 +1266,14 @@ where
                         // SHORTER than the threshold and must produce
                         // nothing (the next top-of-loop observe clears the
                         // loss state). Only a STILL-down connection at the
-                        // mark is "continuously down for 5 minutes".
+                        // mark is "continuously down for 5 minutes"; a
+                        // still-DEGRADED state at the mark drives the
+                        // degraded wake cadence (the reporter dispatches on
+                        // its own episode state — the two are mutually
+                        // exclusive).
                         if matches!(
                             self.current_visibility(primary_last_seen),
-                            Visibility::Lost { .. }
+                            Visibility::Lost { .. } | Visibility::Degraded { .. }
                         ) {
                             visibility_reporter.on_wake_deadline(tokio::time::Instant::now());
                         }
@@ -1444,6 +1448,30 @@ where
         if let Some(primary) = self.cluster_state.current_primary()
             && primary_last_seen.elapsed() > self.config.peer_timeout
         {
+            // DATA-PLANE evidence veto (the late-joined-observer keepalive
+            // blackout, owner logs 2026-06-11): authenticated frames ARE
+            // arriving and applying from the roster's legs — the same
+            // ingest that feeds the periodic stats — while the
+            // PRIMARY-KEEPALIVE class is not. "Connection down with no
+            // successful reconnect+sync" would be FALSE (sync is
+            // succeeding), so the verdict is the DEGRADED addressing-gap
+            // state: honest narration, no loss episode, no wake-LOSS /
+            // cluster-gone escalation; the freshness-filtered primary-leg
+            // redial cadence stays alive (see [`Visibility::Degraded`]).
+            // The freshness window is the SAME `peer_timeout` the silence
+            // judgment uses — one threshold, two sides of one verdict.
+            if let Some(arrival) = self.freshest_data_plane_arrival()
+                && arrival.elapsed() < self.config.peer_timeout
+            {
+                return Visibility::Degraded {
+                    reason: format!(
+                        "named primary {primary} keepalive-silent toward this observer \
+                         for {:.0}s while the data plane is live (last frame {:.1}s ago)",
+                        primary_last_seen.elapsed().as_secs_f64(),
+                        arrival.elapsed().as_secs_f64()
+                    ),
+                };
+            }
             return Visibility::Lost {
                 reason: format!(
                     "named primary {primary} silent for {:.0}s (no keepalive / re-point \
@@ -1454,6 +1482,20 @@ where
             };
         }
         Visibility::Visible
+    }
+
+    /// Freshest data-plane delivery instant across the observer's known
+    /// roster legs ([`Self::known_peer_roster`]) — the max of each leg's
+    /// delivery clock ([`Self::leg_last_delivery`]). `None` when no
+    /// roster leg has ever delivered. The positive evidence the
+    /// [`Visibility::Degraded`] classification keys on: frames arriving
+    /// from ANY member prove the observer's connection to the run is
+    /// alive, whatever the primary-keepalive class is doing.
+    fn freshest_data_plane_arrival(&self) -> Option<std::time::Instant> {
+        self.known_peer_roster()
+            .iter()
+            .filter_map(|id| self.leg_last_delivery(id))
+            .max()
     }
 
     /// Consult the hosted job ledger for the cluster-empty terminal
@@ -1571,14 +1613,7 @@ where
             );
             return;
         }
-        let mut roster: HashSet<String> = self
-            .cluster_state
-            .alive_secondary_members()
-            .map(str::to_owned)
-            .collect();
-        if let Some(p) = self.cluster_state.current_primary() {
-            roster.insert(p.to_owned());
-        }
+        let mut roster: HashSet<String> = self.known_peer_roster();
         // PER-LEG honesty: the reconnector's contract is "the ids I have
         // LOST". Run-level visibility can be lost for reasons unrelated to
         // a given leg (a silent named primary, dead sibling peers), so the
@@ -1627,22 +1662,48 @@ where
         });
     }
 
+    /// The observer's known-peer roster — `current_primary ∪ alive
+    /// worker-secondary members` — the ONE set the reconnect trigger,
+    /// the AE-3 recovery tick, and the data-plane freshness read all key
+    /// on (one roster definition, three consumers).
+    fn known_peer_roster(&self) -> HashSet<String> {
+        let mut roster: HashSet<String> = self
+            .cluster_state
+            .alive_secondary_members()
+            .map(str::to_owned)
+            .collect();
+        if let Some(p) = self.cluster_state.current_primary() {
+            roster.insert(p.to_owned());
+        }
+        roster
+    }
+
+    /// When did `peer_id`'s leg last DELIVER a frame — the freshest of
+    /// the inbox's per-peer ingest clocks (slot delivery + the transport
+    /// arrival edge). `None` if the leg never delivered. The ONE
+    /// per-leg delivery clock both the reconnect-roster freshness filter
+    /// and the data-plane evidence read consume.
+    fn leg_last_delivery(&self, peer_id: &str) -> Option<std::time::Instant> {
+        [
+            self.inbox.last_ingest_from(peer_id),
+            self.inbox.last_transport_arrival_from(peer_id),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+    }
+
     /// Whether `peer_id`'s leg has DELIVERED a frame recently — the
-    /// per-leg liveness the reconnect roster keys on. Reads the inbox's
-    /// per-peer ingest clocks (slot delivery + the transport arrival
-    /// edge, whichever is fresher) against the same
+    /// per-leg liveness the reconnect roster keys on. Reads the leg's
+    /// delivery clock ([`Self::leg_last_delivery`]) against the same
     /// [`ObserverConfig::peer_timeout`] silence threshold the
     /// named-primary visibility check uses: a leg silent past it is
     /// rebuild-eligible (covers the wired-but-blackholed wire, which
     /// `has_peer` would wrongly call healthy); anything fresher is a
     /// working leg the reconnector must not touch.
     fn leg_recently_delivered(&self, peer_id: &str) -> bool {
-        let now = std::time::Instant::now();
-        let fresh = |t: Option<std::time::Instant>| {
-            t.is_some_and(|t| now.duration_since(t) < self.config.peer_timeout)
-        };
-        fresh(self.inbox.last_ingest_from(peer_id))
-            || fresh(self.inbox.last_transport_arrival_from(peer_id))
+        self.leg_last_delivery(peer_id)
+            .is_some_and(|t| t.elapsed() < self.config.peer_timeout)
     }
 
     /// Dispatch one inbound mesh frame. Apply-only: the observer mirrors
@@ -2112,19 +2173,12 @@ where
     /// detection, the C9 quiesce, and the responder rotation live in
     /// [`anti_entropy::plan_recovery_pull`].
     async fn on_recovery_tick(&mut self) {
-        // Known-peer roster = current_primary ∪ alive secondaries. Intersect
+        // Known-peer roster ([`Self::known_peer_roster`]). Intersect
         // it with the peers that have actually broadcast a digest, so the
         // recovery arm only ever targets a peer we both KNOW and have a
         // last-seen digest for. A digest from a peer no longer in the roster
         // (departed) is excluded — we never resurrect a route to a dead peer.
-        let mut roster: HashSet<String> = self
-            .cluster_state
-            .alive_secondary_members()
-            .map(str::to_owned)
-            .collect();
-        if let Some(p) = self.cluster_state.current_primary() {
-            roster.insert(p.to_owned());
-        }
+        let roster: HashSet<String> = self.known_peer_roster();
         let peer_digests: Vec<(String, StateDigest)> = self
             .peer_digests
             .iter()

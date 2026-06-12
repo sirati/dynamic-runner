@@ -2811,3 +2811,280 @@ async fn collective_silence_escalates_and_declares_after_bounded_window() {
         })
         .await;
 }
+
+// ======================================================================
+// Observer-directed keepalive + re-point fan (the late-joined-observer
+// keepalive blackout, owner logs 2026-06-11): a relay-only observer
+// member receives NO `Destination::All` frame — the transport's
+// broadcast is a fire-once fan over its DIRECT connections only — so
+// the PRIMARY-class frames the observer's liveness judgment keys on
+// (the keepalive and the `PrimaryChanged` re-point) must ALSO ride the
+// DIRECTED `Destination::Observer(id)` edge, which the transport router
+// relays through a connected sibling toward a not-directly-connected
+// target.
+// ======================================================================
+
+/// Recorded DIRECTED egress: `(peer_id, frame)` pairs.
+type DirectedLog = Arc<std::sync::Mutex<Vec<(String, DistributedMessage<TestId>)>>>;
+/// Recorded broadcast egress frames.
+type BroadcastLog = Arc<std::sync::Mutex<Vec<DistributedMessage<TestId>>>>;
+
+/// Transport replaying the production relay-only-observer topology:
+/// `broadcast` fans over the DIRECT connection table (here: none — the
+/// observer has no direct leg to this host), while a DIRECTED
+/// `send_to_peer` is relayable toward any peer (the Router-forwarder
+/// path). Both egress classes are recorded so a test can assert exactly
+/// which class reached whom.
+struct RelayOnlyRecordingTransport {
+    directed: DirectedLog,
+    broadcasts: BroadcastLog,
+}
+
+impl PeerTransport<TestId> for RelayOnlyRecordingTransport {
+    async fn broadcast(&mut self, msg: DistributedMessage<TestId>) -> Result<(), String> {
+        self.broadcasts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(msg);
+        Ok(())
+    }
+
+    async fn send_to_peer(
+        &mut self,
+        peer_id: &str,
+        msg: DistributedMessage<TestId>,
+    ) -> Result<(), String> {
+        self.directed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((peer_id.to_string(), msg));
+        Ok(())
+    }
+
+    async fn recv_peer(&mut self) -> Option<DistributedMessage<TestId>> {
+        std::future::pending().await
+    }
+
+    fn try_recv_peer(&mut self) -> Option<DistributedMessage<TestId>> {
+        None
+    }
+
+    fn peer_count(&self) -> usize {
+        0
+    }
+
+    fn has_peer(&self, _id: &PeerId) -> bool {
+        false
+    }
+
+    async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
+}
+
+/// Count the recorded DIRECTED frames to `peer_id` matching `pred`.
+fn directed_count(
+    directed: &DirectedLog,
+    peer_id: &str,
+    pred: impl Fn(&DistributedMessage<TestId>) -> bool,
+) -> usize {
+    directed
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(id, msg)| id == peer_id && pred(msg))
+        .count()
+}
+
+/// True iff `msg` is a Primary-role keepalive.
+fn is_primary_keepalive(msg: &DistributedMessage<TestId>) -> bool {
+    matches!(
+        msg,
+        DistributedMessage::Keepalive {
+            emitter_role: dynrunner_protocol_primary_secondary::KeepaliveRole::Primary,
+            ..
+        }
+    )
+}
+
+/// True iff `msg` is a `ClusterMutation` frame carrying a
+/// `PrimaryChanged` re-point naming `new`.
+fn is_repoint_to(msg: &DistributedMessage<TestId>, new: &str) -> bool {
+    matches!(
+        msg,
+        DistributedMessage::ClusterMutation { mutations, .. }
+            if mutations.iter().any(
+                |m| matches!(m, ClusterMutation::PrimaryChanged { new: n, .. } if n == new)
+            )
+    )
+}
+
+/// ROOT-CAUSE pin (the production blackout): the primary's keepalive
+/// must reach every OBSERVER-role member of the replicated roster as a
+/// DIRECTED `Destination::Observer(id)` send — the broadcast alone never
+/// reaches a relay-only observer, which then ingests live CRDT gossip
+/// from its own direct peers while declaring the named primary silent.
+///
+/// Covers BOTH observer kinds: the LATE-JOINED observer (seated through
+/// the primary's `handle_request_cluster_snapshot` responder, which
+/// originates its `PeerJoined { is_observer: true }`) and the RELOCATED
+/// submitter-observer (its observer role recorded in the replicated
+/// capability roster by the responders' `PeerJoined { is_observer:
+/// true }` for the demoted id).
+#[tokio::test(flavor = "current_thread")]
+async fn primary_keepalive_fan_reaches_observer_members_directed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let directed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let broadcasts = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let transport = RelayOnlyRecordingTransport {
+                directed: directed.clone(),
+                broadcasts: broadcasts.clone(),
+            };
+            let mut cfg = config(Duration::from_millis(50), 2);
+            cfg.node_id = "the-primary".into();
+            let (mut primary, _mesh) = build_primary_pumped(
+                cfg,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+
+            // Observer kind 1 — LATE-JOINED: seated through the snapshot
+            // responder (the production seat path), which originates
+            // `PeerJoined { is_observer: true }` for the requester.
+            primary
+                .handle_request_cluster_snapshot(DistributedMessage::RequestClusterSnapshot {
+                    target: None,
+                    sender_id: "obs-late".into(),
+                    timestamp: 0.0,
+                    is_observer: true,
+                    can_be_primary: false,
+                })
+                .await;
+            // Observer kind 2 — RELOCATED submitter-observer: its observer
+            // role lands in the replicated capability roster via the same
+            // `PeerJoined { is_observer: true }` mutation the responders
+            // originate for the demoted id.
+            primary
+                .apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PeerJoined {
+                    peer_id: "obs-reloc".into(),
+                    is_observer: true,
+                    can_be_primary: false,
+                    cap_version: Default::default(),
+                    member_gen: 0,
+                }])
+                .await;
+            for obs in ["obs-late", "obs-reloc"] {
+                assert!(
+                    primary
+                        .cluster_state
+                        .role_table()
+                        .observers
+                        .contains(obs),
+                    "precondition: {obs} is an observer-role member"
+                );
+            }
+
+            primary.broadcast_primary_keepalive().await;
+            crate::primary::tests::settle_pump().await;
+
+            for obs in ["obs-late", "obs-reloc"] {
+                assert_eq!(
+                    directed_count(&directed, obs, is_primary_keepalive),
+                    1,
+                    "the keepalive fan must DIRECT one Primary-role keepalive \
+                     at observer member {obs} (the broadcast never reaches a \
+                     relay-only observer)"
+                );
+            }
+            assert_eq!(
+                broadcasts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .iter()
+                    .filter(|m| is_primary_keepalive(m))
+                    .count(),
+                1,
+                "the mesh broadcast (the direct-leg fan) still fires exactly once"
+            );
+        })
+        .await;
+}
+
+/// RE-POINT pin: the `PrimaryChanged` announcement — the only other
+/// frame class the observer's `primary_last_seen` clock accepts — must
+/// also reach observer members DIRECTED, from BOTH origination sites:
+/// `activate_local_primary` (bootstrap + every promotion converge here)
+/// and `relocate_primary_to` (the submitter handoff). The re-assert at
+/// an already-held epoch NoOps off the broadcast wire entirely, so
+/// without the directed fan a relay-only observer can NEVER learn the
+/// holder from the authority itself.
+#[tokio::test(flavor = "current_thread")]
+async fn primary_repoint_fan_reaches_observer_members_directed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let directed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let broadcasts = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let transport = RelayOnlyRecordingTransport {
+                directed: directed.clone(),
+                broadcasts: broadcasts.clone(),
+            };
+            let mut cfg = config(Duration::from_millis(50), 2);
+            cfg.node_id = "the-primary".into();
+            let (mut primary, _mesh) = build_primary_pumped(
+                cfg,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+            primary
+                .apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PeerJoined {
+                    peer_id: "obs-1".into(),
+                    is_observer: true,
+                    can_be_primary: false,
+                    cap_version: Default::default(),
+                    member_gen: 0,
+                }])
+                .await;
+
+            // Bootstrap/promotion convergence point: the uniform announce.
+            primary
+                .activate_local_primary()
+                .await
+                .expect("activate_local_primary");
+            crate::primary::tests::settle_pump().await;
+            assert_eq!(
+                directed_count(&directed, "obs-1", |m| is_repoint_to(m, "the-primary")),
+                1,
+                "activate_local_primary must DIRECT its PrimaryChanged \
+                 re-point at the observer member"
+            );
+
+            // The re-assert path (current_primary already == self) NoOps
+            // off the broadcast wire — the directed fan must still carry
+            // the authoritative identity to the observer.
+            primary
+                .activate_local_primary()
+                .await
+                .expect("re-assert activate_local_primary");
+            crate::primary::tests::settle_pump().await;
+            assert_eq!(
+                directed_count(&directed, "obs-1", |m| is_repoint_to(m, "the-primary")),
+                2,
+                "the already-self re-assert (a broadcast NoOp) must still \
+                 DIRECT the re-point at the observer member"
+            );
+
+            // The submitter-relocation handoff re-point.
+            primary.relocate_primary_to("sec-9".into()).await;
+            crate::primary::tests::settle_pump().await;
+            assert_eq!(
+                directed_count(&directed, "obs-1", |m| is_repoint_to(m, "sec-9")),
+                1,
+                "relocate_primary_to must DIRECT its PrimaryChanged re-point \
+                 at the observer member"
+            );
+        })
+        .await;
+}

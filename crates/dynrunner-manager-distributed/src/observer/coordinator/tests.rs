@@ -2920,3 +2920,136 @@ async fn clean_run_complete_is_not_reclassified_by_the_ledger_consult() {
     .await
     .expect("the observer must exit immediately on the already-converged RunComplete");
 }
+
+/// PRODUCTION REPLAY (the late-joined-observer keepalive blackout, owner
+/// logs 2026-06-11): a seated joiner INGESTING LIVE GOSSIP — frames from
+/// an alive member arriving and applying every few moments, the same
+/// ingest that fed the production observer's fresh 10-minute stats —
+/// while NOT ONE primary keepalive / re-point reaches it must NOT
+/// classify its visibility as connection-LOST. The data plane is
+/// demonstrably live, so "connection down with no successful
+/// reconnect+sync" is false; the honest verdict is the DEGRADED
+/// keepalive-addressing state (different narration, no loss episode, no
+/// wake-loss / cluster-gone escalation).
+#[tokio::test(flavor = "current_thread")]
+async fn gossip_fed_observer_without_primary_keepalives_is_not_connection_lost() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // One wired, delivering peer ("peer-0", an alive
+                // worker-secondary member) + a named primary ("sec-0")
+                // whose keepalive class NEVER arrives — the exact
+                // production shape.
+                let (transport, inbound, _peers) = transport_with_peers("obs", 1);
+                let mut cs = ClusterState::<TestId>::new();
+                cs.apply(ClusterMutation::PrimaryChanged {
+                    new: "sec-0".into(),
+                    epoch: 1,
+                    reason: PrimaryChangeReason::Transferred,
+                });
+                cs.apply(ClusterMutation::PeerJoined {
+                    peer_id: "peer-0".into(),
+                    is_observer: false,
+                    can_be_primary: false,
+                    cap_version: Default::default(),
+                    member_gen: 0,
+                });
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "peer-0".into(),
+                    worker_count: 1,
+                    resources: vec![],
+                });
+
+                let mut config = observer_config("obs");
+                // Small silence threshold so the named primary's
+                // keepalive-silence crosses it well inside the test
+                // window; the same threshold is the data-plane freshness
+                // window, which the 40ms gossip stays far under.
+                config.peer_timeout = Duration::from_millis(150);
+
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+                let observer = ObserverCoordinator::new(client, inbox, cs, config);
+
+                // The joiner's primary-keepalive clock: stamped at seat
+                // time and never refreshed (no keepalive / re-point ever
+                // arrives — the production addressing gap).
+                let seat = std::time::Instant::now();
+
+                // Live gossip keeps arriving + applying for ~320ms (the
+                // ingest clocks record each frame at the slot's delivery
+                // choke point).
+                for i in 0..8u32 {
+                    let _ = inbound.send(DistributedMessage::Keepalive {
+                        target: None,
+                        sender_id: "peer-0".into(),
+                        timestamp: f64::from(i),
+                        secondary_id: "peer-0".into(),
+                        active_workers: 1,
+                        emitter_role: KeepaliveRole::Secondary,
+                    });
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+
+                // The named primary is now keepalive-silent far past
+                // `peer_timeout` while the newest frame is ≤40ms old.
+                let verdict = observer.current_visibility(seat);
+                assert!(
+                    !matches!(
+                        verdict,
+                        crate::observer::lost_visibility::Visibility::Lost { .. }
+                    ),
+                    "a gossip-fed observer must NOT classify missing primary \
+                     keepalives as a connection LOSS — its data plane is \
+                     demonstrably live (the production observer printed fresh \
+                     cluster stats the same minute it WARNed 'connection \
+                     down'); got {verdict:?}"
+                );
+                match &verdict {
+                    crate::observer::lost_visibility::Visibility::Degraded { reason } => {
+                        assert!(
+                            reason.contains("sec-0") && reason.contains("data plane is live"),
+                            "the degraded reason names the silent primary AND the \
+                             live data plane: {reason}"
+                        );
+                    }
+                    other => panic!(
+                        "the honest verdict for the addressing gap is Degraded, got {other:?}"
+                    ),
+                }
+
+                // CONTROL (the genuine-loss face, unchanged): with NO
+                // frames arriving past the same window, the very same
+                // shape IS a connection loss — the named-primary-silence
+                // branch must keep firing for a truly dead view.
+                let (transport2, _inbound2, _peers2) = transport_with_peers("obs2", 1);
+                let mut cs2 = ClusterState::<TestId>::new();
+                cs2.apply(ClusterMutation::PrimaryChanged {
+                    new: "sec-0".into(),
+                    epoch: 1,
+                    reason: PrimaryChangeReason::Transferred,
+                });
+                let mut config2 = observer_config("obs2");
+                config2.peer_timeout = Duration::from_millis(50);
+                let (client2, inbox2, pump2) = observer_mesh(transport2, "obs2");
+                tokio::task::spawn_local(pump2);
+                let observer2 = ObserverCoordinator::new(client2, inbox2, cs2, config2);
+                let seat2 = std::time::Instant::now();
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                let verdict2 = observer2.current_visibility(seat2);
+                assert!(
+                    matches!(
+                        verdict2,
+                        crate::observer::lost_visibility::Visibility::Lost { .. }
+                    ),
+                    "with keepalives absent AND no frames at all, the existing \
+                     connection-down classification must be unchanged; got \
+                     {verdict2:?}"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("test must terminate");
+}
