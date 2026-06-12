@@ -19,6 +19,7 @@
 
 mod already_held;
 mod assembly_beacon;
+mod backpressure_requeue;
 mod basic;
 mod bringup_composition_fatal;
 mod bringup_fatal;
@@ -73,10 +74,11 @@ mod worker_lifecycle;
 #[allow(unused_imports)]
 pub(super) use super::test_helpers::{
     FakeWorkerFactory, FixedEstimator, PrimaryMeshKeepalive, ProducerStagingFlags,
-    PromoteHooksFactory, ScriptedWorkerFactory, SlowFakeWorkerFactory, TestId, WorkerScript,
-    build_test_primary, build_test_promote_recipe, build_test_promote_recipe_from_producer,
-    build_test_promote_recipe_with_config, build_test_promote_recipe_with_config_and_hooks,
-    fake_amnesiac_secondary, fake_secondary, fake_secondary_transport_only_no_meshready,
+    PromoteHooksFactory, ScriptedWorkerFactory, SlowFakeWorkerFactory, SurvivorObservations,
+    TestId, WorkerScript, build_test_primary, build_test_promote_recipe,
+    build_test_promote_recipe_from_producer, build_test_promote_recipe_with_config,
+    build_test_promote_recipe_with_config_and_hooks, fake_amnesiac_secondary,
+    fake_operational_survivor, fake_secondary, fake_secondary_transport_only_no_meshready,
     fake_secondary_with_addrs, make_binary, make_relative_binary, seed_operational_ledger,
     setup_test,
 };

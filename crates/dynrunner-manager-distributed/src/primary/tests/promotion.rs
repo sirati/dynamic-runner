@@ -132,15 +132,39 @@ fn mem(bytes: u64) -> Vec<dynrunner_core::ResourceAmount> {
 }
 
 /// A promotion that inherits N `Pending` tasks must dispatch ALL of them —
-/// the F1 regression guard. Pre-F1, `run_pipeline` rebuilt the pool from the
-/// (empty) `binaries` run-arg, clobbering the hydrate-built pool to empty and
-/// zeroing `total_tasks`; the counter exit (`0 + 0 >= 0`) then tripped on the
-/// first operational-loop iteration and broadcast `RunComplete` with ZERO
-/// tasks dispatched (the silent false-complete bug). Post-F1 the unified init
-/// keys on `SeedSource::PromotionSnapshot`: it originates nothing and
-/// `hydrate_from_cluster_state` is the SOLE pool builder, so the N inherited
-/// Pending tasks are all dispatched and completed — `completed == N`,
-/// `stranded == 0`, NO premature `RunComplete`.
+/// the F1 regression guard, driven against REAL operational survivors.
+///
+/// Historical layer 1 (F1 proper): pre-F1, `run_pipeline` rebuilt the pool
+/// from the (empty) `binaries` run-arg, clobbering the hydrate-built pool to
+/// empty and zeroing `total_tasks`; the counter exit (`0 + 0 >= 0`) tripped
+/// on the first operational-loop iteration and broadcast `RunComplete` with
+/// ZERO tasks dispatched (the silent false-complete bug). Post-F1 the
+/// unified init keys on `SeedSource::PromotionSnapshot` and
+/// `hydrate_from_cluster_state` is the SOLE pool builder.
+///
+/// Layer 2 (the masking this test previously had): the survivors were
+/// modelled as BOOTSTRAP-FRESH fakes (`fake_secondary`) — they re-sent
+/// welcome/cert and CONSUMED the bring-up `InitialAssignment` batch like a
+/// setup-phase member. A real failover survivor is OPERATIONAL: it never
+/// re-handshakes, and its frame router has no `InitialAssignment` arm — the
+/// frame is debug-dropped. So a promoted primary that commits inherited-pool
+/// tasks onto the bring-up batch wedges them (committed + replicated
+/// `InFlight`, never executing) until the ~600s reconciliation-probe denial
+/// recovers them. This test drives [`fake_operational_survivor`]s instead:
+///
+///   * sec-0: live survivor whose `MeshReady` re-announce landed → it is
+///     mesh-confirmed and must receive ALL the work, PROMPTLY, as
+///     `TaskAssignment` through the operational dispatch path.
+///   * sec-1: live survivor whose re-announce was LOST → unconfirmed; the
+///     mesh-confirmation gate must withhold every proactive push from it
+///     (zero `TaskAssignment`s) — pinning that the inherited-pool dispatch
+///     rides the gated operational path, not an ungated batch.
+///
+/// Asserted: `completed == N` within the prompt-dispatch timeout (pre-fix
+/// the batch-committed tasks wedge ~600s and the timeout trips), zero
+/// `InitialAssignment` payload entries at either survivor (the bring-up
+/// batch carries work only for setup-phase members), zero assignments at
+/// the unconfirmed survivor, `stranded == 0`, no premature `RunComplete`.
 #[tokio::test(flavor = "current_thread")]
 async fn mid_run_failover_dispatches_all_inherited_pending() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -149,9 +173,9 @@ async fn mid_run_failover_dispatches_all_inherited_pending() {
         .run_until(async {
             const N: usize = 5;
 
-            // --- Live primary: seed N Pending tasks + one SecondaryCapacity
-            // for sec-0, then snapshot its converged ledger (the payload a
-            // promotion carries). ---
+            // --- Live primary: seed N Pending tasks + the survivors'
+            // membership (PeerJoined) and capacity (SecondaryCapacity) —
+            // the converged ledger a real failover promotion inherits. ---
             let snapshot = {
                 let (transport, _ends) = setup_test(1);
                 let (mut live, _mesh) = build_test_primary(
@@ -164,11 +188,20 @@ async fn mid_run_failover_dispatches_all_inherited_pending() {
                 cs.apply(ClusterMutation::PhaseDepsSet {
                     deps: HashMap::new(),
                 });
-                cs.apply(ClusterMutation::SecondaryCapacity {
-                    secondary: "sec-0".into(),
-                    worker_count: 2,
-                    resources: mem(8 * 1024 * 1024 * 1024),
-                });
+                for sid in ["sec-0", "sec-1"] {
+                    cs.apply(ClusterMutation::PeerJoined {
+                        peer_id: sid.into(),
+                        is_observer: false,
+                        can_be_primary: true,
+                        cap_version: Default::default(),
+                        member_gen: 0,
+                    });
+                    cs.apply(ClusterMutation::SecondaryCapacity {
+                        secondary: sid.into(),
+                        worker_count: 2,
+                        resources: mem(8 * 1024 * 1024 * 1024),
+                    });
+                }
                 for i in 0..N {
                     let task = make_binary(&format!("t-{i}"), 100);
                     cs.apply(ClusterMutation::TaskAdded {
@@ -182,11 +215,13 @@ async fn mid_run_failover_dispatches_all_inherited_pending() {
 
             // --- Promoted primary: restore + hydrate + reconstruct via the
             // production promotion construction primitive. ---
-            let (transport, secondary_ends) = setup_test(1);
+            let (transport, mut secondary_ends) = setup_test(2);
             let config = PrimaryConfig {
-                num_secondaries: 1,
+                num_secondaries: 2,
                 connect_timeout: Duration::from_secs(5),
-                peer_timeout: Duration::from_secs(5),
+                // Short straggler window for the unconfirmed survivor:
+                // `wait_for_mesh_ready` proceeds without sec-1's report.
+                mesh_ready_timeout: Duration::from_secs(2),
                 ..test_primary_config()
             };
             let (mut promoted, _mesh) = build_test_primary(
@@ -210,18 +245,47 @@ async fn mid_run_failover_dispatches_all_inherited_pending() {
                 "total_tasks hydrated from the inherited ledger"
             );
 
-            // --- Drive the promoted primary's run on the inherited ledger
-            // against a fake secondary that answers TaskRequests + completes
-            // every dispatched task. ---
-            for (id, rx, tx) in secondary_ends {
-                tokio::task::spawn_local(fake_secondary(id, 2, 1024 * 1024 * 1024, rx, tx));
-            }
+            // --- REAL operational survivors: no welcome/cert re-handshake,
+            // InitialAssignment debug-dropped (tallied), TaskAssignment
+            // completed. sec-0 confirmed (MeshReady re-announce landed),
+            // sec-1 unconfirmed (re-announce lost). ---
+            let confirmed_obs = std::sync::Arc::new(SurvivorObservations::default());
+            let unconfirmed_obs = std::sync::Arc::new(SurvivorObservations::default());
+            let (sec1_id, sec1_rx, sec1_tx) = secondary_ends.remove(1);
+            let (sec0_id, sec0_rx, sec0_tx) = secondary_ends.remove(0);
+            tokio::task::spawn_local(fake_operational_survivor(
+                sec0_id,
+                1024 * 1024 * 1024,
+                true,
+                confirmed_obs.clone(),
+                sec0_rx,
+                sec0_tx,
+            ));
+            tokio::task::spawn_local(fake_operational_survivor(
+                sec1_id,
+                1024 * 1024 * 1024,
+                false,
+                unconfirmed_obs.clone(),
+                sec1_rx,
+                sec1_tx,
+            ));
 
             let (_deps, ops, ope) = noop_phase_args();
-            let outcome = promoted
-                .run_consuming(SeedSource::PromotionSnapshot, ops, ope)
-                .await
-                .expect("promoted run must not error");
+            // PROMPT-dispatch bound: pre-fix, the inherited tasks the batch
+            // committed onto dropped `InitialAssignment` frames sit
+            // replicated-`InFlight` with no holder until the ~600s
+            // reconciliation-probe denial — far beyond this deadline.
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(60),
+                promoted.run_consuming(SeedSource::PromotionSnapshot, ops, ope),
+            )
+            .await
+            .expect(
+                "inherited pool wedged: tasks committed onto the bring-up \
+                 InitialAssignment batch were dropped by the operational \
+                 survivors and never dispatched through the operational path",
+            )
+            .expect("promoted run must not error");
 
             match outcome {
                 PrimaryRunOutcome::Local {
@@ -234,7 +298,7 @@ async fn mid_run_failover_dispatches_all_inherited_pending() {
                     assert_eq!(
                         completed, N,
                         "every inherited Pending task was dispatched + completed \
-                         (pre-F1 false-completed with 0 dispatched)"
+                         through the operational path"
                     );
                     assert_eq!(failed, 0, "no task failed");
                     assert_eq!(
@@ -246,6 +310,42 @@ async fn mid_run_failover_dispatches_all_inherited_pending() {
                     panic!("promoted primary should run to a Local outcome, not relocate")
                 }
             }
+
+            use std::sync::atomic::Ordering;
+            // The bring-up batch may not carry work for OPERATIONAL members:
+            // their router drops the frame, so every payload entry here is a
+            // committed-but-never-executing task.
+            assert_eq!(
+                confirmed_obs
+                    .initial_assignment_payload_entries
+                    .load(Ordering::SeqCst),
+                0,
+                "no inherited-pool task may ride the bring-up InitialAssignment \
+                 batch at an operational member (the frame is dropped unhandled)"
+            );
+            assert_eq!(
+                unconfirmed_obs
+                    .initial_assignment_payload_entries
+                    .load(Ordering::SeqCst),
+                0,
+                "no inherited-pool task may ride the bring-up InitialAssignment \
+                 batch at an operational member (the frame is dropped unhandled)"
+            );
+            // Gate pin: the operational dispatch path consults the
+            // mesh-confirmation gate, so the unconfirmed survivor received
+            // NOTHING while the confirmed one carried the whole pool.
+            assert_eq!(
+                unconfirmed_obs.task_assignments.load(Ordering::SeqCst),
+                0,
+                "the mesh-confirmation gate must withhold proactive dispatch \
+                 from the survivor whose MeshReady re-announce was lost"
+            );
+            assert_eq!(
+                confirmed_obs.task_assignments.load(Ordering::SeqCst),
+                N,
+                "the confirmed survivor carried the whole inherited pool via \
+                 the operational TaskAssignment path"
+            );
         })
         .await;
 }

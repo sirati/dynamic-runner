@@ -870,6 +870,117 @@ pub(super) async fn fake_secondary_with_addrs(
     }
 }
 
+/// Tallies a [`fake_operational_survivor`]'s observations so a test can
+/// assert the promoted primary's dispatch SHAPE, not just its outcome:
+/// how many `InitialAssignment` PAYLOAD entries were dropped on the
+/// operational router (must be 0 — an operational member has no
+/// `InitialAssignment` arm, so a payload riding it is committed-but-
+/// never-executing), and how many `TaskAssignment`s arrived (0 for a
+/// member whose mesh leg never confirmed — the #449 gate).
+#[derive(Default)]
+pub(super) struct SurvivorObservations {
+    /// Total binaries carried by `InitialAssignment` frames this
+    /// survivor DROPPED (the operational router's debug-drop).
+    pub initial_assignment_payload_entries: std::sync::atomic::AtomicUsize,
+    /// Total `TaskAssignment` frames received (the operational path).
+    pub task_assignments: std::sync::atomic::AtomicUsize,
+}
+
+/// A REAL post-failover operational survivor, wire-faithful where
+/// [`fake_secondary`] is bootstrap-fresh:
+///
+///   * It NEVER sends `SecondaryWelcome` / `CertExchange` — an
+///     operational member's enrolment is the inherited CRDT
+///     (`PeerJoined` + `SecondaryCapacity`); only setup-parked members
+///     re-offer the handshake.
+///   * `mesh_ready` selects whether its `MeshReady` re-announce (the
+///     `react_to_primary_identity_change` reaction every survivor fires
+///     when the election installs the new primary) reaches the promoted
+///     primary. `false` models the lost re-announce: the member is
+///     live but unconfirmed, so the #449 mesh-confirmation gate must
+///     withhold every proactive push from it.
+///   * `InitialAssignment` is DROPPED, exactly like the production
+///     operational router (`dispatch_message` has no arm for it — the
+///     frame falls to the unhandled debug-drop). Any payload entries it
+///     carried are tallied into `obs` so the test can assert the
+///     promoted primary committed nothing onto the dropped frame.
+///   * `TaskAssignment` (the operational dispatch path) is completed
+///     normally, with the standard `TaskRequest` follow-up pull.
+pub(super) async fn fake_operational_survivor(
+    secondary_id: String,
+    ram_bytes: u64,
+    mesh_ready: bool,
+    obs: Arc<SurvivorObservations>,
+    mut incoming_from_primary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    outgoing_to_primary: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+) {
+    use std::sync::atomic::Ordering;
+
+    if mesh_ready {
+        // The survivor's MeshReady RE-ANNOUNCE: fired by
+        // `react_to_primary_identity_change` the moment the election's
+        // `PrimaryChanged` applied — i.e. before the promoted primary's
+        // own run pipeline starts consuming its inbox. Sending at spawn
+        // replays that ordering.
+        outgoing_to_primary
+            .send(DistributedMessage::MeshReady {
+                target: Some(Destination::Primary),
+                sender_id: secondary_id.clone(),
+                timestamp: 0.0,
+                secondary_id: secondary_id.clone(),
+                peer_count: 1,
+            })
+            .unwrap();
+    }
+
+    while let Some(msg) = incoming_from_primary.recv().await {
+        match msg {
+            DistributedMessage::InitialAssignment { zip_files, .. } => {
+                // The operational router has NO InitialAssignment arm:
+                // the frame is dropped unhandled. Tally what was lost.
+                let entries: usize = zip_files.iter().map(|zf| zf.binaries.len()).sum();
+                obs.initial_assignment_payload_entries
+                    .fetch_add(entries, Ordering::SeqCst);
+            }
+            DistributedMessage::TaskAssignment {
+                file_hash,
+                worker_id,
+                ..
+            } => {
+                obs.task_assignments.fetch_add(1, Ordering::SeqCst);
+                outgoing_to_primary
+                    .send(DistributedMessage::TaskComplete {
+                        target: Some(Destination::Primary),
+                        sender_id: secondary_id.clone(),
+                        timestamp: 0.0,
+                        secondary_id: secondary_id.clone(),
+                        worker_id,
+                        task_hash: file_hash,
+                        result_data: None,
+                        delivery_seq: None,
+                        // Stamped at the send_to_primary chokepoint (ordering gate).
+                        msgs_posted_through: None,
+                    })
+                    .unwrap();
+                outgoing_to_primary
+                    .send(DistributedMessage::TaskRequest {
+                        target: Some(Destination::Primary),
+                        sender_id: secondary_id.clone(),
+                        timestamp: 0.0,
+                        secondary_id: secondary_id.clone(),
+                        worker_id,
+                        available_resources: vec![dynrunner_core::ResourceAmount {
+                            kind: dynrunner_core::ResourceKind::memory(),
+                            amount: ram_bytes,
+                        }],
+                    })
+                    .unwrap();
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Reconciliation-probe fixture (#308): a fake secondary with AMNESIA —
 /// it handshakes like [`fake_secondary_with_addrs`] (welcome + cert +
 /// `MeshReady`), but SWALLOWS its first batch of assigned work (the

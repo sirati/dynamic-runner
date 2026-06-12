@@ -179,6 +179,31 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // `release_type_slot` here — the helper already did it.
                 if let Some(binary) = recovered_binary {
                     self.pool_mut().requeue(binary);
+                    // Originate the replicated `InFlight → Pending`
+                    // transition in lockstep with the local pool requeue —
+                    // the SAME `TaskRequeued` origination every other
+                    // requeue path emits (`recover_inflight_for_dead_
+                    // secondary`, `reconcile_inherited_slot`). Without it
+                    // the bounced task sat queued locally while every
+                    // replica still recorded it `InFlight` on the bounced
+                    // worker: fail-safe (a failover's hydrate routes the
+                    // stale `InFlight` to the in-flight ledger and only the
+                    // reconciliation probe's denial recovers it) but
+                    // incoherent. Gated on the recovery actually having
+                    // requeued (`recovered_binary` was `Some`): a duplicate
+                    // bounce resolves no slot and must not re-originate
+                    // against what may already be a NEWER assignment. The
+                    // apply rule is `InFlight`-only, so a raced terminal
+                    // that landed first wins (NoOp).
+                    self.apply_and_broadcast_cluster_mutations(vec![
+                        ClusterMutation::TaskRequeued {
+                            hash: task_hash.clone(),
+                            // Stamped at the origination choke point
+                            // (apply_locally_for_broadcast).
+                            version: Default::default(),
+                        },
+                    ])
+                    .await;
                     // The requeued binary is a pool-entry edge AND the
                     // backpressured worker's slot just freed. EMIT a
                     // `TasksAdded` so the worker-management recheck picks
