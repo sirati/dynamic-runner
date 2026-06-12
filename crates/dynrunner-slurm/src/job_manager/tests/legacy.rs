@@ -401,9 +401,6 @@ struct ExcludeRejectingGateway {
 }
 
 impl ExcludeRejectingGateway {
-    fn commands(&self) -> Vec<String> {
-        self.commands.lock().unwrap().clone()
-    }
     fn sbatch_commands(&self) -> Vec<String> {
         self.commands
             .lock()
