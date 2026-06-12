@@ -23,6 +23,17 @@
 //! `CertExchange`, and the optional mesh-send capability the manager
 //! borrows). No caller of this module names a backend.
 //!
+//! # Execution context: the mesh runtime
+//!
+//! Each constructor here runs INSIDE the construct closure of
+//! `MeshHost::on_dedicated_thread` — on the dedicated mesh runtime's
+//! `LocalSet` — because tokio IO resources register with the creating
+//! runtime's driver and the backends `spawn_local` their accept/dial
+//! tasks at construction. The transport never leaves that thread; only
+//! the `Send` halves of each bundle cross back to the coordinator
+//! runtime. Nothing in this module may touch Python (the mesh runtime
+//! never blocks on the GIL).
+//!
 //! # What is NOT this module's concern
 //!
 //! The mesh-level COMPOSITION — the channel-fold's channel mesh, the
@@ -40,32 +51,16 @@ use dynrunner_transport_quic::{
 };
 use dynrunner_transport_tunnel::TunneledPeerTransport;
 
-/// Opaque guard holding the bound mesh listener alive.
-///
-/// Its accept loops were `spawn_local`-ed inside the bind and must
-/// outlive the run; the manager binds this to a `let _guard` in the
-/// `LocalSet` scope so the listeners stay up, never naming the backend
-/// listener type.
-pub(crate) struct MeshListenerGuard(
-    // Held purely for its liveness: the server keeps the bound
-    // QUIC/WSS listeners (and the `spawn_local`-ed accept loops that
-    // feed the transport) alive until this guard is dropped at the end
-    // of the run. Never read after construction.
-    #[allow(dead_code)] NetworkServer,
-);
-
 /// The bootstrap submitter primary's mesh-join transport plus the
 /// backend-derived values the manager threads onward.
 pub(crate) struct PrimaryMeshBundle<I: Identifier> {
-    /// The opaque mesh transport the `PrimaryCoordinator` holds by value.
+    /// The opaque mesh transport the mesh runtime's pump owns for the run.
     pub transport: TunneledPeerTransport<I>,
     /// The primary's listen endpoint (`127.0.0.1:<port>`) — the respawn
     /// trust anchor threaded through `enable_respawn`.
     pub respawn_endpoint: String,
     /// The primary's public cert PEM — the matching trust anchor.
     pub respawn_pubkey_pem: String,
-    /// Held by the manager to keep the accept loops alive for the run.
-    pub listener_guard: MeshListenerGuard,
 }
 
 /// Bind the submitter primary's mesh-join transport on `127.0.0.1:port`.
@@ -73,11 +68,15 @@ pub(crate) struct PrimaryMeshBundle<I: Identifier> {
 /// Builds the `TunneledPeerTransport` first (it OWNS the inbound demux),
 /// then binds the `NetworkServer` wiring its accept loops to the
 /// transport's inbound + registration sinks. Returns the opaque
-/// transport, the respawn trust anchor read off the bound server, and
-/// the live server (held in the bundle).
+/// transport and the respawn trust anchors read off the bound server;
+/// the live server itself is PARKED on the constructing `LocalSet` (a
+/// run-length holder task) so its accept loops stay up until the mesh
+/// runtime is stopped — no caller holds a backend listener type.
 ///
-/// Must run inside the coordinator's `LocalSet` (the server's accept
-/// loops are `spawn_local`-ed).
+/// Must run inside the mesh runtime's `LocalSet` (the construct closure
+/// of `MeshHost::on_dedicated_thread`): the server's accept loops are
+/// `spawn_local`-ed and its sockets register with the creating runtime's
+/// IO driver.
 pub(crate) async fn bind_primary_mesh<I: Identifier>(
     port: u16,
 ) -> Result<PrimaryMeshBundle<I>, String> {
@@ -105,11 +104,20 @@ pub(crate) async fn bind_primary_mesh<I: Identifier>(
     let respawn_endpoint = format!("127.0.0.1:{}", server.port());
     let respawn_pubkey_pem = server.cert_pem().to_string();
 
+    // Park the bound server for the LIFETIME of the constructing
+    // runtime's `LocalSet` (the mesh runtime): the server keeps the bound
+    // QUIC/WSS listeners — and the `spawn_local`-ed accept loops that feed
+    // the transport — alive until the mesh runtime is stopped, which drops
+    // this holder task. Same parking pattern as the liveness listener.
+    tokio::task::spawn_local(async move {
+        let _server = server;
+        std::future::pending::<()>().await;
+    });
+
     Ok(PrimaryMeshBundle {
         transport,
         respawn_endpoint,
         respawn_pubkey_pem,
-        listener_guard: MeshListenerGuard(server),
     })
 }
 
@@ -132,7 +140,9 @@ pub(crate) struct SecondaryMeshBundle<I: Identifier> {
 
 /// Inputs to [`dial_secondary_mesh`] — the secondary's mesh-dial
 /// parameters grouped so the backend-construction signature stays tight.
-pub(crate) struct SecondaryDialParams<'a> {
+/// Fully OWNED (no borrows) so the whole struct moves into the mesh
+/// runtime's `Send + 'static` construct closure.
+pub(crate) struct SecondaryDialParams {
     /// ALL resolved bootstrap-primary `SocketAddr`s (the full resolver
     /// output for the primary URL, not just its first entry). The
     /// factory derives the per-attempt candidate order — v4 first,
@@ -148,7 +158,7 @@ pub(crate) struct SecondaryDialParams<'a> {
     /// capped at [`MAX_DIAL_RETRY_DELAY`].
     pub retry_delay: std::time::Duration,
     /// This secondary's logical id (the peer-mesh cert CN).
-    pub secondary_id: &'a str,
+    pub secondary_id: String,
     /// Peer-id the folded bootstrap wire is keyed under (the
     /// conventional `"primary"`).
     pub bootstrap_primary_id: String,
@@ -402,9 +412,12 @@ where
 /// coordinator's setup-wait owns the entire pre-primary wait
 /// (run_20260611_005927).
 ///
-/// Must run inside the coordinator's `LocalSet`.
+/// Must run inside the mesh runtime's `LocalSet` (the construct closure
+/// of `MeshHost::on_dedicated_thread`): the mesh's listeners/dials
+/// register with the creating runtime's IO driver, and the background
+/// bring-up dial is `spawn_local`-ed.
 pub(crate) async fn dial_secondary_mesh<I: Identifier>(
-    params: SecondaryDialParams<'_>,
+    params: SecondaryDialParams,
 ) -> Result<SecondaryMeshBundle<I>, String> {
     let SecondaryDialParams {
         addrs,
@@ -443,7 +456,7 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
     // the cert CN must match the logical id. `quic_bind_port` (when the
     // operator/wrapper pre-allocated one) pins BOTH mesh listeners to the
     // advertised port; `None` keeps the OS-picked bind.
-    let transport = PeerNetwork::<I>::start(secondary_id, quic_bind_port)
+    let transport = PeerNetwork::<I>::start(&secondary_id, quic_bind_port)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "failed to start peer network");
@@ -527,11 +540,14 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
 /// `run.rs` — it is a `PeerTransport` trait method and names no backend.
 ///
 /// Returns the bare `PeerNetwork`: the standalone, apply-only
-/// `ObserverCoordinator` holds the mesh transport directly and ships no
-/// `PeerCertInfo` (it ignores cert-exchange frames), so the
-/// secondary-style cert bundle the late-joiner used to build is gone.
+/// `ObserverCoordinator` holds no transport and ships no `PeerCertInfo`
+/// (it ignores cert-exchange frames), so the secondary-style cert bundle
+/// the late-joiner used to build is gone.
 ///
-/// Must run inside the coordinator's `LocalSet`.
+/// Must run inside the mesh runtime's `LocalSet` (the construct closure
+/// of `MeshHost::on_dedicated_thread`); the bootstrap rendezvous
+/// (`join_running_cluster`) that follows is transport IO and runs there
+/// too, before the transport is handed to the pump.
 pub(crate) async fn observer_mesh<I: Identifier>(
     observer_id: &str,
 ) -> Result<PeerNetwork<I>, String> {
@@ -985,7 +1001,7 @@ mod tests {
                         addrs: vec![bootstrap_addr],
                         connect_timeout: Duration::from_secs(30),
                         retry_delay: Duration::from_millis(50),
-                        secondary_id: "sec-early",
+                        secondary_id: "sec-early".to_string(),
                         bootstrap_primary_id: "primary".to_string(),
                         ipv4_address: Some("127.0.0.1".to_string()),
                         ipv6_address: None,
@@ -1078,7 +1094,7 @@ mod tests {
                     addrs: vec![bootstrap_addr],
                     connect_timeout: Duration::from_secs(30),
                     retry_delay: Duration::from_millis(50),
-                    secondary_id: "sec-0",
+                    secondary_id: "sec-0".to_string(),
                     bootstrap_primary_id: "primary".to_string(),
                     ipv4_address: Some("127.0.0.1".to_string()),
                     ipv6_address: None,

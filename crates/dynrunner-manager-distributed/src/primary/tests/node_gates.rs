@@ -20,7 +20,7 @@
 
 use super::*;
 
-use crate::process::{LocalRole, Mesh};
+use crate::process::{LocalRole, Mesh, MeshHost};
 use dynrunner_protocol_primary_secondary::address::{Destination, PeerId};
 use dynrunner_protocol_primary_secondary::{DistributedMessage, KeepaliveRole};
 
@@ -356,7 +356,7 @@ async fn node_run_e2e_setup_peer_relocates_to_compute_secondary_cold() {
                 FixedEstimator(100),
             );
             secondary.set_bootstrap_primary_id("setup".to_string());
-            let (sec_node, sec_promo_tx) = Node::new(sec_mesh);
+            let (sec_node, sec_promo_tx) = Node::new(MeshHost::on_local_set(sec_mesh));
             secondary.register_promotion_signal(sec_promo_tx);
             // Cold path: the snapshot carries the seeded tasks, so the promoted
             // primary needs no discovery policy.
@@ -388,7 +388,7 @@ async fn node_run_e2e_setup_peer_relocates_to_compute_secondary_cold() {
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-            let (pri_node, _pri_promo_tx) = Node::new(pri_mesh);
+            let (pri_node, _pri_promo_tx) = Node::new(MeshHost::on_local_set(pri_mesh));
             let pri_node = pri_node.with_primary(primary, pri_slot);
             let binaries: Vec<TaskInfo<TestId>> = (0..3)
                 .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
@@ -522,7 +522,7 @@ async fn node_run_e2e_setup_peer_relocates_to_compute_secondary_pre_staged() {
                 FixedEstimator(100),
             );
             secondary.set_bootstrap_primary_id("setup".to_string());
-            let (sec_node, sec_promo_tx) = Node::new(sec_mesh);
+            let (sec_node, sec_promo_tx) = Node::new(MeshHost::on_local_set(sec_mesh));
             secondary.register_promotion_signal(sec_promo_tx);
             // The discovery policy the relocate target runs on the inherited
             // `Owed` marker — yields the corpus the setup peer did NOT seed.
@@ -569,7 +569,7 @@ async fn node_run_e2e_setup_peer_relocates_to_compute_secondary_pre_staged() {
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-            let (pri_node, _pri_promo_tx) = Node::new(pri_mesh);
+            let (pri_node, _pri_promo_tx) = Node::new(MeshHost::on_local_set(pri_mesh));
             let pri_node = pri_node.with_primary(primary, pri_slot);
             let pri_inputs: NodeRunInputs<FakeWorkerFactory, _, _, TestId> = NodeRunInputs {
                 primary_run_args: Some(PrimaryRunArgs {

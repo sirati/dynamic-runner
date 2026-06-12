@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use dynrunner_manager_distributed::process::{
-    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal, SeedSource,
+    LocalRole, MeshHost, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal, SeedSource,
 };
 use dynrunner_manager_distributed::{
     GracefulAbortTrigger, PrimaryConfig, PrimaryCoordinator, RunError,
@@ -381,11 +381,17 @@ impl PyPrimaryCoordinator {
                 let mut abort_trigger = Some(GracefulAbortTrigger::arm());
 
                 // Stand up the submitter primary's mesh-join transport
-                // through the backend-opaque factory: it builds the mesh
-                // transport, binds the listener wiring its accept loops to
-                // the transport's inbound + registration sinks, and reads
-                // the respawn trust anchors (endpoint + cert PEM) off the
-                // bound listener. No backend type is named here.
+                // through the backend-opaque factory ON the dedicated mesh
+                // runtime thread (`MeshHost::on_dedicated_thread`): the
+                // factory builds the mesh transport, binds the listener
+                // wiring its accept loops to the transport's inbound +
+                // registration sinks (parking the bound listener on the
+                // mesh runtime's LocalSet for the run), and reads the
+                // respawn trust anchors (endpoint + cert PEM) off the bound
+                // listener. No backend type is named here, every socket
+                // registers with the mesh runtime's IO driver, and wire QoS
+                // survives any stall of THIS coordinator runtime. The
+                // construct closure never touches Python.
                 //
                 // The trust anchors are surfaced to each respawned
                 // secondary via `SecondarySpawnSpec` (per-spawn, so a
@@ -396,9 +402,18 @@ impl PyPrimaryCoordinator {
                 // In multi-process local mode the submitter and the spawned
                 // subprocess share the same loopback, so this endpoint is
                 // already the dial-able address.
-                let mesh_bundle =
-                    match transport_factory::bind_primary_mesh::<RunnerIdentifier>(port).await {
-                        Ok(b) => b,
+                let (mesh_host, (respawn_primary_endpoint, respawn_primary_pubkey_pem)) =
+                    match MeshHost::<RunnerIdentifier>::on_dedicated_thread(move || async move {
+                        let bundle =
+                            transport_factory::bind_primary_mesh::<RunnerIdentifier>(port).await?;
+                        Ok((
+                            bundle.transport,
+                            (bundle.respawn_endpoint, bundle.respawn_pubkey_pem),
+                        ))
+                    })
+                    .await
+                    {
+                        Ok(v) => v,
                         Err(e) => {
                             tracing::error!(error = %e, "failed to start primary mesh transport");
                             // A bootstrap-failure exit before the trigger was
@@ -412,16 +427,6 @@ impl PyPrimaryCoordinator {
                         }
                     };
                 tracing::info!(port, "primary network server listening");
-
-                let peer_transport = mesh_bundle.transport;
-                let respawn_primary_endpoint = mesh_bundle.respawn_endpoint;
-                let respawn_primary_pubkey_pem = mesh_bundle.respawn_pubkey_pem;
-                // The factory's listener handle is kept alive for the
-                // `LocalSet`'s lifetime so its accept loops stay up;
-                // secondaries retry-connect on their own and connections
-                // that arrive after we hand control to the coordinator are
-                // accepted by those loops.
-                let _mesh_server_guard = mesh_bundle.listener_guard;
 
                 // Run the primary coordinator with the network server transport.
                 let config = PrimaryConfig {
@@ -464,18 +469,28 @@ impl PyPrimaryCoordinator {
                     ..PrimaryConfig::default()
                 };
 
-                // Wrap the opaque mesh transport in the role-demux `Mesh`
-                // (the one thing in this process that touches the wire) and
-                // register the bootstrap Primary slot, minting the
-                // coordinator's `(client, inbox)` ends + the `Arc<RoleSlot>`
-                // the `Node` holds as the teardown lever. The mesh listener
-                // (held in `_mesh_server_guard` above) stays bound to the
-                // LocalSet so its accept loops keep feeding the transport.
-                let mut mesh = Mesh::new(peer_transport);
-                let (pri_slot, pri_client, pri_inbox) = mesh.register_local_role(
-                    LocalRole::Primary,
-                    PeerId::from(dynrunner_core::SETUP_NODE_ID),
-                );
+                // Register the bootstrap Primary slot through the mesh
+                // runtime's control channel, minting the coordinator's
+                // `(client, inbox)` ends + the `Arc<RoleSlot>` the `Node`
+                // holds as the teardown lever. The mesh listener (parked by
+                // the factory on the mesh runtime's LocalSet) keeps its
+                // accept loops feeding the transport for the whole run.
+                let Some((pri_slot, pri_client, pri_inbox)) = mesh_host
+                    .control()
+                    .register(
+                        LocalRole::Primary,
+                        PeerId::from(dynrunner_core::SETUP_NODE_ID),
+                    )
+                    .await
+                else {
+                    tracing::error!(
+                        "mesh runtime exited before the primary role registration"
+                    );
+                    if let Some(trigger) = abort_trigger.take() {
+                        trigger.report_undelivered().await;
+                    }
+                    return;
+                };
 
                 // BUG-6 demote channel: the bootstrap primary relocates into
                 // a standalone observer on any self→other primary-register
@@ -659,7 +674,7 @@ impl PyPrimaryCoordinator {
                 // an observer, never promote). `Node::run` owns the
                 // coordinator + the mesh-pump + the lifecycle; the boundary
                 // composes the inputs and drives it to a single outcome.
-                let (node, _node_promo_tx) = Node::new(mesh);
+                let (node, _node_promo_tx) = Node::new(mesh_host);
                 let node = node.with_primary(primary, pri_slot);
                 // Construct the typed seed at the boundary from the pre-staged
                 // signal (the construction-site decision pillar 2 mandates —

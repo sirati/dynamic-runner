@@ -3,11 +3,12 @@
 //! # Concern
 //!
 //! ONE concern: SEQUENCE the OS-process's role lifecycle. The node owns the
-//! composition (mesh + role entries + lifecycle channels); `run` turns that
-//! static composition into a running peer by:
+//! composition (the hosted mesh + role entries + lifecycle channels); `run`
+//! turns that static composition into a running peer by:
 //!
-//! 1. handing the mesh to the [`super::pump`] (the sole mesh owner) and
-//!    keeping a [`super::pump::MeshControlHandle`] to register/retag roles,
+//! 1. driving the already-running pump (hosted by the composition site's
+//!    [`super::MeshHost`] — possibly on the dedicated mesh runtime thread)
+//!    through its [`super::pump::MeshControlHandle`] to register/retag roles,
 //! 2. spawning each live coordinator's run loop on the `LocalSet`,
 //! 3. building a snapshot-seeded primary on a [`super::PromotionSignal`]
 //!    (SUPREME-LAW #3 & #7 — the secondary SIGNALS, the node BUILDS),
@@ -31,12 +32,10 @@ mod swap;
 use dynrunner_core::Identifier;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::oneshot;
 
 use super::node::Node;
-use super::pump;
 use super::run_inputs::NodeRunInputs;
 use crate::observer::ObserverCoordinator;
 use crate::primary::{PrimaryCoordinator, PrimaryRunOutcome};
@@ -50,17 +49,15 @@ use swap::{spawn_observer, swap_primary_to_observer};
 
 pub use outcome::{NodeRunOutcome, RunTerminal};
 
-impl<I, Tr, Mgr, Sched, Est>
+impl<I, Mgr, Sched, Est>
     Node<
         I,
-        Tr,
         PrimaryCoordinator<Sched, Est, I>,
         SecondaryCoordinator<Mgr, Sched, Est, I>,
         ObserverCoordinator<I>,
     >
 where
     I: Identifier + 'static,
-    Tr: PeerTransport<I> + 'static,
     Mgr: ManagerEndpoint + 'static,
     Sched: Scheduler<I> + Clone + 'static,
     Est: ResourceEstimator<I> + Clone + 'static,
@@ -74,7 +71,7 @@ where
         F: WorkerFactory<Mgr> + 'static,
     {
         let Node {
-            mesh,
+            host,
             primary,
             secondary,
             observer,
@@ -86,21 +83,13 @@ where
         // it off whichever role is live before we move the entries into tasks.
         let own_peer_id = first_live_peer_id(&primary, &secondary, &observer);
 
-        // Hand the mesh to the pump (sole owner) + keep the control handle.
-        //
-        // ORDERING INVARIANT (R5 — DO NOT REORDER): the pump is spawned
-        // BEFORE any coordinator below. On the `current_thread` LocalSet the
-        // pump's entry `publish_membership()` (see `run_pump`) runs to its
-        // first await before a later-spawned coordinator is polled, so the
-        // pump publishes the live membership into the detached clients' view
-        // BEFORE any coordinator drives its first egress. A coordinator's
-        // first `send_to` / `has_peer`-gated egress (e.g. the secondary's
-        // setup Welcome) must therefore NEVER observe an empty membership
-        // view. Spawning a coordinator before the pump — or making the
-        // entry publish await-first — would re-introduce the empty-view
-        // no-route race the test harness hit.
-        let (control, control_rx) = pump::control_channel::<I>();
-        let pump_task = tokio::task::spawn_local(pump::run_pump(mesh, control_rx));
+        // The pump is ALREADY RUNNING inside the composition site's
+        // `MeshHost` (spawned before any role trio was minted, so its entry
+        // `publish_membership()` preceded every coordinator's first egress —
+        // the R5 invariant, enforced by the host's mint ordering: a
+        // `Register` reply only ships after the pump republishes). The node
+        // drives it solely through the control handle.
+        let control = host.control().clone();
 
         // ── Spawn the bootstrap roles ───────────────────────────────────
 
@@ -280,24 +269,20 @@ where
         }
 
         // ── Wind-down ───────────────────────────────────────────────────
-        // The headline role has resolved into `outcome`. First DEFENSIVELY
-        // drain any final egress (NEW-C): a frame queued in the same sync
-        // step as the headline run-future resolving (e.g. a last keepalive /
-        // completion broadcast) has not yet been pulled by the pump, and a
-        // bare abort would discard it. `wind_down().await` has the pump apply
-        // every currently-queued egress item through the mesh and ack BEFORE
-        // we abort, so no final frame is silently dropped. It is bounded (the
-        // pump drains what is queued NOW, never awaiting a fresh item).
-        //
-        // Then drop the control handle so the pump's control arm closes, and
-        // ABORT the pump rather than awaiting it: the pump's ingress arm
-        // parks on the transport inbound, which stays open as long as a PEER
-        // is still connected (the wire does not close just because THIS
-        // node's headline role finished) — so awaiting the pump would hang.
-        control.wind_down().await;
+        // The headline role has resolved into `outcome`. `MeshHost::stop`
+        // first DEFENSIVELY drains any final egress (NEW-C): a frame queued
+        // in the same sync step as the headline run-future resolving (e.g. a
+        // last keepalive / completion broadcast) has not yet been pulled by
+        // the pump, and a bare stop would discard it — `wind_down` has the
+        // pump apply every currently-queued egress item through the mesh and
+        // ack first (bounded: it drains what is queued NOW, never awaiting a
+        // fresh item). Then the host stops its executor: the local flavor
+        // ABORTS the pump task (its ingress arm parks on the transport
+        // inbound, which stays open as long as a PEER is still connected, so
+        // awaiting it would hang); the dedicated-thread flavor signals the
+        // mesh runtime and joins it with a bounded grace.
         drop(control);
-        pump_task.abort();
-        let _ = pump_task.await;
+        host.stop().await;
         // A still-running sibling role (e.g. a pure-secondary node whose own
         // run is the headline) is aborted on its own arm; the bootstrap
         // primary's wind-down has no sibling to join here.
