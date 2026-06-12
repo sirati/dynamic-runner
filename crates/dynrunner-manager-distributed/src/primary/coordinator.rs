@@ -500,6 +500,30 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// `resolve_destination` miss (a routing-state error, NOT a collapse)
     /// never sets it. Reset to `false` at the start of every run.
     pub(super) mesh_pump_gone: bool,
+    /// THE run-started discriminator for incremental setup delivery: set
+    /// once THIS coordinator's run-start batch (`perform_initial_assignment`
+    /// plus `send_transfer_complete`) has fired, latched in `run_pipeline`'s
+    /// `PromotedDestination` arm — the only site that sequences both halves.
+    /// Read by `serve_setup_on_cert_exchange` (`peer_setup.rs`) to choose the
+    /// per-member serve variant: while `false` (bring-up) a cert-exchanged
+    /// member is served its peer roster ONLY (the run-start halves stay on
+    /// the post-connect-wait batch, so the quorum-proceed policy still
+    /// governs when the run starts); once `true`, a member completing its
+    /// welcome/cert-exchange has MISSED the batch (the fan-out walked the
+    /// roster known at run start), so the serve sends it the FULL setup trio
+    /// — without this a mid-run joiner (a respawned replacement) parks in
+    /// `wait_for_setup` forever, never emits `MeshReady`, and is never
+    /// assignable (the run_20260612_045106 secondary-4 zombie).
+    ///
+    /// Deliberately NODE-LOCAL and per-coordinator-incarnation (NOT a CRDT /
+    /// inherited fact): a promoted primary inherits a mid-run ledger but must
+    /// still classify members welcoming during ITS connect wait as bring-up —
+    /// its own imminent batch serves them their (possibly work-carrying)
+    /// run-start halves, and an early incremental trio would flip them
+    /// operational so the batch's real `InitialAssignment` lands in their
+    /// operational loop's drop arm. Reset to `false` at the start of every
+    /// run.
+    pub(super) run_start_batch_fired: bool,
     /// Per-task identities a runtime `spawn_tasks` batch could not apply
     /// because the validator rejected them (`UnknownDependency` —
     /// an `on_phase_end`-spawned task naming a `(phase_id, task_id)`
@@ -1412,6 +1436,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             total_tasks: 0,
             stranded_count: 0,
             mesh_pump_gone: false,
+            run_start_batch_fired: false,
             spawn_rejected_task_ids: Vec::new(),
             all_binaries: Vec::new(),
             pending: None,
@@ -3665,6 +3690,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // pre-loop send; a coordinator re-used across runs must not inherit a
         // previous run's collapse signal.
         self.mesh_pump_gone = false;
+        // Same per-run reset for the run-started discriminator: latched by
+        // the `PromotedDestination` arm once THIS run's run-start batch has
+        // fired; a coordinator re-used across runs must not serve a new
+        // run's bring-up members the previous run's mid-run trio.
+        self.run_start_batch_fired = false;
         // Same per-run reset for the spawn-rejection ledger: only written
         // by `apply_spawn_tasks` when the validator rejects a runtime
         // `spawn_tasks` task; a coordinator re-used across runs must not
@@ -4119,6 +4149,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
                 // Phase 6: Send transfer complete.
                 self.send_transfer_complete().await?;
+
+                // RUN-START LATCH: both halves of the run-start batch have
+                // now fired over the roster known at this instant. From here
+                // on, a member completing its welcome/cert-exchange has
+                // MISSED the batch, so the incremental per-member serve
+                // (`serve_setup_on_cert_exchange`) must hand it the FULL
+                // setup trio itself — see `run_start_batch_fired`'s field
+                // doc. Latched HERE (the one site that sequences both
+                // halves) and nowhere else. No frame dispatch happens
+                // between `perform_initial_assignment` above and this line
+                // (the pre-loop chain never recvs the inbox), so no
+                // cert-exchange can race the latch.
+                self.run_start_batch_fired = true;
 
                 // Pre-loop collapse gate (transfer-complete window): a
                 // secondary dying AFTER its initial assignment send succeeded

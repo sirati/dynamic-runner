@@ -223,14 +223,35 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// first peer list AND converging every earlier member onto the
     /// fleet so far) and walks the newcomer's typestate.
     ///
-    /// Deliberately NOT served here: `InitialAssignment` and
-    /// `TransferComplete`, the run-start halves of the secondary's
-    /// setup gate. Those stay on the post-connect-wait fan-out
-    /// (`perform_initial_assignment` / `send_transfer_complete`), so the
-    /// quorum-proceed policy still governs WHEN THE RUN STARTS — a
-    /// served member enters `Configuring` (worker pool spawned, mesh
-    /// forming, run config already pushed at its welcome) but cannot go
-    /// Operational or pull work early.
+    /// The run-start halves of the secondary's setup gate
+    /// (`InitialAssignment` / `TransferComplete`) are served on a
+    /// run-started discriminator (`run_start_batch_fired`, latched by
+    /// `run_pipeline` once the run-start batch has fired):
+    ///
+    ///   * BEFORE the run starts (bring-up), they are deliberately NOT
+    ///     served here — they stay on the post-connect-wait fan-out
+    ///     (`perform_initial_assignment` / `send_transfer_complete`), so
+    ///     the quorum-proceed policy still governs WHEN THE RUN STARTS — a
+    ///     served member enters `Configuring` (worker pool spawned, mesh
+    ///     forming, run config already pushed at its welcome) but cannot go
+    ///     Operational or pull work early.
+    ///   * AFTER the run has started, this serve is the ONLY thing that can
+    ///     release the member's setup gate: the batch fan-out already fired
+    ///     over the roster known at run start and never re-runs, so a
+    ///     mid-run joiner (a respawned replacement, or any member welcoming
+    ///     post-start) would otherwise park in `wait_for_setup` forever —
+    ///     handshake-retrying, never emitting `MeshReady`, never assignable
+    ///     (the run_20260612_045106 secondary-4 zombie). The bring-up
+    ///     objections don't apply: the run HAS started, so there is no
+    ///     pool-draining-ahead-of-the-initial-assignment hazard, and the
+    ///     trio's directed frames are exactly the welcome-receipt proof
+    ///     that stops the member's handshake retry.
+    ///
+    /// Fires only on the `Handshaking → CertExchanging` edge (the caller,
+    /// `connect::handle_cert_exchange`, gates on it), so a duplicate
+    /// welcome/cert-exchange from the same incarnation never re-serves —
+    /// the serve is once-per-incarnation, consistent with the existing
+    /// duplicate-welcome handling.
     pub(super) async fn serve_setup_on_cert_exchange(&mut self, secondary_id: &str) {
         tracing::info!(
             secondary = %secondary_id,
@@ -240,6 +261,59 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         );
         self.broadcast_peer_roster().await;
         self.advance_member_peer_listed(secondary_id);
+        if self.run_start_batch_fired {
+            self.serve_run_start_trio_remainder(secondary_id).await;
+        }
+    }
+
+    /// Serve a MID-RUN joiner the run-start halves of its setup trio (the
+    /// roster half was just broadcast by the caller,
+    /// [`Self::serve_setup_on_cert_exchange`]) and walk it to
+    /// `Operational` on this primary's side — the per-member equivalent of
+    /// what the run-start batch did for the bring-up fleet.
+    ///
+    ///   * The `InitialAssignment` is EMPTY by construction: a mid-run
+    ///     joiner is a fresh incarnation holding no pre-assigned work — it
+    ///     pulls via `TaskRequest` like every member post-start (and the
+    ///     `MeshReady` it emits on entering its operational loop fires the
+    ///     confirmation-edge dispatch wakeup in `handle_mesh_ready`, so
+    ///     proactive dispatch reaches it too). An empty payload clobbers
+    ///     nothing on the receiver: the secondary's handler just stamps the
+    ///     dispatch-context flags and dispatches zero tasks. A REJOINING
+    ///     member with in-flight history never crosses this path — it is
+    ///     handled by frame-ingest re-admission (`primary::readmission`)
+    ///     and, being operational, never re-sends the welcome/cert
+    ///     handshake that leads here.
+    ///   * The typestate walk reuses the existing per-member edges
+    ///     ([`Self::advance_member_peers_ready`] /
+    ///     `mark_member_operational`), so the member is keepalive-seeded at
+    ///     the same "became operational" instant the batch path seeds —
+    ///     once its operational keepalives flow it is silence-judgeable
+    ///     like any member.
+    ///
+    /// Send failures are the mesh-pump-gone collapse (warn-and-continue,
+    /// uniform with the batch fan-outs — the `mesh_pump_gone` latch is the
+    /// collapse signal the operational loop consults).
+    async fn serve_run_start_trio_remainder(&mut self, secondary_id: &str) {
+        tracing::info!(
+            secondary = %secondary_id,
+            "run already started: serving the mid-run joiner the run-start \
+             halves of its setup trio (empty InitialAssignment + \
+             TransferComplete) so it can go operational and pull work"
+        );
+        self.advance_member_peers_ready(secondary_id);
+        if let Err(error) = self
+            .send_initial_assignment_to(secondary_id, Vec::new(), Vec::new(), Vec::new())
+            .await
+        {
+            tracing::warn!(
+                secondary_id = %secondary_id,
+                error = %error,
+                "mid-run InitialAssignment delivery failed"
+            );
+        }
+        self.send_transfer_complete_to(secondary_id).await;
+        self.mark_member_operational(secondary_id);
     }
 
     /// Batch peer-list delivery at the connect-wait resolution: the
