@@ -23,14 +23,29 @@
 //! # The policy
 //!
 //! - The accept path only ACCEPTS. The per-connection handshake runs on
-//!   the spawned per-connection task, under [`HANDSHAKE_TIMEOUT`]; its
-//!   failure drops THAT connection and nothing else.
+//!   the spawned per-connection task — via the connection types' own
+//!   handshake drivers ([`QuicConnection::from_incoming`],
+//!   [`WssConnection::accept_handshake`]), each bounded internally by
+//!   their 30s `INBOUND_HANDSHAKE_TIMEOUT`; a failed or stalled
+//!   handshake drops THAT connection and nothing else.
 //! - A listener-level accept error is logged and retried after
 //!   [`ACCEPT_ERROR_BACKOFF`] (transient classes like `ECONNABORTED` /
 //!   fd exhaustion must not kill the mesh's ingress; the backoff stops
 //!   a hot spin while the condition persists). The loops exit only when
 //!   the listener itself is gone (QUIC endpoint closed; the WSS loop
 //!   owns its socket, so only LocalSet teardown ends it).
+//!
+//! # Handshake budget: 30s
+//!
+//! Two independent fixes of this defect picked 60s (loop-level timeout)
+//! and 30s (inside the handshake drivers); the reconciled
+//! implementation keeps the drivers' 30s. The longest conformant wait
+//! is the QUIC first-bi-stream accept, which resolves only once the
+//! dialer WRITES — production dialers send a keepalive/digest within
+//! one ~20s cadence period, so 30s covers it with margin, and the
+//! first PROTOCOL frame after the handshake is separately bounded by
+//! the network-side handlers' 60s `WELCOME_TIMEOUT`. A WSS upgrade is
+//! immediate on a live wire; 30s there is already generous.
 
 use std::future::Future;
 use std::time::Duration;
@@ -38,17 +53,10 @@ use std::time::Duration;
 use crate::transport::{QuicConnection, QuicListener};
 use crate::wss::{WssConnection, WssListener};
 
-/// Per-connection handshake budget. Covers the QUIC TLS handshake +
-/// first-bi-stream wait (which resolves only once the dialer WRITES —
-/// production dialers send a keepalive/digest within one ~20s cadence
-/// period) and the WSS upgrade. Aligned with the first-frame
-/// `WELCOME_TIMEOUT` the network-side handlers already apply after it.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// Pause after a LISTENER-level accept error before re-accepting, so a
 /// persistent error condition (e.g. fd exhaustion) degrades to a slow
-/// retry loop instead of a hot spin.
-const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+/// retry loop instead of a hot spin. The success path never sleeps.
+pub(crate) const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// WSS accept loop: accept raw TCP, hand each connection's WebSocket
 /// handshake + `handler` to its own spawned task. One bad connection
@@ -65,34 +73,33 @@ pub(crate) async fn wss_accept_loop_resilient<F, Fut>(
     loop {
         match listener.accept_raw().await {
             Ok((stream, peer_addr)) => {
+                tracing::debug!(%peer_addr, ctx, "WSS TCP connection accepted");
                 let handler = handler.clone();
                 tokio::task::spawn_local(async move {
-                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, WssListener::handshake(stream))
-                        .await
-                    {
-                        Ok(Ok(conn)) => handler(conn).await,
-                        Ok(Err(e)) => tracing::debug!(
+                    // Internally bounded (30s `INBOUND_HANDSHAKE_TIMEOUT`):
+                    // a stalled upgrade errors out of the driver itself.
+                    match WssConnection::accept_handshake(stream).await {
+                        Ok(conn) => handler(conn).await,
+                        Err(e) => tracing::debug!(
                             %peer_addr,
                             error = %e,
                             ctx,
-                            "WSS handshake failed; dropping that connection \
-                             (listener unaffected)"
-                        ),
-                        Err(_) => tracing::debug!(
-                            %peer_addr,
-                            timeout_s = HANDSHAKE_TIMEOUT.as_secs(),
-                            ctx,
-                            "WSS handshake stalled past the budget; dropping \
-                             that connection (listener unaffected)"
+                            "inbound WSS upgrade failed; dropping the attempt \
+                             (listener kept — the dialer's redial lands fresh)"
                         ),
                     }
                 });
             }
             Err(e) => {
+                // Listener-level accept(2) fault (transient ECONNABORTED
+                // under a reset storm, EMFILE, …): the listener socket is
+                // still bound, so keep accepting — paced so a persistent
+                // fault cannot busy-spin the executor. The loop ends only
+                // with the task (LocalSet teardown).
                 tracing::warn!(
                     error = %e,
                     ctx,
-                    "WSS accept error (transient); listener keeps accepting"
+                    "WSS accept(2) error; listener kept, retrying after backoff"
                 );
                 tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
             }
@@ -112,29 +119,26 @@ pub(crate) async fn quic_accept_loop_resilient<F, Fut>(
     F: Fn(QuicConnection) -> Fut + Clone + 'static,
     Fut: Future<Output = ()> + 'static,
 {
+    // `None` — the endpoint itself closed — is the only loop exit.
     loop {
-        let Some(incoming) = listener.accept_incoming().await else {
+        let Some(incoming) = listener.accept_raw().await else {
             tracing::info!(ctx, "QUIC endpoint closed; accept loop ends");
             break;
         };
         let remote = incoming.remote_address();
         let handler = handler.clone();
         tokio::task::spawn_local(async move {
-            match tokio::time::timeout(HANDSHAKE_TIMEOUT, QuicListener::handshake(incoming)).await {
-                Ok(Ok(conn)) => handler(conn).await,
-                Ok(Err(e)) => tracing::debug!(
+            // Internally bounded (30s `INBOUND_HANDSHAKE_TIMEOUT`): a
+            // dialer that never opens its bi stream errors out of the
+            // driver itself.
+            match QuicConnection::from_incoming(incoming).await {
+                Ok(conn) => handler(conn).await,
+                Err(e) => tracing::debug!(
                     %remote,
                     error = %e,
                     ctx,
-                    "QUIC handshake failed; dropping that connection \
-                     (listener unaffected)"
-                ),
-                Err(_) => tracing::debug!(
-                    %remote,
-                    timeout_s = HANDSHAKE_TIMEOUT.as_secs(),
-                    ctx,
-                    "QUIC handshake stalled past the budget; dropping that \
-                     connection (listener unaffected)"
+                    "inbound QUIC handshake failed; dropping the attempt \
+                     (listener kept — the dialer's redial lands fresh)"
                 ),
             }
         });

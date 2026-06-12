@@ -14,6 +14,14 @@ pub struct QuicConnection {
     recv_buf: Vec<u8>,
 }
 
+/// Bound on one inbound connection's QUIC handshake + first-stream
+/// open. Applied inside [`QuicConnection::from_incoming`] so a dialer
+/// that completes the QUIC handshake but never opens its bi stream
+/// releases the per-connection handler task instead of holding it for
+/// the full idle timeout. Generous: a conformant dialer opens its
+/// stream immediately after the handshake.
+const INBOUND_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl QuicConnection {
     pub fn from_streams(send: SendStream, recv: RecvStream) -> Self {
         Self {
@@ -21,6 +29,34 @@ impl QuicConnection {
             recv,
             recv_buf: Vec::new(),
         }
+    }
+
+    /// Drive ONE incoming connection attempt to an established
+    /// [`QuicConnection`]: complete the QUIC/TLS handshake, then accept
+    /// the dialer's bi-directional stream. PER-CONNECTION fallible —
+    /// a dialer that aborts its handshake (or never opens its stream)
+    /// errors HERE, in whatever task drove this attempt, and says
+    /// nothing about the listener. Accept loops must therefore call
+    /// this from the spawned per-connection handler, never inline in
+    /// the accept loop itself: pre-fix the loops awaited the handshake
+    /// inline and treated its failure as loop-fatal, so one aborted
+    /// in-flight handshake (the run_20260611_202345 simultaneous
+    /// connection reset) permanently killed the node's ability to
+    /// accept re-dialed sessions.
+    pub async fn from_incoming(incoming: quinn::Incoming) -> Result<Self, String> {
+        let established = tokio::time::timeout(INBOUND_HANDSHAKE_TIMEOUT, async {
+            let connection = incoming.await.map_err(|e| e.to_string())?;
+            connection.accept_bi().await.map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "inbound QUIC connection did not establish within {}s",
+                INBOUND_HANDSHAKE_TIMEOUT.as_secs()
+            )
+        })?;
+        let (send, recv) = established?;
+        Ok(Self::from_streams(send, recv))
     }
 
     /// Consume the connection and return the underlying QUIC streams
@@ -147,44 +183,29 @@ impl QuicListener {
         self.local_addr.port()
     }
 
-    /// Await the next incoming connection attempt WITHOUT driving its
-    /// handshake. `None` means the endpoint is closed (the listener is
-    /// genuinely gone — the only loop-terminal condition).
-    ///
-    /// The split exists for listener survivability: the TLS handshake +
-    /// first bi-stream accept are PER-CONNECTION concerns (they can fail
-    /// on a wrong-trust dialer or stall forever on a blackholed one), so
-    /// an accept loop must run them on the spawned per-connection task —
-    /// never inline on the accept path, where one bad connection would
-    /// surface as an accept error (killing a break-on-error loop) or
-    /// park the listener entirely (the run_20260611_200548
-    /// observer-reconnect wedge). Pair with [`Self::handshake`].
-    pub async fn accept_incoming(&self) -> Option<quinn::Incoming> {
+    /// Listener-level accept: the next incoming connection ATTEMPT.
+    /// `None` iff the endpoint itself is closed — the ONLY loop-fatal
+    /// condition an accept loop may exit on. The attempt has NOT been
+    /// handshaken yet; drive it to an established connection with
+    /// [`QuicConnection::from_incoming`] inside the per-connection
+    /// handler task, so a dialer that aborts mid-handshake fails its
+    /// own attempt and nothing else.
+    pub async fn accept_raw(&self) -> Option<quinn::Incoming> {
         self.endpoint.accept().await
     }
 
-    /// Drive one incoming connection attempt to a usable
-    /// [`QuicConnection`]: complete the QUIC/TLS handshake and accept
-    /// the dialer's first bi-directional stream. Note the bi-stream
-    /// only resolves once the dialer has WRITTEN on it — callers bound
-    /// this with a timeout.
-    pub async fn handshake(incoming: quinn::Incoming) -> Result<QuicConnection, String> {
-        let connection = incoming.await.map_err(|e| e.to_string())?;
-        let (send, recv) = connection.accept_bi().await.map_err(|e| e.to_string())?;
-
-        Ok(QuicConnection::from_streams(send, recv))
-    }
-
     /// Accept the next incoming connection and open a bi-directional
-    /// stream — [`Self::accept_incoming`] + inline [`Self::handshake`].
-    ///
-    /// Convenience for single-connection callers (tests, fixtures) that
-    /// accept exactly the connection they themselves dial. Production
-    /// accept LOOPS must use the split form via [`crate::accept_loop`]
-    /// so one bad connection cannot kill or wedge the listener.
+    /// stream — `accept_raw` + [`QuicConnection::from_incoming`] in one
+    /// call, for single-connection callers (tests, fixtures). An accept
+    /// LOOP must NOT use this: a per-connection handshake failure is
+    /// indistinguishable from a listener failure in the flattened
+    /// `Err`, and awaiting the handshake inline serializes (and, treated
+    /// as fatal, kills) the loop — use the split form via
+    /// [`crate::accept_loop`] so one bad connection cannot kill or
+    /// wedge the listener.
     pub async fn accept(&self) -> Result<QuicConnection, String> {
-        let incoming = self.accept_incoming().await.ok_or("endpoint closed")?;
-        Self::handshake(incoming).await
+        let incoming = self.accept_raw().await.ok_or("endpoint closed")?;
+        QuicConnection::from_incoming(incoming).await
     }
 }
 

@@ -4,7 +4,11 @@
 //! - [`bind_port`]: `PeerNetwork::start` bind-port contract (#355) —
 //!   an explicit port pins both listeners (QUIC/UDP + WSS/TCP);
 //!   `None` keeps the OS-picked ephemeral behaviour.
-//! - [`cert_parsing`]: pure PEM→DER bridge tests.
+//! - [`cert_parsing`]: pure PEM→DER bridge tests (the `Err` strings
+//!   are the no-valid-cert WARN's `reasons=` payload).
+//! - [`dial_cert`]: dial-side cert contract — a cert-carrying seed
+//!   entry connects QUIC; a cert-less one falls back to WSS with a
+//!   NON-EMPTY `reasons=` on the no-valid-cert WARN.
 //! - [`two_peers`]: basic peer exchange + dial tie-break
 //!   (`higher_id_does_not_dial_lower_id`).
 //! - [`recv_lifetime`]: `recv_peer_tick_survives_outer_drop` —
@@ -63,6 +67,12 @@
 //!   stale half-open `connections` entry on the accept side; the
 //!   lower-id-dials dedup is preserved on the dial-owner side, and the
 //!   replacement is generation-checked.
+//! - [`reset_then_redial`]: the simultaneous-reset replay
+//!   (run_20260611_202345) — an established session RST plus aborted
+//!   in-flight handshakes at BOTH listeners must not end the accept
+//!   loops; the peer's re-dialed session re-registers and its replayed
+//!   seq-stamped report is delivered + ackable, and the errored accept
+//!   path neither spins nor monopolises the executor.
 //!
 //! - [`accept_resilience`]: listener survival — one aborted / stalled
 //!   / TLS-failed inbound connection must never kill or wedge the
@@ -102,6 +112,7 @@ mod bind_port;
 mod bootstrap_redial;
 mod broadcast_miss;
 mod cert_parsing;
+mod dial_cert;
 mod dial_failure_summary;
 mod dial_sweep;
 mod formation_retry;
@@ -115,5 +126,6 @@ mod primary_link;
 mod reader_exit_disconnect;
 mod recv_lifetime;
 mod recv_tick_closed_spins;
+mod reset_then_redial;
 mod silent_reconnect;
 mod two_peers;

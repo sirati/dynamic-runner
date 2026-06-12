@@ -262,6 +262,17 @@ pub struct PeerNetwork<I: Identifier> {
     /// coordinator. `UnboundedReceiver::recv()` is itself cancel-
     /// safe, so polling the field in place preserves the contract.
     pub(super) reconnect_tick_rx: mpsc::UnboundedReceiver<()>,
+    /// One-shot latch: `true` once `reconnect_tick_rx.recv()` has
+    /// returned `None` (the 5s tick task ended, closing the channel).
+    /// Gates the tick arm of `recv_peer`'s `select!` off PERMANENTLY —
+    /// a closed `UnboundedReceiver::recv()` resolves `None`
+    /// synchronously on every poll, so an ungated arm would burn one
+    /// always-ready poll (and, pre-latch, one WARN) on EVERY
+    /// subsequent `recv_peer` call for the life of the network. Lives
+    /// on the struct (not a `recv_peer` local) because the caller
+    /// re-creates the `recv_peer` future per delivered frame — a local
+    /// reset the latch each call.
+    pub(super) reconnect_tick_closed: bool,
     /// Test-only handle to the reconnect-tick sender. Production
     /// builds drop the sender into the ticker task spawned in
     /// `start()`; the test backdoor keeps a clone so regression
@@ -466,6 +477,7 @@ impl<I: Identifier> PeerNetwork<I> {
             router: Router::new(peer_id.to_string()),
             peer_dial_info: HashMap::new(),
             reconnect_tick_rx,
+            reconnect_tick_closed: false,
             #[cfg(test)]
             reconnect_tick_tx_for_test,
             reconnect_tracker: reconnect::ReconnectTracker::new(),

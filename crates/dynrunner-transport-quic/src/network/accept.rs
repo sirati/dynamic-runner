@@ -39,6 +39,15 @@ const CTX: &str = "network-accepted";
 /// not slow.
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(60);
 
+// PER-CONNECTION failures never end an accept loop — see the matching
+// commentary in `peer::accept`: the pre-fix loops folded a
+// per-connection handshake failure into `accept()`'s `Err` and broke,
+// so one connection reset mid-handshake (the run_20260611_202345
+// simultaneous reset killed in-flight handshakes cluster-wide)
+// permanently dropped the listener — a re-dialed bootstrap wire then
+// had nowhere to land. Accept at the LISTENER level in the loop; run
+// the handshake inside the spawned per-connection handler.
+
 /// QUIC accept loop.
 ///
 /// Resilient (see `crate::accept_loop`): the per-connection handshake

@@ -59,7 +59,10 @@
 //! `mod.rs` owns the pyclass struct + the public `run_observer_late_joiner`
 //! pyfunction dispatcher. `new` is the constructor pymethods block.
 //! `run` is the run() + completed getter pymethods block. `helpers`
-//! carries `map_read_dir_error` + `records_to_seed` + their tests.
+//! carries `map_read_dir_error` + `records_to_seed` +
+//! `apply_local_peer_credentials` (the submitter-persisted cert-pin
+//! overlay that upgrades LOCAL-mode peer dials to valid-cert QUIC) +
+//! their tests.
 //! `gateway_mode` carries the `--gateway` desktop path: gateway-side
 //! `.info` fetch, per-peer `ssh -L` local-forward tunnels, the ONE
 //! seed-rewrite seam, and the reconnector hand-off.
@@ -110,6 +113,16 @@ pub(crate) struct PyObserverLateJoiner {
     /// the constructor so a malformed URL fails before any runtime
     /// spins up.
     pub(super) gateway: Option<dynrunner_gateway::SshConfig>,
+    /// Explicit path of the submitter-persisted peer-credentials file
+    /// (the roster's cert pins —
+    /// `dynrunner_manager_distributed::peer_credentials`). `None` (the
+    /// default) derives the conventional location from the peer-info
+    /// dir's run id and probes it: present → the certs are overlaid
+    /// onto the seed and the peer dials authenticate over QUIC; absent
+    /// → today's WSS-fallback behaviour, unchanged. Local mode only —
+    /// gateway tunnels are TCP forwards that cannot carry QUIC, so the
+    /// constructor rejects the explicit flag together with `--gateway`.
+    pub(super) mesh_credentials_path: Option<PathBuf>,
     pub(super) distributed_config: DistributedConfig,
     /// Static set of `holdings` this observer advertises to the
     /// cluster (e.g. asm-dataset-nix passes the local Nix-store
@@ -151,6 +164,7 @@ pub(crate) struct PyObserverLateJoiner {
     gateway_url = None,
     ssh_identity_file = None,
     ssh_config_file = None,
+    mesh_credentials_path = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_observer_late_joiner<'py>(
@@ -164,6 +178,7 @@ pub(crate) fn run_observer_late_joiner<'py>(
     gateway_url: Option<String>,
     ssh_identity_file: Option<String>,
     ssh_config_file: Option<String>,
+    mesh_credentials_path: Option<PathBuf>,
 ) -> PyResult<Py<PyAny>> {
     let kwargs = PyDict::new(py);
     if let Some(id) = observer_id.as_ref() {
@@ -177,6 +192,9 @@ pub(crate) fn run_observer_late_joiner<'py>(
     }
     if let Some(cfg) = ssh_config_file.as_ref() {
         kwargs.set_item("ssh_config_file", cfg)?;
+    }
+    if let Some(path) = mesh_credentials_path.as_ref() {
+        kwargs.set_item("mesh_credentials_path", path)?;
     }
     if let Some(dc) = distributed_config.as_ref() {
         kwargs.set_item("distributed_config", dc.clone())?;

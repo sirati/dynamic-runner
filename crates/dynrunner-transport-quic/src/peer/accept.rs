@@ -21,6 +21,23 @@ use super::{AcceptedPeer, DisconnectedPeer};
 /// Handler-provenance tag carried by the framed-IO pump logs.
 const CTX: &str = "peer-accepted";
 
+// PER-CONNECTION failures never end an accept loop. The pre-fix loops
+// awaited the whole handshake inside `listener.accept()` and broke on
+// ANY `Err` — but that `Err` conflated per-connection faults (a TCP
+// connection reset mid WS-upgrade, an aborted QUIC/TLS handshake, a
+// dialer that never opened its bi stream) with listener death. A
+// simultaneous connection reset (run_20260611_202345: one gateway
+// event RST many sessions in the same second, including in-flight
+// handshakes) therefore permanently killed the listener — every later
+// re-dial (the heal the accept-replace machinery and the
+// redial-request nudges depend on) had nowhere to land, so a peer's
+// replayed task reports could never re-register a session and ingest
+// from it stayed dead for the rest of the run. The loops now accept
+// at the LISTENER level only and drive the per-connection handshake
+// inside the spawned handler, where its failure drops that one
+// attempt and nothing else (it also no longer serializes the loop on
+// a slow dialer's handshake).
+
 pub(super) async fn quic_accept_loop<I: Identifier>(
     listener: QuicListener,
     incoming_tx: InboundTap<I>,

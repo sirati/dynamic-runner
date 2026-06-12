@@ -214,6 +214,56 @@ async fn drained_and_warns_with_closed_tick() -> (usize, usize) {
 /// falsification probe above documents). With the gate the arm is structurally
 /// silenced after one report. The drained count confirms the co-scheduled
 /// consumer is not starved.
+/// The latch is STRUCT-level, not per-call: production re-creates the
+/// `recv_peer` future per delivered frame (the mesh-pump shape), so a
+/// call-local gate would re-poll the closed channel and re-WARN on
+/// EVERY subsequent `recv_peer` — one wasted always-ready poll plus
+/// one log line per frame, forever. Driving recv_peer across TWO
+/// separate calls must still produce EXACTLY ONE close WARN.
+#[tokio::test(flavor = "current_thread")]
+async fn closed_reconnect_tick_latch_survives_recv_peer_recreation() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let records: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+            let layer = CaptureLayer {
+                records: Arc::clone(&records),
+            };
+            let subscriber = Registry::default().with(layer);
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            let mut peer: PeerNetwork<TestId> = PeerNetwork::start("peer-a", None).await.unwrap();
+            let (tick_tx, tick_rx) = mpsc::unbounded_channel::<()>();
+            drop(tick_tx);
+            peer.reconnect_tick_rx = tick_rx;
+
+            // Two SEPARATE recv_peer calls (each future dropped by its
+            // bounding sleep — the per-frame re-creation shape).
+            for _ in 0..2 {
+                tokio::select! {
+                    _ = peer.recv_peer() => {
+                        panic!("recv_peer unexpectedly resolved — no frame source exists");
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
+            }
+
+            let warns = records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.message.contains("reconnect-tick channel closed"))
+                .count();
+            assert_eq!(
+                warns, 1,
+                "the tick-closed latch must persist across recv_peer \
+                 re-creations: exactly one WARN total, not one per call. \
+                 (Observed: {warns}.)",
+            );
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn closed_reconnect_tick_arm_is_gated_off_after_one_warn() {
     let local = tokio::task::LocalSet::new();

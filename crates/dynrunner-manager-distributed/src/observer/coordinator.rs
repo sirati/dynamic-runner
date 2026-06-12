@@ -84,6 +84,7 @@ use crate::cluster_state::ClusterState;
 use crate::observer::announcer::{AnnouncerOutboxItem, PeerMeshAnnouncerSender};
 use crate::observer::failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 use crate::observer::fleet_death::{FleetDeathDetector, FleetDeathVerdict};
+use crate::observer::graceful_abort_trigger::GracefulAbortTrigger;
 use crate::observer::lifecycle::{AnnouncerHandle, attach_observer_announcer};
 use crate::observer::lost_visibility::{
     EndedOutage, LostVisibilityReporter, MeshLiveness, RetryDirective, Visibility, WakeNoteSlot,
@@ -325,6 +326,14 @@ where
     /// ports (specimen 1 of run_20260611_200548). `Rc<Cell<_>>`: the
     /// coordinator and its spawned task live on one `LocalSet` thread.
     reconnect_in_flight: std::rc::Rc<std::cell::Cell<bool>>,
+    /// The operator's SIGUSR2 graceful-abort trigger. `Some` when the
+    /// entry path pre-armed it (the late-joiner arms BEFORE its bootstrap
+    /// rendezvous so a pre-seat signal is latched instead of killing the
+    /// process — see [`crate::observer::graceful_abort_trigger`]); `None`
+    /// → [`Self::run`] arms at loop start (every other path's behaviour).
+    /// Either way the run loop consumes the SAME trigger, so a buffered
+    /// pre-seat delivery is serviced exactly like a post-seat one.
+    graceful_abort_trigger: Option<GracefulAbortTrigger>,
 }
 
 impl<I> ObserverCoordinator<I>
@@ -445,6 +454,7 @@ where
             wake_note: WakeNoteSlot::default(),
             reconnector,
             reconnect_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
+            graceful_abort_trigger: None,
         }
     }
 
@@ -503,6 +513,7 @@ where
             wake_note: WakeNoteSlot::default(),
             reconnector,
             reconnect_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
+            graceful_abort_trigger: None,
         }
     }
 
@@ -520,6 +531,18 @@ where
         reconnector: Arc<dyn crate::observer::TunnelReconnector>,
     ) {
         self.reconnector = Some(reconnector);
+    }
+
+    /// Inject a pre-armed operator graceful-abort trigger AFTER
+    /// construction — the SIGUSR2 sibling of
+    /// [`Self::set_tunnel_reconnector`]. Used by the late-joiner entry
+    /// path, which arms the trigger at process entry (BEFORE its
+    /// bootstrap rendezvous, so a signal received pre-seat is latched
+    /// rather than killing the process via the kernel's default
+    /// disposition) and hands the SAME trigger here for the run loop to
+    /// consume. Without an injection, [`Self::run`] arms at loop start.
+    pub fn set_graceful_abort_trigger(&mut self, trigger: GracefulAbortTrigger) {
+        self.graceful_abort_trigger = Some(trigger);
     }
 
     /// Read-only access to the replicated ledger (tests / result getters).
@@ -899,20 +922,19 @@ where
             // `GracefulAbortRequest` to the primary; re-sending the signal
             // re-sends the request (idempotent at the primary's latch), so
             // a request lost to a failover window is operator-recoverable.
-            // Registration failure (exotic runtimes) degrades to a parked
-            // arm — the embedding driver can still call
-            // `request_graceful_abort` directly.
-            let mut graceful_abort_signal =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
-                    .map_err(|e| {
-                        tracing::warn!(
-                            error = %e,
-                            "SIGUSR2 graceful-abort trigger could not be \
-                             registered; the signal channel is disabled for \
-                             this observer"
-                        );
-                    })
-                    .ok();
+            // The trigger module owns the SIGUSR2 stream: an entry path
+            // that pre-armed it (the late-joiner, whose bootstrap window
+            // must survive the signal) injected it via
+            // `set_graceful_abort_trigger` and its latched pre-seat
+            // delivery fires this arm's first poll; otherwise arm NOW (the
+            // pre-injection behaviour of every other path). Registration
+            // failure degrades to a parked arm inside the trigger — the
+            // embedding driver can still call `request_graceful_abort`
+            // directly.
+            let mut graceful_abort_signal = self
+                .graceful_abort_trigger
+                .take()
+                .unwrap_or_else(GracefulAbortTrigger::arm);
 
             loop {
                 // 1. Narrate (item 9/14): emit pending phase / summary
@@ -1064,19 +1086,14 @@ where
                     // Operator graceful-abort trigger (SIGUSR2). Each
                     // delivery sends one typed GracefulAbortRequest to the
                     // primary. `recv() == None` (signal stream closed) parks
-                    // the arm for the rest of the run — never a hot-loop.
-                    // Cancel-safety: `Signal::recv` is cancel-safe (tokio
-                    // docs); a sibling arm winning drops and rebuilds the
-                    // recv future without losing a queued signal.
-                    sig = async {
-                        match graceful_abort_signal.as_mut() {
-                            Some(stream) => stream.recv().await,
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        match sig {
-                            Some(()) => self.request_graceful_abort().await,
-                            None => graceful_abort_signal = None,
+                    // the trigger for the rest of the run — never a
+                    // hot-loop. Cancel-safety: `GracefulAbortTrigger::recv`
+                    // is cancel-safe (see its doc); a sibling arm winning
+                    // drops and rebuilds the recv future without losing a
+                    // queued signal.
+                    sig = graceful_abort_signal.recv() => {
+                        if sig.is_some() {
+                            self.request_graceful_abort().await;
                         }
                     }
                     // Announcer outbox drain: the announcer task posts a
@@ -1543,13 +1560,16 @@ where
                 return;
             }
         };
-        let reply = DistributedMessage::ClusterSnapshot {
-            target: None,
-            sender_id: self.config.node_id.clone(),
-            timestamp: timestamp_now(),
-            snapshot_json: (*snapshot_json).clone(),
-        };
-        let dst = anti_entropy::reply_destination(requester, requester_is_observer);
+        // The shared snapshot-RPC answer (`anti_entropy::snapshot_reply`):
+        // reply typed off the requester's self-declared role, addressed by
+        // its id — resolvable for a rosterless joiner over its direct leg.
+        let (dst, reply) = anti_entropy::snapshot_reply(
+            &self.config.node_id,
+            requester,
+            requester_is_observer,
+            timestamp_now(),
+            (*snapshot_json).clone(),
+        );
         if let Err(e) = self.send_to(dst, reply).await {
             tracing::warn!(
                 requester = %requester,
