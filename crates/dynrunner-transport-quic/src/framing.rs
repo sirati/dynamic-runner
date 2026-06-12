@@ -46,7 +46,9 @@
 //! its own copy of the loop with its own silent error branches.
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, InboundTap, chunking, codec};
+use dynrunner_protocol_primary_secondary::{
+    DepthWatch, DistributedMessage, InboundTap, chunking, codec,
+};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -560,6 +562,33 @@ pub(crate) async fn run_quic_reader<I: Identifier>(
     tracing::debug!(ctx, peer = %peer, "QUIC reader done");
 }
 
+/// Egress-queue accumulation visibility, shared by both writer pumps:
+/// feed the post-dequeue backlog depth to the connection's
+/// [`DepthWatch`] and WARN (threshold + rate-limited, the policy's
+/// concern) when the queue is accumulating — the consumer (this pump,
+/// i.e. the wire) is persistently slower than the producers. The
+/// per-connection egress channel is deliberately unbounded (see the
+/// channel doc at the mint sites); this is the honesty signal that
+/// keeps "unbounded" from meaning "invisible until the process is
+/// 20 GB of cold swap". A FULLY-parked writer (blocked in a wire
+/// write) cannot observe — that case is bounded by the leg-liveness
+/// detection (QUIC keep-alive/idle, WSS TCP keepalive, TCP
+/// retransmission timeout) tearing the connection down, which frees
+/// the queue with it; the lingering case this catches is the
+/// slow-but-flowing leg that never quite dies.
+fn observe_egress_depth(watch: &mut DepthWatch, depth: usize, ctx: &'static str, peer: &str) {
+    if let Some(depth) = watch.observe(depth, std::time::Instant::now()) {
+        tracing::warn!(
+            ctx,
+            peer = %peer,
+            queued_frames = depth,
+            "egress queue to this peer is accumulating: the wire drains \
+             slower than frames are queued (slow/blackholed leg); memory \
+             grows with every queued frame until the leg drains or dies"
+        );
+    }
+}
+
 /// QUIC-leg writer pump: drain `outgoing_rx`, encode each message
 /// through the [`encode_outbound_frames`] gate (an unsendable frame is
 /// dropped LOUDLY there and the connection kept; an oversized
@@ -573,7 +602,9 @@ pub(crate) async fn run_quic_writer<I: Identifier>(
     ctx: &'static str,
     peer: String,
 ) {
+    let mut depth_watch = DepthWatch::with_defaults();
     'pump: while let Some(msg) = outgoing_rx.recv().await {
+        observe_egress_depth(&mut depth_watch, outgoing_rx.len(), ctx, &peer);
         for frame in encode_outbound_frames(&msg, ctx, &peer) {
             if let Err(error) = send.write_all(&frame).await {
                 tracing::debug!(ctx, peer = %peer, error = %error, "QUIC write failed");
@@ -653,7 +684,9 @@ pub(crate) async fn run_wss_writer<I: Identifier>(
     ctx: &'static str,
     peer: String,
 ) {
+    let mut depth_watch = DepthWatch::with_defaults();
     'pump: while let Some(msg) = outgoing_rx.recv().await {
+        observe_egress_depth(&mut depth_watch, outgoing_rx.len(), ctx, &peer);
         for frame in encode_outbound_frames(&msg, ctx, &peer) {
             if let Err(error) = ws_write.send(Message::Binary(frame.into())).await {
                 tracing::debug!(ctx, peer = %peer, error = %error, "WSS write failed");

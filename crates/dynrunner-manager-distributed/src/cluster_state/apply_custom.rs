@@ -20,6 +20,26 @@ use dynrunner_core::Identifier;
 use super::types::CustomMsgState;
 use super::{ApplyOutcome, ClusterState};
 
+/// Size facts of the replicated custom-message inbox on THIS replica —
+/// the accumulation-visibility read surface (every replica retains
+/// `Unhandled` payloads until the Handled/Failed fact compacts them, so
+/// a stalled watermark grows payload-bearing state on EVERY mirror, not
+/// just the primary). Consumed by the periodic collection-stats line
+/// (`crate::collection_stats`); the primary's keep-up monitor keeps its
+/// own dispatch-latency view (`unhandled_custom_message_keys`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct CustomInboxStats {
+    /// Live `Unhandled` entries (each retains its full payload).
+    pub(crate) unhandled: usize,
+    /// Live terminal tombstones (`Handled`/`Failed`) not yet swept by
+    /// the contiguous-prefix watermark — label-only, payload dropped. A
+    /// large value here means the watermark is stalled on a gap.
+    pub(crate) terminal: usize,
+    /// Total retained payload bytes across the `Unhandled` entries —
+    /// the number that turns into cold swap when compaction stalls.
+    pub(crate) payload_bytes: usize,
+}
+
 impl<I: Identifier> ClusterState<I> {
     /// Is `(origin, seq)` already subsumed by the per-origin terminal
     /// watermark — i.e. provably terminal (`Handled` or `Failed`; the
@@ -254,5 +274,24 @@ impl<I: Identifier> ClusterState<I> {
     #[cfg(test)]
     pub(crate) fn custom_message_count(&self) -> usize {
         self.custom_messages.len()
+    }
+
+    /// Fold the inbox's size facts for the periodic collection-stats
+    /// line. On-demand O(live entries): the steady-state inbox is
+    /// ~empty (every Handled/Failed apply compacts), so the fold is
+    /// near-free at the stats cadence; on a pathological stalled inbox
+    /// the fold cost is exactly proportional to the problem it reports.
+    pub(crate) fn custom_inbox_stats(&self) -> CustomInboxStats {
+        let mut stats = CustomInboxStats::default();
+        for state in self.custom_messages.values() {
+            match state {
+                CustomMsgState::Unhandled { topic, data } => {
+                    stats.unhandled += 1;
+                    stats.payload_bytes += topic.len() + data.len();
+                }
+                CustomMsgState::Handled | CustomMsgState::Failed => stats.terminal += 1,
+            }
+        }
+        stats
     }
 }

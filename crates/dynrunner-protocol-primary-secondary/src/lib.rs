@@ -11,6 +11,7 @@ pub mod cluster_mutation;
 pub const CUSTOM_MESSAGE_MAX_BYTES: usize = 100 * 1024;
 pub mod chunking;
 pub mod codec;
+pub mod depth_watch;
 pub mod freshness;
 pub mod messages;
 pub mod relay;
@@ -28,6 +29,7 @@ pub use chunking::{
     AbandonedTransfer, ChunkIngest, ChunkOutcome, ChunkReassembler, split_frame,
 };
 pub use codec::{decode_frame, deserialize_message, serialize_message};
+pub use depth_watch::{DEPTH_WARN_INTERVAL, DEPTH_WARN_THRESHOLD, DepthWatch};
 pub use freshness::{FreshnessClock, InboundClosed, InboundTap, IngestEdges};
 pub use messages::*;
 pub use relay::{

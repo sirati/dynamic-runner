@@ -441,3 +441,68 @@ fn digest_detects_inbox_and_watermark_divergence() {
     b.restore(a.snapshot());
     assert!(!b.digest().is_behind(&a.digest()), "healed → quiesce");
 }
+
+/// REPLICA-SIDE growth bound (the 22 GB cold-swap class): a mirror that
+/// applies the broadcast Posted+Handled stream — the exact sequence a
+/// secondary receives from the primary's atomic effect+terminal frames
+/// — retains NOTHING: every pair compacts through the watermark, so N
+/// messages leave zero live entries and zero retained payload bytes.
+/// This is the structural guarantee that the payload-bearing inbox
+/// mirror is bounded by the in-flight window, not by run length.
+#[test]
+fn replica_mirror_growth_is_bounded_under_handled_compaction() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    let payload = vec![0u8; 1024];
+    for seq in 1..=500u64 {
+        s.apply(posted("sec-1", seq, "milestone", &payload));
+        s.apply(handled("sec-1", seq));
+        // Bounded at EVERY step, not just at the end: the watermark
+        // sweeps each contiguous terminal as it lands.
+        assert_eq!(
+            s.custom_message_count(),
+            0,
+            "seq {seq}: a Handled-covered entry must be physically pruned"
+        );
+    }
+    assert_eq!(s.custom_terminal_watermark("sec-1"), Some(500));
+    let stats = s.custom_inbox_stats();
+    assert_eq!(stats.unhandled, 0);
+    assert_eq!(stats.terminal, 0);
+    assert_eq!(stats.payload_bytes, 0, "no payload byte may be retained");
+}
+
+/// The observability contract for the STALL shape: a mirror whose
+/// Handled facts stop arriving (lost frames + no anti-entropy heal)
+/// reports the exact retained entry count and payload bytes — the
+/// numbers the periodic collection-stats line prints, so accumulation
+/// is visible in production logs at megabyte scale.
+#[test]
+fn stalled_mirror_reports_exact_retained_entries_and_bytes() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    let payload = vec![0u8; 2048];
+    for seq in 1..=100u64 {
+        s.apply(posted("sec-1", seq, "milestone", &payload));
+    }
+    // A handled tail past a gap (seq 1 unhandled): terminal tombstones
+    // that cannot compact are counted separately — payload-free.
+    s.apply(handled("sec-1", 100));
+    let stats = s.custom_inbox_stats();
+    assert_eq!(stats.unhandled, 99);
+    assert_eq!(stats.terminal, 1);
+    assert_eq!(
+        stats.payload_bytes,
+        99 * (2048 + "milestone".len()),
+        "retained bytes are the sum of every live Unhandled topic+payload"
+    );
+    // The heal releases everything: a snapshot from a compacted peer
+    // prunes below its watermark and the stats drop to zero.
+    let mut donor = ClusterState::<RunnerIdentifier>::new();
+    for seq in 1..=100u64 {
+        donor.apply(posted("sec-1", seq, "milestone", &payload));
+        donor.apply(handled("sec-1", seq));
+    }
+    s.restore(donor.snapshot());
+    let healed = s.custom_inbox_stats();
+    assert_eq!(healed.unhandled, 0);
+    assert_eq!(healed.payload_bytes, 0, "heal must release retained bytes");
+}
