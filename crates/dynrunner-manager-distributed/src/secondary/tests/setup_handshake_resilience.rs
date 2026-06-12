@@ -14,9 +14,10 @@
 //! background transport concern (the wire folds in whenever it lands)
 //! and the welcome/cert handshake becomes a RETRYING `wait_for_setup`
 //! arm — a no-route send is absorbed and retried on a capped backoff
-//! (give-up stays owned by the unconfigured-deadline), and a welcome
-//! LOST on a dying wire is re-sent until the primary's first frame
-//! proves receipt.
+//! (give-up stays owned by the unconfigured-deadline), and the retry
+//! stays armed until the WHOLE setup trio has landed (a re-welcome is
+//! the trio-retransmit request the primary's duplicate-welcome re-serve
+//! answers — run_20260612_105712).
 //!
 //! Two pins:
 //!
@@ -309,13 +310,18 @@ async fn broadcast_announce_does_not_disarm_welcome_retry() {
         .await;
 }
 
-/// The disarm pin (the GREEN half's other edge): a DIRECTED setup frame
-/// from the primary — `InitialAssignment`, which the primary only sends
-/// to a secondary in its welcomed registry — IS receipt proof, and the
-/// welcome retry must STOP on it (no churn against a primary that has
-/// provably enrolled this node).
+/// The retry-persistence pin (the run_20260612_105712 wedge): a DIRECTED
+/// setup frame landing (`InitialAssignment`) proves the welcome was
+/// received, but it must NOT disarm the handshake retry while the trio
+/// is still incomplete — the re-welcome is the trio-retransmit request
+/// the primary's duplicate-welcome re-serve answers. Pre-fix the retry
+/// disarmed on `got_assignment`/`got_transfer`, so a member whose roster
+/// broadcast was lost to the leg-registration race sat at
+/// `got_peer_info=false` forever with NO recovery channel (zero
+/// keepalives → silence-judged dead at ~124s). Retries end with the
+/// trio: the gate releasing exits the wait, and with it the retry arm.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn directed_setup_frame_stops_welcome_retry() {
+async fn partial_trio_keeps_welcome_retry_armed() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
     local
@@ -323,7 +329,7 @@ async fn directed_setup_frame_stops_welcome_retry() {
             let (sec_to_pri_tx, mut sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
             let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
 
-            let config = resilience_config("sec-directed-stop");
+            let config = resilience_config("sec-partial-trio");
             let secondary_id = config.secondary_id.clone();
             let unified =
                 channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
@@ -332,10 +338,10 @@ async fn directed_setup_frame_stops_welcome_retry() {
             let (mut secondary, _guard) = start_secondary_pump(harness);
 
             let driver = async {
-                // Welcome observed → answer with the DIRECTED half of the
-                // trio (an empty InitialAssignment — the shape
-                // `perform_initial_assignment` sends every known
-                // secondary).
+                // Welcome observed → answer with the DIRECTED halves of
+                // the trio (empty InitialAssignment + TransferComplete —
+                // the production replacement received exactly these two;
+                // the roster broadcast was lost).
                 loop {
                     let frame = sec_to_pri_rx.recv().await.expect("wire open");
                     if matches!(frame.msg_type(), MessageType::SecondaryWelcome) {
@@ -355,31 +361,34 @@ async fn directed_setup_frame_stops_welcome_retry() {
                         uses_file_based_items: true,
                     })
                     .expect("inbound open");
+                pri_to_sec_tx
+                    .send(DistributedMessage::TransferComplete {
+                        target: None,
+                        sender_id: "setup".into(),
+                        timestamp: 0.0,
+                        total_files: 0,
+                        total_bytes: 0,
+                    })
+                    .expect("inbound open");
 
-                // Drain the wire for many retry-cap periods of virtual
-                // time: NO further welcome may appear once the directed
-                // frame proved receipt. (Digest beacons keep flowing —
-                // only the welcome is the assertion subject.)
-                let quiet_until = tokio::time::Instant::now() + Duration::from_secs(120);
+                // The discriminator: with `got_peer_info` still false, a
+                // FURTHER welcome must reach the wire (the retry stayed
+                // armed past the directed halves). The wedge deadline is
+                // PERSISTENT (fires-under-load law).
+                let wedge_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
                 loop {
-                    tokio::select! {
-                        f = sec_to_pri_rx.recv() => {
-                            let frame = f.expect("wire open");
-                            // A welcome ALREADY IN FLIGHT when the directed
-                            // frame landed is indistinguishable from churn
-                            // only within the first backoff period; anything
-                            // beyond one period after the proof is churn.
-                            if matches!(frame.msg_type(), MessageType::SecondaryWelcome)
-                                && tokio::time::Instant::now()
-                                    > quiet_until - Duration::from_secs(119)
-                            {
-                                panic!(
-                                    "welcome retry churned on AFTER a directed \
-                                     setup frame proved receipt"
-                                );
-                            }
-                        }
-                        _ = tokio::time::sleep_until(quiet_until) => break,
+                    let frame = tokio::select! {
+                        f = sec_to_pri_rx.recv() => f.expect("wire open"),
+                        _ = tokio::time::sleep_until(wedge_deadline) => panic!(
+                            "PARTIAL-TRIO DISARM (run_20260612_105712): the \
+                             directed trio halves disarmed the welcome retry \
+                             with got_peer_info still false — the lost roster \
+                             has no retransmit channel and the member wedges \
+                             until it is silence-judged dead"
+                        ),
+                    };
+                    if matches!(frame.msg_type(), MessageType::SecondaryWelcome) {
+                        break; // the retry survived the partial trio
                     }
                 }
             };
@@ -389,7 +398,7 @@ async fn directed_setup_frame_stops_welcome_retry() {
                 res = secondary.run_until_setup_or_done(&mut factory) => {
                     panic!("setup wait must keep waiting for the trio, got {res:?}");
                 }
-                () = driver => { /* quiet window held */ }
+                () = driver => { /* post-partial-trio welcome observed */ }
             }
         })
         .await;

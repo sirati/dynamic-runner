@@ -280,6 +280,7 @@ async fn run(cfg: WrapperConfig) -> ExitCode {
         &net.peer_ips,
         net.quic_port,
         &net.secondary_url,
+        &net.hostname,
         cgroup_parent.as_deref(),
     );
     banner_container_start(&cfg, &layout, &net);
@@ -339,6 +340,12 @@ struct Network {
     peer_ips: PeerIps,
     quic_port: u16,
     secondary_url: String,
+    /// The wrapper host's external FQDN (the SAME source the Reverse-mode
+    /// peer-info record publishes as its line-1 host). Passed to the
+    /// container as `--hostname` so in-container identity matches the
+    /// node — without it the runner reports the container UTS default
+    /// ("unknown") instead of the SLURM node name.
+    hostname: String,
 }
 
 /// Step 7, mode-aware (generate.rs:583-642, :775-791). Allocates the QUIC
@@ -348,6 +355,11 @@ struct Network {
 async fn resolve_network(cfg: &WrapperConfig) -> std::io::Result<Network> {
     let peer_ips = network::detect_peer_ips();
     let quic_port = network::alloc_free_port()?;
+    // Resolved once for BOTH modes: the Reverse-mode peer-info record's
+    // line-1 host AND the container's `--hostname` (see `Network::hostname`)
+    // share this one source, so the published external identity and the
+    // in-container identity can never diverge.
+    let hostname = hostname_fqdn();
 
     let secondary_url = match &cfg.connection {
         ConnectionMode::Reverse {
@@ -356,7 +368,6 @@ async fn resolve_network(cfg: &WrapperConfig) -> std::io::Result<Network> {
             let tunnel_port = network::alloc_free_port()?;
             tracing::info!(target: LOG_TARGET, "Using tunnel port: {tunnel_port}");
             tracing::info!(target: LOG_TARGET, "Using QUIC port: {quic_port}");
-            let hostname = hostname_fqdn();
             let record = network::write_connection_info(
                 std::path::Path::new(connection_info_dir),
                 &cfg.secondary_id,
@@ -388,6 +399,7 @@ async fn resolve_network(cfg: &WrapperConfig) -> std::io::Result<Network> {
         peer_ips,
         quic_port,
         secondary_url,
+        hostname,
     })
 }
 
