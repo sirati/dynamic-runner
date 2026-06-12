@@ -39,27 +39,41 @@ const CTX: &str = "network-accepted";
 /// not slow.
 const WELCOME_TIMEOUT: Duration = Duration::from_secs(60);
 
+// PER-CONNECTION failures never end an accept loop — see the matching
+// commentary in `peer::accept`: the pre-fix loops folded a
+// per-connection handshake failure into `accept()`'s `Err` and broke,
+// so one connection reset mid-handshake (the run_20260611_202345
+// simultaneous reset killed in-flight handshakes cluster-wide)
+// permanently dropped the listener — a re-dialed bootstrap wire then
+// had nowhere to land. Accept at the LISTENER level in the loop; run
+// the handshake inside the spawned per-connection handler.
+
 /// QUIC accept loop.
 pub(super) async fn quic_accept_loop<I: Identifier>(
     listener: QuicListener,
     incoming_tx: InboundTap<I>,
     new_conn_tx: RegistrationSink<I>,
 ) {
-    loop {
-        match listener.accept().await {
-            Ok(conn) => {
-                let incoming_tx = incoming_tx.clone();
-                let new_conn_tx = new_conn_tx.clone();
-                tokio::task::spawn_local(async move {
-                    handle_new_quic_connection(conn, incoming_tx, new_conn_tx).await;
-                });
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "QUIC accept error");
-                break;
-            }
-        }
+    // `None` — the endpoint itself closed — is the only loop exit.
+    while let Some(incoming) = listener.accept_raw().await {
+        let incoming_tx = incoming_tx.clone();
+        let new_conn_tx = new_conn_tx.clone();
+        tokio::task::spawn_local(async move {
+            let conn = match QuicConnection::from_incoming(incoming).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "inbound QUIC handshake failed; dropping the attempt \
+                         (listener kept — the dialer's redial lands fresh)"
+                    );
+                    return;
+                }
+            };
+            handle_new_quic_connection(conn, incoming_tx, new_conn_tx).await;
+        });
     }
+    tracing::debug!("QUIC endpoint closed; accept loop ended");
 }
 
 /// WSS accept loop.
@@ -69,17 +83,36 @@ pub(super) async fn wss_accept_loop<I: Identifier>(
     new_conn_tx: RegistrationSink<I>,
 ) {
     loop {
-        match listener.accept().await {
-            Ok(conn) => {
+        match listener.accept_raw().await {
+            Ok((tcp_stream, peer_addr)) => {
+                tracing::debug!(%peer_addr, "WSS TCP connection accepted");
                 let incoming_tx = incoming_tx.clone();
                 let new_conn_tx = new_conn_tx.clone();
                 tokio::task::spawn_local(async move {
+                    let conn = match WssConnection::accept_handshake(tcp_stream).await {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                %peer_addr,
+                                "inbound WSS upgrade failed; dropping the attempt \
+                                 (listener kept — the dialer's redial lands fresh)"
+                            );
+                            return;
+                        }
+                    };
                     handle_new_wss_connection(conn, incoming_tx, new_conn_tx).await;
                 });
             }
             Err(e) => {
-                tracing::error!(error = %e, "WSS accept error");
-                break;
+                // Listener-level accept(2) fault: the listener socket is
+                // still bound, so keep accepting — paced so a persistent
+                // fault cannot busy-spin the executor.
+                tracing::warn!(
+                    error = %e,
+                    "WSS accept(2) error; listener kept, retrying after backoff"
+                );
+                tokio::time::sleep(crate::wss::ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }

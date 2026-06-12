@@ -23,6 +23,23 @@ const TERMINATE_GRACE: Duration = Duration::from_secs(5);
 /// `waitpid(WNOHANG)` calls are bounded by `TERMINATE_GRACE` anyway.
 const TERMINATE_POLL: Duration = Duration::from_millis(50);
 
+/// Niceness increment applied to every worker subprocess at spawn
+/// (owner-set constant — deliberately +10, not +19, and deliberately
+/// NOT configurable).
+///
+/// A coordinator co-located with a full complement of uncapped workers
+/// is starved at default equal scheduler weight — in production a
+/// primary's main loop lagged its own ticks 12× over 22 minutes,
+/// false-death deferrals engaged, report-ACK servicing starved and
+/// fleets collapsed. Spawning workers at nice +10 keeps the (mostly
+/// idle, latency-critical) control plane schedulable under full worker
+/// load: `nice` is inherited across fork/exec so JVM/compiler children
+/// of the worker inherit it automatically, and an unprivileged process
+/// cannot renice back UP, so it sticks for the whole worker subtree.
+/// Lowering priority needs no capability, so this is rootless-podman
+/// safe. The coordinator itself stays at its launch priority.
+const WORKER_NICENESS: i32 = 10;
+
 /// Resolve a worker's `(stdout, stderr)` stdio destinations from an
 /// optional capture-file path.
 ///
@@ -371,6 +388,13 @@ impl SubprocessWorkerFactory {
     /// teardown and orphaning compute that the operator already
     /// declared unwanted.
     ///
+    /// Worker at lower CPU priority than the coordinator: a `pre_exec`
+    /// hook (see `spawn_priority`) lowers the child's niceness by
+    /// [`WORKER_NICENESS`] relative to this process, so the co-located
+    /// control plane keeps scheduler priority under full worker load.
+    /// Inherited by everything the worker forks; best-effort (a renice
+    /// failure never blocks the spawn).
+    ///
     /// Worker attached to its per-worker sub-cgroup on `fork(2)` /
     /// pre-`execve(2)`: when `subcgroup_procs` is `Some`, a `pre_exec`
     /// closure writes the child's pid to that leaf's `cgroup.procs`.
@@ -400,6 +424,11 @@ impl SubprocessWorkerFactory {
         }
         cmd.stdin(std::process::Stdio::null())
             .process_group(0);
+        // Worker runs at lower CPU priority than the spawning
+        // coordinator (see `WORKER_NICENESS`); applied at the ONE
+        // command-construction chokepoint so initial spawns and every
+        // respawn flavour are deprioritised uniformly.
+        crate::spawn_priority::lower_child_priority(&mut cmd, WORKER_NICENESS);
         // Route the worker's OS-stdout + stderr to its per-worker log file
         // (append) so a crash that bypasses Python logging is still captured;
         // fall back to silence when no capture path is set or the open fails.
@@ -1104,6 +1133,59 @@ mod tests {
         assert_eq!(
             initial.stdio_capture, respawn.stdio_capture,
             "stdio capture path must be byte-identical"
+        );
+    }
+
+    /// CPU-priority pin: every worker subprocess built by
+    /// `command_from_rendered` — the ONE chokepoint all spawn paths
+    /// (initial pool, type-shift respawn, startup-crash respawn) funnel
+    /// through — runs at niceness +10 relative to the spawning process,
+    /// so a full complement of busy workers cannot starve the
+    /// co-located coordinator's control plane at equal scheduler
+    /// weight. `nice` is inherited across fork/exec and an unprivileged
+    /// process cannot renice back UP, so the whole worker subtree
+    /// stays deprioritised while the coordinator keeps its own
+    /// priority.
+    ///
+    /// The child reads its own niceness from `/proc/self/stat` field 19
+    /// (inherited by `awk` from the pre-exec'd `sh`); the expectation is
+    /// relative to THIS process's niceness (clamped at the kernel max
+    /// of 19) so the pin holds even when the test runner itself was
+    /// launched under `nice`.
+    #[test]
+    fn command_from_rendered_lowers_child_niceness_by_ten() {
+        let factory = make_factory_with_two_types();
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("niceness.out");
+
+        let rendered = RenderedCommand {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "awk '{print $19}' /proc/self/stat".to_string(),
+            ],
+            env: std::collections::HashMap::new(),
+            cwd: None,
+            stdio_capture: Some(out_path.clone()),
+        };
+        let mut cmd = factory.command_from_rendered(&rendered, None);
+        let status = cmd.spawn().expect("spawn sh").wait().expect("wait sh");
+        assert!(status.success(), "sh exited non-success: {status:?}");
+
+        let child_nice: i64 = std::fs::read_to_string(&out_path)
+            .expect("child should have written its niceness")
+            .trim()
+            .parse()
+            .expect("niceness should be an integer");
+        // SAFETY: plain getpriority(2) query on our own process — no
+        // global state mutated. (`-1` is a valid return here, not an
+        // error sentinel worth disambiguating for a test baseline.)
+        let own_nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) } as i64;
+        assert_eq!(
+            child_nice,
+            (own_nice + i64::from(WORKER_NICENESS)).min(19),
+            "worker child must run {WORKER_NICENESS} niceness below its spawner \
+             (spawner is at {own_nice})",
         );
     }
 }

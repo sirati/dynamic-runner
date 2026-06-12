@@ -15,9 +15,10 @@
 //!   local reader (`read_peer_info_dir_v2`) then consumes;
 //! - tunnel machinery: [`dynrunner_slurm::LocalForwardTunnels`] spawns
 //!   one `ssh -N -L 127.0.0.1:<local>:<compute>:<quic_port>
-//!   <gateway>` per seed peer (per-peer registry, 3s alive-gate,
-//!   same-port rebuild, half-dead escalation — the `-R` path's
-//!   lifecycle policy);
+//!   <gateway>` per seed peer — concurrently, each a mux client over
+//!   the connected gateway's ControlMaster socket (per-peer registry,
+//!   3s alive-gate, same-port rebuild, half-dead escalation — the
+//!   `-R` path's lifecycle policy);
 //! - seed building: the sibling [`super::helpers::records_to_seed`]
 //!   stays byte-identical; [`rewrite_seed_for_local_forwards`] below is
 //!   the SINGLE place a fetched record's dial target is replaced by its
@@ -196,7 +197,15 @@ async fn acquire_over_connected_gateway(
             })
         })
         .collect();
-    let tunnels = Arc::new(LocalForwardTunnels::new(cfg.clone()));
+    //    Each `ssh -L` multiplexes over the connected gateway's
+    //    ControlMaster socket (one real auth session; the registry
+    //    falls back to direct dials if the master dies), so the
+    //    whole cohort establishes concurrently in one alive-gate
+    //    window instead of ~3s × N sequentially.
+    let tunnels = Arc::new(LocalForwardTunnels::new(
+        cfg.clone(),
+        gateway.control_path().map(str::to_owned),
+    ));
     let endpoints = tunnels.establish(&targets).await.map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("observer late-joiner: {e}"))
     })?;

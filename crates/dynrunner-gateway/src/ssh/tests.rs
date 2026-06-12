@@ -221,3 +221,15 @@ fn parse_master_pid_rejects_overflow() {
         None
     );
 }
+
+/// The mux-liveness gate: an absent control socket is `false` — the
+/// canonical "master never spawned / already dead" shape a fallback
+/// caller must see. (`ssh -O check` talks only to the local socket,
+/// so this probes offline and fast.)
+#[tokio::test]
+async fn control_socket_alive_false_when_socket_missing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cp = dir.path().join("no-such-master.sock");
+    let cfg = ssh_config_with(None, None);
+    assert!(!super::control_socket_alive(&cp.to_string_lossy(), &cfg).await);
+}

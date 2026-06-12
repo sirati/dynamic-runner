@@ -64,6 +64,10 @@ impl PyPrimaryCoordinator {
         // captured on the GIL thread for the detached-runtime `PrimaryConfig`
         // so this primary answers `RequestRunConfig` from its own copy.
         let forwarded_argv = self.forwarded_argv.clone();
+        // Local credential-store target (the SLURM pipeline points it
+        // into the run's local cert dir; `None` elsewhere) — captured
+        // for the detached-runtime `PrimaryConfig`.
+        let peer_credentials_path = self.peer_credentials_path.clone();
         // Take the parked deployment-mode job-manager handle (if any)
         // out for the detached runtime so the inner coordinator can
         // park it on itself before `run()` enters. `None` for the
@@ -420,6 +424,10 @@ impl PyPrimaryCoordinator {
                     // `RequestRunConfig` so every joining / promoted node
                     // sources a byte-identical copy from the submitter.
                     forwarded_argv,
+                    // Where to persist the roster's cert pins locally
+                    // (the late-joiner pickup); `None` outside the
+                    // SLURM submitter path.
+                    peer_credentials_path,
                     // Staged silence schedule: keepalive-interval-relative
                     // defaults (not surfaced on the Python config today).
                     ..PrimaryConfig::default()
