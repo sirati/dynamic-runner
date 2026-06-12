@@ -36,7 +36,38 @@ fn hash_one<H: Hash>(value: H) -> u64 {
 }
 
 impl<I: Identifier> ClusterState<I> {
-    /// Build a compact anti-entropy [`StateDigest`] of the whole ledger.
+    /// Build a compact anti-entropy [`StateDigest`] of the whole ledger,
+    /// served from the node-local memo when it is clean.
+    ///
+    /// The fold is O(ledger) (66k+ tasks + outputs + capabilities +
+    /// grow-max maps); the anti-entropy receive cadence calls this on EVERY
+    /// inbound `StateDigest` frame and on every `snapshot_json` cache check,
+    /// so an unchanged ledger is folded over and over. The memo
+    /// ([`ClusterState::digest_cache`]) collapses that to ONE fold per
+    /// ledger generation: a clean read returns the stored value; a cleared
+    /// read recomputes once via [`Self::compute_digest`] and re-populates.
+    /// The memo is cleared at every folded-field mutation seam (see the
+    /// `digest_cache` field doc), so a memo HIT is byte-identical to a fresh
+    /// fold by construction — the `digest_memo_matches_fresh_fold`
+    /// differential test pins this.
+    ///
+    /// Populates the memo through `&self` (the `Cell` interior mutability),
+    /// so the read signature is unchanged and no caller — primary,
+    /// secondary, observer, or `snapshot_json` — learns the memo exists.
+    pub fn digest(&self) -> StateDigest {
+        if let Some(cached) = self.digest_cache.get() {
+            return cached;
+        }
+        let computed = self.compute_digest();
+        self.digest_cache.set(Some(computed));
+        computed
+    }
+
+    /// The pure O(ledger) fold that builds a [`StateDigest`] from scratch —
+    /// the un-memoized projection [`Self::digest`] caches. Held private so
+    /// the only un-memoized caller is `digest()`'s recompute branch (and the
+    /// differential test, via a `#[cfg(test)]` re-export below); every other
+    /// caller goes through the memo.
     ///
     /// Sibling to [`Self::snapshot`] and bound by the SAME structural-
     /// completeness guard: the exhaustive destructure below (NO `..`)
@@ -48,7 +79,11 @@ impl<I: Identifier> ClusterState<I> {
     ///
     /// Read-only: every binding is consumed by a count or an
     /// order-independent fold; nothing is mutated.
-    pub fn digest(&self) -> StateDigest {
+    fn compute_digest(&self) -> StateDigest {
+        // Count this full fold for the memo-hit tests (a memo HIT skips
+        // this method entirely, so the counter stays put). Pure diagnostic;
+        // carries no convergence signal.
+        self.digest_fold_count.set(self.digest_fold_count.get() + 1);
         // Exhaustive destructure (NO `..` rest pattern) — the structural
         // completeness guard, mirroring `snapshot()`. Every `ClusterState`
         // field is NAMED here. The node-local fields (dispatcher senders,
@@ -154,6 +189,12 @@ impl<I: Identifier> ClusterState<I> {
             // node-local: the dead-rejoin WARN throttle is a per-node log
             // gate (#416) — carries no convergence signal.
             dead_rejoin_warn: _dead_rejoin_warn,
+            // node-local: the digest memo + its fold counter are pure
+            // derivations of the replicated fields (the memo IS this fold's
+            // own result), so they carry no convergence signal — same
+            // classification as `snapshot_json_cache`.
+            digest_cache: _digest_cache,
+            digest_fold_count: _digest_fold_count,
         } = self;
 
         // `peer_holdings` is steady-state best-effort metadata
@@ -302,5 +343,20 @@ impl<I: Identifier> ClusterState<I> {
             custom_terminal_watermarks_count: custom_terminal_watermarks.len() as u64,
             custom_terminal_watermarks_hash,
         }
+    }
+
+    /// Test seam: the un-memoized fold AND the count of full folds run so
+    /// far. The differential pin (`digest_memo_matches_fresh_fold`) asserts
+    /// the memoized [`Self::digest`] equals this fresh fold after every
+    /// mutation; the memo-hit pins (`digest`/`snapshot_json_cache` tests)
+    /// read the count to prove a clean read skips the fold.
+    #[cfg(test)]
+    pub(crate) fn fresh_digest_fold(&self) -> StateDigest {
+        self.compute_digest()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn digest_fold_count(&self) -> u64 {
+        self.digest_fold_count.get()
     }
 }

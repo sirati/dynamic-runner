@@ -40,7 +40,6 @@ pub(super) fn test_oom_watcher() -> OomWatcher {
     OomWatcher::new_with_workers_cgroup(
         OomWatcherConfig {
             sample_interval: Duration::from_millis(50),
-            decision_interval: Duration::from_millis(100),
             heartbeat_interval: Duration::from_secs(60),
             log_enabled: false,
         },
