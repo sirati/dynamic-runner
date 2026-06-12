@@ -376,6 +376,25 @@ def add_framework_arguments(
         ),
     )
     parser.add_argument(
+        "--observer-mesh-credentials",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help=(
+            "Path of the submitter-persisted peer-credentials file (the "
+            "run's per-peer QUIC cert pins, written by the setup primary "
+            "into the run's local cert dir as peer_credentials.json). Only "
+            "meaningful with --observer-join-from-peer-info-dir in LOCAL "
+            "mode: the certs are overlaid onto the seed so the observer "
+            "dials peers over QUIC with valid certs instead of degrading "
+            "to WSS. OMITTED: the conventional location "
+            "(/tmp/db-runner-cert-<run_id>/peer_credentials.json, derived "
+            "from the peer-info dir's run id) is probed automatically and "
+            "silently skipped when absent. Rejected together with a remote "
+            "--gateway (tunneled legs are TCP-only; QUIC cannot ride them)."
+        ),
+    )
+    parser.add_argument(
         "--secondary-id",
         type=str,
         help="Unique identifier for this secondary (required with --secondary)",
@@ -835,5 +854,18 @@ def validate_parsed_args(args: argparse.Namespace, parser: argparse.ArgumentPars
                 "cluster, OR --secondary to be a regular worker-bearing "
                 "secondary that connects to the primary URL."
             )
+
+    # --observer-mesh-credentials is INPUT to the late-joiner's seed
+    # construction; without the late-joiner mode nothing ever reads it.
+    # Reject up-front rather than silently ignoring an operator-supplied
+    # credentials file.
+    if getattr(args, "observer_mesh_credentials", None) and not getattr(
+        args, "observer_join_from_peer_info_dir", None
+    ):
+        parser.error(
+            "--observer-mesh-credentials requires "
+            "--observer-join-from-peer-info-dir: the credentials file is "
+            "only read by the late-joiner observer's seed construction."
+        )
 
 

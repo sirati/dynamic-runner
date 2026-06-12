@@ -114,3 +114,113 @@ async fn worker_requester_gets_secondary_typed_reply() {
         })
         .await;
 }
+
+/// The secondary responder answers a snapshot pull REGARDLESS of its
+/// routing stamp. Two production stamp shapes:
+///
+///   - `Some(Destination::Secondary(<responder>))` — the egress-stamped
+///     anti-entropy pull (`reconcile_against_peer` types every pull
+///     `Secondary(sender)` and the puller's egress stamps it);
+///   - `Some(Destination::Primary)` — a primary-addressed pull the
+///     mesh-ingress fan-fallback hands to the secondary slot when the
+///     named role has no live local slot (stale sender-side role
+///     knowledge).
+///
+/// The stamp is the WIRE ENVELOPE's routing header, not request
+/// semantics — the responder serves its replica for every shape. Pins
+/// the masking-refutation half of the starved-primary RCA: the
+/// SECONDARY dispatch arm was never the stamped-drop site (that was the
+/// primary's `target: None` pattern).
+#[tokio::test(flavor = "current_thread")]
+async fn target_stamped_request_is_answered_not_dropped() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            for stamp in [
+                Destination::Secondary(PeerId::from("responder")),
+                Destination::Primary,
+            ] {
+                let (mut sec, peer_log) = make_recording_secondary("responder");
+                sec.enter_operational_for_test();
+
+                let req = DistributedMessage::RequestClusterSnapshot {
+                    target: None,
+                    sender_id: "peer-0".into(),
+                    timestamp: 0.0,
+                    is_observer: false,
+                    can_be_primary: true,
+                }
+                .with_target(stamp.clone());
+                sec.dispatch_message(req, &mut FakeWorkerFactory)
+                    .await
+                    .expect("stamped RequestClusterSnapshot handler succeeds");
+                sec.drain_egress().await;
+
+                let answered = peer_log
+                    .borrow()
+                    .iter()
+                    .any(|m| matches!(m, DistributedMessage::ClusterSnapshot { .. }));
+                assert!(
+                    answered,
+                    "the secondary must answer a snapshot pull stamped {stamp:?}; \
+                     a silent stamp-filtered drop starves the puller"
+                );
+            }
+        })
+        .await;
+}
+
+/// A ROSTERLESS late-joiner (in no replicated roster — it is bootstrapping
+/// precisely to learn the roster) with a live direct transport leg is
+/// answered: the reply's no-route gate reads the TRANSPORT membership
+/// (`has_route` over the published view), never the CRDT roster, so the
+/// joiner's accept-side leg is a sufficient return wire. Replays the
+/// production joiner shape: requests arrive un-stamped (`target: None` —
+/// the raw `join_running_cluster` send bypasses any coordinator egress)
+/// from an id the responder has never seen in any `PeerJoined`.
+#[tokio::test(flavor = "current_thread")]
+async fn rosterless_joiner_with_direct_leg_is_answered() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, peer_log, membership) = super::super::test_helpers::
+                make_secondary_recording_with_membership(election_config("responder"), 1);
+            sec.enter_operational_for_test();
+
+            // The joiner's direct leg registers in the TRANSPORT membership
+            // (the accept-side connection) — but no CRDT roster entry
+            // exists for it anywhere.
+            membership
+                .borrow_mut()
+                .push(PeerId::from("late-joiner-7"));
+            sec.publish_membership();
+
+            let req = DistributedMessage::RequestClusterSnapshot {
+                target: None,
+                sender_id: "late-joiner-7".into(),
+                timestamp: 0.0,
+                is_observer: true,
+                can_be_primary: false,
+            };
+            sec.dispatch_message(req, &mut FakeWorkerFactory)
+                .await
+                .expect("rosterless joiner request handler succeeds");
+            sec.drain_egress().await;
+
+            let reply_target = peer_log.borrow().iter().find_map(|m| match m {
+                DistributedMessage::ClusterSnapshot { .. } => {
+                    Some(m.target().cloned())
+                }
+                _ => None,
+            });
+            assert_eq!(
+                reply_target,
+                Some(Some(Destination::Observer(PeerId::from("late-joiner-7")))),
+                "the reply must reach the rosterless joiner over its direct \
+                 leg, typed off its self-declared role"
+            );
+        })
+        .await;
+}

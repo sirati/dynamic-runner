@@ -50,6 +50,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             })
             .collect();
 
+        // Persist the roster's connection credentials to LOCAL state
+        // when configured (the setup/submitter primary) — the SAME
+        // `peers` list the broadcast below fans out, captured at the
+        // moment it exists instead of dropping it with process memory.
+        // A late-joiner observer on this host overlays the cert pins
+        // onto its `.info`-derived seed and dials QUIC with valid
+        // certs. Never fatal; see `peer_credentials::store_if_configured`.
+        crate::peer_credentials::store_if_configured(
+            self.config.peer_credentials_path.as_deref(),
+            &peers,
+        );
+
         // Originate one `PeerJoined { is_observer: true }` mutation
         // per observer secondary, applied locally and broadcast over
         // the same CRDT path as `seed_cluster_state`'s `PhaseDepsSet`

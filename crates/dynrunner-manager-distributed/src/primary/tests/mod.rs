@@ -40,6 +40,7 @@ mod message_phase_ordering;
 mod node_gates;
 mod oom_bucket;
 mod oploop_arm_hunt;
+mod peer_credentials_persist;
 mod phase_decision;
 mod phase_end_raise;
 mod phase_ordering;

@@ -214,6 +214,19 @@ pub(super) fn drive_rust_primary<'py>(
         coord_kwargs.set_item("panik_watcher_poll_interval_secs", secs)?;
     }
 
+    // Persist the roster's peer connection credentials (per-peer cert
+    // pins) into the run's LOCAL cert dir — the submitter is the only
+    // primary with a local late-joiner spawn home, so the path is set
+    // HERE, not in the generic coordinator defaults. A late-joiner
+    // observer on this host derives the same path from the run id and
+    // upgrades its peer dials to valid-cert QUIC.
+    coord_kwargs.set_item(
+        "peer_credentials_path",
+        crate::slurm::local_run_state::peer_credentials_path(
+            &crate::slurm::local_run_state::cert_dir_for_run(&outcome.run_id),
+        ),
+    )?;
+
     let num_secondaries = outcome.num_secondaries;
     let args_tuple = PyTuple::new(
         py,

@@ -250,7 +250,12 @@ pub(crate) fn run_slurm_pipeline<'py>(
     let job_manager_cls = job_manager_module.getattr("SlurmJobManager")?;
     let job_manager = job_manager_cls.call1((&gateway, &slurm_config, &packaging, deployment))?;
 
-    let cert_dir_str = format!("/tmp/db-runner-cert-{run_id}");
+    // Local per-run state home — naming owned by `local_run_state` (the
+    // late-joiner derives the SAME path to pick up the persisted peer
+    // credentials, so the convention must have exactly one owner).
+    let cert_dir_str = crate::slurm::local_run_state::cert_dir_for_run(&run_id)
+        .to_string_lossy()
+        .into_owned();
     let pathlib = py.import("pathlib")?;
     let cert_dir = pathlib.getattr("Path")?.call1((cert_dir_str,))?;
     let mkdir_kwargs = PyDict::new(py);

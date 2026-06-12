@@ -1,7 +1,10 @@
-//! Peer-info-dir helpers: error mapping + seed-record construction.
+//! Peer-info-dir helpers: error mapping, seed-record construction, and
+//! the local peer-credentials overlay (cert pins for QUIC dials).
 //!
-//! Both are pure functions called from the run loop; isolated here so
-//! the dispatcher body stays focused on orchestration.
+//! Called from the run loop; isolated here so the dispatcher body
+//! stays focused on orchestration. `apply_local_peer_credentials` is
+//! the one function with filesystem access (the credentials probe +
+//! load); the rest are pure.
 
 use pyo3::prelude::*;
 
@@ -94,6 +97,83 @@ pub(super) fn records_to_seed(records: &[PeerInfoRecord]) -> Vec<PeerConnectionI
             })
         })
         .collect()
+}
+
+/// Overlay the submitter-persisted peer credentials (the roster's cert
+/// pins — [`dynrunner_manager_distributed::peer_credentials`]) onto a
+/// LOCAL-mode seed, so the joiner's peer dials authenticate over QUIC
+/// instead of degrading to WSS.
+///
+/// Path resolution:
+/// - `explicit_path` (`--observer-mesh-credentials`): the file MUST
+///   load — the operator asked for it, so a failure is a hard error.
+/// - `None`: derive the conventional location from the peer-info dir's
+///   run id (`crate::slurm::local_run_state`) and PROBE it. Absent →
+///   nothing happens (old run dirs / non-submitter hosts keep today's
+///   WSS-fallback behaviour exactly); present-but-unloadable → WARN
+///   and continue (a stale or torn file must not brick the join).
+///
+/// Gateway mode never calls this: tunneled legs are TCP-only (no
+/// QUIC), and the constructor rejects the explicit flag with
+/// `--gateway` up front.
+pub(super) fn apply_local_peer_credentials(
+    seed: &mut [PeerConnectionInfo],
+    explicit_path: Option<&std::path::Path>,
+    peer_info_dir: &std::path::Path,
+) -> PyResult<()> {
+    use crate::slurm::local_run_state;
+    use dynrunner_manager_distributed::peer_credentials;
+
+    let (path, explicit) = match explicit_path {
+        Some(p) => (p.to_path_buf(), true),
+        None => {
+            let Some(run_id) = local_run_state::derive_run_id_from_info_dir(peer_info_dir) else {
+                tracing::debug!(
+                    peer_info_dir = %peer_info_dir.display(),
+                    "peer-info dir does not follow the <base>/<run_id>/connection_info \
+                     convention; skipping the local peer-credentials probe"
+                );
+                return Ok(());
+            };
+            let p = local_run_state::peer_credentials_path(&local_run_state::cert_dir_for_run(
+                &run_id,
+            ));
+            if !p.exists() {
+                tracing::debug!(
+                    path = %p.display(),
+                    "no local peer-credentials file for this run; peer dials \
+                     keep the WSS fallback"
+                );
+                return Ok(());
+            }
+            (p, false)
+        }
+    };
+    match peer_credentials::load_peer_credentials(&path) {
+        Ok(creds) => {
+            let filled = peer_credentials::overlay_seed_certs(seed, &creds);
+            tracing::info!(
+                path = %path.display(),
+                credential_entries = creds.len(),
+                seed_certs_overlaid = filled,
+                "loaded local peer credentials; cert-pinned seed entries will \
+                 dial peers over QUIC with valid certs"
+            );
+            Ok(())
+        }
+        Err(e) if explicit => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "observer late-joiner: failed to load the explicit mesh-credentials file: {e}"
+        ))),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "derived local peer-credentials file failed to load; \
+                 continuing with the WSS fallback"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Decode every bootstrap snapshot reply (wire-erased JSON strings) into
@@ -246,5 +326,100 @@ mod tests {
             .expect("snapshot serializes");
         let snaps = decode_bootstrap_snapshots(&[json]).expect("valid snapshot decodes");
         assert_eq!(snaps.len(), 1);
+    }
+
+    fn certless_seed_entry(id: &str) -> PeerConnectionInfo {
+        PeerConnectionInfo {
+            secondary_id: id.into(),
+            cert: String::new(),
+            ipv4: Some("10.0.0.1".into()),
+            ipv6: None,
+            port: 5000,
+            is_observer: false,
+            liveness_port: None,
+        }
+    }
+
+    /// EXPLICIT credentials path (`--observer-mesh-credentials`): a
+    /// load failure is a HARD error — the operator asked for the file,
+    /// silently proceeding cert-less would lie about the dial security.
+    #[test]
+    fn explicit_credentials_path_load_failure_is_fatal() {
+        let mut seed = vec![certless_seed_entry("sec-0")];
+        let err = apply_local_peer_credentials(
+            &mut seed,
+            Some(std::path::Path::new("/nonexistent/peer_credentials.json")),
+            std::path::Path::new("/anywhere/connection_info"),
+        )
+        .expect_err("an explicit-but-unloadable credentials file must hard-fail");
+        assert!(
+            err.to_string().contains("mesh-credentials"),
+            "the error must name the credentials load failure: {err}"
+        );
+    }
+
+    /// EXPLICIT path that loads: certs are overlaid onto the cert-less
+    /// seed entries by id.
+    #[test]
+    fn explicit_credentials_path_overlays_certs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer_credentials.json");
+        let mut cred = certless_seed_entry("sec-0");
+        cred.cert = "PINNED-CERT".into();
+        dynrunner_manager_distributed::peer_credentials::store_peer_credentials(&path, &[cred])
+            .unwrap();
+
+        let mut seed = vec![certless_seed_entry("sec-0"), certless_seed_entry("sec-1")];
+        apply_local_peer_credentials(
+            &mut seed,
+            Some(&path),
+            std::path::Path::new("/anywhere/connection_info"),
+        )
+        .expect("a loadable explicit credentials file applies");
+        assert_eq!(seed[0].cert, "PINNED-CERT");
+        assert_eq!(seed[1].cert, "", "an uncovered peer stays cert-less (WSS fallback)");
+    }
+
+    /// NO explicit path, conventional run dir, credentials PRESENT at
+    /// the derived `/tmp/db-runner-cert-<run_id>` location: the full
+    /// derive→probe→load→overlay path fills the certs — the exact
+    /// pickup a late-joiner spawned on the submitter host runs. Uses a
+    /// unique 1999-dated run id so it can never collide with a real
+    /// run's local state; cleans the /tmp dir up afterwards.
+    #[test]
+    fn derived_credentials_present_overlay_end_to_end() {
+        let run_id = format!("run_19990101_{:06}", std::process::id() % 1_000_000);
+        let cert_dir = crate::slurm::local_run_state::cert_dir_for_run(&run_id);
+        let cred_path = crate::slurm::local_run_state::peer_credentials_path(&cert_dir);
+        let mut cred = certless_seed_entry("sec-0");
+        cred.cert = "DERIVED-CERT".into();
+        dynrunner_manager_distributed::peer_credentials::store_peer_credentials(
+            &cred_path,
+            &[cred],
+        )
+        .unwrap();
+
+        let info_dir = std::path::PathBuf::from(format!("/cluster/logs/{run_id}/connection_info"));
+        let mut seed = vec![certless_seed_entry("sec-0")];
+        let result = apply_local_peer_credentials(&mut seed, None, &info_dir);
+        // Clean up BEFORE asserting so a failure doesn't leak /tmp state.
+        std::fs::remove_dir_all(&cert_dir).ok();
+        result.expect("derived credentials must apply");
+        assert_eq!(seed[0].cert, "DERIVED-CERT");
+    }
+
+    /// NO explicit path + a peer-info dir that doesn't follow the
+    /// run-id convention: nothing is probed, the seed is untouched, and
+    /// the call succeeds — the old-run-dirs backward-compat contract.
+    #[test]
+    fn derived_credentials_absent_keeps_seed_unchanged() {
+        let mut seed = vec![certless_seed_entry("sec-0")];
+        apply_local_peer_credentials(
+            &mut seed,
+            None,
+            std::path::Path::new("/data/not-a-run-dir/connection_info"),
+        )
+        .expect("absence of credentials must never fail the join");
+        assert_eq!(seed[0].cert, "");
     }
 }
