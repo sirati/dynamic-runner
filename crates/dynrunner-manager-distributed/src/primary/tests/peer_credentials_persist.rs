@@ -64,17 +64,19 @@ async fn drive_send_peer_lists_inner(n: u32, path: Option<std::path::PathBuf>) {
                 can_be_primary: true,
             })
             .await;
-        primary.handle_cert_exchange(DistributedMessage::CertExchange {
-            target: None,
-            sender_id: id.clone(),
-            timestamp: 0.0,
-            secondary_id: id.clone(),
-            public_cert_pem: format!("CERT-PEM-{i}"),
-            ipv4_address: Some("10.0.0.7".into()),
-            ipv6_address: None,
-            quic_port: 4000 + i as u16,
-            liveness_port: Some(5000 + i as u16),
-        });
+        primary
+            .handle_cert_exchange(DistributedMessage::CertExchange {
+                target: None,
+                sender_id: id.clone(),
+                timestamp: 0.0,
+                secondary_id: id.clone(),
+                public_cert_pem: format!("CERT-PEM-{i}"),
+                ipv4_address: Some("10.0.0.7".into()),
+                ipv6_address: None,
+                quic_port: 4000 + i as u16,
+                liveness_port: Some(5000 + i as u16),
+            })
+            .await;
     }
 
     primary

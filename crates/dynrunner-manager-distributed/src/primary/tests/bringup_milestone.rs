@@ -77,17 +77,19 @@ async fn connect_and_capture(requested: u32, welcomed: u32) -> Vec<String> {
                 can_be_primary: true,
             })
             .await;
-        primary.handle_cert_exchange(DistributedMessage::CertExchange {
-            target: None,
-            sender_id: id.clone(),
-            timestamp: 0.0,
-            secondary_id: id.clone(),
-            public_cert_pem: "cert".into(),
-            ipv4_address: Some("127.0.0.1".into()),
-            ipv6_address: None,
-            quic_port: 4000 + i as u16,
-            liveness_port: Some(5000 + i as u16),
-        });
+        primary
+            .handle_cert_exchange(DistributedMessage::CertExchange {
+                target: None,
+                sender_id: id.clone(),
+                timestamp: 0.0,
+                secondary_id: id.clone(),
+                public_cert_pem: "cert".into(),
+                ipv4_address: Some("127.0.0.1".into()),
+                ipv6_address: None,
+                quic_port: 4000 + i as u16,
+                liveness_port: Some(5000 + i as u16),
+            })
+            .await;
     }
 
     let capture = TargetCapture::for_target(IMPORTANT_TARGET);

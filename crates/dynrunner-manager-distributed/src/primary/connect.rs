@@ -308,7 +308,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
         match msg.msg_type() {
             MessageType::SecondaryWelcome => self.handle_welcome(msg).await,
-            MessageType::CertExchange => self.handle_cert_exchange(msg),
+            MessageType::CertExchange => self.handle_cert_exchange(msg).await,
             MessageType::TaskRequest => self.handle_task_request(msg, command_rx).await?,
             // Wire task terminals route through the terminal-ordering
             // gate (`terminal_gate.rs`): a terminal whose origin's
@@ -718,7 +718,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
     }
 
-    pub(super) fn handle_cert_exchange(&mut self, msg: DistributedMessage<I>) {
+    pub(super) async fn handle_cert_exchange(&mut self, msg: DistributedMessage<I>) {
         if let DistributedMessage::CertExchange {
             target: None,
             secondary_id,
@@ -746,6 +746,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     SecondaryConnectionState::CertExchanging(conn),
                 );
                 tracing::debug!(secondary = %secondary_id, "cert exchange received");
+                // Incremental setup delivery: the member is servable the
+                // moment its cert/addresses land — notify the setup-
+                // delivery owner (`peer_setup`) so the grown roster is
+                // broadcast NOW and this member's typestate is walked,
+                // instead of holding it (and every earlier-welcomed
+                // member) hostage until the whole fleet has welcomed.
+                // Fires only on this Handshaking → CertExchanging edge:
+                // a duplicate cert-exchange (the load-bearing handshake
+                // retry) finds the member already walked and lands in
+                // the `else` arm below, so retries never re-broadcast.
+                self.serve_setup_on_cert_exchange(&secondary_id).await;
             } else {
                 self.secondaries.insert(secondary_id, state);
             }

@@ -291,16 +291,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // only spins up post-`wait_for_setup`) was about to start
         // ticking.
         for secondary_id in &secondary_ids {
-            if let Some(state) = self.secondaries.remove(secondary_id) {
-                let new_state = match state {
-                    SecondaryConnectionState::InitialAssigning(conn) => {
-                        SecondaryConnectionState::Operational(conn.assignments_sent())
-                    }
-                    other => other,
-                };
-                self.secondaries.insert(secondary_id.clone(), new_state);
-            }
-            self.seed_keepalive(secondary_id);
+            self.mark_member_operational(secondary_id);
         }
 
         let assigned: usize = assignments_per_secondary.values().map(|v| v.len()).sum();
@@ -322,6 +313,26 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         );
 
         Ok(InitialAssignmentOutcome::Completed)
+    }
+
+    /// The ONE per-member operational typestate walk:
+    /// `InitialAssigning → Operational` ("its `InitialAssignment` has
+    /// been sent"), plus the keepalive re-seed. No-op state-wise from
+    /// any other state; the keepalive seed always runs (matching the
+    /// historical batch, which seeded every CRDT-known id whether or
+    /// not a connection typestate existed for it).
+    fn mark_member_operational(&mut self, secondary_id: &str) {
+        if let Some(state) = self.secondaries.remove(secondary_id) {
+            let new_state = match state {
+                SecondaryConnectionState::InitialAssigning(conn) => {
+                    SecondaryConnectionState::Operational(conn.assignments_sent())
+                }
+                other => other,
+            };
+            self.secondaries
+                .insert(secondary_id.to_string(), new_state);
+        }
+        self.seed_keepalive(secondary_id);
     }
 
     // ── Phase 6: Transfer Complete ──

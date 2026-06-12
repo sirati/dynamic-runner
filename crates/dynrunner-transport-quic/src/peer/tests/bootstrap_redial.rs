@@ -227,6 +227,96 @@ async fn dropped_bootstrap_wire_is_redialed_and_refolded() {
         .await;
 }
 
+/// PRE-SETUP arming pin: the BACKGROUND bring-up fold — the
+/// [`super::super::bootstrap_redial::BootstrapFoldHandle`] hand-over the
+/// secondary's `dial_secondary_mesh` uses, i.e. the ONLY fold that
+/// exists while a welcomed member is still waiting for its setup trio —
+/// must arm the re-dial supervisor exactly like the synchronous
+/// `register_primary_link` fold does. A bootstrap wire that dies during
+/// the PRE-setup wait (the welcomed-but-unserved window) is re-dialed
+/// and re-folded; the member never sits unconfigured on a dead wire
+/// with no re-dial path.
+#[tokio::test(flavor = "current_thread")]
+async fn background_bringup_fold_arms_redial_for_presetup_wire_death() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let listener = WssListener::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .expect("bind test WSS listener");
+            let addr: SocketAddr = listener.local_addr();
+
+            let mut net: PeerNetwork<TestId> = PeerNetwork::start("sec-0", None).await.unwrap();
+
+            // ---- Background bring-up fold (the pre-setup path) ----
+            // Dial + accept concurrently, then hand the wire over through
+            // the ASYNC fold handle — exactly what the detached bring-up
+            // dial task does once its dial lands.
+            let (client_res, server_res) = tokio::join!(
+                NetworkClient::<TestId>::connect_wss_only(addr),
+                listener.accept()
+            );
+            let client = client_res.expect("bring-up bootstrap dial");
+            let server_conn: WssConnection = server_res.expect("accept bring-up bootstrap wire");
+            net.bootstrap_fold_handle()
+                .fold("primary".to_string(), addr, client);
+
+            // The fold is processed by the `recv_peer` fold arm — pump it.
+            let folded = pump_until(&mut net, Duration::from_secs(5), |n| {
+                PeerTransport::<TestId>::has_peer(n, &PeerId::from("primary"))
+            })
+            .await;
+            assert!(
+                folded,
+                "the background bring-up fold must install the bootstrap \
+                 wire as a mesh member"
+            );
+
+            // ---- Pre-setup wire death ----
+            // The member is welcomed but unserved; its bootstrap wire dies
+            // (idle-killed tunnel / dropped forward) while it waits.
+            drop(server_conn);
+
+            // ---- The armed supervisor re-dials + the fold arm re-folds ----
+            let mut server_conn2: WssConnection =
+                tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect(
+                        "a bootstrap wire folded through the BACKGROUND \
+                         bring-up path must be re-dialed after a pre-setup \
+                         drop — the redial supervisor must be armed by that \
+                         fold too",
+                    )
+                    .expect("accept the re-dial");
+            let refolded = pump_until(&mut net, Duration::from_secs(5), |n| {
+                PeerTransport::<TestId>::has_peer(n, &PeerId::from("primary"))
+            })
+            .await;
+            assert!(refolded, "the re-dialed wire must be re-folded");
+
+            // Frames flow on the restored wire — the primary's eventual
+            // setup trio has a live pipe to ride.
+            MessageSender::send(&mut server_conn2, keepalive(7))
+                .await
+                .expect("server send post-refold");
+            let mut delivered = false;
+            for _ in 0..25 {
+                if let Some(DistributedMessage::Keepalive {
+                    active_workers: 7, ..
+                }) = pump_once(&mut net).await
+                {
+                    delivered = true;
+                    break;
+                }
+            }
+            assert!(
+                delivered,
+                "a frame over the re-folded pre-setup wire must reach recv_peer"
+            );
+        })
+        .await;
+}
+
 /// A WEDGED listener (TCP accepts into the kernel backlog but the
 /// WebSocket handshake is never answered — the half-dead-forward /
 /// parked-acceptor shape from run_20260611_200548) must not hang the

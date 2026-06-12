@@ -32,6 +32,7 @@ mod dispatch_decoupling;
 mod e2e;
 mod graceful_abort;
 mod hydrate;
+mod incremental_setup;
 mod initial_assignment;
 mod injected_spread;
 mod invalidation_abort;
