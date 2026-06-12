@@ -287,6 +287,17 @@ impl<I: Identifier> ClusterState<I> {
         self.phase_may_be_empty.contains(phase)
     }
 
+    /// The replicated respawn-policy CAPS (`ClusterMutation::
+    /// RespawnPolicySet`, set once per run by the submitter's seed when
+    /// `--respawn-policy` is enabled). `None` = the run launched with
+    /// the policy disabled. Read by the promoted primary's hydrate to
+    /// re-arm the respawn DECISION pipeline after failover/relocation —
+    /// the sibling [`Self::respawn_events`] ledger carries the budget's
+    /// SPEND; this carries its CAPS.
+    pub fn respawn_policy(&self) -> Option<super::types::ReplicatedRespawnPolicy> {
+        self.respawn_policy
+    }
+
     /// True iff `phase`'s `on_phase_end` edge COMPLETED on some
     /// authoritative primary (hook fired + hook-queued commands drained +
     /// `mark_phase_done` issued), replicated via

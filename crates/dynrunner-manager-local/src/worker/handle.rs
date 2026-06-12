@@ -22,7 +22,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::cgroup::SubcgroupHandle;
-use crate::monitor::{ProcStatmMonitor, ResourceMonitor};
 
 use super::event::WorkerEvent;
 use super::exit_status::{WorkerExitStatus, try_reap_subprocess};
@@ -72,6 +71,12 @@ pub struct WorkerHandle<M: ManagerEndpoint, I: Identifier> {
     pub has_initial_assignment: bool,
     pub idle: bool,
     pub actual_usage: ResourceMap,
+    /// Swap component of the last [`Self::update_resource_usage`]
+    /// reading, in bytes. The memory kind in `actual_usage` already
+    /// INCLUDES this (charged = resident + swap — the decision
+    /// input); this field exists so observability (the OOM watcher's
+    /// structured log) can report the swap share separately.
+    pub actual_swap_bytes: u64,
     pub assignment_failure_count: u32,
     pub pid: Option<u32>,
     /// Per-worker cgroup-v2 leaf the pool's spawn site materialised
@@ -168,6 +173,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
             has_initial_assignment: false,
             idle: false,
             actual_usage: ResourceMap::new(),
+            actual_swap_bytes: 0,
             assignment_failure_count: 0,
             pid: None,
             subcgroup: None,
@@ -999,8 +1005,16 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         self.opportunistic = true;
     }
 
-    /// Update actual resource usage by reading /proc/[pid]/statm (Linux only).
+    /// Update actual resource usage from the worker's memory charge
+    /// (resident + swap; cgroup-leaf-first, `/proc` fallback — see
+    /// [`crate::monitor::measure_worker_charge`]). The memory kind in
+    /// `actual_usage` carries the CHARGED bytes so the scheduler's
+    /// pressure decision sees swap growth as pressure; the swap
+    /// component is kept separately for observability
+    /// ([`Self::actual_swap_bytes`]).
     pub fn update_resource_usage(&mut self) {
-        self.actual_usage = ProcStatmMonitor.measure(self.pid);
+        let charge = crate::monitor::measure_worker_charge(self.pid, self.subcgroup_dir());
+        self.actual_swap_bytes = charge.swap_bytes;
+        self.actual_usage = charge.to_resource_map();
     }
 }

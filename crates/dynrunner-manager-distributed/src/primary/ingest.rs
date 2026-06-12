@@ -46,6 +46,26 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         ClusterMutation::PhaseMayBeEmptySet { phases }
     }
 
+    /// Build the `ClusterMutation::RespawnPolicySet` carrying this
+    /// coordinator's enabled respawn caps, for emission paired with
+    /// `PhaseDepsSet` from every seed originator (same run-constant
+    /// lifecycle as [`Self::phase_may_be_empty_mutation`]). `None` when
+    /// `--respawn-policy` is disabled (`enable_respawn` never ran) — a
+    /// disabled policy replicates nothing and every replica's `None`
+    /// stays "respawn off". Replicating the caps is what lets a
+    /// relocated/promoted primary re-arm the respawn DECISION at hydrate
+    /// (the spend ledger was already replicated; the caps were the
+    /// missing half — see `respawn::remote`).
+    pub(crate) fn respawn_policy_mutation(&self) -> Option<ClusterMutation<I>> {
+        self.respawn_budget
+            .as_ref()
+            .map(|b| ClusterMutation::RespawnPolicySet {
+                max_per_secondary: b.max_per_secondary,
+                max_total: b.max_total,
+                cooldown_ms: b.cooldown.as_millis() as u64,
+            })
+    }
+
     /// Build the `TaskSkippedAlreadyDone` transitions for the marked
     /// subset of a discovered batch — the ONE place both seed seams
     /// (`originate_cold_seed` cold-start + `discover_on_promotion`
@@ -267,6 +287,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // promoted primary inherits the same opt-out. NoOp on apply when the
         // set is empty (the common no-opt-out run).
         seed.push(self.phase_may_be_empty_mutation());
+        // Pair the respawn-policy CAPS with the phase graph (same
+        // run-constant lifecycle) so a promoted primary inherits the
+        // respawn decision's admission gate. Absent when the policy is
+        // disabled — replicas keep `None` ("respawn off").
+        seed.extend(self.respawn_policy_mutation());
         seed.extend(
             self.all_binaries
                 .iter()
@@ -366,7 +391,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // discovery itself post-connect.
         self.all_binaries = Vec::new();
 
-        let seed: Vec<ClusterMutation<I>> = vec![
+        let mut seed: Vec<ClusterMutation<I>> = vec![
             ClusterMutation::PhaseDepsSet { deps: phase_deps },
             // Pair the `may_be_empty` opt-out with the phase graph (same
             // static-graph lifecycle) so the relocated/promoted primary's
@@ -374,6 +399,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             self.phase_may_be_empty_mutation(),
             ClusterMutation::DiscoveryDebtDeclared,
         ];
+        // Pair the respawn-policy CAPS with the phase graph (same
+        // run-constant lifecycle) so the relocated/promoted primary
+        // re-arms the respawn decision at hydrate. Absent when disabled.
+        seed.extend(self.respawn_policy_mutation());
         // Apply locally (stamps versions, filters NoOps) and STAGE the
         // applied frames for the post-connection broadcast — the same split
         // across the connect boundary `originate_cold_seed` uses (a

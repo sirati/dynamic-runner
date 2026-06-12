@@ -213,6 +213,36 @@ pub enum ClusterMutation<I> {
     PhaseMayBeEmptySet {
         phases: Vec<PhaseId>,
     },
+    /// Per-run static respawn-policy CAPS (`--respawn-policy=
+    /// on-secondary-death` + its three knobs). Emitted once by the
+    /// submitter primary in the same seed batch as [`Self::PhaseDepsSet`]
+    /// (same run-constant lifecycle) IFF the policy is enabled; a
+    /// disabled policy emits nothing and every replica's `None` means
+    /// "respawn off".
+    ///
+    /// This is what makes the respawn DECISION failover-portable: the
+    /// spend LEDGER (`RespawnEventRecord` grow-only set) was already
+    /// replicated, but the CAPS the budget gate compares it against
+    /// lived only in the submitter's CLI wiring — so a relocated/promoted
+    /// primary could never re-arm the decision. With the caps replicated,
+    /// a promoted primary re-arms the respawn pipeline at hydrate (its
+    /// EXECUTION is delegated over the mesh to the provider-host
+    /// process; see `DistributedMessage::RespawnSpawnRequest`). A
+    /// primary decision consumes this fact (the budget admission gate),
+    /// satisfying the no-observer-only-CRDT rule.
+    ///
+    /// Set-once apply (mirrors [`Self::PhaseDepsSet`] /
+    /// [`Self::PhaseMayBeEmptySet`]): re-application once the local
+    /// policy is seeded is a NoOp; snapshot restore adopts it only when
+    /// local is `None` (first-write-wins — the policy is run-constant).
+    RespawnPolicySet {
+        max_per_secondary: u32,
+        max_total: u32,
+        /// Cooldown between accepted respawns of the same family, in
+        /// milliseconds (an explicit integer wire shape — no nested
+        /// secs/nanos struct to keep cross-version decoding trivial).
+        cooldown_ms: u64,
+    },
     /// "The run is done — every secondary should drain and exit."
     ///
     /// Emitted exactly once by the primary just before it returns

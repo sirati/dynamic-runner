@@ -181,6 +181,39 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // silence mark so the new incarnation's judged clock starts from
         // its own fresh evidence (the next sweep re-seeds it).
         self.silence_judged_marks.remove(secondary_id);
+        // The fresh incarnation re-earns the setup exemption: its own
+        // keepalive emitter has not started yet, so the pre-Operational
+        // gate must spare it again until its first proven keepalive.
+        self.keepalive_proven.remove(secondary_id);
+    }
+
+    /// Record PROOF that `msg`'s sender runs its operational main loop:
+    /// a mesh `Keepalive` carrying the SECONDARY emitter role is sent
+    /// only by a secondary's post-`wait_for_setup` keepalive arm, so its
+    /// arrival is ground truth that setup completed on the member's own
+    /// node — whatever this primary's connection typestate for it says.
+    /// Called from the `dispatch_message` Keepalive arm (after the
+    /// preamble's `record_keepalive` refreshed the death clock).
+    ///
+    /// The proof BOUNDS the silence sweep's pre-Operational setup
+    /// exemption (see [`Self::collect_heartbeat_report`]): once a member
+    /// has provably emitted, it is silence-judged like any Operational
+    /// member, so a member whose primary-side connection state wedged
+    /// pre-Operational cannot die silence-invisible (the
+    /// run_20260611_214327 face: a wire-dead member was never declared
+    /// because a duplicate welcome had regressed its state). No-op for
+    /// unknown senders (a stray frame after death) and for non-secondary
+    /// emitter roles (a primary keepalive proves a different loop).
+    pub(super) fn note_secondary_keepalive_frame(&mut self, msg: &DistributedMessage<I>) {
+        if let DistributedMessage::Keepalive {
+            sender_id,
+            emitter_role: KeepaliveRole::Secondary,
+            ..
+        } = msg
+            && self.secondaries.contains_key(sender_id.as_str())
+        {
+            self.keepalive_proven.insert(sender_id.clone());
+        }
     }
 
     /// Fold the per-secondary keepalive map into a sweep of RAW silence
@@ -189,17 +222,30 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// NOT itself partition dead/alive (the single death clock is the
     /// continuous silence age, not a binary dead-at-Nx list).
     ///
-    /// Only secondaries in the Operational state are reported. Pre-
-    /// Operational states (Handshaking, InitialAssigning) are still
-    /// finishing setup and the secondary's own main loop — which sends
-    /// keepalives — hasn't started yet (see `secondary/processing.rs` where
+    /// Secondaries in a pre-Operational state (Handshaking,
+    /// InitialAssigning) are exempt WHILE their keepalive emitter has not
+    /// provably started: they are still finishing setup and the
+    /// secondary's own main loop — which sends keepalives — hasn't
+    /// started yet (see `secondary/processing.rs` where
     /// `keepalive_interval.tick()` fires only post-`wait_for_setup`).
     /// Subjecting them to the silence schedule falsely declares a
-    /// slow-to-handshake secondary dead at the operational-loop transition:
-    /// e.g. a SLURM secondary that took 38s for container startup, SSH-
-    /// tunnel, and handshake would be dropped immediately on the first
-    /// heartbeat tick, despite being healthy and processing tasks. The gate
-    /// is preserved verbatim from the binary-clock version.
+    /// slow-to-handshake secondary dead at the operational-loop
+    /// transition: e.g. a SLURM secondary that took 38s for container
+    /// startup, SSH-tunnel, and handshake would be dropped immediately on
+    /// the first heartbeat tick, despite being healthy and processing
+    /// tasks.
+    ///
+    /// The exemption is BOUNDED by proof, not by state alone
+    /// (`keepalive_proven` — see [`Self::note_secondary_keepalive_frame`]):
+    /// a member whose mesh keepalives have arrived has demonstrably
+    /// completed setup on its own node, so it is judged like any
+    /// Operational member even if this primary's connection typestate for
+    /// it reads pre-Operational. Pre-bound, a member whose state had been
+    /// regressed out of `Operational` (the duplicate-welcome wedge —
+    /// run_20260611_214327) was skipped here on EVERY sweep: its death
+    /// produced no WARN stage, no hard backstop, no `PeerRemoved` —
+    /// respawn unreachable and its in-flight tasks stranded forever. A
+    /// removal deferral must never be able to outlive a dead peer.
     ///
     /// FLOOD IMMUNITY — the INGEST-clock union: each secondary's
     /// last-evidence-of-life is the LATEST of (a) its last PROCESSED
@@ -232,7 +278,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             if !matches!(
                 state,
                 crate::state::SecondaryConnectionState::Operational(_)
-            ) {
+            ) && !self.keepalive_proven.contains(id)
+            {
                 continue;
             }
             let last_evidence = [
@@ -402,11 +449,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
         self.secondaries.remove(&secondary_id);
         self.secondary_keepalives.remove(&secondary_id);
-        // The secondary is gone; drop any staged-WARN state and the
-        // judged-silence mark so a re-welcomed id (respawn reusing the
-        // slot) starts a fresh streak.
+        // The secondary is gone; drop any staged-WARN state, the
+        // judged-silence mark, and the keepalive proof so a re-welcomed
+        // id (respawn reusing the slot) starts a fresh streak with the
+        // setup exemption re-earned.
         self.silence_warn_stage.remove(&secondary_id);
         self.silence_judged_marks.remove(&secondary_id);
+        self.keepalive_proven.remove(&secondary_id);
 
         // Authoritative origination, one batch: the dead secondary's
         // in-flight tasks transition `InFlight → Pending` in the CRDT

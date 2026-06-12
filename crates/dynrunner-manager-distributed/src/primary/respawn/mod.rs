@@ -20,9 +20,11 @@
 mod budget;
 mod handler;
 mod listener;
+mod remote;
 mod types;
 
 pub use listener::respawn_dispatcher_listener;
+pub use remote::{RemoteRespawnPending, RemoteSecondarySpawner};
 pub use types::{
     RespawnBudget, RespawnDecision, RespawnOutcome, RespawnRequest, SecondarySpawnSpec,
     SecondarySpawner, SpawnError,

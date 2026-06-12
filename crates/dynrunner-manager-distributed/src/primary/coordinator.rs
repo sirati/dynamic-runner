@@ -720,6 +720,21 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// only liveness fact dispatch consumes, via the two boundary methods).
     pub(super) silence_warn_stage: HashMap<String, usize>,
 
+    /// The set of members whose operational MAIN LOOP has provably run
+    /// this incarnation: a mesh `Keepalive` with the SECONDARY emitter
+    /// role was received from them (the secondary's keepalive arm spins
+    /// up only post-`wait_for_setup`). Owned by the liveness module
+    /// (`primary::heartbeat`). Read by `collect_heartbeat_report` to
+    /// BOUND the Operational-state setup exemption: a pre-Operational
+    /// member is exempt from the silence schedule only while its
+    /// keepalive emitter has not started — once proven, it is judged
+    /// like any Operational member, so a member whose connection
+    /// typestate wedged pre-Operational (while its node kept working)
+    /// cannot die silence-invisible. Entry removed on welcome (a fresh
+    /// incarnation re-earns its exemption) and on requeue (the member
+    /// is gone).
+    pub(super) keepalive_proven: HashSet<String>,
+
     /// Per-secondary backoff timestamps. When a secondary returns
     /// "No idle worker available" Recoverable (its dispatch.rs
     /// `is_idle_state()` check found every worker non-idle —
@@ -941,6 +956,16 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// — the policy is disabled at construction and the operational
     /// arm never consults it.
     pub(super) respawn_budget: Option<RespawnBudget>,
+
+    /// Correlation table for the REMOTE respawn backend (the
+    /// promoted/relocated primary's `RemoteSecondarySpawner`, whose
+    /// physical provider lives in the submitter/observer process). The
+    /// stub registers a waiter per request; the inbox arm's
+    /// `RespawnSpawnResult` / `RespawnRevokeResult` handler completes
+    /// it through this handle. `None` on the local-provider topology
+    /// (the submitter primary) and when the policy is disabled. Set by
+    /// [`Self::enable_respawn_remote`] only.
+    pub(super) remote_respawn_pending: Option<super::respawn::RemoteRespawnPending>,
 
     /// Transport-recovery port handed to the observer at relocation
     /// (BUG-B reconnect). The submitter primary never uses it itself —
@@ -1362,6 +1387,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             secondary_keepalives: HashMap::new(),
             own_tick_health,
             silence_judged_marks: HashMap::new(),
+            keepalive_proven: HashSet::new(),
             ingest_gate: super::heartbeat::IngestEdgeGate::new(),
             silence_warn_stage: HashMap::new(),
             backpressured_secondaries: HashMap::new(),
@@ -1386,6 +1412,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             respawn_tasks: JoinSet::new(),
             respawn_spawner: None,
             respawn_budget: None,
+            remote_respawn_pending: None,
             tunnel_reconnector: None,
             respawn_lifecycle_tx: None,
             respawn_lifecycle_rx: None,
@@ -1663,6 +1690,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
         self.reconstruct_workers_from_cluster_state();
         self.reconstruct_secondaries_from_cluster_state();
+        // Re-arm the respawn DECISION from the replicated policy caps
+        // (`ClusterMutation::RespawnPolicySet`, originated by the
+        // submitter's seed): the spend ledger (`respawn_events`) already
+        // rode the snapshot, and with the caps restored here the budget
+        // gate is complete — the inert-after-relocation hole closes at
+        // the same hydrate that reconstructs every other replicated
+        // fact. Execution is delegated over the mesh to the
+        // provider-host process (`enable_respawn_remote`); a `None`
+        // policy (run launched with `--respawn-policy=disabled`)
+        // re-arms nothing.
+        if let Some(policy) = self.cluster_state.respawn_policy() {
+            self.enable_respawn_remote(policy.into());
+        }
         // `phase_started_emitted` is seeded by `hydrate_from_cluster_state`
         // (V3) — derived from the CRDT's per-phase progressed-task set on
         // BOTH the cold and promote paths, so it is no longer a promote-ONLY
@@ -1834,6 +1874,43 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `register_lifecycle_listener` (which this call delegates
         // to under the hood).
         self.register_lifecycle_listener(respawn_dispatcher_listener(tx));
+    }
+
+    /// Enable the respawn pipeline with the REMOTE execution backend —
+    /// the promoted/relocated-primary topology, where the respawn
+    /// DECISION runs here but the physical provider lives in the
+    /// submitter/observer process (mesh node-id
+    /// [`dynrunner_core::SETUP_NODE_ID`], host-id-stable across that
+    /// process's primary→observer demotion). Builds a
+    /// [`super::respawn::RemoteSecondarySpawner`] over this
+    /// coordinator's own mesh egress and installs it through the SAME
+    /// [`Self::enable_respawn`] wiring the local providers use — one
+    /// decision path, two execution backends behind one trait.
+    ///
+    /// Invoked by [`Self::seed_from_promotion_snapshot`] when the
+    /// restored ledger carries a replicated respawn policy; same
+    /// pre-`run` contract as `enable_respawn`. A no-op when a spawner
+    /// is already installed (the submitter's local provider wins — the
+    /// pre-relocation window must keep calling the provider directly).
+    pub fn enable_respawn_remote(&mut self, budget: RespawnBudget) {
+        if self.respawn_spawner.is_some() {
+            return;
+        }
+        let pending = super::respawn::RemoteRespawnPending::default();
+        let spawner = super::respawn::RemoteSecondarySpawner::new(
+            self.client.clone(),
+            dynrunner_protocol_primary_secondary::PeerId::from(dynrunner_core::SETUP_NODE_ID),
+            self.config.node_id.clone(),
+            pending.clone(),
+        );
+        self.remote_respawn_pending = Some(pending);
+        // The spec's endpoint/pubkey snapshot is unused by the remote
+        // providers (the SLURM wrapper generator captures its own
+        // deployment context; a respawned secondary fetches its run
+        // config — argv AND trust anchor — over the peer mesh at cold
+        // start), so the promoted primary passes empty strings rather
+        // than inventing values it does not hold.
+        self.enable_respawn(Arc::new(spawner), budget, String::new(), String::new());
     }
 
     /// Install the liveness-beacon ping receiver (from a
@@ -3360,6 +3437,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             task_completed_dispatcher_handle,
             panik_signal_rx,
             tunnel_reconnector,
+            respawn_spawner,
             ..
         } = self;
 
@@ -3399,6 +3477,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `None` on backends that self-heal — the observer then has
             // nothing to drive.
             reconnector: tunnel_reconnector,
+            // The respawn PROVIDER belongs to this PROCESS, not the
+            // primary role: the relocated submitter keeps it across its
+            // demotion and serves remote respawn-execution requests from
+            // whichever primary holds the decision (see
+            // `primary::respawn::remote`). `None` when the run launched
+            // with the policy disabled.
+            respawn_provider: respawn_spawner,
         }
     }
 

@@ -226,3 +226,76 @@ fn respawn_budget_survives_promotion() {
         "once the inherited cooldown elapses the family is admissible"
     );
 }
+
+// ── Replicated respawn-policy CAPS (the budget's other half) ──────
+
+/// The `RespawnPolicySet` apply is set-once / first-write-wins: the
+/// first application seeds the caps (`Applied`); any re-application —
+/// identical or divergent — NoOps and the seeded caps stand (the policy
+/// is run-constant; there is no un-set).
+#[test]
+fn respawn_policy_apply_is_set_once() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    assert_eq!(s.respawn_policy(), None);
+
+    let outcome = s.apply(ClusterMutation::RespawnPolicySet {
+        max_per_secondary: 3,
+        max_total: 10,
+        cooldown_ms: 30_000,
+    });
+    assert!(matches!(outcome, ApplyOutcome::Applied));
+    let policy = s.respawn_policy().expect("policy seeded");
+    assert_eq!(policy.max_per_secondary, 3);
+    assert_eq!(policy.max_total, 10);
+    assert_eq!(policy.cooldown_ms, 30_000);
+
+    // Re-application (at-least-once delivery) NoOps; a divergent
+    // re-origination cannot flap the seeded caps.
+    let outcome = s.apply(ClusterMutation::RespawnPolicySet {
+        max_per_secondary: 99,
+        max_total: 99,
+        cooldown_ms: 1,
+    });
+    assert!(matches!(outcome, ApplyOutcome::NoOp));
+    assert_eq!(s.respawn_policy().unwrap().max_per_secondary, 3);
+}
+
+/// The caps ride the snapshot and restore on the first-bootstrap-adopt
+/// rule: a `None` local adopts the snapshot's policy (the promoted
+/// primary's inherit path); a seeded local KEEPS its policy against a
+/// divergent incoming one (first-write-wins, mirroring
+/// `phase_may_be_empty`); and a policy-less snapshot leaves a seeded
+/// local intact (a stale peer can never un-set the caps).
+#[test]
+fn respawn_policy_snapshot_restore_first_write_wins() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    let mut origin = ClusterState::<RunnerIdentifier>::new();
+    origin.apply(ClusterMutation::RespawnPolicySet {
+        max_per_secondary: 2,
+        max_total: 7,
+        cooldown_ms: 5_000,
+    });
+    let snap = origin.snapshot();
+
+    // Promoted-primary inherit: None local adopts.
+    let mut promoted = ClusterState::<RunnerIdentifier>::new();
+    promoted.restore(snap.clone());
+    assert_eq!(promoted.respawn_policy().unwrap().max_total, 7);
+
+    // Seeded local keeps its policy against a divergent snapshot.
+    let mut seeded = ClusterState::<RunnerIdentifier>::new();
+    seeded.apply(ClusterMutation::RespawnPolicySet {
+        max_per_secondary: 1,
+        max_total: 1,
+        cooldown_ms: 1,
+    });
+    seeded.restore(snap);
+    assert_eq!(seeded.respawn_policy().unwrap().max_total, 1);
+
+    // A policy-less snapshot cannot un-set a seeded local.
+    let empty_snap = ClusterState::<RunnerIdentifier>::new().snapshot();
+    assert!(empty_snap.respawn_policy.is_none());
+    seeded.restore(empty_snap);
+    assert_eq!(seeded.respawn_policy().unwrap().max_total, 1);
+}

@@ -61,6 +61,16 @@ pub struct ClusterState<I> {
     /// intentional pure-sequencing gate. Empty on the common no-opt-out
     /// run.
     pub(super) phase_may_be_empty: std::collections::HashSet<PhaseId>,
+    /// Per-run static respawn-policy CAPS. Set once at run start via
+    /// `ClusterMutation::RespawnPolicySet` (originated by the submitter
+    /// primary in the same seed batch as `PhaseDepsSet`, same
+    /// run-constant lifecycle) IFF `--respawn-policy` was enabled; `None`
+    /// for the run's lifetime otherwise. Read by the promoted primary's
+    /// hydrate to re-arm the respawn DECISION pipeline after failover /
+    /// relocation (the sibling `respawn_events` ledger replicates the
+    /// budget's SPEND; this replicates its CAPS). First-write-wins on
+    /// apply and restore — mirrors `phase_may_be_empty`.
+    pub(super) respawn_policy: Option<super::types::ReplicatedRespawnPolicy>,
     /// Set by `ClusterMutation::RunComplete`. Sticky monotonic flag —
     /// once true, the run is over and every node should drain and
     /// exit. Read by the secondary's operational loop to break out
@@ -469,6 +479,7 @@ where
             retry_passes_used,
             unfulfillable_reinject_used,
             respawn_events,
+            respawn_policy,
             phase_may_be_empty,
             phases_ended,
             custom_messages,
@@ -526,6 +537,9 @@ where
             unfulfillable_reinject_used: unfulfillable_reinject_used.clone(),
             // Replicated grow-only SET (F7) — clone preserves it.
             respawn_events: respawn_events.clone(),
+            // Replicated run-constant respawn caps — clone preserves it
+            // (same lifecycle as `phase_may_be_empty`).
+            respawn_policy: *respawn_policy,
             // Replicated grow-only SET (#343) — clone preserves it.
             phases_ended: phases_ended.clone(),
             // Replicated custom-message inbox + watermarks (F5) — clone
@@ -576,6 +590,7 @@ where
             retry_passes_used,
             unfulfillable_reinject_used,
             respawn_events,
+            respawn_policy,
             phases_ended,
             custom_messages,
             custom_terminal_watermarks,
@@ -611,6 +626,7 @@ where
                 &unfulfillable_reinject_used.len(),
             )
             .field("respawn_events", &respawn_events.len())
+            .field("respawn_policy", respawn_policy)
             .field("phases_ended", phases_ended)
             .field("custom_messages", &custom_messages.len())
             .field("custom_terminal_watermarks", &custom_terminal_watermarks.len())
@@ -649,6 +665,7 @@ impl<I> Default for ClusterState<I> {
             retry_passes_used: HashMap::new(),
             unfulfillable_reinject_used: HashMap::new(),
             respawn_events: HashMap::new(),
+            respawn_policy: None,
             phases_ended: HashSet::new(),
             custom_messages: HashMap::new(),
             custom_terminal_watermarks: HashMap::new(),

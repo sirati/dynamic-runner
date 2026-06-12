@@ -2302,3 +2302,214 @@ async fn chronically_starved_primary_removes_dead_member_and_requests_respawn() 
         })
         .await;
 }
+
+// ======================================================================
+// Pre-Operational wedge replay (run_20260611_214327)
+// ======================================================================
+
+/// A `SecondaryWelcome` frame as the secondary's setup loop emits it —
+/// including the handshake-RETRY duplicate that lands after the
+/// bring-up walk already advanced the member past `Handshaking`.
+fn welcome_from(id: &str) -> DistributedMessage<TestId> {
+    DistributedMessage::SecondaryWelcome {
+        target: None,
+        sender_id: id.to_string(),
+        timestamp: 0.0,
+        secondary_id: id.to_string(),
+        resources: vec![],
+        worker_count: 1,
+        hostname: "host".into(),
+        is_observer: false,
+        can_be_primary: true,
+    }
+}
+
+/// REPLAY (run_20260611_214327): an UNSTARVED primary must remove a
+/// wire-dead member within the hard silence window even when the
+/// member's connection-state was REGRESSED out of `Operational` by a
+/// duplicate `SecondaryWelcome`.
+///
+/// The production sequence, replayed: the secondary's setup loop
+/// retries its welcome on a capped backoff (`wait_for_setup` — the
+/// retry is load-bearing per run_20260611_005927), so a duplicate
+/// welcome routinely lands AFTER the one-shot bring-up walk advanced
+/// the member to `Operational`. Pre-fix, `handle_welcome` re-inserted a
+/// fresh `Handshaking` state — and the batch walk phases never re-run,
+/// so the member sat pre-Operational FOREVER while still working tasks
+/// and keepaliving. When it was then kill -9'd (frames stop, wire dead,
+/// SLURM job gone), the silence sweep's Operational gate skipped it on
+/// every tick: no WARN stage, no hard backstop, no `PeerRemoved` for
+/// 11+ minutes — respawn unreachable, its in-flight task stranded
+/// ("left to the silence machinery", which was blind to the holder).
+#[tokio::test(flavor = "current_thread")]
+async fn rewelcomed_dead_member_is_removed_within_hard_window() {
+    let (transport, _sec_rx, _kept) = empty_transport();
+    // interval 50ms → hard backstop 100ms (2x), own-tick starvation gate
+    // 150ms (3x): the 60ms tick gaps below keep the decider provably
+    // healthy (unstarved) while a dead member's silence crosses the
+    // backstop.
+    let (mut primary, _mesh) = build_primary(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+    register_operational_secondary(&mut primary, "dead-sec", 0, "victim");
+    register_operational_secondary(&mut primary, "survivor", 1, "victim-2");
+
+    // The member's main loop is provably running: its mesh keepalive
+    // arrives through the real ingest path (dispatch preamble +
+    // Keepalive arm).
+    primary
+        .dispatch_message(keepalive_from("dead-sec"), &mut None)
+        .await
+        .unwrap();
+
+    // The handshake-retry duplicate welcome lands after the bring-up
+    // walk. Pre-fix this silently regressed the member to `Handshaking`.
+    primary
+        .dispatch_message(welcome_from("dead-sec"), &mut None)
+        .await
+        .unwrap();
+
+    // Baseline on-cadence tick; the member keepalives once more (alive
+    // and working — the light-load production shape).
+    primary.process_heartbeat_tick().await.unwrap();
+    primary
+        .dispatch_message(keepalive_from("dead-sec"), &mut None)
+        .await
+        .unwrap();
+
+    // kill -9: dead-sec's frames STOP (zero ingest, wire dead). The
+    // survivor keeps keepaliving every round; the decider ticks on
+    // cadence.
+    let mut removed_at_tick = None;
+    for tick in 0..6 {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        primary
+            .dispatch_message(keepalive_from("survivor"), &mut None)
+            .await
+            .unwrap();
+        primary.process_heartbeat_tick().await.unwrap();
+        if !primary.secondaries.contains_key("dead-sec") {
+            removed_at_tick = Some(tick);
+            break;
+        }
+    }
+    assert!(
+        removed_at_tick.is_some(),
+        "a wire-dead member must be PeerRemoved within the hard silence \
+         window on an unstarved primary, REGARDLESS of a duplicate-welcome \
+         state regression (the run_20260611_214327 wedge: never removed, \
+         respawn unreachable, task stranded)"
+    );
+    assert!(
+        !primary.cluster_state.is_peer_alive("dead-sec"),
+        "the authoritative PeerRemoved must land in the replicated membership"
+    );
+    assert!(
+        primary.secondaries.contains_key("survivor"),
+        "the keepaliving survivor must not be swept up"
+    );
+    assert_eq!(
+        primary.pool().iter().count(),
+        1,
+        "the dead member's stranded in-flight task is requeued into the pool"
+    );
+}
+
+/// The bounded-gate law, entry-path-agnostic: a member stuck in ANY
+/// pre-Operational connection state whose mesh keepalives have PROVEN
+/// its main loop is running must be judged by the silence schedule.
+/// The Operational gate's setup exemption exists for members whose
+/// keepalive EMITTER has not started yet (the secondary's keepalive arm
+/// spins up post-`wait_for_setup`); the moment the member demonstrably
+/// emits, the exemption must lift — a removal deferral that can never
+/// lift is a bug by construction.
+#[tokio::test(flavor = "current_thread")]
+async fn keepalive_proven_pre_operational_member_is_silence_judged() {
+    let (transport, _sec_rx, _kept) = empty_transport();
+    let (mut primary, _mesh) = build_primary(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+    register_operational_secondary(&mut primary, "wedged", 0, "victim");
+
+    // Force the wedge directly (entry-path-agnostic — whatever regressed
+    // the state, the silence machinery must stay bounded): the member's
+    // primary-side state sits at `Handshaking` while its own node keeps
+    // running.
+    let conn = SecondaryConnection::new("wedged".into()).receive_welcome(
+        1,
+        vec![],
+        "host".into(),
+        0,
+        None,
+        false,
+        false,
+    );
+    primary
+        .secondaries
+        .insert("wedged".into(), SecondaryConnectionState::Handshaking(conn));
+
+    // Its main loop provably runs: a mesh keepalive frame arrives.
+    primary
+        .dispatch_message(keepalive_from("wedged"), &mut None)
+        .await
+        .unwrap();
+    primary.process_heartbeat_tick().await.unwrap();
+
+    // Then it dies: total silence past the hard window, decider healthy.
+    let mut removed = false;
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        primary.process_heartbeat_tick().await.unwrap();
+        if !primary.secondaries.contains_key("wedged") {
+            removed = true;
+            break;
+        }
+    }
+    assert!(
+        removed,
+        "a keepalive-proven member must be silence-judged (and removed on \
+         genuine death) regardless of its pre-Operational connection state"
+    );
+    assert!(!primary.cluster_state.is_peer_alive("wedged"));
+}
+
+/// Root-cause guard: a duplicate `SecondaryWelcome` (the setup loop's
+/// handshake retry — routine, load-bearing) must NOT regress a walked
+/// member's connection typestate. The bring-up walk's batch transitions
+/// run once; a member re-buried into `Handshaking` mid-run would never
+/// be walked back.
+#[tokio::test(flavor = "current_thread")]
+async fn duplicate_welcome_does_not_regress_walked_state() {
+    let (transport, _sec_rx, _kept) = empty_transport();
+    let (mut primary, _mesh) = build_primary(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+    register_operational_secondary(&mut primary, "sec-a", 0, "victim");
+
+    primary
+        .dispatch_message(welcome_from("sec-a"), &mut None)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            primary.secondaries.get("sec-a"),
+            Some(SecondaryConnectionState::Operational(_))
+        ),
+        "a duplicate welcome (handshake retry) must not regress a walked \
+         member's typestate — the batch walk never re-runs, so a regressed \
+         member would sit pre-Operational (and silence-invisible) forever"
+    );
+}
