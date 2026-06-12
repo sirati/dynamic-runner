@@ -10,9 +10,19 @@ use super::PrimaryCoordinator;
 use super::wire::timestamp_now;
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
-    pub(super) async fn send_peer_lists(&mut self) -> Result<(), String> {
-        tracing::info!("sending peer lists");
-
+    /// Build the `PeerConnectionInfo` roster — the SOLE roster builder
+    /// for the `PeerInfo` fan-out, shared by the incremental per-member
+    /// serve ([`Self::serve_setup_on_cert_exchange`]) and the batch
+    /// [`Self::send_peer_lists`].
+    ///
+    /// Only members that have completed cert-exchange are listed: a
+    /// pre-cert member has no cert/addresses yet, so its entry would be
+    /// an undialable husk. At the batch call site this filter is
+    /// vacuous (the connect wait's quorum drop already removed every
+    /// non-cert-exchanged member); on the incremental path it is what
+    /// keeps a welcomed-but-not-yet-cert-exchanged sibling out of the
+    /// broadcast until its own cert edge serves it.
+    fn peer_roster(&self) -> Vec<PeerConnectionInfo> {
         // Both address families travel from the originating
         // secondary's `CertExchange` (see `secondary::setup::
         // send_cert_exchange`) through `primary::connect::
@@ -24,9 +34,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // set bug that surfaced as "WSS race to peer failed across
         // all addresses; attempted=N connected=0" on the consumer
         // side after the dialer was made dual-family-aware.
-        let peers: Vec<PeerConnectionInfo> = self
-            .secondaries
+        self.secondaries
             .values()
+            .filter(|s| s.is_at_least_cert_exchanged())
             .map(|s| PeerConnectionInfo {
                 secondary_id: s.id().to_string(),
                 cert: s.cert_pem().unwrap_or("").to_string(),
@@ -48,7 +58,32 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // simply not beaconed.
                 liveness_port: s.liveness_port(),
             })
-            .collect();
+            .collect()
+    }
+
+    /// Broadcast the CURRENT peer roster to the fleet (and persist its
+    /// credentials + originate the observer-join CRDT batch) — the ONE
+    /// `PeerInfo` emission path.
+    ///
+    /// Two callers, one behaviour:
+    ///   * the incremental per-member serve
+    ///     ([`Self::serve_setup_on_cert_exchange`]) — fired on each
+    ///     member's cert-exchange edge, so the new member receives its
+    ///     first peer list the moment it is servable AND every
+    ///     earlier-welcomed member receives the GROWN roster (the
+    ///     mesh-pump re-runs its peer-dial sweep off the same frame, so
+    ///     the mesh converges as the fleet fills in — late peers are
+    ///     never permanently unknown to early peers);
+    ///   * the batch [`Self::send_peer_lists`] at the connect-wait
+    ///     resolution — the final convergence broadcast over the settled
+    ///     (possibly quorum-shrunk) roster.
+    ///
+    /// Receiver-idempotent end to end: the secondary's setup loop just
+    /// re-arms its mesh watchdog off the latest count, the mesh-pump
+    /// skips already-connected legs, and the observer-join batch NoOps
+    /// on re-application.
+    async fn broadcast_peer_roster(&mut self) {
+        let peers = self.peer_roster();
 
         // Persist the roster's connection credentials to LOCAL state
         // when configured (the setup/submitter primary) — the SAME
@@ -93,7 +128,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             })
             .collect();
 
-        let secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
         // The PeerInfo fan-out rides the unified mesh egress: build the
         // narrow setup-typed `SetupBootstrapMessage` (so an accidental
         // operational variant fails to type-check here), then losslessly
@@ -138,19 +172,89 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // role table is a silent NoOp.
         self.apply_and_broadcast_cluster_mutations(observer_mutations)
             .await;
+    }
+
+    /// The ONE per-member peer-list typestate walk:
+    /// `CertExchanging → PeerDiscovery` ("its peer list has been sent").
+    /// No-op from any other state, so the incremental serve and the
+    /// batch [`Self::send_peer_lists`] can both walk a member without
+    /// either knowing whether the other already did.
+    fn advance_member_peer_listed(&mut self, secondary_id: &str) {
+        if let Some(state) = self.secondaries.remove(secondary_id) {
+            if let SecondaryConnectionState::CertExchanging(conn) = state {
+                self.secondaries.insert(
+                    secondary_id.to_string(),
+                    SecondaryConnectionState::PeerDiscovery(conn.begin_peer_discovery()),
+                );
+            } else {
+                self.secondaries.insert(secondary_id.to_string(), state);
+            }
+        }
+    }
+
+    /// The ONE per-member peers-ready typestate walk:
+    /// `PeerDiscovery → InitialAssigning` (the orchestration has decided
+    /// the peer-connection window is over). No-op from any other state.
+    fn advance_member_peers_ready(&mut self, secondary_id: &str) {
+        if let Some(state) = self.secondaries.remove(secondary_id) {
+            if let SecondaryConnectionState::PeerDiscovery(conn) = state {
+                self.secondaries.insert(
+                    secondary_id.to_string(),
+                    SecondaryConnectionState::InitialAssigning(conn.peers_ready()),
+                );
+            } else {
+                self.secondaries.insert(secondary_id.to_string(), state);
+            }
+        }
+    }
+
+    /// Incremental setup delivery — serve a member the moment it
+    /// completes its handshake (the `Handshaking → CertExchanging` edge
+    /// in `connect::handle_cert_exchange`), instead of holding every
+    /// welcomed member hostage until the WHOLE fleet has welcomed.
+    ///
+    /// Pre-fix, the setup payloads were all-or-nothing: nothing flowed
+    /// until the connect wait resolved (full fleet or quorum-proceed
+    /// timeout), so a fleet with one slow/missing member kept every
+    /// already-welcomed member parked in `AwaitingPrimary` — workers
+    /// unspawned, peer mesh unformed, bootstrap wires carrying nothing
+    /// but beacons — for up to the whole straggler window. Now each
+    /// arrival broadcasts the grown roster (serving the newcomer its
+    /// first peer list AND converging every earlier member onto the
+    /// fleet so far) and walks the newcomer's typestate.
+    ///
+    /// Deliberately NOT served here: `InitialAssignment` and
+    /// `TransferComplete`, the run-start halves of the secondary's
+    /// setup gate. Those stay on the post-connect-wait fan-out
+    /// (`perform_initial_assignment` / `send_transfer_complete`), so the
+    /// quorum-proceed policy still governs WHEN THE RUN STARTS — a
+    /// served member enters `Configuring` (worker pool spawned, mesh
+    /// forming, run config already pushed at its welcome) but cannot go
+    /// Operational or pull work early.
+    pub(super) async fn serve_setup_on_cert_exchange(&mut self, secondary_id: &str) {
+        tracing::info!(
+            secondary = %secondary_id,
+            "serving setup incrementally: broadcasting the grown peer \
+             roster (newcomer gets its first peer list; earlier members \
+             converge onto the fleet so far)"
+        );
+        self.broadcast_peer_roster().await;
+        self.advance_member_peer_listed(secondary_id);
+    }
+
+    /// Batch peer-list delivery at the connect-wait resolution: the
+    /// final convergence broadcast over the settled roster, plus the
+    /// peer-list walk for any member the incremental serve has not
+    /// already walked (none in the common path; the loop is the
+    /// belt-and-braces over the same ONE per-member walk).
+    pub(super) async fn send_peer_lists(&mut self) -> Result<(), String> {
+        tracing::info!("sending peer lists");
+        self.broadcast_peer_roster().await;
 
         // Transition all from CertExchanging -> PeerDiscovery
+        let secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
         for secondary_id in &secondary_ids {
-            if let Some(state) = self.secondaries.remove(secondary_id) {
-                if let SecondaryConnectionState::CertExchanging(conn) = state {
-                    self.secondaries.insert(
-                        secondary_id.clone(),
-                        SecondaryConnectionState::PeerDiscovery(conn.begin_peer_discovery()),
-                    );
-                } else {
-                    self.secondaries.insert(secondary_id.clone(), state);
-                }
-            }
+            self.advance_member_peer_listed(secondary_id);
         }
 
         Ok(())
@@ -163,16 +267,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
 
         for secondary_id in secondary_ids {
-            if let Some(state) = self.secondaries.remove(&secondary_id) {
-                if let SecondaryConnectionState::PeerDiscovery(conn) = state {
-                    self.secondaries.insert(
-                        secondary_id,
-                        SecondaryConnectionState::InitialAssigning(conn.peers_ready()),
-                    );
-                } else {
-                    self.secondaries.insert(secondary_id, state);
-                }
-            }
+            self.advance_member_peers_ready(&secondary_id);
         }
 
         Ok(())

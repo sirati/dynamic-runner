@@ -677,7 +677,13 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
                     // target-clear): the primary's PeerInfo broadcast is
                     // stamped `Destination::All` by the egress, so accept ANY
                     // target here (the routing header is not what we assert).
+                    // Setup delivery is incremental (a roster broadcast fires
+                    // on EACH member's cert-exchange edge), so the FIRST
+                    // PeerInfo sec-1 sees may carry only whichever member
+                    // welcomed first — capture the roster that carries sec-0,
+                    // the entry whose address plumbing this test asserts.
                     if let DistributedMessage::PeerInfo { peers, .. } = &msg
+                        && peers.iter().any(|p| p.secondary_id == "sec-0")
                         && let Some(tx) = peer_info_tx.take()
                     {
                         let _ = tx.send(peers.clone());
