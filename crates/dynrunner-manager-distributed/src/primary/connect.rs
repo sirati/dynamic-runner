@@ -334,6 +334,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `handle_task_failed` path. See
             // `primary::reconciliation_probe`.
             MessageType::TaskHoldResponse => self.handle_task_hold_response(msg, command_rx).await,
+            // Remote respawn-execution outcomes: the provider-host
+            // observer's answer to this primary's RespawnSpawnRequest /
+            // RespawnRevokeRequest. Completes the matching waiter inside
+            // the RemoteSecondarySpawner's retry loop. See
+            // `primary::respawn::remote`.
+            MessageType::RespawnSpawnResult | MessageType::RespawnRevokeResult => {
+                self.handle_respawn_exec_result(msg)
+            }
             MessageType::MeshReady => self.handle_mesh_ready(msg),
             // Observer-requested graceful abort: the ONE management command
             // a zero-authority observer may send. The handler originates the

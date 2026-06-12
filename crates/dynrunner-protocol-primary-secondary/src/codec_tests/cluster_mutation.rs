@@ -987,3 +987,33 @@ fn readmission_peer_joined_decodes_literal_sender_bytes() {
         _ => panic!("expected PeerJoined"),
     }
 }
+
+/// Wire-shape mirror for the replicated respawn caps: decode the EXACT
+/// JSON bytes a submitter primary's seed batch carries for a
+/// `RespawnPolicySet` (externally tagged enum, integer `cooldown_ms`),
+/// and pin the sender-side encoding against the same bytes — the caps
+/// are what a promoted primary re-arms its respawn decision from, so a
+/// silent shape drift would re-open the inert-after-relocation hole.
+#[test]
+fn respawn_policy_set_mirrors_wire_bytes() {
+    let wire = r#"{"RespawnPolicySet":{"max_per_secondary":3,"max_total":10,"cooldown_ms":30000}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(wire).unwrap();
+    match decoded {
+        ClusterMutation::RespawnPolicySet {
+            max_per_secondary,
+            max_total,
+            cooldown_ms,
+        } => {
+            assert_eq!(max_per_secondary, 3);
+            assert_eq!(max_total, 10);
+            assert_eq!(cooldown_ms, 30_000);
+        }
+        _ => panic!("expected RespawnPolicySet"),
+    }
+    let encoded: ClusterMutation<TestId> = ClusterMutation::RespawnPolicySet {
+        max_per_secondary: 3,
+        max_total: 10,
+        cooldown_ms: 30_000,
+    };
+    assert_eq!(serde_json::to_string(&encoded).unwrap(), wire);
+}

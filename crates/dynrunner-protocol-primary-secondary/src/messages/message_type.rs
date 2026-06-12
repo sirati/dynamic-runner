@@ -72,6 +72,23 @@ pub enum MessageType {
     /// holder's positive denial, on which the primary fails + requeues
     /// the task via the backpressure-shaped path.
     TaskHoldResponse,
+    /// Primary -> provider-host observer: "submit a replacement
+    /// secondary" — the remote-execution leg of the respawn pipeline.
+    /// The decision (budget/ledger) stays on the primary; the physical
+    /// provider lives in the submitter/observer process. Keyed by the
+    /// primary-minted `new_secondary_id` (correlation + idempotency).
+    RespawnSpawnRequest,
+    /// Provider-host observer -> primary: the spawn outcome, correlated
+    /// by `new_secondary_id`. Re-sent from the outcome cache on a
+    /// duplicate request (lost-result replay).
+    RespawnSpawnResult,
+    /// Primary -> provider-host observer: revoke a still-pending
+    /// replacement (its original re-admitted). Idempotent at the
+    /// provider per the `SecondarySpawner::revoke` contract.
+    RespawnRevokeRequest,
+    /// Provider-host observer -> primary: the revoke outcome,
+    /// correlated by `new_secondary_id`.
+    RespawnRevokeResult,
     Keepalive,
     TimeoutDetected,
     TimeoutQuery,

@@ -129,6 +129,12 @@ impl<I: Identifier> ClusterState<I> {
             // INDEPENDENT convergence signal. A `_`-bound exclusion, same
             // rationale as `role_table` (a derived/co-converging field).
             phase_may_be_empty: _phase_may_be_empty,
+            // Replicated run-constant respawn caps, EXCLUDED for the same
+            // reason as `phase_may_be_empty`: originated in the SAME seed
+            // batch as `phase_deps` and healed by the same snapshot
+            // first-bootstrap-adopt path, so it co-converges with the
+            // graph and carries no INDEPENDENT convergence signal.
+            respawn_policy: _respawn_policy,
             // ── node-local: not replicated, carries no convergence signal ──
             // (see the field docs on `ClusterState`; same set `snapshot()`
             // classifies node-local).

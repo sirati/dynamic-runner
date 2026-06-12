@@ -344,6 +344,19 @@ pub struct ClusterStateSnapshot<I> {
     /// with a pre-field sender (missing field decodes as an empty map).
     #[serde(default)]
     pub respawn_events: HashMap<String, RespawnEventRecord>,
+    /// Replicated respawn-policy CAPS — the run-constant
+    /// `--respawn-policy=on-secondary-death` knobs the budget admission
+    /// gate compares the `respawn_events` SPEND against. Carried so a
+    /// promoted primary re-arms the respawn DECISION at hydrate (the
+    /// sibling ledger above carries the spend; without the caps a
+    /// relocated primary could never re-enable the pipeline). Merge rule
+    /// on `restore`: first-write-wins (adopt only when local is `None` —
+    /// the policy is set once per run, mirroring `phase_may_be_empty`).
+    /// `#[serde(default)]` keeps wire compat with a pre-field sender
+    /// (missing field decodes as `None` — "respawn off", the
+    /// conservative shape).
+    #[serde(default)]
+    pub respawn_policy: Option<super::types::ReplicatedRespawnPolicy>,
     /// Replicated "phase ended" facts (#343) — grow-only SET of the phases
     /// whose `on_phase_end` edge completed. Carried so a promoted primary
     /// inherits exactly which phases already fired their hook: present →
@@ -433,6 +446,8 @@ impl<I: Identifier> ClusterState<I> {
             unfulfillable_reinject_used,
             // Replicated grow-only SET (F7).
             respawn_events,
+            // Replicated run-constant respawn caps.
+            respawn_policy,
             // Replicated grow-only SET (#343).
             phases_ended,
             // Replicated custom-message inbox + watermarks (F5).
@@ -531,6 +546,10 @@ impl<I: Identifier> ClusterState<I> {
             // inherits the respawn ledger via union-merge on restore (the
             // admission budget + cooldown survive failover).
             respawn_events: respawn_events.clone(),
+            // Replicated run-constant respawn caps — carried so a promoted
+            // primary re-arms the respawn decision at hydrate (first-write-
+            // wins on restore).
+            respawn_policy: *respawn_policy,
             // Replicated grow-only SET (#343) — carried so a promoted
             // primary inherits which phases already fired `on_phase_end`
             // (the no-redo decision input) via union-merge on restore.
@@ -680,6 +699,7 @@ impl<I: Identifier> ClusterState<I> {
             retry_passes_used,
             unfulfillable_reinject_used,
             respawn_events,
+            respawn_policy,
             phases_ended,
             custom_messages,
             custom_terminal_watermarks,
@@ -937,6 +957,15 @@ impl<I: Identifier> ClusterState<I> {
         // correct + idempotent. The merge rule is spelled once in
         // `grow_max::merge_grow_set`.
         merge_grow_set(&mut self.respawn_events, respawn_events);
+        // Respawn-policy caps: same static-config lifecycle as
+        // `phase_may_be_empty` — adopt on first-bootstrap (local `None`).
+        // The policy is set once per run by the submitter's seed, so a
+        // non-`None` local is already the run's policy; first-write-wins
+        // keeps a divergent (contract-violating) incoming value from
+        // flapping the budget gate.
+        if self.respawn_policy.is_none() {
+            self.respawn_policy = respawn_policy;
+        }
         // Grow-only SET (#343): plain set UNION so a promoted primary
         // inherits which phases already fired `on_phase_end` and a stale
         // peer's snapshot can never un-end a phase. Idempotent +
