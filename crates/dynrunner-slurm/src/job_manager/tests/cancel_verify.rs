@@ -280,6 +280,60 @@ async fn verified_cancel_returns_after_one_poll_when_all_jobs_clear() {
     }
 }
 
+/// CLEAN-COMPLETION sweep shape: the ledger holds the whole framework
+/// cohort, but at clean completion the WELCOMED members have already
+/// self-terminated off the verdict (gone from squeue), while one
+/// never-joined PENDING respawn (`170002`) is still queued, squatting a
+/// node it would otherwise idle to its 600s give-up on. The verified
+/// sweep must:
+///   - re-scancel the still-queued straggler until it leaves (>= 2
+///     scancels — initial pass + at least one verify-round re-scancel),
+///   - NOT re-scancel the self-terminated members (they have no squeue
+///     row, so the verify loop drops them — exactly one initial scancel,
+///     never a re-scancel; the sweep does not WAIT on them), and
+///   - drain the ledger either way.
+/// This is the GAP the clean-completion path closes: before it, a
+/// disarmed guard left the straggler running.
+#[tokio::test]
+async fn clean_completion_sweep_cancels_straggler_and_skips_self_terminated() {
+    // 170000/170001 self-terminated (0 rounds — gone on the first poll);
+    // 170002 is the never-joined PENDING respawn, still RUNNING for one
+    // post-scancel poll before it finally leaves.
+    let mut running = HashMap::new();
+    running.insert("170002".to_string(), 1u32);
+    let gw = ScancelVerifyGateway::new(running);
+    let mut mgr = manager_with_jobs(gw, &["170000", "170001", "170002"]);
+
+    mgr.cancel_all_jobs_verified(zero_delay_policy(3))
+        .await
+        .expect("clean-completion sweep returns Ok");
+
+    // The never-joined straggler is re-scancelled by the verify loop.
+    assert!(
+        mgr.gateway().scancel_count("170002") >= 2,
+        "the still-queued PENDING respawn must be re-scancelled until it \
+         leaves; got {} scancel(s) (commands: {:?})",
+        mgr.gateway().scancel_count("170002"),
+        mgr.gateway().commands(),
+    );
+    // The self-terminated members are NOT re-scancelled: the verify loop
+    // squeue-filters them out, so the sweep never waits on a job that
+    // already wound itself down.
+    for gone in ["170000", "170001"] {
+        assert_eq!(
+            mgr.gateway().scancel_count(gone),
+            1,
+            "a self-terminated member must not be re-scancelled; {gone} \
+             commands: {:?}",
+            mgr.gateway().commands(),
+        );
+    }
+    assert!(
+        mgr.job_ids().is_empty(),
+        "the clean-completion sweep must drain the ledger",
+    );
+}
+
 // ── In-flight sbatch race tests ──────────────────────────────────────────────
 
 /// Gateway whose `execute_command` for sbatch blocks on a oneshot gate.
@@ -414,7 +468,14 @@ async fn inflight_sbatch_orphan_race_marker_seen_by_teardown() {
             let submit_handle = tokio::task::spawn_local(async move {
                 let mut locked = mgr_clone.lock().await;
                 locked
-                    .submit_job("#!/bin/sh\necho hi\n", "sec-race-test", "sec-race-test", 1, "/log")
+                    .submit_job(
+                        "#!/bin/sh\necho hi\n",
+                        "sec-race-test",
+                        "sec-race-test",
+                        1,
+                        "/log",
+                        None,
+                    )
                     .await
             });
 

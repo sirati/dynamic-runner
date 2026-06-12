@@ -636,6 +636,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // batch below). `worker_count` is `Copy`; `resources` is
             // cloned once.
             let advertised_resources = resources.clone();
+            // Record this secondary's node (its advertised hostname) so a
+            // later respawn for it can exclude the node from the
+            // replacement's sbatch. Kept in a map that OUTLIVES the
+            // connection (the death path purges `secondaries` before the
+            // respawn dispatch runs), so this is the surviving source of
+            // the dead member's node. Skip an empty hostname — a blank
+            // `--exclude=` would hard-error sbatch; absence just means the
+            // node is unknown and the replacement places unconstrained.
+            if !hostname.is_empty() {
+                self.secondary_nodes
+                    .insert(secondary_id.clone(), hostname.clone());
+            }
             if fresh_member {
                 let conn = SecondaryConnection::new(secondary_id.clone());
                 let conn = conn.receive_welcome(
