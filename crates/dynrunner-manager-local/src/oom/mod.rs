@@ -100,7 +100,15 @@ impl LogTrigger {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OomWatcherSnapshot {
     pub host: HostMemoryReading,
+    /// Resident component of the tracked-worker sum (charged − swap).
     pub tracked_workers_rss_sum: u64,
+    /// Swap component of the tracked-worker sum. Growth here is
+    /// PRESSURE: pages migrating to swap shrink RSS while the worker
+    /// is dying, so the swap share must be visible alongside it.
+    pub tracked_workers_swap_sum: u64,
+    /// Charged sum (resident + swap) — the same number the kill
+    /// decision consumes per worker via `actual_usage`.
+    pub tracked_workers_charged_sum: u64,
     pub tracked_workers_count: u32,
     pub captured_at: Option<Instant>,
 }
@@ -199,7 +207,9 @@ pub struct OomWatcher {
 struct TrackedDeltaFields {
     host_ram_used: u64,
     container_memory_current: u64,
-    tracked_workers_rss_sum: u64,
+    /// Charged (resident + swap) tracked-worker sum: swap growth is
+    /// pressure and must trip the delta trigger like RSS growth.
+    tracked_workers_charged_sum: u64,
 }
 
 impl OomWatcher {
@@ -317,11 +327,13 @@ impl OomWatcher {
             }
             self.last_kernel_oom_count = Some(current);
         }
-        let tracked_workers_rss_sum = sum_worker_rss(pool);
+        let (charged_sum, swap_sum) = sum_worker_charge(pool);
         let tracked_workers_count = pool.workers.len() as u32;
         self.last_snapshot = OomWatcherSnapshot {
             host,
-            tracked_workers_rss_sum,
+            tracked_workers_rss_sum: charged_sum.saturating_sub(swap_sum),
+            tracked_workers_swap_sum: swap_sum,
+            tracked_workers_charged_sum: charged_sum,
             tracked_workers_count,
             captured_at: Some(now),
         };
@@ -363,8 +375,11 @@ impl OomWatcher {
             // inside `check_resource_pressure`; re-summing is cheap
             // and keeps the log line self-consistent.
             let host = self.probe.read();
+            let (charged_sum, swap_sum) = sum_worker_charge(pool);
             self.last_snapshot.host = host;
-            self.last_snapshot.tracked_workers_rss_sum = sum_worker_rss(pool);
+            self.last_snapshot.tracked_workers_rss_sum = charged_sum.saturating_sub(swap_sum);
+            self.last_snapshot.tracked_workers_swap_sum = swap_sum;
+            self.last_snapshot.tracked_workers_charged_sum = charged_sum;
             self.last_snapshot.tracked_workers_count = pool.workers.len() as u32;
             self.last_snapshot.captured_at = Some(Instant::now());
             self.note_kill();
@@ -442,7 +457,7 @@ impl OomWatcher {
         let prev = &self.last_log_values;
         let cur_host_ram_used = snap.host.host_ram_used_bytes.unwrap_or(0);
         let cur_cgroup_cur = snap.host.container_memory_current.unwrap_or(0);
-        let cur_rss_sum = snap.tracked_workers_rss_sum;
+        let cur_charged_sum = snap.tracked_workers_charged_sum;
 
         let host_total = snap.host.host_ram_total_bytes.unwrap_or(0);
         let pressure_ratio = if host_total == 0 {
@@ -457,7 +472,7 @@ impl OomWatcher {
         let delta = |cur: u64, prev: u64| -> u64 { cur.saturating_sub(prev) };
         let any_grew_by_1gib = delta(cur_host_ram_used, prev.host_ram_used) >= DELTA_TRIGGER_BYTES
             || delta(cur_cgroup_cur, prev.container_memory_current) >= DELTA_TRIGGER_BYTES
-            || delta(cur_rss_sum, prev.tracked_workers_rss_sum) >= DELTA_TRIGGER_BYTES;
+            || delta(cur_charged_sum, prev.tracked_workers_charged_sum) >= DELTA_TRIGGER_BYTES;
 
         if any_grew_by_1gib {
             Some(LogTrigger::DeltaUnderPressure)
@@ -484,9 +499,11 @@ impl OomWatcher {
             "container_swap_current": snap.host.container_swap_current,
             "container_swap_max": snap.host.container_swap_max,
             "tracked_workers_rss_sum": snap.tracked_workers_rss_sum,
+            "tracked_workers_swap_sum": snap.tracked_workers_swap_sum,
+            "tracked_workers_charged_sum": snap.tracked_workers_charged_sum,
             "tracked_workers_count": snap.tracked_workers_count,
             "trigger": trigger.as_str(),
-            "note": "tracked_workers_rss_sum measures direct workers only — daemon-delegated subprocesses NOT included",
+            "note": "tracked_workers_* sums measure the workers' own cgroup subtrees (or the worker processes themselves in the flat fallback) — daemon-delegated subprocesses NOT included; charged = rss + swap, the kill-decision input",
         });
         tracing::info!(target: "oom_watcher", oom_watcher = %json);
 
@@ -494,7 +511,7 @@ impl OomWatcher {
         self.last_log_values = TrackedDeltaFields {
             host_ram_used: snap.host.host_ram_used_bytes.unwrap_or(0),
             container_memory_current: snap.host.container_memory_current.unwrap_or(0),
-            tracked_workers_rss_sum: snap.tracked_workers_rss_sum,
+            tracked_workers_charged_sum: snap.tracked_workers_charged_sum,
         };
         if matches!(trigger, LogTrigger::Kill) {
             self.pending_kill_event = false;
@@ -502,11 +519,14 @@ impl OomWatcher {
     }
 }
 
-/// Sum the RSS bytes across all workers in the pool. Reads the
-/// already-cached `actual_usage` (populated by
-/// `update_all_resource_usage` / `check_resource_pressure`); no
-/// /proc access here.
-fn sum_worker_rss<M, I>(pool: &WorkerPool<M, I>) -> u64
+/// Sum the `(charged, swap)` bytes across all workers in the pool.
+/// Reads the already-cached `actual_usage` / `actual_swap_bytes`
+/// (populated by `update_all_resource_usage` /
+/// `check_resource_pressure`); no /proc or cgroup access here. The
+/// memory kind in `actual_usage` carries the CHARGED bytes
+/// (resident + swap — see [`crate::monitor::MemoryCharge`]); the
+/// swap component rides separately on the handle.
+fn sum_worker_charge<M, I>(pool: &WorkerPool<M, I>) -> (u64, u64)
 where
     M: ManagerEndpoint + 'static,
     I: Identifier,
@@ -514,8 +534,12 @@ where
     let mem_kind = ResourceKind::memory();
     pool.workers
         .iter()
-        .map(|w| w.actual_usage.get(&mem_kind))
-        .sum()
+        .fold((0u64, 0u64), |(charged, swap), w| {
+            (
+                charged.saturating_add(w.actual_usage.get(&mem_kind)),
+                swap.saturating_add(w.actual_swap_bytes),
+            )
+        })
 }
 
 /// Minimal RFC-3339-ish UTC timestamp builder.
