@@ -129,7 +129,7 @@ mod tuple_keyed_map {
 ///   Carried so a bootstrap-relocated / freshly-promoted primary seeded
 ///   purely from a snapshot reconstructs the alive-membership ledger
 ///   (`is_peer_alive` → `alive_secondary_members` →
-///   `alive_remote_secondary_count`) the moment it restores — without
+///   `alive_worker_secondary_count`) the moment it restores — without
 ///   it `peer_state` stays empty and the count is a false zero from
 ///   tick 0. The inserted entry holds ONLY liveness; the role
 ///   capabilities ride the separate `capabilities` 2P-set (C6) and the

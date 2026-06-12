@@ -766,8 +766,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let chronic = self.own_tick_health.in_chronic_starvation();
         let judged_now = self.own_tick_health.judged_elapsed();
         // Exclude the recognized primary's own same-peer secondary by IDENTITY
-        // (the same `id != current_primary` cut `alive_remote_secondary_count`
-        // uses). The EARLY dispatch-altitude requeue acts on first-stage silence,
+        // (an `id != current_primary` cut owned here, for the early-requeue
+        // concern only). The EARLY dispatch-altitude requeue acts on first-stage silence,
         // so during a transient self-keepalive gap — when the host's own
         // secondary is still processing but momentarily silent — reporting self
         // here would yank the self's LIVE in-flight task before the next

@@ -471,15 +471,13 @@ fn restore_migrates_unphased_deps_to_enclosing_phase() {
 /// After restore the downstream consumers the operational loop arms
 /// fleet-dead on MUST read honest values: `is_peer_alive(secondary)`
 /// true, `alive_secondary_members()` non-empty, a positive
-/// `alive_remote_secondary_count()` (a `current_primary` is set so the
-/// `id` vs `current_primary` filter is genuinely exercised), and
-/// `run_complete()` true.
+/// `alive_worker_secondary_count()`, and `run_complete()` true.
 ///
 /// Without the `alive_members` projection (part 1 of the fix),
 /// `peer_state` would stay empty after restore, so `is_peer_alive` is
 /// false for all ids, `alive_secondary_members()` is empty, and
-/// `alive_remote_secondary_count()` is a FALSE ZERO from tick 0 — the
-/// exact condition that fires fleet-dead at 30s while remote
+/// `alive_worker_secondary_count()` is a FALSE ZERO from tick 0 — the
+/// exact condition that fires fleet-dead at 30s while
 /// secondaries are alive. This test fails on that omission.
 #[test]
 fn consumer_invariants_survive_snapshot_restore() {
@@ -512,9 +510,9 @@ fn consumer_invariants_survive_snapshot_restore() {
         worker_count: 4,
         resources: vec![mem(2 * 1024 * 1024 * 1024)],
     });
-    // The same-peer host is the recognized primary so the
-    // `id != current_primary` cut in `alive_remote_secondary_count`
-    // is genuinely exercised.
+    // The same-peer host is the recognized primary (the production
+    // promoted shape; the count is identity-blind, so the recognized
+    // primary's id is immaterial to it).
     s.apply(ClusterMutation::PrimaryChanged {
         new: "setup".into(),
         epoch: 1,
@@ -537,9 +535,9 @@ fn consumer_invariants_survive_snapshot_restore() {
     let members: HashSet<&str> = relocated.alive_secondary_members().collect();
     assert_eq!(members, HashSet::from(["sec-remote"]));
     assert_eq!(
-        relocated.alive_remote_secondary_count(),
+        relocated.alive_worker_secondary_count(),
         1,
-        "honest remote-secondary count post-restore (false-zero is the bug)"
+        "honest worker-secondary count post-restore (false-zero is the bug)"
     );
     assert!(
         relocated.run_complete(),

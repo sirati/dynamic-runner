@@ -749,12 +749,12 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     pub(super) backpressured_secondaries: HashMap<String, Instant>,
 
     /// First moment (operational-loop iteration) where
-    /// `self.secondaries` became empty while the pool still has
-    /// pending work. Cleared whenever a secondary is present
-    /// (handle_welcome reconnect, etc.). After
-    /// `config.fleet_dead_timeout` of continuous emptiness, the
-    /// operational loop exits cleanly with pending tasks moved
-    /// into `failed_tasks`. See `fleet_dead_timeout` docs for the
+    /// `cluster_state.alive_worker_secondary_count()` read zero while
+    /// the pool still has pending work. Cleared whenever an alive
+    /// worker-secondary is present again (re-handshake / partial fleet
+    /// survival). After `config.fleet_dead_timeout` of continuous
+    /// emptiness, the operational loop exits cleanly with the queued
+    /// tasks left stranded. See `fleet_dead_timeout` docs for the
     /// rationale.
     pub(super) fleet_dead_since: Option<Instant>,
 
