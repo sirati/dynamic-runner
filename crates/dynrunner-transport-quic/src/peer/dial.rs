@@ -218,8 +218,8 @@ pub(super) async fn dial_peer(
         ),
     }
 
-    if let Some(cert_der) = peer_cert_der.as_ref() {
-        match race_quic(&addrs, peer_id, cert_der, ATTEMPT_TIMEOUT).await {
+    match peer_cert_der.as_ref() {
+        Ok(cert_der) => match race_quic(&addrs, peer_id, cert_der, ATTEMPT_TIMEOUT).await {
             Ok((addr, conn)) => {
                 tracing::info!(peer = peer_id, %addr, %attempt, "connected to peer via QUIC");
                 return Some(PeerConnection::Quic(conn));
@@ -230,9 +230,17 @@ pub(super) async fn dial_peer(
                 "QUIC race to peer failed across all addresses, trying WSS",
                 &format_failures(&failures),
             ),
+        },
+        // No usable cert ⇒ the QUIC race is structurally impossible
+        // (nothing to pin the server against). The parser's `Err`
+        // carries the SPECIFIC failure (absent vs corrupt cert) so the
+        // `reasons=` field is never empty — pre-fix this branch logged
+        // `reasons=` blank and the operator could not tell WHY QUIC was
+        // skipped (production shape: a late-joiner seeded from cert-less
+        // `.info` records).
+        Err(reason) => {
+            emit_dial_step_failure(peer_id, attempt, "no valid cert for peer, trying WSS", reason)
         }
-    } else {
-        emit_dial_step_failure(peer_id, attempt, "no valid cert for peer, trying WSS", "");
     }
 
     match race_wss(&addrs, ATTEMPT_TIMEOUT).await {

@@ -258,8 +258,27 @@ pub async fn run_pump<I, Tr>(
             maybe_item = dispatch_rx.recv(), if egress_open => {
                 match maybe_item {
                     Some(item) => {
+                        // Capture the envelope identity BEFORE the apply
+                        // consumes the item: a failed apply is this frame's
+                        // TERMINAL drop (the coordinator's `MeshClient::send`
+                        // already returned Ok at enqueue time, so no caller
+                        // ever observes the wire failure — nothing
+                        // retransmits). WARN, never DEBUG: a snapshot reply
+                        // to a bootstrapping joiner that dies here is
+                        // otherwise invisible at production log levels (the
+                        // joiner just times out against a responder that
+                        // believes it answered).
+                        let kind = item.frame.msg_type();
+                        let target = item.target.clone();
                         if let Err(reason) = mesh.apply_local_dispatch(item).await {
-                            tracing::debug!(%reason, "mesh-pump: egress apply returned an error");
+                            tracing::warn!(
+                                %reason,
+                                kind = ?kind,
+                                target = ?target,
+                                "mesh-pump: egress apply failed — the queued \
+                                 frame is DROPPED (the sender observed Ok at \
+                                 enqueue; nothing retransmits it)"
+                            );
                         }
                     }
                     None => egress_open = false,

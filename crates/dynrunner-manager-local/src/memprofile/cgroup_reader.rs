@@ -51,8 +51,7 @@ pub struct CgroupSample {
 /// treated as "0 bytes" and is not an error. Any other I/O error from
 /// any of the three files is surfaced as [`MemProfileError::Io`].
 pub fn read(cgroup_dir: &Path) -> Result<CgroupSample, MemProfileError> {
-    let memory_current = read_scalar(cgroup_dir, "memory.current")?;
-    let swap_current = read_swap_current(cgroup_dir)?;
+    let (memory_current, swap_current) = read_charge(cgroup_dir)?;
     let memory_stat = read_stat(cgroup_dir)?;
 
     Ok(CgroupSample {
@@ -60,6 +59,19 @@ pub fn read(cgroup_dir: &Path) -> Result<CgroupSample, MemProfileError> {
         swap_current,
         memory_stat,
     })
+}
+
+/// Read just the `(memory.current, memory.swap.current)` pair from a
+/// cgroup-v2 leaf. Shared primitive between the memprofile sampler
+/// (via [`read`]) and the worker-charge accounting in
+/// [`crate::monitor`] — one owner for the "what does this cgroup
+/// currently hold in RAM + swap" read so the two consumers cannot
+/// drift. Missing `memory.swap.current` (host without swap
+/// accounting) reads as `0`, same contract as [`read`].
+pub(crate) fn read_charge(cgroup_dir: &Path) -> Result<(u64, u64), MemProfileError> {
+    let memory_current = read_scalar(cgroup_dir, "memory.current")?;
+    let swap_current = read_swap_current(cgroup_dir)?;
+    Ok((memory_current, swap_current))
 }
 
 /// Read a whole-file unsigned-integer pseudo-file (`memory.current`,

@@ -24,6 +24,7 @@ impl PyObserverLateJoiner {
         gateway_url = None,
         ssh_identity_file = None,
         ssh_config_file = None,
+        mesh_credentials_path = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -36,6 +37,7 @@ impl PyObserverLateJoiner {
         gateway_url: Option<String>,
         ssh_identity_file: Option<String>,
         ssh_config_file: Option<String>,
+        mesh_credentials_path: Option<PathBuf>,
     ) -> PyResult<Self> {
         // Resolve the gateway mode UP FRONT so a malformed URL fails at
         // construction (operator-visible, before any runtime spins up).
@@ -60,6 +62,19 @@ impl PyObserverLateJoiner {
                 }
             },
         };
+        // An explicit credentials file together with gateway mode is a
+        // contradiction the operator should hear about UP FRONT: every
+        // gateway-mode leg rides a TCP `ssh -L` forward, which cannot
+        // carry QUIC/UDP — the cert pins could never be used (the
+        // seed-rewrite seam clears certs for exactly that reason).
+        if gateway.is_some() && mesh_credentials_path.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "observer late-joiner: --observer-mesh-credentials cannot be combined with \
+                 a remote --gateway: gateway-mode legs ride TCP ssh -L forwards, which \
+                 cannot carry QUIC, so pinned certs are unusable there (the dials are \
+                 WSS-over-tunnel by design)",
+            ));
+        }
         // Default observer-id includes a small random suffix so two
         // concurrent observer-dispatchers on the same gateway don't
         // collide on the peer-id (the mesh keys on it). The format
@@ -88,6 +103,7 @@ impl PyObserverLateJoiner {
             observer_id,
             peer_info_dir,
             gateway,
+            mesh_credentials_path,
             distributed_config: distributed_config.unwrap_or_default(),
             holdings,
             panik_watcher_paths: panik_watcher_paths.unwrap_or_default(),

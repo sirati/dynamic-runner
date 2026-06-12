@@ -33,6 +33,7 @@ impl PyPrimaryCoordinator {
         panik_watcher_paths = None,
         panik_watcher_poll_interval_secs = 10.0,
         forwarded_argv = Vec::new(),
+        peer_credentials_path = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -56,6 +57,7 @@ impl PyPrimaryCoordinator {
         panik_watcher_paths: Option<Vec<std::path::PathBuf>>,
         panik_watcher_poll_interval_secs: f64,
         forwarded_argv: Vec<String>,
+        peer_credentials_path: Option<std::path::PathBuf>,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
         let uses_file_based_items: bool = task_definition
@@ -101,6 +103,7 @@ impl PyPrimaryCoordinator {
             panik_watcher_paths: panik_watcher_paths.unwrap_or_default(),
             panik_watcher_poll_interval_secs,
             forwarded_argv,
+            peer_credentials_path,
         })
     }
 
