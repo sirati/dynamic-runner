@@ -40,6 +40,12 @@ pub mod control;
 mod coordinator;
 pub(crate) mod custom_message;
 mod dispatch;
+// The duplicate-assignment wire marker is emitter-owned (the router's
+// TaskAssignment arm emits it) but consumed by the primary's TaskFailed
+// classifier; re-export ONLY the constant so `mod dispatch` stays
+// private (same pattern as `resource::NO_FAULT_PREEMPT_WIRE_MESSAGE`,
+// which rides its module's existing `pub(crate)` visibility).
+pub(crate) use dispatch::TASK_ALREADY_HELD_WIRE_MESSAGE;
 mod election;
 mod lifecycle;
 // `pub(crate)` only so the `cascade_drain_done` pool-cascade primitive

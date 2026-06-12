@@ -27,6 +27,16 @@ use crate::worker_signal::WorkerMgmtSignal;
 ///     — the reconciliation probe's holder positively denied holding
 ///     the task (#308): its terminal will never come, but it did not
 ///     FAIL anywhere, so it requeues without burning retry budget.
+///
+/// Deliberately NOT in this set:
+/// [`crate::secondary::TASK_ALREADY_HELD_WIRE_MESSAGE`] — the
+/// duplicate-assignment coherence report ("I am ALREADY RUNNING that
+/// hash"). It is the requeue's exact OPPOSITE: the task must STAY in
+/// flight on the holder (a requeue re-arms the post-failover assign
+/// loop this marker exists to break), so `handle_task_failed`
+/// recognises it FIRST and routes to
+/// [`PrimaryCoordinator::note_task_already_held`] before any
+/// slot/ledger mutation.
 fn is_backpressure_shaped(error_message: &str) -> bool {
     error_message == "No idle worker available"
         || error_message == "worker pipe broken; respawning"
@@ -54,6 +64,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             ..
         } = &msg
         {
+            // Duplicate-assignment coherence report — recognised BEFORE
+            // the dedup gate and BEFORE `free_slot_on_terminal`: the
+            // holder is ALREADY RUNNING the hash, so neither the slot nor
+            // the ledger nor the pool may be touched (see
+            // `note_task_already_held` for the two-case contract). Falling
+            // through would account a still-running task as a terminal
+            // failure.
+            if error_message == crate::secondary::TASK_ALREADY_HELD_WIRE_MESSAGE {
+                self.note_task_already_held(secondary_id, *worker_id, task_hash);
+                return;
+            }
             // Dedup gate (#50 peer-forwarding redundancy):
             // Same shape as `handle_task_complete`'s dedup —
             // peers forward observed peer-TaskFailed events to

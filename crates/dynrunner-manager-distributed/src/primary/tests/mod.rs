@@ -17,6 +17,7 @@
 //!   `WorkerMgmtSignal::TasksAdded`; positive + negative-control +
 //!   is_idle-advisory + coalesce.
 
+mod already_held;
 mod assembly_beacon;
 mod basic;
 mod bringup_composition_fatal;

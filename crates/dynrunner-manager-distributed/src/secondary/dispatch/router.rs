@@ -108,6 +108,57 @@ where
                     );
                     return Ok(());
                 }
+                // Duplicate-assignment recognition (the post-failover assign
+                // loop). A hash this node ALREADY HOLDS in live own-worker
+                // bookkeeping (`holding_worker` — the same single truth
+                // source the #308 probe responder answers from: the
+                // generation-aware `active_tasks` plus the respawn-HOLD
+                // `pending_first_bind` deferrals) must NEVER enter the
+                // idle-target selection below: with no idle worker it would
+                // bounce as the GENERIC "No idle worker available"
+                // backpressure — which the authority classifies as requeue,
+                // sustaining an indefinite assign → bounce → requeue loop
+                // against the still-running task — and with an idle worker
+                // present the fallback would DOUBLE-RUN the hash on this
+                // node and clobber its `active_tasks` entry. Answer with the
+                // already-held coherence report instead, naming the REAL
+                // holding worker: the authority keeps the task in flight on
+                // this holder (its optimistic dispatch commit is the correct
+                // record) and the eventual real terminal settles it. Reached
+                // when the authority's replicated ledger lost the `InFlight`
+                // fact (the originating primary died between the assignment
+                // send and its `TaskAssigned` broadcast landing) or a
+                // false-dead recovery requeued a live holder's work.
+                if let Some(holding_wid) = self.lifecycle.holding_worker(&file_hash) {
+                    tracing::info!(
+                        task_hash = %file_hash,
+                        requested_worker_id = worker_id,
+                        holding_worker_id = holding_wid,
+                        "TaskAssignment for a hash this node is already \
+                         running (duplicate dispatch — the authority's ledger \
+                         lost the in-flight fact); answering already-held so \
+                         it re-converges to InFlight on this holder"
+                    );
+                    let msg = DistributedMessage::TaskFailed {
+                        target: None,
+                        sender_id: self.config.secondary_id.clone(),
+                        timestamp: timestamp_now(),
+                        secondary_id: self.config.secondary_id.clone(),
+                        worker_id: holding_wid,
+                        task_hash: file_hash,
+                        error_type: ErrorType::Recoverable,
+                        error_message: super::TASK_ALREADY_HELD_WIRE_MESSAGE.into(),
+                        // Stamped at the send_to_primary chokepoint (#352).
+                        delivery_seq: None,
+                        // Stamped at the send_to_primary chokepoint (ordering gate).
+                        msgs_posted_through: None,
+                    };
+                    // Report to the primary role only — the authority owns
+                    // mesh propagation, same contract as the backpressure
+                    // report below.
+                    self.send_to_primary(msg).await?;
+                    return Ok(());
+                }
                 // Resolve binary path via the three-mode helper
                 // (uses_file_based_items / pre_staged_mode / default
                 // extraction-cache). See `resolve_for_dispatch` for

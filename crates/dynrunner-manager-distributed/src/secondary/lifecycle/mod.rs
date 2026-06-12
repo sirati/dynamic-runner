@@ -832,16 +832,28 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     /// whose maps genuinely don't know the hash will never produce a
     /// terminal for it.
     pub(in crate::secondary) fn holds_task(&self, task_hash: &str) -> bool {
+        self.holding_worker(task_hash).is_some()
+    }
+
+    /// The worker holding `task_hash` in this node's live own-worker
+    /// bookkeeping, or `None` when no live bookkeeping knows the hash.
+    /// The SINGLE truth source behind [`Self::holds_task`] (see its doc
+    /// for the "live bookkeeping" definition): the probe responder
+    /// consumes the boolean, the duplicate-assignment recognition in the
+    /// dispatch router consumes the holder id (its "already held" reply
+    /// names the worker actually running the task, not the slot the
+    /// stale authority picked).
+    pub(in crate::secondary) fn holding_worker(&self, task_hash: &str) -> Option<WorkerId> {
         match self {
-            SecondaryLifecycle::Configuring(cfg) => cfg.active_tasks.contains_key(task_hash),
+            SecondaryLifecycle::Configuring(cfg) => cfg.active_tasks.get(task_hash).copied(),
             SecondaryLifecycle::Operational(op) => {
-                op.active_tasks.contains_key(task_hash)
-                    || op
-                        .pending_first_bind
-                        .values()
-                        .any(|pending| pending.file_hash == task_hash)
+                op.active_tasks.get(task_hash).copied().or_else(|| {
+                    op.pending_first_bind
+                        .iter()
+                        .find_map(|(wid, pending)| (pending.file_hash == task_hash).then_some(*wid))
+                })
             }
-            _ => false,
+            _ => None,
         }
     }
 }
