@@ -51,6 +51,7 @@ pub fn build_run_argv(
     peer_ips: &PeerIps,
     quic_port: u16,
     secondary_url: &str,
+    host_hostname: &str,
     cgroup_parent: Option<&str>,
 ) -> Vec<String> {
     let mut argv: Vec<String> = Vec::new();
@@ -86,6 +87,14 @@ pub fn build_run_argv(
     argv.push("--pull=never".to_string());
     argv.push("--network".to_string());
     argv.push("host".to_string());
+    // In-container identity = the node. `--network host` shares the net
+    // namespace but podman still gives the container a PRIVATE UTS
+    // namespace whose default hostname is not the node's — the runner
+    // then reports "unknown" in its welcome/logs. Pass the wrapper
+    // host's external FQDN (the SAME source the Reverse-mode peer-info
+    // record publishes) so node-keyed forensics line up.
+    argv.push("--hostname".to_string());
+    argv.push(host_hostname.to_string());
     // Podman's rootless default is pids_limit=2048 (from containers.conf).
     // Under SLURM, fork-heavy or thread-heavy workloads (JVM, parallel
     // compilers, autotools) exhaust that cap → clone() EAGAIN. Pass 0
@@ -308,6 +317,7 @@ mod tests {
             &both_ips(),
             7777,
             secondary_url,
+            "node01.cluster",
             None,
         );
 
@@ -325,6 +335,8 @@ mod tests {
             "--pull=never",
             "--network",
             "host",
+            "--hostname",
+            "node01.cluster",
             "--pids-limit=0",
             "--ulimit",
             "nproc=32768:32768",
@@ -385,6 +397,13 @@ mod tests {
             argv.contains(&"--pids-limit=0".to_string()),
             "--pids-limit=0 must be present in argv"
         );
+        // In-container identity: `--hostname <host FQDN>` must be present so
+        // the runner doesn't report the container UTS default ("unknown").
+        let hn = argv
+            .iter()
+            .position(|a| a == "--hostname")
+            .expect("--hostname present");
+        assert_eq!(argv[hn + 1], "node01.cluster");
         // The dispatcher's task-specific argv now travels over the peer
         // mesh (cold-start fetch), NOT on the launch command line: no
         // `--forwarded-arg` flag and none of its values appear.
@@ -425,6 +444,7 @@ mod tests {
             &both_ips(),
             7777,
             "tcp://gw.cluster:4433",
+            "node01.cluster",
             Some(parent),
         );
         let without_parent = build_run_argv(
@@ -435,6 +455,7 @@ mod tests {
             &both_ips(),
             7777,
             "tcp://gw.cluster:4433",
+            "node01.cluster",
             None,
         );
 
@@ -482,6 +503,7 @@ mod tests {
             &PeerIps::default(),
             5555,
             secondary_url,
+            "node02.cluster",
             None,
         );
 
@@ -499,6 +521,8 @@ mod tests {
             "--pull=never",
             "--network",
             "host",
+            "--hostname",
+            "node02.cluster",
             "--pids-limit=0",
             "--ulimit",
             "nproc=32768:32768",
@@ -575,6 +599,7 @@ mod tests {
             &both_ips(),
             9001,
             secondary_url,
+            "node01.cluster",
             None,
         );
 
@@ -609,6 +634,7 @@ mod tests {
             &both_ips(),
             7777,
             "tcp://gw:4433",
+            "node01.cluster",
             None,
         );
 

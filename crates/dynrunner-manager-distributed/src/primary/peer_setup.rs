@@ -1,6 +1,7 @@
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, PeerConnectionInfo, SetupBootstrapMessage,
+    ClusterMutation, Destination, DistributedMessage, PeerConnectionInfo, PeerId,
+    SetupBootstrapMessage,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -59,6 +60,55 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 liveness_port: s.liveness_port(),
             })
             .collect()
+    }
+
+    /// Build the wire `PeerInfo` frame over `peers` — the ONE frame
+    /// construction, shared by the fleet broadcast
+    /// ([`Self::broadcast_peer_roster`]) and the directed per-member
+    /// delivery ([`Self::send_peer_roster_to`]). One builder, two
+    /// addressings: the two paths can never drift in frame shape.
+    fn peer_roster_frame(&self, peers: Vec<PeerConnectionInfo>) -> DistributedMessage<I> {
+        SetupBootstrapMessage::PeerInfo {
+            sender_id: self.config.node_id.clone(),
+            timestamp: timestamp_now(),
+            peers,
+        }
+        .into()
+    }
+
+    /// Send the CURRENT roster to ONE member, DIRECTED
+    /// (`Destination::Secondary(id)`) — the same reliability class as the
+    /// trio's other two frames (`InitialAssignment` / `TransferComplete`).
+    ///
+    /// Why a directed copy exists at all: the fleet broadcast resolves
+    /// `Destination::All` to the transport legs REGISTERED AT THAT
+    /// INSTANT, and nothing retransmits a missed broadcast on reconnect
+    /// (see the transport's broadcast-honesty WARN). A joining member
+    /// whose leg registration races the broadcast therefore never sees
+    /// its roster — without it, no `ingest_peer_liveness_addrs`, no
+    /// keepalives, and the member is silence-judged dead (the
+    /// run_20260612_105712 replacement). A directed send instead rides
+    /// the relay-capable router path (forwarded through any connected
+    /// sibling, redial on relay), exactly like the two trio frames that
+    /// DID arrive in that run.
+    ///
+    /// Send failures are the mesh-pump-gone collapse (warn-and-continue,
+    /// uniform with the sibling setup sends).
+    async fn send_peer_roster_to(&mut self, secondary_id: &str) {
+        let msg = self.peer_roster_frame(self.peer_roster());
+        if let Err(error) = self
+            .send_to(
+                Destination::Secondary(PeerId::from(secondary_id.to_string())),
+                msg,
+            )
+            .await
+        {
+            tracing::warn!(
+                secondary_id = %secondary_id,
+                error = %error,
+                "directed PeerInfo delivery failed"
+            );
+        }
     }
 
     /// Broadcast the CURRENT peer roster to the fleet (and persist its
@@ -130,24 +180,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
         // The PeerInfo fan-out rides the unified mesh egress: build the
         // narrow setup-typed `SetupBootstrapMessage` (so an accidental
-        // operational variant fails to type-check here), then losslessly
-        // convert it to the wire `DistributedMessage` and broadcast it
-        // through `send_to(Destination::All, ..)` — the same egress every
-        // other primary broadcast uses. The wire bytes are identical to the
-        // pre-mesh `PrimaryPeerSetupBootstrap` path (the `From` conversion
-        // is the same one the adapter used internally); only the routing
-        // surface changed, from a transport-direct adapter to the queued
-        // mesh send. Per-secondary delivery failures are not folded into a
-        // synchronous result anymore (the queued send has none): a silent
-        // secondary surfaces through the heartbeat monitor, exactly as the
-        // adapter's own docs noted the per-secondary signal already did.
-        let msg: dynrunner_protocol_primary_secondary::DistributedMessage<I> =
-            SetupBootstrapMessage::PeerInfo {
-                sender_id: self.config.node_id.clone(),
-                timestamp: timestamp_now(),
-                peers,
-            }
-            .into();
+        // operational variant fails to type-check here — see
+        // `peer_roster_frame`, the ONE construction site), then broadcast
+        // it through `send_to(Destination::All, ..)` — the same egress
+        // every other primary broadcast uses. The wire bytes are identical
+        // to the pre-mesh `PrimaryPeerSetupBootstrap` path (the `From`
+        // conversion is the same one the adapter used internally); only the
+        // routing surface changed, from a transport-direct adapter to the
+        // queued mesh send. Per-secondary delivery failures are not folded
+        // into a synchronous result anymore (the queued send has none): a
+        // silent secondary surfaces through the heartbeat monitor, exactly
+        // as the adapter's own docs noted the per-secondary signal already
+        // did.
+        let msg = self.peer_roster_frame(peers);
         // `Destination::All` always resolves, so the only way this `send_to`
         // errors is the local mesh-pump being gone (the node winding down) —
         // a cluster collapse, which `send_to` latches on `self.mesh_pump_gone`
@@ -244,23 +289,98 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///     (the run_20260612_045106 secondary-4 zombie). The bring-up
     ///     objections don't apply: the run HAS started, so there is no
     ///     pool-draining-ahead-of-the-initial-assignment hazard, and the
-    ///     trio's directed frames are exactly the welcome-receipt proof
-    ///     that stops the member's handshake retry.
+    ///     trio completing the member's setup gate is what ends its
+    ///     handshake retry (the retry persists for the whole trio-wait;
+    ///     see `secondary::setup::wait_for_setup`).
     ///
     /// Fires only on the `Handshaking → CertExchanging` edge (the caller,
     /// `connect::handle_cert_exchange`, gates on it), so a duplicate
-    /// welcome/cert-exchange from the same incarnation never re-serves —
-    /// the serve is once-per-incarnation, consistent with the existing
-    /// duplicate-welcome handling.
+    /// cert-exchange from the same incarnation never re-runs this serve.
+    /// Retransmission for a member whose served frames were LOST is the
+    /// duplicate-WELCOME path ([`Self::re_serve_setup_on_duplicate_welcome`]):
+    /// once-per-incarnation here, re-served on demand there.
+    ///
+    /// The newcomer's roster is sent DIRECTED in addition to the fleet
+    /// broadcast: the broadcast races the newcomer's mesh-leg
+    /// registration (a `Destination::All` fan reaches only the legs
+    /// registered at that instant, and a missed broadcast is never
+    /// retransmitted), while the directed copy rides the relay-capable
+    /// router path — the same delivery class that got the trio's other
+    /// two frames through in run_20260612_105712 while the broadcast
+    /// PeerInfo vanished. The broadcast stays: it is what converges every
+    /// EARLIER member onto the grown roster.
     pub(super) async fn serve_setup_on_cert_exchange(&mut self, secondary_id: &str) {
         tracing::info!(
             secondary = %secondary_id,
-            "serving setup incrementally: broadcasting the grown peer \
-             roster (newcomer gets its first peer list; earlier members \
+            "serving setup incrementally: directed peer roster to the \
+             newcomer + broadcasting the grown roster (earlier members \
              converge onto the fleet so far)"
         );
+        self.send_peer_roster_to(secondary_id).await;
         self.broadcast_peer_roster().await;
         self.advance_member_peer_listed(secondary_id);
+        if self.run_start_batch_fired {
+            self.serve_run_start_trio_remainder(secondary_id).await;
+        }
+    }
+
+    /// Re-serve the setup trio to a member that sent a DUPLICATE welcome
+    /// — the retransmission half of the incremental serve (the
+    /// cert-exchange edge above is once-per-incarnation by design, so
+    /// this is the ONLY path that can replace a served-but-LOST frame).
+    ///
+    /// A duplicate welcome is the member's own statement that its setup
+    /// gate has not released: the secondary's `wait_for_setup` re-offers
+    /// the handshake on a capped backoff until the WHOLE trio has landed,
+    /// so each re-welcome doubles as a trio-retransmit request (the
+    /// run_20260612_105712 shape: the directed halves landed, the roster
+    /// broadcast was lost to the leg-registration race, and the member
+    /// sat at `got_peer_info=false` with nothing left to retransmit it).
+    ///
+    /// Suppression is keyed on per-incarnation OPERATIONAL PROOF, not on
+    /// this primary's connection typestate: the mid-run serve walks a
+    /// member `Operational` on the send side the instant the trio is
+    /// SENT, so the typestate cannot distinguish "served and running"
+    /// from "served and wedged". `keepalive_proven` can — it is inserted
+    /// only when the member's post-`wait_for_setup` keepalive emitter
+    /// provably runs, and cleared per incarnation (`seed_keepalive`). A
+    /// proven member's straggler duplicate (a welcome already in flight
+    /// when its gate released) is therefore NOT re-served — re-serving it
+    /// would clear its proof via `mark_member_operational`'s keepalive
+    /// re-seed and regress the silence sweep's judgment bound. An
+    /// UNPROVEN member is re-served the full trio, all idempotent on the
+    /// receiver (roster re-ingest, dispatch-flag re-stamp, gate re-set;
+    /// an already-operational receiver debug-drops the run-start halves).
+    ///
+    /// Pre-cert members are skipped: their roster entry does not exist
+    /// yet, and their own cert edge is the first serve. Pre-run-start the
+    /// re-serve is roster-only, mirroring the first serve's governance
+    /// (the quorum-proceed policy owns the run start).
+    pub(super) async fn re_serve_setup_on_duplicate_welcome(&mut self, secondary_id: &str) {
+        if self.keepalive_proven.contains(secondary_id) {
+            return;
+        }
+        let servable = self
+            .secondaries
+            .get(secondary_id)
+            .map(|s| s.is_at_least_cert_exchanged())
+            .unwrap_or(false);
+        if !servable {
+            return;
+        }
+        tracing::info!(
+            secondary = %secondary_id,
+            run_started = self.run_start_batch_fired,
+            "duplicate welcome from a member without operational proof: \
+             re-serving its setup trio (directed roster{}) — its gate has \
+             not released, so a served frame was lost in flight",
+            if self.run_start_batch_fired {
+                " + run-start halves"
+            } else {
+                "; run-start halves stay on the batch fan-out"
+            }
+        );
+        self.send_peer_roster_to(secondary_id).await;
         if self.run_start_batch_fired {
             self.serve_run_start_trio_remainder(secondary_id).await;
         }
