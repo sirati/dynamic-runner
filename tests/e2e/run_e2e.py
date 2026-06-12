@@ -800,10 +800,12 @@ def _run_one_scenario(
                 print(
                     f"[run_e2e]   FAIL: {scenario.name} — "
                     f"{len(leftover)} SLURM job(s) left running after run "
-                    f"finished: {' '.join(leftover)}. The framework's run "
-                    f"completion did not propagate to all secondaries (see "
-                    f"docs/MIGRATION_2026_05_PYTHON_TO_RUST.md → "
-                    f"'Known issues')",
+                    f"finished: {' '.join(leftover)}. Either the run's "
+                    f"terminal did not propagate to all secondaries "
+                    f"(teardown regression), or the scenario killed the "
+                    f"primary before the cluster was operational so the "
+                    f"secondaries are stuck in setup with no primary to "
+                    f"fail over from (a scenario-timing bug).",
                     flush=True,
                 )
                 # Cancel them so the next scenario isn't blocked by
