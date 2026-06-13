@@ -4677,7 +4677,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             fail_oom = outcome.fail_oom,
             fail_final = outcome.fail_final,
             total = self.total_tasks,
-            "primary finished"
+            "run complete:"
         );
 
         Ok(())
@@ -4758,7 +4758,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // sitting in the inbox at loop exit — are ingested before any
         // verdict is authored. Both gates fire BEFORE the broadcast
         // ladder below: a node that fails either one authors NO verdict
-        // and never reaches the caller's "primary finished" log.
+        // and never reaches the caller's "run complete:" log.
         //
         // Gate 1 — verdict adoption: the replicated `run_aborted` latch
         // is sticky and, at this point, FOREIGN by construction (every

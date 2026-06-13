@@ -800,7 +800,7 @@ impl PyPrimaryCoordinator {
                                 // missing dep / cycle). The primary already
                                 // broadcast the `RunAborted` verdict; RAISE so
                                 // this node's exit is non-zero — never the `Other`
-                                // swallow's false rc=0 "primary finished"
+                                // swallow's false rc=0 "run complete:"
                                 // (run_~1429: the primary logged the ERROR then
                                 // silently continued with an empty pool).
                                 fatal_policy_exit = Some(e);
