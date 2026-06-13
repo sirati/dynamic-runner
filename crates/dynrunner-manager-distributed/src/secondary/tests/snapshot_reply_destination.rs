@@ -49,6 +49,7 @@ async fn reply_target_for(requester: &str, is_observer: bool) -> Destination {
         timestamp: 0.0,
         stream_id: format!("{requester}/0"),
         resume_after: None,
+        task_ranges: Vec::new(),
         is_observer,
         can_be_primary: !is_observer,
     };
@@ -167,6 +168,7 @@ async fn target_stamped_request_is_answered_not_dropped() {
                     timestamp: 0.0,
                     stream_id: "peer-0/0".into(),
                     resume_after: None,
+                    task_ranges: Vec::new(),
                     is_observer: false,
                     can_be_primary: true,
                 }
@@ -235,6 +237,7 @@ async fn rosterless_joiner_with_direct_leg_is_answered() {
                 timestamp: 0.0,
                 stream_id: "late-joiner-7/0".into(),
                 resume_after: None,
+                task_ranges: Vec::new(),
                 is_observer: true,
                 can_be_primary: false,
             };

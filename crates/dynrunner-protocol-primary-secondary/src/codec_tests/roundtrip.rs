@@ -218,11 +218,18 @@ fn roundtrip_pull_probe() {
 }
 
 /// Pull-model PROBE REPLY round-trips: the requester addressee, the inbox
-/// depth, and the `ahead` bit all survive on their NON-default values
-/// (`ahead = true` is the value that actually selects a target — a default
-/// `false` would mask a dropped field).
+/// depth, the `ahead` bit, AND the piggybacked P1 `range_digest` all survive
+/// on their NON-default values (`ahead = true` is the value that actually
+/// selects a target — a default `false` would mask a dropped field; the
+/// range digest carries a sentinel bucket so a dropped/zeroed array is
+/// caught, the wire-shape mirror discipline for the new field).
 #[test]
 fn roundtrip_pull_probe_reply() {
+    let mut range_digest = crate::RangeDigest::default();
+    range_digest.counts[7] = 5;
+    range_digest.folds[7] = 0xDEAD_BEEF;
+    range_digest.counts[200] = 1;
+    range_digest.folds[200] = 0x1234_5678_9ABC_DEF0;
     let msg: DistributedMessage<TestId> = DistributedMessage::PullProbeReply {
         target: None,
         sender_id: "donor".into(),
@@ -230,6 +237,7 @@ fn roundtrip_pull_probe_reply() {
         requester: "behind-node".into(),
         inbox_size: 42,
         ahead: true,
+        range_digest: Box::new(range_digest.clone()),
     };
     let bytes = serialize_message(&msg).unwrap();
     let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
@@ -240,12 +248,21 @@ fn roundtrip_pull_probe_reply() {
             requester,
             inbox_size,
             ahead,
+            range_digest: rd,
             ..
         } => {
             assert_eq!(sender_id, "donor");
             assert_eq!(requester, "behind-node");
             assert_eq!(inbox_size, 42);
             assert!(ahead, "the ahead bit must survive on its non-default value");
+            assert_eq!(
+                rd.counts, range_digest.counts,
+                "the piggybacked range-digest counts must survive the wire"
+            );
+            assert_eq!(
+                rd.folds, range_digest.folds,
+                "the piggybacked range-digest folds must survive the wire"
+            );
         }
         _ => panic!("expected PullProbeReply"),
     }
@@ -266,6 +283,7 @@ fn legacy_pull_probe_reply_without_ahead_decodes_false() {
             requester,
             inbox_size,
             ahead,
+            range_digest,
             ..
         } => {
             assert_eq!(requester, "behind-node");
@@ -274,6 +292,12 @@ fn legacy_pull_probe_reply_without_ahead_decodes_false() {
                 !ahead,
                 "a pre-field reply must decode as NOT-ahead (never a pull candidate)"
             );
+            // A pre-`range_digest` reply decodes as the all-zero digest; the
+            // requester then computes no narrowing and falls back to the
+            // all-ranges full stream (the data-loss fail-safe — a legacy
+            // responder degrades to a P0 full pull, never a dropped range).
+            assert_eq!(range_digest.counts, [0u32; crate::RANGE_COUNT]);
+            assert_eq!(range_digest.folds, [0u64; crate::RANGE_COUNT]);
         }
         _ => panic!("expected PullProbeReply"),
     }

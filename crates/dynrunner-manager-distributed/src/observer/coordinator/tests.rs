@@ -1451,6 +1451,9 @@ async fn warn_dropped_decode_is_repulled_and_converges_via_recovery() {
                                         requester: sender_id,
                                         inbox_size: 0,
                                         ahead: true,
+                                        range_digest: Box::new(
+                                            dynrunner_protocol_primary_secondary::RangeDigest::default(),
+                                        ),
                                     })
                                     .expect("inbound open");
                             }
@@ -1974,6 +1977,7 @@ async fn observer_answers_snapshot_pull_from_behind_secondary() {
                         timestamp: 0.0,
                         stream_id: "sec-1/0".into(),
                         resume_after: None,
+                        task_ranges: Vec::new(),
                         is_observer: false,
                         can_be_primary: true,
                     })
@@ -2079,6 +2083,7 @@ async fn observer_answers_observer_requester_with_observer_typed_reply() {
                         timestamp: 0.0,
                         stream_id: "obs-1/0".into(),
                         resume_after: None,
+                        task_ranges: Vec::new(),
                         is_observer: true,
                         can_be_primary: false,
                     })

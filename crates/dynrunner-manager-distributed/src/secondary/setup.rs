@@ -907,11 +907,18 @@ where
                             requester,
                             inbox_size,
                             ahead,
+                            range_digest,
                             ..
                         } = msg
                         {
-                            self.handle_pull_probe_reply(&sender_id, &requester, inbox_size, ahead)
-                                .await;
+                            self.handle_pull_probe_reply(
+                                &sender_id,
+                                &requester,
+                                inbox_size,
+                                ahead,
+                                range_digest,
+                            )
+                            .await;
                         }
                         continue;
                     }

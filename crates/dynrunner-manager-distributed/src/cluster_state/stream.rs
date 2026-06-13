@@ -147,7 +147,22 @@ impl SnapshotStreamPlan {
     /// Capture a plan over the CURRENT ledger. `resume_after: Some(k)`
     /// builds a fresh-resume plan: only keys strictly after `k`, and NO
     /// tail capture (see the module doc).
-    pub fn new<I: Identifier>(state: &ClusterState<I>, resume_after: Option<&str>) -> Self {
+    ///
+    /// `task_ranges` is the P1 range-scoped delta filter: when NON-empty,
+    /// only keys whose bucket (`keyspace::range_index`) is in the set are
+    /// streamed — the requester asked for exactly the buckets that diverge
+    /// from this responder, so a one-task change re-streams ~one bucket. An
+    /// EMPTY set means ALL ranges (the P0 full stream) — the wire-compatible
+    /// safe default for a legacy/uncomputed requester, so a missing delta
+    /// never silently DROPS a divergent range (the data-loss fail-safe); it
+    /// only forgoes the narrowing. The filter is applied to the SAME key
+    /// universe and with the SAME `range_index` the requester's range digest
+    /// used, so the streamed key-set ⊆ the divergent ranges by construction.
+    pub fn new<I: Identifier>(
+        state: &ClusterState<I>,
+        resume_after: Option<&str>,
+        task_ranges: &[u16],
+    ) -> Self {
         // The key UNIVERSE is the LOGICAL ledger: fat in-memory keys ∪
         // settled (spilled) keys — a settled entry is still this
         // replica's ledger entry, served per-key from the spill file at
@@ -160,10 +175,23 @@ impl SnapshotStreamPlan {
                 .keys()
                 .chain(state.settled_entries().map(|(k, _)| k))
         };
+        // P1 range filter: empty = all ranges (P0). A non-empty set keeps
+        // only keys bucketed into a requested range. Membership is a small
+        // bounded set (≤ RANGE_COUNT u16s), tested per key via a sorted
+        // binary search so the per-key cost stays O(log K).
+        let mut wanted: Vec<u16> = task_ranges.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let in_range = |k: &str| -> bool {
+            wanted.is_empty()
+                || wanted
+                    .binary_search(&(super::keyspace::range_index(k) as u16))
+                    .is_ok()
+        };
         let mut keys: Vec<String> = match resume_after {
-            None => all_keys().cloned().collect(),
+            None => all_keys().filter(|k| in_range(k)).cloned().collect(),
             Some(cursor) => all_keys()
-                .filter(|k| k.as_str() > cursor)
+                .filter(|k| k.as_str() > cursor && in_range(k))
                 .cloned()
                 .collect(),
         };
@@ -175,8 +203,19 @@ impl SnapshotStreamPlan {
             // An EMPTY capture needs no tail package at all (a max-merge
             // of an empty map is a no-op) — `done` then rides the last
             // batch (or the head of an empty ledger).
-            tallies: resume_after
-                .is_none()
+            //
+            // The tail's tally map is captured ONLY for a from-the-start,
+            // FULL-KEYSPACE plan. A RANGE-SCOPED plan (non-empty
+            // `task_ranges`) omits the tail for the SAME reason a resume
+            // plan does (module doc): it ships only SOME task keys, so a
+            // captured tally would count events for tasks this stream never
+            // delivers — the permanent-overshoot hazard (the receiver bumps
+            // the grow-max lattice for an event whose state it did not
+            // receive, freezing the overshoot and looking "ahead" to every
+            // digest). The tallies converge through the anti-entropy digest
+            // (which folds them) on the next pull — strictly safer than
+            // risking an irrecoverable overshoot.
+            tallies: (resume_after.is_none() && wanted.is_empty())
                 .then(|| state.phase_event_tallies.clone())
                 .filter(|t| !t.is_empty()),
             tail_sent: false,

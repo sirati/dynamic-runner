@@ -82,6 +82,7 @@ async fn observer_late_joiner_accept_emits_peer_joined_observer_true() {
                 timestamp: 0.0,
                 stream_id: "late-observer-1/0".into(),
                 resume_after: None,
+                task_ranges: Vec::new(),
                 is_observer: true,
                 // An observer is never primary-capable.
                 can_be_primary: false,
@@ -142,6 +143,7 @@ async fn worker_late_joiner_accept_emits_peer_joined_observer_false() {
                 timestamp: 0.0,
                 stream_id: "late-worker-1/0".into(),
                 resume_after: None,
+                task_ranges: Vec::new(),
                 is_observer: false,
                 // A re-bootstrapping compute worker declares it can host the
                 // primary on demand; the relay must carry that truth.

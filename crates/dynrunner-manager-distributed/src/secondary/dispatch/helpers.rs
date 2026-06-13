@@ -508,7 +508,16 @@ where
             crate::pull_coordinator::PullDirective::PullFrom {
                 target_id,
                 target_is_observer,
+                target_range_digest,
             } => {
+                // P1: compute the divergent range-set against the chosen
+                // responder's piggybacked range digest, so the request
+                // streams only the divergent buckets. The fold is the
+                // cluster_state's; the compare is the pull-model vocabulary.
+                let task_ranges = crate::pull_coordinator::divergent_ranges_for_pull(
+                    &self.cluster_state.tasks_range_digest(),
+                    &target_range_digest,
+                );
                 let (dst, frame, stream_id) = crate::pull_coordinator::pull_request(
                     &self.config.secondary_id,
                     // A compute secondary is never an observer; its
@@ -517,6 +526,7 @@ where
                     self.config.can_be_primary,
                     &target_id,
                     target_is_observer,
+                    task_ranges,
                     &mut self.inbound_snapshots,
                     timestamp_now(),
                 );
@@ -540,6 +550,11 @@ where
     ) {
         let local = self.cluster_state.digest();
         let ahead = crate::pull_coordinator::probe_reply_ahead(&local, prober_digest);
+        // P1: piggyback this responder's task-ledger range digest so the
+        // prober can compute the divergent buckets without a second
+        // round-trip (folded once per inbound probe — single-flight +
+        // cooldown-bounded, so far below the killed per-digest storm).
+        let range_digest = self.cluster_state.tasks_range_digest();
         // The prober declared its own role on the probe? The probe carries
         // no role bit (a compute secondary's probe), so reply typed
         // `Secondary(prober)` — the prober's id==self ingress fan absorbs a
@@ -553,6 +568,7 @@ where
             false,
             self.inbox.depth() as u64,
             ahead,
+            range_digest,
         );
         let _ = self.send_to(dst, frame).await;
     }
@@ -568,6 +584,7 @@ where
         requester: &str,
         inbox_size: u64,
         ahead: bool,
+        range_digest: Box<dynrunner_protocol_primary_secondary::RangeDigest>,
     ) {
         if requester != self.config.secondary_id {
             return;
@@ -581,6 +598,9 @@ where
             responder_is_observer: false,
             inbox_size,
             ahead,
+            // P1: the responder's piggybacked range digest, retained on the
+            // candidate so the pull to it streams only the divergent buckets.
+            range_digest,
         };
         if let Some(directive) = self
             .pull_coordinator
@@ -631,6 +651,10 @@ where
             responder_is_observer: donor_is_observer,
             inbox_size: 0,
             ahead: true,
+            // The probe→pull mechanics under test do not depend on the
+            // delta content; the default (all-zero) range digest yields the
+            // all-ranges full pull, which is what this helper exercises.
+            range_digest: Box::new(dynrunner_protocol_primary_secondary::RangeDigest::default()),
         };
         // A synthetic `now` strictly past the window guarantees the
         // first-answer fallback commits on this reply (the FSM's probe

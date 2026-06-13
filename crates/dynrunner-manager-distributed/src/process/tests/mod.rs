@@ -65,6 +65,7 @@ pub(super) fn snapshot_request_frame(sender: &str) -> DistributedMessage<TestId>
         timestamp: 1.0,
         stream_id: format!("{sender}/0"),
         resume_after: None,
+        task_ranges: Vec::new(),
         is_observer: false,
         can_be_primary: true,
     }

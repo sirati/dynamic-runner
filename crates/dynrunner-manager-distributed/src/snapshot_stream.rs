@@ -104,12 +104,16 @@ impl SnapshotStreamResponder {
         requester_is_observer: bool,
         stream_id: &str,
         resume_after: Option<&str>,
+        task_ranges: &[u16],
     ) {
         self.expire_idle();
         if let Some(existing) = self.streams.get_mut(stream_id) {
             // Same-stream resume: keep the original plan (and its
             // tally capture — provably safe, see the plan's doc),
-            // skip forward to the requester's cursor.
+            // skip forward to the requester's cursor. The plan's range
+            // filter was fixed at creation (the requester's divergent set is
+            // a property of THAT pull); a resume re-request only advances the
+            // cursor, never re-scopes the ranges.
             existing.plan.reposition(resume_after);
             existing.last_activity = Instant::now();
             let _ = self.wake_tx.send(stream_id.to_string());
@@ -138,7 +142,7 @@ impl SnapshotStreamResponder {
             OutboundStream {
                 requester: requester.to_string(),
                 requester_is_observer,
-                plan: SnapshotStreamPlan::new(state, resume_after),
+                plan: SnapshotStreamPlan::new(state, resume_after, task_ranges),
                 seq: 0,
                 last_activity: Instant::now(),
             },
@@ -381,7 +385,7 @@ pub(crate) fn stream_frames_for_test<I: Identifier>(
     responder_id: &str,
     stream_id: &str,
 ) -> Vec<DistributedMessage<I>> {
-    let mut plan = SnapshotStreamPlan::new(donor, None);
+    let mut plan = SnapshotStreamPlan::new(donor, None, &[]);
     let mut out = Vec::new();
     while let Some(built) = plan.next_package(donor) {
         let p = built.expect("test snapshot package encodes");

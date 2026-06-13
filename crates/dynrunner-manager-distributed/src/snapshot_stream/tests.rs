@@ -83,7 +83,7 @@ fn unpack(
 async fn sibling_arm_fires_between_packages_on_a_big_ledger() {
     let state = big_state();
     let mut resp = SnapshotStreamResponder::new("node-a");
-    resp.accept_request(&state, "joiner-1", false, "joiner-1/0", None);
+    resp.accept_request(&state, "joiner-1", false, "joiner-1/0", None, &[]);
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let mut packages = 0usize;
@@ -128,7 +128,7 @@ async fn sibling_arm_fires_between_packages_on_a_big_ledger() {
 async fn emits_one_bounded_package_per_wake_with_contiguous_seqs() {
     let state = small_state();
     let mut resp = SnapshotStreamResponder::new("node-a");
-    resp.accept_request(&state, "joiner-1", false, "joiner-1/7", None);
+    resp.accept_request(&state, "joiner-1", false, "joiner-1/7", None, &[]);
     let mut frames = Vec::new();
     loop {
         let stream_id = resp.next_wake().await;
@@ -162,7 +162,7 @@ async fn emits_one_bounded_package_per_wake_with_contiguous_seqs() {
 async fn observer_requester_gets_observer_typed_packages() {
     let state = small_state();
     let mut resp = SnapshotStreamResponder::new("node-a");
-    resp.accept_request(&state, "obs-1", true, "obs-1/0", None);
+    resp.accept_request(&state, "obs-1", true, "obs-1/0", None, &[]);
     let stream_id = resp.next_wake().await;
     let (dst, _) = resp.emit_next(&stream_id, &state, 0.0).expect("first package");
     assert_eq!(dst, Destination::Observer(PeerId::from("obs-1".to_string())));
@@ -175,7 +175,7 @@ async fn observer_requester_gets_observer_typed_packages() {
 async fn same_stream_resume_repositions_instead_of_restarting() {
     let state = big_state();
     let mut resp = SnapshotStreamResponder::new("node-a");
-    resp.accept_request(&state, "joiner-1", false, "j/0", None);
+    resp.accept_request(&state, "joiner-1", false, "j/0", None, &[]);
     // Ship head + first batch; pretend the rest was lost.
     let mut cursor: Option<String> = None;
     for _ in 0..2 {
@@ -188,7 +188,7 @@ async fn same_stream_resume_repositions_instead_of_restarting() {
     }
     let cursor = cursor.expect("first batch carried a cursor");
     // The requester re-requests with the same stream id + its cursor.
-    resp.accept_request(&state, "joiner-1", false, "j/0", Some(&cursor));
+    resp.accept_request(&state, "joiner-1", false, "j/0", Some(&cursor), &[]);
     assert_eq!(resp.active_streams(), 1, "resume reuses the live stream");
     // Drain; collect every shipped task key (ignoring the re-sent head).
     let mut shipped: HashSet<String> = HashSet::new();
@@ -228,10 +228,10 @@ async fn max_active_streams_is_enforced() {
     let state = small_state();
     let mut resp = SnapshotStreamResponder::new("node-a");
     for i in 0..MAX_ACTIVE_STREAMS {
-        resp.accept_request(&state, &format!("peer-{i}"), false, &format!("p{i}/0"), None);
+        resp.accept_request(&state, &format!("peer-{i}"), false, &format!("p{i}/0"), None, &[]);
     }
     assert_eq!(resp.active_streams(), MAX_ACTIVE_STREAMS);
-    resp.accept_request(&state, "one-too-many", false, "otm/0", None);
+    resp.accept_request(&state, "one-too-many", false, "otm/0", None, &[]);
     assert_eq!(
         resp.active_streams(),
         MAX_ACTIVE_STREAMS,
@@ -245,7 +245,7 @@ async fn max_active_streams_is_enforced() {
 async fn abort_drops_the_stream_and_stale_tokens_noop() {
     let state = small_state();
     let mut resp = SnapshotStreamResponder::new("node-a");
-    resp.accept_request(&state, "joiner-1", false, "j/0", None);
+    resp.accept_request(&state, "joiner-1", false, "j/0", None, &[]);
     resp.abort_stream("j/0");
     assert_eq!(resp.active_streams(), 0);
     // The accept enqueued a token; it must resolve to a no-op.

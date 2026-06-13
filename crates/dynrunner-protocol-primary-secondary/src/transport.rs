@@ -665,6 +665,13 @@ pub trait PeerTransport<I: Identifier> {
                             timestamp: timestamp_now(),
                             stream_id: stream_id.clone(),
                             resume_after,
+                            // A fresh joiner pulls the FULL ledger: it holds
+                            // no range digest of its own to compute a delta
+                            // against, so it requests ALL ranges (empty =
+                            // all-ranges, the P0 full stream). The P1
+                            // range-scoped delta narrows STEADY-STATE
+                            // anti-entropy pulls, not bootstrap bring-up.
+                            task_ranges: Vec::new(),
                             // The joiner declares its own role + capability
                             // so the responder broadcasts a truthful
                             // `PeerJoined` rather than assuming observer /

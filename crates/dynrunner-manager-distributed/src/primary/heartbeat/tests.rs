@@ -3079,6 +3079,7 @@ async fn primary_keepalive_fan_reaches_observer_members_directed() {
                     timestamp: 0.0,
                     stream_id: "obs-late/0".into(),
                     resume_after: None,
+                    task_ranges: Vec::new(),
                     is_observer: true,
                     can_be_primary: false,
                 })

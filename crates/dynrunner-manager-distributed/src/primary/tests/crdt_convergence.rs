@@ -377,6 +377,7 @@ async fn primary_answers_request_cluster_snapshot() {
                     timestamp: 0.0,
                     stream_id: "sec-0/0".into(),
                     resume_after: None,
+                    task_ranges: Vec::new(),
                     is_observer: false,
                     can_be_primary: true,
                 })
@@ -493,6 +494,7 @@ async fn primary_answers_observer_requester_with_observer_typed_reply() {
                     timestamp: 0.0,
                     stream_id: "sec-0/0".into(),
                     resume_after: None,
+                    task_ranges: Vec::new(),
                     is_observer: true,
                     can_be_primary: false,
                 })
@@ -777,6 +779,7 @@ async fn primary_answers_target_stamped_snapshot_request() {
                             timestamp: 0.0,
                             stream_id: "sec-0/0".into(),
                             resume_after: None,
+                            task_ranges: Vec::new(),
                             is_observer: true,
                             can_be_primary: false,
                         }
