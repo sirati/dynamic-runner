@@ -1422,46 +1422,67 @@ async fn warn_dropped_decode_is_repulled_and_converges_via_recovery() {
                         })
                         .expect("inbound open");
 
-                    // Two pulls are NOT timer-driven: the at-entry bootstrap
-                    // request (fired synchronously before the loop, to the
-                    // named primary) and the ONE reactive pull the single
-                    // inbound digest triggers. Answer BOTH of those with a
-                    // MALFORMED snapshot (WARN-dropped — the observer stays
-                    // behind). Since no further digest ever arrives, EVERY
-                    // pull after those two can ONLY be the TIMER-driven AE-3
-                    // recovery cadence (it re-pulls off the recorded digest);
-                    // answer those with the GOOD snapshot → converges. This
-                    // is the isolation: without the recovery cadence there is
-                    // no third pull and the test hangs to its 5s timeout.
-                    let mut non_timer_pulls_left = 2u8;
+                    // The disciplined pull (#491): a behind observer
+                    // broadcasts a `PullProbe` (reactively off the digest AND
+                    // off the recovery tick), selects an `ahead` responder,
+                    // then issues a `RequestSnapshotStream`. This driver:
+                    //   - answers EVERY probe with an `ahead` reply naming the
+                    //     primary (so the observer always picks it as target);
+                    //   - answers the FIRST snapshot pull with a MALFORMED
+                    //     `done` package (WARN-dropped; the cursor never
+                    //     advances AND `on_pull_done` returns the FSM to Idle,
+                    //     so the observer stays behind and re-probes on the
+                    //     next recovery tick);
+                    //   - answers EVERY subsequent pull with the GOOD donor
+                    //     stream → converges.
+                    // Without the recovery cadence re-noting the divergence,
+                    // there is no second pull and the test hangs to its 5s
+                    // timeout — the isolation is preserved.
+                    let mut first_pull_malformed = true;
                     while let Some(frame) = to_primary_rx.recv().await {
-                        if let DistributedMessage::RequestSnapshotStream { stream_id, .. } = frame
-                        {
-                            if non_timer_pulls_left > 0 {
-                                non_timer_pulls_left -= 1;
-                                // A MALFORMED package (WARN-dropped; the
-                                // cursor never advances past it).
+                        match frame {
+                            DistributedMessage::PullProbe { sender_id, .. } => {
                                 inbound_for_driver
-                                    .send(DistributedMessage::SnapshotStreamPackage {
+                                    .send(DistributedMessage::PullProbeReply {
                                         target: None,
                                         sender_id: "promoted-sec".into(),
                                         timestamp: 0.0,
-                                        stream_id,
-                                        seq: 0,
-                                        cursor: None,
-                                        payload: "not even base64!!".to_string(),
-                                        done: true,
+                                        requester: sender_id,
+                                        inbox_size: 0,
+                                        ahead: true,
                                     })
                                     .expect("inbound open");
-                            } else {
-                                for reply in crate::snapshot_stream::stream_frames_for_test(
-                                    &good_donor,
-                                    "promoted-sec",
-                                    &stream_id,
-                                ) {
-                                    inbound_for_driver.send(reply).expect("inbound open");
+                            }
+                            DistributedMessage::RequestSnapshotStream { stream_id, .. } => {
+                                if first_pull_malformed {
+                                    first_pull_malformed = false;
+                                    // A MALFORMED package (WARN-dropped; the
+                                    // cursor never advances past it). The
+                                    // `done` flag ends the pull's in-flight
+                                    // cycle so the next recovery tick re-probes.
+                                    inbound_for_driver
+                                        .send(DistributedMessage::SnapshotStreamPackage {
+                                            target: None,
+                                            sender_id: "promoted-sec".into(),
+                                            timestamp: 0.0,
+                                            stream_id,
+                                            seq: 0,
+                                            cursor: None,
+                                            payload: "not even base64!!".to_string(),
+                                            done: true,
+                                        })
+                                        .expect("inbound open");
+                                } else {
+                                    for reply in crate::snapshot_stream::stream_frames_for_test(
+                                        &good_donor,
+                                        "promoted-sec",
+                                        &stream_id,
+                                    ) {
+                                        inbound_for_driver.send(reply).expect("inbound open");
+                                    }
                                 }
                             }
+                            _ => {}
                         }
                     }
                     keepalive_pump.abort();

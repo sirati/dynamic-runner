@@ -42,6 +42,23 @@ pub enum MessageType {
     /// sender pulls a snapshot via `RequestSnapshotStream`. Detector
     /// only — carries no task payloads and triggers no merge by itself.
     StateDigest,
+    /// Pull-model probe (the single-flight anti-entropy convergence
+    /// replacement): a behind node broadcasts it to DIRECT neighbours only
+    /// (never relayed), carrying its own `StateDigest`; each neighbour
+    /// answers with a `PullProbeReply` reporting its inbox depth + whether
+    /// it is ahead. Collapses the eager per-digest immediate-pull fan-out
+    /// into one probe→pull cycle per cooldown.
+    PullProbe,
+    /// Reply to a `PullProbe`: the responder's current inbox depth + the
+    /// `ahead` bit (does it hold ledger data the requester lacks). The
+    /// requester picks the smallest-inbox ahead responder as its pull
+    /// target. Sent directly back to the requester; never relayed.
+    PullProbeReply,
+    /// The chosen pull target could not serve a `RequestSnapshotStream`
+    /// because its direct link to the requester dropped. Rides the
+    /// relay-toward-the-role-holder path so it reaches the requester
+    /// INDIRECTLY; the requester then falls to the next candidate.
+    PullFail,
     MeshReady,
     /// Observer -> Primary: "gracefully abort the run" — the ONE
     /// management command a zero-authority observer may send. The

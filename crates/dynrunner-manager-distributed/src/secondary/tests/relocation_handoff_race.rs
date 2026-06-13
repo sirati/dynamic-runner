@@ -103,19 +103,36 @@ async fn fake_relocated_observer(
                 sender_is_observer: false,
             })
             .unwrap();
-        // Answer exactly one snapshot pull from this round's donor state.
+        // The disciplined pull (#491): the behind secondary first
+        // broadcasts a `PullProbe`; this donor (ahead) answers with an
+        // `ahead` `PullProbeReply`, which selects it as the pull target; the
+        // secondary then sends the `RequestSnapshotStream` we answer from
+        // this round's donor state. Answer the probe AND the resulting pull.
         loop {
             match from_secondary.recv().await {
-                Some(msg) => {
-                    if let DistributedMessage::RequestSnapshotStream { stream_id, .. } = msg {
-                        for reply in crate::snapshot_stream::stream_frames_for_test(
-                            &donor, "setup", &stream_id,
-                        ) {
-                            to_secondary.send(reply).unwrap();
-                        }
-                        break;
-                    }
+                Some(DistributedMessage::PullProbe { sender_id, .. }) => {
+                    // Reply ahead with an idle inbox so the secondary selects
+                    // us as its pull target.
+                    to_secondary
+                        .send(DistributedMessage::PullProbeReply {
+                            target: None,
+                            sender_id: "setup".into(),
+                            timestamp: 0.0,
+                            requester: sender_id,
+                            inbox_size: 0,
+                            ahead: true,
+                        })
+                        .unwrap();
                 }
+                Some(DistributedMessage::RequestSnapshotStream { stream_id, .. }) => {
+                    for reply in
+                        crate::snapshot_stream::stream_frames_for_test(&donor, "setup", &stream_id)
+                    {
+                        to_secondary.send(reply).unwrap();
+                    }
+                    break;
+                }
+                Some(_) => {}
                 None => return,
             }
         }
@@ -532,16 +549,27 @@ async fn registration_gated_observer(
             .unwrap();
         loop {
             match from_secondary.recv().await {
-                Some(msg) => {
-                    if let DistributedMessage::RequestSnapshotStream { stream_id, .. } = msg {
-                        for reply in crate::snapshot_stream::stream_frames_for_test(
-                            &donor, "setup", &stream_id,
-                        ) {
-                            to_secondary.send(reply).unwrap();
-                        }
-                        break;
-                    }
+                Some(DistributedMessage::PullProbe { sender_id, .. }) => {
+                    to_secondary
+                        .send(DistributedMessage::PullProbeReply {
+                            target: None,
+                            sender_id: "setup".into(),
+                            timestamp: 0.0,
+                            requester: sender_id,
+                            inbox_size: 0,
+                            ahead: true,
+                        })
+                        .unwrap();
                 }
+                Some(DistributedMessage::RequestSnapshotStream { stream_id, .. }) => {
+                    for reply in
+                        crate::snapshot_stream::stream_frames_for_test(&donor, "setup", &stream_id)
+                    {
+                        to_secondary.send(reply).unwrap();
+                    }
+                    break;
+                }
+                Some(_) => {}
                 None => return,
             }
         }

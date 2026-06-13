@@ -140,15 +140,37 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
             sec.dispatch_message(digest_frame, &mut FakeWorkerFactory)
                 .await
                 .expect("StateDigest dispatch succeeds");
-            // Drain the queued egress onto the RecordingPeer so the pull is
+            // Drain the queued egress onto the RecordingPeer so the probe is
             // observable in the log (MeshClient::send is queued).
             sec.drain_egress().await;
 
-            // The secondary detected it is behind and pulled a snapshot.
+            // The disciplined pull (#491): a divergent digest now NOTES the
+            // divergence to the pull coordinator, which broadcasts ONE probe
+            // — NOT an eager per-digest snapshot pull. No RequestSnapshotStream
+            // is emitted yet (it waits on the probe's smallest-inbox-ahead
+            // selection).
+            assert!(
+                peer_log
+                    .borrow()
+                    .iter()
+                    .any(|m| matches!(m, DistributedMessage::PullProbe { .. })),
+                "behind a peer digest, the secondary must broadcast a pull probe"
+            );
+            assert_eq!(
+                count_snapshot_requests(&peer_log),
+                0,
+                "the pull is single-flight + probe-first: no eager per-digest snapshot pull"
+            );
+
+            // The donor answers the probe (ahead, idle inbox); the
+            // first-answer fallback then commits the pull target and issues
+            // the resume-from-cursor RequestSnapshotStream.
+            sec.complete_pull_probe_for_test("setup", false).await;
+            sec.drain_egress().await;
             assert_eq!(
                 count_snapshot_requests(&peer_log),
                 1,
-                "behind a peer digest, the secondary must request exactly one snapshot"
+                "after the probe reply selects the donor, the secondary requests exactly one snapshot"
             );
 
             // ── The pull reply: the peer answers with its package

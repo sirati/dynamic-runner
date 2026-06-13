@@ -44,6 +44,25 @@ const ARM_REPORT_REPLAY: usize = 9;
 const ARM_WORKER_RESTART: usize = 10;
 const ARM_SNAPSHOT_STREAM: usize = 11;
 const ARM_SETTLED_SPILL: usize = 12;
+const ARM_PULL: usize = 13;
+
+/// Per-iteration inbox batch-drain bound (#491). After the awaited
+/// `inbox.recv()` arm yields ONE frame, the arm body synchronously sweeps
+/// up to this many MORE already-queued frames before yielding back to the
+/// `select!`. This is the drain-rate relief: the operational loop's other
+/// arms run O(ledger) work per iteration (digest folds on inbound
+/// `StateDigest`, fresh snapshot-stream plan builds on
+/// `RequestSnapshotStream`), so a one-frame-per-iteration drain lost to a
+/// faster ingress rate let the unbounded mesh inbox grow without bound (the
+/// relocated-primary RSS leak). Draining a bounded BATCH each pass
+/// multiplies the drain throughput so the loop keeps up; the cap bounds the
+/// burst so the loop still yields to every sibling arm (keepalive,
+/// election, OOM sweep, the pull arm) within the iteration. A backlog
+/// larger than the cap simply drains DOWN across consecutive iterations.
+/// Nothing is dropped — the cap length-slices, it does not shed. Honest
+/// per-iteration backpressure that survives independent of the storm; it is
+/// folded in here with the pull-model rather than shipped separately.
+const INBOX_BATCH_DRAIN_CAP: usize = 256;
 
 /// Arm names, index-aligned with the `ARM_*` ids above (render order of the
 /// compact stats line). The single `oom_sweep` arm counts SWEEPS (one
@@ -63,6 +82,7 @@ const PROCESS_TASKS_ARM_NAMES: &[&str] = &[
     "worker_restart",
     "snapshot_stream",
     "settled_spill",
+    "pull",
 ];
 
 impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
@@ -376,7 +396,22 @@ where
                             "snapshot-stream package send failed; dropping stream \
                              (the requester's pull cadence resumes from its cursor)"
                         );
-                        self.snapshot_streams.abort_stream(&stream_id);
+                        // The direct leg to the requester dropped mid-transfer;
+                        // signal it via a PullFail (delivered INDIRECTLY through
+                        // the relay) so its pull driver falls to the next target
+                        // instead of waiting out the 30s re-probe.
+                        if let Some((requester, requester_is_observer)) =
+                            self.snapshot_streams.abort_stream(&stream_id)
+                        {
+                            let (fail_dst, fail) = crate::pull_coordinator::pull_fail(
+                                &self.config.secondary_id,
+                                crate::secondary::wire::timestamp_now(),
+                                &requester,
+                                requester_is_observer,
+                                &stream_id,
+                            );
+                            let _ = self.send_to(fail_dst, fail).await;
+                        }
                     }
                 }
                 // Settled-CRDT spill arm: cadence sweep (collect a batch
@@ -402,6 +437,24 @@ where
                     match msg {
                         Some(m) => {
                             self.handle_inbound(m, factory).await;
+                            // Batch-drain relief (#491): the awaited `recv`
+                            // above is the ONE cancel-safe wait — the only
+                            // future a sibling arm can cancel. Now that it
+                            // yielded a frame we are committed to THIS
+                            // iteration, so synchronously sweep up to
+                            // `INBOX_BATCH_DRAIN_CAP` MORE frames the channel
+                            // already holds and handle them in arrival order.
+                            // `drain_ready` never awaits, so the whole sweep
+                            // runs inside the arm body where no cancellation
+                            // can occur (no consume-then-await hazard). The
+                            // cap bounds the burst so the loop still yields to
+                            // every sibling arm each pass; a deeper backlog
+                            // drains down across iterations. The arm-stat
+                            // counts ONE selection regardless of batch size
+                            // (it measures select! wins, not frames).
+                            for m in self.inbox.drain_ready(INBOX_BATCH_DRAIN_CAP) {
+                                self.handle_inbound(m, factory).await;
+                            }
                         }
                         None => {
                             tracing::info!(
@@ -721,6 +774,34 @@ where
                         false,
                     );
                     let _ = self.send_to(Destination::All, frame).await;
+                }
+                // Disciplined-pull WAKE arm (#491 storm-killer): drives the
+                // `pull_coordinator`'s probe/selection/rebalance timers. Parks
+                // on the coordinator's PERSISTENT `wake_deadline` (an absolute
+                // instant derived from STORED state — the window end, the
+                // re-probe deadline, or the rebalance deadline), NOT a relative
+                // sleep, so it fires under constant sibling-arm activity (the
+                // watchdog-fires-under-load law). On fire, `tick` resolves the
+                // due transition and returns the directives this node must send
+                // (a re-probe, or the committed `RequestSnapshotStream`); each
+                // is translated by the role-owned `drive_pull_directive` edge.
+                // `None` deadline (Idle — no divergence noticed) parks the arm.
+                // Cancel-safe: `sleep_until` consumes nothing and the deadline
+                // is recomputed each iteration from the coordinator's stored
+                // state, so a sibling arm winning merely re-creates the future
+                // against the SAME instant.
+                _ = async {
+                    match self.pull_coordinator.wake_deadline() {
+                        Some(due) => {
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await
+                        }
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    arm_stats.record(ARM_PULL);
+                    for directive in self.pull_coordinator.tick(std::time::Instant::now()) {
+                        self.drive_pull_directive(directive).await;
+                    }
                 }
                 // Buffered-report-replay WAKE arm: re-deliver a retained
                 // confirmable report (terminal / IMPORTANT custom) when

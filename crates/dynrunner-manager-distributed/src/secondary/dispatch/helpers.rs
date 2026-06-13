@@ -436,54 +436,210 @@ where
     }
 
     /// Anti-entropy receive side: compare `digest` (a peer's broadcast)
-    /// against the local replica and pull a snapshot from the proven-ahead
-    /// SENDER iff this replica is behind. The decision (compare + target
-    /// selection + request construction) lives in `crate::anti_entropy` so
-    /// primary / secondary / observer share ONE policy; this helper owns
-    /// only the `send_to` edge. Shared between the operational dispatch
-    /// router's `StateDigest` arm and `wait_for_setup`'s receive loop —
-    /// pre-`Operational` participation is what lets a setup-wedged
-    /// secondary recover a missed relocation announcement (the pull's
-    /// packages heal via [`Self::restore_snapshot_stream_frame`]).
+    /// against the local replica and, iff this replica is behind, NOTE the
+    /// divergence to the disciplined PULL driver (`pull_coordinator`)
+    /// instead of firing an eager immediate snapshot pull at the sender.
+    /// `note_behind` is IDEMPOTENT — a divergence noticed while a probe→pull
+    /// cycle is already in flight is a NoOp — so a perpetually-behind
+    /// replica under churn initiates pulls at the cooldown rate, NOT one per
+    /// inbound digest (the #491 snapshot-package storm the eager
+    /// `reconcile_against_peer` caused). The cold (Idle) note returns a
+    /// `Probe` directive, which the shared `drive_pull_directive` edge
+    /// broadcasts; selection + the actual pull happen on the pull arm's
+    /// timers. The digest beacon + `is_behind` DETECTION are unchanged;
+    /// only the eager per-digest pull is replaced.
+    ///
+    /// Shared between the operational dispatch router's `StateDigest` arm
+    /// and `wait_for_setup`'s receive loop — pre-`Operational` participation
+    /// still triggers the heal; the pull arm runs in the operational loop,
+    /// and a pre-operational note simply primes the FSM (the cold probe is
+    /// emitted on the first edge-drive once the loop runs).
     pub(in crate::secondary) async fn reconcile_state_digest(
         &mut self,
         sender_id: &str,
         sender_is_observer: bool,
         digest: &dynrunner_protocol_primary_secondary::StateDigest,
     ) {
+        let _ = (sender_id, sender_is_observer);
         let local = self.cluster_state.digest();
-        let requester = crate::anti_entropy::RequesterIdentity {
-            node_id: &self.config.secondary_id,
-            // Wire role advertisement: a compute SecondaryCoordinator
-            // is never an observer (the observer role IS the
-            // standalone ObserverCoordinator), so the anti-entropy
-            // requester always declares `false`.
-            is_observer: false,
-            can_be_primary: self.config.can_be_primary,
-        };
-        if let Some((destination, request)) = crate::anti_entropy::reconcile_against_peer(
-            &local,
-            digest,
-            sender_id,
-            sender_is_observer,
-            &requester,
-            &mut self.inbound_snapshots,
-            timestamp_now(),
-        ) {
-            if let Err(e) = self.send_to(destination, request).await {
-                tracing::debug!(
-                    error = %e,
-                    peer = %sender_id,
-                    "anti-entropy: snapshot pull request send failed; \
-                     a later digest round retries"
+        if !local.is_behind(digest) {
+            // Converged on every field the peer reports — nothing to pull
+            // (the self-quiescing steady state).
+            return;
+        }
+        if let Some(directive) = self
+            .pull_coordinator
+            .note_behind(std::time::Instant::now())
+        {
+            // Cold trigger ⇒ broadcast the probe now; a note while a cycle
+            // is in flight returns None (single-flight) and emits nothing.
+            self.drive_pull_directive(directive).await;
+        }
+    }
+
+    /// Translate ONE [`crate::pull_coordinator::PullDirective`] into this
+    /// secondary's `send_to` edge — the role-owned wire-touch half of the
+    /// disciplined pull (the FSM + selection live in `pull_coordinator`;
+    /// the frame construction + role-typing in
+    /// `pull_coordinator::pull_probe` / `pull_request`; this method only
+    /// owns the `send_to`). A `Probe` broadcasts the local digest to direct
+    /// neighbours; a `PullFrom` issues the resume-from-cursor
+    /// `RequestSnapshotStream` to the chosen target and hands the minted
+    /// stream id back to the coordinator so a later `PullFail` matches it.
+    pub(in crate::secondary) async fn drive_pull_directive(
+        &mut self,
+        directive: crate::pull_coordinator::PullDirective,
+    ) {
+        match directive {
+            crate::pull_coordinator::PullDirective::Probe => {
+                let digest = self.cluster_state.digest();
+                let frame = crate::pull_coordinator::pull_probe(
+                    &self.config.secondary_id,
+                    timestamp_now(),
+                    digest,
                 );
-            } else {
-                tracing::debug!(
-                    peer = %sender_id,
-                    "anti-entropy: local replica behind peer digest; \
-                     requested snapshot pull"
-                );
+                let _ = self
+                    .send_to(
+                        dynrunner_protocol_primary_secondary::Destination::All,
+                        frame,
+                    )
+                    .await;
             }
+            crate::pull_coordinator::PullDirective::PullFrom {
+                target_id,
+                target_is_observer,
+            } => {
+                let (dst, frame, stream_id) = crate::pull_coordinator::pull_request(
+                    &self.config.secondary_id,
+                    // A compute secondary is never an observer; its
+                    // primary-capability rides the request.
+                    false,
+                    self.config.can_be_primary,
+                    &target_id,
+                    target_is_observer,
+                    &mut self.inbound_snapshots,
+                    timestamp_now(),
+                );
+                if self.send_to(dst, frame).await.is_ok() {
+                    // Bind the in-flight pull's stream id so a `PullFail`
+                    // for exactly this attempt advances the target.
+                    self.pull_coordinator.note_pull_stream(&stream_id);
+                }
+            }
+        }
+    }
+
+    /// Answer an inbound `PullProbe`: reply with this node's current inbox
+    /// depth + the responder-side `ahead` bit (does this replica hold ledger
+    /// data the prober lacks, computed from the digest the probe carried).
+    /// Direct-only reply (the prober's 30s re-probe recovers a lost one).
+    pub(in crate::secondary) async fn handle_pull_probe(
+        &mut self,
+        prober_id: &str,
+        prober_digest: &dynrunner_protocol_primary_secondary::StateDigest,
+    ) {
+        let local = self.cluster_state.digest();
+        let ahead = crate::pull_coordinator::probe_reply_ahead(&local, prober_digest);
+        // The prober declared its own role on the probe? The probe carries
+        // no role bit (a compute secondary's probe), so reply typed
+        // `Secondary(prober)` — the prober's id==self ingress fan absorbs a
+        // mis-type harmlessly, and a compute prober is the common case. An
+        // observer prober's reply mis-type is covered the same way the eager
+        // path's was (the receiver-side id==self fan).
+        let (dst, frame) = crate::pull_coordinator::pull_probe_reply(
+            &self.config.secondary_id,
+            timestamp_now(),
+            prober_id,
+            false,
+            self.inbox.depth() as u64,
+            ahead,
+        );
+        let _ = self.send_to(dst, frame).await;
+    }
+
+    /// Record an inbound `PullProbeReply` into the pull driver. A reply
+    /// addressed to a different requester (not us) is ignored; a usable
+    /// (ahead) reply may resolve the pull target (the first-answer fallback
+    /// once the window has elapsed), in which case the returned directive is
+    /// driven onto the wire.
+    pub(in crate::secondary) async fn handle_pull_probe_reply(
+        &mut self,
+        responder_id: &str,
+        requester: &str,
+        inbox_size: u64,
+        ahead: bool,
+    ) {
+        if requester != self.config.secondary_id {
+            return;
+        }
+        let reply = crate::pull_coordinator::ProbeReply {
+            responder_id,
+            // Role hint for the eventual pull's typing: the reply frame
+            // carries no responder-role bit, so default `Secondary`; an
+            // observer responder's pull is covered by the receiver id==self
+            // fan, as in the eager path.
+            responder_is_observer: false,
+            inbox_size,
+            ahead,
+        };
+        if let Some(directive) = self
+            .pull_coordinator
+            .on_probe_reply(std::time::Instant::now(), &reply)
+        {
+            self.drive_pull_directive(directive).await;
+        }
+    }
+
+    /// Record an inbound `PullFail` (a chosen target's direct leg to us
+    /// dropped) into the pull driver and drive the fall-to-next-target
+    /// directive if one is produced. A fail for a requester that is not us,
+    /// or for a stream that is not in flight, is ignored by the driver.
+    pub(in crate::secondary) async fn handle_pull_fail(
+        &mut self,
+        requester: &str,
+        stream_id: &str,
+    ) {
+        if requester != self.config.secondary_id {
+            return;
+        }
+        if let Some(directive) = self
+            .pull_coordinator
+            .on_fail(std::time::Instant::now(), stream_id)
+        {
+            self.drive_pull_directive(directive).await;
+        }
+    }
+
+    /// Test-only: drive a complete pull-PROBE answer so an integration test
+    /// can advance the disciplined pull from "probe emitted" to "snapshot
+    /// pull issued" deterministically, without a real 1-second wait. It
+    /// feeds a single AHEAD `PullProbeReply` from `donor` at a synthetic
+    /// `now` PAST the selection window — exactly the production first-answer
+    /// fallback (a reply that lands after an empty window commits on
+    /// arrival) — and drives the resulting `RequestSnapshotStream`. The role
+    /// edge is identical to the live `handle_pull_probe_reply` path; only
+    /// the clock is synthetic. Call AFTER a digest dispatch has emitted the
+    /// probe (the FSM must be Probing).
+    #[cfg(test)]
+    pub(in crate::secondary) async fn complete_pull_probe_for_test(
+        &mut self,
+        donor_id: &str,
+        donor_is_observer: bool,
+    ) {
+        let reply = crate::pull_coordinator::ProbeReply {
+            responder_id: donor_id,
+            responder_is_observer: donor_is_observer,
+            inbox_size: 0,
+            ahead: true,
+        };
+        // A synthetic `now` strictly past the window guarantees the
+        // first-answer fallback commits on this reply (the FSM's probe
+        // `since` is the real instant at dispatch, always ≤ now).
+        let past_window = std::time::Instant::now()
+            + crate::pull_coordinator::SELECTION_WINDOW
+            + std::time::Duration::from_millis(1);
+        if let Some(directive) = self.pull_coordinator.on_probe_reply(past_window, &reply) {
+            self.drive_pull_directive(directive).await;
         }
     }
 

@@ -32,6 +32,9 @@ impl<I> DistributedMessage<I> {
             | Self::RequestRunConfig { target, .. }
             | Self::RunConfig { target, .. }
             | Self::StateDigest { target, .. }
+            | Self::PullProbe { target, .. }
+            | Self::PullProbeReply { target, .. }
+            | Self::PullFail { target, .. }
             | Self::MeshReady { target, .. }
             | Self::GracefulAbortRequest { target, .. }
             | Self::TaskComplete { target, .. }
@@ -81,6 +84,9 @@ impl<I> DistributedMessage<I> {
             | Self::RequestRunConfig { target, .. }
             | Self::RunConfig { target, .. }
             | Self::StateDigest { target, .. }
+            | Self::PullProbe { target, .. }
+            | Self::PullProbeReply { target, .. }
+            | Self::PullFail { target, .. }
             | Self::MeshReady { target, .. }
             | Self::GracefulAbortRequest { target, .. }
             | Self::TaskComplete { target, .. }
@@ -144,6 +150,9 @@ impl<I> DistributedMessage<I> {
             | Self::RequestRunConfig { target, .. }
             | Self::RunConfig { target, .. }
             | Self::StateDigest { target, .. }
+            | Self::PullProbe { target, .. }
+            | Self::PullProbeReply { target, .. }
+            | Self::PullFail { target, .. }
             | Self::MeshReady { target, .. }
             | Self::GracefulAbortRequest { target, .. }
             | Self::TaskComplete { target, .. }
@@ -188,6 +197,9 @@ impl<I> DistributedMessage<I> {
             | Self::RequestRunConfig { sender_id, .. }
             | Self::RunConfig { sender_id, .. }
             | Self::StateDigest { sender_id, .. }
+            | Self::PullProbe { sender_id, .. }
+            | Self::PullProbeReply { sender_id, .. }
+            | Self::PullFail { sender_id, .. }
             | Self::MeshReady { sender_id, .. }
             | Self::GracefulAbortRequest { sender_id, .. }
             | Self::TaskComplete { sender_id, .. }
@@ -231,6 +243,9 @@ impl<I> DistributedMessage<I> {
             | Self::RequestRunConfig { timestamp, .. }
             | Self::RunConfig { timestamp, .. }
             | Self::StateDigest { timestamp, .. }
+            | Self::PullProbe { timestamp, .. }
+            | Self::PullProbeReply { timestamp, .. }
+            | Self::PullFail { timestamp, .. }
             | Self::MeshReady { timestamp, .. }
             | Self::GracefulAbortRequest { timestamp, .. }
             | Self::TaskComplete { timestamp, .. }
@@ -469,6 +484,9 @@ impl<I> DistributedMessage<I> {
             Self::RequestRunConfig { .. } => MessageType::RequestRunConfig,
             Self::RunConfig { .. } => MessageType::RunConfig,
             Self::StateDigest { .. } => MessageType::StateDigest,
+            Self::PullProbe { .. } => MessageType::PullProbe,
+            Self::PullProbeReply { .. } => MessageType::PullProbeReply,
+            Self::PullFail { .. } => MessageType::PullFail,
             Self::MeshReady { .. } => MessageType::MeshReady,
             Self::GracefulAbortRequest { .. } => MessageType::GracefulAbortRequest,
             Self::TaskComplete { .. } => MessageType::TaskComplete,

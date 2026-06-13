@@ -109,6 +109,8 @@ where
             crate::snapshot_stream::SnapshotStreamResponder::new(&config.secondary_id);
         let inbound_snapshots =
             crate::snapshot_stream::InboundSnapshotStreams::new(&config.secondary_id);
+        let pull_coordinator =
+            crate::pull_coordinator::PullCoordinator::new(&config.secondary_id);
         // Settled-CRDT spill: attach this coordinator's spill segment to
         // the state it owns (degrades to disabled — fat-but-correct — on
         // any setup failure; see `settled_spill`).
@@ -156,6 +158,7 @@ where
             settled_spill,
             snapshot_streams,
             inbound_snapshots,
+            pull_coordinator,
             lifecycle_rx: Some(lifecycle_rx),
             peer_lifecycle_listeners: Vec::new(),
             lifecycle_dispatcher_handle: None,

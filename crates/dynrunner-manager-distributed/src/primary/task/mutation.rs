@@ -239,59 +239,153 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     }
 
     /// Anti-entropy receive: compare a peer's `StateDigest` against the
-    /// primary's own and pull a snapshot iff the primary is somehow behind.
-    ///
-    /// Single concern: the receive-side of the convergence cadence on the
-    /// primary. The compare + target-selection + request-construction live
-    /// in `crate::anti_entropy` so all three roles share ONE policy; this
-    /// method only owns the primary's `send_to` edge. The authoritative
-    /// primary is essentially never behind a follower's digest, so this is
-    /// almost always a NoOp (a matching digest → `None`); it exists for
-    /// uniformity (a freshly-promoted primary still warming its mirror, or
-    /// an out-of-order seed window, could momentarily be behind a peer that
-    /// already saw a mutation). The pull's reply heals via the primary's
-    /// own `ClusterMutation`/snapshot apply paths. The primary declares
-    /// itself non-observer + primary-capable on the request frame.
+    /// primary's own and, iff the primary is somehow behind, NOTE the
+    /// divergence to the disciplined PULL driver (`pull_coordinator`)
+    /// instead of firing an eager immediate pull. `note_behind` is
+    /// IDEMPOTENT (single-flight), so even a primary that briefly diverges
+    /// initiates at most one probe→pull cycle at the cooldown rate, not one
+    /// per digest. The authoritative primary is essentially never behind a
+    /// follower's digest, so this is almost always a NoOp (a matching digest
+    /// returns early); it exists for the freshly-promoted primary still
+    /// warming its mirror. The digest beacon + `is_behind` DETECTION are
+    /// unchanged; only the eager pull is replaced.
     pub(crate) async fn handle_state_digest(&mut self, msg: DistributedMessage<I>) {
         let DistributedMessage::StateDigest {
             target: None,
             digest,
-            sender_id,
-            sender_is_observer,
             ..
         } = msg
         else {
             return;
         };
         let local = self.cluster_state.digest();
-        let requester = crate::anti_entropy::RequesterIdentity {
-            node_id: &self.config.node_id,
-            // The primary is never an observer and is always primary-capable.
-            is_observer: false,
-            can_be_primary: true,
-        };
-        if let Some((destination, request)) = crate::anti_entropy::reconcile_against_peer(
-            &local,
-            &digest,
-            &sender_id,
-            sender_is_observer,
-            &requester,
-            &mut self.inbound_snapshots,
-            timestamp_now(),
-        ) {
-            if let Err(e) = self.send_to(destination, request).await {
-                tracing::debug!(
-                    error = %e,
-                    peer = %sender_id,
-                    "anti-entropy: primary snapshot pull request send failed; \
-                     a later digest round retries"
+        if !local.is_behind(&digest) {
+            // Converged on the peer's digest — nothing to pull (the
+            // steady-state authoritative-primary path).
+            return;
+        }
+        if let Some(directive) = self
+            .pull_coordinator
+            .note_behind(std::time::Instant::now())
+        {
+            self.drive_pull_directive(directive).await;
+        }
+    }
+
+    /// Translate ONE [`crate::pull_coordinator::PullDirective`] into the
+    /// primary's `send_to` edge — the role-owned wire-touch half of the
+    /// disciplined pull (FSM + selection in `pull_coordinator`; frame
+    /// construction + role-typing in `pull_coordinator::pull_probe` /
+    /// `pull_request`; this owns only `send_to`). The primary declares
+    /// `is_observer: false`, `can_be_primary: true` on its pulls.
+    pub(crate) async fn drive_pull_directive(
+        &mut self,
+        directive: crate::pull_coordinator::PullDirective,
+    ) {
+        match directive {
+            crate::pull_coordinator::PullDirective::Probe => {
+                let digest = self.cluster_state.digest();
+                let frame = crate::pull_coordinator::pull_probe(
+                    &self.config.node_id,
+                    timestamp_now(),
+                    digest,
                 );
-            } else {
-                tracing::debug!(
-                    peer = %sender_id,
-                    "anti-entropy: primary behind peer digest; requested snapshot pull"
-                );
+                let _ = self
+                    .send_to(
+                        dynrunner_protocol_primary_secondary::Destination::All,
+                        frame,
+                    )
+                    .await;
             }
+            crate::pull_coordinator::PullDirective::PullFrom {
+                target_id,
+                target_is_observer,
+            } => {
+                let (dst, frame, stream_id) = crate::pull_coordinator::pull_request(
+                    &self.config.node_id,
+                    false,
+                    true,
+                    &target_id,
+                    target_is_observer,
+                    &mut self.inbound_snapshots,
+                    timestamp_now(),
+                );
+                if self.send_to(dst, frame).await.is_ok() {
+                    self.pull_coordinator.note_pull_stream(&stream_id);
+                }
+            }
+        }
+    }
+
+    /// Answer an inbound `PullProbe`: reply with the primary's inbox depth
+    /// + the responder-side `ahead` bit. Direct-only reply.
+    pub(crate) async fn handle_pull_probe(&mut self, msg: DistributedMessage<I>) {
+        let DistributedMessage::PullProbe {
+            sender_id, digest, ..
+        } = msg
+        else {
+            return;
+        };
+        let local = self.cluster_state.digest();
+        let ahead = crate::pull_coordinator::probe_reply_ahead(&local, &digest);
+        let (dst, frame) = crate::pull_coordinator::pull_probe_reply(
+            &self.config.node_id,
+            timestamp_now(),
+            &sender_id,
+            false,
+            self.inbox.depth() as u64,
+            ahead,
+        );
+        let _ = self.send_to(dst, frame).await;
+    }
+
+    /// Record an inbound `PullProbeReply` into the pull driver.
+    pub(crate) async fn handle_pull_probe_reply(&mut self, msg: DistributedMessage<I>) {
+        let DistributedMessage::PullProbeReply {
+            sender_id,
+            requester,
+            inbox_size,
+            ahead,
+            ..
+        } = msg
+        else {
+            return;
+        };
+        if requester != self.config.node_id {
+            return;
+        }
+        let reply = crate::pull_coordinator::ProbeReply {
+            responder_id: &sender_id,
+            responder_is_observer: false,
+            inbox_size,
+            ahead,
+        };
+        if let Some(directive) = self
+            .pull_coordinator
+            .on_probe_reply(std::time::Instant::now(), &reply)
+        {
+            self.drive_pull_directive(directive).await;
+        }
+    }
+
+    /// Record an inbound `PullFail` and fall to the next pull target.
+    pub(crate) async fn handle_pull_fail(&mut self, msg: DistributedMessage<I>) {
+        let DistributedMessage::PullFail {
+            requester,
+            stream_id,
+            ..
+        } = msg
+        else {
+            return;
+        };
+        if requester != self.config.node_id {
+            return;
+        }
+        if let Some(directive) = self
+            .pull_coordinator
+            .on_fail(std::time::Instant::now(), &stream_id)
+        {
+            self.drive_pull_directive(directive).await;
         }
     }
 
@@ -509,6 +603,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                      next digest round re-pulls from the last good cursor)"
                 );
             }
+        }
+        // End the disciplined pull's in-flight cycle on the terminal package
+        // (whether or not it decoded) so the driver returns to Idle: the
+        // primary goes quiescent once converged, and re-probes on the next
+        // divergence rather than after the rebalance. A NoOp for a
+        // bootstrap-stream `done`.
+        if done {
+            self.pull_coordinator.on_pull_done(&stream_id);
         }
     }
 

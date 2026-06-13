@@ -187,7 +187,10 @@ async fn missed_abort_broadcast_converges_via_digest() {
                 "precondition: the verdict presence bit makes the laggard behind"
             );
 
-            // The peer's periodic digest arrives → the secondary must pull.
+            // The peer's periodic digest arrives → the secondary NOTES the
+            // divergence to the disciplined pull driver, which broadcasts a
+            // probe; the donor's probe reply then selects it and issues the
+            // snapshot pull.
             sec.dispatch_message(
                 DistributedMessage::StateDigest {
                     target: None,
@@ -200,6 +203,15 @@ async fn missed_abort_broadcast_converges_via_digest() {
             )
             .await
             .expect("StateDigest dispatch succeeds");
+            sec.drain_egress().await;
+            assert!(
+                peer_log
+                    .borrow()
+                    .iter()
+                    .any(|m| matches!(m, DistributedMessage::PullProbe { .. })),
+                "behind on the verdict bit, the secondary must broadcast a pull probe"
+            );
+            sec.complete_pull_probe_for_test("peer-0", false).await;
             sec.drain_egress().await;
             assert!(
                 peer_log

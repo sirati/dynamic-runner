@@ -1,6 +1,7 @@
 pub mod anti_entropy;
 pub mod cluster_state;
 pub(crate) mod collection_stats;
+pub mod pull_coordinator;
 pub mod settled_spill;
 pub mod snapshot_stream;
 pub mod discovery;

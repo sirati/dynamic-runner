@@ -79,7 +79,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::Instrument;
 
-use crate::anti_entropy::{self, RequesterIdentity};
+use crate::anti_entropy;
 use crate::cluster_state::ClusterState;
 use crate::observer::announcer::{AnnouncerOutboxItem, PeerMeshAnnouncerSender};
 use crate::observer::cluster_gone::{ClusterGoneDetector, ClusterGoneVerdict};
@@ -310,18 +310,13 @@ where
     /// AE-3 recovery-cadence state: the LAST-SEEN `(declared-observer bit,
     /// [`StateDigest`])` of each peer that has broadcast one, keyed by
     /// sender-id. The timer-driven recovery arm intersects this with the
-    /// live roster (`current_primary` ∪ alive secondaries) and asks
-    /// [`anti_entropy::plan_recovery_pull`] whether the replica is still
-    /// behind any of them — the C9 quiesce signal. The declared-observer
-    /// bit rides each peer's digest frame and is stored so the recovery
-    /// pull is typed off the responder's role. Updated on every inbound
-    /// `StateDigest` frame.
+    /// live roster (`current_primary` ∪ alive secondaries) and checks
+    /// whether the replica is still behind any of them — the C9 quiesce
+    /// signal — to decide whether to NOTE the divergence to the disciplined
+    /// pull driver (`pull_coordinator`). The declared-observer bit rides
+    /// each peer's digest frame and is stored for the roster intersection.
+    /// Updated on every inbound `StateDigest` frame.
     peer_digests: std::collections::HashMap<String, (bool, StateDigest)>,
-    /// AE-3 responder rotation cursor (the different-responder-on-malformed
-    /// rotation). Advanced by [`anti_entropy::plan_recovery_pull`] on each
-    /// tick that has a candidate, so a malformed-snapshot responder is not
-    /// retried on the immediately-following tick.
-    recovery_cursor: usize,
     /// Outbound snapshot-stream driver: serves `RequestSnapshotStream`
     /// pulls one bounded package per run-loop wakeup — see
     /// `crate::snapshot_stream`. The loop's wake arm drains it; the
@@ -338,6 +333,13 @@ where
     /// AE-3 recovery cadence) RESUME an interrupted stream instead of
     /// re-pulling from scratch.
     inbound_snapshots: crate::snapshot_stream::InboundSnapshotStreams,
+    /// Disciplined anti-entropy PULL driver (the #491 storm-killer): the
+    /// single-flight probe→select→pull FSM. BOTH the reactive digest-receive
+    /// path AND the AE-3 recovery tick feed it `note_behind` instead of the
+    /// eager `reconcile_against_peer` / `plan_recovery_pull` immediate pull;
+    /// the run loop's pull arm drives its timers + translates its directives
+    /// into `send_to`. See `crate::pull_coordinator`.
+    pull_coordinator: crate::pull_coordinator::PullCoordinator,
     /// Rate limit for the digest tick's fault WARNs (empty mesh registry /
     /// failed broadcast). The tick fires every ~20s; during an outage the
     /// SAME fault recurs every tick, so the gate emits at most once per
@@ -559,6 +561,7 @@ where
         let settled_spill =
             crate::settled_spill::SettledSpillDriver::start("observer", &mut cluster_state);
         let inbound_snapshots = crate::snapshot_stream::InboundSnapshotStreams::new(&node_id);
+        let pull_coordinator = crate::pull_coordinator::PullCoordinator::new(&node_id);
         Self {
             client,
             inbox,
@@ -578,10 +581,10 @@ where
             announcer_handle: Some(announcer_handle),
             task_completed_rx: Some(task_rx),
             peer_digests: std::collections::HashMap::new(),
-            recovery_cursor: 0,
             snapshot_streams,
             settled_spill,
             inbound_snapshots,
+            pull_coordinator,
             ae_digest_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             wake_note: WakeNoteSlot::default(),
@@ -661,6 +664,7 @@ where
         let settled_spill =
             crate::settled_spill::SettledSpillDriver::start("observer", &mut cluster_state);
         let inbound_snapshots = crate::snapshot_stream::InboundSnapshotStreams::new(&node_id);
+        let pull_coordinator = crate::pull_coordinator::PullCoordinator::new(&node_id);
         Self {
             client,
             inbox,
@@ -673,10 +677,10 @@ where
             announcer_handle: Some(announcer_handle),
             task_completed_rx: Some(task_rx),
             peer_digests: std::collections::HashMap::new(),
-            recovery_cursor: 0,
             snapshot_streams,
             settled_spill,
             inbound_snapshots,
+            pull_coordinator,
             ae_digest_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             wake_note: WakeNoteSlot::default(),
@@ -1340,7 +1344,42 @@ where
                                 "observer: snapshot-stream package send failed; dropping \
                                  stream (the requester resumes from its cursor)"
                             );
-                            self.snapshot_streams.abort_stream(&stream_id);
+                            // The direct leg to the requester dropped; signal
+                            // it via a PullFail (relayed INDIRECTLY) so its
+                            // pull driver falls to the next target.
+                            if let Some((requester, requester_is_observer)) =
+                                self.snapshot_streams.abort_stream(&stream_id)
+                            {
+                                let (fail_dst, fail) = crate::pull_coordinator::pull_fail::<I>(
+                                    &self.config.node_id,
+                                    timestamp_now(),
+                                    &requester,
+                                    requester_is_observer,
+                                    &stream_id,
+                                );
+                                let _ = self.send_to(fail_dst, fail).await;
+                            }
+                        }
+                    }
+                    // Disciplined-pull WAKE arm (#491 storm-killer): drives
+                    // the `pull_coordinator`'s probe/selection/rebalance
+                    // timers off its PERSISTENT `wake_deadline` (an absolute
+                    // instant from STORED state — the window end / re-probe /
+                    // rebalance deadline), NOT a relative sleep, so it fires
+                    // under constant sibling-arm activity. `None` (Idle) parks
+                    // the arm. Cancel-safe: `sleep_until` consumes nothing and
+                    // the deadline is recomputed each iteration from the
+                    // coordinator's stored state.
+                    _ = async {
+                        match self.pull_coordinator.wake_deadline() {
+                            Some(due) => {
+                                tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await
+                            }
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        for directive in self.pull_coordinator.tick(std::time::Instant::now()) {
+                            self.drive_pull_directive(directive).await;
                         }
                     }
                     // Settled-CRDT spill arm: cadence sweep / write
@@ -1833,6 +1872,34 @@ where
                 self.on_state_digest(&sender_id, sender_is_observer, &digest)
                     .await;
             }
+            // Pull-model PROBE from a behind peer: answer with our inbox
+            // depth + `ahead`. Direct-neighbours-only (the ingress never
+            // re-broadcast this inbound `All`); never relayed onward.
+            DistributedMessage::PullProbe {
+                sender_id, digest, ..
+            } => {
+                self.handle_pull_probe(&sender_id, &digest).await;
+            }
+            // Pull-model PROBE REPLY → the single-flight pull driver.
+            DistributedMessage::PullProbeReply {
+                sender_id,
+                requester,
+                inbox_size,
+                ahead,
+                ..
+            } => {
+                self.handle_pull_probe_reply(&sender_id, &requester, inbox_size, ahead)
+                    .await;
+            }
+            // Pull-model FAIL (chosen target's direct leg to us dropped,
+            // delivered INDIRECTLY via the relay) → fall to next target.
+            DistributedMessage::PullFail {
+                requester,
+                stream_id,
+                ..
+            } => {
+                self.handle_pull_fail(&requester, &stream_id).await;
+            }
             DistributedMessage::RequestSnapshotStream {
                 sender_id,
                 stream_id,
@@ -2151,48 +2218,148 @@ where
                 );
             }
         }
+        // End the disciplined pull's in-flight cycle on the terminal package
+        // (whether or not THIS package decoded) so the driver returns to
+        // Idle: a converged observer goes quiescent, a still-behind one (a
+        // WARN-dropped package) re-probes on its next divergence detection
+        // (the recovery tick) rather than waiting out the rebalance. A NoOp
+        // for a bootstrap-stream `done`.
+        if done {
+            self.pull_coordinator.on_pull_done(stream_id);
+        }
     }
 
     /// Anti-entropy receive side (item 3): compare the peer's digest
-    /// against ours and pull a snapshot if behind. Uses the role-agnostic
-    /// `reconcile_against_peer` as-is; the observer owns only the `send_to`
-    /// edge.
+    /// against ours and, iff behind, NOTE the divergence to the disciplined
+    /// PULL driver (`pull_coordinator`) instead of firing an eager immediate
+    /// pull at the sender. `note_behind` is IDEMPOTENT (a NoOp while a
+    /// probe→pull cycle is in flight = single-flight), so a behind observer
+    /// under churn initiates pulls at the cooldown rate, not one per inbound
+    /// digest. The cold trigger's `Probe` directive is driven onto the wire;
+    /// selection + pull happen on the pull arm's timers. The peer-digest
+    /// store is kept (it still bounds against the live roster and the
+    /// recovery tick reads "are we behind any known peer"); the eager pull
+    /// is replaced.
     async fn on_state_digest(
         &mut self,
         sender_id: &str,
         sender_is_observer: bool,
         peer: &StateDigest,
     ) {
-        // Record this peer's last-seen digest + declared role for the AE-3
-        // recovery cadence (the C9 quiesce signal: the timer arm pulls iff
-        // still behind one of these, typed off the stored role). Reactive
-        // single-frame reconciliation still runs below.
+        // Record this peer's last-seen digest + declared role (the recovery
+        // tick's still-behind-any-known-peer signal reads it).
         self.peer_digests
             .insert(sender_id.to_string(), (sender_is_observer, *peer));
         let local = self.cluster_state.digest();
-        let requester = RequesterIdentity {
-            node_id: &self.config.node_id,
-            is_observer: true,
-            can_be_primary: false,
-        };
-        let Some((dst, req)) = anti_entropy::reconcile_against_peer::<I>(
-            &local,
-            peer,
-            sender_id,
-            sender_is_observer,
-            &requester,
-            &mut self.inbound_snapshots,
-            timestamp_now(),
-        ) else {
+        if !local.is_behind(peer) {
             // Converged on this peer's digest — nothing to pull.
             return;
+        }
+        if let Some(directive) = self
+            .pull_coordinator
+            .note_behind(std::time::Instant::now())
+        {
+            self.drive_pull_directive(directive).await;
+        }
+    }
+
+    /// Translate ONE [`crate::pull_coordinator::PullDirective`] into this
+    /// observer's `send_to` edge — the role-owned wire-touch half of the
+    /// disciplined pull (FSM + selection in `pull_coordinator`; frame
+    /// construction + role-typing in `pull_coordinator::pull_probe` /
+    /// `pull_request`; this method only owns `send_to`). The observer
+    /// declares `is_observer: true`, `can_be_primary: false` on its pulls.
+    async fn drive_pull_directive(&mut self, directive: crate::pull_coordinator::PullDirective) {
+        match directive {
+            crate::pull_coordinator::PullDirective::Probe => {
+                let digest = self.cluster_state.digest();
+                let frame = crate::pull_coordinator::pull_probe::<I>(
+                    &self.config.node_id,
+                    timestamp_now(),
+                    digest,
+                );
+                if let Err(e) = self.send_to(Destination::All, frame).await
+                    && let Some(suppressed) = self.ae_recovery_warn.permit()
+                {
+                    tracing::warn!(
+                        error = %e,
+                        suppressed_since_last_warn = suppressed,
+                        "observer pull-probe broadcast failed; the pull driver re-probes"
+                    );
+                }
+            }
+            crate::pull_coordinator::PullDirective::PullFrom {
+                target_id,
+                target_is_observer,
+            } => {
+                let (dst, frame, stream_id) = crate::pull_coordinator::pull_request::<I>(
+                    &self.config.node_id,
+                    true,
+                    false,
+                    &target_id,
+                    target_is_observer,
+                    &mut self.inbound_snapshots,
+                    timestamp_now(),
+                );
+                if self.send_to(dst, frame).await.is_ok() {
+                    self.pull_coordinator.note_pull_stream(&stream_id);
+                }
+            }
+        }
+    }
+
+    /// Answer an inbound `PullProbe`: reply with this observer's inbox depth
+    /// + the responder-side `ahead` bit. Direct-only reply.
+    async fn handle_pull_probe(&mut self, prober_id: &str, prober_digest: &StateDigest) {
+        let local = self.cluster_state.digest();
+        let ahead = crate::pull_coordinator::probe_reply_ahead(&local, prober_digest);
+        let (dst, frame) = crate::pull_coordinator::pull_probe_reply::<I>(
+            &self.config.node_id,
+            timestamp_now(),
+            prober_id,
+            false,
+            self.inbox.depth() as u64,
+            ahead,
+        );
+        let _ = self.send_to(dst, frame).await;
+    }
+
+    /// Record an inbound `PullProbeReply` into the pull driver (a usable
+    /// reply may resolve the pull target via the first-answer fallback).
+    async fn handle_pull_probe_reply(
+        &mut self,
+        responder_id: &str,
+        requester: &str,
+        inbox_size: u64,
+        ahead: bool,
+    ) {
+        if requester != self.config.node_id {
+            return;
+        }
+        let reply = crate::pull_coordinator::ProbeReply {
+            responder_id,
+            responder_is_observer: false,
+            inbox_size,
+            ahead,
         };
-        if let Err(e) = self.send_to(dst, req).await {
-            tracing::warn!(
-                error = %e,
-                "observer anti-entropy snapshot pull failed; will retry on the next \
-                 digest divergence"
-            );
+        if let Some(directive) = self
+            .pull_coordinator
+            .on_probe_reply(std::time::Instant::now(), &reply)
+        {
+            self.drive_pull_directive(directive).await;
+        }
+    }
+
+    /// Record an inbound `PullFail` and fall to the next pull target.
+    async fn handle_pull_fail(&mut self, requester: &str, stream_id: &str) {
+        if requester != self.config.node_id {
+            return;
+        }
+        if let Some(directive) = self
+            .pull_coordinator
+            .on_fail(std::time::Instant::now(), stream_id)
+        {
+            self.drive_pull_directive(directive).await;
         }
     }
 
@@ -2287,70 +2454,59 @@ where
         }
     }
 
-    /// AE-3 recovery-cadence tick (D-C / C9): the TIMER-driven snapshot
-    /// recovery, distinct from the digest broadcast above. With ZERO
-    /// inbound traffic, re-pull a fresh snapshot from a rotating known peer
-    /// IFF the local replica is still behind that peer's last-seen digest.
-    /// This is what makes a WARN-dropped steady-state decode (the
-    /// non-latching `on_cluster_snapshot` arm) recover: the next tick re-
-    /// pulls until convergence. The role owns only the `send_to` edge +
+    /// AE-3 recovery-cadence tick (D-C / C9): the TIMER-driven half of the
+    /// disciplined pull, distinct from the digest broadcast above. With ZERO
+    /// inbound traffic, NOTE divergence to the `pull_coordinator` IFF the
+    /// local replica is still behind ANY known peer's last-seen digest. This
+    /// is what makes a WARN-dropped steady-state decode (the non-latching
+    /// `on_cluster_snapshot` arm) recover: the next tick re-notes until
+    /// convergence, and `note_behind`'s single-flight + the pull driver's
+    /// 30s re-probe / target selection subsume the old responder rotation.
+    /// The role owns only the `send_to` edge (via `drive_pull_directive`) +
     /// the peer-digest store + the roster intersection; the convergence
-    /// detection, the C9 quiesce, and the responder rotation live in
-    /// [`anti_entropy::plan_recovery_pull`].
+    /// detection lives in [`StateDigest::is_behind`] and the
+    /// single-flight/selection in [`crate::pull_coordinator`].
     async fn on_recovery_tick(&mut self) {
-        // Known-peer roster ([`Self::known_peer_roster`]). Intersect
-        // it with the peers that have actually broadcast a digest, so the
-        // recovery arm only ever targets a peer we both KNOW and have a
-        // last-seen digest for. A digest from a peer no longer in the roster
-        // (departed) is excluded — we never resurrect a route to a dead peer.
+        // Known-peer roster ([`Self::known_peer_roster`]): the live peers
+        // we both KNOW and hold a last-seen digest for (a departed peer's
+        // digest is excluded — we never resurrect a route to a dead peer).
         let roster: HashSet<String> = self.known_peer_roster();
-        let peer_digests: Vec<(String, bool, StateDigest)> = self
+        let local = self.cluster_state.digest();
+        // Behind ANY known live peer's last-seen digest? (the C9 quiesce
+        // signal: if converged with all of them, nothing to do this tick.)
+        let behind_any = self
             .peer_digests
             .iter()
             .filter(|(id, _)| roster.contains(id.as_str()))
-            .map(|(id, (is_observer, d))| (id.clone(), *is_observer, *d))
-            .collect();
-        let local = self.cluster_state.digest();
-        let requester = RequesterIdentity {
-            node_id: &self.config.node_id,
-            is_observer: true,
-            can_be_primary: false,
-        };
-        let Some((dst, req)) = anti_entropy::plan_recovery_pull::<I>(
-            &local,
-            &peer_digests,
-            &mut self.recovery_cursor,
-            &requester,
-            &mut self.inbound_snapshots,
-            timestamp_now(),
-        ) else {
-            // C9: converged with every known peer (or none known yet) —
-            // quiesce, no pull this tick.
+            .any(|(_, (_, d))| local.is_behind(d));
+        if !behind_any {
+            // Converged with every known peer (or none known yet) — quiesce.
             return;
-        };
-        // A planned pull over an EMPTY mesh registry can only no-route —
-        // name the registry state (rate-limited; same gate as the Err arm
-        // below, so one tick emits at most one recovery-fault WARN).
-        if self.client.peer_count() == 0
-            && let Some(suppressed) = self.ae_recovery_warn.permit()
-        {
-            tracing::warn!(
-                pull_target = ?dst,
-                suppressed_since_last_warn = suppressed,
-                "AE-3 recovery pull has no peers to reach: the mesh registry \
-                 is EMPTY while a known peer's digest proves this replica \
-                 behind — recovery cannot engage until the peer (re-)registers"
-            );
         }
-        if let Err(e) = self.send_to(dst, req).await
-            && let Some(suppressed) = self.ae_recovery_warn.permit()
+        // The TIMER-driven half of the storm-killer: NOTE the divergence to
+        // the disciplined pull driver instead of firing an immediate
+        // rotating `plan_recovery_pull`. Idempotent (single-flight) — a
+        // recovery tick while a probe→pull cycle is already in flight is a
+        // NoOp, so the recovery cadence can never stack a second pull. The
+        // pull driver's own 30s re-probe / target selection subsumes the
+        // old responder-rotation entirely.
+        if let Some(directive) = self
+            .pull_coordinator
+            .note_behind(std::time::Instant::now())
         {
-            tracing::warn!(
-                error = %e,
-                suppressed_since_last_warn = suppressed,
-                "observer AE-3 recovery snapshot pull failed; the next recovery \
-                 tick rotates to a different responder"
-            );
+            // A planned probe over an EMPTY mesh registry can only no-route
+            // — name the registry state (rate-limited).
+            if self.client.peer_count() == 0
+                && let Some(suppressed) = self.ae_recovery_warn.permit()
+            {
+                tracing::warn!(
+                    suppressed_since_last_warn = suppressed,
+                    "AE-3 recovery: a known peer's digest proves this replica \
+                     behind but the mesh registry is EMPTY — the pull probe \
+                     cannot reach anyone until a peer (re-)registers"
+                );
+            }
+            self.drive_pull_directive(directive).await;
         }
     }
 

@@ -29,6 +29,7 @@ const ARM_GRACEFUL_ABORT: usize = 10;
 const ARM_TASK_BACKOFF: usize = 11;
 const ARM_SNAPSHOT_STREAM: usize = 12;
 const ARM_SETTLED_SPILL: usize = 13;
+const ARM_PULL: usize = 14;
 
 /// Arm names, index-aligned with the `ARM_*` ids above. The render order of
 /// the compact stats line.
@@ -47,6 +48,7 @@ const OP_LOOP_ARM_NAMES: &[&str] = &[
     "task_backoff",
     "snapshot_stream",
     "settled_spill",
+    "pull",
 ];
 
 /// Render a drain-by-`MessageType` tally as a single diagnostic string:
@@ -769,7 +771,42 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             "snapshot-stream package send failed; dropping stream \
                              (the requester's pull cadence resumes from its cursor)"
                         );
-                        self.snapshot_streams.abort_stream(&stream_id);
+                        // The direct leg to the requester dropped; signal it
+                        // via a PullFail (delivered INDIRECTLY through the
+                        // relay) so its pull driver falls to the next target.
+                        if let Some((requester, requester_is_observer)) =
+                            self.snapshot_streams.abort_stream(&stream_id)
+                        {
+                            let (fail_dst, fail) = crate::pull_coordinator::pull_fail(
+                                &self.config.node_id,
+                                crate::primary::wire::timestamp_now(),
+                                &requester,
+                                requester_is_observer,
+                                &stream_id,
+                            );
+                            let _ = self.send_to(fail_dst, fail).await;
+                        }
+                    }
+                }
+                // Disciplined-pull WAKE arm (#491 storm-killer): drives the
+                // `pull_coordinator`'s probe/selection/rebalance timers off
+                // its PERSISTENT `wake_deadline` (an absolute instant from
+                // STORED state), NOT a relative sleep, so it fires under
+                // constant sibling-arm activity (the watchdog law). `None`
+                // (Idle — the authoritative primary's steady state) parks the
+                // arm. Cancel-safe: `sleep_until` consumes nothing and the
+                // deadline is recomputed each iteration from stored state.
+                _ = async {
+                    match self.pull_coordinator.wake_deadline() {
+                        Some(due) => {
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await
+                        }
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    arm_stats.record(ARM_PULL);
+                    for directive in self.pull_coordinator.tick(Instant::now()) {
+                        self.drive_pull_directive(directive).await;
                     }
                 }
                 event = self.settled_spill.next_event() => {

@@ -676,6 +676,16 @@ where
                 ) {
                     self.react_to_primary_identity_change().await;
                 }
+                // The terminal package ends the disciplined pull's in-flight
+                // cycle: return the driver to Idle so a converged node goes
+                // quiescent and a still-behind node (a WARN-dropped package)
+                // re-probes on its NEXT divergence detection rather than
+                // waiting out the rebalance. A NoOp for a bootstrap-stream
+                // `done` (its id never matches the pull driver's in-flight
+                // stream).
+                if done {
+                    self.pull_coordinator.on_pull_done(&stream_id);
+                }
                 Ok(())
             }
             DistributedMessage::StateDigest {
@@ -694,6 +704,41 @@ where
                 // role rides the frame so the pull is typed off it.
                 self.reconcile_state_digest(&sender_id, sender_is_observer, &digest)
                     .await;
+                Ok(())
+            }
+            // Pull-model PROBE from a behind peer: answer with our inbox
+            // depth + the responder-side `ahead` bit. Direct-neighbours-only
+            // (the ingress never re-broadcast this inbound `All`), handled
+            // locally, never relayed onward.
+            DistributedMessage::PullProbe {
+                sender_id, digest, ..
+            } => {
+                self.handle_pull_probe(&sender_id, &digest).await;
+                Ok(())
+            }
+            // Pull-model PROBE REPLY: a direct neighbour answered our probe.
+            // Fed to the single-flight pull driver (smallest-inbox-ahead
+            // selection + first-answer fallback).
+            DistributedMessage::PullProbeReply {
+                sender_id,
+                requester,
+                inbox_size,
+                ahead,
+                ..
+            } => {
+                self.handle_pull_probe_reply(&sender_id, &requester, inbox_size, ahead)
+                    .await;
+                Ok(())
+            }
+            // Pull-model FAIL: the chosen target could not serve our pull
+            // (its direct leg to us dropped — delivered INDIRECTLY via the
+            // relay). Fall to the next candidate.
+            DistributedMessage::PullFail {
+                requester,
+                stream_id,
+                ..
+            } => {
+                self.handle_pull_fail(&requester, &stream_id).await;
                 Ok(())
             }
             DistributedMessage::ClusterMutation { mutations, .. } => {
