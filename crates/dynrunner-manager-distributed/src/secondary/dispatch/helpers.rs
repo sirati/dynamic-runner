@@ -117,14 +117,30 @@ where
     ///      (`repoll_idle_workers`, `Destination::Primary` re-resolved
     ///      at the egress edge) instead of sitting out a stale window
     ///      (the dispatch-silence symptom).
+    ///   3. **Retained-report re-drive.** A confirmable report retained
+    ///      during the prior primary's outage re-resolves
+    ///      `Destination::Primary` at its egress on every drain, so it
+    ///      WOULD route to the new holder — but its `next_due` is a
+    ///      backoff slot timed against the gone primary (capped at 60s),
+    ///      so a member that already KNOWS the new primary would
+    ///      otherwise sit out that slot before re-sending (the production
+    ///      `15+30+60+60+60` replay-backoff stall). The identity advance
+    ///      is the same "the target just changed, re-deliver NOW" edge as
+    ///      `record_primary_message`'s route-recovery drain, so this fires
+    ///      the SAME schedule-overriding `drain_report_replays_now` — the
+    ///      retained reports land at the new primary within one reaction
+    ///      instead of waiting out a stale backoff. A re-absorb (route not
+    ///      actually up yet) simply re-buffers on the advanced slot.
     ///
     /// The re-announce is queued BEFORE the repoll so the new primary
     /// hears this member's confirmation ahead of its first
-    /// request-driven pulls.
+    /// request-driven pulls; the retained-report re-drive runs LAST so the
+    /// re-announce + repoll are already queued when the reports go out.
     pub(in crate::secondary) async fn react_to_primary_identity_change(&mut self) {
         self.rearm_mesh_ready_for_new_primary().await;
         self.op_mut().primary_link.reset_all_backoff();
         self.repoll_idle_workers().await;
+        self.drain_report_replays_now().await;
     }
 
     /// The unified primary-activation apply hook for a
