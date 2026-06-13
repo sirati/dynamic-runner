@@ -314,6 +314,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     primary_completed.insert(hash.clone());
                     completed_task_ids.insert(task.task_id.clone());
                 }
+                // A succeeded setup task: a success-like terminal that
+                // satisfies dependents' deps (its task_id enters the
+                // dep-resolution seed, so build tasks gated on it pre-resolve
+                // in `extend()`) and is NOT re-dispatched on failover (never
+                // pushed into `items` — re-running it would re-execute the
+                // setup work whose effect is already done). Unlike a
+                // spawn-time skip it WAS executed in-process, so it marks the
+                // phase STARTED (it is genuine evidence the phase activated),
+                // matching the `Completed` arm. The CRDT entry stays
+                // `SetupCompleted`. It enters `primary_completed` for the
+                // run-completion counter slot, like the other non-`Failed`
+                // terminals.
+                TaskState::SetupCompleted { task, .. } => {
+                    started_phases.insert(task.phase_id.clone());
+                    phases_with_terminal.insert(task.phase_id.clone());
+                    primary_completed.insert(hash.clone());
+                    completed_task_ids.insert(task.task_id.clone());
+                }
                 // Cascade-paused dependent. Re-seed as Pending into the
                 // new primary's pool: the prereq's TaskCompleted apply
                 // arm has already (or will shortly) auto-resume the
@@ -431,6 +449,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     soft_failed_seed.push((entry.task_id.clone(), entry.phase_id.clone()));
                 }
                 SettledClass::SkippedAlreadyDone => {
+                    phases_with_terminal.insert(entry.phase_id.clone());
+                    primary_completed.insert(hash.clone());
+                    completed_task_ids.insert(entry.task_id.clone());
+                }
+                // SetupCompleted → started + terminal + completed mirror +
+                // dep seed, mirroring the fat `SetupCompleted` arm above (a
+                // succeeded setup task was executed in-process, so it marks
+                // the phase started, satisfies dependents, and is never
+                // re-dispatched).
+                SettledClass::SetupCompleted => {
+                    started_phases.insert(entry.phase_id.clone());
                     phases_with_terminal.insert(entry.phase_id.clone());
                     primary_completed.insert(hash.clone());
                     completed_task_ids.insert(entry.task_id.clone());

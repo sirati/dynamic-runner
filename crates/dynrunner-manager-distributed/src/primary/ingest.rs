@@ -631,10 +631,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 | TaskState::Unfulfillable { .. }
                 | TaskState::InvalidTask { .. }
                 // Already terminal: a #3b run-wide invalidation must not
-                // overwrite a skip (the apply rule's weakest-terminal lockout
-                // would NoOp it anyway; skipping it here keeps the broadcast
-                // minimal).
-                | TaskState::SkippedAlreadyDone { .. } => None,
+                // overwrite a skip or a succeeded setup task (the apply
+                // rule's weakest-terminal lockout would NoOp it anyway;
+                // skipping it here keeps the broadcast minimal).
+                | TaskState::SkippedAlreadyDone { .. }
+                | TaskState::SetupCompleted { .. } => None,
             })
             .collect();
         if targets.is_empty() {

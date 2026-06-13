@@ -200,6 +200,7 @@ fn task_info_generic() {
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
+        kind: Default::default(),
         resolved_path: None,
     };
     assert_eq!(bi.size, 1024);
@@ -220,6 +221,7 @@ fn task_info_serde_roundtrip_with_phase_fields() {
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
+        kind: Default::default(),
         resolved_path: None,
     };
     let json = serde_json::to_string(&bi).unwrap();
@@ -390,6 +392,7 @@ fn task_info_preferred_secondaries_default_empty() {
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
+        kind: Default::default(),
         resolved_path: None,
     };
     let re_json = serde_json::to_value(&bi).unwrap();

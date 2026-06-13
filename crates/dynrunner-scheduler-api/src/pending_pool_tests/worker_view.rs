@@ -385,6 +385,7 @@ fn view_construction_clones_no_candidates() {
             task_depends_on: base.task_depends_on,
             preferred_secondaries: base.preferred_secondaries,
             preferred_version: base.preferred_version,
+            kind: base.kind,
             resolved_path: base.resolved_path,
         }
     };

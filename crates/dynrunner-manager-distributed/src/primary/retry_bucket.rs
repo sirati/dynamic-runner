@@ -475,6 +475,7 @@ mod important_event_tests {
             task_depends_on: vec![],
             preferred_secondaries: SoftPreferredSecondaries::default(),
             preferred_version: Default::default(),
+            kind: Default::default(),
             resolved_path: None,
         }
     }

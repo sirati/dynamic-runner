@@ -59,6 +59,7 @@ mod requeue_terminal_race;
 mod result_data_plumbing;
 mod retry;
 mod run_start_raise;
+mod setup_kind;
 mod setup_promote;
 mod stranded;
 mod terminal_ack;

@@ -116,6 +116,7 @@ fn make_binary(name: &str) -> dynrunner_core::TaskInfo<TestId> {
         task_depends_on: Vec::new(),
         preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
+        kind: Default::default(),
         resolved_path: None,
     }
 }

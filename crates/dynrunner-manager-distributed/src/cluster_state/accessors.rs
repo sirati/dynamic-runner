@@ -132,6 +132,7 @@ impl<I: Identifier> ClusterState<I> {
                 TaskState::Blocked { .. } => c.blocked += 1,
                 TaskState::InvalidTask { .. } => c.invalid_task += 1,
                 TaskState::SkippedAlreadyDone { .. } => c.skipped_already_done += 1,
+                TaskState::SetupCompleted { .. } => c.setup_succeeded += 1,
             }
         }
         // Settled (spilled) entries are LOGICAL ledger entries — fold
@@ -142,6 +143,7 @@ impl<I: Identifier> ClusterState<I> {
                 SettledClass::FailedFinal(_) => c.failed += 1,
                 SettledClass::InvalidTask => c.invalid_task += 1,
                 SettledClass::SkippedAlreadyDone => c.skipped_already_done += 1,
+                SettledClass::SetupCompleted => c.setup_succeeded += 1,
             }
         }
         c
@@ -197,6 +199,12 @@ impl<I: Identifier> ClusterState<I> {
                 // would mis-classify every skip as STRANDED and false-abort
                 // a clean skip-bearing run as `ClusterCollapsed`.
                 TaskState::SkippedAlreadyDone { .. } => o.skipped += 1,
+                // Succeeded setup-kind task: a SUCCESS-LIKE terminal in its
+                // OWN bucket (`setup_succeeded`), NEVER `succeeded` (the
+                // run-complete success count reports only worker WORK). Like
+                // `skipped`, it IS a terminal outcome so `total_terminal()`
+                // counts it.
+                TaskState::SetupCompleted { .. } => o.setup_succeeded += 1,
                 // Non-terminal: Pending, InFlight, and Blocked all
                 // contribute to neither bucket. Blocked tasks are
                 // cascade-paused dependents that will auto-resume to
@@ -218,6 +226,7 @@ impl<I: Identifier> ClusterState<I> {
                 SettledClass::FailedFinal(kind) => fold_failed_kind(kind, &mut o),
                 SettledClass::InvalidTask => o.fail_final += 1,
                 SettledClass::SkippedAlreadyDone => o.skipped += 1,
+                SettledClass::SetupCompleted => o.setup_succeeded += 1,
             }
         }
         o
@@ -241,6 +250,7 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::Unfulfillable { task, .. }
                 | TaskState::InvalidTask { task, .. }
                 | TaskState::SkippedAlreadyDone { task, .. }
+                | TaskState::SetupCompleted { task, .. }
                 | TaskState::Blocked { task, .. } => task,
             };
             (h, t)
@@ -262,7 +272,8 @@ impl<I: Identifier> ClusterState<I> {
             | TaskState::Failed { task, .. }
             | TaskState::Unfulfillable { task, .. }
             | TaskState::InvalidTask { task, .. }
-            | TaskState::SkippedAlreadyDone { task, .. } => Some((h, task)),
+            | TaskState::SkippedAlreadyDone { task, .. }
+            | TaskState::SetupCompleted { task, .. } => Some((h, task)),
             _ => None,
         })
     }
@@ -438,6 +449,7 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::Unfulfillable { task, .. }
                 | TaskState::InvalidTask { task, .. }
                 | TaskState::SkippedAlreadyDone { task, .. }
+                | TaskState::SetupCompleted { task, .. }
                 | TaskState::Blocked { task, .. } => task,
             };
             let entry = base.entry(&task.phase_id).or_insert((false, false));
@@ -545,6 +557,7 @@ impl<I: Identifier> ClusterState<I> {
                     | TaskState::Unfulfillable { task, .. }
                     | TaskState::InvalidTask { task, .. }
                     | TaskState::SkippedAlreadyDone { task, .. }
+                    | TaskState::SetupCompleted { task, .. }
                     | TaskState::Blocked { task, .. } => task,
                 };
                 (task.task_id == task_id && &task.phase_id == phase_id).then_some(h.as_str())
@@ -640,6 +653,7 @@ impl<I: Identifier> ClusterState<I> {
                     | TaskState::Unfulfillable { task, .. }
                     | TaskState::InvalidTask { task, .. }
                     | TaskState::SkippedAlreadyDone { task, .. }
+                    | TaskState::SetupCompleted { task, .. }
                     | TaskState::Blocked { task, .. } => task,
                 };
                 if &task.phase_id != phase_id {
@@ -688,7 +702,12 @@ impl<I: Identifier> ClusterState<I> {
                 TaskState::Pending { .. }
                 | TaskState::InFlight { .. }
                 | TaskState::Blocked { .. } => p.to_run += 1,
-                TaskState::Completed { .. } => p.done += 1,
+                // `SetupCompleted` is success-like work this run performed
+                // in-process — folded into `done` for the per-phase
+                // progress partition (the OUTCOME-level `setup_succeeded`
+                // bucket keeps it out of the global success count; this
+                // phase-progress view is a distinct concern).
+                TaskState::Completed { .. } | TaskState::SetupCompleted { .. } => p.done += 1,
                 TaskState::Failed { .. }
                 | TaskState::Unfulfillable { .. }
                 | TaskState::InvalidTask { .. } => p.failed += 1,
@@ -702,7 +721,7 @@ impl<I: Identifier> ClusterState<I> {
                 continue;
             }
             match entry.class {
-                SettledClass::Completed => p.done += 1,
+                SettledClass::Completed | SettledClass::SetupCompleted => p.done += 1,
                 SettledClass::FailedFinal(_) | SettledClass::InvalidTask => p.failed += 1,
                 SettledClass::SkippedAlreadyDone => p.skipped += 1,
             }

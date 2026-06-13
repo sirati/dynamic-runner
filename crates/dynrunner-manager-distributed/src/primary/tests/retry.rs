@@ -800,6 +800,7 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                     task_depends_on: vec![],
                     preferred_secondaries: SoftPreferredSecondaries::default(),
                     preferred_version: Default::default(),
+                    kind: Default::default(),
                     resolved_path: None,
                 }
             }

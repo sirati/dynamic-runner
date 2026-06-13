@@ -184,6 +184,28 @@ pub enum TaskState<I> {
     /// `to_completed_event` is `None` so the skip stays silent on the
     /// completion channel.
     SkippedAlreadyDone { task: TaskInfo<I>, attempt: u32 },
+    /// A `TaskKind::Setup` task that SUCCEEDED. Distinct terminal variant
+    /// (rather than `Completed` carrying the kind) for the SAME reason as
+    /// `SkippedAlreadyDone`: it is SUCCESS-LIKE — terminal, satisfies a
+    /// dependent's `TaskDep`, counts toward phase completion — but a
+    /// DISTINCT accounting category. It is NOT folded into `Completed` /
+    /// `succeeded`: a succeeded setup task is counted in its OWN
+    /// `setup_succeeded` bucket so the run-complete success line reports
+    /// only worker WORK. Holding the kind on `Completed` instead would
+    /// force `counts()` / `outcome_counts()` / the narrator to peek inside
+    /// `task.kind` — scattered kind-special-casing the four-seam design
+    /// forbids; a discrete variant lets every counter dispatch on the
+    /// discriminant exactly as it already does for
+    /// `SkippedAlreadyDone` / `Unfulfillable` / `InvalidTask`.
+    ///
+    /// A setup task is executed IN-PROCESS by its affinity member (never
+    /// dispatched to a worker), so no worker outcome ever competes for its
+    /// hash — like `SkippedAlreadyDone`, it carries NO `version` and NO
+    /// error payload, and ranks as a spawn/in-process terminal in
+    /// [`TerminalRank`]. The originating mutation (the in-process
+    /// executor's success) is added by the executor phase; this variant +
+    /// its terminal/dep/counter wiring is the primitive that consumes it.
+    SetupCompleted { task: TaskInfo<I>, attempt: u32 },
 }
 
 impl<I> TaskState<I> {
@@ -200,6 +222,7 @@ impl<I> TaskState<I> {
             | TaskState::Unfulfillable { task, .. }
             | TaskState::InvalidTask { task, .. }
             | TaskState::SkippedAlreadyDone { task, .. }
+            | TaskState::SetupCompleted { task, .. }
             | TaskState::Blocked { task, .. } => task,
         }
     }
@@ -217,6 +240,7 @@ impl<I> TaskState<I> {
             | TaskState::Unfulfillable { task, .. }
             | TaskState::InvalidTask { task, .. }
             | TaskState::SkippedAlreadyDone { task, .. }
+            | TaskState::SetupCompleted { task, .. }
             | TaskState::Blocked { task, .. } => task,
         }
     }
@@ -236,6 +260,7 @@ impl<I> TaskState<I> {
             | TaskState::Unfulfillable { attempt, .. }
             | TaskState::InvalidTask { attempt, .. }
             | TaskState::SkippedAlreadyDone { attempt, .. }
+            | TaskState::SetupCompleted { attempt, .. }
             | TaskState::Blocked { attempt, .. } => *attempt,
         }
     }
@@ -265,6 +290,9 @@ impl<I> TaskState<I> {
     /// `SkippedAlreadyDone` IS terminal — a dependent of a skipped task is
     /// unblocked exactly like a dependent of a completed one (the outputs
     /// the skip validated as already-present are what the dependent reads).
+    /// `SetupCompleted` IS terminal for the same reason: a build task that
+    /// gates on a setup task (`TaskDep`) unblocks the moment that setup
+    /// task succeeds — overlapping, per the setup-task primitive's design.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -273,6 +301,7 @@ impl<I> TaskState<I> {
                 | TaskState::Unfulfillable { .. }
                 | TaskState::InvalidTask { .. }
                 | TaskState::SkippedAlreadyDone { .. }
+                | TaskState::SetupCompleted { .. }
         )
     }
 
@@ -330,10 +359,19 @@ impl<I> TaskState<I> {
             // must not be counted as a completion by a downstream consumer
             // bucket). Grouped with the non-terminal `None` arms because it,
             // like them, projects to no terminal event.
+            //
+            // A `SetupCompleted` is also silent on the completion channel
+            // for the SAME load-bearing reason: a succeeded setup task is
+            // counted in its own `setup_succeeded` bucket, NEVER the success
+            // bucket, so it must not surface as a `success: true` completion
+            // a downstream consumer Policy could fold into its success
+            // tally. Its dependents are unblocked through the cascade-resume
+            // path (the terminal-resume seam), not this event projection.
             TaskState::Pending { .. }
             | TaskState::InFlight { .. }
             | TaskState::Blocked { .. }
-            | TaskState::SkippedAlreadyDone { .. } => None,
+            | TaskState::SkippedAlreadyDone { .. }
+            | TaskState::SetupCompleted { .. } => None,
         }
     }
 }
@@ -472,21 +510,27 @@ pub(super) enum JoinBand {
     Terminal = 2,
 }
 
-/// Within the `Terminal` band: `SkippedAlreadyDone < {Failed,
-/// Unfulfillable} < Completed < InvalidTask` (D-T — InvalidTask is the
-/// unique TOP). `SkippedAlreadyDone` is the WEAKEST terminal so a skip
-/// never out-ranks a real outcome in a hypothetical hash collision (a
-/// real Completed/Failed/Unfulfillable/InvalidTask for the same hash
-/// always wins the join over the spawn-time skip). `FailedLike` covers
-/// `Failed | Unfulfillable`; they tie-break below by a fixed `failedlike`
-/// discriminant then the payload content hash, but only when both are
-/// `FailedLike` at equal version.
+/// Within the `Terminal` band: `SkippedAlreadyDone < SetupCompleted <
+/// {Failed, Unfulfillable} < Completed < InvalidTask` (D-T — InvalidTask
+/// is the unique TOP among WORK terminals). `SkippedAlreadyDone` is the
+/// WEAKEST terminal so a skip never out-ranks a real outcome in a
+/// hypothetical hash collision (a real
+/// Completed/Failed/Unfulfillable/InvalidTask for the same hash always
+/// wins the join over the spawn-time skip). `SetupCompleted` is the next-
+/// weakest, and like the skip it is a NON-COMPETING terminal: a setup-kind
+/// task's hash is only ever originated terminal by its in-process executor
+/// (never worker-dispatched), so its rank never decides a real collision —
+/// it sits low purely for a total, deterministic order. `FailedLike`
+/// covers `Failed | Unfulfillable`; they tie-break below by a fixed
+/// `failedlike` discriminant then the payload content hash, but only when
+/// both are `FailedLike` at equal version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum TerminalRank {
     SkippedAlreadyDone = 0,
-    FailedLike = 1,
-    Completed = 2,
-    InvalidTask = 3,
+    SetupCompleted = 1,
+    FailedLike = 2,
+    Completed = 3,
+    InvalidTask = 4,
 }
 
 /// Within the `NonTerminal` band, the rank sub-key (`Pending < InFlight`),
@@ -595,6 +639,11 @@ pub struct StateCounts {
     /// skips whose outputs already existed. SUCCESS-LIKE terminal kept in
     /// its OWN category (NOT folded into `completed` nor any `fail_*`).
     pub skipped_already_done: usize,
+    /// Tasks in `TaskState::SetupCompleted { .. }` — succeeded setup-kind
+    /// tasks. SUCCESS-LIKE terminal kept in its OWN category (NOT folded
+    /// into `completed` nor any `fail_*`), so the worker-work `completed`
+    /// count reports only worker work.
+    pub setup_succeeded: usize,
 }
 
 /// Per-phase task partition over the replicated ledger — the value shape
@@ -714,16 +763,30 @@ pub struct OutcomeSummary {
     /// total_terminal()`) and a clean skip-bearing run would false-abort
     /// as `ClusterCollapsed`.
     pub skipped: usize,
+    /// Succeeded `TaskState::SetupCompleted` terminals — a SUCCESS-LIKE
+    /// terminal kept in its OWN bucket: NOT folded into `succeeded` (the
+    /// run-complete summary / narrator success count must report only
+    /// worker WORK this run performed) and NOT any failure class. It IS a
+    /// terminal, fully-accounted outcome, so [`Self::total_terminal`]
+    /// includes it — sibling to `skipped`, for the same finalize-accounting
+    /// reason (a setup task left out of `total_terminal` would be
+    /// mis-classified as STRANDED).
+    pub setup_succeeded: usize,
 }
 
 impl OutcomeSummary {
     /// Sum across all buckets — the total tasks that reached a
-    /// terminal state (success, any failure, or a discovery-time
-    /// skip). Distinct from `total_tasks` on the coordinator, which
-    /// counts the input batch; `total_terminal()` reaches
-    /// `total_tasks` exactly when the run is fully accounted for.
+    /// terminal state (success, any failure, a discovery-time skip, or a
+    /// succeeded setup task). Distinct from `total_tasks` on the
+    /// coordinator, which counts the input batch; `total_terminal()`
+    /// reaches `total_tasks` exactly when the run is fully accounted for.
     pub fn total_terminal(&self) -> usize {
-        self.succeeded + self.fail_retry + self.fail_oom + self.fail_final + self.skipped
+        self.succeeded
+            + self.fail_retry
+            + self.fail_oom
+            + self.fail_final
+            + self.skipped
+            + self.setup_succeeded
     }
 }
 

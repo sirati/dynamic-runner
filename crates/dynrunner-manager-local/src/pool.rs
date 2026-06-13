@@ -1120,6 +1120,7 @@ mod orphan_poll_task_tests {
             task_depends_on: Vec::new(),
             preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
             preferred_version: Default::default(),
+            kind: Default::default(),
             resolved_path: None,
         }
     }

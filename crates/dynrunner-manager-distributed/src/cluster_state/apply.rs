@@ -571,8 +571,10 @@ impl<I: Identifier> ClusterState<I> {
                     | TaskState::InvalidTask { .. }
                     // A skip is terminal: it locks out a late cascade-pause
                     // exactly like the other terminals (a TaskBlocked must
-                    // not regress an already-done item to Blocked).
+                    // not regress an already-done item to Blocked). A
+                    // succeeded setup task is terminal for the same reason.
                     | TaskState::SkippedAlreadyDone { .. }
+                    | TaskState::SetupCompleted { .. }
                     | TaskState::InFlight { .. } => ApplyOutcome::NoOp,
                     TaskState::Blocked { .. } => {
                         // Already blocked: idempotent on a matching `on`,

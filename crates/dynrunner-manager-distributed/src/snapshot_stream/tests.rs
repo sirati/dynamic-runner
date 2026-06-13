@@ -24,6 +24,7 @@ fn mk_task(name: &str, payload_bytes: usize) -> TaskInfo<RunnerIdentifier> {
         task_depends_on: Vec::new(),
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
+        kind: Default::default(),
         resolved_path: None,
     }
 }

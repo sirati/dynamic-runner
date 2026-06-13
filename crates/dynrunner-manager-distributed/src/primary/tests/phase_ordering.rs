@@ -54,6 +54,7 @@ fn phased_binary(name: &str, phase: &str, size: u64) -> TaskInfo<TestId> {
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
+        kind: Default::default(),
         resolved_path: None,
     }
 }

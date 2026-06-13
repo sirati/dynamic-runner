@@ -119,6 +119,7 @@ fn hash_one<H: std::hash::Hash>(value: H) -> u64 {
 pub(crate) enum SettledClass {
     Completed,
     SkippedAlreadyDone,
+    SetupCompleted,
     InvalidTask,
     FailedFinal(ErrorType),
 }
@@ -493,8 +494,14 @@ pub(crate) fn write_spill_batch<I: Identifier>(
 /// the retry buckets actually target.
 pub(crate) fn settle_eligible<I>(state: &TaskState<I>) -> bool {
     match state {
+        // `SetupCompleted` is a join fixed-point: a setup task's terminal
+        // is originated once by its in-process executor and is never
+        // retried or re-failed (no retry bucket targets it, no reset
+        // resurrects it), so it is settle-eligible exactly like the other
+        // success-like terminals.
         TaskState::Completed { .. }
         | TaskState::SkippedAlreadyDone { .. }
+        | TaskState::SetupCompleted { .. }
         | TaskState::InvalidTask { .. } => true,
         TaskState::Failed { kind, .. } => {
             !BucketKind::Recoverable.matches(kind) && !BucketKind::Oom.matches(kind)
@@ -512,6 +519,7 @@ fn settled_class_of<I>(state: &TaskState<I>) -> Option<SettledClass> {
     match state {
         TaskState::Completed { .. } => Some(SettledClass::Completed),
         TaskState::SkippedAlreadyDone { .. } => Some(SettledClass::SkippedAlreadyDone),
+        TaskState::SetupCompleted { .. } => Some(SettledClass::SetupCompleted),
         TaskState::InvalidTask { .. } => Some(SettledClass::InvalidTask),
         TaskState::Failed { kind, .. } if settle_eligible(state) => {
             Some(SettledClass::FailedFinal(kind.clone()))

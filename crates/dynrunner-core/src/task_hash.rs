@@ -70,6 +70,7 @@ mod tests {
             payload: serde_json::Value::Null,
             task_id: "shared-id".into(),
             task_depends_on: Vec::<TaskDep>::new(),
+            kind: Default::default(),
             preferred_secondaries: SoftPreferredSecondaries::default(),
             preferred_version: Default::default(),
             resolved_path: None,

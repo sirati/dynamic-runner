@@ -110,6 +110,7 @@ fn variant_name(s: &TaskState<RunnerIdentifier>) -> &'static str {
         TaskState::Unfulfillable { .. } => "unfulfillable",
         TaskState::InvalidTask { .. } => "invalid",
         TaskState::SkippedAlreadyDone { .. } => "skipped",
+        TaskState::SetupCompleted { .. } => "setup_completed",
     }
 }
 

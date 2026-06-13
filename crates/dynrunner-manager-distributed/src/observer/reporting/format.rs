@@ -135,6 +135,13 @@ pub fn render_report(cur: &StatsSnapshot, prev: &StatsSnapshot) -> Option<String
             },
         },
         MetricLine {
+            label: "setup",
+            shape: MetricShape::Counter {
+                total: cur.setup_succeeded,
+                delta: delta(cur.setup_succeeded, prev.setup_succeeded),
+            },
+        },
+        MetricLine {
             label: "failed (retry)",
             shape: MetricShape::Counter {
                 total: cur.fail_retry,

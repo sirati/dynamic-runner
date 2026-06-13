@@ -349,9 +349,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let (counter_completed, failed_kind, success_like) =
             match self.cluster_state.task_view(task_hash) {
                 Some(crate::cluster_state::TaskView::Live(state)) => match state {
-                    TaskState::Completed { .. } | TaskState::SkippedAlreadyDone { .. } => {
-                        (true, None, true)
-                    }
+                    // `SetupCompleted` is success-like for the cascade (its
+                    // dependents resolve) and goes in the completed mirror
+                    // for dep pre-resolution — disjoint from `failed_tasks`,
+                    // exactly like `Completed`/`SkippedAlreadyDone`. (The
+                    // separate `setup_succeeded` OUTCOME bucket is derived
+                    // from the CRDT; this node-local mirror is a dep-
+                    // resolution set, not the success count.)
+                    TaskState::Completed { .. }
+                    | TaskState::SkippedAlreadyDone { .. }
+                    | TaskState::SetupCompleted { .. } => (true, None, true),
                     TaskState::Failed { kind, .. } => (false, Some(kind.clone()), false),
                     TaskState::Unfulfillable { .. } | TaskState::InvalidTask { .. } => {
                         (true, None, false)
@@ -368,9 +375,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 Some(crate::cluster_state::TaskView::Settled(entry)) => {
                     use crate::cluster_state::SettledClass;
                     match &entry.class {
-                        SettledClass::Completed | SettledClass::SkippedAlreadyDone => {
-                            (true, None, true)
-                        }
+                        SettledClass::Completed
+                        | SettledClass::SkippedAlreadyDone
+                        | SettledClass::SetupCompleted => (true, None, true),
                         SettledClass::FailedFinal(kind) => (false, Some(kind.clone()), false),
                         SettledClass::InvalidTask => (true, None, false),
                     }
