@@ -126,7 +126,13 @@ struct SpillWriter {
 /// }
 /// ```
 pub struct SettledSpillDriver {
-    interval: tokio::time::Interval,
+    /// Lazily built on the first [`Self::next_event`] poll — `tokio::time::interval`
+    /// panics outside a runtime, and the synchronous coordinator/test
+    /// constructors call [`Self::start`] / [`Self::disabled`] before any
+    /// runtime is necessarily entered. Deferring the build to the first
+    /// async poll (where a runtime is guaranteed) keeps construction
+    /// runtime-free without leaking the cadence concern to any caller.
+    interval: Option<tokio::time::Interval>,
     done_tx: tokio::sync::mpsc::UnboundedSender<WriteDone>,
     done_rx: tokio::sync::mpsc::UnboundedReceiver<WriteDone>,
     /// `Some` while idle; `None` while a write is in flight or after a
@@ -149,12 +155,8 @@ impl SettledSpillDriver {
     /// spill is an optimization and must never gate a run.
     pub fn start<I: Identifier>(role: &'static str, state: &mut ClusterState<I>) -> Self {
         let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut interval = tokio::time::interval(SWEEP_INTERVAL);
-        // A missed tick (busy loop) coalesces; the sweep is cadence,
-        // not a deadline.
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut driver = Self {
-            interval,
+            interval: None,
             done_tx,
             done_rx,
             writer: None,
@@ -192,7 +194,7 @@ impl SettledSpillDriver {
     pub fn disabled(role: &'static str) -> Self {
         let (done_tx, done_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            interval: tokio::time::interval(SWEEP_INTERVAL),
+            interval: None,
             done_tx,
             done_rx,
             writer: None,
@@ -223,9 +225,20 @@ impl SettledSpillDriver {
     /// resolves into busy-spin — ticks are bounded by the cadence and
     /// completions by in-flight writes (≤1).
     pub async fn next_event(&mut self) -> SpillEvent {
+        // Build the cadence on first poll (runtime guaranteed here), then
+        // split the borrows so the `tick()` and `recv()` futures poll
+        // together. The `interval` helper returns the field as `&mut
+        // Interval`; bind it + the receiver to disjoint locals before the
+        // `select!` so neither future re-borrows `self`.
+        let interval = self.interval.get_or_insert_with(|| {
+            let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval
+        });
+        let done_rx = &mut self.done_rx;
         tokio::select! {
-            _ = self.interval.tick() => SpillEvent::Sweep,
-            done = self.done_rx.recv() => {
+            _ = interval.tick() => SpillEvent::Sweep,
+            done = done_rx.recv() => {
                 SpillEvent::WriteDone(Box::new(done.expect(
                     "done channel cannot close: self holds the sender",
                 )))
