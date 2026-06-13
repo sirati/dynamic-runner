@@ -638,6 +638,12 @@ where
             // restores the connection record the re-welcome resets.
             let trio_incomplete = !got_peer_info || !got_assignment || !got_transfer;
             let received = loop {
+                // Pull-coordinator wake deadline, recomputed each iteration
+                // from the FSM's STORED state and bound OUTSIDE the select so
+                // the arm's future does not borrow `self` (the
+                // `recv_setup_frame` arm holds the `&mut self`). A persistent
+                // absolute instant — the watchdog-fires-under-load law.
+                let pull_wake = self.pull_coordinator.wake_deadline();
                 tokio::select! {
                     // Cancel-safe: `recv_setup_frame` is a sync backlog
                     // pop + `RoleInbox::recv` (a plain mpsc recv), so a
@@ -694,6 +700,27 @@ where
                                 "setup-phase anti-entropy digest broadcast \
                                  failed; the next tick retries"
                             );
+                        }
+                    }
+                    // Disciplined-pull WAKE arm (#491 storm-killer), setup-wait
+                    // copy: drives the `pull_coordinator`'s probe/selection/
+                    // rebalance timers off its PERSISTENT `wake_deadline` so a
+                    // setup-wedged secondary's relocation heal completes the
+                    // probe→select→pull cadence (the leaderless-wedge fix path).
+                    // `None` (Idle — converged / not yet behind) parks the arm.
+                    // Cancel-safe: `sleep_until` consumes nothing; the deadline
+                    // is recomputed each iteration from the coordinator's stored
+                    // state.
+                    _ = async {
+                        match pull_wake {
+                            Some(due) => {
+                                tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await
+                            }
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        for directive in self.pull_coordinator.tick(std::time::Instant::now()) {
+                            self.drive_pull_directive(directive).await;
                         }
                     }
                     // Setup-phase failover-election tick (#420 face (c)). The
@@ -842,12 +869,61 @@ where
                                 &payload,
                                 done,
                             );
+                            // End the disciplined pull's in-flight cycle on
+                            // the terminal package so the setup-wedged
+                            // secondary's driver returns to Idle (re-probes on
+                            // the next divergence instead of after rebalance).
+                            if done {
+                                self.pull_coordinator.on_pull_done(&stream_id);
+                            }
                         }
                         // The restored package may carry a terminal latch
                         // (RunComplete / RunAborted — they ride the stream's
                         // HEAD package) — re-loop to the single terminal-exit
                         // check at the loop head, exactly as the
                         // ClusterMutation arm below does.
+                        continue;
+                    }
+                    // Pull-model frames (#491) during setup-wait — handled
+                    // inline + `continue`d BEFORE the announce trigger below,
+                    // exactly like StateDigest, so a `PullProbe` from the
+                    // relocated primary is NEVER mistaken for the first
+                    // primary-originated announce frame (which would spawn the
+                    // worker pool). A setup-wedged secondary must answer probes
+                    // (so peers behind IT can heal) and complete its OWN heal
+                    // pull through the disciplined cadence here.
+                    if let MessageType::PullProbe = msg.msg_type() {
+                        if let DistributedMessage::PullProbe {
+                            sender_id, digest, ..
+                        } = msg
+                        {
+                            self.handle_pull_probe(&sender_id, &digest).await;
+                        }
+                        continue;
+                    }
+                    if let MessageType::PullProbeReply = msg.msg_type() {
+                        if let DistributedMessage::PullProbeReply {
+                            sender_id,
+                            requester,
+                            inbox_size,
+                            ahead,
+                            ..
+                        } = msg
+                        {
+                            self.handle_pull_probe_reply(&sender_id, &requester, inbox_size, ahead)
+                                .await;
+                        }
+                        continue;
+                    }
+                    if let MessageType::PullFail = msg.msg_type() {
+                        if let DistributedMessage::PullFail {
+                            requester,
+                            stream_id,
+                            ..
+                        } = msg
+                        {
+                            self.handle_pull_fail(&requester, &stream_id).await;
+                        }
                         continue;
                     }
                     // Setup-phase failover-election frames (#420 face (c)):

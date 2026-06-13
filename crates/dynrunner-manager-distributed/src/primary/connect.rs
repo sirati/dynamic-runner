@@ -385,6 +385,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // only if it is somehow behind (almost always a NoOp on the
             // authoritative primary). See `handle_state_digest`.
             MessageType::StateDigest => self.handle_state_digest(msg).await,
+            // Pull-model PROBE from a behind peer: answer with our inbox
+            // depth + the responder-side `ahead` bit. Direct-neighbours-only
+            // (the ingress never re-broadcast this inbound `All`), handled
+            // locally, never relayed onward.
+            MessageType::PullProbe => self.handle_pull_probe(msg).await,
+            // Pull-model PROBE REPLY → the single-flight pull driver
+            // (smallest-inbox-ahead selection + first-answer fallback).
+            MessageType::PullProbeReply => self.handle_pull_probe_reply(msg).await,
+            // Pull-model FAIL (chosen target's direct leg to us dropped,
+            // delivered INDIRECTLY via the relay) → fall to the next target.
+            MessageType::PullFail => self.handle_pull_fail(msg).await,
             // Anti-entropy pull-reply arm. One package of the stream this
             // primary's own `handle_state_digest` requested from a
             // proven-ahead peer. Pre-fix this fell through the catch-all

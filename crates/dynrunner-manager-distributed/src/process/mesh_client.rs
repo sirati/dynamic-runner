@@ -267,6 +267,44 @@ impl<I: Identifier> RoleInbox<I> {
         self.rx.try_recv().ok()
     }
 
+    /// Synchronously drain up to `cap` frames that are ALREADY queued,
+    /// returning them as owned values in arrival order. Never awaits and
+    /// never blocks — it stops at the first empty `try_recv` or once `cap`
+    /// frames have been taken, whichever comes first.
+    ///
+    /// # Why a bounded batch
+    ///
+    /// The owning coordinator's operational `select!` consumes ONE frame
+    /// per loop iteration (the awaited `recv` arm), while the SAME loop
+    /// runs O(ledger) per-iteration work (digest folds on inbound
+    /// `StateDigest`, fresh snapshot-stream plan builds on
+    /// `RequestSnapshotStream`). When ingress outruns that one-per-iteration
+    /// drain the unbounded channel grows without bound (#491). Draining a
+    /// bounded batch each iteration multiplies the per-iteration drain
+    /// throughput so the loop keeps up, while the `cap` bounds the burst so
+    /// the loop still yields to every other `select!` arm (keepalive,
+    /// election, OOM sweep) within the iteration.
+    ///
+    /// # Cancel-safety
+    ///
+    /// This method does not exist to be raced in a `select!` arm — it is a
+    /// SYNCHRONOUS follow-on the caller runs AFTER an awaited `recv()`
+    /// already yielded a frame, i.e. inside the arm BODY where no
+    /// cancellation can occur. It consumes only frames the channel already
+    /// holds, so nothing is lost: each frame it returns is committed to the
+    /// caller, exactly like a `while let Some(_) = try_recv()` loop, just
+    /// length-capped.
+    pub fn drain_ready(&mut self, cap: usize) -> Vec<DistributedMessage<I>> {
+        let mut batch = Vec::new();
+        while batch.len() < cap {
+            match self.rx.try_recv() {
+                Ok(frame) => batch.push(frame),
+                Err(_) => break,
+            }
+        }
+        batch
+    }
+
     /// Frames currently queued in this inbox — the accumulation-
     /// visibility read for the periodic collection-stats line. A
     /// drained loop holds ~zero; a persistently-growing depth means
@@ -274,5 +312,99 @@ impl<I: Identifier> RoleInbox<I> {
     /// (every queued frame is retained, cold, until processed).
     pub fn depth(&self) -> usize {
         self.rx.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dynrunner_protocol_primary_secondary::KeepaliveRole;
+
+    /// A cheap tagged frame so the batch order can be asserted.
+    fn frame(sender: &str) -> DistributedMessage<String> {
+        DistributedMessage::Keepalive {
+            target: None,
+            sender_id: sender.to_string(),
+            timestamp: 0.0,
+            secondary_id: sender.to_string(),
+            active_workers: 0,
+            emitter_role: KeepaliveRole::Secondary,
+        }
+    }
+
+    fn sender_of(msg: &DistributedMessage<String>) -> &str {
+        match msg {
+            DistributedMessage::Keepalive { sender_id, .. } => sender_id,
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    /// Mint a `RoleInbox` over a fresh channel, returning the inbox and the
+    /// write end (the slot's inbound sender stand-in) so a test can enqueue
+    /// frames without standing up a `Mesh`.
+    fn inbox_with_sender() -> (
+        RoleInbox<String>,
+        mpsc::UnboundedSender<DistributedMessage<String>>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let inbox = RoleInbox::new(rx, IngestLiveness::new(), None);
+        (inbox, tx)
+    }
+
+    /// The batch-drain pulls N>1 queued frames in ONE call (the
+    /// drain-rate relief: one loop iteration now consumes a bounded BATCH,
+    /// not a single frame), in arrival order, and leaves the inbox empty
+    /// when fewer than `cap` are queued.
+    #[test]
+    fn drain_ready_pulls_all_queued_up_to_cap() {
+        let (mut inbox, tx) = inbox_with_sender();
+        for s in ["a", "b", "c"] {
+            tx.send(frame(s)).expect("send");
+        }
+        let batch = inbox.drain_ready(16);
+        let got: Vec<&str> = batch.iter().map(sender_of).collect();
+        assert_eq!(got, vec!["a", "b", "c"], "drains all queued in arrival order");
+        assert_eq!(inbox.depth(), 0, "inbox empty after draining fewer than cap");
+        assert!(inbox.try_recv().is_none());
+    }
+
+    /// `cap` bounds the burst: a backed-up inbox is drained at most `cap`
+    /// frames per call, the remainder stay queued for the next iteration —
+    /// so a flood cannot monopolise the loop and starve the sibling arms.
+    #[test]
+    fn drain_ready_is_bounded_by_cap_and_leaves_remainder() {
+        let (mut inbox, tx) = inbox_with_sender();
+        for i in 0..10 {
+            tx.send(frame(&format!("f{i}"))).expect("send");
+        }
+        let batch = inbox.drain_ready(4);
+        assert_eq!(batch.len(), 4, "drains exactly cap when more are queued");
+        let got: Vec<&str> = batch.iter().map(sender_of).collect();
+        assert_eq!(got, vec!["f0", "f1", "f2", "f3"], "FIFO order preserved");
+        assert_eq!(inbox.depth(), 6, "remainder stays queued for the next iteration");
+        // A second bounded call drains the next slice (the backed-up inbox
+        // drains DOWN across iterations — the observed #491 recovery shape).
+        let next: Vec<String> = inbox
+            .drain_ready(4)
+            .iter()
+            .map(|m| sender_of(m).to_string())
+            .collect();
+        assert_eq!(next, vec!["f4", "f5", "f6", "f7"]);
+        assert_eq!(inbox.depth(), 2);
+    }
+
+    /// A zero cap and an empty inbox both yield an empty batch without
+    /// consuming anything (no off-by-one drain, no panic on empty).
+    #[test]
+    fn drain_ready_zero_cap_and_empty_inbox_are_noops() {
+        let (mut inbox, tx) = inbox_with_sender();
+        assert!(inbox.drain_ready(0).is_empty(), "zero cap drains nothing");
+        assert!(inbox.drain_ready(8).is_empty(), "empty inbox drains nothing");
+        tx.send(frame("x")).expect("send");
+        assert!(
+            inbox.drain_ready(0).is_empty(),
+            "zero cap leaves a queued frame untouched"
+        );
+        assert_eq!(inbox.depth(), 1, "the frame is still queued after a zero-cap call");
     }
 }

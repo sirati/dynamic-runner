@@ -220,12 +220,20 @@ impl SnapshotStreamResponder {
         Some((dst, frame))
     }
 
-    /// Drop a stream whose package send failed (dead leg). The
-    /// requester resumes from its cursor when it re-requests.
-    pub fn abort_stream(&mut self, stream_id: &str) {
-        if self.streams.remove(stream_id).is_some() {
-            tracing::debug!(stream_id, "snapshot stream aborted (send failure)");
-        }
+    /// Drop a stream whose package send failed (dead leg) and return the
+    /// `(requester_id, requester_is_observer)` of the aborted stream, so the
+    /// caller can send the requester a `PullFail` (the pull-model
+    /// indirect-delivery fallback: a chunk that could not be DELIVERED over
+    /// the direct leg signals the requester to fall to its next pull target,
+    /// the one frame routed via the relay-toward-the-role-holder path).
+    /// `None` when the stream id was unknown (already done/expired) — there
+    /// is no requester to notify. The requester also resumes from its cursor
+    /// on a plain re-request, so the `PullFail` is an OPTIMISTIC fast-path
+    /// fallback, not the sole recovery.
+    pub fn abort_stream(&mut self, stream_id: &str) -> Option<(String, bool)> {
+        let removed = self.streams.remove(stream_id)?;
+        tracing::debug!(stream_id, "snapshot stream aborted (send failure)");
+        Some((removed.requester, removed.requester_is_observer))
     }
 
     fn expire_idle(&mut self) {

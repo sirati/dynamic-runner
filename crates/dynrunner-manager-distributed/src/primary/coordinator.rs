@@ -863,6 +863,15 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// node's own anti-entropy pulls RESUME an interrupted stream
     /// (same stream id + cursor) instead of re-pulling from scratch.
     pub(super) inbound_snapshots: crate::snapshot_stream::InboundSnapshotStreams,
+    /// Disciplined anti-entropy PULL driver (the #491 storm-killer): the
+    /// single-flight probe→select→pull FSM. The digest-receive path feeds
+    /// it `note_behind` instead of the eager per-digest immediate pull; the
+    /// operational loop's pull arm drives its timers + translates its
+    /// directives into `send_to`. Almost always Idle on the authoritative
+    /// primary (it is rarely behind a follower), but load-bearing for a
+    /// freshly-promoted primary still warming its mirror. See
+    /// `crate::pull_coordinator`.
+    pub(super) pull_coordinator: crate::pull_coordinator::PullCoordinator,
 
     /// Cross-thread / cross-runtime ingress for the
     /// `PrimaryHandle` PyO3 surface. Each handler sits alongside
@@ -1462,6 +1471,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         );
         let snapshot_streams = crate::snapshot_stream::SnapshotStreamResponder::new(&config.node_id);
         let inbound_snapshots = crate::snapshot_stream::InboundSnapshotStreams::new(&config.node_id);
+        let pull_coordinator = crate::pull_coordinator::PullCoordinator::new(&config.node_id);
         // Settled-CRDT spill: attach this coordinator's spill segment to
         // the state it owns (degrades to disabled — fat-but-correct — on
         // any setup failure; see `settled_spill`).
@@ -1522,6 +1532,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             snapshot_streams,
             settled_spill,
             inbound_snapshots,
+            pull_coordinator,
             command_rx: Some(command_rx),
             command_tx,
             lifecycle_rx: Some(lifecycle_rx),

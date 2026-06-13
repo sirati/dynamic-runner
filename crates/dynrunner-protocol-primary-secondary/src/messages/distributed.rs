@@ -545,6 +545,125 @@ pub enum DistributedMessage<I> {
         #[serde(default)]
         sender_is_observer: bool,
     },
+    /// Pull-model PROBE: a node that detected it is behind broadcasts this
+    /// to its DIRECT mesh neighbours (never relayed onward) to discover the
+    /// least-loaded peer that holds ledger data it lacks. Carries the
+    /// requester's own [`StateDigest`] so each responder can compute, on its
+    /// own side, whether it is AHEAD of the requester (it holds data the
+    /// requester is missing) — the cheap correctness filter that stops the
+    /// requester ever burning a pull cycle on a peer that cannot help. Every
+    /// direct neighbour answers with a [`Self::PullProbeReply`]. This is the
+    /// single-flight, load-balanced replacement for the eager per-digest
+    /// immediate pull (`anti_entropy::reconcile_against_peer`): a node runs
+    /// at most one probe→pull cycle at a time regardless of how many
+    /// divergent digests it sees, so a perpetually-behind replica under
+    /// churn initiates pulls at the cooldown rate, NOT one per inbound
+    /// digest (the #491 snapshot-package storm).
+    ///
+    /// All fields are `#[serde(default)]`-wire-compatible: a pre-field peer
+    /// that cannot decode the new `msg_type` tag fails the decode loudly-
+    /// but-gracefully through the framed-IO pumps (same contract as every
+    /// other variant added to this enum), and a future field added here
+    /// decodes as its zero value on a peer that predates it.
+    PullProbe {
+        /// Mesh routing target (Phase-C C3) — same contract as every other
+        /// variant. A `PullProbe` is sent to [`Destination::All`]; the
+        /// receiving mesh-pump's `route_incoming` local-fans an inbound
+        /// `All` frame and NEVER re-broadcasts it, so the probe reaches
+        /// only the sender's DIRECT neighbours, exactly as the protocol
+        /// requires (direct-neighbours-only, never relayed onward).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// The requester's own current digest. The responder computes
+        /// `ahead = self_digest.is_behind(requester_digest) == false &&
+        /// requester_digest.is_behind(self_digest)` — i.e. the responder
+        /// holds ledger data the requester lacks — and stamps the result on
+        /// its [`Self::PullProbeReply`]'s `ahead` bit. Computed
+        /// responder-side so the requester need not carry every peer's
+        /// digest; the probe carries the requester's digest exactly once.
+        digest: StateDigest,
+    },
+    /// Pull-model PROBE REPLY: a direct neighbour's answer to a
+    /// [`Self::PullProbe`], reporting its current inbox depth and whether it
+    /// is AHEAD of the requester. The requester collects replies for a 1s
+    /// selection window, filters to the `ahead` responders (Decision A: the
+    /// ahead-filter — never pull from a peer that cannot help), and picks
+    /// the one with the SMALLEST `inbox_size` as its pull target (the
+    /// least-loaded ahead peer answers fastest and starves no one). If the
+    /// 1s window elapses with zero replies, the FIRST subsequent reply is
+    /// chosen. The chosen target then receives a `RequestSnapshotStream`
+    /// (resume-from-last-good cursor); subsequent chunks target the SAME
+    /// peer until a 1-minute rebalance re-probes.
+    ///
+    /// Sent DIRECTLY back to the requester (`Destination::Secondary(id)` /
+    /// `Destination::Observer(id)` — the requester's id, typed off its
+    /// declared role); never relayed (a reply that cannot reach the
+    /// requester directly is simply lost, and the requester's 30s re-probe
+    /// recovers).
+    PullProbeReply {
+        /// Mesh routing target (Phase-C C3) — same contract as every other
+        /// variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// The requester this reply answers (the `sender_id` of the
+        /// [`Self::PullProbe`] that triggered it). The requester matches
+        /// replies to its outstanding probe by this; a reply whose
+        /// `requester` is not this node's id is ignored. Named `requester`
+        /// (not `target`) because the wire envelope's routing-header field
+        /// is already `target` (the C3 stamp); this is the application-level
+        /// addressee, the probe originator.
+        requester: String,
+        /// The responder's current role-inbox depth (queued frames) — the
+        /// load signal the requester selects the SMALLEST of among the
+        /// `ahead` responders. A deep inbox means the responder is already
+        /// backed up; pulling from it would worsen its starvation.
+        inbox_size: u64,
+        /// Whether the responder holds ledger data the requester lacks
+        /// (`requester_digest.is_behind(responder_digest)`), computed
+        /// responder-side from the digest the [`Self::PullProbe`] carried.
+        /// Only `ahead` responders are pull candidates (Decision A); if no
+        /// reply is `ahead`, the requester pulls from no one this cycle (it
+        /// is caught up, or the others are behind too — the next probe
+        /// re-evaluates). `#[serde(default)]` decodes a pre-field peer as
+        /// `false` — the conservative "cannot help" shape, so a legacy
+        /// responder is never selected as a pull target.
+        #[serde(default)]
+        ahead: bool,
+    },
+    /// Pull-model FAIL: the chosen pull TARGET could not serve the
+    /// requester's `RequestSnapshotStream` because the DIRECT link to the
+    /// requester dropped in the meantime. Unlike a [`Self::PullProbeReply`]
+    /// (direct-only, lost if the leg is gone), a `PullFail` rides the
+    /// existing relay-toward-the-role-holder path so it is delivered
+    /// INDIRECTLY when the direct leg to the requester is gone — that is
+    /// precisely the case it signals. On receipt the requester drops the
+    /// dead target and falls to the NEXT target in its smallest-inbox-
+    /// ordered candidate list (the FAIL→next-target fallback).
+    PullFail {
+        /// Mesh routing target (Phase-C C3) — same contract as every other
+        /// variant. Stamped `Destination::Secondary(requester)` /
+        /// `Observer(requester)`; the ingress role-miss relay forwards it
+        /// toward the requester's recognized holder when the direct leg is
+        /// gone (the indirect-delivery contract this frame exists for).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// The requester this fail is addressed to (the originator of the
+        /// `RequestSnapshotStream` the responder could not answer). Named
+        /// `requester` (not `target`) for the same reason as
+        /// [`Self::PullProbeReply::requester`]: the routing-header field is
+        /// already `target`.
+        requester: String,
+        /// The `stream_id` of the `RequestSnapshotStream` that failed, so
+        /// the requester correlates the fail to its in-flight pull and
+        /// abandons exactly that attempt before falling to the next target.
+        stream_id: String,
+    },
     TaskComplete {
         /// Mesh routing target (Phase-C C3): the resolved role-bearing
         /// [`Destination`] the egress stamps so the receiving mesh-pump

@@ -145,8 +145,12 @@ pub fn reply_destination(requester_id: &str, requester_is_observer: bool) -> Des
 /// off the requester's declared role) and the anti-entropy PULL
 /// ([`reconcile_against_peer`] / [`plan_recovery_pull`], typed off the
 /// digest sender's declared role) resolve through this ONE point, so the
-/// `(id, is_observer) → Destination` mapping is never re-implemented.
-fn role_destination(id: &str, is_observer: bool) -> Destination {
+/// `(id, is_observer) → Destination` mapping is never re-implemented. The
+/// pull-model frame builders ([`crate::pull_coordinator`]) type their
+/// probe-reply / pull-request / fail destinations through this SAME point
+/// (a `PullCoordinator` directive names a peer by id + role bit), so the
+/// disciplined pull never re-implements the addressing either.
+pub(crate) fn role_destination(id: &str, is_observer: bool) -> Destination {
     let id = PeerId::from(id.to_string());
     if is_observer {
         Destination::Observer(id)

@@ -362,6 +362,12 @@ where
     /// node's own anti-entropy pulls RESUME an interrupted stream
     /// (same stream id + cursor) instead of re-pulling from scratch.
     pub(super) inbound_snapshots: crate::snapshot_stream::InboundSnapshotStreams,
+    /// Disciplined anti-entropy PULL driver (the #491 storm-killer): the
+    /// single-flight probe→select→pull FSM. The digest-receive path feeds
+    /// it `note_behind` instead of the eager per-digest immediate pull; the
+    /// operational loop's pull arm drives its timers + translates its
+    /// directives into `send_to`. See `crate::pull_coordinator`.
+    pub(super) pull_coordinator: crate::pull_coordinator::PullCoordinator,
 
     /// Peer-lifecycle dispatcher channel receiver, paired with the
     /// `lifecycle_tx` installed on `cluster_state` at construction.

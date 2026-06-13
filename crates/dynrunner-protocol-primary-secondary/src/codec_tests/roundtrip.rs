@@ -185,6 +185,155 @@ fn state_digest_observer_sender_bit_is_on_the_wire() {
     }
 }
 
+/// Pull-model PROBE round-trips: the requester id + the carried digest
+/// survive the wire. The digest is the responder-side `ahead`-filter input,
+/// so its fields must arrive intact.
+#[test]
+fn roundtrip_pull_probe() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::PullProbe {
+        target: None,
+        sender_id: "behind-node".into(),
+        timestamp: 99.5,
+        digest: StateDigest {
+            tasks_count: 7,
+            tasks_hash: 0xABCD,
+            primary_epoch: 3,
+            ..Default::default()
+        },
+    };
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+    match decoded {
+        DistributedMessage::PullProbe {
+            sender_id, digest, ..
+        } => {
+            assert_eq!(sender_id, "behind-node");
+            assert_eq!(digest.tasks_count, 7);
+            assert_eq!(digest.tasks_hash, 0xABCD);
+            assert_eq!(digest.primary_epoch, 3);
+        }
+        _ => panic!("expected PullProbe"),
+    }
+}
+
+/// Pull-model PROBE REPLY round-trips: the requester addressee, the inbox
+/// depth, and the `ahead` bit all survive on their NON-default values
+/// (`ahead = true` is the value that actually selects a target — a default
+/// `false` would mask a dropped field).
+#[test]
+fn roundtrip_pull_probe_reply() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::PullProbeReply {
+        target: None,
+        sender_id: "donor".into(),
+        timestamp: 1.0,
+        requester: "behind-node".into(),
+        inbox_size: 42,
+        ahead: true,
+    };
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+    match decoded {
+        DistributedMessage::PullProbeReply {
+            sender_id,
+            requester,
+            inbox_size,
+            ahead,
+            ..
+        } => {
+            assert_eq!(sender_id, "donor");
+            assert_eq!(requester, "behind-node");
+            assert_eq!(inbox_size, 42);
+            assert!(ahead, "the ahead bit must survive on its non-default value");
+        }
+        _ => panic!("expected PullProbeReply"),
+    }
+}
+
+/// Wire-shape mirror + backcompat: a `PullProbeReply` from a pre-`ahead`
+/// sender (the `ahead` key absent entirely) decodes as `ahead == false` —
+/// the conservative "cannot help" shape, so a legacy responder is never
+/// selected as a pull target. Decodes the OTHER side's literal bytes (not a
+/// re-encode of our own value) so a tag/field rename that still round-trips
+/// against itself is caught.
+#[test]
+fn legacy_pull_probe_reply_without_ahead_decodes_false() {
+    let bytes = r#"{"msg_type":"pull_probe_reply","sender_id":"donor","timestamp":0.0,"requester":"behind-node","inbox_size":3}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(bytes).unwrap();
+    match decoded {
+        DistributedMessage::PullProbeReply {
+            requester,
+            inbox_size,
+            ahead,
+            ..
+        } => {
+            assert_eq!(requester, "behind-node");
+            assert_eq!(inbox_size, 3);
+            assert!(
+                !ahead,
+                "a pre-field reply must decode as NOT-ahead (never a pull candidate)"
+            );
+        }
+        _ => panic!("expected PullProbeReply"),
+    }
+}
+
+/// Pull-model FAIL round-trips: the requester addressee + the failed
+/// stream id survive, so the requester correlates the fail to its in-flight
+/// pull and falls to the next target.
+#[test]
+fn roundtrip_pull_fail() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::PullFail {
+        target: None,
+        sender_id: "dead-leg-target".into(),
+        timestamp: 5.0,
+        requester: "behind-node".into(),
+        stream_id: "behind-node/4".into(),
+    };
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+    match decoded {
+        DistributedMessage::PullFail {
+            sender_id,
+            requester,
+            stream_id,
+            ..
+        } => {
+            assert_eq!(sender_id, "dead-leg-target");
+            assert_eq!(requester, "behind-node");
+            assert_eq!(stream_id, "behind-node/4");
+        }
+        _ => panic!("expected PullFail"),
+    }
+}
+
+/// The three pull frames carry the EXPECTED `msg_type` discriminators on
+/// the wire (the receiver demuxes on these), and a peer mirrors the literal
+/// bytes back into the right variant — catches a `rename_all` drift that
+/// would still round-trip against itself.
+#[test]
+fn pull_frames_wire_tags_mirror() {
+    for (literal, want_tag) in [
+        (
+            r#"{"msg_type":"pull_probe","sender_id":"a","timestamp":0.0,"digest":{}}"#,
+            MessageType::PullProbe,
+        ),
+        (
+            r#"{"msg_type":"pull_probe_reply","sender_id":"b","timestamp":0.0,"requester":"a","inbox_size":1,"ahead":true}"#,
+            MessageType::PullProbeReply,
+        ),
+        (
+            r#"{"msg_type":"pull_fail","sender_id":"c","timestamp":0.0,"requester":"a","stream_id":"a/0"}"#,
+            MessageType::PullFail,
+        ),
+    ] {
+        let decoded: DistributedMessage<TestId> = serde_json::from_str(literal).unwrap();
+        assert_eq!(decoded.msg_type(), want_tag, "literal: {literal}");
+    }
+}
+
 #[test]
 fn roundtrip_secondary_welcome() {
     use dynrunner_core::{ResourceAmount, ResourceKind};
