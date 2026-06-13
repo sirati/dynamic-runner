@@ -145,6 +145,17 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             // executor affinity. `to_task_info` resets it to `None` — same
             // rides-the-CRDT-path rationale as `kind`.
             setup_affinity: _setup_affinity,
+            // ── not transferred on the dispatch descriptor ──
+            // The upload-file ref (#336 P1) is the ACTION payload of a
+            // `Setup` upload task — it rides the CRDT-ledger path on
+            // `TaskInfo` (serialized with `#[serde(default)]` for
+            // wire-compat), not the primary↔secondary DISPATCH descriptor.
+            // A `Setup` task is never worker-dispatched (the scheduling
+            // seam excludes it), so anything round-tripping here is by
+            // construction `Work` with no upload ref. `to_task_info` resets
+            // it to `None` — same rides-the-CRDT-path rationale as `kind`
+            // and `setup_affinity`.
+            upload_file: _upload_file,
             // ── node-local: not transferred ──
             // `#[serde(skip)]` on the struct — the local on-disk resolved
             // location is host-specific and the receiving secondary
@@ -200,6 +211,10 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             // construction worker work; the kind rides the CRDT path (see
             // the destructure note above).
             kind: Default::default(),
+            // Reset to `None` — a dispatched task carries no upload-file
+            // ref (it is worker work, not a setup upload action); the
+            // upload ref rides the CRDT path (see the destructure note).
+            upload_file: None,
             // Reset to `None` — a dispatched task carries no executor
             // affinity (it is worker work); the executor affinity rides the
             // CRDT path on `TaskInfo`, see the destructure note above.

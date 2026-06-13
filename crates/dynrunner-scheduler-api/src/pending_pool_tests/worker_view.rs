@@ -387,6 +387,7 @@ fn view_construction_clones_no_candidates() {
             preferred_version: base.preferred_version,
             kind: base.kind,
             setup_affinity: None,
+            upload_file: None,
             resolved_path: base.resolved_path,
         }
     };

@@ -477,6 +477,7 @@ mod important_event_tests {
             preferred_version: Default::default(),
             kind: Default::default(),
             setup_affinity: None,
+            upload_file: None,
             resolved_path: None,
         }
     }

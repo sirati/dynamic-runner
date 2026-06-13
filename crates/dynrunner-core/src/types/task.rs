@@ -138,6 +138,32 @@ pub struct TaskInfo<I> {
     /// indistinguishable for ordinary tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_affinity: Option<String>,
+    /// Upload-file reference for a [`TaskKind::Setup`] task whose action
+    /// is "upload this file to the cluster" (#336 P1). `Some` ⇒ the
+    /// in-process executor on [`Self::setup_affinity`] performs the upload
+    /// via the registered upload-action callback and originates
+    /// `SetupCompleted` on success (the dependent work task that
+    /// `task_depends_on` this setup task then unblocks). `None` ⇒ the
+    /// no-upload-needed case (the pre-staged / mode-2 gate): the setup
+    /// task's action is the unchanged no-op success — exactly the #489
+    /// primitive behaviour.
+    ///
+    /// Only a `Setup` task ever carries `Some`; a `Work` task is always
+    /// `None`. NOT part of `compute_task_hash` (the recipe is
+    /// `{phase_id, path, identifier}`), so attaching a file ref never
+    /// changes the ledger key — it is action metadata, exactly like
+    /// `setup_affinity` is routing metadata. `#[serde(default)]` keeps the
+    /// wire backward-compatible (a frame from a peer that predates this
+    /// field decodes as `None` — the no-op gate); `skip_serializing_if`
+    /// keeps the common `None` case off the wire so a rolling upgrade is
+    /// indistinguishable for every non-upload task.
+    ///
+    /// BOXED so the (rare) upload payload does not bloat the common
+    /// `TaskInfo` (and thus `ClusterMutation::TaskAdded`, which embeds it) —
+    /// `Option<Box<_>>` is one pointer. Serde treats `Box<T>` transparently,
+    /// so the wire shape is identical to an inline `UploadFileRef`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_file: Option<Box<UploadFileRef>>,
     /// Optional soft worker-pinning class. Items with the same `Some(id)` prefer
     /// the same worker for kernel page-cache reuse; `None` joins the free pool.
     pub affinity_id: Option<AffinityId>,
@@ -243,6 +269,38 @@ pub struct TaskInfo<I> {
 }
 
 pub type TaskInput<I> = TaskInfo<I>;
+
+/// The file a [`TaskKind::Setup`] upload-action task uploads to the
+/// cluster (#336 P1). Deliberately MINIMAL for P1: a `source` path on
+/// the source-owning member (the submitter / observer that physically
+/// holds the file) plus an optional explicit `dest`. P2 owns how
+/// discovery / consumers ATTACH refs to tasks; this type is only the
+/// per-file payload the registered upload callback receives.
+///
+/// `dest = None` ⇒ the upload callback derives the destination from
+/// `source` the same way the bulk-walk does (strip-prefix under the
+/// gateway srcbins dir). `dest = Some(p)` ⇒ upload to exactly `p` — the
+/// explicit-placement case a consumer-spawned file-setup-task uses for a
+/// shared resource that does not live under `--source`.
+///
+/// Wire-compatible: `#[serde(default)]` on `dest` so a future field
+/// addition stays additive, and the whole type rides on `TaskInfo` only
+/// when present (`skip_serializing_if = "Option::is_none"` on the field),
+/// so a peer that predates #336 never sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadFileRef {
+    /// On-disk location of the file to upload, on the source-owning
+    /// affinity member. Absolute, or relative to the member's configured
+    /// source root (the upload callback resolves it the same way the
+    /// bulk-walk's per-file path is resolved).
+    pub source: PathBuf,
+    /// Explicit cluster-side destination for the upload. `None` ⇒ the
+    /// callback derives it from `source` (strip-prefix under srcbins),
+    /// matching the bulk-walk's placement. `Some` ⇒ upload verbatim to
+    /// this path (the consumer-spawned shared-resource case).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dest: Option<PathBuf>,
+}
 
 /// One edge in the per-task dep graph: the full `(phase_id, task_id)`
 /// identity of the prerequisite, plus a per-edge opt-in to receive the

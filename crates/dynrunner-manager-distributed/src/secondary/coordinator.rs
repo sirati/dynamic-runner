@@ -164,6 +164,7 @@ where
             lifecycle_dispatcher_handle: None,
             task_completed_rx: Some(task_completed_rx),
             task_completed_listeners: Vec::new(),
+            upload_action: None,
             task_completed_dispatcher_handle: None,
             worker_message_tx,
             worker_message_rx: Some(worker_message_rx),
@@ -470,6 +471,19 @@ where
         listener: Box<dyn crate::task_completed::TaskCompletedListener>,
     ) {
         self.task_completed_listeners.push(listener);
+    }
+
+    /// Wire the upload-action port (#336 P1) this secondary's in-process
+    /// setup executor uses to perform an assigned upload setup task's file
+    /// upload. Set before `run`. Absence leaves the executor with no
+    /// uploader — an assigned setup task carrying an upload-file ref then
+    /// fails as a wiring error (a no-ref setup task no-op-succeeds). See
+    /// [`crate::upload_action`].
+    pub fn set_upload_action(
+        &mut self,
+        action: std::sync::Arc<dyn crate::upload_action::UploadAction>,
+    ) {
+        self.upload_action = Some(action);
     }
 
     /// Register a [`crate::worker_messages::WorkerMessageListener`]

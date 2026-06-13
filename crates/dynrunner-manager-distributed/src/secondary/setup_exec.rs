@@ -33,7 +33,7 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::SecondaryCoordinator;
 use super::wire::timestamp_now;
-use crate::setup_exec::{SetupOutcome, execute_setup, run_setup_action};
+use crate::setup_exec::{SetupOutcome, execute_setup_with_upload};
 
 impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
@@ -57,14 +57,19 @@ where
         &mut self,
         task_hash: String,
     ) -> Result<(), String> {
-        // Resolve the task from the local CRDT mirror by hash. The
-        // `task_state` accessor returns the live `TaskState` whose `.task()`
-        // is the `TaskInfo` we execute against.
-        let outcome = match self.cluster_state.task_state(&task_hash) {
-            Some(state) => {
-                let task = state.task().clone();
-                execute_setup(&task, run_setup_action)
-            }
+        // Resolve the task from the local CRDT mirror by hash, CLONING it out
+        // so the `cluster_state` borrow ends before the (async) upload path
+        // runs against `&self.upload_action`. The `task_state` accessor
+        // returns the live `TaskState` whose `.task()` is the `TaskInfo` we
+        // execute against.
+        let task = self
+            .cluster_state
+            .task_state(&task_hash)
+            .map(|state| state.task().clone());
+        let outcome = match task {
+            // The shared executor path (#336 P1): an upload-ref task uploads
+            // via the registered action; a no-ref task keeps the #489 no-op.
+            Some(task) => execute_setup_with_upload(&task, &self.upload_action).await,
             None => {
                 tracing::warn!(
                     task_hash = %task_hash,

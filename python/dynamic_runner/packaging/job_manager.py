@@ -245,61 +245,116 @@ class SlurmJobManager:
         created_dirs: set[str] = {str(srcbins_dir)}
         uploaded = 0
         for binary in binaries:
-            raw = Path(binary.path)
-            # Resolve the on-disk read location: relative paths join
-            # against source_root (post-Bug-B wire-id shape — mirrors
-            # the Rust queue_initial_staging fix); absolute paths use
-            # binary.path verbatim.
-            local = raw if raw.is_absolute() else src_root / raw
-            # A discovered item with no backing file on disk is a
-            # computed/producer item: a ``uses_file_based_items=False``
-            # task discovers items it will PRODUCE, not files to upload.
-            # Skip it — the per-item authority for upload-stageability is
-            # "does this binary resolve to a real file under --source?",
-            # and the task-class flag cannot discriminate (a pure producer
-            # and a mixed composite are both ``uses_file_based_items=False``),
-            # so the walk itself must honour the no-backing-file case rather
-            # than stat+scp blindly (which OSErrors the whole dispatch).
-            # Mirrors the Rust upload (images.rs). The StageFile/staging path
-            # stays strict — it is gated to file-based tasks, whose files
-            # exist, and a genuinely-missing file-based source SHOULD surface
-            # there as ``SourceUnreadable``.
-            if not local.exists():
-                logger.warning(
-                    "Binary %s (resolved %s) has no backing source file "
-                    "under --source %s; skipping upload (computed/producer "
-                    "item — nothing to stage).",
-                    raw,
-                    local,
-                    src_root,
-                )
-                continue
-            try:
-                rel = local.resolve().relative_to(src_root)
-            except ValueError:
-                logger.warning(
-                    "Binary %s (resolved %s) is not under --source root %s; "
-                    "skipping upload (absolute path will ship as out-of-band; "
-                    "secondary must already see it).",
-                    raw,
-                    local.resolve(),
-                    src_root,
-                )
-                continue
-            remote = srcbins_dir / rel
-            parent = str(remote.parent)
-            if parent not in created_dirs:
-                self.gateway.create_directory(parent)
-                created_dirs.add(parent)
-            # Same idempotent gateway-copy boundary as the image
-            # uploads — one transient scp/ssh fault on one file must
-            # not kill the dispatch.
-            retry_transient(
-                lambda: self.gateway.transfer_file(local, str(remote)),
-                what=f"source-binary upload of {rel}",
-            )
-            uploaded += 1
+            if self._stage_one_source_file(
+                Path(binary.path), src_root, srcbins_dir, created_dirs
+            ):
+                uploaded += 1
         logger.info("Source-binary upload complete (%d/%d files)", uploaded, len(binaries))
+
+    def _stage_one_source_file(
+        self,
+        raw: Path,
+        src_root: Path,
+        srcbins_dir: Path,
+        created_dirs: set[str],
+    ) -> bool:
+        """Stage ONE source file to ``<srcbins>/<rel>`` on the gateway.
+
+        The single-file core of :meth:`upload_source_binaries`, factored out
+        UNCHANGED so the #336 upload-action callback (:meth:`upload_task_file`)
+        reuses the SAME placement + per-blob ``retry_transient`` transfer for a
+        per-task file upload rather than re-implementing it. The bulk walk
+        loops this once per binary; the callback calls it once per
+        file-setup-task.
+
+        Returns ``True`` if transferred, ``False`` if skipped (no backing
+        file, or out-of-tree — the same skip semantics the bulk walk and the
+        Rust ``images.rs`` upload agree on). Raises the underlying
+        ``OSError`` (transient class) / other (permanent) on a transfer that
+        could not complete after the bounded retry.
+
+        ``created_dirs`` is the shared mkdir-dedup set (the bulk walk's, or a
+        per-call singleton).
+        """
+        # Resolve the on-disk read location: relative paths join against
+        # source_root (post-Bug-B wire-id shape — mirrors the Rust
+        # queue_initial_staging fix); absolute paths use the path verbatim.
+        local = raw if raw.is_absolute() else src_root / raw
+        # A discovered item with no backing file on disk is a
+        # computed/producer item: a ``uses_file_based_items=False`` task
+        # discovers items it will PRODUCE, not files to upload. Skip it — the
+        # per-item authority for upload-stageability is "does this resolve to
+        # a real file under --source?", and the task-class flag cannot
+        # discriminate (a pure producer and a mixed composite are both
+        # ``uses_file_based_items=False``), so the walk itself honours the
+        # no-backing-file case rather than stat+scp blindly (which OSErrors
+        # the whole dispatch). Mirrors the Rust upload (images.rs). The
+        # StageFile/staging path stays strict — it is gated to file-based
+        # tasks, whose files exist, and a genuinely-missing file-based source
+        # SHOULD surface there as ``SourceUnreadable``.
+        if not local.exists():
+            logger.warning(
+                "Binary %s (resolved %s) has no backing source file "
+                "under --source %s; skipping upload (computed/producer "
+                "item — nothing to stage).",
+                raw,
+                local,
+                src_root,
+            )
+            return False
+        try:
+            rel = local.resolve().relative_to(src_root)
+        except ValueError:
+            logger.warning(
+                "Binary %s (resolved %s) is not under --source root %s; "
+                "skipping upload (absolute path will ship as out-of-band; "
+                "secondary must already see it).",
+                raw,
+                local.resolve(),
+                src_root,
+            )
+            return False
+        remote = srcbins_dir / rel
+        parent = str(remote.parent)
+        if parent not in created_dirs:
+            self.gateway.create_directory(parent)
+            created_dirs.add(parent)
+        # Same idempotent gateway-copy boundary as the image uploads — one
+        # transient scp/ssh fault on one file must not kill the dispatch.
+        retry_transient(
+            lambda: self.gateway.transfer_file(local, str(remote)),
+            what=f"source-binary upload of {rel}",
+        )
+        return True
+
+    def upload_task_file(self, source: str, dest: str | None = None) -> None:
+        """Upload ONE task file to the cluster — the #336 P1 upload-action
+        callback target (registered Rust→Python; see the
+        ``upload_action``/``UploadAction`` seam).
+
+        ``source`` is the file's on-disk location on the source-owning member
+        (the submitter / observer that holds it). ``dest`` is the cluster-side
+        destination RELATIVE to the gateway srcbins dir; ``None`` derives it
+        from ``source``'s basename. Either way the file lands under
+        ``<srcbins>/...``, the SAME bind-mount root the bulk walk populates, so
+        a secondary's ``src_network`` view resolves it identically.
+
+        Reuses the bulk walk's per-blob ``retry_transient`` transfer — NOT
+        re-implemented. Raises ``OSError`` (transient) / other (permanent) on
+        a transfer that could not complete after the bounded retry; the Rust
+        bridge classifies the exception for the upload action's retry/terminal
+        decision.
+        """
+        srcbins_dir = self._expanded_remote_path(self.slurm_config.get_srcbins_dir())
+        # The srcbins-relative tail: an explicit dest verbatim, else the
+        # source's basename (P2 owns richer placement policy).
+        rel = Path(dest) if dest is not None else Path(Path(source).name)
+        remote = srcbins_dir / rel
+        self.gateway.create_directory(str(remote.parent))
+        retry_transient(
+            lambda: self.gateway.transfer_file(Path(source), str(remote)),
+            what=f"task-file upload of {source} -> {remote}",
+        )
 
     def build_and_transfer_images(self, local_project_root: Path) -> PodmanImageMetadata:
         """Build the single docker image locally and transfer to gateway."""

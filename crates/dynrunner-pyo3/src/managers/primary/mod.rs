@@ -157,6 +157,18 @@ pub(crate) struct PyPrimaryCoordinator {
     /// is owned by `self` and read in the operational `select!`).
     pub(super) fulfillability_matcher: Option<Py<PyAny>>,
 
+    /// Optional Python upload callable supplied at `__init__` (#336 P1).
+    /// `Some` iff the caller passed `upload_action=<callable>`; the callable
+    /// is bridged through `crate::upload_action_bridge::PyUploadAction` and
+    /// installed on the inner `PrimaryCoordinator` at `run()` start via
+    /// `set_upload_action`. Constructor-only — same pre-`run()` registration
+    /// contract as the fulfillability matcher (the inner coordinator reads
+    /// the handle from inside the operational loop and carries it onto the
+    /// observer tail, so a late install would be invisible). The callable's
+    /// shape is `upload(source: str, dest: str | None) -> None` — typically
+    /// `SlurmJobManager.upload_task_file`.
+    pub(super) upload_action: Option<Py<PyAny>>,
+
     /// Optional opaque handle to the deployment-mode job manager,
     /// installed by the SLURM pipeline after `run_preparation` returns
     /// and BEFORE `run()` enters. Stored as `Arc<dyn Any + Send + Sync>`

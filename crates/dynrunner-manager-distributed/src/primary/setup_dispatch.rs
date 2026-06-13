@@ -54,7 +54,7 @@ use crate::primary::PrimaryCoordinator;
 use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::coordinator::InFlightEntry;
 use crate::primary::wire::{compute_task_hash, timestamp_now};
-use crate::setup_exec::{SetupOutcome, execute_setup, run_setup_action};
+use crate::setup_exec::{SetupOutcome, execute_setup_with_upload};
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Service the setup-task dispatch pass: route every dispatchable
@@ -159,7 +159,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let phase = task.phase_id.clone();
         let task_id = task.task_id.clone();
         self.pool_mut().mark_in_flight(&phase);
-        let outcome = execute_setup(&task, run_setup_action);
+        // The shared executor path (#336 P1): an upload-ref task uploads via
+        // the registered action; a no-ref task keeps the #489 no-op success.
+        let outcome = execute_setup_with_upload(&task, &self.upload_action).await;
         self.settle_setup_terminal(&hash, &phase, &task_id, outcome, command_rx)
             .await;
     }

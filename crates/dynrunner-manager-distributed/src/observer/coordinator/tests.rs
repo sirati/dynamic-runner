@@ -55,6 +55,7 @@ fn task(phase: &str, id: &str, deps: &[(&str, &str)]) -> TaskInfo<TestId> {
         preferred_secondaries: Default::default(),
         kind: Default::default(),
         setup_affinity: None,
+        upload_file: None,
         resolved_path: None,
         preferred_version: Default::default(),
     }
@@ -1042,6 +1043,7 @@ fn build_test_handoff(
         lifecycle_dispatcher_handle,
         holdings: std::collections::HashSet::new(),
         reconnector: None,
+        upload_action: None,
         graceful_abort_trigger: None,
         respawn_provider: None,
         job_ledger: None,
@@ -1874,6 +1876,7 @@ async fn lost_visibility_drives_tunnel_reconnect_with_roster() {
                     lifecycle_dispatcher_handle: lifecycle_dispatcher,
                     holdings: std::collections::HashSet::new(),
                     reconnector: Some(reconnector.clone()),
+                    upload_action: None,
                     graceful_abort_trigger: None,
                     respawn_provider: None,
                     job_ledger: None,
@@ -2677,6 +2680,7 @@ fn observer_with_ledger(
         lifecycle_dispatcher_handle: lifecycle_dispatcher,
         holdings: std::collections::HashSet::new(),
         reconnector: None,
+        upload_action: None,
         graceful_abort_trigger: None,
         respawn_provider: None,
         job_ledger: Some(probe),
@@ -2805,6 +2809,7 @@ async fn one_empty_then_jobs_reappear_renders_no_verdict() {
                     lifecycle_dispatcher_handle: lifecycle_dispatcher,
                     holdings: std::collections::HashSet::new(),
                     reconnector: None,
+                    upload_action: None,
                     graceful_abort_trigger: None,
                     respawn_provider: None,
                     job_ledger: Some(probe.clone()),
@@ -2948,6 +2953,7 @@ async fn clean_run_complete_is_not_reclassified_by_the_ledger_consult() {
                     lifecycle_dispatcher_handle: lifecycle_dispatcher,
                     holdings: std::collections::HashSet::new(),
                     reconnector: None,
+                    upload_action: None,
                     graceful_abort_trigger: None,
                     respawn_provider: None,
                     job_ledger: Some(probe.clone()),
@@ -3106,4 +3112,104 @@ async fn gossip_fed_observer_without_primary_keepalives_is_not_connection_lost()
     })
     .await
     .expect("test must terminate");
+}
+
+// ── #336 P1: the observer twin executes an upload setup task + reports ──
+
+/// A stub `UploadAction` for the observer-twin test: counts calls, returns a
+/// fixed result. The trait is `Send + Sync`, so the stub uses an atomic
+/// counter rather than a `RefCell`.
+struct ObsStubUploader {
+    calls: std::sync::atomic::AtomicUsize,
+    result: Result<(), crate::upload_action::UploadError>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::upload_action::UploadAction for ObsStubUploader {
+    async fn upload(
+        &self,
+        _file: &dynrunner_core::UploadFileRef,
+    ) -> Result<(), crate::upload_action::UploadError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.result.clone()
+    }
+}
+
+/// A `Setup`-kind UPLOAD task in `phase`, carrying an upload-file ref.
+fn upload_setup(phase: &str, id: &str, source: &str) -> TaskInfo<TestId> {
+    let mut t = task(phase, id, &[]);
+    t.kind = dynrunner_core::TaskKind::Setup;
+    t.setup_affinity = Some("obs".to_string());
+    t.upload_file = Some(Box::new(dynrunner_core::UploadFileRef {
+        source: std::path::PathBuf::from(source),
+        dest: None,
+    }));
+    t
+}
+
+/// OBSERVER TWIN — an assigned upload setup task is executed IN-PROCESS on
+/// the observer (the relocated submitter holds the source files), the
+/// registered upload action fires, and the observer reports a
+/// `SetupTerminal { success: true }` to the recognized primary. This is the
+/// relocation-safe path: the submitter→observer uploads regardless of who is
+/// primary; the primary originates the authoritative terminal.
+#[tokio::test(flavor = "current_thread")]
+async fn observer_twin_executes_upload_and_reports_success() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _inbound, mut peers) = transport_with_peers("obs", 1);
+            let mut cs = ClusterState::<TestId>::new();
+            // The recognized primary is the wired peer (the terminal sink).
+            cs.apply(ClusterMutation::PrimaryChanged {
+                new: "peer-0".into(),
+                epoch: 1,
+                reason: PrimaryChangeReason::Election,
+            });
+            // Seed the upload setup task in the local replicated ledger (the
+            // `add` helper keys by task_id, so the hash == "up-obs").
+            let up = upload_setup("work", "up-obs", "/src/toolchain.tar");
+            add(&mut cs, &up);
+
+            let (client, inbox, pump) = observer_mesh(transport, "obs");
+            tokio::task::spawn_local(pump);
+            let mut observer =
+                ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
+            let uploader = std::sync::Arc::new(ObsStubUploader {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                result: Ok(()),
+            });
+            observer.set_upload_action(uploader.clone());
+
+            // Drive the assignment exactly as the inbound router does.
+            observer.execute_setup_assignment("up-obs".to_string()).await;
+            // Let the pump drain the queued egress onto the wire.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            assert_eq!(
+                uploader.calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the observer twin invoked the upload action for the assigned task"
+            );
+            let frame = peers[0]
+                .try_recv()
+                .expect("the observer reports a SetupTerminal to the primary");
+            match frame {
+                DistributedMessage::SetupTerminal {
+                    task_hash,
+                    success,
+                    target,
+                    ..
+                } => {
+                    assert_eq!(task_hash, "up-obs");
+                    assert!(success, "a clean upload reports success");
+                    assert!(
+                        matches!(target, Some(Destination::Primary)),
+                        "the terminal is stamped Destination::Primary, got {target:?}"
+                    );
+                }
+                other => panic!("expected SetupTerminal, got {other:?}"),
+            }
+        })
+        .await;
 }

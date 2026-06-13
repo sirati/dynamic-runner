@@ -74,6 +74,7 @@ mod tests {
             setup_affinity: None,
             preferred_secondaries: SoftPreferredSecondaries::default(),
             preferred_version: Default::default(),
+            upload_file: None,
             resolved_path: None,
         }
     }

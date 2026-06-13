@@ -23,6 +23,7 @@ pub(crate) mod warn_throttle;
 pub mod secondary;
 pub mod setup_exec;
 pub mod state;
+pub mod upload_action;
 pub mod task_completed;
 pub mod worker_messages;
 pub mod worker_signal;
@@ -70,3 +71,6 @@ pub use observer::{
     SharedSnapshotSource, StatsSnapshot, TokioClock, TunnelReconnector, attach_observer_announcer,
     run_observer_announcer, run_reporter,
 };
+// Re-export the upload-action port (#336 P1) for the PyO3 binding + consumer
+// wire-up — same one-import-path convenience as `TunnelReconnector`.
+pub use upload_action::{UploadAction, UploadActionHandle, UploadError};

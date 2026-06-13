@@ -29,7 +29,7 @@ use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{Destination, DistributedMessage, timestamp_now};
 
 use crate::observer::coordinator::ObserverCoordinator;
-use crate::setup_exec::{SetupOutcome, execute_setup, run_setup_action};
+use crate::setup_exec::{SetupOutcome, execute_setup_with_upload};
 
 impl<I: Identifier> ObserverCoordinator<I> {
     /// Execute an assigned setup task IN-PROCESS on the observer and report
@@ -43,11 +43,17 @@ impl<I: Identifier> ObserverCoordinator<I> {
     /// hash absent from the local ledger is reported as a non-recoverable
     /// FAILURE so the primary settles it rather than leaving it in flight.
     pub(crate) async fn execute_setup_assignment(&mut self, task_hash: String) {
-        let outcome = match self.cluster_state().task_state(&task_hash) {
-            Some(state) => {
-                let task = state.task().clone();
-                execute_setup(&task, run_setup_action)
-            }
+        // Resolve + CLONE the task out of the ledger so the `cluster_state`
+        // borrow ends before the (async) upload path runs against
+        // `self.upload_action()`.
+        let task = self
+            .cluster_state()
+            .task_state(&task_hash)
+            .map(|state| state.task().clone());
+        let outcome = match task {
+            // The shared executor path (#336 P1): an upload-ref task uploads
+            // via the registered action; a no-ref task keeps the #489 no-op.
+            Some(task) => execute_setup_with_upload(&task, self.upload_action()).await,
             None => {
                 tracing::warn!(
                     target: "dynrunner_setup",

@@ -52,6 +52,7 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
             preferred_version: Default::default(),
             kind: Default::default(),
             setup_affinity: None,
+            upload_file: None,
             resolved_path: None,
         },
         version: Default::default(),
@@ -484,6 +485,7 @@ fn make_relative_path_binary(name: &str) -> TaskInfo<TestId> {
         preferred_version: Default::default(),
         kind: Default::default(),
         setup_affinity: None,
+        upload_file: None,
         resolved_path: None,
     }
 }
