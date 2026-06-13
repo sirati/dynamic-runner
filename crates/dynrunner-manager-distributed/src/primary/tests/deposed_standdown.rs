@@ -16,7 +16,7 @@
 //!   and ingesting a higher-epoch snapshot fires the BUG-6 demote signal;
 //! - a primary that observes the replicated `RunAborted` latch STANDS
 //!   DOWN: it adopts the verdict (non-zero, the abort reason) and never
-//!   authors `RunComplete` / "primary finished";
+//!   authors `RunComplete` / "run complete:";
 //! - a primary that loses primary RECOGNITION (the CRDT register names
 //!   another holder at a higher epoch) must not author ANY clean verdict
 //!   at run end — the exit is a structured `Deposed`, not rc=0.
@@ -111,7 +111,7 @@ async fn cluster_snapshot_reply_is_ingested_and_fires_demote() {
 /// verdict (here: present before the operational loop entered — the
 /// snapshot-carried / zombie-heard-late shape) must STAND DOWN: adopt the
 /// verdict as a structured non-zero exit, author NO `RunComplete`, and
-/// never log "primary finished". Production: the deposed epoch-2 primary
+/// never log "run complete:". Production: the deposed epoch-2 primary
 /// ran 2 more minutes and exited rc=0 with divergent totals.
 #[tokio::test(flavor = "current_thread")]
 async fn replicated_abort_verdict_stands_primary_down_without_clean_finish() {
@@ -201,7 +201,7 @@ async fn replicated_abort_verdict_stands_primary_down_without_clean_finish() {
 /// A primary that loses primary RECOGNITION mid-run (the replicated
 /// register adopts a higher-epoch holder — here learned only at the very
 /// end, the dead-leg-starved production shape) must NOT author a clean
-/// verdict at run end: no `RunComplete`, no "primary finished" — a
+/// verdict at run end: no `RunComplete`, no "run complete:" — a
 /// structured `Deposed` exit instead. Production: the deposed epoch-2
 /// primary exited rc=0 with `primary finished succeeded=165 fail_final=108`
 /// against the cluster's 153/120 abort verdict.
