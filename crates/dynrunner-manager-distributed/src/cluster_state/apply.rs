@@ -84,6 +84,14 @@ impl<I: Identifier> ClusterState<I> {
         self.invalidate_digest_cache();
         match m {
             ClusterMutation::TaskAdded { hash, task } => {
+                // Occupied means occupied in the LOGICAL ledger: a SETTLED
+                // entry (fat body spilled to disk) is still this hash's
+                // ledger entry, and a re-delivered TaskAdded must NoOp
+                // against it exactly as against a fat occupied slot — a
+                // vacant-insert here would resurrect a terminal to Pending.
+                if self.settled_contains(&hash) {
+                    return ApplyOutcome::NoOp;
+                }
                 if let std::collections::hash_map::Entry::Vacant(e) = self.tasks.entry(hash) {
                     e.insert(TaskState::Pending {
                         task,
@@ -115,7 +123,15 @@ impl<I: Identifier> ClusterState<I> {
                 // assignment for the retried generation out-ranks the
                 // `TaskRetried` reset and a stale lower-attempt assignment
                 // loses.
-                let Some(state) = self.tasks.get(&hash) else {
+                //
+                // The lookup consults the settled index via a PROBE key
+                // (built from the mutation's scalar fields by the same
+                // constructors `task_join_key` uses): a dominated settled
+                // entry NoOps right here; a dominating assignment (the
+                // out-of-order post-retry re-assignment) rehydrates the fat
+                // body first so the candidate carries the true `TaskInfo`.
+                let probe = super::merge::key_in_flight(attempt, version);
+                let Some(state) = self.task_entry_unsettling(&hash, &probe) else {
                     return ApplyOutcome::NoOp;
                 };
                 let task = state.task().clone();
@@ -145,7 +161,13 @@ impl<I: Identifier> ClusterState<I> {
                 // event) are all owned by `merge_task_state`. The `attempt`
                 // (F2) is carried onto the `Completed` so the completion
                 // preserves the generation it completed under.
-                let Some(state) = self.tasks.get(&hash) else {
+                //
+                // Settled consult via probe key: a late duplicate against a
+                // settled terminal NoOps; a genuinely dominating completion
+                // (e.g. the retry-pass success superseding a settled
+                // Failed-final in a failover race) rehydrates first.
+                let probe = super::merge::key_completed(attempt);
+                let Some(state) = self.task_entry_unsettling(&hash, &probe) else {
                     return ApplyOutcome::NoOp;
                 };
                 let task = state.task().clone();
@@ -175,7 +197,16 @@ impl<I: Identifier> ClusterState<I> {
                 //   * a higher-version re-failure WINS (B1 re-failure emit
                 //     cadence), an idempotent same-version re-delivery
                 //     NoOps (no double-count).
-                let Some(state) = self.tasks.get(&hash) else {
+                //
+                // Settled consult via probe key (mirrors the arm's own
+                // ErrorType → discrete-variant translation): a late
+                // duplicate against a settled terminal NoOps; a dominating
+                // failure (an incoming InvalidTask over a settled Completed
+                // — the D-T flip — or a higher-version re-failure over a
+                // settled Failed-final) rehydrates first.
+                let probe =
+                    super::merge::probe_key_for_failed_mutation(&kind, &error, version, attempt);
+                let Some(state) = self.task_entry_unsettling(&hash, &probe) else {
                     return ApplyOutcome::NoOp;
                 };
                 let task = state.task().clone();
@@ -490,6 +521,20 @@ impl<I: Identifier> ClusterState<I> {
                 attempt,
                 version,
             } => {
+                // Settled consult via probe key: the bumped `attempt` is
+                // the TOP of the join key, so a reset against a settled
+                // `Failed`-final REHYDRATES it (attempt n+1 dominates
+                // attempt n across the band boundary) and the `Failed`-only
+                // gate below then applies exactly as on a fat entry. A
+                // reset whose probe does NOT dominate the settled entry is
+                // a stale redelivery and NoOps. (The retry buckets never
+                // TARGET a settle-eligible kind — Recoverable/OOM stay fat
+                // — so this arm's rehydrate is the defensive lattice path,
+                // not a steady-state cost.)
+                let probe = super::merge::key_pending(attempt, version);
+                if self.task_entry_unsettling(&hash, &probe).is_none() {
+                    return ApplyOutcome::NoOp;
+                }
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };

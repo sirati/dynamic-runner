@@ -460,6 +460,13 @@ impl<I: Identifier> ClusterState<I> {
     /// tests and any in-memory capture; the WIRE transfer is the
     /// package stream (see `cluster_state::stream`), never one
     /// monolithic serialization of this value.
+    ///
+    /// FAT entries only: a SETTLED (spilled) entry's body lives in the
+    /// node-local spill file and is deliberately NOT rehydrated here —
+    /// the stream serves settled entries per-key from the file, and the
+    /// promotion capture (the one production caller) pairs this with
+    /// the settled-base handover (`settled_base_clone`), which IS the
+    /// settled half of the seed.
     pub fn snapshot(&self) -> ClusterStateSnapshot<I> {
         let mut snap = self.stream_head();
         snap.tasks = self.tasks.clone();
@@ -557,6 +564,14 @@ impl<I: Identifier> ClusterState<I> {
             // their own and never cross the wire.
             digest_cache: _digest_cache,
             digest_fold_count: _digest_fold_count,
+            // ── task-batch partition, file-served ──: a settled entry is
+            // a `tasks` ledger entry whose fat body lives in the spill
+            // file; the snapshot STREAM serves it per-key from the file
+            // (`settled_record`) inside the same task-batch packages.
+            // `snapshot()` (the in-memory capture) carries fat entries
+            // only — its production caller (the promotion signal) pairs
+            // it with the settled-base handover (`settled_base_clone`).
+            settled: _settled,
         } = self;
         ClusterStateSnapshot {
             // Task-batch partition — empty in the head; the stream's

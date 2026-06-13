@@ -28,6 +28,7 @@ const ARM_PANIK: usize = 9;
 const ARM_GRACEFUL_ABORT: usize = 10;
 const ARM_TASK_BACKOFF: usize = 11;
 const ARM_SNAPSHOT_STREAM: usize = 12;
+const ARM_SETTLED_SPILL: usize = 13;
 
 /// Arm names, index-aligned with the `ARM_*` ids above. The render order of
 /// the compact stats line.
@@ -45,6 +46,7 @@ const OP_LOOP_ARM_NAMES: &[&str] = &[
     "graceful_abort",
     "task_backoff",
     "snapshot_stream",
+    "settled_spill",
 ];
 
 /// Render a drain-by-`MessageType` tally as a single diagnostic string:
@@ -769,6 +771,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         );
                         self.snapshot_streams.abort_stream(&stream_id);
                     }
+                }
+                event = self.settled_spill.next_event() => {
+                    arm_stats.record(ARM_SETTLED_SPILL);
+                    // Settled-CRDT spill arm: cadence sweep (collect a
+                    // batch of join-fixed-point entries, kick ONE
+                    // spawn_blocking write) or a write completion
+                    // (commit: evict fat bodies into the slim index).
+                    // Cancel-safe (interval tick / mpsc recv); bounded
+                    // per-wakeup work (one batch clone or one receipt).
+                    self.settled_spill.handle(event, &mut self.cluster_state);
                 }
                 _ = heartbeat_tick.tick() => {
                     arm_stats.record(ARM_HEARTBEAT);

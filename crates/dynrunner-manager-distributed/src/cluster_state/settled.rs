@@ -1,0 +1,780 @@
+//! Settled-entry disk spill: node-local storage backend for the JOIN
+//! FIXED-POINT slice of the replicated task ledger.
+//!
+//! Single concern: WHERE a settled task's fat body lives (the
+//! append-only spill file + the slim in-memory index) and the algebra
+//! that keeps the `ClusterState` reads/merges/digest byte-identical to
+//! the all-in-memory state. WHEN batches are written (the cadence, the
+//! `spawn_blocking` write, the degrade policy) is the
+//! [`crate::settled_spill`] driver's concern.
+//!
+//! # Settlement criterion (formal)
+//!
+//! An entry is SETTLED when it is a join fixed-point: merging any
+//! REACHABLE input yields itself. Derived against the `TaskJoinKey`
+//! lattice + the originator gates:
+//!
+//! * `Completed` — the strongest reachable terminal. `InvalidTask`
+//!   out-ranks it within an attempt (D-T), but an `InvalidTask` is only
+//!   originated at injection-validation time, before dispatch — a task
+//!   that completed was dispatched, so no InvalidTask origination
+//!   exists for its hash. A higher attempt is only minted by
+//!   `TaskRetried`, whose F2-β gate is `Failed`-only.
+//! * `SkippedAlreadyDone` — the WEAKEST terminal by rank, but a skip is
+//!   never dispatched, so no real outcome is ever originated for it.
+//! * `InvalidTask` — the unique TOP within an attempt; non-reinjectable,
+//!   never retried (no bucket targets it).
+//! * `Failed` with a kind NO retry bucket matches
+//!   ([`BucketKind::matches`] is the ONE policy source): `Recoverable`
+//!   (the retry bucket) and `ResourceExhausted("memory")` (the OOM
+//!   bucket) stay FAT — a `TaskRetried` reset reaches them; every other
+//!   kind is final.
+//!
+//! NOT settled: `Pending` / `InFlight` / `Blocked` (live), and
+//! `Unfulfillable` (reinjectable via `TaskReinjected`).
+//!
+//! The criterion is an OPTIMIZATION, not a correctness assumption: the
+//! settled consult in `merge_task_state` / the apply-arm probes compare
+//! the stored join key and REHYDRATE the fat body from the file when a
+//! lattice-allowed dominating input arrives anyway (the
+//! fixed-point-violation escape hatch), so convergence is unconditional.
+//!
+//! # Record framing
+//!
+//! One record = `u32-LE length prefix` + ciborium CBOR of
+//! [`SettledRecord`] `{ hash, state, outputs }` — one settled entry,
+//! self-contained (the co-keyed `TaskOutputs` ride inside so a record
+//! is the complete settled fact). Deliberately NOT byte-spliceable into
+//! a `#481` snapshot-stream package: a package payload is ONE CBOR
+//! `ClusterStateSnapshot` document whose `tasks` / `task_outputs` maps
+//! are serde-encoded containers with their own headers — splicing
+//! per-entry fragments would mean hand-rolled CBOR container assembly
+//! outside serde (fragile, bypasses the one codec). The stream instead
+//! DECODES a record from the file and re-encodes the package
+//! (`ClusterState::settled_record`): the memory win holds (no resident
+//! fat body — the decode is transient per package) and the wire format
+//! is unchanged, so receivers and resume cursors are untouched.
+//!
+//! # Concurrency protocol (one writer, lock-free readers)
+//!
+//! Settled candidates are collected ON-LOOP as clones
+//! ([`ClusterState::collect_spill_batch`] — the fat entry STAYS in the
+//! map while the write is in flight, so every on-loop reader keeps
+//! seeing it), written in one blocking batch
+//! ([`write_spill_batch`], run inside `spawn_blocking` by the driver),
+//! and only AFTER the flush is the committed offset published
+//! (`Release` store) and the receipt applied on-loop
+//! ([`ClusterState::commit_spill`] — evict + index). Readers hold their
+//! own `Arc<File>` (positionless `pread`) and never read past the
+//! committed offset, so no torn record is ever observable and no lock
+//! exists anywhere on the path. An entry that advanced between collect
+//! and commit fails the receipt's join-key check and is simply skipped
+//! (its on-disk record is dead bytes; the advanced state re-settles
+//! later if it reaches a new fixed-point).
+//!
+//! # Digest algebra
+//!
+//! Each committed entry's XOR contribution `hash_one((key,
+//! hashable_join_key(state)))` moves from the live fold into the
+//! settled accumulator — `digest()` folds `acc ⊕ fold(fat)`, which is
+//! BYTE-IDENTICAL to the full fold by XOR associativity (settle and
+//! unsettle are value-preserving moves; the differential test pins it).
+//!
+//! # Crash / restart
+//!
+//! The file is scratch: created with truncate on open, never reused by
+//! a respawned process (replicated state rebuilds via the bootstrap
+//! stream and the fresh process re-settles as entries arrive).
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskDep, TaskOutputs};
+use serde::{Deserialize, Serialize};
+
+use crate::primary::retry_bucket::BucketKind;
+
+use super::merge::{hashable_join_key, task_join_key, task_join_key_dominates};
+use super::types::TaskJoinKey;
+use super::{ClusterState, TaskState};
+
+/// Hash one hashable value — the same default-hasher fold `digest.rs` /
+/// `merge.rs` use (process-stable; cross-build stability not required).
+fn hash_one<H: std::hash::Hash>(value: H) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Compact terminal classification of a settled entry — exactly the
+/// projection every fat-body-free reader needs (outcome buckets, dep
+/// cascade classification, hydrate seeds). `FailedFinal` carries the
+/// `ErrorType` verbatim so the hydrate-time `failed_tasks` ledger and
+/// the `fail_oom`-vs-`fail_final` bucket split stay faithful.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SettledClass {
+    Completed,
+    SkippedAlreadyDone,
+    InvalidTask,
+    FailedFinal(ErrorType),
+}
+
+/// Slim in-memory index entry for one settled task: identity +
+/// classification + join key + file location. Retained fields, each
+/// justified by a production reader:
+///
+/// * `task_id` / `phase_id` — dep resolution (`task_hash_for_dep`),
+///   hydrate seeds, per-phase rollups/partitions, observer stats.
+/// * `task_depends_on` — the dispatch-time `inherit_outputs` ancestor
+///   walk (`predecessor_outputs`) reads a COMPLETED predecessor's dep
+///   edges; typically empty or a few edges.
+/// * `class` — outcome buckets, the CRDT-terminal settle path's
+///   classification, hydrate's per-class seeds.
+/// * `join_key` — the merge dominance consult + the broadcast
+///   choke-point's attempt stamp.
+/// * `digest_contribution` — the entry's XOR term, stored so unsettle
+///   subtracts exactly what commit added (XOR is self-inverse).
+/// * `segment` / `offset` / `len` — the record's location for the
+///   stream-from-file responder and the rehydrate escape hatch.
+///
+/// The small output VALUES dep-resolution / keyed-output /
+/// skip-existing lookups need stay in the existing `task_outputs` map
+/// (it already IS the hot hash-keyed index for them and is NOT evicted
+/// — the fat cost was the per-task `TaskInfo` payload, not the
+/// consumer-published key/value outputs).
+#[derive(Debug, Clone)]
+pub(crate) struct SettledEntry {
+    pub(crate) task_id: String,
+    pub(crate) phase_id: PhaseId,
+    pub(crate) task_depends_on: Vec<TaskDep>,
+    pub(crate) class: SettledClass,
+    pub(super) join_key: TaskJoinKey,
+    digest_contribution: u64,
+    pub(crate) segment: u32,
+    pub(crate) offset: u64,
+    pub(crate) len: u32,
+}
+
+impl SettledEntry {
+    /// The retry-attempt generation the settled state carried — read by
+    /// the broadcast choke point's attempt stamp.
+    pub(crate) fn attempt(&self) -> u32 {
+        self.join_key.attempt
+    }
+
+    /// Rough resident size of this index entry (the memory-pin seam —
+    /// a counting estimate, not an allocator measurement).
+    fn approx_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.task_id.capacity()
+            + self.phase_id.as_str().len()
+            + self
+                .task_depends_on
+                .iter()
+                .map(|d| {
+                    std::mem::size_of::<TaskDep>()
+                        + d.task_id.capacity()
+                        + d.phase_id.as_str().len()
+                })
+                .sum::<usize>()
+            + match &self.class {
+                SettledClass::FailedFinal(k) => std::mem::size_of_val(k),
+                _ => 0,
+            }
+    }
+}
+
+/// One spill-file segment: a read fd (`Arc<File>` — positionless
+/// `pread`, shareable across clones / the promoted-primary handover)
+/// plus the published committed offset readers must not read past.
+#[derive(Clone)]
+pub(crate) struct SettledSegment {
+    file: Arc<File>,
+    committed: Arc<AtomicU64>,
+}
+
+/// The settled store: slim index + segment table + the settled half of
+/// the digest's tasks fold. Owned by `ClusterState` as a NODE-LOCAL
+/// storage backend for replicated data: the index/accumulator are pure
+/// derivations of replicated entries (like the digest memo), the file
+/// is node-local scratch.
+///
+/// `pub` (not `pub(crate)`) because it crosses the promotion seam as a
+/// [`crate::process::PromotionSignal`] field / builder parameter — the
+/// pyo3 recipe threads it into the promoted primary opaquely
+/// (`adopt_settled_base`); every method stays `pub(crate)`.
+#[derive(Default)]
+pub struct SettledStore {
+    index: HashMap<String, SettledEntry>,
+    segments: Vec<SettledSegment>,
+    /// XOR accumulator over settled `(key, hashable_join_key)` terms —
+    /// `digest()` folds `acc ⊕ fold(fat)`.
+    tasks_hash_acc: u64,
+    /// The segment THIS instance's writer appends to; `None` on a
+    /// read-only adopted base (a clone, or before a writer attaches).
+    own_segment: Option<u32>,
+    /// Total records committed through this store (observability).
+    records_committed: u64,
+    /// Running estimate of resident index bytes (the memory-pin seam).
+    approx_index_bytes: usize,
+}
+
+/// `Clone` IS the read-only clone ([`SettledStore::clone_read_only`]):
+/// the index + shared read fds carry over; the writer affiliation is
+/// dropped (one-writer rule). Required so the `PromotionSignal` that
+/// carries a settled base stays `Clone` for test fixtures.
+impl Clone for SettledStore {
+    fn clone(&self) -> Self {
+        self.clone_read_only()
+    }
+}
+
+impl std::fmt::Debug for SettledStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettledStore")
+            .field("index", &self.index.len())
+            .field("segments", &self.segments.len())
+            .field("own_segment", &self.own_segment)
+            .field("records_committed", &self.records_committed)
+            .finish()
+    }
+}
+
+impl SettledStore {
+    /// An EMPTY settled base — no index entries, no segments. The
+    /// merge-neutral handover value: a `PromotedPrimaryBuilder` (or a
+    /// test fixture) with no settled slice to inherit installs this, and
+    /// the subsequent snapshot restore seeds a fully-fat ledger. `pub`
+    /// for the same reason as the type: it crosses the promotion seam.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Read-only clone of this store: the index + accumulator are
+    /// replicated-data derivations (a cloned replica keeps serving
+    /// settled reads through the shared `Arc<File>` segments), the
+    /// WRITER affiliation is node-local runtime state and is dropped
+    /// (one-writer rule: the clone never appends to the source's file;
+    /// its own driver may attach a fresh segment).
+    pub(crate) fn clone_read_only(&self) -> Self {
+        Self {
+            index: self.index.clone(),
+            segments: self.segments.clone(),
+            tasks_hash_acc: self.tasks_hash_acc,
+            own_segment: None,
+            records_committed: self.records_committed,
+            approx_index_bytes: self.approx_index_bytes,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    pub(crate) fn contains(&self, hash: &str) -> bool {
+        self.index.contains_key(hash)
+    }
+
+    pub(crate) fn get(&self, hash: &str) -> Option<&SettledEntry> {
+        self.index.get(hash)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &SettledEntry)> {
+        self.index.iter()
+    }
+
+    pub(super) fn tasks_hash_acc(&self) -> u64 {
+        self.tasks_hash_acc
+    }
+
+    pub(crate) fn records_committed(&self) -> u64 {
+        self.records_committed
+    }
+
+    pub(crate) fn approx_index_bytes(&self) -> usize {
+        self.approx_index_bytes
+    }
+
+    /// Whether a writer segment is attached (the sweep collects only
+    /// when there is somewhere durable to put the batch).
+    pub(crate) fn has_writer(&self) -> bool {
+        self.own_segment.is_some()
+    }
+
+    /// The writer segment's id, if one is attached (the driver stamps
+    /// it onto receipts).
+    pub(crate) fn writer_segment_id(&self) -> Option<u32> {
+        self.own_segment
+    }
+
+    /// The writer segment's committed-offset cell, if one is attached
+    /// (the driver re-arms its writer half around it after each batch).
+    pub(crate) fn writer_committed_cell(&self) -> Option<Arc<AtomicU64>> {
+        self.own_segment
+            .map(|id| Arc::clone(&self.segments[id as usize].committed))
+    }
+
+    /// Total committed bytes across every segment backing this store
+    /// (observability: the spill-file footprint settled reads draw on).
+    pub(crate) fn committed_bytes(&self) -> u64 {
+        self.segments
+            .iter()
+            .map(|s| s.committed.load(Ordering::Acquire))
+            .sum()
+    }
+
+    /// Attach a segment (read fd + committed-offset cell) and make it
+    /// this store's writer target. Returns the segment id the driver
+    /// stamps onto its receipts.
+    pub(crate) fn attach_writer_segment(
+        &mut self,
+        file: Arc<File>,
+        committed: Arc<AtomicU64>,
+    ) -> u32 {
+        let id = self.segments.len() as u32;
+        self.segments.push(SettledSegment { file, committed });
+        self.own_segment = Some(id);
+        id
+    }
+
+    /// Read + decode one settled record. `None` on any failure (an
+    /// out-of-committed-range read, an IO error, a decode error) — the
+    /// caller treats the entry as unreadable and degrades loudly at its
+    /// own seam. Never reads past the segment's committed offset.
+    fn read_record<I: Identifier>(&self, entry: &SettledEntry) -> Option<SettledRecord<I>> {
+        let segment = self.segments.get(entry.segment as usize)?;
+        let committed = segment.committed.load(Ordering::Acquire);
+        let end = entry.offset.checked_add(u64::from(entry.len))?;
+        if end > committed {
+            // Index entries are only minted at commit (post-flush), so
+            // this is structurally unreachable for a coherent store;
+            // refuse rather than risk a torn read.
+            tracing::error!(
+                offset = entry.offset,
+                len = entry.len,
+                committed,
+                "settled-spill read past committed offset refused (index/commit incoherence)"
+            );
+            return None;
+        }
+        let mut buf = vec![0u8; entry.len as usize];
+        if let Err(e) = read_exact_at(&segment.file, &mut buf, entry.offset) {
+            tracing::error!(
+                error = %e,
+                offset = entry.offset,
+                len = entry.len,
+                "settled-spill record read failed"
+            );
+            return None;
+        }
+        // Strip the length prefix; the body is the CBOR record.
+        let body = buf.get(RECORD_PREFIX_LEN..)?;
+        match ciborium::from_reader(body) {
+            Ok(rec) => Some(rec),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    offset = entry.offset,
+                    "settled-spill record decode failed"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Positional read of the whole buffer at `offset` (Unix `pread` —
+/// `&File` is enough; no seek, so concurrent readers never interfere).
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+/// Bytes of the `u32`-LE length prefix in front of every record body.
+const RECORD_PREFIX_LEN: usize = 4;
+
+/// The on-disk record: one settled entry, self-contained (state + the
+/// co-keyed outputs). Serialized as CBOR behind a length prefix.
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
+pub(crate) struct SettledRecord<I> {
+    pub(crate) hash: String,
+    pub(crate) state: TaskState<I>,
+    pub(crate) outputs: Option<TaskOutputs>,
+}
+
+/// One collected spill candidate: a CLONE of the fat entry (the map
+/// keeps the original until commit) plus the join key the commit-time
+/// staleness check compares.
+pub(crate) struct SpillCandidate<I> {
+    pub(crate) hash: String,
+    pub(crate) state: TaskState<I>,
+    pub(crate) outputs: Option<TaskOutputs>,
+    // The join key the commit-time staleness check compares against —
+    // `pub(super)` so the `TaskJoinKey` (cluster_state-internal) never
+    // leaks past the module; the driver only moves candidates through.
+    pub(super) join_key: TaskJoinKey,
+}
+
+/// The receipt a completed blocking write hands back on-loop: where
+/// each record landed, stamped with the join key it was collected at.
+pub(crate) struct SpillReceipt {
+    pub(crate) segment: u32,
+    pub(crate) written: Vec<WrittenRecord>,
+}
+
+pub(crate) struct WrittenRecord {
+    pub(crate) hash: String,
+    // `pub(super)` — same `TaskJoinKey`-containment rationale as
+    // `SpillCandidate::join_key`.
+    pub(super) join_key: TaskJoinKey,
+    pub(crate) offset: u64,
+    pub(crate) len: u32,
+}
+
+/// Append `batch` to `file` (the writer's OWN fd, positioned at
+/// `start_offset`), flush, then publish the new committed offset
+/// (`Release` — pairs with readers' `Acquire`). Pure blocking IO +
+/// encode; the driver runs it inside `spawn_blocking`. On error the
+/// committed offset is NOT advanced (whatever partial bytes landed
+/// past it are invisible to every reader) and the caller degrades.
+pub(crate) fn write_spill_batch<I: Identifier>(
+    file: &mut File,
+    start_offset: u64,
+    committed: &AtomicU64,
+    segment: u32,
+    batch: Vec<SpillCandidate<I>>,
+) -> std::io::Result<(SpillReceipt, u64)> {
+    let mut written = Vec::with_capacity(batch.len());
+    let mut buf: Vec<u8> = Vec::new();
+    let mut offset = start_offset;
+    for cand in batch {
+        buf.clear();
+        // Reserve the length prefix, encode the body behind it, then
+        // back-fill the prefix.
+        buf.extend_from_slice(&[0u8; RECORD_PREFIX_LEN]);
+        let record = SettledRecord {
+            hash: cand.hash.clone(),
+            state: cand.state,
+            outputs: cand.outputs,
+        };
+        ciborium::into_writer(&record, &mut buf)
+            .map_err(|e| std::io::Error::other(format!("settled record encode: {e}")))?;
+        let body_len = (buf.len() - RECORD_PREFIX_LEN) as u32;
+        buf[..RECORD_PREFIX_LEN].copy_from_slice(&body_len.to_le_bytes());
+        file.write_all(&buf)?;
+        let len = buf.len() as u32;
+        written.push(WrittenRecord {
+            hash: cand.hash,
+            join_key: cand.join_key,
+            offset,
+            len,
+        });
+        offset += u64::from(len);
+    }
+    file.flush()?;
+    // Durable in the page cache (a spill, not a durability file — no
+    // fsync); publish so readers may now reach these records.
+    committed.store(offset, Ordering::Release);
+    Ok((SpillReceipt { segment, written }, offset))
+}
+
+/// Is `state` a join fixed-point (see the module doc)? The `Failed`
+/// arm derives finality from [`BucketKind::matches`] — the ONE retry
+/// policy source — so the settle predicate can never drift from what
+/// the retry buckets actually target.
+pub(crate) fn settle_eligible<I>(state: &TaskState<I>) -> bool {
+    match state {
+        TaskState::Completed { .. }
+        | TaskState::SkippedAlreadyDone { .. }
+        | TaskState::InvalidTask { .. } => true,
+        TaskState::Failed { kind, .. } => {
+            !BucketKind::Recoverable.matches(kind) && !BucketKind::Oom.matches(kind)
+        }
+        TaskState::Pending { .. }
+        | TaskState::InFlight { .. }
+        | TaskState::Blocked { .. }
+        | TaskState::Unfulfillable { .. } => false,
+    }
+}
+
+/// Project a settle-eligible state onto its [`SettledClass`]. `None`
+/// for a non-eligible state (callers gate on [`settle_eligible`]).
+fn settled_class_of<I>(state: &TaskState<I>) -> Option<SettledClass> {
+    match state {
+        TaskState::Completed { .. } => Some(SettledClass::Completed),
+        TaskState::SkippedAlreadyDone { .. } => Some(SettledClass::SkippedAlreadyDone),
+        TaskState::InvalidTask { .. } => Some(SettledClass::InvalidTask),
+        TaskState::Failed { kind, .. } if settle_eligible(state) => {
+            Some(SettledClass::FailedFinal(kind.clone()))
+        }
+        _ => None,
+    }
+}
+
+impl<I: Identifier> ClusterState<I> {
+    /// Whether `hash` is in the settled index (fat body on disk).
+    pub(crate) fn settled_contains(&self, hash: &str) -> bool {
+        self.settled.contains(hash)
+    }
+
+    /// Borrow `hash`'s settled index entry, if settled.
+    pub(crate) fn settled_entry(&self, hash: &str) -> Option<&SettledEntry> {
+        self.settled.get(hash)
+    }
+
+    /// Iterate the settled index: `(hash, slim entry)` for every entry
+    /// whose fat body lives on disk. The union of this and the fat
+    /// iterators is the full logical ledger.
+    pub(crate) fn settled_entries(&self) -> impl Iterator<Item = (&String, &SettledEntry)> {
+        self.settled.iter()
+    }
+
+    /// Borrow the settled store (driver / observability seam).
+    pub(crate) fn settled_store(&self) -> &SettledStore {
+        &self.settled
+    }
+
+    /// Attach the spill writer's segment (read fd + committed offset)
+    /// and return its id. Called once by the spill driver at enable
+    /// time; until then the store is empty/read-only and nothing
+    /// settles.
+    pub(crate) fn attach_spill_segment(&mut self, file: Arc<File>, committed: Arc<AtomicU64>) -> u32 {
+        self.settled.attach_writer_segment(file, committed)
+    }
+
+    /// Adopt a read-only settled base (promotion handover / the Clone
+    /// path): the donor's index + segments + accumulator become this
+    /// replica's settled view. Only legal while this state holds NO
+    /// settled entries of its own (the promoted primary installs the
+    /// base BEFORE restoring the donor snapshot); a non-empty local
+    /// store is a caller bug and panics in debug builds.
+    pub(crate) fn install_settled_base(&mut self, base: SettledStore) {
+        debug_assert!(
+            self.settled.is_empty(),
+            "install_settled_base on a state that already settled entries"
+        );
+        // Keep an already-attached writer segment functional: re-attach
+        // it after the base's segments. (Today the promoted-primary
+        // path installs the base before any writer attaches, so this is
+        // a defensive re-append, exercised by unit tests only.)
+        let own = self.settled.own_segment.map(|id| {
+            let seg = self.settled.segments[id as usize].clone();
+            (seg.file, seg.committed)
+        });
+        self.settled = base;
+        self.settled.own_segment = None;
+        if let Some((file, committed)) = own {
+            self.settled.attach_writer_segment(file, committed);
+        }
+    }
+
+    /// Clone this state's settled store read-only (the promotion
+    /// handover capture — see [`Self::install_settled_base`]).
+    pub(crate) fn settled_base_clone(&self) -> SettledStore {
+        self.settled.clone_read_only()
+    }
+
+    /// Collect up to `max_entries` settle-eligible fat entries as spill
+    /// candidates (CLONES — the fat map is untouched until
+    /// [`Self::commit_spill`]). Returns an empty batch when no writer
+    /// segment is attached. The scan is over the FAT map only (already-
+    /// settled entries are not in it), self-healing by construction:
+    /// anything missed this sweep is collected on the next.
+    pub(crate) fn collect_spill_batch(&self, max_entries: usize) -> Vec<SpillCandidate<I>> {
+        if !self.settled.has_writer() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (hash, state) in &self.tasks {
+            if out.len() >= max_entries {
+                break;
+            }
+            if !settle_eligible(state) {
+                continue;
+            }
+            out.push(SpillCandidate {
+                hash: hash.clone(),
+                state: state.clone(),
+                outputs: self.task_outputs.get(hash).cloned(),
+                join_key: task_join_key(state),
+            });
+        }
+        out
+    }
+
+    /// Apply a durable write receipt: for every record whose fat entry
+    /// STILL ranks at the collected join key, evict the fat body and
+    /// insert the slim index entry; an entry that advanced mid-write is
+    /// skipped (its record is dead bytes — it re-settles later if it
+    /// reaches a new fixed-point). Returns the number of entries
+    /// evicted.
+    ///
+    /// Digest-value-preserving: each eviction XORs the entry's term
+    /// into the settled accumulator at the same instant it leaves the
+    /// live fold, so `digest()` is unchanged — the memo is deliberately
+    /// NOT invalidated.
+    pub(crate) fn commit_spill(&mut self, receipt: SpillReceipt) -> usize {
+        let mut evicted = 0usize;
+        for rec in receipt.written {
+            let Some(state) = self.tasks.get(&rec.hash) else {
+                continue;
+            };
+            if task_join_key(state) != rec.join_key {
+                // Advanced between collect and commit (the lattice-
+                // allowed escape) — keep it fat.
+                continue;
+            }
+            let Some(class) = settled_class_of(state) else {
+                continue;
+            };
+            let task = state.task();
+            let entry = SettledEntry {
+                task_id: task.task_id.clone(),
+                phase_id: task.phase_id.clone(),
+                task_depends_on: task.task_depends_on.clone(),
+                class,
+                join_key: rec.join_key,
+                digest_contribution: hash_one((&rec.hash, hashable_join_key(state))),
+                segment: receipt.segment,
+                offset: rec.offset,
+                len: rec.len,
+            };
+            self.settled.tasks_hash_acc ^= entry.digest_contribution;
+            self.settled.approx_index_bytes += entry.approx_bytes();
+            self.settled.records_committed += 1;
+            self.settled.index.insert(rec.hash.clone(), entry);
+            self.tasks.remove(&rec.hash);
+            evicted += 1;
+        }
+        evicted
+    }
+
+    /// The fixed-point-violation escape hatch: if `incoming_key`
+    /// strictly dominates `hash`'s settled join key, rehydrate the fat
+    /// body from the spill file back into `tasks` (removing the index
+    /// entry and subtracting its digest term) and return `true` — the
+    /// caller then proceeds exactly as if the entry had always been
+    /// fat. `false` when the settled entry dominates (the common late
+    /// duplicate → NoOp) or the record is unreadable (logged loudly;
+    /// refusing keeps the settled fact — other replicas still hold the
+    /// data, anti-entropy converges them).
+    pub(super) fn unsettle_if_dominated(&mut self, hash: &str, incoming_key: &TaskJoinKey) -> bool {
+        let Some(entry) = self.settled.get(hash) else {
+            return false;
+        };
+        if !task_join_key_dominates(incoming_key, &entry.join_key) {
+            return false;
+        }
+        let Some(record) = self.settled.read_record::<I>(entry) else {
+            tracing::error!(
+                hash,
+                "settled entry dominated by an incoming mutation but its spill \
+                 record is unreadable; keeping the settled fact (convergence \
+                 for this hash defers to anti-entropy against other replicas)"
+            );
+            return false;
+        };
+        tracing::debug!(
+            hash,
+            "settled entry rehydrated: an incoming mutation dominates its \
+             join fixed-point (lattice escape hatch)"
+        );
+        let entry = self
+            .settled
+            .index
+            .remove(hash)
+            .expect("checked present above");
+        self.settled.tasks_hash_acc ^= entry.digest_contribution;
+        self.settled.approx_index_bytes = self
+            .settled
+            .approx_index_bytes
+            .saturating_sub(entry.approx_bytes());
+        // The outputs never left the in-memory map, so only the task
+        // state is reinstated.
+        self.tasks.insert(hash.to_string(), record.state);
+        true
+    }
+
+    /// Read + decode `hash`'s settled record from the spill file — the
+    /// stream-from-file responder's per-entry read. `None` when the
+    /// hash is not settled or the record is unreadable (the package
+    /// build then skips it exactly like a vanished key; the receiver
+    /// converges through anti-entropy).
+    pub(crate) fn settled_record(&self, hash: &str) -> Option<(TaskState<I>, Option<TaskOutputs>)> {
+        let entry = self.settled.get(hash)?;
+        let record = self.settled.read_record::<I>(entry)?;
+        Some((record.state, record.outputs))
+    }
+
+    /// Apply-arm lookup that consults the settled index: a fat entry is
+    /// returned as-is; a settled entry whose stored key `incoming_key`
+    /// strictly dominates is rehydrated first; a dominating settled
+    /// entry (the common late duplicate) returns `None` — exactly the
+    /// NoOp the arm's absent-slot path takes.
+    pub(super) fn task_entry_unsettling(
+        &mut self,
+        hash: &str,
+        incoming_key: &TaskJoinKey,
+    ) -> Option<&TaskState<I>> {
+        if !self.tasks.contains_key(hash) {
+            self.unsettle_if_dominated(hash, incoming_key);
+        }
+        self.tasks.get(hash)
+    }
+
+    /// Test-only: attach a writer segment over a freshly-truncated spill
+    /// file at `path` (the same shape the production driver opens), then
+    /// synchronously run ONE full collect → blocking write+flush →
+    /// commit sweep. Returns the count of entries evicted. The committed
+    /// offset is a per-call cell so a reader opened against `path` sees
+    /// exactly the flushed bytes. Drives the protocol end-to-end without
+    /// the tokio driver.
+    #[cfg(test)]
+    pub(crate) fn test_spill_all(&mut self, path: &std::path::Path) -> usize {
+        if !self.settled.has_writer() {
+            // Truncate-create the file (drop the write handle immediately —
+            // the sweep below reopens its own append fd), then attach a
+            // dedicated read fd as the segment.
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .expect("test spill file open");
+            let read_fd = File::open(path).expect("test spill read fd");
+            let committed = Arc::new(AtomicU64::new(0));
+            self.attach_spill_segment(Arc::new(read_fd), committed);
+        }
+        let segment = self.settled.writer_segment_id().expect("writer attached");
+        let committed = self
+            .settled
+            .writer_committed_cell()
+            .expect("writer attached");
+        let start = committed.load(Ordering::Acquire);
+        let batch = self.collect_spill_batch(usize::MAX);
+        if batch.is_empty() {
+            return 0;
+        }
+        let mut write_fd = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("test spill reopen");
+        use std::io::Seek as _;
+        write_fd
+            .seek(std::io::SeekFrom::Start(start))
+            .expect("seek to append offset");
+        let (receipt, _new_offset) =
+            write_spill_batch(&mut write_fd, start, &committed, segment, batch)
+                .expect("test spill write");
+        self.commit_spill(receipt)
+    }
+}

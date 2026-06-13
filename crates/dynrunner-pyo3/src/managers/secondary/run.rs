@@ -1371,7 +1371,7 @@ pub(crate) fn build_promoted_primary_recipe(
     // this node's OWN local producer on the GIL thread and captured by value;
     // they are NOT read off the `InitialAssignment`-fed cell (a relocate-target
     // has no `InitialAssignment` before promotion — its cell is at `Default`).
-    Box::new(move |client, inbox, demote_rx, snapshot| {
+    Box::new(move |client, inbox, demote_rx, snapshot, settled_base| {
         let config = PrimaryConfig {
             node_id: secondary_id.clone(),
             keepalive_interval,
@@ -1536,6 +1536,12 @@ pub(crate) fn build_promoted_primary_recipe(
         // secondary's. The cell is a cheap `Arc`-backed clone (the recipe fires
         // once, but `clone()` keeps the `FnMut` move-free). Observation-only.
         primary.set_op_loop_arm_stats_cell(op_loop_arm_stats_cell.clone());
+        // Install the inherited settled-CRDT base FIRST: the promoting
+        // host's slim index + read fds onto its spill file become this
+        // primary's settled base, so the join-fixed-point ledger slice is
+        // adopted without replaying fat bodies. MUST precede the snapshot
+        // restore (which merges the disjoint fat half over it).
+        primary.adopt_settled_base(settled_base);
         // Seed from the promoting host's converged snapshot (NORMAL pre-`run`
         // construction input — not a `run_activated` resume, which is gone):
         // restore the ledger + rebuild the derived pool/roster caches, then
@@ -2570,7 +2576,13 @@ task = Task()
                     dynrunner_manager_distributed::oploop_instrumentation::OpLoopArmStatsCell::new(),
             });
 
-            let mut built = recipe(client, inbox, demote_rx, snapshot);
+            let mut built = recipe(
+                client,
+                inbox,
+                demote_rx,
+                snapshot,
+                dynrunner_manager_distributed::SettledStore::empty(),
+            );
             // Keep the slot alive for the coordinator's lifetime.
             let _slot = slot;
 
@@ -2672,7 +2684,13 @@ task = Task()
                     dynrunner_manager_distributed::oploop_instrumentation::OpLoopArmStatsCell::new(),
             });
 
-            let built = recipe(client, inbox, demote_rx, snapshot);
+            let built = recipe(
+                client,
+                inbox,
+                demote_rx,
+                snapshot,
+                dynrunner_manager_distributed::SettledStore::empty(),
+            );
             let _slot = slot;
 
             let calls = module.getattr("on_run_start_calls").unwrap();
@@ -2774,7 +2792,13 @@ task = Task()
                     dynrunner_manager_distributed::oploop_instrumentation::OpLoopArmStatsCell::new(),
             });
 
-            let built = recipe(client, inbox, demote_rx, snapshot);
+            let built = recipe(
+                client,
+                inbox,
+                demote_rx,
+                snapshot,
+                dynrunner_manager_distributed::SettledStore::empty(),
+            );
             let _slot = slot;
 
             // The hook fired (and raised) once.

@@ -34,6 +34,7 @@ mod respawn_ledger;
 mod role_table;
 mod run_aborted;
 mod secondary_capacity;
+mod settled;
 mod snapshot;
 mod stream;
 mod task_outputs;

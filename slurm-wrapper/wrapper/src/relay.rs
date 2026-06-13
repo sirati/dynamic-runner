@@ -521,6 +521,7 @@ mod tests {
             src_tmp: dir.join("src"),
             out_tmp: dir.join("out"),
             log_tmp: dir.join("log"),
+            work_tmp: dir.join("work"),
             podman_storage: dir.join("storage"),
             podman_run: dir.join("run"),
             socket_dir: socket_dir.clone(),

@@ -56,10 +56,18 @@ where
 
     // The caller's recipe builds + snapshot-seeds the primary from the
     // converged `cluster_state` the secondary captured ON the signal at the
-    // promotion-fire instant. The node only threads the snapshot through —
-    // the builder owns `seed_from_promotion_snapshot` + coordinator
-    // construction (scheduler/estimator are the caller's concern).
-    let mut built = builder(client, inbox, demote_rx, signal.snapshot);
+    // promotion-fire instant. The node only threads the snapshot (fat
+    // entries) AND the settled-CRDT base (join-fixed-point slice, inherited
+    // from the promoting host's spill index without replay) through — the
+    // builder owns `adopt_settled_base` + `seed_from_promotion_snapshot` +
+    // coordinator construction (scheduler/estimator are the caller's concern).
+    let mut built = builder(
+        client,
+        inbox,
+        demote_rx,
+        signal.snapshot,
+        signal.settled_base,
+    );
     built.coordinator.register_demote_on_displaced(demote_tx);
 
     let (tx, rx) = oneshot::channel();

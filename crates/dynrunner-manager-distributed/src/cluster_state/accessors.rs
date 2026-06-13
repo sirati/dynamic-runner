@@ -13,19 +13,91 @@ use std::sync::Arc;
 use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, TaskOutputs, WorkerId};
 use dynrunner_protocol_primary_secondary::{DiscoveryDebt, RoleTable, SecondaryCapacityRecord};
 
+use super::settled::{SettledClass, SettledEntry};
 use super::{
     ClusterState, OutcomeSummary, PeerReadmission, PhaseRollup, PhaseTaskPartition, StateCounts,
     TaskState,
 };
 
+/// One LOGICAL ledger entry, wherever its body lives: a fat in-memory
+/// `TaskState` or a settled (spilled) entry's slim index view. The read
+/// shape for callers that ask presence / terminality / identity
+/// questions about an arbitrary hash — exactly the questions a settled
+/// entry can answer without touching the disk.
+#[derive(Debug)]
+pub(crate) enum TaskView<'a, I> {
+    Live(&'a TaskState<I>),
+    Settled(&'a SettledEntry),
+}
+
+impl<I> TaskView<'_, I> {
+    /// Terminal for dependency-resolution / phase-completion purposes —
+    /// a settled entry is terminal by construction (only join
+    /// fixed-point terminals settle).
+    pub(crate) fn is_terminal(&self) -> bool {
+        match self {
+            TaskView::Live(state) => state.is_terminal(),
+            TaskView::Settled(_) => true,
+        }
+    }
+
+    pub(crate) fn task_id(&self) -> &str {
+        match self {
+            TaskView::Live(state) => &state.task().task_id,
+            TaskView::Settled(entry) => &entry.task_id,
+        }
+    }
+
+    pub(crate) fn phase_id(&self) -> &PhaseId {
+        match self {
+            TaskView::Live(state) => &state.task().phase_id,
+            TaskView::Settled(entry) => &entry.phase_id,
+        }
+    }
+
+    /// The retry-attempt generation (F2) — the broadcast choke point's
+    /// attempt stamp reads this so a copy-current mutation for a
+    /// settled hash stamps the true generation, not a cold 0.
+    pub(crate) fn attempt(&self) -> u32 {
+        match self {
+            TaskView::Live(state) => state.attempt(),
+            TaskView::Settled(entry) => entry.attempt(),
+        }
+    }
+}
+
 impl<I: Identifier> ClusterState<I> {
+    /// Borrow the IN-MEMORY (fat) state for `hash`. A SETTLED entry —
+    /// fat body spilled to disk — returns `None` here: callers asking
+    /// presence / terminality / identity questions must use
+    /// [`Self::task_view`] / [`Self::contains_task`]; this accessor is
+    /// for the LIVE-state-specific reads (reinject's Unfulfillable
+    /// gate, the retry bucket's Failed gate, post-spawn classification
+    /// — states that are never settled).
     pub fn task_state(&self, hash: &str) -> Option<&TaskState<I>> {
         self.tasks.get(hash)
     }
 
-    /// Iterator over `(&hash, &TaskState)` for every entry in the
-    /// ledger. Used by post-promotion hydration that needs to make
-    /// state-dependent decisions per task (Pending → into pool;
+    /// Whether `hash` is a LOGICAL ledger entry — fat or settled.
+    pub fn contains_task(&self, hash: &str) -> bool {
+        self.tasks.contains_key(hash) || self.settled_contains(hash)
+    }
+
+    /// The logical-entry view for `hash`: the fat state, or the settled
+    /// slim view, or `None` for a hash the ledger does not know.
+    pub(crate) fn task_view(&self, hash: &str) -> Option<TaskView<'_, I>> {
+        if let Some(state) = self.tasks.get(hash) {
+            return Some(TaskView::Live(state));
+        }
+        self.settled_entry(hash).map(TaskView::Settled)
+    }
+
+    /// Iterator over `(&hash, &TaskState)` for every FAT (in-memory)
+    /// entry. A SETTLED entry's fat body lives in the spill file and is
+    /// NOT yielded — callers that need the full logical ledger pair
+    /// this with [`Self::settled_entries`] (the hydrate and observer
+    /// stats paths do). Used by post-promotion hydration that needs to
+    /// make state-dependent decisions per task (Pending → into pool;
     /// terminal → contribute task_id to completed-deps seed;
     /// InFlight → skip).
     pub fn tasks_iter(&self) -> impl Iterator<Item = (&String, &TaskState<I>)> {
@@ -62,6 +134,16 @@ impl<I: Identifier> ClusterState<I> {
                 TaskState::SkippedAlreadyDone { .. } => c.skipped_already_done += 1,
             }
         }
+        // Settled (spilled) entries are LOGICAL ledger entries — fold
+        // their slim classes into the same buckets the fat states feed.
+        for (_, entry) in self.settled_entries() {
+            match entry.class {
+                SettledClass::Completed => c.completed += 1,
+                SettledClass::FailedFinal(_) => c.failed += 1,
+                SettledClass::InvalidTask => c.invalid_task += 1,
+                SettledClass::SkippedAlreadyDone => c.skipped_already_done += 1,
+            }
+        }
         c
     }
 
@@ -91,20 +173,7 @@ impl<I: Identifier> ClusterState<I> {
         for s in self.tasks.values() {
             match s {
                 TaskState::Completed { .. } => o.succeeded += 1,
-                TaskState::Failed { kind, .. } => match kind {
-                    ErrorType::Recoverable => o.fail_retry += 1,
-                    ErrorType::ResourceExhausted(k) if k.as_str() == "memory" => o.fail_oom += 1,
-                    // Defensive: the apply rule for `TaskFailed` routes
-                    // `Unfulfillable` straight to `TaskState::Unfulfillable`
-                    // (the discrete state below), so this arm is unreachable
-                    // in practice. Kept for exhaustiveness — if a legacy
-                    // wire path ever lands a `Failed { Unfulfillable, .. }`
-                    // entry the count still partitions correctly.
-                    ErrorType::ResourceExhausted(_)
-                    | ErrorType::NonRecoverable
-                    | ErrorType::Unfulfillable { .. }
-                    | ErrorType::InvalidTask { .. } => o.fail_final += 1,
-                },
+                TaskState::Failed { kind, .. } => fold_failed_kind(kind, &mut o),
                 // Discrete `Unfulfillable` state: reinjectable resource-
                 // availability failure. Tallied as `fail_final` for the
                 // operator-readable buckets until the dedicated
@@ -139,14 +208,29 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::Blocked { .. } => {}
             }
         }
+        // Settled (spilled) entries: the same per-class mapping, off the
+        // slim index. `FailedFinal` routes through the ONE shared
+        // `fold_failed_kind` so the kind partition cannot drift from the
+        // fat arm's.
+        for (_, entry) in self.settled_entries() {
+            match &entry.class {
+                SettledClass::Completed => o.succeeded += 1,
+                SettledClass::FailedFinal(kind) => fold_failed_kind(kind, &mut o),
+                SettledClass::InvalidTask => o.fail_final += 1,
+                SettledClass::SkippedAlreadyDone => o.skipped += 1,
+            }
+        }
         o
     }
 
-    /// Iterator over `(task_hash, &TaskInfo)` for every entry in the
-    /// ledger, regardless of state. Used by the post-promotion
-    /// hydration path to seed `mark_tasks_completed` with the
-    /// task_ids of terminal tasks (so surviving Pending tasks'
-    /// `task_depends_on` references resolve).
+    /// Iterator over `(task_hash, &TaskInfo)` for every FAT (in-memory)
+    /// entry, regardless of state. SETTLED entries carry no in-memory
+    /// `TaskInfo` and are not yielded — the remaining production reader
+    /// (the preferred-secondaries validator) is live-entry-shaped by
+    /// design (a terminal task never re-dispatches, so its preference
+    /// list is operationally dead); identity-shaped lookups go through
+    /// [`Self::task_deps_for_identity`] / [`Self::task_hash_for_dep`],
+    /// which DO consult the settled index.
     pub fn iter_all(&self) -> impl Iterator<Item = (&String, &TaskInfo<I>)> {
         self.tasks.iter().map(|(h, s)| {
             let t = match s {
@@ -163,13 +247,15 @@ impl<I: Identifier> ClusterState<I> {
         })
     }
 
-    /// Iterator over `(task_hash, &TaskInfo)` for terminal entries
-    /// (`Completed`, `Failed`, `Unfulfillable`, `InvalidTask`,
-    /// `SkippedAlreadyDone`). `Blocked` is non-terminal (auto-resumes to
-    /// `Pending` when its prereq completes) and is excluded. A
-    /// `SkippedAlreadyDone` IS surfaced — its dependents resolve their
-    /// `task_depends_on` reference against it exactly as against a
-    /// `Completed` prereq.
+    /// Iterator over `(task_hash, &TaskInfo)` for FAT (in-memory)
+    /// terminal entries (`Completed`, `Failed`, `Unfulfillable`,
+    /// `InvalidTask`, `SkippedAlreadyDone`). `Blocked` is non-terminal
+    /// (auto-resumes to `Pending` when its prereq completes) and is
+    /// excluded. A `SkippedAlreadyDone` IS surfaced — its dependents
+    /// resolve their `task_depends_on` reference against it exactly as
+    /// against a `Completed` prereq. SETTLED terminals are not yielded
+    /// (no in-memory `TaskInfo`); pair with [`Self::settled_entries`]
+    /// for the full terminal set.
     pub fn iter_terminal(&self) -> impl Iterator<Item = (&String, &TaskInfo<I>)> {
         self.tasks.iter().filter_map(|(h, s)| match s {
             TaskState::Completed { task, .. }
@@ -360,6 +446,11 @@ impl<I: Identifier> ClusterState<I> {
                 entry.1 = true;
             }
         }
+        // Settled (spilled) entries: terminal by construction — they set
+        // `has_any` for their phase and are never live.
+        for (_, settled) in self.settled_entries() {
+            base.entry(&settled.phase_id).or_insert((false, false)).0 = true;
+        }
 
         // `phase_dispatchable` consults the per-phase live bit; project
         // it once for the dep walk. A phase absent here is vacuously
@@ -443,19 +534,55 @@ impl<I: Identifier> ClusterState<I> {
     /// states). The scan keeps the dependency-tracking concern
     /// self-contained inside cluster_state.
     pub fn task_hash_for_dep(&self, phase_id: &PhaseId, task_id: &str) -> Option<&str> {
-        self.tasks.iter().find_map(|(h, s)| {
-            let task = match s {
-                TaskState::Pending { task, .. }
-                | TaskState::InFlight { task, .. }
-                | TaskState::Completed { task, .. }
-                | TaskState::Failed { task, .. }
-                | TaskState::Unfulfillable { task, .. }
-                | TaskState::InvalidTask { task, .. }
-                | TaskState::SkippedAlreadyDone { task, .. }
-                | TaskState::Blocked { task, .. } => task,
-            };
-            (task.task_id == task_id && &task.phase_id == phase_id).then_some(h.as_str())
-        })
+        self.tasks
+            .iter()
+            .find_map(|(h, s)| {
+                let task = match s {
+                    TaskState::Pending { task, .. }
+                    | TaskState::InFlight { task, .. }
+                    | TaskState::Completed { task, .. }
+                    | TaskState::Failed { task, .. }
+                    | TaskState::Unfulfillable { task, .. }
+                    | TaskState::InvalidTask { task, .. }
+                    | TaskState::SkippedAlreadyDone { task, .. }
+                    | TaskState::Blocked { task, .. } => task,
+                };
+                (task.task_id == task_id && &task.phase_id == phase_id).then_some(h.as_str())
+            })
+            // Settled (spilled) entries resolve deps too — a completed
+            // prereq is the COMMON dep target and is exactly what spills.
+            .or_else(|| {
+                self.settled_entries().find_map(|(h, entry)| {
+                    (entry.task_id == task_id && &entry.phase_id == phase_id)
+                        .then_some(h.as_str())
+                })
+            })
+    }
+
+    /// The `task_depends_on` edges of the task with the given full
+    /// `(phase_id, task_id)` identity — fat or settled. The dispatch-time
+    /// `inherit_outputs` ancestry walk reads a COMPLETED (and typically
+    /// SETTLED) predecessor's dep edges here; the slim index retains them
+    /// for exactly this reader. Owned clone (the walk recurses while the
+    /// caller may hold no borrow).
+    pub(crate) fn task_deps_for_identity(
+        &self,
+        phase_id: &PhaseId,
+        task_id: &str,
+    ) -> Option<Vec<dynrunner_core::TaskDep>> {
+        self.tasks
+            .values()
+            .find_map(|s| {
+                let task = s.task();
+                (task.task_id == task_id && &task.phase_id == phase_id)
+                    .then(|| task.task_depends_on.clone())
+            })
+            .or_else(|| {
+                self.settled_entries().find_map(|(_, entry)| {
+                    (entry.task_id == task_id && &entry.phase_id == phase_id)
+                        .then(|| entry.task_depends_on.clone())
+                })
+            })
     }
 
     /// Borrow a completed dependency's cached [`TaskOutputs`] by its
@@ -521,6 +648,17 @@ impl<I: Identifier> ClusterState<I> {
                 let outputs = self.task_outputs.get(hash)?;
                 Some((task.task_id.clone(), outputs.clone()))
             })
+            // Settled (spilled) entries of the phase: their identity comes
+            // off the slim index; the output VALUES never left the
+            // `task_outputs` map (it is the hot output index — not
+            // evicted), so the same hash-keyed read serves them.
+            .chain(self.settled_entries().filter_map(|(hash, entry)| {
+                if &entry.phase_id != phase_id {
+                    return None;
+                }
+                let outputs = self.task_outputs.get(hash)?;
+                Some((entry.task_id.clone(), outputs.clone()))
+            }))
             .collect()
     }
 
@@ -555,6 +693,18 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::Unfulfillable { .. }
                 | TaskState::InvalidTask { .. } => p.failed += 1,
                 TaskState::SkippedAlreadyDone { .. } => p.skipped += 1,
+            }
+        }
+        // Settled (spilled) entries of this phase: same buckets, off the
+        // slim class (`to_run` is impossible — only terminals settle).
+        for (_, entry) in self.settled_entries() {
+            if &entry.phase_id != phase {
+                continue;
+            }
+            match entry.class {
+                SettledClass::Completed => p.done += 1,
+                SettledClass::FailedFinal(_) | SettledClass::InvalidTask => p.failed += 1,
+                SettledClass::SkippedAlreadyDone => p.skipped += 1,
             }
         }
         p
@@ -730,6 +880,25 @@ impl<I: Identifier> ClusterState<I> {
             .values()
             .map(|c| u64::from(c.worker_count))
             .sum()
+    }
+}
+
+/// The ONE `Failed { kind }` → outcome-bucket partition, shared by the
+/// fat-state arm and the settled-index arm of [`ClusterState::
+/// outcome_counts`] so the two cannot drift:
+///   - `Recoverable`                 → `fail_retry`
+///   - `ResourceExhausted("memory")` → `fail_oom`
+///   - everything else (incl. the defensively-unreachable
+///     `Unfulfillable`/`InvalidTask` kinds a legacy wire path could
+///     land inside a `Failed`) → `fail_final`.
+fn fold_failed_kind(kind: &ErrorType, o: &mut OutcomeSummary) {
+    match kind {
+        ErrorType::Recoverable => o.fail_retry += 1,
+        ErrorType::ResourceExhausted(k) if k.as_str() == "memory" => o.fail_oom += 1,
+        ErrorType::ResourceExhausted(_)
+        | ErrorType::NonRecoverable
+        | ErrorType::Unfulfillable { .. }
+        | ErrorType::InvalidTask { .. } => o.fail_final += 1,
     }
 }
 

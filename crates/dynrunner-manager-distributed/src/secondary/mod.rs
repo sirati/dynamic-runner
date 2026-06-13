@@ -350,6 +350,14 @@ where
     /// process-loop wakeup — see `crate::snapshot_stream`. The loop's
     /// wake arm drains it; the router's request arm feeds it.
     pub(super) snapshot_streams: crate::snapshot_stream::SnapshotStreamResponder,
+    /// Settled-CRDT spill driver: sweeps join-fixed-point ledger
+    /// entries to the node-local spill file on a cadence (one
+    /// `spawn_blocking` write in flight, durable-then-evict) — see
+    /// `crate::settled_spill`. The process loop owns its one arm; the
+    /// PROMOTION capture pairs the fat snapshot with this store's
+    /// read-only base (`settled_base_clone`) so the promoted primary
+    /// inherits the settled slice without replay.
+    pub(super) settled_spill: crate::settled_spill::SettledSpillDriver,
     /// Inbound snapshot-stream progress (per responder): lets this
     /// node's own anti-entropy pulls RESUME an interrupted stream
     /// (same stream id + cursor) instead of re-pulling from scratch.

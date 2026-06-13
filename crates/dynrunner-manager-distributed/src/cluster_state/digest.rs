@@ -190,6 +190,13 @@ impl<I: Identifier> ClusterState<I> {
             // own result), so they carry no convergence signal.
             digest_cache: _digest_cache,
             digest_fold_count: _digest_fold_count,
+            // Settled spill store: the settled half of the tasks fold.
+            // Each settled entry's XOR term was moved from the live fold
+            // into `tasks_hash_acc` at spill-commit time (value-preserving
+            // — see `commit_spill`), so seeding the fold below with the
+            // accumulator and adding the settled count keeps the digest
+            // BYTE-IDENTICAL to a full fold of the logical state.
+            settled,
         } = self;
 
         // `peer_holdings` is steady-state best-effort metadata
@@ -223,7 +230,11 @@ impl<I: Identifier> ClusterState<I> {
         // vice versa) — a same-key entry that advanced to a stronger state,
         // OR two divergent failure records at equal rank (the version +
         // payload content hash discriminate them, C4), changes the fold.
-        let mut tasks_hash = 0u64;
+        //
+        // Seeded with the SETTLED accumulator: spilled entries' terms were
+        // moved out of the live fold at commit time, and XOR associativity
+        // makes `acc ⊕ fold(fat)` equal the full logical fold.
+        let mut tasks_hash = settled.tasks_hash_acc();
         for (key, state) in tasks {
             tasks_hash ^= hash_one((key, super::merge::hashable_join_key(state)));
         }
@@ -291,7 +302,7 @@ impl<I: Identifier> ClusterState<I> {
             super::grow_max::fold_grow_max(custom_terminal_watermarks);
 
         StateDigest {
-            tasks_count: tasks.len() as u64,
+            tasks_count: (tasks.len() + settled.len()) as u64,
             tasks_hash,
             secondary_capacities_count: secondary_capacities.len() as u64,
             secondary_capacities_hash,

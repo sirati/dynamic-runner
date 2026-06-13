@@ -41,6 +41,7 @@ mod digest;
 mod events;
 mod grow_max;
 mod merge;
+mod settled;
 mod snapshot;
 mod state;
 mod stream;
@@ -56,6 +57,18 @@ mod types;
 // see only the public method surface.
 pub(crate) use apply_custom::CustomInboxStats;
 pub(crate) use broadcast::{AppliedBatch, apply_locally_for_broadcast};
+// Settled-spill surface: the slim index entry + class projection the
+// fat-body-free readers consume, the store handed across the promotion
+// seam, and the batch/receipt + blocking-write primitives the
+// `settled_spill` driver schedules.
+pub(crate) use accessors::TaskView;
+// `SettledStore` is `pub` because it crosses the wire-less promotion
+// seam inside the `pub` `process::PromotionSignal` and the
+// `PromotedPrimaryBuilder` signature (the pyo3 recipe threads it
+// opaquely). The other settled types stay in-crate (the
+// fat-body-free readers + the spill driver are all this crate).
+pub use settled::SettledStore;
+pub(crate) use settled::{SettledClass, SpillReceipt, write_spill_batch};
 pub use snapshot::ClusterStateSnapshot;
 pub use state::ClusterState;
 // Snapshot-stream partition policy + payload codec: the plan iterates a

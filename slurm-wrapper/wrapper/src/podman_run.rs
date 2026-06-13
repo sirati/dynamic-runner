@@ -4,7 +4,9 @@
 //! capability). Phase 1 (1H) fills bodies.
 
 use crate::bin_resolve::ResolvedBins;
-use crate::dirs::{reaper_panik_container_path, Layout, LOG_TMP_CONTAINER_PATH};
+use crate::dirs::{
+    reaper_panik_container_path, Layout, LOG_TMP_CONTAINER_PATH, WORK_TMP_CONTAINER_PATH,
+};
 use crate::network::PeerIps;
 use dynrunner_slurm_wrapper_config::WrapperConfig;
 
@@ -129,6 +131,12 @@ pub fn build_run_argv(
         argv.push("-e".to_string());
         argv.push("DYNRUNNER_NETWORK=/app/dynrunner-network".to_string());
     }
+    // Point the in-container framework at the bind-mounted scratch work
+    // dir so the settled-CRDT spill lands on node-local scratch (the
+    // framework reads `settled_spill::WORK_DIR_ENV`). Always present —
+    // the work mount below is unconditional, mirroring out-tmp/log-tmp.
+    argv.push("-e".to_string());
+    argv.push(format!("DYNRUNNER_WORK_DIR={WORK_TMP_CONTAINER_PATH}"));
 
     // ---- VOLUMES — generate.rs:835-841 + dynrunner_volume_block ----
     argv.push("-v".to_string());
@@ -140,6 +148,14 @@ pub fn build_run_argv(
         "{}:{}",
         layout.log_tmp.display(),
         LOG_TMP_CONTAINER_PATH
+    ));
+    // Per-node scratch WORK mount (settled-CRDT spill), sibling shape to
+    // out-tmp/log-tmp; exported as DYNRUNNER_WORK_DIR above.
+    argv.push("-v".to_string());
+    argv.push(format!(
+        "{}:{}",
+        layout.work_tmp.display(),
+        WORK_TMP_CONTAINER_PATH
     ));
     argv.push("-v".to_string());
     argv.push(format!(
@@ -242,6 +258,7 @@ mod tests {
             src_tmp: PathBuf::from("/tmp/asm-2f1d4e89/src"),
             out_tmp: PathBuf::from("/tmp/asm-2f1d4e89/out"),
             log_tmp: PathBuf::from("/tmp/asm-2f1d4e89/log"),
+            work_tmp: PathBuf::from("/tmp/asm-2f1d4e89/work"),
             podman_storage: PathBuf::from("/tmp/asm-2f1d4e89/storage"),
             podman_run: PathBuf::from("/tmp/asm-2f1d4e89/run"),
             socket_dir: PathBuf::from("/tmp/asm-2f1d4e89/sockets"),
@@ -348,12 +365,16 @@ mod tests {
             "PRIMARY_NODE_IPV6=fe80::1",
             "-e",
             "DYNRUNNER_NETWORK=/app/dynrunner-network",
+            "-e",
+            "DYNRUNNER_WORK_DIR=/app/work-tmp",
             "-v",
             "/tmp/asm-2f1d4e89/src:/app/src-tmp",
             "-v",
             "/tmp/asm-2f1d4e89/out:/app/out-tmp",
             "-v",
             "/tmp/asm-2f1d4e89/log:/app/log-tmp",
+            "-v",
+            "/tmp/asm-2f1d4e89/work:/app/work-tmp",
             "-v",
             "/net/srcbins:/app/src-network:ro",
             "-v",
@@ -530,12 +551,16 @@ mod tests {
             "PRIMARY_NODE_IPV4=",
             "-e",
             "PRIMARY_NODE_IPV6=",
+            "-e",
+            "DYNRUNNER_WORK_DIR=/app/work-tmp",
             "-v",
             "/tmp/asm-2f1d4e89/src:/app/src-tmp",
             "-v",
             "/tmp/asm-2f1d4e89/out:/app/out-tmp",
             "-v",
             "/tmp/asm-2f1d4e89/log:/app/log-tmp",
+            "-v",
+            "/tmp/asm-2f1d4e89/work:/app/work-tmp",
             "-v",
             "/net/srcbins:/app/src-network:ro",
             "-v",

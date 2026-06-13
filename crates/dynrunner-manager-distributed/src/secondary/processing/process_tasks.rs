@@ -43,6 +43,7 @@ const ARM_SECONDARY_CONTROL: usize = 8;
 const ARM_REPORT_REPLAY: usize = 9;
 const ARM_WORKER_RESTART: usize = 10;
 const ARM_SNAPSHOT_STREAM: usize = 11;
+const ARM_SETTLED_SPILL: usize = 12;
 
 /// Arm names, index-aligned with the `ARM_*` ids above (render order of the
 /// compact stats line). The single `oom_sweep` arm counts SWEEPS (one
@@ -61,6 +62,7 @@ const PROCESS_TASKS_ARM_NAMES: &[&str] = &[
     "report_replay",
     "worker_restart",
     "snapshot_stream",
+    "settled_spill",
 ];
 
 impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
@@ -376,6 +378,15 @@ where
                         );
                         self.snapshot_streams.abort_stream(&stream_id);
                     }
+                }
+                // Settled-CRDT spill arm: cadence sweep (collect a batch
+                // of join-fixed-point entries, kick ONE spawn_blocking
+                // write) or a write completion (commit: evict fat bodies
+                // into the slim index). Cancel-safe (interval tick / mpsc
+                // recv); bounded per-wakeup work.
+                event = self.settled_spill.next_event() => {
+                    arm_stats.record(ARM_SETTLED_SPILL);
+                    self.settled_spill.handle(event, &mut self.cluster_state);
                 }
                 // Single mesh inbound arm. There is one role inbound
                 // stream — the mesh-pump demuxes every wire frame addressed

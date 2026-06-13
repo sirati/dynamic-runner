@@ -288,11 +288,18 @@ where
             // advance.
             if let Some(tx) = &self.promotion_tx {
                 let snapshot = self.cluster_state.snapshot();
+                // Settled-CRDT base captured atomically with the fat
+                // snapshot: the slim index + read fds onto this host's
+                // spill file. The built primary installs it before
+                // restoring `snapshot`, inheriting the join-fixed-point
+                // slice without replaying fat bodies (hydrate-from-index).
+                let settled_base = self.cluster_state.settled_base_clone();
                 if tx
                     .send(PromotionSignal {
                         reason,
                         epoch,
                         snapshot,
+                        settled_base,
                     })
                     .is_err()
                 {

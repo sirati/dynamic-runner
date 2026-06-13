@@ -327,6 +327,12 @@ where
     /// `crate::snapshot_stream`. The loop's wake arm drains it; the
     /// inbound request arm feeds it.
     snapshot_streams: crate::snapshot_stream::SnapshotStreamResponder,
+    /// Settled-CRDT spill driver: sweeps join-fixed-point ledger
+    /// entries to the node-local spill file on a cadence — see
+    /// `crate::settled_spill`. The run loop owns its one arm; the
+    /// observer's mirror holds the same multi-GB terminal ledger every
+    /// member does, so it spills like every other role.
+    settled_spill: crate::settled_spill::SettledSpillDriver,
     /// Inbound snapshot-stream progress (per responder): lets this
     /// observer's own pulls (bootstrap recovery, reactive digest,
     /// AE-3 recovery cadence) RESUME an interrupted stream instead of
@@ -547,6 +553,11 @@ where
         // `PrimaryChanged`), so the attach SEEDS the view immediately.
         crate::process::attach_primary_recognition(&mut cluster_state, client.role_holder_view());
         let snapshot_streams = crate::snapshot_stream::SnapshotStreamResponder::new(&node_id);
+        // Settled-CRDT spill: the handoff state may already carry an
+        // inherited settled base (the demoted primary's segments); this
+        // attaches the observer's OWN writer segment for new settles.
+        let settled_spill =
+            crate::settled_spill::SettledSpillDriver::start("observer", &mut cluster_state);
         let inbound_snapshots = crate::snapshot_stream::InboundSnapshotStreams::new(&node_id);
         Self {
             client,
@@ -569,6 +580,7 @@ where
             peer_digests: std::collections::HashMap::new(),
             recovery_cursor: 0,
             snapshot_streams,
+            settled_spill,
             inbound_snapshots,
             ae_digest_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
@@ -645,6 +657,9 @@ where
         // inert without a provider; requests then get an error reply).
         let (respawn_exec_tx, respawn_exec_rx) = mpsc::unbounded_channel::<RespawnExecOutcome>();
         let snapshot_streams = crate::snapshot_stream::SnapshotStreamResponder::new(&node_id);
+        // Settled-CRDT spill: attach this observer's writer segment.
+        let settled_spill =
+            crate::settled_spill::SettledSpillDriver::start("observer", &mut cluster_state);
         let inbound_snapshots = crate::snapshot_stream::InboundSnapshotStreams::new(&node_id);
         Self {
             client,
@@ -660,6 +675,7 @@ where
             peer_digests: std::collections::HashMap::new(),
             recovery_cursor: 0,
             snapshot_streams,
+            settled_spill,
             inbound_snapshots,
             ae_digest_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
@@ -1326,6 +1342,12 @@ where
                             );
                             self.snapshot_streams.abort_stream(&stream_id);
                         }
+                    }
+                    // Settled-CRDT spill arm: cadence sweep / write
+                    // completion (see `crate::settled_spill`). Cancel-safe;
+                    // bounded per-wakeup work.
+                    event = self.settled_spill.next_event() => {
+                        self.settled_spill.handle(event, &mut self.cluster_state);
                     }
                     // Anti-entropy tick (item 3): broadcast our digest.
                     _ = ae_tick.tick() => {

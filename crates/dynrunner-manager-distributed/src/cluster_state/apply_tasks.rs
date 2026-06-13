@@ -229,8 +229,10 @@ impl<I: Identifier> ClusterState<I> {
         let mut applied_any = false;
         for task in tasks {
             let hash = crate::primary::wire::compute_task_hash(&task);
-            if self.tasks.contains_key(&hash) {
-                // Idempotent: already present in the ledger.
+            if self.contains_task(&hash) {
+                // Idempotent: already present in the LOGICAL ledger —
+                // fat in-memory entry OR a settled (spilled) one; a
+                // re-spawn must never resurrect a settled terminal.
                 continue;
             }
             // Resolve deps + classify in one pass. We scan deps in
@@ -267,6 +269,32 @@ impl<I: Identifier> ClusterState<I> {
                         continue;
                     }
                 };
+                // A SETTLED dep (fat body spilled) classifies off its slim
+                // index class — the same per-state rules as the fat match
+                // below, projected: Completed/Skipped resolve, InvalidTask
+                // and Failed{NonRecoverable} cascade-fail, any other final
+                // Failed kind is pending-blocked (faithful to the fat arm,
+                // which only cascade-fails on NonRecoverable).
+                if let Some(entry) = self.settled_entry(&dep_hash) {
+                    use super::settled::SettledClass;
+                    match &entry.class {
+                        SettledClass::Completed | SettledClass::SkippedAlreadyDone => {}
+                        SettledClass::InvalidTask => {
+                            cascade_fail = true;
+                            break;
+                        }
+                        SettledClass::FailedFinal(ErrorType::NonRecoverable) => {
+                            cascade_fail = true;
+                            break;
+                        }
+                        SettledClass::FailedFinal(_) => {
+                            if blocked_on_pending.is_none() {
+                                blocked_on_pending = Some(dep_hash);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 match self.tasks.get(&dep_hash) {
                     Some(TaskState::Failed {
                         kind: ErrorType::NonRecoverable,

@@ -109,6 +109,12 @@ where
             crate::snapshot_stream::SnapshotStreamResponder::new(&config.secondary_id);
         let inbound_snapshots =
             crate::snapshot_stream::InboundSnapshotStreams::new(&config.secondary_id);
+        // Settled-CRDT spill: attach this coordinator's spill segment to
+        // the state it owns (degrades to disabled — fat-but-correct — on
+        // any setup failure; see `settled_spill`).
+        let mut cluster_state = ClusterState::new();
+        let settled_spill =
+            crate::settled_spill::SettledSpillDriver::start("secondary", &mut cluster_state);
         let mut this = Self {
             config,
             client,
@@ -146,7 +152,8 @@ where
             mesh: super::lifecycle::MeshFormation::default(),
             fatal_exit: None,
             deposed_primary: false,
-            cluster_state: ClusterState::new(),
+            cluster_state,
+            settled_spill,
             snapshot_streams,
             inbound_snapshots,
             lifecycle_rx: Some(lifecycle_rx),
