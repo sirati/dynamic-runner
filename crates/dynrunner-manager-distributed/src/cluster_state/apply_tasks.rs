@@ -278,7 +278,9 @@ impl<I: Identifier> ClusterState<I> {
                 if let Some(entry) = self.settled_entry(&dep_hash) {
                     use super::settled::SettledClass;
                     match &entry.class {
-                        SettledClass::Completed | SettledClass::SkippedAlreadyDone => {}
+                        SettledClass::Completed
+                        | SettledClass::SkippedAlreadyDone
+                        | SettledClass::SetupCompleted => {}
                         SettledClass::InvalidTask => {
                             cascade_fail = true;
                             break;
@@ -333,12 +335,15 @@ impl<I: Identifier> ClusterState<I> {
                         }
                     }
                     Some(TaskState::Completed { .. })
-                    | Some(TaskState::SkippedAlreadyDone { .. }) => {
+                    | Some(TaskState::SkippedAlreadyDone { .. })
+                    | Some(TaskState::SetupCompleted { .. }) => {
                         // Resolved dep — contributes nothing to the
                         // blocking decision. A skipped prereq's outputs
                         // already exist on the shared fs, so a dependent of
                         // it is unblocked exactly like a dependent of a
-                        // completed task.
+                        // completed task. A SUCCEEDED setup task likewise
+                        // satisfies the dep (the setup-task primitive's
+                        // whole point: build tasks gate on it overlapping).
                     }
                     Some(TaskState::Pending { .. })
                     | Some(TaskState::InFlight { .. })

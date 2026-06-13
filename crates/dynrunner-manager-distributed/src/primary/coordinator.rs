@@ -2943,12 +2943,35 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         for hash in hashes {
             if let Some(entry) = self.in_flight.remove(&hash) {
                 self.release_type_slot(&entry.task.type_id);
-                self.pool_mut().requeue(entry.task);
-                requeue_mutations.push(ClusterMutation::TaskRequeued {
-                    hash,
-                    // Stamped at the origination choke point (apply_locally_for_broadcast).
-                    version: Default::default(),
-                });
+                if entry.task.kind.is_reassignable() {
+                    // WORK task: recover it to `Pending` for another worker
+                    // (`InFlight → Pending`, the dead-secondary requeue).
+                    self.pool_mut().requeue(entry.task);
+                    requeue_mutations.push(ClusterMutation::TaskRequeued {
+                        hash,
+                        // Stamped at the origination choke point (apply_locally_for_broadcast).
+                        version: Default::default(),
+                    });
+                } else {
+                    // NON-reassignable (a setup task): its executor is its
+                    // source-owning member, so the holder's death is
+                    // UNRECOVERABLE — drive it to a terminal `Failed`
+                    // (NonRecoverable) instead of a requeue. Its dependents
+                    // then follow the existing failed-dependency cascade
+                    // (loud, no silent loss), exactly as for any other
+                    // non-recoverable terminal. The task is NOT returned to
+                    // the pool (no `requeue`), so it can never be re-dispatched.
+                    requeue_mutations.push(ClusterMutation::TaskFailed {
+                        hash,
+                        kind: dynrunner_core::ErrorType::NonRecoverable,
+                        error: "setup-task executor (its source-owning member) died; \
+                                setup tasks are non-reassignable — terminal unrecoverable"
+                            .to_string(),
+                        // Stamped at the origination choke point (apply_locally_for_broadcast).
+                        version: Default::default(),
+                        attempt: Default::default(),
+                    });
+                }
             }
         }
         requeue_mutations

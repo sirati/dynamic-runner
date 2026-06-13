@@ -13,6 +13,82 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::identifiers::{AffinityId, PhaseId, TypeId};
 use super::resource::SoftPreferredSecondaries;
 
+/// The KIND of a task — the first-class behavioral classification that
+/// decides, at four seams only (scheduling, reassignment-on-death,
+/// dependency-resolution, counting), whether a task is ordinary worker
+/// WORK or a framework SETUP primitive.
+///
+/// A `Setup` task is NEVER worker-assignable: it is executed IN-PROCESS
+/// by its affinity member (the source-owning member) — the executor
+/// lands in a later phase; in this primitive a `Setup` task simply sits
+/// in the ledger until that executor exists. It is NON-reassignable: an
+/// executor death drives it to a terminal-unrecoverable state, never a
+/// requeue. A SUCCEEDED `Setup` task satisfies a dependent's `TaskDep`
+/// (so build tasks can gate on a setup task overlapping) and is counted
+/// in its OWN `setup_succeeded` bucket — never the `succeeded` bucket.
+///
+/// `Default` is `Work`, and the field is `#[serde(default)]` on
+/// `TaskInfo`, so a frame from a peer that predates this field decodes
+/// as `Work` — the wire stays backward-compatible. NOT folded into
+/// `compute_task_hash` (the recipe is `{phase_id, path, identifier}`),
+/// so marking a task `Setup` never changes its ledger key.
+///
+/// The classification drives behavior ONLY through this enum's
+/// predicate methods at the four seams; no consumer of the field spells
+/// a bare `if kind == Setup` — they ask `is_worker_assignable()` /
+/// `is_reassignable()` / `is_setup()` so the kind→behavior mapping has a
+/// single owner (this type).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskKind {
+    /// Ordinary worker work: dispatched to a worker, reassignable on the
+    /// holder's death, completion counts in `succeeded`. The default —
+    /// every existing task, and every wire frame that predates the
+    /// `kind` field, is `Work`.
+    #[default]
+    Work,
+    /// A framework setup primitive: never worker-assigned, executed
+    /// in-process by its affinity member, non-reassignable (death →
+    /// terminal unrecoverable), depend-able, and counted in the separate
+    /// `setup_succeeded` bucket on success.
+    Setup,
+}
+
+impl TaskKind {
+    /// Whether a task of this kind may be dispatched to a WORKER. Only
+    /// `Work` is worker-assignable; a `Setup` task is executed in-process
+    /// by its affinity member and must never enter a worker-dispatch
+    /// view. The scheduling seam (`PendingPool`) reads this.
+    pub fn is_worker_assignable(self) -> bool {
+        matches!(self, TaskKind::Work)
+    }
+
+    /// Whether an in-flight task of this kind may be REASSIGNED (requeued
+    /// to `Pending`) when its holder dies. `Work` is reassignable —
+    /// another worker picks it up. A `Setup` task is NOT: its executor is
+    /// its source-owning member, so an executor death is unrecoverable
+    /// (the task goes terminal, dependents cascade). The death seam (the
+    /// primary's in-flight recovery) reads this.
+    pub fn is_reassignable(self) -> bool {
+        matches!(self, TaskKind::Work)
+    }
+
+    /// Whether this is a `Setup` task. The plain discriminant query for
+    /// the few call sites that classify by kind without a behavioral
+    /// predicate (e.g. the PyO3 boundary mapping an `is_setup` bool).
+    pub fn is_setup(self) -> bool {
+        matches!(self, TaskKind::Setup)
+    }
+
+    /// `&self` twin of [`Self::is_worker_assignable`] for the
+    /// `#[serde(skip_serializing_if = …)]` attribute on `TaskInfo.kind`
+    /// (serde hands the predicate a `&T`). Keeps the common `Work` case
+    /// off the wire so a rolling upgrade is indistinguishable for
+    /// ordinary tasks; the behavioral seams use the by-value predicate.
+    fn is_work(&self) -> bool {
+        self.is_worker_assignable()
+    }
+}
+
 /// One scheduling unit handed to the runtime: an identifier, an on-disk
 /// payload (`path` + `size`), the phase/type tag that decides where it
 /// dispatches, an optional affinity hint, and an opaque per-item payload.
@@ -30,6 +106,18 @@ pub struct TaskInfo<I> {
     pub phase_id: PhaseId,
     /// Which task type within the phase. Selects the worker module + memory estimator.
     pub type_id: TypeId,
+    /// First-class behavioral classification — ordinary worker [`TaskKind::Work`]
+    /// (the default) or the framework [`TaskKind::Setup`] primitive.
+    /// Drives behavior at the four kind-seams only (scheduling /
+    /// reassignment / dependency-resolution / counting) via
+    /// [`TaskKind`]'s predicate methods. `#[serde(default)]` keeps the
+    /// wire backward-compatible (a frame without the field decodes as
+    /// `Work`); `skip_serializing_if` keeps the common `Work` case quiet
+    /// on the wire so a rolling upgrade is indistinguishable for ordinary
+    /// tasks. NOT part of `compute_task_hash`, so marking a task `Setup`
+    /// never changes its ledger key.
+    #[serde(default, skip_serializing_if = "TaskKind::is_work")]
+    pub kind: TaskKind,
     /// Optional soft worker-pinning class. Items with the same `Some(id)` prefer
     /// the same worker for kernel page-cache reuse; `None` joins the free pool.
     pub affinity_id: Option<AffinityId>,

@@ -215,6 +215,7 @@ mod tests {
                 prefs.iter().map(|s| (*s).to_string()).collect(),
             ),
             preferred_version: Default::default(),
+            kind: Default::default(),
             resolved_path: None,
         }
     }
@@ -308,6 +309,7 @@ mod tests {
                 prefs.iter().map(|s| (*s).to_string()).collect(),
             ),
             preferred_version: Default::default(),
+            kind: Default::default(),
             resolved_path: None,
         }
     }

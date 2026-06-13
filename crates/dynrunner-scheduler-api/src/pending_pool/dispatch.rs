@@ -115,13 +115,15 @@ impl<I: Identifier> PendingPool<I> {
         // ORIGINAL bucket positions, so skipping an item here keeps
         // every emitted locator valid for `take_selected`.
         let now = std::time::Instant::now();
-        let backoff = &self.dispatch_backoff;
         let collect_bucket = |key: &BucketKey,
                               bucket: &'p Bucket<I>,
                               emitted: &mut HashSet<BucketKey>,
                               sink: &mut Vec<Paired<'p, I>>| {
             for (idx, item) in bucket.items.iter().enumerate() {
-                if !backoff.is_eligible(&item.task_id, now) {
+                // The SINGLE dispatch-eligibility gate (re-dispatch backoff
+                // AND worker-assignable kind) — a `Setup` task is invisible
+                // to the worker view here, never via a scattered kind check.
+                if !self.dispatch_eligible(item, now) {
                     continue;
                 }
                 sink.push((item, (key.clone(), idx)));
@@ -378,11 +380,36 @@ impl<I: Identifier> PendingPool<I> {
 
     /// Index of the first dispatch-eligible item in `bucket` at `now`
     /// (`None` when the bucket is empty or every item is parked under
-    /// an unexpired re-dispatch backoff stamp).
+    /// an unexpired re-dispatch backoff stamp, or is a non-worker-
+    /// assignable kind).
     fn first_eligible_index(&self, bucket: &Bucket<I>, now: std::time::Instant) -> Option<usize> {
         bucket
             .items
             .iter()
-            .position(|item| self.dispatch_backoff.is_eligible(&item.task_id, now))
+            .position(|item| self.dispatch_eligible(item, now))
+    }
+
+    /// Whether `item` may be dispatched to a WORKER at `now`. The SINGLE
+    /// worker-dispatch-eligibility predicate, consulted by every dispatch
+    /// read path (`view_for_worker`'s per-item filter and
+    /// [`Self::first_eligible_index`], which backs `pop_for_worker` /
+    /// `choose_bucket_for`). It is the conjunction of two independent
+    /// gates over the same "can this go to a worker right now" concern:
+    ///
+    ///   * the per-task re-dispatch BACKOFF (timing — a recently-bounced
+    ///     task is parked until its stamp expires), and
+    ///   * the task KIND (structural — only a `TaskKind::Work` task is
+    ///     worker-assignable; a `TaskKind::Setup` task is executed
+    ///     in-process by its affinity member and must NEVER appear in a
+    ///     worker dispatch view).
+    ///
+    /// A `Setup` task therefore sits in its bucket invisible to workers
+    /// (still counted as queued, so it holds its phase open) until its
+    /// in-process executor consumes it — the scheduling seam of the
+    /// setup-task primitive. Folding the kind gate in here (rather than
+    /// scattering `if kind == Setup` across the four soft-pin classes)
+    /// keeps the kind→behavior mapping at one seam.
+    fn dispatch_eligible(&self, item: &TaskInfo<I>, now: std::time::Instant) -> bool {
+        item.kind.is_worker_assignable() && self.dispatch_backoff.is_eligible(&item.task_id, now)
     }
 }

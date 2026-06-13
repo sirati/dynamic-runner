@@ -134,6 +134,24 @@ class TaskInfo:
     # task's content hash. See ``PhaseSpec.may_be_empty`` for the related
     # empty-phase proceed-or-fail contract.
     skipped_already_done: bool = False
+    # First-class task-KIND marker. ``False`` (default) ⇒ an ordinary
+    # WORKER task (every existing consumer). ``True`` ⇒ a framework SETUP
+    # task: it is NEVER dispatched to a worker (it is executed in-process
+    # by its source-owning member), is NON-reassignable if that member
+    # dies (death → terminal unrecoverable, dependents cascade), can be
+    # DEPENDED ON by other tasks via ``task_depends_on`` (a build task
+    # gates on a setup task, scheduling overlapping once the setup
+    # succeeds), and on success is counted in a SEPARATE setup bucket —
+    # never the success count.
+    #
+    # The setup-task primitive is UNCONDITIONAL: a consumer can declare a
+    # setup task regardless of any run/CLI configuration. The bit is
+    # carried through the PyO3 boundary
+    # (``crate::pytypes::extract_binaries``) onto the core Rust
+    # ``TaskInfo.kind`` (``TaskKind::Setup``); unlike
+    # ``skipped_already_done`` it is a property of the scheduling unit,
+    # not a discovery-time routing signal.
+    is_setup: bool = False
 
     @property
     def binary_name(self) -> str:
@@ -170,6 +188,7 @@ class TaskInfo:
             "affinity_id": self.affinity_id,
             "payload": self.payload,
             "task_id": self.task_id,
+            "is_setup": self.is_setup,
             # Normalise each dep to a JSON-friendly shape: bare-strings
             # stay strings (legacy wire), ``TaskDep`` instances render as
             # ``{"task_id": ..., "inherit_outputs": ...}``. Matches the

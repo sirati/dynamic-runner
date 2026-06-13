@@ -39,6 +39,7 @@ fn task(task_id: &str, deps: Vec<&str>) -> TaskInfo<Arc<str>> {
             .collect(),
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
+        kind: Default::default(),
         resolved_path: None,
     }
 }

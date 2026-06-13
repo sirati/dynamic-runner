@@ -37,6 +37,11 @@ use crate::{ClusterState, TaskState};
 pub struct StatsSnapshot {
     /// `OutcomeSummary::succeeded` — unique-hash completion count.
     pub succeeded: usize,
+    /// `OutcomeSummary::setup_succeeded` — succeeded setup-kind tasks. A
+    /// SUCCESS-LIKE terminal in its OWN line, NEVER folded into
+    /// `succeeded` (the setup-task counter contract: a succeeded setup
+    /// task never inflates the worker-work success count).
+    pub setup_succeeded: usize,
     /// `OutcomeSummary::fail_retry` — last-observed `Recoverable`.
     pub fail_retry: usize,
     /// `OutcomeSummary::fail_oom` — last-observed memory `ResourceExhausted`.
@@ -204,6 +209,7 @@ impl StatsSnapshot {
 
         StatsSnapshot {
             succeeded: outcome.succeeded,
+            setup_succeeded: outcome.setup_succeeded,
             fail_retry: outcome.fail_retry,
             fail_oom: outcome.fail_oom,
             // `outcome_counts().fail_final` FOLDS BOTH the discrete
@@ -259,6 +265,7 @@ fn task_of<I>(state: &TaskState<I>) -> &dynrunner_core::TaskInfo<I> {
         | TaskState::Unfulfillable { task, .. }
         | TaskState::Blocked { task, .. }
         | TaskState::InvalidTask { task, .. }
-        | TaskState::SkippedAlreadyDone { task, .. } => task,
+        | TaskState::SkippedAlreadyDone { task, .. }
+        | TaskState::SetupCompleted { task, .. } => task,
     }
 }

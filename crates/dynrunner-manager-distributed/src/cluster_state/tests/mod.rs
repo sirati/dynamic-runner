@@ -34,6 +34,7 @@ mod respawn_ledger;
 mod role_table;
 mod run_aborted;
 mod secondary_capacity;
+mod setup_kind;
 mod settled;
 mod snapshot;
 mod stream;
@@ -52,6 +53,7 @@ pub(super) fn mk_task(name: &str) -> TaskInfo<RunnerIdentifier> {
         task_depends_on: Vec::new(),
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
+        kind: Default::default(),
         resolved_path: None,
     }
 }

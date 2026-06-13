@@ -84,6 +84,11 @@ fn terminal_payload_hash<I>(state: &TaskState<I>) -> u64 {
         // separates it as the weakest terminal — two replicas holding the
         // skip for the same hash share this constant and idempotent-NoOp).
         TaskState::SkippedAlreadyDone { .. } => skipped_payload_hash(),
+        // Fixed discriminant tag; a succeeded setup task carries no error
+        // payload (the terminal_rank already separates it) — two replicas
+        // holding the SetupCompleted for the same hash share this constant
+        // and idempotent-NoOp.
+        TaskState::SetupCompleted { .. } => setup_completed_payload_hash(),
         TaskState::Pending { .. } | TaskState::InFlight { .. } | TaskState::Blocked { .. } => 0,
     }
 }
@@ -108,6 +113,9 @@ fn invalid_task_payload_hash(reason: &str, last_error: &str) -> u64 {
 }
 fn skipped_payload_hash() -> u64 {
     hash_one(4u8)
+}
+fn setup_completed_payload_hash() -> u64 {
+    hash_one(5u8)
 }
 
 /// Build the ONE canonical convergence key for a task state (§2.2). The
@@ -145,6 +153,7 @@ pub(super) fn task_join_key<I>(state: &TaskState<I>) -> TaskJoinKey {
             version, attempt, ..
         } => key_invalid_task(*attempt, *version, terminal_payload_hash(state)),
         TaskState::SkippedAlreadyDone { attempt, .. } => key_skipped(*attempt),
+        TaskState::SetupCompleted { attempt, .. } => key_setup_completed(*attempt),
     }
 }
 
@@ -251,6 +260,24 @@ pub(super) fn key_skipped(attempt: u32) -> TaskJoinKey {
         nonterminal_rank: NonTerminalRank::Pending,
         failedlike: FailedLikeRank::Failed,
         payload_content_hash: skipped_payload_hash(),
+    }
+}
+
+pub(super) fn key_setup_completed(attempt: u32) -> TaskJoinKey {
+    TaskJoinKey {
+        attempt,
+        band: JoinBand::Terminal,
+        // A non-competing success-like terminal: a setup-kind task's hash
+        // is only ever originated terminal by its in-process executor (it
+        // is never worker-dispatched), so no real worker outcome competes
+        // for the same hash. It carries no version; the terminal rank
+        // places it as the second-weakest terminal (above the spawn-time
+        // skip, below every WORK terminal) purely for a total order.
+        terminal_rank: TerminalRank::SetupCompleted,
+        version: TaskVersion::default(),
+        nonterminal_rank: NonTerminalRank::Pending,
+        failedlike: FailedLikeRank::Failed,
+        payload_content_hash: setup_completed_payload_hash(),
     }
 }
 

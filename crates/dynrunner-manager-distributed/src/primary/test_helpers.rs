@@ -60,6 +60,7 @@ pub(super) fn make_relative_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
+        kind: Default::default(),
         resolved_path: None,
     }
 }
@@ -85,6 +86,7 @@ pub(super) fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
+        kind: Default::default(),
         resolved_path: None,
     }
 }

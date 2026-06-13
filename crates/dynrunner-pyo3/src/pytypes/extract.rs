@@ -57,6 +57,8 @@ pub(crate) fn task_to_pytask<I: Identifier>(task: &TaskInfo<I>) -> PyTaskInfo {
         // does not live on `TaskInfo<I>`, so the Rust→Python projection
         // reconstitutes the default.
         skipped_already_done: false,
+        // `kind` IS on `TaskInfo<I>`, so the projection reflects it.
+        is_setup: task.kind.is_setup(),
     }
 }
 
@@ -284,6 +286,25 @@ pub(crate) fn extract_binaries(
                 .and_then(|v| v.extract::<bool>().ok())
                 .unwrap_or(false);
 
+            // Optional `is_setup` marker — the consumer-boundary surface of
+            // the first-class `TaskKind`. Missing attribute or a non-bool
+            // value collapses to `false` ⇒ `TaskKind::Work` (back-compat: a
+            // producer that predates the marker yields ordinary worker
+            // tasks). `True` ⇒ `TaskKind::Setup`, declaring the task a
+            // framework setup primitive REGARDLESS of any CLI flag (the
+            // primitive is unconditional). This is the SINGLE point the
+            // Python `is_setup` bool maps to the Rust `TaskKind`.
+            let kind = if item
+                .getattr("is_setup")
+                .ok()
+                .and_then(|v| v.extract::<bool>().ok())
+                .unwrap_or(false)
+            {
+                dynrunner_core::TaskKind::Setup
+            } else {
+                dynrunner_core::TaskKind::Work
+            };
+
             Ok((
                 TaskInfo {
                     path: PathBuf::from(path),
@@ -297,6 +318,7 @@ pub(crate) fn extract_binaries(
                     task_depends_on,
                     preferred_secondaries: SoftPreferredSecondaries::new(preferred_secondaries),
                     preferred_version: Default::default(),
+                    kind,
                     resolved_path: None,
                 },
                 skipped_already_done,

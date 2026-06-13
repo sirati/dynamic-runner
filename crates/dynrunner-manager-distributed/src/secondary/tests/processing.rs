@@ -167,6 +167,7 @@ pub(super) fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         task_depends_on: vec![],
         preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
+        kind: Default::default(),
         resolved_path: None,
     }
 }

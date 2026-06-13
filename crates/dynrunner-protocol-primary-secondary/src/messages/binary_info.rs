@@ -124,6 +124,18 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             // (the worker never reads it), so it is intentionally dropped
             // here.
             preferred_version: _preferred_version,
+            // ── not transferred on the dispatch descriptor ──
+            // The task KIND (`Work`/`Setup`) is a scheduling/dependency/
+            // counting classification that rides the CRDT-ledger
+            // (`ClusterMutation`/snapshot) path, where it is serialized
+            // directly on `TaskInfo` with a `#[serde(default)]` for
+            // wire-compat. This descriptor is the primary↔secondary DISPATCH
+            // projection, and a `Setup` task is NEVER worker-dispatched (the
+            // scheduling seam excludes it), so anything that round-trips
+            // here is by construction `Work`. `to_task_info` resets it to the
+            // `Work` default on the dispatch round-trip — same
+            // rides-the-CRDT-path rationale as `preferred_version` above.
+            kind: _kind,
             // ── node-local: not transferred ──
             // `#[serde(skip)]` on the struct — the local on-disk resolved
             // location is host-specific and the receiving secondary
@@ -175,6 +187,10 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             // Reset on the dispatch round-trip — see the destructure note
             // above; the preferred-metadata version rides the CRDT path.
             preferred_version: Default::default(),
+            // Reset to the `Work` default — a dispatched task is by
+            // construction worker work; the kind rides the CRDT path (see
+            // the destructure note above).
+            kind: Default::default(),
             resolved_path: None,
         }
     }

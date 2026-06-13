@@ -50,6 +50,7 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
             task_depends_on: vec![],
             preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
             preferred_version: Default::default(),
+            kind: Default::default(),
             resolved_path: None,
         },
         version: Default::default(),
@@ -480,6 +481,7 @@ fn make_relative_path_binary(name: &str) -> TaskInfo<TestId> {
         task_depends_on: vec![],
         preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
+        kind: Default::default(),
         resolved_path: None,
     }
 }

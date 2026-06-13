@@ -78,6 +78,19 @@ pub(crate) struct PyTaskInfo {
     /// the `From`/`task_to_pytask` conversions deliberately drop it.
     #[pyo3(get)]
     pub(super) skipped_already_done: bool,
+    /// First-class task-KIND marker — the consumer-boundary surface of
+    /// the Rust [`dynrunner_core::TaskKind`]. `False` (default) ⇒
+    /// `TaskKind::Work` (an ordinary worker task — every existing
+    /// consumer). `True` ⇒ `TaskKind::Setup`: a framework setup primitive
+    /// that is never worker-assigned, executed in-process by its affinity
+    /// member, non-reassignable on death, depend-able, and counted in the
+    /// separate setup bucket. Available UNCONDITIONALLY (the primitive is
+    /// not behind any CLI flag): a consumer can declare a setup task
+    /// regardless of how the run is configured. Carried on the core
+    /// `TaskInfo<I>` (unlike `skipped_already_done`) as `kind` — the
+    /// `From<&PyTaskInfo>` / `From<&TaskInfo>` conversions thread it.
+    #[pyo3(get)]
+    pub(super) is_setup: bool,
 }
 
 #[pymethods]
@@ -102,6 +115,7 @@ impl PyTaskInfo {
         task_depends_on = Vec::new(),
         preferred_secondaries = Vec::new(),
         skipped_already_done = false,
+        is_setup = false,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -118,6 +132,7 @@ impl PyTaskInfo {
         task_depends_on: Vec<String>,
         preferred_secondaries: Vec<String>,
         skipped_already_done: bool,
+        is_setup: bool,
     ) -> PyResult<Self> {
         if task_id.is_empty() {
             return Err(PyValueError::new_err(
@@ -138,6 +153,7 @@ impl PyTaskInfo {
             task_depends_on,
             preferred_secondaries,
             skipped_already_done,
+            is_setup,
         })
     }
 }
@@ -186,6 +202,14 @@ impl From<&PyTaskInfo> for TaskInfo<RunnerIdentifier> {
                 .collect(),
             preferred_secondaries: SoftPreferredSecondaries::new(py.preferred_secondaries.clone()),
             preferred_version: Default::default(),
+            // The consumer-boundary `is_setup` bool maps to the first-class
+            // `TaskKind` here — the SINGLE point this pyclass surface
+            // crosses into the Rust kind.
+            kind: if py.is_setup {
+                dynrunner_core::TaskKind::Setup
+            } else {
+                dynrunner_core::TaskKind::Work
+            },
             resolved_path: None,
         }
     }
@@ -225,6 +249,9 @@ impl From<&TaskInfo<RunnerIdentifier>> for PyTaskInfo {
             // time a task is in the ledger, its skip status is encoded in
             // its `TaskState` variant, not in this discovery-time field.
             skipped_already_done: false,
+            // `kind` IS carried on the core `TaskInfo<I>`, so the
+            // round-trip-back faithfully reflects it.
+            is_setup: bi.kind.is_setup(),
         }
     }
 }
@@ -257,6 +284,7 @@ mod tests {
             task_depends_on: Vec::new(),
             preferred_secondaries: preferred,
             skipped_already_done: false,
+            is_setup: false,
         }
     }
 
@@ -322,6 +350,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             false,
+            false,
         )
         .expect_err("empty task_id must fail");
         // We assert against the rendered message (no Python
@@ -348,6 +377,7 @@ mod tests {
             "null".into(),
             Vec::new(),
             Vec::new(),
+            false,
             false,
         )
         .expect("non-empty task_id must succeed");
