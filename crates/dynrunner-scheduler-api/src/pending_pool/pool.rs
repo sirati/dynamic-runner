@@ -136,6 +136,14 @@ pub struct PendingPool<I: Identifier> {
     /// cannot cycle requeue → re-assign at memory speed. See
     /// [`super::backoff`] for the contract.
     pub(super) dispatch_backoff: super::backoff::DispatchBackoff,
+    /// Bring-up FORMATION-WINDOW reservation overlay: tags each queued
+    /// task with the member it is reserved for, so a first-confirmed
+    /// member's idle workers drain only their own pre-computed share
+    /// instead of the whole global pool while late members are still
+    /// forming (the #494 14/14/0 pack). Inert (`active == false`) outside
+    /// the bring-up window — the local single-node manager never opens
+    /// it. See [`super::reservation`] for the contract.
+    pub(super) reservation: super::reservation::TaskReservation,
 }
 
 impl<I: Identifier> PendingPool<I> {
@@ -245,6 +253,7 @@ impl<I: Identifier> PendingPool<I> {
             in_flight_tasks: HashSet::new(),
             blocked_per_phase: HashMap::new(),
             dispatch_backoff: super::backoff::DispatchBackoff::default(),
+            reservation: super::reservation::TaskReservation::default(),
         })
     }
 

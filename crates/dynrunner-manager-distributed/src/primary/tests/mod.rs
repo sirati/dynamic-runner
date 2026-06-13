@@ -22,6 +22,7 @@ mod assembly_beacon;
 mod backpressure_requeue;
 mod basic;
 mod bringup_composition_fatal;
+mod bringup_reservation;
 mod bringup_fatal;
 mod bringup_milestone;
 mod capacity_dispatch;

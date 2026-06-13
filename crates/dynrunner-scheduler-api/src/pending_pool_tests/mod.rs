@@ -18,6 +18,7 @@ mod partition;
 mod phase_graph;
 mod phase_lifecycle;
 mod query_predicates;
+mod reservation;
 mod setup_kind;
 mod take_first_match;
 mod task_deps;

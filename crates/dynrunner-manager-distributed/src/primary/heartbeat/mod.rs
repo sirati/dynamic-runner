@@ -545,6 +545,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         for wid in dead_global_ids {
             self.pool_mut().release_worker(wid);
         }
+        // #494 bring-up reservation: this is the GENUINE member-removal
+        // path, the one redistribute trigger. If a formation-window
+        // reservation is still open and this dead member held a share it
+        // never drained, fold it onto the surviving fleet round-robin (the
+        // dead member is already retained out of `self.workers` above, so
+        // the survivor order excludes it). A no-op once the window has
+        // closed — a steady-state death just requeues, no redistribute.
+        self.redistribute_reservation_for_dead_member(&secondary_id);
 
         self.secondaries.remove(&secondary_id);
         self.secondary_keepalives.remove(&secondary_id);
