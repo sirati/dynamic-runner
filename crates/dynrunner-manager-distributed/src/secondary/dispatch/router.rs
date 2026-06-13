@@ -802,6 +802,15 @@ where
                 }
                 Ok(())
             }
+            DistributedMessage::SetupAssignment { task_hash, .. } => {
+                // The primary directed a `TaskKind::Setup` task to this node's
+                // in-process executor (this node is the task's affinity
+                // member). Runs poolless (a setup task never touches the
+                // worker pool), so it is valid on a 0-worker Operational node.
+                // The executor body + the terminal report to the primary live
+                // in `secondary::setup_exec`; this is the one-line delegate.
+                self.execute_setup_assignment(task_hash).await
+            }
             _ => {
                 tracing::debug!(msg_type = ?msg.msg_type(), "unhandled message in secondary");
                 Ok(())

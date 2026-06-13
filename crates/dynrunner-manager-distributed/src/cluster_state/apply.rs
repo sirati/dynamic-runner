@@ -631,6 +631,45 @@ impl<I: Identifier> ClusterState<I> {
                     _ => ApplyOutcome::NoOp,
                 }
             }
+            ClusterMutation::SetupCompleted { hash } => {
+                // A setup task SUCCEEDED in its in-process executor.
+                // Authoritative in-process transition (like
+                // `TaskSkippedAlreadyDone`, NOT a monotone join), so it keeps
+                // its explicit precondition arm and does NOT route through
+                // `merge_task_state`. Gate on `InFlight` (the executor was
+                // assigned via the standard `TaskAssigned` `Pending →
+                // InFlight`) OR `Pending` (a not-yet-assigned originate, or a
+                // failover-replayed seed): a real terminal or `Blocked` state
+                // is the weakest-terminal lockout, so a late/out-of-order
+                // setup success can never overwrite real progress. Idempotent
+                // — a re-applied success against an already-`SetupCompleted`
+                // entry is the `_ => NoOp` arm. The `attempt` is preserved
+                // from the source.
+                //
+                // Unlike `TaskSkippedAlreadyDone`, a setup SUCCESS must
+                // auto-resume its `Blocked` dependents: a build task gated on
+                // this setup task (`TaskDep`) sits `Blocked { on: <hash> }`
+                // and unblocks the moment the setup task succeeds (the
+                // setup-task primitive's overlapping-dependent design). Reuse
+                // the SAME `resume_blocked_on` cascade the `TaskCompleted` arm
+                // runs — the single owner of the Blocked → Pending resume —
+                // and surface the resumed tasks on the SAME `resumed` sink the
+                // originator-side caller drains into its live pool.
+                let Some(state) = self.tasks.get_mut(&hash) else {
+                    return ApplyOutcome::NoOp;
+                };
+                match state {
+                    TaskState::InFlight { task, attempt, .. }
+                    | TaskState::Pending { task, attempt, .. } => {
+                        let (task, attempt) = (task.clone(), *attempt);
+                        *state = TaskState::SetupCompleted { task, attempt };
+                        let just_resumed = self.resume_blocked_on(&hash);
+                        resumed.extend(just_resumed);
+                        ApplyOutcome::Applied
+                    }
+                    _ => ApplyOutcome::NoOp,
+                }
+            }
             ClusterMutation::TaskPreferredSecondariesUpdated {
                 hash,
                 secondaries,

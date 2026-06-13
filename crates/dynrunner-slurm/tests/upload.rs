@@ -116,6 +116,7 @@ fn make_binary(path: impl Into<PathBuf>) -> TaskInfo<String> {
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
         kind: Default::default(),
+        setup_affinity: None,
         resolved_path: None,
     }
 }

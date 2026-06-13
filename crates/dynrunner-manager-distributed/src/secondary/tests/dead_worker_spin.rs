@@ -112,6 +112,7 @@ fn make_binary(name: &str) -> dynrunner_core::TaskInfo<TestId> {
         preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
         kind: Default::default(),
+        setup_affinity: None,
         resolved_path: None,
     }
 }

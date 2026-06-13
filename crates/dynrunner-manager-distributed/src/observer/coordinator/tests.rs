@@ -54,6 +54,7 @@ fn task(phase: &str, id: &str, deps: &[(&str, &str)]) -> TaskInfo<TestId> {
             .collect(),
         preferred_secondaries: Default::default(),
         kind: Default::default(),
+        setup_affinity: None,
         resolved_path: None,
         preferred_version: Default::default(),
     }

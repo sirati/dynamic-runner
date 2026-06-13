@@ -294,6 +294,22 @@ fn roundtrip_all_message_types() {
                 "peer mesh fully failed to form: 0 of 4 peers reachable; cluster routing impossible"
                     .into(),
         },
+        DistributedMessage::SetupAssignment {
+            target: None,
+            sender_id: "p".into(),
+            timestamp: 0.0,
+            secondary_id: "s".into(),
+            task_hash: "h".into(),
+        },
+        DistributedMessage::SetupTerminal {
+            target: None,
+            sender_id: "s".into(),
+            timestamp: 0.0,
+            secondary_id: "s".into(),
+            task_hash: "h".into(),
+            success: true,
+            error_message: String::new(),
+        },
     ];
 
     for msg in &messages {
@@ -391,4 +407,81 @@ fn snapshot_stream_package_mirrors_literal_sender_bytes() {
         }
         other => panic!("expected SnapshotStreamPackage, got {:?}", other.msg_type()),
     }
+}
+
+/// Wire-shape mirror for `SetupAssignment` (primary → executor member):
+/// the EXACT bytes the primary's egress emits — tag, field names, field
+/// order, with `target` elided while `None`. Decode the literal, pin every
+/// field, then re-encode and require identical bytes back (NOT
+/// symmetric-on-the-wrong-shape).
+#[test]
+fn setup_assignment_mirrors_literal_sender_bytes() {
+    let literal = r#"{"msg_type":"setup_assignment","sender_id":"setup","timestamp":7.5,"secondary_id":"sec-0","task_hash":"abc123"}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(literal).unwrap();
+    match &decoded {
+        DistributedMessage::SetupAssignment {
+            target,
+            sender_id,
+            timestamp,
+            secondary_id,
+            task_hash,
+        } => {
+            assert!(target.is_none());
+            assert_eq!(sender_id, "setup");
+            assert_eq!(*timestamp, 7.5);
+            assert_eq!(secondary_id, "sec-0");
+            assert_eq!(task_hash, "abc123");
+        }
+        other => panic!("expected SetupAssignment, got {:?}", other.msg_type()),
+    }
+    let reencoded = serde_json::to_string(&decoded).unwrap();
+    assert_eq!(reencoded, literal);
+}
+
+/// Wire-shape mirror for `SetupTerminal` (executor member → primary): the
+/// EXACT bytes the off-primary executor's report emits, pinning the
+/// `success` bool and `error_message` shape on BOTH the success (empty
+/// message) and failure (non-empty message) variants.
+#[test]
+fn setup_terminal_mirrors_literal_sender_bytes() {
+    // Success report.
+    let ok = r#"{"msg_type":"setup_terminal","sender_id":"sec-0","timestamp":8.0,"secondary_id":"sec-0","task_hash":"abc123","success":true,"error_message":""}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(ok).unwrap();
+    match &decoded {
+        DistributedMessage::SetupTerminal {
+            target,
+            sender_id,
+            timestamp,
+            secondary_id,
+            task_hash,
+            success,
+            error_message,
+        } => {
+            assert!(target.is_none());
+            assert_eq!(sender_id, "sec-0");
+            assert_eq!(*timestamp, 8.0);
+            assert_eq!(secondary_id, "sec-0");
+            assert_eq!(task_hash, "abc123");
+            assert!(*success);
+            assert_eq!(error_message, "");
+        }
+        other => panic!("expected SetupTerminal, got {:?}", other.msg_type()),
+    }
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), ok);
+
+    // Failure report carries the reason.
+    let fail = r#"{"msg_type":"setup_terminal","sender_id":"sec-0","timestamp":8.0,"secondary_id":"sec-0","task_hash":"abc123","success":false,"error_message":"build action failed"}"#;
+    let decoded_fail: DistributedMessage<TestId> = serde_json::from_str(fail).unwrap();
+    match &decoded_fail {
+        DistributedMessage::SetupTerminal {
+            success,
+            error_message,
+            ..
+        } => {
+            assert!(!*success);
+            assert_eq!(error_message, "build action failed");
+        }
+        other => panic!("expected SetupTerminal, got {:?}", other.msg_type()),
+    }
+    assert_eq!(serde_json::to_string(&decoded_fail).unwrap(), fail);
 }

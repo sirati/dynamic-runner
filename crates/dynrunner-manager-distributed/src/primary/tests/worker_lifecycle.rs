@@ -357,7 +357,7 @@ async fn stale_complete_after_reassignment_is_noop_on_slot() {
             let batch = crate::worker_signal::recv_worker_signal_batch(&mut wm_rx)
                 .await
                 .expect("completion must emit a TasksAdded batch");
-            primary.react_to_worker_signal_batch(batch).await;
+            primary.react_to_worker_signal_batch(batch, &mut None).await;
             assert!(
                 primary.slot_holds_hash_for_test("sec-0", 0, &other_hash),
                 "worker reassigned to the other task by the deferred recheck"

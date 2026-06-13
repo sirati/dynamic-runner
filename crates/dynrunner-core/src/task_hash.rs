@@ -71,6 +71,7 @@ mod tests {
             task_id: "shared-id".into(),
             task_depends_on: Vec::<TaskDep>::new(),
             kind: Default::default(),
+            setup_affinity: None,
             preferred_secondaries: SoftPreferredSecondaries::default(),
             preferred_version: Default::default(),
             resolved_path: None,

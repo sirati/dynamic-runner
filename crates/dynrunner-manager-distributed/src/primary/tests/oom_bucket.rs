@@ -63,6 +63,7 @@ fn phased_task(name: &str, phase: &str, size: u64) -> TaskInfo<TestId> {
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
         kind: Default::default(),
+        setup_affinity: None,
         resolved_path: None,
     }
 }
@@ -283,7 +284,7 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
                 "the bucket's emit must carry a TasksAdded; got {:?}",
                 batch.signals
             );
-            primary.react_to_worker_signal_batch(batch).await;
+            primary.react_to_worker_signal_batch(batch, &mut None).await;
             // Let the pump drain the queued TaskAssignments onto the wire
             // before reading them (egress is QUEUED — M4).
             settle_pump().await;

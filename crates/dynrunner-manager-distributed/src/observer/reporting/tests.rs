@@ -44,6 +44,7 @@ fn task(task_id: &str, phase: &str, deps: &[&str]) -> TaskInfo<()> {
         preferred_secondaries: Default::default(),
         preferred_version: Default::default(),
         kind: Default::default(),
+        setup_affinity: None,
         resolved_path: None,
     }
 }

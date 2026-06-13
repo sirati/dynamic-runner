@@ -118,6 +118,26 @@ pub struct TaskInfo<I> {
     /// never changes its ledger key.
     #[serde(default, skip_serializing_if = "TaskKind::is_work")]
     pub kind: TaskKind,
+    /// EXECUTOR-affinity member for a [`TaskKind::Setup`] task: the peer
+    /// id of the source-owning member that runs this setup task IN-PROCESS
+    /// (zero-worker). For framework auto-staging this is the submitter /
+    /// observer; for a consumer setup task it is the consumer-specified
+    /// member (e.g. a compute node for `--build-compilers`). The primary's
+    /// setup selector targets exactly this member; the member's in-process
+    /// executor runs the task and originates its terminal.
+    ///
+    /// `None` on a [`TaskKind::Work`] task (the overwhelmingly-common case)
+    /// and on a `Setup` task whose affinity defaults to the primary itself
+    /// (the selector reads `None` as "run on the primary"). NOT part of
+    /// `compute_task_hash` (the recipe is `{phase_id, path, identifier}`),
+    /// so setting an executor affinity never changes the ledger key — it is
+    /// a routing concern, exactly like `preferred_secondaries`.
+    /// `#[serde(default)]` keeps the wire backward-compatible (a frame
+    /// without the field decodes as `None`); `skip_serializing_if` keeps the
+    /// common `None` case off the wire so a rolling upgrade is
+    /// indistinguishable for ordinary tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_affinity: Option<String>,
     /// Optional soft worker-pinning class. Items with the same `Some(id)` prefer
     /// the same worker for kernel page-cache reuse; `None` joins the free pool.
     pub affinity_id: Option<AffinityId>,

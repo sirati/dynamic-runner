@@ -60,6 +60,7 @@ pub(crate) mod resource;
 mod sampler_hooks;
 mod setup;
 mod setup_deadline;
+mod setup_exec;
 mod staging;
 mod stats;
 mod types;

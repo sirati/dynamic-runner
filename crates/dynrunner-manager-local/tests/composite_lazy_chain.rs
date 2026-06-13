@@ -59,6 +59,7 @@ fn make_task(name: &str, phase: &str, type_id: &str) -> TaskInfo<TestId> {
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
         kind: Default::default(),
+        setup_affinity: None,
         resolved_path: None,
     }
 }

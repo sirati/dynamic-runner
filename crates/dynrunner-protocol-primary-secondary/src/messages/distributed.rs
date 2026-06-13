@@ -1209,6 +1209,73 @@ pub enum DistributedMessage<I> {
         /// text in a JSON string.
         payload_b64: String,
     },
+    /// Primary -> setup-task affinity member: "RUN this `TaskKind::Setup`
+    /// task IN-PROCESS." The directed counterpart of
+    /// [`Self::TaskAssignment`] for a setup task — but a setup task is
+    /// NEVER worker-dispatched, so this frame routes to the member's
+    /// in-process setup EXECUTOR (not its worker pool) and carries no
+    /// worker id / binary descriptor.
+    ///
+    /// Carries only `task_hash`: the `TaskInfo` lives on the member's
+    /// replicated `cluster_state` (a prior `TaskAdded` broadcast seeded it
+    /// `Pending`), so the executor reads the task locally by hash rather
+    /// than re-shipping the descriptor. `secondary_id` names the addressed
+    /// affinity member (mirroring `TaskAssignment.secondary_id`) so a
+    /// broadcast-shaped delivery can self-filter. Sent only when the
+    /// affinity member is NOT the primary; a primary-affinity setup task is
+    /// executed locally with no wire frame.
+    SetupAssignment {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant. `#[serde(default, skip_serializing_if)]` keeps
+        /// the wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// The addressed executor-affinity member (mirrors
+        /// `TaskAssignment.secondary_id`).
+        secondary_id: String,
+        /// The setup task's ledger hash; the executor resolves the
+        /// `TaskInfo` from its own replicated `cluster_state`.
+        task_hash: String,
+    },
+    /// Setup-task affinity member -> primary: the TERMINAL of an
+    /// in-process setup-task execution. The setup-task counterpart of the
+    /// worker `TaskComplete` / `TaskFailed` reports — routed to the
+    /// primary's setup-terminal handler (NOT the worker terminal gate),
+    /// which originates the authoritative CRDT terminal:
+    /// `success = true` → [`crate::ClusterMutation::SetupCompleted`];
+    /// `success = false` → the EXISTING
+    /// `ClusterMutation::TaskFailed { kind: NonRecoverable }` (the same
+    /// terminal the executor-death seam drives — a setup task is
+    /// non-reassignable, so a failed execution is unrecoverable and its
+    /// dependents cascade).
+    ///
+    /// A SEPARATE report frame (not `TaskComplete`/`TaskFailed`): a setup
+    /// task has NO worker, so the worker-terminal handlers' worker-slot /
+    /// type-slot / `completed_tasks` machinery does not apply — threading a
+    /// setup terminal through them would scatter `if kind == Setup` through
+    /// the worker terminal path. This dedicated frame keeps the
+    /// setup-terminal concern self-contained. Sent only by an OFF-primary
+    /// executor; a primary-self-exec originates the CRDT terminal directly
+    /// with no wire frame.
+    SetupTerminal {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// The reporting executor member (the originator).
+        secondary_id: String,
+        /// The setup task's ledger hash this terminal resolves.
+        task_hash: String,
+        /// `true` ⇒ the action succeeded (→ `SetupCompleted`); `false` ⇒
+        /// it failed (→ `TaskFailed { NonRecoverable }`).
+        success: bool,
+        /// The operator-facing failure reason; empty on success.
+        error_message: String,
+    },
 }
 
 /// Which role's liveness a [`DistributedMessage::Keepalive`] asserts.

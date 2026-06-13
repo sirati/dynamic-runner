@@ -827,6 +827,7 @@ async fn ensure_worker_for_type_respawns_on_type_shift_and_is_idempotent_on_matc
             preferred_secondaries: SoftPreferredSecondaries::default(),
             preferred_version: Default::default(),
             kind: Default::default(),
+            setup_affinity: None,
             resolved_path: None,
         }
     }

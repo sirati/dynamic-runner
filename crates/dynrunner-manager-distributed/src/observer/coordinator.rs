@@ -745,6 +745,14 @@ where
         &self.cluster_state
     }
 
+    /// This observer's own peer id. Read by the setup-task executor twin
+    /// (`observer::setup_exec`) to stamp its `SetupTerminal` report; a thin
+    /// accessor so the sibling module need not reach into the private
+    /// `config` field.
+    pub(crate) fn node_id(&self) -> &str {
+        &self.config.node_id
+    }
+
     /// Tasks the cluster recorded as successfully completed, read off the
     /// observer's moved-in (converged) `cluster_state`. Same CRDT reader
     /// (`outcome_counts().succeeded`) the primary's `completed_count` routes
@@ -810,7 +818,7 @@ where
     /// The mesh-pump (not this coordinator) does loopback-vs-remote; an
     /// observer never loops back, so the resolved self case is the same
     /// best-effort drop the original held.
-    async fn send_to(
+    pub(crate) async fn send_to(
         &mut self,
         dst: Destination,
         msg: DistributedMessage<I>,
@@ -1870,6 +1878,17 @@ where
                 new_secondary_id, ..
             } => {
                 self.on_respawn_revoke_request(new_secondary_id).await;
+            }
+            // The primary directed a `TaskKind::Setup` task to THIS observer's
+            // in-process executor (framework auto-staging affinity = the
+            // submitter, which runs as a standalone observer after a
+            // bootstrap relocation). The observer runs it poolless and reports
+            // the terminal to the primary (it holds zero authority — the
+            // primary originates the CRDT terminal). Body + report live in
+            // `observer::setup_exec`; this is the one-line delegate, the twin
+            // of the secondary's router arm.
+            DistributedMessage::SetupAssignment { task_hash, .. } => {
+                self.execute_setup_assignment(task_hash).await;
             }
             // Every other frame is irrelevant to a zero-authority
             // observer (it owns no dispatch / setup / election concern).

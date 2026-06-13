@@ -356,7 +356,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     .as_mut()
                     .and_then(crate::worker_signal::try_collect_worker_signal_batch)
                 {
-                    self.react_to_worker_signal_batch(batch).await;
+                    self.react_to_worker_signal_batch(batch, &mut command_rx).await;
                 }
                 if self.worker_mgmt_fail_outcome.is_none() {
                     break;
@@ -419,7 +419,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     .as_mut()
                     .and_then(crate::worker_signal::try_collect_worker_signal_batch)
                 {
-                    self.react_to_worker_signal_batch(batch).await;
+                    self.react_to_worker_signal_batch(batch, &mut command_rx).await;
                 }
                 break;
             }
@@ -682,7 +682,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             // that emitted the signals never touched
                             // worker management directly (the
                             // dispatch-decoupling law).
-                            self.react_to_worker_signal_batch(batch).await;
+                            self.react_to_worker_signal_batch(batch, &mut command_rx).await;
                         }
                         None => {
                             // Every sender dropped. Same as the matcher

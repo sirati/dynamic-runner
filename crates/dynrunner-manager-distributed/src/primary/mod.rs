@@ -44,6 +44,7 @@ mod reconciliation_probe;
 pub mod respawn;
 pub(crate) mod retry_bucket;
 mod secondary_id;
+mod setup_dispatch;
 pub mod staging;
 pub(crate) mod task;
 mod terminal_gate;

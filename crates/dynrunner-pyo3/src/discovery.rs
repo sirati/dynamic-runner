@@ -194,6 +194,7 @@ fn pytaskinfo_from_mark(
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
         kind: Default::default(),
+        setup_affinity: None,
         resolved_path: None,
     };
     Ok(PyTaskInfo::from(&task))

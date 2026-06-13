@@ -20,6 +20,7 @@ pub(crate) mod run_narrator;
 pub mod runtime_watchdog;
 pub(crate) mod warn_throttle;
 pub mod secondary;
+pub mod setup_exec;
 pub mod state;
 pub mod task_completed;
 pub mod worker_messages;

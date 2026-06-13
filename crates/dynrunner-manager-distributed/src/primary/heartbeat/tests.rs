@@ -192,6 +192,7 @@ fn task(label: &str, depends_on: &[(&str, &str)]) -> TaskInfo<TestId> {
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
         kind: Default::default(),
+        setup_affinity: None,
         resolved_path: None,
     }
 }
@@ -285,6 +286,7 @@ async fn dead_secondary_requeues_in_flight_task() {
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
         kind: Default::default(),
+        setup_affinity: None,
         resolved_path: None,
     };
     primary.stage_in_flight_for_test("dead-sec".into(), 0, in_flight.clone());
@@ -488,6 +490,7 @@ fn register_operational_secondary<S, E>(
             preferred_secondaries: SoftPreferredSecondaries::default(),
             preferred_version: Default::default(),
             kind: Default::default(),
+            setup_affinity: None,
             resolved_path: None,
         },
     );
@@ -751,7 +754,7 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
             // (correctly) treat the freshly-assigned-to survivor as a silent
             // holder and evict it — a test artifact, not the kickstart contract.
             primary.record_keepalive("sec-b");
-            primary.react_to_worker_signal_batch(batch).await;
+            primary.react_to_worker_signal_batch(batch, &mut None).await;
 
             // The load-bearing assertion: sec-b's outgoing channel saw a
             // `TaskAssignment` — i.e. the recheck re-dispatched to the
@@ -852,6 +855,7 @@ async fn r1_dead_secondary_requeue_then_hydrate_redispatches_exactly_once() {
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
         kind: Default::default(),
+        setup_affinity: None,
         resolved_path: None,
     };
     let victim_hash = primary.stage_in_flight_for_test("dead-sec".into(), 0, victim.clone());
@@ -1462,7 +1466,7 @@ async fn lazy_requeue_fires_at_dispatch_altitude_when_only_silent_held_work_rema
             let batch = crate::worker_signal::WorkerSignalBatch {
                 signals: vec![crate::worker_signal::WorkerMgmtSignal::TasksAdded],
             };
-            primary.react_to_worker_signal_batch(batch).await;
+            primary.react_to_worker_signal_batch(batch, &mut None).await;
 
             assert!(
                 !primary.secondaries.contains_key("sec-a"),
@@ -1481,7 +1485,7 @@ async fn lazy_requeue_fires_at_dispatch_altitude_when_only_silent_held_work_rema
             // Keep the survivor live across the re-dispatch reaction (production
             // invariant: a live secondary keeps sending keepalives).
             primary.record_keepalive("sec-b");
-            primary.react_to_worker_signal_batch(followup).await;
+            primary.react_to_worker_signal_batch(followup, &mut None).await;
 
             // The re-dispatch TaskAssignment is a QUEUED mesh send; settle the
             // production pump so it drains onto sec-b's outgoing channel before
