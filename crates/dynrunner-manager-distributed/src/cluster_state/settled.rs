@@ -207,6 +207,7 @@ pub(crate) struct SettledSegment {
 /// [`crate::process::PromotionSignal`] field / builder parameter — the
 /// pyo3 recipe threads it into the promoted primary opaquely
 /// (`adopt_settled_base`); every method stays `pub(crate)`.
+#[derive(Default)]
 pub struct SettledStore {
     index: HashMap<String, SettledEntry>,
     segments: Vec<SettledSegment>,
@@ -220,19 +221,6 @@ pub struct SettledStore {
     records_committed: u64,
     /// Running estimate of resident index bytes (the memory-pin seam).
     approx_index_bytes: usize,
-}
-
-impl Default for SettledStore {
-    fn default() -> Self {
-        Self {
-            index: HashMap::new(),
-            segments: Vec::new(),
-            tasks_hash_acc: 0,
-            own_segment: None,
-            records_committed: 0,
-            approx_index_bytes: 0,
-        }
-    }
 }
 
 /// `Clone` IS the read-only clone ([`SettledStore::clone_read_only`]):

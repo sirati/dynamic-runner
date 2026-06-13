@@ -332,11 +332,15 @@ fn settled_index_bytes_far_below_fat_bytes() {
         t.path = std::path::PathBuf::from(format!(
             "/very/long/staged/source/tree/path/segment/{name}/binary.tar"
         ));
+        // ~2 KB opaque payload — the production `TaskInfo.payload` shape
+        // (consumer metadata) the slim index does NOT retain. The real
+        // 46.5k-task ledger's multi-GB footprint is exactly this fat
+        // per-item body × N; the slim index keeps only id/phase/deps.
         t.payload = serde_json::json!({
             "toolchain": "clang-17-x86_64-unknown-linux-gnu",
             "flags": ["-O2", "-march=native", "-flto", "-fno-omit-frame-pointer"],
             "variant": format!("variant-of-{name}"),
-            "blob": "x".repeat(256),
+            "blob": "x".repeat(2048),
         });
         t
     };

@@ -336,7 +336,7 @@ impl SettledSpillDriver {
         }
         self.ticks_since_stats = 0;
         let store = state.settled_store();
-        if store.len() == 0 && self.degraded {
+        if store.is_empty() && self.degraded {
             return;
         }
         tracing::info!(
