@@ -219,6 +219,11 @@ impl PySecondaryCoordinator {
                 self.task_definition_py.bind(py),
                 self.task_args_py.bind(py),
             );
+        // Framework file-staging selector (#489 P3/P4) for the relocate-target
+        // primary, sourced from this node's OWN run-uniform `task_args` (same
+        // local-producer discipline as the two staging flags above — a
+        // relocate target has no `InitialAssignment` cell at promotion).
+        let promote_staging_strategy = extract_staging_strategy(self.task_args_py.bind(py));
         // Panik-watcher config captured before `py.detach` so the
         // tokio-runtime closure owns its own copy. Cloning a `Vec<PathBuf>`
         // is cheap; the watcher only needs read-only access.
@@ -905,6 +910,7 @@ impl PySecondaryCoordinator {
                     pre_staged_mode: promote_pre_staged_mode,
                     source_pre_staged_root: promote_pre_staged_root,
                     source_dir: promote_source_dir,
+                    staging_strategy: promote_staging_strategy,
                     setup_discovery: Some(setup_discovery),
                     // The node-bound liveness listener's ping receiver: the
                     // promoted primary folds beacon datagrams into the
@@ -1194,6 +1200,16 @@ pub(crate) struct PromotedPrimaryRecipeInputs {
     /// submitter had. `None` for callers without a local source root
     /// (`uses_file_based_items=false` / pre-staged / tests).
     pub source_dir: Option<std::path::PathBuf>,
+    /// Framework file-staging selector (#489 P3/P4) the PROMOTED primary uses.
+    /// `StagingStrategy::SetupTasks` when `--stage-via-setup-tasks` is on:
+    /// the relocate-target primary's `discover_on_promotion` seeds the
+    /// discovered corpus's files as per-file pre-succeeded setup tasks
+    /// (+ `TaskDep` gating) — the #488-free path on the relocate target.
+    /// `StagingStrategy::Disabled` (default) keeps the old StageFile path.
+    /// Unlike `pre_staged_mode`/`uses_file_based_items` (wire-fed cells that
+    /// default-stamp at promotion), this is a NODE-LOCAL launch constant the
+    /// recipe carries directly from the manager's `stage_via_setup_tasks` flag.
+    pub staging_strategy: dynrunner_manager_distributed::StagingStrategy,
     /// The consumer's discovery policy + phase graph for the PROMOTED primary's
     /// `discover_on_promotion` driver (mode-2 relocate — SLURM submitter OR the
     /// in-process `--source-already-staged` setup peer that relocates onto this
@@ -1282,6 +1298,31 @@ fn extract_staging_dispatch_flags(
     (uses_file_based_items, pre_staged_mode)
 }
 
+/// Derive the framework file-staging strategy (#489 P3/P4) for a PROMOTED
+/// primary from this node's OWN local producer (`task_args`), the same
+/// run-uniform source `extract_staging_dispatch_flags` reads. A relocate
+/// target has no `InitialAssignment` cell at promotion, so the strategy — like
+/// `pre_staged_mode` — is sourced from the booted `task_args`, NOT the wire.
+///
+/// `task_args.stage_via_setup_tasks` truthy → `StagingStrategy::SetupTasks`;
+/// missing / falsey → `StagingStrategy::Disabled` (the old StageFile path).
+/// Mirrors the submitter's `--stage-via-setup-tasks` CLI flag, which the run's
+/// forwarded argv reconstructs identically on every node.
+fn extract_staging_strategy(
+    task_args: &Bound<'_, PyAny>,
+) -> dynrunner_manager_distributed::StagingStrategy {
+    let on = task_args
+        .getattr("stage_via_setup_tasks")
+        .ok()
+        .and_then(|v| v.extract::<bool>().ok())
+        .unwrap_or(false);
+    if on {
+        dynrunner_manager_distributed::StagingStrategy::SetupTasks
+    } else {
+        dynrunner_manager_distributed::StagingStrategy::Disabled
+    }
+}
+
 /// Build the `PromotedPrimaryBuilder` recipe `Node::run` invokes on a
 /// promotion signal to construct the snapshot-seeded `PrimaryCoordinator`.
 ///
@@ -1328,6 +1369,7 @@ pub(crate) fn build_promoted_primary_recipe(
         pre_staged_mode,
         source_pre_staged_root,
         source_dir,
+        staging_strategy,
         setup_discovery,
         liveness_ping_rx,
         peer_liveness_addrs,
@@ -1406,6 +1448,12 @@ pub(crate) fn build_promoted_primary_recipe(
                 None
             },
             source_dir: source_dir.clone(),
+            // Framework file-staging selector (#489 P3/P4): the relocate-target
+            // primary uses the SAME strategy the submitter did. On
+            // `SetupTasks`, this primary's `discover_on_promotion` seeds the
+            // discovered files as per-file pre-succeeded setup tasks — the
+            // #488-free path on the relocate target.
+            staging_strategy,
             ..PrimaryConfig::default()
         };
         let mut primary = PrimaryCoordinator::new(
@@ -2569,6 +2617,7 @@ task = Task()
                 pre_staged_mode: false,
                 source_pre_staged_root: None,
                 source_dir: None,
+                staging_strategy: dynrunner_manager_distributed::StagingStrategy::Disabled,
                 setup_discovery: None,
                 liveness_ping_rx: None,
                 peer_liveness_addrs: None,
@@ -2677,6 +2726,7 @@ task = Task()
                 pre_staged_mode: false,
                 source_pre_staged_root: None,
                 source_dir: None,
+                staging_strategy: dynrunner_manager_distributed::StagingStrategy::Disabled,
                 setup_discovery: None,
                 liveness_ping_rx: None,
                 peer_liveness_addrs: None,
@@ -2785,6 +2835,7 @@ task = Task()
                 pre_staged_mode: false,
                 source_pre_staged_root: None,
                 source_dir: None,
+                staging_strategy: dynrunner_manager_distributed::StagingStrategy::Disabled,
                 setup_discovery: None,
                 liveness_ping_rx: None,
                 peer_liveness_addrs: None,

@@ -85,6 +85,14 @@ pub(crate) struct PyDistributedManager {
     /// The cold path (`None`) discovers the corpus upfront in Python and
     /// cold-seeds it (`DiscoveryDebt` stays `Undeclared`).
     pub(super) source_pre_staged_root: Option<PathBuf>,
+    /// Framework file-staging selector (`--stage-via-setup-tasks`, #489 P3/P4):
+    /// `false` (default) → the OLD StageFile path; `true` → the setup-task
+    /// model (per-file pre-succeeded setup tasks + `TaskDep` gating, the
+    /// #488-free path). Threaded into `PrimaryConfig.staging_strategy` for BOTH
+    /// the bootstrap in-process primary AND every per-secondary promote recipe
+    /// (the relocate target, where the mode-2 discovery seeds the setup tasks),
+    /// so the flag is honored on whichever peer holds the primary.
+    pub(super) stage_via_setup_tasks: bool,
     /// Held for the per-phase lifecycle hooks that re-acquire the GIL
     /// from inside `PrimaryCoordinator::run` (Phase 5B). The
     /// distributed in-process pipeline drives a primary; secondaries

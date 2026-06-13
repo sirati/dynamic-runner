@@ -37,6 +37,7 @@ use super::module;
     log_paths = None,
     worker_spec = None,
     source_pre_staged_root = None,
+    stage_via_setup_tasks = false,
     fulfillability_matcher = None,
     peer_lifecycle_listener = None,
     task_completed_listener = None,
@@ -60,6 +61,7 @@ pub(crate) fn run_distributed<'py>(
     log_paths: Option<LogPathConfig>,
     worker_spec: Option<WorkerSpec>,
     source_pre_staged_root: Option<std::path::PathBuf>,
+    stage_via_setup_tasks: bool,
     fulfillability_matcher: Option<Py<PyAny>>,
     peer_lifecycle_listener: Option<Py<PyAny>>,
     task_completed_listener: Option<Py<PyAny>>,
@@ -97,6 +99,14 @@ pub(crate) fn run_distributed<'py>(
     )?;
     if let Some(root) = source_pre_staged_root.as_ref() {
         kwargs.set_item("source_pre_staged_root", root)?;
+    }
+    // Framework file-staging selector (#489 P3/P4): forward the
+    // `--stage-via-setup-tasks` flag to `RustDistributedManager`, which
+    // threads it into the bootstrap primary's + every promote recipe's
+    // `PrimaryConfig.staging_strategy`. Only set when on (the constructor
+    // defaults to `false` = the old StageFile path).
+    if stage_via_setup_tasks {
+        kwargs.set_item("stage_via_setup_tasks", true)?;
     }
     if let Some(m) = fulfillability_matcher.as_ref() {
         kwargs.set_item("fulfillability_matcher", m)?;

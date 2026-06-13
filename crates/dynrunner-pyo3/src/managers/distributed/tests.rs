@@ -107,6 +107,7 @@ fn build_manager(py: Python<'_>, cap: Option<u32>) -> PyResult<Py<PyDistributedM
         /* distributed_config */ None,
         /* max_resources_per_secondary */ None,
         /* source_pre_staged_root */ None,
+        /* stage_via_setup_tasks */ false,
         /* peer_lifecycle_listener */ None,
         /* task_completed_listener */ None,
         /* unfulfillable_reinject_max_per_task */ cap,

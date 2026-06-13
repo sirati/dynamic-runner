@@ -95,6 +95,30 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .collect()
     }
 
+    /// Map the framework-staging `pre_succeeded` setup-task hashes (#489 P3)
+    /// to `Pending → SetupCompleted` transitions — the setup-task parallel of
+    /// [`Self::skip_transitions`]. Each hash was seeded `Pending` by the
+    /// `TaskAdded` fan-out (the setup task rides the batch alongside its
+    /// dependent work task); this materialises it PRE-SUCCEEDED in the SAME
+    /// local-apply pass, so hydrate routes its `task_id` into
+    /// `completed_task_ids` and the dependent work task's `TaskDep`
+    /// pre-resolves to `Pending` (never `Blocked`) — the #488-free path. The
+    /// `SetupCompleted` apply rule gates on `Pending` | `InFlight`, so a hash
+    /// already moved off `Pending` is a harmless NoOp. Shared by both
+    /// originators (`originate_cold_seed` / `discover_on_promotion`) so the
+    /// pre-succeeded seeding has one owner.
+    ///
+    /// Empty when the flag is off (the augmentation produced no setup tasks).
+    pub(crate) fn setup_completed_transitions(
+        &self,
+        pre_succeeded: &[String],
+    ) -> Vec<ClusterMutation<I>> {
+        pre_succeeded
+            .iter()
+            .map(|hash| ClusterMutation::SetupCompleted { hash: hash.clone() })
+            .collect()
+    }
+
     /// Cold-start CRDT origination: turn the bootstrap task batch into the
     /// freshly-seeded replicated ledger `hydrate_from_cluster_state` then
     /// builds the pool from.
@@ -152,6 +176,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         marked_batch: Vec<(TaskInfo<I>, bool)>,
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     ) -> Result<(), RunError> {
+        // Framework flagged staging (#489 P3): when `--stage-via-setup-tasks`
+        // is on, augment the batch with a per-file PRE-SUCCEEDED setup task
+        // per file-backed work task + the work task's `TaskDep` on it. A no-op
+        // (identity transform) when the flag is off — the default cold seed is
+        // byte-for-byte unchanged. The `pre_succeeded` hashes are transitioned
+        // `Pending → SetupCompleted` below alongside the skip transitions.
+        let crate::primary::StagingAugmentation {
+            batch: marked_batch,
+            pre_succeeded: staging_pre_succeeded,
+        } = crate::primary::augment_batch_for_staging(
+            marked_batch,
+            self.config.staging_strategy,
+        );
         // NB: `phase_started_emitted` is NOT cleared here (V3). Seeding it is
         // now `hydrate_from_cluster_state`'s sole concern, derived from the
         // CRDT (`has_any && has-a-non-pending/blocked-task` per phase) on BOTH
@@ -311,6 +348,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // weakest-terminal lockout). One shared helper with
         // `discover_on_promotion` — no duplicated partition logic.
         seed.extend(self.skip_transitions(&marked_batch));
+        // Framework flagged staging (#489 P3): transition each pre-staged
+        // file's setup task `Pending → SetupCompleted` in the SAME local-apply
+        // pass (parallel to the skip transitions above), so hydrate routes its
+        // `task_id` into `completed_task_ids` and its dependent work task's
+        // `TaskDep` pre-resolves to `Pending`. Empty when the flag is off.
+        seed.extend(self.setup_completed_transitions(&staging_pre_succeeded));
         // #2: transition each missing-dep task `Pending → InvalidTask` in the
         // SAME local-apply pass, so hydrate sees them terminal (dep-seed, out
         // of pool) — the faithful equivalent of the pre-F1 pool pre-fail. The

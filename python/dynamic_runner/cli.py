@@ -726,6 +726,21 @@ def add_framework_arguments(
         ),
     )
     parser.add_argument(
+        "--stage-via-setup-tasks",
+        action="store_true",
+        default=False,
+        help=(
+            "Use the setup-task model for the framework's file-staging instead "
+            "of the legacy StageFile pass. Each file-backed task is gated on a "
+            "per-file setup task that is recorded as pre-succeeded in the "
+            "replicated ledger, so any primary (original, relocated, or "
+            "promoted) reads the staging state from the ledger rather than a "
+            "per-node mode flag. Fixes the relocated-primary staging mis-stamp "
+            "(#488) on this path. When off (the default), the legacy StageFile "
+            "staging runs unchanged."
+        ),
+    )
+    parser.add_argument(
         "--jobs",
         type=positive_int,
         default=1,

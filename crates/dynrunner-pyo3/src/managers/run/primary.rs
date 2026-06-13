@@ -57,6 +57,7 @@ use super::module;
     output_dir = None,
     task_args = None,
     source_pre_staged_root = None,
+    stage_via_setup_tasks = false,
     unfulfillable_reinject_max_per_task = None,
     respawn_policy = None,
     respawn_spawner = None,
@@ -78,6 +79,7 @@ pub(crate) fn run_primary<'py>(
     output_dir: Option<String>,
     task_args: Option<Py<PyAny>>,
     source_pre_staged_root: Option<std::path::PathBuf>,
+    stage_via_setup_tasks: bool,
     unfulfillable_reinject_max_per_task: Option<u32>,
     respawn_policy: Option<Py<PyAny>>,
     respawn_spawner: Option<Py<PyAny>>,
@@ -95,6 +97,13 @@ pub(crate) fn run_primary<'py>(
     }
     if let Some(root) = source_pre_staged_root.as_ref() {
         kwargs.set_item("source_pre_staged_root", root)?;
+    }
+    // Framework file-staging selector (#489 P3/P4): forward the
+    // `--stage-via-setup-tasks` flag to `RustPrimaryCoordinator`, which threads
+    // it into `PrimaryConfig.staging_strategy`. Only set when on (the
+    // constructor defaults to `false` = the old StageFile path).
+    if stage_via_setup_tasks {
+        kwargs.set_item("stage_via_setup_tasks", true)?;
     }
     if let Some(n) = unfulfillable_reinject_max_per_task {
         kwargs.set_item("unfulfillable_reinject_max_per_task", n)?;

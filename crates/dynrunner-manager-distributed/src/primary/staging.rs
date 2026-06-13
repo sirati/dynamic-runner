@@ -247,6 +247,22 @@ where
     /// caller forgot to thread `source_dir` is visible without
     /// silently losing staging.
     pub(super) fn maybe_auto_stage_initial(&mut self) -> Result<(), String> {
+        // Framework flagged staging (#489 P3): when `--stage-via-setup-tasks`
+        // is on, file-staging is the setup-task model (per-file pre-succeeded
+        // setup tasks seeded at run-seed time), so the OLD StageFile fan-out
+        // MUST NOT also run — the two staging systems never both execute (no
+        // double-staging). The selector is the SOLE branch on the strategy in
+        // this module; the setup-task path's seeding lives entirely in the
+        // seed originators (`originate_cold_seed` / `discover_on_promotion`),
+        // not here.
+        if self.config.staging_strategy != crate::primary::StagingStrategy::Disabled {
+            tracing::debug!(
+                "auto-stage skipped: staging-via-setup-tasks is on (the \
+                 setup-task model seeds per-file pre-succeeded setup tasks at \
+                 run-seed time; the old StageFile fan-out does not run)"
+            );
+            return Ok(());
+        }
         // Resume detection (failover-promotion). A promoted primary that
         // INHERITED a populated CRDT is RESUMING an already-running run —
         // the corpus was staged once by the run's original primary and

@@ -62,6 +62,7 @@ mod run_start_raise;
 mod setup_dispatch;
 mod setup_kind;
 mod setup_promote;
+mod setup_staging;
 mod stranded;
 mod terminal_ack;
 mod terminal_verdict;

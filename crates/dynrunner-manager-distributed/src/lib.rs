@@ -34,7 +34,7 @@ pub use primary::staging::{StagingEntry, StagingError, compute_initial_staging_e
 pub use primary::wire::compute_task_hash;
 pub use primary::{
     PhaseHookRaiseLatch, PrimaryConfig, PrimaryCoordinator, PrimaryRunOutcome, RunError,
-    derive_connect_timeout,
+    StagingAugmentation, StagingStrategy, augment_batch_for_staging, derive_connect_timeout,
 };
 pub use discovery::{SetupDiscovery, SetupDiscoveryFn};
 // The operator's SIGUSR2 graceful-abort trigger — armed once at process

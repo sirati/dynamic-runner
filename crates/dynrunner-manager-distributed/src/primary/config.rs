@@ -328,6 +328,31 @@ pub struct PrimaryConfig {
     /// fake workers that never open them).
     pub source_dir: Option<std::path::PathBuf>,
 
+    /// Which framework file-staging system this run uses — the SELECTOR for
+    /// the `--stage-via-setup-tasks` feature (#489 P3/P4).
+    ///
+    /// [`StagingStrategy::Disabled`] (the default) keeps the OLD staging path
+    /// (`maybe_auto_stage_initial` / `StageFile` / `source_pre_staged_root`)
+    /// byte-for-byte: the cold seed is un-augmented and the post-connect
+    /// StageFile fan-out runs exactly as before.
+    ///
+    /// [`StagingStrategy::SetupTasks`] (flag on) routes file-staging through
+    /// the setup-task model: each file-backed work task is gated on a
+    /// per-file PRE-SUCCEEDED setup task seeded into the replicated ledger
+    /// (the #488-free path — any primary reads the ledger, no
+    /// `pre_staged_mode` to mis-stamp). When on, the OLD StageFile fan-out
+    /// (`maybe_auto_stage_initial`) is SUPPRESSED — the two systems never both
+    /// run (no double-staging). The submitter's pre-`run()` upload
+    /// (`upload_source_binaries`, mode-1) is independent of this selector and
+    /// still runs when the corpus is on the submitter; only the in-cluster
+    /// StageFile notification path is governed here.
+    ///
+    /// One field, consumed at exactly TWO seams: the seed originators
+    /// (`originate_cold_seed` / `discover_on_promotion`, which apply the
+    /// augmentation transform) and `maybe_auto_stage_initial` (which
+    /// short-circuits when on). No other code branches on it.
+    pub staging_strategy: crate::primary::StagingStrategy,
+
     /// Per-task budget cap for `PrimaryCommand::ReinjectTask` (the
     /// `PrimaryHandle::reinject_task` PyO3 entry point). `None`
     /// (the default) means unbounded — a control plane that
@@ -420,6 +445,7 @@ impl Default for PrimaryConfig {
             fleet_dead_timeout: Duration::from_secs(30),
             mesh_ready_timeout: Duration::from_secs(60),
             source_dir: None,
+            staging_strategy: crate::primary::StagingStrategy::Disabled,
             unfulfillable_reinject_max_per_task: None,
             forwarded_argv: Vec::new(),
             peer_credentials_path: None,
