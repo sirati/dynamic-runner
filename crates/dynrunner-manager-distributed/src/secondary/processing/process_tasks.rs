@@ -497,6 +497,10 @@ where
                     // post-lag evidence instead of declaring live peers dead
                     // off our own stall (#423).
                     self.own_tick_health.observe_tick(std::time::Instant::now());
+                    // Periodic collection-stats line (accumulation
+                    // visibility for the unbounded collections) — cheap
+                    // off-cadence, emits every COLLECTION_STATS_INTERVAL.
+                    self.observe_collection_stats();
                     self.send_keepalive().await;
                     self.check_peer_timeouts();
                     self.check_peer_mesh_watchdog().await;

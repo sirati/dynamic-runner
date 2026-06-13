@@ -61,6 +61,7 @@ mod sampler_hooks;
 mod setup;
 mod setup_deadline;
 mod staging;
+mod stats;
 mod types;
 mod wait_marks;
 mod wire;
@@ -867,4 +868,13 @@ where
     /// See [`crate::oploop_instrumentation::OpLoopArmStatsCell`].
     pub(in crate::secondary) op_loop_arm_stats_cell:
         Option<crate::oploop_instrumentation::OpLoopArmStatsCell>,
+
+    /// Cadence state for the periodic collection-stats line — the
+    /// accumulation-visibility twin of `op_loop_arm_stats` for the
+    /// unbounded-by-design collections this coordinator holds (the
+    /// replicated custom-message inbox mirror, the confirmable-report
+    /// replay buffer, the role inbox). Driven once per keepalive tick
+    /// (`observe_collection_stats`); policy + thresholds live in
+    /// [`crate::collection_stats`].
+    pub(in crate::secondary) collection_stats: crate::collection_stats::CollectionStatsEmitter,
 }

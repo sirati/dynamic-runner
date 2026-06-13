@@ -211,6 +211,9 @@ where
             delivery_ack_timeout: resource::DEFAULT_DELIVERY_ACK_TIMEOUT,
             op_loop_arm_stats: None,
             op_loop_arm_stats_cell: None,
+            collection_stats: crate::collection_stats::CollectionStatsEmitter::new(
+                std::time::Instant::now(),
+            ),
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
