@@ -77,7 +77,7 @@ async fn run_dispatch_recheck(primary: &mut TestPrimary) {
     let batch = recv_worker_signal_batch(&mut wm_rx)
         .await
         .expect("emit must produce a batch");
-    primary.react_to_worker_signal_batch(batch).await;
+    primary.react_to_worker_signal_batch(batch, &mut None).await;
 }
 
 /// THE strand-prevention pin. Two members each with one idle worker:
@@ -348,7 +348,7 @@ async fn first_dispatch_to_unconfirmed_member_is_withheld_until_mesh_ready() {
             .await
             .expect("a landing MeshReady must wake dispatch (TasksAdded on the bus)")
             .expect("emit must produce a batch");
-            primary.react_to_worker_signal_batch(batch).await;
+            primary.react_to_worker_signal_batch(batch, &mut None).await;
             settle_pump().await;
 
             assert_eq!(

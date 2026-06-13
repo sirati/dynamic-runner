@@ -322,6 +322,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             MessageType::TaskComplete | MessageType::TaskFailed => {
                 self.ingest_task_terminal(msg, command_rx).await
             }
+            // Off-primary setup-task executor's terminal report (the
+            // setup-task counterpart of a worker terminal). Routed to the
+            // dedicated setup-terminal handler — a setup task has no worker
+            // slot, so it does NOT go through the worker terminal gate. The
+            // handler originates the authoritative CRDT terminal
+            // (`SetupCompleted` / `TaskFailed { NonRecoverable }`). See
+            // `primary::setup_dispatch`.
+            MessageType::SetupTerminal => self.handle_setup_terminal(msg, command_rx).await,
             // Consumer custom message (F5): droppable → direct handler
             // dispatch; important → CRDT-post + the handler-dispatch
             // decision. The ack echo for an important landing already

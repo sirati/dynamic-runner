@@ -216,6 +216,7 @@ mod tests {
             ),
             preferred_version: Default::default(),
             kind: Default::default(),
+            setup_affinity: None,
             resolved_path: None,
         }
     }
@@ -310,6 +311,7 @@ mod tests {
             ),
             preferred_version: Default::default(),
             kind: Default::default(),
+            setup_affinity: None,
             resolved_path: None,
         }
     }

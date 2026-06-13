@@ -63,6 +63,7 @@ fn make_binary(name: &str, phase: &str) -> TaskInfo<TestId> {
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
         kind: Default::default(),
+        setup_affinity: None,
         resolved_path: None,
     }
 }

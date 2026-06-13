@@ -108,6 +108,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `.await`s its own spawn_blocking GIL handle). `Err` aborts the run.
         let binaries = (sd.discover)().await.map_err(RunError::Other)?;
 
+        // Framework flagged staging (#489 P3): augment the discovered batch
+        // with per-file PRE-SUCCEEDED setup tasks + the work tasks' `TaskDep`
+        // gates, exactly as `originate_cold_seed` does. This is the mode-2
+        // `--source-already-staged` path — the corpus is discovered POST-
+        // relocate, so the SAME augmentation transform runs HERE on the
+        // discovered batch (the transform is shared, like `skip_transitions`).
+        // A no-op (identity) when the flag is off.
+        let crate::primary::StagingAugmentation {
+            batch: binaries,
+            pre_succeeded: staging_pre_succeeded,
+        } = crate::primary::augment_batch_for_staging(binaries, self.config.staging_strategy);
+
         // ONE atomic batch so "the tasks are now in the CRDT" and "debt
         // settled" land together on the wire — no window where a peer sees
         // `Settled` without the tasks or vice versa. PhaseDepsSet first (so
@@ -129,6 +141,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `SkippedAlreadyDone`. One shared helper with `originate_cold_seed`
         // — no duplicated partition logic.
         batch.extend(self.skip_transitions(&binaries));
+        // Framework flagged staging (#489 P3): transition each pre-staged
+        // file's setup task `Pending → SetupCompleted` — the SAME shared
+        // helper the cold seed uses, so the pre-succeeded seeding has one
+        // owner on both originators. Empty when the flag is off.
+        batch.extend(self.setup_completed_transitions(&staging_pre_succeeded));
         batch.push(ClusterMutation::DiscoverySettled);
         self.apply_and_broadcast_cluster_mutations(batch).await;
 

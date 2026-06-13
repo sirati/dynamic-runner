@@ -54,6 +54,7 @@ pub(super) fn mk_task(name: &str) -> TaskInfo<RunnerIdentifier> {
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
         kind: Default::default(),
+        setup_affinity: None,
         resolved_path: None,
     }
 }

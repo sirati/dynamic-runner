@@ -128,7 +128,12 @@ where
     /// into the live `PendingPool` so the next dispatch tick picks
     /// them up. The CRDT and pool stay coherent without a per-task
     /// re-cascade walk here.
-    pub(super) async fn apply_fail_permanent(
+    // `pub(crate)` (not `pub(super)`): the permanent-failure cascade is the
+    // shared non-recoverable terminal path. Besides the command channel, the
+    // setup-task terminal sink (`primary::setup_dispatch::settle_setup_terminal`)
+    // routes a FAILED setup task through it so a setup failure cascades to
+    // dependents identically to a non-recoverable worker terminal.
+    pub(crate) async fn apply_fail_permanent(
         &mut self,
         hash: String,
         error: ErrorType,

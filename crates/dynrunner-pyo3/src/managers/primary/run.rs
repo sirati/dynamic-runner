@@ -62,6 +62,17 @@ impl PyPrimaryCoordinator {
         // inside the detached-runtime closure before the seed is built.
         let source_pre_staged = source_pre_staged_root.is_some();
         let source_dir = self.source_dir.clone();
+        // The framework file-staging selector (#489 P3/P4): the
+        // `stage_via_setup_tasks` kwarg maps to the typed `StagingStrategy` the
+        // `PrimaryConfig` consumes. `false → Disabled` (old StageFile path,
+        // unchanged); `true → SetupTasks` (per-file pre-succeeded setup tasks +
+        // `TaskDep` gating). Resolved here on the GIL thread so the value moves
+        // into the detached-runtime `PrimaryConfig` build below.
+        let staging_strategy = if self.stage_via_setup_tasks {
+            dynrunner_manager_distributed::StagingStrategy::SetupTasks
+        } else {
+            dynrunner_manager_distributed::StagingStrategy::Disabled
+        };
         // The node-local run-config (the operator's `args.forwarded_argv`),
         // captured on the GIL thread for the detached-runtime `PrimaryConfig`
         // so this primary answers `RequestRunConfig` from its own copy.
@@ -454,6 +465,10 @@ impl PyPrimaryCoordinator {
                     // `uses_file_based_items=false`, or future
                     // remote-only primaries).
                     source_dir,
+                    // Framework file-staging selector (#489 P3/P4): old
+                    // StageFile path vs the setup-task model. Mapped from the
+                    // `stage_via_setup_tasks` kwarg above.
+                    staging_strategy,
                     unfulfillable_reinject_max_per_task,
                     // The submitter's node-local run-config (the operator's
                     // `args.forwarded_argv`). Answered verbatim on

@@ -58,7 +58,9 @@ impl<I> DistributedMessage<I> {
             | Self::Relay { target, .. }
             | Self::RelayBackoff { target, .. }
             | Self::RedialRequest { target, .. }
-            | Self::FrameChunk { target, .. } => target.as_ref(),
+            | Self::FrameChunk { target, .. }
+            | Self::SetupAssignment { target, .. }
+            | Self::SetupTerminal { target, .. } => target.as_ref(),
         }
     }
 
@@ -110,7 +112,9 @@ impl<I> DistributedMessage<I> {
             | Self::Relay { target, .. }
             | Self::RelayBackoff { target, .. }
             | Self::RedialRequest { target, .. }
-            | Self::FrameChunk { target, .. } => target,
+            | Self::FrameChunk { target, .. }
+            | Self::SetupAssignment { target, .. }
+            | Self::SetupTerminal { target, .. } => target,
         };
         *slot = Some(dst);
     }
@@ -176,7 +180,9 @@ impl<I> DistributedMessage<I> {
             | Self::Relay { target, .. }
             | Self::RelayBackoff { target, .. }
             | Self::RedialRequest { target, .. }
-            | Self::FrameChunk { target, .. } => target,
+            | Self::FrameChunk { target, .. }
+            | Self::SetupAssignment { target, .. }
+            | Self::SetupTerminal { target, .. } => target,
         };
         *slot = None;
     }
@@ -223,7 +229,9 @@ impl<I> DistributedMessage<I> {
             | Self::Relay { sender_id, .. }
             | Self::RelayBackoff { sender_id, .. }
             | Self::RedialRequest { sender_id, .. }
-            | Self::FrameChunk { sender_id, .. } => sender_id,
+            | Self::FrameChunk { sender_id, .. }
+            | Self::SetupAssignment { sender_id, .. }
+            | Self::SetupTerminal { sender_id, .. } => sender_id,
         }
     }
 
@@ -269,7 +277,9 @@ impl<I> DistributedMessage<I> {
             | Self::Relay { timestamp, .. }
             | Self::RelayBackoff { timestamp, .. }
             | Self::RedialRequest { timestamp, .. }
-            | Self::FrameChunk { timestamp, .. } => *timestamp,
+            | Self::FrameChunk { timestamp, .. }
+            | Self::SetupAssignment { timestamp, .. }
+            | Self::SetupTerminal { timestamp, .. } => *timestamp,
         }
     }
 
@@ -511,6 +521,8 @@ impl<I> DistributedMessage<I> {
             Self::RelayBackoff { .. } => MessageType::RelayBackoff,
             Self::RedialRequest { .. } => MessageType::RedialRequest,
             Self::FrameChunk { .. } => MessageType::FrameChunk,
+            Self::SetupAssignment { .. } => MessageType::SetupAssignment,
+            Self::SetupTerminal { .. } => MessageType::SetupTerminal,
         }
     }
 }

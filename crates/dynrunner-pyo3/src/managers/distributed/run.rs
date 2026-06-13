@@ -170,6 +170,16 @@ impl PyDistributedManager {
         // `PrimaryConfig` inside the detached-runtime closure before the seed
         // is built.
         let source_pre_staged = source_pre_staged_root.is_some();
+        // Framework file-staging selector (#489 P3/P4): map the
+        // `stage_via_setup_tasks` flag to the typed `StagingStrategy` the
+        // `PrimaryConfig` consumes. `Copy`, so it is shared by the bootstrap
+        // in-process primary's config AND every per-secondary promote recipe
+        // (the relocate target seeds the setup tasks in `discover_on_promotion`).
+        let staging_strategy = if self.stage_via_setup_tasks {
+            dynrunner_manager_distributed::StagingStrategy::SetupTasks
+        } else {
+            dynrunner_manager_distributed::StagingStrategy::Disabled
+        };
 
         // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
         // and dispatch to the Python TaskDefinition's `on_phase_*`
@@ -779,6 +789,10 @@ impl PyDistributedManager {
                             pre_staged_mode: promote_pre_staged_mode,
                             source_pre_staged_root: promote_pre_staged_root,
                             source_dir: promote_source_dir,
+                            // Framework file-staging selector (#489 P3/P4): the
+                            // relocate-target primary uses the SAME strategy the
+                            // in-process setup peer was launched with (`Copy`).
+                            staging_strategy,
                             setup_discovery: sec_setup_discovery,
                             // In-process `--multi-computer local`: the
                             // liveness-beacon UDP path is wired only on the
@@ -868,6 +882,10 @@ impl PyDistributedManager {
                     // pre-queues) wired without each caller re-
                     // implementing the orchestration.
                     source_dir: Some(source_dir.clone()),
+                    // Framework file-staging selector (#489 P3/P4): old
+                    // StageFile path vs the setup-task model. Mapped from the
+                    // `stage_via_setup_tasks` flag above.
+                    staging_strategy,
                     // Snapshot taken on the GIL thread (see above) so
                     // the in-process distributed primary honours the
                     // same `unfulfillable_reinject_max_per_task` knob

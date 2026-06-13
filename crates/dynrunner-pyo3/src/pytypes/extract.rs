@@ -59,6 +59,8 @@ pub(crate) fn task_to_pytask<I: Identifier>(task: &TaskInfo<I>) -> PyTaskInfo {
         skipped_already_done: false,
         // `kind` IS on `TaskInfo<I>`, so the projection reflects it.
         is_setup: task.kind.is_setup(),
+        // `setup_affinity` IS on `TaskInfo<I>`, so the projection reflects it.
+        setup_affinity: task.setup_affinity.clone(),
     }
 }
 
@@ -305,6 +307,18 @@ pub(crate) fn extract_binaries(
                 dynrunner_core::TaskKind::Work
             };
 
+            // Optional `setup_affinity` — the consumer names the member that
+            // runs a setup task IN-PROCESS. Missing / non-str / empty
+            // collapses to `None` (the executor defaults to the primary).
+            // A routing concern consulted only for a `Setup` task; carried
+            // verbatim onto the core `TaskInfo`.
+            let setup_affinity: Option<String> = item
+                .getattr("setup_affinity")
+                .ok()
+                .and_then(|v| v.extract::<Option<String>>().ok())
+                .flatten()
+                .filter(|s| !s.is_empty());
+
             Ok((
                 TaskInfo {
                     path: PathBuf::from(path),
@@ -319,6 +333,7 @@ pub(crate) fn extract_binaries(
                     preferred_secondaries: SoftPreferredSecondaries::new(preferred_secondaries),
                     preferred_version: Default::default(),
                     kind,
+                    setup_affinity,
                     resolved_path: None,
                 },
                 skipped_already_done,

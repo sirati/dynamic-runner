@@ -152,6 +152,16 @@ class TaskInfo:
     # ``skipped_already_done`` it is a property of the scheduling unit,
     # not a discovery-time routing signal.
     is_setup: bool = False
+    # EXECUTOR-affinity member for a setup task (``is_setup=True``): the
+    # peer id of the member that runs this setup task IN-PROCESS (its
+    # source-owning member). A consumer setup task names its member here
+    # (e.g. a compute node id); ``None`` defaults the executor to the
+    # primary itself. Ignored for an ordinary work task. Carried through
+    # the PyO3 boundary onto the core Rust ``TaskInfo.setup_affinity``; the
+    # primary's setup selector targets exactly this member. A routing
+    # concern (like ``affinity_id``), NOT folded into the task's content
+    # hash.
+    setup_affinity: str | None = None
 
     @property
     def binary_name(self) -> str:
@@ -189,6 +199,7 @@ class TaskInfo:
             "payload": self.payload,
             "task_id": self.task_id,
             "is_setup": self.is_setup,
+            "setup_affinity": self.setup_affinity,
             # Normalise each dep to a JSON-friendly shape: bare-strings
             # stay strings (legacy wire), ``TaskDep`` instances render as
             # ``{"task_id": ..., "inherit_outputs": ...}``. Matches the

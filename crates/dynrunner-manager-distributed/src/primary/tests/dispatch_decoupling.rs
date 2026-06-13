@@ -224,7 +224,7 @@ async fn tasks_added_recheck_dispatches_dependent_phase_after_predecessor_comple
                 "the completion emit must carry TasksAdded; got {:?}",
                 batch.signals
             );
-            primary.react_to_worker_signal_batch(batch).await;
+            primary.react_to_worker_signal_batch(batch, &mut None).await;
 
             // The recheck dispatched B to the now-free worker. Its
             // TaskAssignment is a queued mesh send, so settle the pump
@@ -395,7 +395,7 @@ async fn dispatch_selects_on_authoritative_free_predicate_not_advisory_is_idle()
             let batch = recv_worker_signal_batch(&mut wm_rx)
                 .await
                 .expect("emit must produce a batch");
-            primary.react_to_worker_signal_batch(batch).await;
+            primary.react_to_worker_signal_batch(batch, &mut None).await;
 
             // The remaining-task assignment is a queued mesh send.
             settle_pump().await;
@@ -473,7 +473,7 @@ async fn coalesce_multiple_tasks_added_into_one_recheck() {
             // into a single recheck (idempotent over the pool/worker
             // view), so the coalesced multi-signal batch produces a
             // single dispatch, not three.
-            primary.react_to_worker_signal_batch(batch).await;
+            primary.react_to_worker_signal_batch(batch, &mut None).await;
             // B's assignment is a queued mesh send.
             settle_pump().await;
             assert_eq!(

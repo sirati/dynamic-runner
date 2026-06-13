@@ -104,6 +104,7 @@ pub fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
         kind: Default::default(),
+        setup_affinity: None,
         resolved_path: None,
     }
 }

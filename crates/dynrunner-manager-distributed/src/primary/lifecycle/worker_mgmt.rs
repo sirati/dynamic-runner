@@ -31,7 +31,9 @@
 
 use dynrunner_core::Identifier;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use tokio::sync::mpsc as tokio_mpsc;
 
+use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::{PrimaryCoordinator, RunError};
 use crate::worker_signal::{WorkerMgmtSignal, WorkerSignalBatch};
 
@@ -46,7 +48,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// the recheck is idempotent over the pool/worker view, so we run it
     /// at most once per batch even if the batch carried several
     /// `TasksAdded`. The other two signals act per-occurrence.
-    pub(crate) async fn react_to_worker_signal_batch(&mut self, batch: WorkerSignalBatch) {
+    pub(crate) async fn react_to_worker_signal_batch(
+        &mut self,
+        batch: WorkerSignalBatch,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) {
         let mut tasks_added = false;
         for signal in batch.signals {
             match signal {
@@ -88,6 +94,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `.ok()` swallows the transient so the reaction can't abort
             // the loop.
             self.dispatch_to_idle_workers(true).await.ok();
+            // Setup-task dispatch: the symmetric SELECTION pass for
+            // `TaskKind::Setup` tasks (a setup task entering the pool emits
+            // the same `TasksAdded`). Routes each setup task whose affinity
+            // member is connected to its in-process executor (off-primary
+            // member) or runs it locally (primary affinity). Self-contained
+            // in `primary::setup_dispatch`; the worker recheck never learns
+            // the setup concern. Runs alongside — not inside — the worker
+            // recheck because the two select disjoint task sets (worker work
+            // vs setup) over the SAME pool.
+            self.dispatch_setup_tasks(command_rx).await;
             // Lazy on-demand dead-secondary requeue. AFTER the dispatch
             // pass returns (NEVER inside the per-worker loop:
             // `requeue_dead_secondary` runs `self.workers.retain(..)`,
@@ -185,7 +201,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.worker_mgmt_rx = Some(rx);
         match drained {
             Some(batch) => {
-                self.react_to_worker_signal_batch(batch).await;
+                // Pre-loop in-wait servicing: no operational command channel
+                // is taken yet, so a setup task that self-execs here drives
+                // its phase cascade with no inline callback receiver (matching
+                // every other pre-loop `note_item_*` caller's `&mut None`).
+                self.react_to_worker_signal_batch(batch, &mut None).await;
                 true
             }
             None => false,

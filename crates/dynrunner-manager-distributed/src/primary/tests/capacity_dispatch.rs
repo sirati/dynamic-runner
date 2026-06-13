@@ -221,7 +221,7 @@ async fn late_capacity_over_wire_grows_roster_and_dispatches_ready_task() {
 
             // The recheck runs but sec-0 has not confirmed its mesh leg:
             // the gate withholds (capacity alone is not assignability).
-            primary.react_to_worker_signal_batch(batch).await;
+            primary.react_to_worker_signal_batch(batch, &mut None).await;
             settle_pump().await;
             assert!(
                 assigned_ids(&mut ends[0].1).is_empty(),
@@ -235,7 +235,7 @@ async fn late_capacity_over_wire_grows_roster_and_dispatches_ready_task() {
             let batch = recv_worker_signal_batch(&mut wm_rx)
                 .await
                 .expect("a confirming MeshReady must emit a wakeup batch");
-            primary.react_to_worker_signal_batch(batch).await;
+            primary.react_to_worker_signal_batch(batch, &mut None).await;
             settle_pump().await;
             assert_eq!(
                 assigned_ids(&mut ends[0].1),
@@ -336,7 +336,7 @@ async fn locally_originated_capacity_growth_grows_roster_and_dispatches() {
             // confirmation-edge wakeup batch is coalesced into the same
             // reaction.)
             primary.handle_mesh_ready(mesh_ready_from("sec-0"));
-            primary.react_to_worker_signal_batch(batch).await;
+            primary.react_to_worker_signal_batch(batch, &mut None).await;
             settle_pump().await;
             // The capacity-batch broadcast itself rides the same wire
             // (sec-0's egress); filter to TaskAssignment only.

@@ -40,6 +40,7 @@ fn task(task_id: &str, deps: Vec<&str>) -> TaskInfo<Arc<str>> {
         preferred_secondaries: SoftPreferredSecondaries::default(),
         preferred_version: Default::default(),
         kind: Default::default(),
+        setup_affinity: None,
         resolved_path: None,
     }
 }

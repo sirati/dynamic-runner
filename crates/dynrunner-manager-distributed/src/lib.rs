@@ -21,6 +21,7 @@ pub(crate) mod run_narrator;
 pub mod runtime_watchdog;
 pub(crate) mod warn_throttle;
 pub mod secondary;
+pub mod setup_exec;
 pub mod state;
 pub mod task_completed;
 pub mod worker_messages;
@@ -34,7 +35,7 @@ pub use primary::staging::{StagingEntry, StagingError, compute_initial_staging_e
 pub use primary::wire::compute_task_hash;
 pub use primary::{
     PhaseHookRaiseLatch, PrimaryConfig, PrimaryCoordinator, PrimaryRunOutcome, RunError,
-    derive_connect_timeout,
+    StagingAugmentation, StagingStrategy, augment_batch_for_staging, derive_connect_timeout,
 };
 pub use discovery::{SetupDiscovery, SetupDiscoveryFn};
 // The operator's SIGUSR2 graceful-abort trigger — armed once at process

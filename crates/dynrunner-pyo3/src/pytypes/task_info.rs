@@ -91,6 +91,15 @@ pub(crate) struct PyTaskInfo {
     /// `From<&PyTaskInfo>` / `From<&TaskInfo>` conversions thread it.
     #[pyo3(get)]
     pub(super) is_setup: bool,
+    /// EXECUTOR-affinity member for a setup task (`is_setup = True`): the
+    /// peer id of the member that runs this setup task IN-PROCESS. A
+    /// consumer setup task names its source-owning member here (e.g. a
+    /// compute node id); `None` defaults the executor to the primary
+    /// itself. Ignored for an ordinary work task (`is_setup = False`).
+    /// Maps to the core [`dynrunner_core::TaskInfo::setup_affinity`] — the
+    /// `From<&PyTaskInfo>` / `From<&TaskInfo>` conversions thread it.
+    #[pyo3(get)]
+    pub(super) setup_affinity: Option<String>,
 }
 
 #[pymethods]
@@ -116,6 +125,7 @@ impl PyTaskInfo {
         preferred_secondaries = Vec::new(),
         skipped_already_done = false,
         is_setup = false,
+        setup_affinity = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -133,6 +143,7 @@ impl PyTaskInfo {
         preferred_secondaries: Vec<String>,
         skipped_already_done: bool,
         is_setup: bool,
+        setup_affinity: Option<String>,
     ) -> PyResult<Self> {
         if task_id.is_empty() {
             return Err(PyValueError::new_err(
@@ -154,6 +165,7 @@ impl PyTaskInfo {
             preferred_secondaries,
             skipped_already_done,
             is_setup,
+            setup_affinity,
         })
     }
 }
@@ -210,6 +222,11 @@ impl From<&PyTaskInfo> for TaskInfo<RunnerIdentifier> {
             } else {
                 dynrunner_core::TaskKind::Work
             },
+            // The consumer-boundary executor-affinity id is carried verbatim
+            // onto the core `TaskInfo` — the primary's setup selector reads
+            // it to target the in-process executor member. Threaded only for
+            // the routing concern; the kind decides whether it is consulted.
+            setup_affinity: py.setup_affinity.clone(),
             resolved_path: None,
         }
     }
@@ -252,6 +269,9 @@ impl From<&TaskInfo<RunnerIdentifier>> for PyTaskInfo {
             // `kind` IS carried on the core `TaskInfo<I>`, so the
             // round-trip-back faithfully reflects it.
             is_setup: bi.kind.is_setup(),
+            // `setup_affinity` IS carried on the core `TaskInfo<I>`, so the
+            // round-trip-back faithfully reflects it.
+            setup_affinity: bi.setup_affinity.clone(),
         }
     }
 }
@@ -285,6 +305,7 @@ mod tests {
             preferred_secondaries: preferred,
             skipped_already_done: false,
             is_setup: false,
+            setup_affinity: None,
         }
     }
 
@@ -351,6 +372,7 @@ mod tests {
             Vec::new(),
             false,
             false,
+            None,
         )
         .expect_err("empty task_id must fail");
         // We assert against the rendered message (no Python
@@ -379,6 +401,7 @@ mod tests {
             Vec::new(),
             false,
             false,
+            None,
         )
         .expect("non-empty task_id must succeed");
         assert_eq!(ok.task_id, "stable-id");

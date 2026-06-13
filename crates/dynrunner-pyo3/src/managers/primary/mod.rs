@@ -92,6 +92,16 @@ pub(crate) struct PyPrimaryCoordinator {
     /// `uses_file_based_items=False`, and remote-only primaries
     /// that never read the source from this filesystem.
     pub(super) source_dir: Option<std::path::PathBuf>,
+    /// Whether the framework's file-staging uses the SETUP-TASK model
+    /// (`--stage-via-setup-tasks`, #489 P3/P4) instead of the OLD
+    /// StageFile/`maybe_auto_stage_initial` path. Read at construction from
+    /// the `stage_via_setup_tasks` kwarg (defaults to False — the OLD path).
+    /// Threaded into `PrimaryConfig.staging_strategy`: `false →
+    /// StagingStrategy::Disabled` (old path, byte-for-byte unchanged), `true →
+    /// StagingStrategy::SetupTasks` (per-file pre-succeeded setup tasks +
+    /// `TaskDep` gating; the #488-free path). The selector lives here and is
+    /// consumed at exactly the `to_rust_config` seam.
+    pub(super) stage_via_setup_tasks: bool,
     /// Rust-side bundle of the command channel + reinject-cap cell
     /// shared with every `PyPrimaryHandle` minted from this
     /// coordinator. Single concern split out into

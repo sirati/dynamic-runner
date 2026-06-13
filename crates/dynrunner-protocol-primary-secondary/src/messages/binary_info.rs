@@ -136,6 +136,15 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             // `Work` default on the dispatch round-trip — same
             // rides-the-CRDT-path rationale as `preferred_version` above.
             kind: _kind,
+            // ── not transferred on the dispatch descriptor ──
+            // The EXECUTOR-affinity member of a `Setup` task is a routing
+            // concern that rides the CRDT-ledger path on `TaskInfo`, not the
+            // primary↔secondary DISPATCH descriptor: a `Setup` task is never
+            // worker-dispatched (the scheduling seam excludes it), so
+            // anything round-tripping here is by construction `Work` with no
+            // executor affinity. `to_task_info` resets it to `None` — same
+            // rides-the-CRDT-path rationale as `kind`.
+            setup_affinity: _setup_affinity,
             // ── node-local: not transferred ──
             // `#[serde(skip)]` on the struct — the local on-disk resolved
             // location is host-specific and the receiving secondary
@@ -191,6 +200,10 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             // construction worker work; the kind rides the CRDT path (see
             // the destructure note above).
             kind: Default::default(),
+            // Reset to `None` — a dispatched task carries no executor
+            // affinity (it is worker work); the executor affinity rides the
+            // CRDT path on `TaskInfo`, see the destructure note above.
+            setup_affinity: None,
             resolved_path: None,
         }
     }

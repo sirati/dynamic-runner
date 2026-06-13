@@ -96,6 +96,37 @@ fn task_skipped_already_done_decodes_literal_sender_bytes() {
     }
 }
 
+/// `SetupCompleted` round-trips with its `hash` preserved (the setup-success
+/// terminal carries only the hash — version-LESS / attempt-LESS, like
+/// `TaskSkippedAlreadyDone`; the `TaskInfo` + `attempt` live on the ledger
+/// entry, not on the wire).
+#[test]
+fn roundtrip_setup_completed() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::SetupCompleted {
+        hash: "h-setup".into(),
+    };
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+    match decoded {
+        ClusterMutation::SetupCompleted { hash } => assert_eq!(hash, "h-setup"),
+        _ => panic!("expected SetupCompleted"),
+    }
+}
+
+/// Wire-shape mirror (NOT symmetric-on-the-wrong-shape): decode the EXACT
+/// JSON bytes the executor's success origination emits —
+/// `{"SetupCompleted":{"hash":"..."}}` — pinning the externally-tagged
+/// shape the other side must produce.
+#[test]
+fn setup_completed_decodes_literal_sender_bytes() {
+    let bytes = r#"{"SetupCompleted":{"hash":"h-from-executor"}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
+    match decoded {
+        ClusterMutation::SetupCompleted { hash } => assert_eq!(hash, "h-from-executor"),
+        _ => panic!("expected SetupCompleted"),
+    }
+}
+
 /// `PhaseEnded` round-trips through serde with its `phase` preserved
 /// (the replicated "on_phase_end edge completed" fact carries only the
 /// phase id — grow-only set semantics live in the apply rule, not on the

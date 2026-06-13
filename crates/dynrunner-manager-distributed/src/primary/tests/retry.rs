@@ -801,6 +801,7 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                     preferred_secondaries: SoftPreferredSecondaries::default(),
                     preferred_version: Default::default(),
                     kind: Default::default(),
+                    setup_affinity: None,
                     resolved_path: None,
                 }
             }

@@ -84,6 +84,14 @@ pub(super) fn drive_rust_primary<'py>(
         let root = slurm_config.call_method0("get_srcbins_mount_source")?;
         coord_kwargs.set_item("source_pre_staged_root", root)?;
     }
+    // Framework file-staging selector (#489 P3/P4): the submitter primary uses
+    // the setup-task model when `--stage-via-setup-tasks` is on. The SLURM
+    // secondaries that may be promoted read the SAME flag off their own
+    // `task_args` (reconstructed from `forwarded_argv`, which carries the
+    // flag), so the relocate target seeds the staging setup tasks identically.
+    if attr_truthy(args, "stage_via_setup_tasks") {
+        coord_kwargs.set_item("stage_via_setup_tasks", true)?;
+    }
     // Thread source_dir into the coordinator's config uniformly.
     // The SLURM pipeline retains its explicit
     // `queue_initial_staging` pre-call below (it depends on

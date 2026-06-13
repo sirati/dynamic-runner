@@ -44,6 +44,8 @@ mod reconciliation_probe;
 pub mod respawn;
 pub(crate) mod retry_bucket;
 mod secondary_id;
+mod setup_dispatch;
+mod setup_staging;
 pub mod staging;
 pub(crate) mod task;
 mod terminal_gate;
@@ -62,6 +64,7 @@ pub use config::{
     DEFAULT_TASK_RECONCILIATION_TIMEOUT, OnCustomMessage, OnPhaseEnd, OnPhaseStart,
     PhaseHookRaiseLatch, PrimaryConfig, derive_connect_timeout,
 };
+pub use setup_staging::{StagingAugmentation, StagingStrategy, augment_batch_for_staging};
 pub use coordinator::{PrimaryCoordinator, PrimaryRunOutcome};
 pub use error::RunError;
 

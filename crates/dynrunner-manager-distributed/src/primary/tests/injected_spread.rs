@@ -149,7 +149,7 @@ async fn inject_and_recheck(
     let batch = recv_worker_signal_batch(wm_rx)
         .await
         .expect("runtime spawn must emit a TasksAdded batch");
-    primary.react_to_worker_signal_batch(batch).await;
+    primary.react_to_worker_signal_batch(batch, &mut None).await;
     settle_pump().await;
 }
 

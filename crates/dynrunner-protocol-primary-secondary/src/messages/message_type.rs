@@ -146,4 +146,12 @@ pub enum MessageType {
     /// entirely inside the framing layer's framed-IO pumps; the
     /// application layer (and even the Router) never observes it.
     FrameChunk,
+    /// Primary -> setup-task affinity member: "run this `TaskKind::Setup`
+    /// task in-process." Routed to the member's setup executor, not its
+    /// worker pool.
+    SetupAssignment,
+    /// Setup-task affinity member -> primary: the terminal of an in-process
+    /// setup-task execution (success → `SetupCompleted`, failure →
+    /// `TaskFailed { NonRecoverable }`).
+    SetupTerminal,
 }

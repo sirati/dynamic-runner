@@ -178,3 +178,147 @@ fn setup_succeeded_counter_disjoint_from_succeeded() {
         "both terminals are fully accounted (no stranded mis-classification)"
     );
 }
+
+// ── P2: the `ClusterMutation::SetupCompleted` WRITE arm ──
+
+/// The `SetupCompleted` mutation transitions an `InFlight` setup task (the
+/// state after the executor was assigned) to the terminal
+/// `TaskState::SetupCompleted`, preserving the source `attempt`. This is the
+/// terminal-WRITE the executor originates on success.
+#[test]
+fn setup_completed_mutation_writes_terminal_from_inflight() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    let setup = mk_setup_task("setup");
+    let setup_hash = crate::primary::wire::compute_task_hash(&setup);
+    // The executor was assigned: the task is InFlight (attempt 3 to prove
+    // the attempt is preserved verbatim).
+    s.tasks.insert(
+        setup_hash.clone(),
+        TaskState::InFlight {
+            task: setup,
+            secondary: "member-1".into(),
+            worker: 0,
+            version: Default::default(),
+            attempt: 3,
+        },
+    );
+
+    let outcome = s.apply(ClusterMutation::SetupCompleted {
+        hash: setup_hash.clone(),
+    });
+    assert!(matches!(outcome, ApplyOutcome::Applied));
+    match s.task_state(&setup_hash) {
+        Some(TaskState::SetupCompleted { attempt, .. }) => {
+            assert_eq!(*attempt, 3, "the source attempt is preserved");
+        }
+        other => panic!("SetupCompleted must write the terminal, got {other:?}"),
+    }
+}
+
+/// The `SetupCompleted` apply arm AUTO-RESUMES a dependent that was
+/// `Blocked` on the setup task — driven END-TO-END through the mutation
+/// (not by a direct `resume_blocked_on` call), so a build task gated on the
+/// setup task becomes dispatchable the moment the executor's success
+/// mutation applies (seam (c) via the WRITE arm).
+#[test]
+fn setup_completed_mutation_resumes_blocked_dependent() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    let setup = mk_setup_task("setup");
+    let setup_hash = crate::primary::wire::compute_task_hash(&setup);
+    s.tasks.insert(
+        setup_hash.clone(),
+        TaskState::InFlight {
+            task: setup,
+            secondary: "member-1".into(),
+            worker: 0,
+            version: Default::default(),
+            attempt: 0,
+        },
+    );
+    let dependent = mk_task("dependent");
+    let dep_hash = crate::primary::wire::compute_task_hash(&dependent);
+    s.tasks.insert(
+        dep_hash.clone(),
+        TaskState::Blocked {
+            task: dependent,
+            on: setup_hash.clone(),
+            attempt: 0,
+        },
+    );
+
+    // Apply the success terminal through the mutation; the arm's
+    // resume_blocked_on unblocks the dependent.
+    let outcome = s.apply(ClusterMutation::SetupCompleted {
+        hash: setup_hash.clone(),
+    });
+    assert!(matches!(outcome, ApplyOutcome::Applied));
+    match s.task_state(&dep_hash) {
+        Some(TaskState::Pending { .. }) => {}
+        other => panic!(
+            "the SetupCompleted mutation must auto-resume the Blocked dependent to \
+             Pending, got {other:?}"
+        ),
+    }
+    // And the setup task itself is terminal.
+    assert!(matches!(
+        s.task_state(&setup_hash),
+        Some(TaskState::SetupCompleted { .. })
+    ));
+}
+
+/// The `SetupCompleted` arm is gated: it NoOps against a state that is not
+/// `InFlight`/`Pending` (a real terminal locks it out), and is idempotent
+/// against an already-`SetupCompleted` entry — a late/duplicate executor
+/// success can never overwrite real progress.
+#[test]
+fn setup_completed_mutation_noops_against_real_terminal_and_is_idempotent() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    let setup = mk_setup_task("setup");
+    let setup_hash = crate::primary::wire::compute_task_hash(&setup);
+    // A non-recoverable FAILURE already settled it (e.g. the executor died).
+    s.tasks.insert(
+        setup_hash.clone(),
+        TaskState::Failed {
+            task: setup,
+            kind: ErrorType::NonRecoverable,
+            last_error: "executor died".into(),
+            version: Default::default(),
+            attempt: 0,
+        },
+    );
+    let outcome = s.apply(ClusterMutation::SetupCompleted {
+        hash: setup_hash.clone(),
+    });
+    assert!(
+        matches!(outcome, ApplyOutcome::NoOp),
+        "a real terminal locks out a late setup success"
+    );
+    assert!(
+        matches!(s.task_state(&setup_hash), Some(TaskState::Failed { .. })),
+        "the failure terminal survives the late success"
+    );
+
+    // Idempotent against an already-succeeded entry.
+    s.tasks.insert(
+        setup_hash.clone(),
+        TaskState::SetupCompleted {
+            task: mk_setup_task("setup"),
+            attempt: 0,
+        },
+    );
+    let again = s.apply(ClusterMutation::SetupCompleted { hash: setup_hash });
+    assert!(matches!(again, ApplyOutcome::NoOp));
+}
+
+/// The `SetupCompleted` mutation against an unknown hash is a safe NoOp
+/// (no panic, no spurious insert) — a duplicate report after the entry was
+/// compacted, or a frame for a task this replica never saw.
+#[test]
+fn setup_completed_mutation_unknown_hash_is_noop() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    let outcome = s.apply(ClusterMutation::SetupCompleted {
+        hash: "no-such-hash".into(),
+    });
+    assert!(matches!(outcome, ApplyOutcome::NoOp));
+    assert!(s.task_state("no-such-hash").is_none());
+}

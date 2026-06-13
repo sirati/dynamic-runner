@@ -533,6 +533,51 @@ pub enum ClusterMutation<I> {
     TaskSkippedAlreadyDone {
         hash: String,
     },
+    /// A `TaskKind::Setup` task SUCCEEDED in its in-process executor: the
+    /// ledger entry transitions to the terminal `TaskState::SetupCompleted`
+    /// (success-like — terminal, satisfies a dependent's `TaskDep`, counts
+    /// in the separate `setup_succeeded` bucket — but NOT folded into
+    /// `Completed`/`succeeded`). The terminal-WRITE counterpart of the
+    /// read/merge/rank/dep/counter side the setup-task primitive already
+    /// carries: this is the ONLY originator of that variant.
+    ///
+    /// Originated by the affinity member's setup executor on success — on
+    /// the primary directly (`originate_setup_completed`), or, when the
+    /// executor is off-primary, by the primary on receipt of the executor's
+    /// terminal report. The FAILURE twin reuses the EXISTING
+    /// `TaskFailed { kind: NonRecoverable }` (shared with the executor-death
+    /// seam), so a succeeded setup task has exactly one success mutation and
+    /// a failed one exactly one failure mutation — no third terminal.
+    ///
+    /// Carries only `hash` (mirroring [`Self::TaskSkippedAlreadyDone`]): the
+    /// `TaskInfo` lives on the ledger entry a prior `TaskAdded` seeded, and
+    /// the `attempt` is PRESERVED from the source state (the executor was
+    /// assigned via the standard `TaskAssigned` `Pending → InFlight`
+    /// transition, so the source is `InFlight`; a not-yet-assigned `Pending`
+    /// is also accepted). NO `version`: a setup task's hash is only ever
+    /// originated terminal by its in-process executor (never worker-
+    /// dispatched), so no real worker outcome competes for the hash — the
+    /// terminal rank alone (`TerminalRank::SetupCompleted`, the
+    /// second-weakest) settles any hypothetical collision, matching
+    /// `TaskSkippedAlreadyDone`'s version-free shape.
+    ///
+    /// Apply rule (see `cluster_state/apply.rs`): an AUTHORITATIVE
+    /// in-process transition (like `TaskSkippedAlreadyDone`, NOT a monotone
+    /// join), so it keeps an explicit precondition arm: `InFlight`/`Pending
+    /// → SetupCompleted` (Applied, `attempt` preserved); any other state
+    /// (a real terminal already settled it, idempotent re-application) is a
+    /// NoOp. Unlike `TaskSkippedAlreadyDone`, the arm ALSO auto-resumes
+    /// every `Blocked { on: <this hash> }` dependent back to `Pending` (the
+    /// `resume_blocked_on` cascade the `TaskCompleted` arm runs) — a build
+    /// task gated on this setup task unblocks the moment it succeeds.
+    ///
+    /// Wire-safe under rolling upgrade exactly like `TaskSkippedAlreadyDone`
+    /// / `PhaseMayBeEmptySet`: the originator is always the newest primary /
+    /// executor; a deployment with no setup tasks never originates it, so
+    /// non-adopters see zero new wire.
+    SetupCompleted {
+        hash: String,
+    },
     /// External-control update of the per-task preferred-secondaries
     /// list. The future dispatch policy consults this field when
     /// picking a worker; this mutation lets external control planes

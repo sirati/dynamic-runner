@@ -167,6 +167,13 @@ fn stamp_versions<I: Identifier>(
             // apply arm preserves the `attempt` from the `Pending` source
             // (a skip is a spawn-time terminal, not a stamped transition).
             | ClusterMutation::TaskSkippedAlreadyDone { .. }
+            // `SetupCompleted` is version-LESS and attempt-LESS for the same
+            // reason as `TaskSkippedAlreadyDone`: an authoritative in-process
+            // terminal whose `attempt` the apply arm preserves from the
+            // source state (no stamped transition), and whose hash no worker
+            // outcome ever competes for (a setup task is never
+            // worker-dispatched), so the terminal rank alone settles it.
+            | ClusterMutation::SetupCompleted { .. }
             | ClusterMutation::PrimaryChanged { .. }
             | ClusterMutation::PhaseDepsSet { .. }
             | ClusterMutation::PhaseMayBeEmptySet { .. }

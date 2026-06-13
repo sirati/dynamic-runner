@@ -424,6 +424,12 @@ pub(crate) fn run_remote_podman_pipeline<'py>(
             let root = slurm_config.call_method0("get_srcbins_mount_source")?;
             coord_kwargs.set_item("source_pre_staged_root", root)?;
         }
+        // Framework file-staging selector (#489 P3/P4): same setup-task model
+        // opt-in as the SLURM path (the promoted remote-podman secondary reads
+        // the flag off its own `forwarded_argv`-reconstructed `task_args`).
+        if attr_truthy(args, "stage_via_setup_tasks") {
+            coord_kwargs.set_item("stage_via_setup_tasks", true)?;
+        }
         let source_dir_str = sel_result.getattr("source_dir")?.str()?;
         coord_kwargs.set_item("source_dir", source_dir_str)?;
 
