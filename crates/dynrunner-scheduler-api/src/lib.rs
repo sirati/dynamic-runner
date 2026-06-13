@@ -2,8 +2,8 @@ use dynrunner_core::{Identifier, ResourceMap, TaskInfo, WorkerId};
 
 pub mod pending_pool;
 pub use pending_pool::{
-    BucketKey, IngestPartition, PendingPool, PendingPoolError, PhaseState, ViewSelection,
-    WorkerView,
+    BucketKey, IngestPartition, PendingPool, PendingPoolError, PhaseState, ReservationKey,
+    ViewSelection, WorkerView,
 };
 
 /// Processing phases that the manager cycles through.

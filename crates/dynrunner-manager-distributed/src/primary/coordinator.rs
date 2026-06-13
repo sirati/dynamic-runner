@@ -2647,9 +2647,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let secondary_id = self.workers[worker_idx].secondary_id.as_str();
         let soft_predicate =
             preferred_secondaries::apply_preferred_secondaries_predicate::<I>(secondary_id);
-        let view = self
-            .pool()
-            .view_for_worker(global_wid, Some(&soft_predicate));
+        let pool = self.pool();
+        let view = pool.view_for_worker(global_wid, Some(&soft_predicate));
+        // Bring-up reservation scope (#494): while the formation window is
+        // open, a member's view is capped so it can never drain a STILL-
+        // FORMING (unconfirmed) member's reserved share — the late
+        // confirmers' slices the 14/14/0 pack ate. A task reserved to a
+        // confirmed holder, or to THIS member, or unreserved, is still
+        // admitted (a confirmed holder's overflow is free for the formed
+        // fleet, including a mid-run joiner). The pool owns the holder
+        // map; the per-holder mesh-confirmation fact is THIS coordinator's
+        // (`member_mesh_confirmed`), supplied at the seam. Inert (admits
+        // everything) once the window closes OR on the local single-node
+        // manager (which never opens one).
+        let holder_confirmed = |holder: &str| self.member_mesh_confirmed(holder);
+        let view =
+            view.filter(|item| pool.reservation_admits(secondary_id, item, &holder_confirmed));
         // Step 0 — the dispatch freezes. Emptying the TYPED view
         // (rather than branching at the call sites) keeps every consumer
         // shape-oblivious: the scheduler sees zero candidates and the
@@ -3503,6 +3516,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         });
     }
 
+    /// Test-only seam: declare `secondary_id` DEAD through the genuine
+    /// member-removal primitive (`requeue_dead_secondary`) — the path the
+    /// heartbeat monitor drives on keepalive-miss. Recovers its in-flight
+    /// tasks, retains its workers out, redistributes any held bring-up
+    /// reservation share, and originates `PeerRemoved`. Lets the
+    /// reservation tests exercise the redistribute trigger without a
+    /// wall-clock keepalive timeout.
+    #[cfg(test)]
+    pub async fn requeue_dead_secondary_for_test(
+        &mut self,
+        secondary_id: &str,
+    ) -> Result<(), String> {
+        let dead = crate::primary::heartbeat::DeadSecondary {
+            secondary_id: secondary_id.to_string(),
+            last_keepalive: std::time::Instant::now(),
+        };
+        self.requeue_dead_secondary(
+            dead,
+            dynrunner_protocol_primary_secondary::RemovalCause::KeepaliveMiss,
+        )
+        .await
+    }
+
     /// Test-only seam: model a HALF-JOINED member by dropping `secondary_id`
     /// from the mesh-confirmation set, so `should_skip_worker_for_dispatch`
     /// withholds work from its workers (the unformed-mesh-leg dispatch gate).
@@ -4324,6 +4360,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // began committing would zero committed-but-not-yet-originated
                 // slots — FORBIDDEN.
                 self.reconstruct_workers_from_cluster_state();
+
+                // Phase 4.9: OPEN the bring-up reservation (#494). Partition
+                // the initial pending pool across the FULL EXPECTED member set
+                // via the projected-load interleave so each member gets a
+                // reserved share. MUST run AFTER the roster is reconstructed
+                // (it reads `self.workers`) and BEFORE
+                // `perform_initial_assignment` — both the initial batch and the
+                // operational idle-worker recheck construct their views through
+                // `dispatch_view_for_worker`, which scopes to the member's
+                // reserved share, so a first-confirmed member drains only its
+                // slice instead of the whole pool while the fleet forms (the
+                // 14/14/0 pack). The veto in `should_skip_worker_for_dispatch`
+                // still withholds any send to an unconfirmed member — the
+                // reservation only caps what a CONFIRMED member may pull.
+                self.seed_bringup_reservation();
 
                 // Phase 5: the initial per-secondary assignment — a pure
                 // scheduler over the reconstructed `self.workers`, staged-files

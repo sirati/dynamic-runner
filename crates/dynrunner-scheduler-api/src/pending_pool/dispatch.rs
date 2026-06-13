@@ -273,6 +273,14 @@ impl<I: Identifier> PendingPool<I> {
         // The item left the queue: drop its backoff stamp (the streak
         // persists — a later requeue keeps doubling).
         self.dispatch_backoff.note_taken(&item.task_id);
+        // Drop its bring-up reservation holder entry (the holder confirmed
+        // and a worker took its share); the formation window closes itself
+        // when the last reserved task drains. Inert outside the window.
+        // Disjoint field borrow (`reservation`, not whole `self`) so the
+        // live `bucket` borrow below stays valid — mirrors the backoff
+        // line above.
+        self.reservation
+            .note_taken(&(item.phase_id.clone(), item.task_id.clone()));
 
         if key.2 != no_aff {
             if !bucket.pinned_workers.contains(&worker_id) {

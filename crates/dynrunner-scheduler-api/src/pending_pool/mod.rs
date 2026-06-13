@@ -64,12 +64,14 @@ mod lifecycle;
 mod partition;
 mod pool;
 mod queries;
+mod reservation;
 mod types;
 mod view;
 
 pub use backoff::{DISPATCH_BACKOFF_BASE, DISPATCH_BACKOFF_CAP};
 pub use partition::IngestPartition;
 pub use pool::PendingPool;
+pub use reservation::ReservationKey;
 pub use types::{BucketKey, PendingPoolError, PhaseState, PreferencePredicate};
 pub use view::{ViewSelection, WorkerView};
 

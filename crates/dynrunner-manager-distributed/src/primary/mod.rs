@@ -24,6 +24,7 @@
 //! [`task`], [`wire`].
 
 mod assignment;
+mod bringup_reservation;
 mod command_channel;
 mod config;
 mod connect;
