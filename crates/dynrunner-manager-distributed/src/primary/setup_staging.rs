@@ -149,6 +149,13 @@ fn stage_task_for<I: Identifier>(work: &TaskInfo<I>) -> TaskInfo<I> {
         // the upload path will use so the two strategies agree structurally.
         kind: TaskKind::Setup,
         setup_affinity: Some(dynrunner_core::SETUP_NODE_ID.to_string()),
+        // No upload-file ref: this auto-staging stage task is the PRE-STAGED
+        // (mode-2) gate — the file is already on the cluster, so the task is
+        // seeded pre-succeeded and its action never runs (the #489 no-op
+        // gate). #336 P2 owns the upload variant (attach an `UploadFileRef`
+        // here when the file is NOT yet on the cluster); P1 only delivers the
+        // executor's upload-action path such a ref would drive.
+        upload_file: None,
         affinity_id: None,
         payload: serde_json::Value::Null,
         task_id: stage_task_id,
@@ -250,6 +257,7 @@ mod tests {
             task_depends_on: Vec::new(),
             preferred_secondaries: Default::default(),
             preferred_version: Default::default(),
+            upload_file: None,
             resolved_path: None,
         }
     }

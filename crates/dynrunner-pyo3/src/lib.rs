@@ -22,6 +22,7 @@ mod system_resources;
 mod task_completed_bridge;
 mod task_def;
 mod transport;
+mod upload_action_bridge;
 mod worker_message_bridge;
 
 use config::distributed::DistributedConfig;

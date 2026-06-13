@@ -207,6 +207,18 @@ where
     /// provider supplied — the observer never names ssh. See
     /// [`crate::observer::reconnect`].
     pub reconnector: ReconnectorHandle,
+    /// The upload-action port for setup-task UPLOADS (#336 P1). On the
+    /// framework auto-staging path the SUBMITTER is the upload affinity, and
+    /// after a bootstrap relocation the submitter runs as THIS standalone
+    /// observer (its primary role moved to a compute peer) — so the observer
+    /// is exactly where an upload setup task executes. Consulted by the
+    /// observer's in-process setup executor when an assigned setup task
+    /// carries an [`dynrunner_core::UploadFileRef`]. Carried on the handoff
+    /// (the relocating primary hands its `upload_action` over) so the
+    /// uploader survives relocation; `None` on a cold-join observer that
+    /// never submitted (it holds no source files). A no-ref setup task
+    /// no-op-succeeds regardless. See [`crate::upload_action`].
+    pub upload_action: crate::upload_action::UploadActionHandle,
     /// The operator's SIGUSR2 graceful-abort trigger the relocating primary
     /// held (armed once at process entry). Carried so the SAME stream drives
     /// the standalone observer's graceful-abort arm — a SIGUSR2 latched
@@ -368,6 +380,15 @@ where
     /// is nothing for the observer to drive. The observer NEVER owns ssh —
     /// it calls `reconnect(roster)`; see [`crate::observer::reconnect`].
     reconnector: ReconnectorHandle,
+    /// The upload-action port for setup-task UPLOADS (#336 P1). The
+    /// submitter→observer is the framework auto-staging upload affinity, so
+    /// the observer's in-process setup executor consults this when an
+    /// assigned setup task carries an [`dynrunner_core::UploadFileRef`].
+    /// Carried across relocation on the [`ObserverHandoff`]; `None` on a
+    /// cold-join observer (it never submitted, so holds no source files). A
+    /// no-ref setup task no-op-succeeds regardless. See
+    /// [`crate::upload_action`].
+    upload_action: crate::upload_action::UploadActionHandle,
     /// Single-flight latch for the spawned reconnect call. A reconnect
     /// over a roster with dead peers can run for MINUTES (each dead
     /// id's rebuild burns its ssh establishment budget); the ~60s
@@ -523,6 +544,7 @@ where
             lifecycle_dispatcher_handle,
             holdings,
             reconnector,
+            upload_action,
             graceful_abort_trigger,
             respawn_provider,
             job_ledger,
@@ -589,6 +611,12 @@ where
             ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             wake_note: WakeNoteSlot::default(),
             reconnector,
+            // The upload-action port the relocating primary held — the
+            // submitter→observer is the framework auto-staging upload
+            // affinity, so the observer keeps the uploader across demotion
+            // and executes upload setup tasks in-process (#336 P1). `None`
+            // on a backend with no uploader wired.
+            upload_action,
             reconnect_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
             // The provider this process kept across its demotion (None
             // when the run's respawn policy is disabled).
@@ -685,6 +713,11 @@ where
             ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             wake_note: WakeNoteSlot::default(),
             reconnector,
+            // Cold-join observers (late-joiner consoles) never submitted, so
+            // they hold no source files and host no upload action (#336 P1).
+            // The submitter→observer arrives via `from_handoff`, which carries
+            // the relocating primary's `upload_action` across.
+            upload_action: None,
             reconnect_in_flight: std::rc::Rc::new(std::cell::Cell::new(false)),
             // Cold-join observers (late-joiner consoles) host no respawn
             // provider; the submitter/observer process is the only
@@ -719,6 +752,20 @@ where
         self.reconnector = Some(reconnector);
     }
 
+    /// Wire (or replace) the upload-action port AFTER construction (#336 P1)
+    /// — the upload-executor sibling of [`Self::set_tunnel_reconnector`].
+    /// The submitter→observer is the framework auto-staging upload affinity;
+    /// this is the port its in-process setup executor uses to perform an
+    /// assigned upload setup task's file upload. Normally carried across the
+    /// relocation handoff; this setter exists for the wiring paths that
+    /// inject it post-construction (mirroring the reconnector). Absence
+    /// leaves the executor with no uploader — an upload-ref setup task then
+    /// fails as a wiring error (a no-ref task no-op-succeeds). See
+    /// [`crate::upload_action`].
+    pub fn set_upload_action(&mut self, action: Arc<dyn crate::upload_action::UploadAction>) {
+        self.upload_action = Some(action);
+    }
+
     /// Wire (or replace) the job-ledger consult port AFTER construction —
     /// the cluster-empty-verdict sibling of [`Self::set_tunnel_reconnector`].
     /// Only the process that hosts the job ledger (the relocated submitter)
@@ -747,6 +794,15 @@ where
     /// Read-only access to the replicated ledger (tests / result getters).
     pub fn cluster_state(&self) -> &ClusterState<I> {
         &self.cluster_state
+    }
+
+    /// The registered upload-action port (#336 P1). Read by the setup-task
+    /// executor twin (`observer::setup_exec`) to perform an assigned upload
+    /// setup task's file upload. `None` when no uploader was wired (a
+    /// cold-join observer / a backend with no upload action). See
+    /// [`crate::upload_action`].
+    pub(crate) fn upload_action(&self) -> &crate::upload_action::UploadActionHandle {
+        &self.upload_action
     }
 
     /// This observer's own peer id. Read by the setup-task executor twin

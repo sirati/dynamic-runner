@@ -62,6 +62,7 @@ pub(super) fn make_relative_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         preferred_version: Default::default(),
         kind: Default::default(),
         setup_affinity: None,
+        upload_file: None,
         resolved_path: None,
     }
 }
@@ -89,6 +90,7 @@ pub(super) fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         preferred_version: Default::default(),
         kind: Default::default(),
         setup_affinity: None,
+        upload_file: None,
         resolved_path: None,
     }
 }

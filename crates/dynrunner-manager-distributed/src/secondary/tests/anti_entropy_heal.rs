@@ -38,6 +38,7 @@ fn mk_task(name: &str) -> TaskInfo<TestId> {
         preferred_version: Default::default(),
         kind: Default::default(),
         setup_affinity: None,
+        upload_file: None,
         resolved_path: None,
     }
 }

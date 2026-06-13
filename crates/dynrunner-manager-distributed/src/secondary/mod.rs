@@ -405,6 +405,17 @@ where
     /// rationale.
     pub(super) task_completed_listeners: Vec<Box<dyn crate::task_completed::TaskCompletedListener>>,
 
+    /// The upload-action port for setup-task UPLOADS (#336 P1). Consulted
+    /// by this secondary's in-process setup executor when an assigned setup
+    /// task carries an [`dynrunner_core::UploadFileRef`] (a consumer setup
+    /// task whose source-owning affinity is THIS compute node). `None` on a
+    /// secondary that hosts no upload setup task (the common case — the
+    /// framework auto-staging affinity is the submitter→observer, not a
+    /// compute secondary); a no-ref setup task no-op-succeeds regardless.
+    /// Set before `run` via [`Self::set_upload_action`]. See
+    /// [`crate::upload_action`].
+    pub(super) upload_action: crate::upload_action::UploadActionHandle,
+
     /// Handle to the task-completion dispatcher task. Mirrors
     /// `lifecycle_dispatcher_handle` — same Drop-vs-explicit cleanup
     /// rationale.

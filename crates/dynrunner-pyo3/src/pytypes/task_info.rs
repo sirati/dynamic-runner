@@ -227,6 +227,13 @@ impl From<&PyTaskInfo> for TaskInfo<RunnerIdentifier> {
             // it to target the in-process executor member. Threaded only for
             // the routing concern; the kind decides whether it is consulted.
             setup_affinity: py.setup_affinity.clone(),
+            // #336 P1 adds the upload-file ref as a CORE-side action
+            // payload, but the consumer-facing ATTACH API (how a Python
+            // task declares its files) is P2 — so this boundary always
+            // produces `None` for now (the no-op gate). P2 threads a real
+            // kwarg here; the field is already wire-present so that change
+            // is purely additive.
+            upload_file: None,
             resolved_path: None,
         }
     }

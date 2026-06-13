@@ -27,6 +27,55 @@ fn setup_task(name: &str, affinity: Option<&str>) -> TaskInfo<TestId> {
     t
 }
 
+/// A `Setup`-kind UPLOAD task (#336 P1): carries an upload-file ref so its
+/// in-process executor performs the upload via the registered action.
+fn upload_setup_task(name: &str, affinity: Option<&str>, source: &str) -> TaskInfo<TestId> {
+    let mut t = setup_task(name, affinity);
+    t.upload_file = Some(Box::new(dynrunner_core::UploadFileRef {
+        source: std::path::PathBuf::from(source),
+        dest: None,
+    }));
+    t
+}
+
+/// A stub `UploadAction` for the end-to-end primary tests: counts calls and
+/// returns a fixed result. The trait is `Send + Sync` (so a real
+/// `Arc<dyn UploadAction>` survives relocation), so the stub uses an atomic
+/// counter rather than a `RefCell`.
+struct StubUploader {
+    calls: std::sync::atomic::AtomicUsize,
+    result: Result<(), crate::upload_action::UploadError>,
+}
+
+impl StubUploader {
+    fn ok() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            result: Ok(()),
+        })
+    }
+    fn permanent(reason: &str) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            result: Err(crate::upload_action::UploadError::Permanent(reason.into())),
+        })
+    }
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::upload_action::UploadAction for StubUploader {
+    async fn upload(
+        &self,
+        _file: &dynrunner_core::UploadFileRef,
+    ) -> Result<(), crate::upload_action::UploadError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.result.clone()
+    }
+}
+
 /// A `Work` task on phase `work` depending on the named setup task (same
 /// phase) — the build task gated on a setup task.
 fn dependent_work(name: &str, dep_setup_id: &str) -> TaskInfo<TestId> {
@@ -448,6 +497,106 @@ async fn setup_success_unblocks_dependent_work_task_end_to_end() {
             assert!(
                 primary.pool().iter().any(|t| t.task_id == "build"),
                 "the resumed dependent re-enters the dispatch pool"
+            );
+        })
+        .await;
+}
+
+// ── #336 P1: the upload-action end-to-end primary path ─────────────────
+
+/// UPLOAD ACTION (on-primary self-exec) — a file-setup-task whose affinity
+/// is the primary fires the registered upload callback, settles
+/// `SetupCompleted`, and its dependent Work task becomes dispatchable. The
+/// gating/overlap fall out of the #489 dep model (mirrors
+/// `setup_success_unblocks_dependent_work_task_end_to_end`, but the action
+/// is a real upload, not the no-op).
+#[tokio::test(flavor = "current_thread")]
+async fn upload_setup_task_fires_callback_then_unblocks_dependent() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Affinity == the primary's own id ("setup") → self-exec.
+            let upload = upload_setup_task("up-a", Some("setup"), "/src/libfoo.a");
+            let upload_hash = compute_task_hash(&upload);
+            let (mut primary, _ends, _mesh) = primary_with_tasks(vec![upload]);
+            let uploader = StubUploader::ok();
+            primary.set_upload_action(uploader.clone());
+
+            // The dependent build task is spawned Blocked on the upload.
+            let build = dependent_work("build", "up-a");
+            let build_hash = compute_task_hash(&build);
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::TasksSpawned { tasks: vec![build] });
+
+            primary
+                .react_to_worker_signal_batch(one_tasks_added_batch(), &mut None)
+                .await;
+            settle_pump().await;
+
+            // The upload callback fired exactly once for this task …
+            assert_eq!(
+                uploader.calls(),
+                1,
+                "the upload action is invoked for the file-setup-task"
+            );
+            // … the setup task settled SetupCompleted (separate bucket) …
+            assert!(
+                matches!(
+                    primary.cluster_state.task_state(&upload_hash),
+                    Some(crate::cluster_state::TaskState::SetupCompleted { .. })
+                ),
+                "a successful upload settles SetupCompleted"
+            );
+            assert_eq!(primary.cluster_state.outcome_counts().setup_succeeded, 1);
+            // … and the dependent Work task auto-resumed to dispatchable.
+            assert!(
+                matches!(
+                    primary.cluster_state.task_state(&build_hash),
+                    Some(crate::cluster_state::TaskState::Pending { .. })
+                ),
+                "the dependent work task unblocks once its upload setup task succeeds"
+            );
+        })
+        .await;
+}
+
+/// UPLOAD ACTION permanent failure — a permanent transfer failure drives the
+/// EXISTING `TaskFailed { NonRecoverable }` terminal (distinct from the
+/// no-op gate's death semantics) and cascades to the dependent Work task.
+#[tokio::test(flavor = "current_thread")]
+async fn upload_setup_task_permanent_failure_cascades() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let upload = upload_setup_task("up-b", Some("setup"), "/src/missing.a");
+            let upload_hash = compute_task_hash(&upload);
+            let build = dependent_work("build", "up-b");
+            let (mut primary, _ends, _mesh) = primary_with_tasks(vec![upload, build]);
+            let uploader = StubUploader::permanent("source missing on submitter");
+            primary.set_upload_action(uploader.clone());
+
+            primary
+                .react_to_worker_signal_batch(one_tasks_added_batch(), &mut None)
+                .await;
+            settle_pump().await;
+
+            assert_eq!(uploader.calls(), 1, "the permanent failure is not retried");
+            // The upload setup task is terminal Failed(NonRecoverable).
+            assert!(
+                matches!(
+                    primary.cluster_state.task_state(&upload_hash),
+                    Some(crate::cluster_state::TaskState::Failed {
+                        kind: dynrunner_core::ErrorType::NonRecoverable,
+                        ..
+                    })
+                ),
+                "a permanent upload failure is terminal Failed(NonRecoverable)"
+            );
+            // Its dependent build cascade-failed (dropped from the pool).
+            assert!(
+                !primary.pool().iter().any(|t| t.task_id == "build"),
+                "the dependent build is dropped by the permanent-failure cascade"
             );
         })
         .await;

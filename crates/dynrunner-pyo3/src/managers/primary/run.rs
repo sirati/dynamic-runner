@@ -238,6 +238,16 @@ impl PyPrimaryCoordinator {
             .take()
             .map(crate::fulfillability_matcher_bridge::PyFulfillabilityMatcher::new);
 
+        // Same shape for the upload-action kwarg (#336 P1): take the Python
+        // upload callable out of `self`, wrap it as an
+        // `Arc<dyn UploadAction>` at the bridge boundary, and install it on
+        // the inner coordinator BEFORE `run()` enters (the setup executor
+        // consults it / it rides onto the observer tail at relocation).
+        let upload_action = self
+            .upload_action
+            .take()
+            .map(crate::upload_action_bridge::PyUploadAction::new);
+
         // Resolve the bind port. When the caller (e.g. the SLURM
         // packaging pipeline) pre-supplied `listen_port`, honour it
         // exactly — that path has already wired an SSH `-R` forward
@@ -639,6 +649,15 @@ impl PyPrimaryCoordinator {
                 // manager-distributed API.
                 if let Some(matcher) = fulfillability_matcher {
                     primary.set_fulfillability_matcher(matcher);
+                }
+
+                // Same boundary (#336 P1): install the Python upload action
+                // (if any) BEFORE `run()` enters. The setup executor reads it
+                // when an upload setup task runs in-process, and
+                // `into_observer_handoff` carries it onto the observer tail at
+                // relocation (the submitter→observer is the upload affinity).
+                if let Some(action) = upload_action {
+                    primary.set_upload_action(action);
                 }
 
                 // Spawn the panik watcher and hand its signal

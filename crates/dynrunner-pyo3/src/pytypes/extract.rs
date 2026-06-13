@@ -334,6 +334,7 @@ pub(crate) fn extract_binaries(
                     preferred_version: Default::default(),
                     kind,
                     setup_affinity,
+                    upload_file: None,
                     resolved_path: None,
                 },
                 skipped_already_done,

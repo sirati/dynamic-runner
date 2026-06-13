@@ -55,6 +55,7 @@ pub(super) fn t(phase: &str, ty: &str, affinity: &str, size: u64) -> TaskInfo<()
         preferred_version: Default::default(),
         kind: Default::default(),
         setup_affinity: None,
+        upload_file: None,
         resolved_path: None,
     }
 }

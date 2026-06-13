@@ -1067,6 +1067,7 @@ async fn build_remote_rig() -> RemoteRig {
         lifecycle_dispatcher_handle: lifecycle_dispatcher,
         holdings: std::collections::HashSet::new(),
         reconnector: None,
+        upload_action: None,
         respawn_provider: Some(provider.clone() as Arc<dyn SecondarySpawner>),
         graceful_abort_trigger: None,
         job_ledger: None,

@@ -92,6 +92,82 @@ where
     }
 }
 
+/// The ASYNC execution path the three role wrappers (primary self-exec,
+/// secondary twin, observer twin) call for EVERY assigned setup task —
+/// #336 P1's single entry point, layered cleanly over the #489 primitive.
+///
+/// The dispatch is by the task's ACTION shape, owned here so no role wrapper
+/// learns it:
+///   * The task carries an [`dynrunner_core::UploadFileRef`] AND an
+///     `UploadAction` is registered ⇒ perform the upload (with a bounded
+///     OUTER retry on a transient the provider could not absorb — see
+///     [`crate::upload_action::UPLOAD_OUTER_RETRIES`]; the per-blob retry
+///     lives in the provider, owner decision 2026-06-14). Provider
+///     `Ok` ⇒ `Success`; `Permanent` ⇒ `Failure`; `Transient` exhausted ⇒
+///     `Failure`.
+///   * The task carries an `UploadFileRef` but NO action is registered ⇒
+///     `Failure` (the executor was asked to upload but has no uploader; this
+///     is a wiring error, surfaced loudly rather than silently no-op'd).
+///   * The task carries NO ref ⇒ the unchanged #489 NO-OP success (the
+///     pre-staged / mode-2 gate): `execute_setup(task, run_setup_action)`.
+///
+/// `action` is the coordinator's `UploadActionHandle` (`Option<Arc<…>>`); it
+/// is consulted ONLY when the task carries a ref, so a no-ref task succeeds
+/// regardless of whether an uploader is registered.
+pub async fn execute_setup_with_upload<I>(
+    task: &TaskInfo<I>,
+    action: &crate::upload_action::UploadActionHandle,
+) -> SetupOutcome
+where
+    I: Identifier,
+{
+    let Some(file) = task.upload_file.as_ref() else {
+        // No upload ref: the #489 no-op gate, byte-for-byte unchanged.
+        return execute_setup(task, run_setup_action);
+    };
+    let Some(uploader) = action.as_ref() else {
+        return SetupOutcome::Failure(format!(
+            "setup task '{}' carries an upload-file ref ({}) but no upload \
+             action is registered on its executor member — wiring error",
+            task.task_id,
+            file.source.display(),
+        ));
+    };
+    // Bounded OUTER retry: the provider owns the per-blob transient retry, so
+    // this only re-attempts a WHOLE-action transient the provider could not
+    // absorb. A permanent failure short-circuits immediately (no retry).
+    let mut last_transient: Option<String> = None;
+    for attempt in 0..=crate::upload_action::UPLOAD_OUTER_RETRIES {
+        match uploader.upload(file).await {
+            Ok(()) => return SetupOutcome::Success,
+            Err(e) if e.is_transient() => {
+                tracing::warn!(
+                    target: "dynrunner_setup",
+                    task_id = %task.task_id,
+                    source = %file.source.display(),
+                    attempt,
+                    reason = %e.reason(),
+                    "upload action hit a transient failure; re-attempting"
+                );
+                last_transient = Some(e.reason().to_string());
+            }
+            Err(e) => {
+                return SetupOutcome::Failure(format!(
+                    "upload of '{}' failed permanently: {}",
+                    file.source.display(),
+                    e.reason(),
+                ));
+            }
+        }
+    }
+    SetupOutcome::Failure(format!(
+        "upload of '{}' failed after {} transient attempts: {}",
+        file.source.display(),
+        crate::upload_action::UPLOAD_OUTER_RETRIES + 1,
+        last_transient.unwrap_or_else(|| "unknown transient fault".to_string()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +191,7 @@ mod tests {
             preferred_version: Default::default(),
             kind: TaskKind::Setup,
             setup_affinity: affinity.map(str::to_string),
+            upload_file: None,
             resolved_path: None,
         }
     }
@@ -137,5 +214,163 @@ mod tests {
         let task = setup_task("setup-b", None);
         let outcome = execute_setup(&task, |_| Err("boom".to_string()));
         assert_eq!(outcome, SetupOutcome::Failure("boom".to_string()));
+    }
+
+    // ── #336 P1: the upload-action execution path ──────────────────────
+
+    use crate::upload_action::{UploadAction, UploadError, UPLOAD_OUTER_RETRIES};
+    use dynrunner_core::UploadFileRef;
+    use std::sync::{Arc, Mutex};
+
+    /// A setup task carrying an upload-file ref (the upload-action case).
+    fn upload_task(name: &str, source: &str) -> TaskInfo<RunnerIdentifier> {
+        let mut t = setup_task(name, Some("submitter"));
+        t.upload_file = Some(Box::new(UploadFileRef {
+            source: PathBuf::from(source),
+            dest: None,
+        }));
+        t
+    }
+
+    /// A stub `UploadAction` that records every file it was asked to upload
+    /// and returns a SCRIPTED sequence of results (one per call). The script
+    /// is consumed front-to-back; a call past the end defaults to `Ok`.
+    /// Uses `Mutex` (not `RefCell`) because the trait is `Send + Sync` (so a
+    /// real `Arc<dyn UploadAction>` survives the relocation handoff) — the
+    /// stub honours that bound.
+    struct StubUploader {
+        calls: Mutex<Vec<PathBuf>>,
+        script: Mutex<std::collections::VecDeque<Result<(), UploadError>>>,
+    }
+
+    impl StubUploader {
+        fn new(script: Vec<Result<(), UploadError>>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                script: Mutex::new(script.into()),
+            })
+        }
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl UploadAction for StubUploader {
+        async fn upload(&self, file: &UploadFileRef) -> Result<(), UploadError> {
+            self.calls.lock().unwrap().push(file.source.clone());
+            // Pop the next scripted result; default to Ok when exhausted.
+            self.script.lock().unwrap().pop_front().unwrap_or(Ok(()))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_upload_ref_keeps_the_no_op_success_gate() {
+        // A setup task WITHOUT an upload ref no-op-succeeds — the #489
+        // mode-2 gate, unchanged — and the registered action is NEVER
+        // consulted (even when one is present).
+        let task = setup_task("gate", Some("submitter"));
+        let uploader = StubUploader::new(vec![Err(UploadError::Permanent("must not run".into()))]);
+        let handle: crate::upload_action::UploadActionHandle = Some(uploader.clone());
+        let outcome = execute_setup_with_upload(&task, &handle).await;
+        assert_eq!(outcome, SetupOutcome::Success);
+        assert_eq!(
+            uploader.call_count(),
+            0,
+            "a no-ref task must never invoke the upload action"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn upload_ref_fires_callback_and_succeeds() {
+        // A setup task carrying an upload ref invokes the action with THAT
+        // file's source and succeeds on a clean upload.
+        let task = upload_task("up-a", "/src/libfoo.a");
+        let uploader = StubUploader::new(vec![Ok(())]);
+        let handle: crate::upload_action::UploadActionHandle = Some(uploader.clone());
+        let outcome = execute_setup_with_upload(&task, &handle).await;
+        assert_eq!(outcome, SetupOutcome::Success);
+        assert_eq!(uploader.call_count(), 1);
+        assert_eq!(
+            uploader.calls.lock().unwrap().as_slice(),
+            &[PathBuf::from("/src/libfoo.a")],
+            "the action is invoked with the task's upload-file source"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transient_failures_retry_then_succeed() {
+        // A transient fault the provider could not absorb is re-attempted by
+        // the bounded OUTER retry; an eventual success terminates Success.
+        let task = upload_task("up-b", "/src/x");
+        let uploader = StubUploader::new(vec![
+            Err(UploadError::Transient("blip 1".into())),
+            Err(UploadError::Transient("blip 2".into())),
+            Ok(()),
+        ]);
+        let handle: crate::upload_action::UploadActionHandle = Some(uploader.clone());
+        let outcome = execute_setup_with_upload(&task, &handle).await;
+        assert_eq!(outcome, SetupOutcome::Success);
+        assert_eq!(
+            uploader.call_count(),
+            3,
+            "two transient retries then success = three attempts"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transient_failures_exhaust_then_fail() {
+        // Transient faults beyond the bounded outer-retry budget terminate
+        // Failure (NonRecoverable downstream). Total attempts =
+        // UPLOAD_OUTER_RETRIES + 1.
+        let always_transient: Vec<_> = (0..(UPLOAD_OUTER_RETRIES as usize + 5))
+            .map(|i| Err(UploadError::Transient(format!("blip {i}"))))
+            .collect();
+        let task = upload_task("up-c", "/src/y");
+        let uploader = StubUploader::new(always_transient);
+        let handle: crate::upload_action::UploadActionHandle = Some(uploader.clone());
+        let outcome = execute_setup_with_upload(&task, &handle).await;
+        assert!(matches!(outcome, SetupOutcome::Failure(_)));
+        assert_eq!(
+            uploader.call_count(),
+            UPLOAD_OUTER_RETRIES as usize + 1,
+            "the outer retry caps at UPLOAD_OUTER_RETRIES + 1 attempts"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn permanent_failure_fails_without_retry() {
+        // A permanent fault short-circuits immediately — NO outer retry.
+        let task = upload_task("up-d", "/src/z");
+        let uploader = StubUploader::new(vec![
+            Err(UploadError::Permanent("source missing".into())),
+            Ok(()), // would succeed on a (forbidden) retry
+        ]);
+        let handle: crate::upload_action::UploadActionHandle = Some(uploader.clone());
+        let outcome = execute_setup_with_upload(&task, &handle).await;
+        assert!(matches!(outcome, SetupOutcome::Failure(_)));
+        assert_eq!(
+            uploader.call_count(),
+            1,
+            "a permanent failure must not be retried"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn upload_ref_without_registered_action_is_a_wiring_failure() {
+        // A task asks for an upload but the executor has no uploader: this
+        // is a loud wiring error, NOT a silent no-op-success.
+        let task = upload_task("up-e", "/src/w");
+        let handle: crate::upload_action::UploadActionHandle = None;
+        let outcome = execute_setup_with_upload(&task, &handle).await;
+        match outcome {
+            SetupOutcome::Failure(reason) => {
+                assert!(
+                    reason.contains("no upload action is registered"),
+                    "the wiring-error reason must name the missing action; got: {reason}"
+                );
+            }
+            other => panic!("expected a wiring Failure, got {other:?}"),
+        }
     }
 }

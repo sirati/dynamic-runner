@@ -1059,6 +1059,18 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// `tunnel_reconnector`. See [`crate::observer::job_ledger`].
     pub(super) job_ledger_probe: crate::observer::JobLedgerProbeHandle,
 
+    /// The upload-action port for setup-task UPLOADS (#336 P1). Consulted
+    /// by the in-process setup executor when a setup task whose affinity is
+    /// THIS primary carries an [`dynrunner_core::UploadFileRef`], AND
+    /// carried onto the observer tail at relocation (the submitter→observer
+    /// is the framework auto-staging upload affinity — it physically holds
+    /// the source files). `None` on a coordinator with no uploader wired
+    /// (no upload setup task it hosts); an upload-ref task assigned to a
+    /// primary with `None` here fails as a wiring error. Wired from the
+    /// deployment layer via [`Self::set_upload_action`], symmetric with
+    /// `tunnel_reconnector`. See [`crate::upload_action`].
+    pub(super) upload_action: crate::upload_action::UploadActionHandle,
+
     /// Sender side of the dispatcher → operational-loop respawn
     /// lifecycle channel (carries the full
     /// [`crate::peer_lifecycle::PeerLifecycleEvent`] stream:
@@ -1551,6 +1563,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             remote_respawn_pending: None,
             tunnel_reconnector: None,
             job_ledger_probe: None,
+            upload_action: None,
             respawn_lifecycle_tx: None,
             respawn_lifecycle_rx: None,
             pending_replacements: super::respawn::PendingReplacements::default(),
@@ -2084,6 +2097,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// path). See [`crate::observer::job_ledger`].
     pub fn set_job_ledger_probe(&mut self, probe: Arc<dyn crate::observer::JobLedgerProbe>) {
         self.job_ledger_probe = Some(probe);
+    }
+
+    /// Park the upload-action port (#336 P1) the in-process setup executor
+    /// uses to perform a setup task's file upload, and which the primary
+    /// hands to its observer tail at relocation (the submitter→observer is
+    /// the framework auto-staging upload affinity). Must be set BEFORE
+    /// `run()` enters (same pre-run wiring contract as
+    /// [`Self::set_tunnel_reconnector`]). Absence leaves the executor with
+    /// no uploader — a setup task carrying an upload-file ref then fails as
+    /// a wiring error (a no-ref task is unaffected: it no-op-succeeds). See
+    /// [`crate::upload_action`].
+    pub fn set_upload_action(&mut self, action: Arc<dyn crate::upload_action::UploadAction>) {
+        self.upload_action = Some(action);
     }
 
     /// Read the parked deployment-mode job manager. Returns `None`
@@ -3806,6 +3832,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             graceful_abort_trigger,
             tunnel_reconnector,
             job_ledger_probe,
+            upload_action,
             respawn_spawner,
             ..
         } = self;
@@ -3853,6 +3880,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `None` on backends that self-heal — the observer then has
             // nothing to drive.
             reconnector: tunnel_reconnector,
+            // Hand the observer the upload-action port: the submitter→observer
+            // is the framework auto-staging upload affinity, so the observer
+            // it steps down into executes upload setup tasks in-process (#336
+            // P1). `None` on backends with no uploader wired.
+            upload_action,
             // The respawn PROVIDER belongs to this PROCESS, not the
             // primary role: the relocated submitter keeps it across its
             // demotion and serves remote respawn-execution requests from
