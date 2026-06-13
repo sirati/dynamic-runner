@@ -43,6 +43,7 @@ _SCENARIO_NAMES: tuple[str, ...] = (
     "primary-death-failover",
     "escape-hatch-external-master",
     "source-already-staged",
+    "stage-via-setup-tasks",
 )
 
 

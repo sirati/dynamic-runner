@@ -883,4 +883,22 @@ def validate_parsed_args(args: argparse.Namespace, parser: argparse.ArgumentPars
             "only read by the late-joiner observer's seed construction."
         )
 
+    # --stage-via-setup-tasks is currently supported ONLY with a pre-staged
+    # corpus (--source-already-staged, mode-2). In mode-2 each file is already
+    # on the cluster filesystem so a per-file setup task can be seeded
+    # pre-succeeded and the dep gate is honest. Mode-1 (framework-upload /
+    # files-on-submitter) suppresses the legacy StageFile physical-resolution
+    # fan-out on this flag path but does NOT replace it — per-secondary file
+    # delivery is unwired, leading to a silent NonRecoverable at dispatch. Fail
+    # fast here rather than silently at runtime.
+    if getattr(args, "stage_via_setup_tasks", False) and not getattr(
+        args, "source_already_staged", None
+    ):
+        parser.error(
+            "--stage-via-setup-tasks currently requires a pre-staged corpus "
+            "(--source-already-staged). Framework-upload (mode-1) staging via "
+            "setup tasks is not yet supported — omit --stage-via-setup-tasks "
+            "to use the default staging path."
+        )
+
 

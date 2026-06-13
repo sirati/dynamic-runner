@@ -55,21 +55,24 @@ use dynrunner_core::{Identifier, TaskDep, TaskInfo, TaskKind};
 /// (`maybe_auto_stage_initial` / `StageFile`) runs and this module produces
 /// NO augmentation — the cold seed is byte-for-byte what it was before.
 ///
-/// `SetupTasks` is the new flagged path and covers BOTH upload modes with ONE
-/// ledger model (owner-adjudicated option C): each file-backed work task gets
-/// a per-file SETUP task seeded PRE-SUCCEEDED, gated by `TaskDep`. The modes
-/// differ ONLY in whether a pre-run upload of the file happened, NOT in the
-/// ledger shape — mode-2 (`--source-already-staged`) has the file already on
-/// the cluster (nothing uploads), and mode-1 (files-on-submitter) runs the
-/// EXISTING Python `upload_source_binaries` BEFORE `run()` (unchanged), so by
-/// the time the setup task is seeded the file IS present and pre-succeeded is
-/// honest.
+/// `SetupTasks` is the new flagged path. It is currently ONLY supported with a
+/// pre-staged corpus (`--source-already-staged`, mode-2): the file is already
+/// on the cluster filesystem at run start, so each file-backed work task gets
+/// a per-file SETUP task seeded PRE-SUCCEEDED, gated by `TaskDep`. The
+/// pre-succeeded stamp is honest because the file is already present — the
+/// setup task never executes.
 ///
-/// In both modes the setup task is pre-succeeded in the replicated ledger, so
-/// any primary (original / relocated / promoted) resolves the dependent's dep
-/// from the ledger — the #488-free path. When the flag is on, the OLD
-/// StageFile fan-out (`maybe_auto_stage_initial`) does NOT run (no
-/// double-staging).
+/// Mode-1 (framework-upload / files-on-submitter) staging via setup tasks is
+/// NOT yet wired: the legacy `StageFile` physical-resolution path (which moves
+/// files to each secondary) is suppressed on this flag path but its replacement
+/// is not implemented. The CLI guard (`validate_parsed_args`) rejects the
+/// `--stage-via-setup-tasks` + no-`--source-already-staged` combination at
+/// startup with a clear error, so this code path is never reached for mode-1.
+///
+/// In mode-2 the setup task is pre-succeeded in the replicated ledger, so any
+/// primary (original / relocated / promoted) resolves the dependent's dep from
+/// the ledger — the #488-free path. When the flag is on, the OLD StageFile
+/// fan-out (`maybe_auto_stage_initial`) does NOT run (no double-staging).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StagingStrategy {
     /// The flag is off. The framework uses the OLD staging path; this module

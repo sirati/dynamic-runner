@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import io
 import pathlib
 import sys
 import types
 import unittest
+from contextlib import redirect_stderr
 
 
 _PACKAGE_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -63,6 +65,17 @@ filter_framework_argv = _forwarded_argv.filter_framework_argv
 
 def _parse(argv: list[str]) -> argparse.Namespace:
     return cli.build_arg_parser("test").parse_args(argv)
+
+
+def _parse_and_validate(argv: list[str]) -> argparse.Namespace:
+    """Build, parse, AND run cross-flag validation — mirrors what
+    `dynamic_runner.run.run` does so guard tests exercise the same path
+    the operator hits.
+    """
+    parser = cli.build_arg_parser("test")
+    args = parser.parse_args(argv)
+    cli.validate_parsed_args(args, parser)
+    return args
 
 
 class StageViaSetupTasksFlagShapeTests(unittest.TestCase):
@@ -111,6 +124,57 @@ class StageViaSetupTasksForwardingTests(unittest.TestCase):
         # task token as if it took a value.
         argv = ["--platform", "x64", "--stage-via-setup-tasks", "--compiler", "gcc"]
         self.assertEqual(filter_framework_argv(argv), argv)
+
+
+class StageViaSetupTasksGuardTests(unittest.TestCase):
+    """The CLI guard: `--stage-via-setup-tasks` without `--source-already-staged`
+    must fail fast with a clear error at config time, not silently at dispatch
+    with a NonRecoverable.
+
+    Invariant: mode-1 (framework-upload / files-on-submitter) staging via setup
+    tasks suppresses the legacy StageFile physical-resolution fan-out but does
+    NOT replace it — per-secondary file delivery is unwired. `validate_parsed_args`
+    rejects the combination so operators learn immediately rather than at
+    runtime dispatch.
+    """
+
+    def test_flag_on_without_source_already_staged_is_rejected(self) -> None:
+        # Headline guard: flag-ON + no --source-already-staged → clear error,
+        # NOT a silent pass or a runtime NonRecoverable.
+        parser = cli.build_arg_parser("test")
+        args = parser.parse_args(["--stage-via-setup-tasks"])
+        stderr_buf = io.StringIO()
+        with self.assertRaises(SystemExit) as cm, redirect_stderr(stderr_buf):
+            cli.validate_parsed_args(args, parser)
+        self.assertEqual(cm.exception.code, 2)
+        msg = stderr_buf.getvalue()
+        # The error message names the unsupported combination so the
+        # operator knows exactly what is missing.
+        self.assertIn("--stage-via-setup-tasks", msg)
+        self.assertIn("--source-already-staged", msg)
+
+    def test_flag_on_with_source_already_staged_passes_guard(self) -> None:
+        # Valid mode-2 combo: flag-ON + --source-already-staged + a
+        # distributed mode (--source-already-staged itself requires one).
+        # The guard must NOT reject this combination.
+        args = _parse_and_validate(
+            [
+                "--stage-via-setup-tasks",
+                "--source-already-staged",
+                "/nfs/corpus",
+                "--multi-computer",
+                "slurm",
+            ]
+        )
+        self.assertTrue(args.stage_via_setup_tasks)
+        self.assertEqual(args.source_already_staged, "/nfs/corpus")
+
+    def test_flag_off_without_source_already_staged_passes_guard(self) -> None:
+        # Default (flag absent) + no --source-already-staged is the
+        # ordinary run path; must never be affected by the guard.
+        args = _parse_and_validate([])
+        self.assertFalse(args.stage_via_setup_tasks)
+        self.assertIsNone(args.source_already_staged)
 
 
 if __name__ == "__main__":
