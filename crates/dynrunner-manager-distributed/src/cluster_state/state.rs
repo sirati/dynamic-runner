@@ -454,6 +454,22 @@ pub struct ClusterState<I> {
     /// does NOT recompute". Carries no convergence signal — classified
     /// node-local in every destructure guard.
     pub(super) digest_fold_count: std::cell::Cell<u64>,
+    /// Settled-entry disk spill: the node-local STORAGE BACKEND for the
+    /// join-fixed-point slice of `tasks` (see `cluster_state::settled`).
+    /// A settled entry's fat body lives in the append-only spill file;
+    /// this store holds the slim index, the shared read fds, and the
+    /// settled half of the digest's tasks fold. Empty (and inert) until
+    /// the spill driver attaches a writer segment.
+    ///
+    /// Classification: the index/accumulator are pure DERIVATIONS of
+    /// replicated entries (like `digest_cache`), the fds node-local
+    /// runtime handles. Clone carries it READ-ONLY (`clone_read_only` —
+    /// a cloned replica keeps serving settled reads through the shared
+    /// `Arc<File>`, never writes the source's file); snapshot/stream
+    /// serve settled entries from the FILE (`settled_record`), restore
+    /// converges through the `merge_task_state` settled consult; the
+    /// digest folds the accumulator (`tasks_hash_acc`).
+    pub(super) settled: super::settled::SettledStore,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -513,6 +529,9 @@ where
             // counter). Bound for the exhaustive-destructure guard.
             digest_cache: _digest_cache,
             digest_fold_count: _digest_fold_count,
+            // Settled store: carried READ-ONLY (index + shared read fds;
+            // the writer affiliation is dropped — one-writer rule).
+            settled,
         } = self;
         Self {
             tasks: tasks.clone(),
@@ -575,6 +594,10 @@ where
             // digest on first use, so it never inherits the source's memo).
             digest_cache: std::cell::Cell::new(None),
             digest_fold_count: std::cell::Cell::new(0),
+            // Settled store: read-only carry — the cloned replica keeps
+            // serving settled reads through the shared `Arc<File>`
+            // segments but never writes the source's file.
+            settled: settled.clone_read_only(),
         }
     }
 }
@@ -622,6 +645,7 @@ where
             dead_rejoin_warn,
             digest_cache,
             digest_fold_count,
+            settled,
         } = self;
         f.debug_struct("ClusterState")
             .field("tasks", tasks)
@@ -659,6 +683,7 @@ where
             .field("dead_rejoin_warn", &dead_rejoin_warn.len())
             .field("digest_cache", &digest_cache.get().is_some())
             .field("digest_fold_count", &digest_fold_count.get())
+            .field("settled", settled)
             .finish()
     }
 }
@@ -699,6 +724,7 @@ impl<I> Default for ClusterState<I> {
             dead_rejoin_warn: HashMap::new(),
             digest_cache: std::cell::Cell::new(None),
             digest_fold_count: std::cell::Cell::new(0),
+            settled: super::settled::SettledStore::default(),
         }
     }
 }
@@ -708,7 +734,16 @@ impl<I: Identifier> ClusterState<I> {
         Self::default()
     }
 
+    /// Total logical ledger entries: the fat in-memory map PLUS the
+    /// settled (spilled) index — a settled entry is still a ledger
+    /// entry, its fat body just lives on disk.
     pub fn task_count(&self) -> usize {
+        self.tasks.len() + self.settled.len()
+    }
+
+    /// Count of FAT (in-memory, unsettled) entries — the observability
+    /// complement of [`Self::task_count`] for the spill stats line.
+    pub fn tasks_in_memory(&self) -> usize {
         self.tasks.len()
     }
 

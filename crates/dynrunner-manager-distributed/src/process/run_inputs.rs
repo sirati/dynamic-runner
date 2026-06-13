@@ -143,6 +143,11 @@ pub type PromotedPrimaryBuilder<Sched, Est, I> = Box<
         RoleInbox<I>,
         mpsc::UnboundedReceiver<()>,
         crate::cluster_state::ClusterStateSnapshot<I>,
+        // The promoting host's settled-CRDT base (slim index + read fds
+        // onto its spill file). Installed as the built primary's settled
+        // base BEFORE the fat snapshot restore, so the join-fixed-point
+        // ledger slice is inherited without replaying fat bodies.
+        crate::cluster_state::SettledStore,
     ) -> PromotedPrimary<Sched, Est, I>,
 >;
 

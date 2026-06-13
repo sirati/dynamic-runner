@@ -14,6 +14,16 @@ use std::path::PathBuf;
 /// side ([`reaper_panik_container_path`]) can never drift.
 pub const LOG_TMP_CONTAINER_PATH: &str = "/app/log-tmp";
 
+/// Container-internal mount point of the per-node scratch `work` dir
+/// ([`Layout::work_tmp`], host: `<rndtmp>/work`), bind-mounted by
+/// `podman_run.rs` (`-v <work_tmp>:/app/work-tmp`). The settled-CRDT
+/// spill file lives under here; the wrapper also exports this path as
+/// `DYNRUNNER_WORK_DIR` so the in-container secondary resolves its work
+/// dir to the mounted scratch volume (the framework's
+/// `settled_spill::WORK_DIR_ENV`). Sibling shape to
+/// [`LOG_TMP_CONTAINER_PATH`].
+pub const WORK_TMP_CONTAINER_PATH: &str = "/app/work-tmp";
+
 /// Fixed basename of the reaper's graceful-last-resort panik sentinel.
 /// Framework-owned (dot-prefixed so it never collides with an operator
 /// `--panik-file` or a log file): the wrapper injects
@@ -41,6 +51,12 @@ pub struct Layout {
     pub src_tmp: PathBuf,           // <rndtmp>/src                   (:38)
     pub out_tmp: PathBuf,           // <rndtmp>/out                   (:39)
     pub log_tmp: PathBuf,           // <rndtmp>/log                   (:40)
+    /// Per-node scratch WORK dir: `<rndtmp>/work`. Bind-mounted to
+    /// [`WORK_TMP_CONTAINER_PATH`] and exported to the container as
+    /// `DYNRUNNER_WORK_DIR` so the framework's settled-CRDT spill lands
+    /// on node-local scratch. Sibling lifecycle to `out_tmp`/`log_tmp`
+    /// (created in `create_dirs`, torn down with `rndtmp`).
+    pub work_tmp: PathBuf,          // <rndtmp>/work
     pub podman_storage: PathBuf,    // <rndtmp>/storage               (:41)
     pub podman_run: PathBuf,        // <rndtmp>/run                   (:42)
     pub socket_dir: PathBuf,        // <rndtmp>/sockets               (:43)
@@ -93,6 +109,7 @@ impl Layout {
         let src_tmp = rndtmp.join("src");
         let out_tmp = rndtmp.join("out");
         let log_tmp = rndtmp.join("log");
+        let work_tmp = rndtmp.join("work");
         let podman_storage = rndtmp.join("storage");
         let podman_run = rndtmp.join("run");
         let socket_dir = rndtmp.join("sockets");
@@ -123,6 +140,7 @@ impl Layout {
             src_tmp,
             out_tmp,
             log_tmp,
+            work_tmp,
             podman_storage,
             podman_run,
             socket_dir,
@@ -158,6 +176,9 @@ impl Layout {
         std::fs::create_dir_all(&self.src_tmp)?;
         std::fs::create_dir_all(&self.out_tmp)?;
         std::fs::create_dir_all(&self.log_tmp)?;
+        // Per-node scratch WORK dir (settled-CRDT spill), created with
+        // the out/log siblings; bind-mounted to WORK_TMP_CONTAINER_PATH.
+        std::fs::create_dir_all(&self.work_tmp)?;
         std::fs::create_dir_all(&self.socket_dir)?;
         // mkdir -p storage run (generate.rs:345)
         std::fs::create_dir_all(&self.podman_storage)?;
@@ -220,6 +241,7 @@ mod tests {
         assert_eq!(l.src_tmp, PathBuf::from("/tmp/asm-2f1d4e89/src"));
         assert_eq!(l.out_tmp, PathBuf::from("/tmp/asm-2f1d4e89/out"));
         assert_eq!(l.log_tmp, PathBuf::from("/tmp/asm-2f1d4e89/log"));
+        assert_eq!(l.work_tmp, PathBuf::from("/tmp/asm-2f1d4e89/work"));
         assert_eq!(l.podman_storage, PathBuf::from("/tmp/asm-2f1d4e89/storage"));
         assert_eq!(l.podman_run, PathBuf::from("/tmp/asm-2f1d4e89/run"));
         assert_eq!(l.socket_dir, PathBuf::from("/tmp/asm-2f1d4e89/sockets"));
@@ -306,6 +328,7 @@ mod tests {
             src_tmp: root.join("src"),
             out_tmp: root.join("out"),
             log_tmp: root.join("log"),
+            work_tmp: root.join("work"),
             podman_storage: root.join("storage"),
             podman_run: root.join("run"),
             socket_dir: root.join("sockets"),
@@ -332,6 +355,7 @@ mod tests {
             &layout.src_tmp,
             &layout.out_tmp,
             &layout.log_tmp,
+            &layout.work_tmp,
             &layout.socket_dir,
             &layout.podman_storage,
             &layout.podman_run,

@@ -112,8 +112,20 @@ pub struct PromotionSignal<I: Identifier> {
     /// The promoting host's converged `cluster_state` snapshot, captured at
     /// the promotion-fire instant. The `Node` threads it to the
     /// [`super::PromotedPrimaryBuilder`] so the built primary resumes from
-    /// the right replicated generation rather than empty state.
+    /// the right replicated generation rather than empty state. Carries
+    /// the FAT (in-memory) entries; the SETTLED slice rides `settled_base`.
     pub snapshot: ClusterStateSnapshot<I>,
+    /// The promoting host's settled-CRDT base — its slim index + the
+    /// shared read fds onto its (still-mapped) spill file, cloned
+    /// read-only at the same instant as `snapshot`. The built primary
+    /// installs this as ITS settled base BEFORE restoring `snapshot`
+    /// (`install_settled_base`), so the join-fixed-point ledger slice is
+    /// inherited WITHOUT replaying any fat body through memory — the
+    /// promoted primary's local file+index IS its settled base (the
+    /// owner's hydrate-from-index, no-redo decision). The two halves are
+    /// disjoint (a hash is fat XOR settled), so their union is the full
+    /// logical ledger.
+    pub settled_base: crate::cluster_state::SettledStore,
 }
 
 /// The OS-process role composition shell (see the module docs).

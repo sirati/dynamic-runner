@@ -391,6 +391,53 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }
         }
 
+        // SETTLED (spilled) entries: the same per-class seeds as the fat
+        // terminal arms above, served off the slim index — the promoted
+        // node's local file+index IS its settled base, consumed here
+        // WITHOUT replaying fat bodies through memory. Per class,
+        // faithfully mirroring the fat arms:
+        //   * Completed → started + terminal + completed mirror + dep seed;
+        //   * FailedFinal → started + terminal + soft-failed seed + the
+        //     hash-keyed kind ledger (NOT the completed mirror — the two
+        //     sets are strictly disjoint, see the Failed arm above);
+        //   * InvalidTask → started + terminal + completed mirror +
+        //     soft-failed seed;
+        //   * SkippedAlreadyDone → terminal + completed mirror + dep seed,
+        //     and NOT started (#343 — a skip proves seeding, not
+        //     activation).
+        // `all_binaries` (the retry/OOM candidate universe) deliberately
+        // gains NO settled entries: the retry buckets only target
+        // Recoverable/OOM kinds, which never settle, so no settled
+        // TaskInfo can ever be a candidate.
+        for (hash, entry) in self.cluster_state.settled_entries() {
+            use crate::cluster_state::SettledClass;
+            match &entry.class {
+                SettledClass::Completed => {
+                    started_phases.insert(entry.phase_id.clone());
+                    phases_with_terminal.insert(entry.phase_id.clone());
+                    primary_completed.insert(hash.clone());
+                    completed_task_ids.insert(entry.task_id.clone());
+                }
+                SettledClass::FailedFinal(kind) => {
+                    started_phases.insert(entry.phase_id.clone());
+                    phases_with_terminal.insert(entry.phase_id.clone());
+                    soft_failed_seed.push((entry.task_id.clone(), entry.phase_id.clone()));
+                    failed_tasks.insert(hash.clone(), kind.clone());
+                }
+                SettledClass::InvalidTask => {
+                    started_phases.insert(entry.phase_id.clone());
+                    phases_with_terminal.insert(entry.phase_id.clone());
+                    primary_completed.insert(hash.clone());
+                    soft_failed_seed.push((entry.task_id.clone(), entry.phase_id.clone()));
+                }
+                SettledClass::SkippedAlreadyDone => {
+                    phases_with_terminal.insert(entry.phase_id.clone());
+                    primary_completed.insert(hash.clone());
+                    completed_task_ids.insert(entry.task_id.clone());
+                }
+            }
+        }
+
         self.completed_tasks = primary_completed;
         // V3: seed `phase_started_emitted` from the CRDT-derived started set
         // (a phase with ≥1 progressed task). On the cold path this is empty

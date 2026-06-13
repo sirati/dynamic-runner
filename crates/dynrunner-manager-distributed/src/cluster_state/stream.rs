@@ -148,11 +148,21 @@ impl SnapshotStreamPlan {
     /// builds a fresh-resume plan: only keys strictly after `k`, and NO
     /// tail capture (see the module doc).
     pub fn new<I: Identifier>(state: &ClusterState<I>, resume_after: Option<&str>) -> Self {
-        let mut keys: Vec<String> = match resume_after {
-            None => state.tasks.keys().cloned().collect(),
-            Some(cursor) => state
+        // The key UNIVERSE is the LOGICAL ledger: fat in-memory keys ∪
+        // settled (spilled) keys — a settled entry is still this
+        // replica's ledger entry, served per-key from the spill file at
+        // batch-build time. The union keeps the canonical sorted-key
+        // order (and with it the responder-agnostic resume cursor)
+        // identical to the all-in-memory iteration.
+        let all_keys = || {
+            state
                 .tasks
                 .keys()
+                .chain(state.settled_entries().map(|(k, _)| k))
+        };
+        let mut keys: Vec<String> = match resume_after {
+            None => all_keys().cloned().collect(),
+            Some(cursor) => all_keys()
                 .filter(|k| k.as_str() > cursor)
                 .cloned()
                 .collect(),
@@ -226,27 +236,43 @@ impl SnapshotStreamPlan {
                 let key = &self.keys[self.pos];
                 self.pos += 1;
                 cursor = Some(key.clone());
-                // Skip entries that vanished from the live map since
-                // capture (the plan holds keys, not entries — no frozen
-                // ledger copy).
-                let Some(task_state) = state.tasks.get(key) else {
-                    continue;
+                // Resolve the entry wherever its body lives: the fat map,
+                // or — for a SETTLED key — the spill file, decoded
+                // per-entry (`settled_record`: its own read fd, never past
+                // the committed offset; transient — no fat residency). A
+                // key that vanished from BOTH (or an unreadable record) is
+                // skipped exactly as before: the plan holds keys, not
+                // entries, and the receiver converges via anti-entropy.
+                let (task_state, settled_outputs) = match state.tasks.get(key) {
+                    Some(s) => (s.clone(), None),
+                    None => match state.settled_record(key) {
+                        Some((s, outputs)) => (s, outputs),
+                        None => continue,
+                    },
                 };
                 // Size the entry by encoding it once into a scratch
                 // buffer — bounded per-batch work, and the only way to
                 // get an exact bound without a second full encode of a
                 // speculative batch.
                 let mut scratch = Vec::new();
-                if let Err(e) = ciborium::into_writer(task_state, &mut scratch) {
+                if let Err(e) = ciborium::into_writer(&task_state, &mut scratch) {
                     return Some(Err(format!("snapshot-stream task entry encode: {e}")));
                 }
                 raw_bytes += scratch.len() + key.len() + 16;
-                batch.tasks.insert(key.clone(), task_state.clone());
+                batch.tasks.insert(key.clone(), task_state);
                 // The co-keyed output entry rides the SAME package so
-                // the restore join reads it co-present (TS-3).
-                if let Some(outputs) = state.task_outputs.get(key) {
+                // the restore join reads it co-present (TS-3). The
+                // in-memory map is the one hot source; the record's
+                // embedded copy is the fallback shape (equal by
+                // construction — first-write-wins on both ends).
+                if let Some(outputs) = state
+                    .task_outputs
+                    .get(key)
+                    .cloned()
+                    .or(settled_outputs)
+                {
                     raw_bytes += key.len() + 64;
-                    batch.task_outputs.insert(key.clone(), outputs.clone());
+                    batch.task_outputs.insert(key.clone(), outputs);
                 }
             }
             return Some(encode_stream_payload(&batch).map(|payload| StreamPackage {

@@ -1,5 +1,6 @@
 pub mod anti_entropy;
 pub mod cluster_state;
+pub mod settled_spill;
 pub mod snapshot_stream;
 pub mod discovery;
 pub mod fulfillability_matcher;
@@ -45,7 +46,8 @@ pub use secondary::{
 pub use zip_extract::compute_file_hash;
 // Re-export transport traits from the comm API crate for convenience.
 pub use cluster_state::{
-    ApplyOutcome, ClusterState, OutcomeSummary, PhaseRollup, RoleChangeHook, StateCounts, TaskState,
+    ApplyOutcome, ClusterState, OutcomeSummary, PhaseRollup, RoleChangeHook, SettledStore,
+    StateCounts, TaskState,
 };
 pub use dynrunner_protocol_primary_secondary::SecondaryTransport;
 pub use message_router::{MessageRouter, RoutedMessage};

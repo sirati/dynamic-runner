@@ -378,6 +378,7 @@ mod tests {
             src_tmp: rndtmp.join("src"),
             out_tmp: rndtmp.join("out"),
             log_tmp: rndtmp.join("log"),
+            work_tmp: rndtmp.join("work"),
             podman_storage: rndtmp.join("storage"),
             podman_run: rndtmp.join("run"),
             socket_dir: rndtmp.join("sockets"),

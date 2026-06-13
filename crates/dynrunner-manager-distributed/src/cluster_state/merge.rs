@@ -62,25 +62,52 @@ fn hash_one<H: Hash>(value: H) -> u64 {
 /// for terminals (this is what closes the equal-version divergent-payload
 /// sub-case the version alone, commonly `(epoch, 0)` for a single
 /// primary, cannot). `0` for non-terminals.
+///
+/// Delegates per-variant to the field-level `*_payload_hash` helpers
+/// below so the settled-spill PROBE keys (built from raw mutation
+/// fields, without a `TaskState` in hand) hash the identical tuples —
+/// one spelling, no drift.
 fn terminal_payload_hash<I>(state: &TaskState<I>) -> u64 {
     match state {
-        TaskState::Completed { .. } => hash_one(0u8),
+        TaskState::Completed { .. } => completed_payload_hash(),
         TaskState::Failed {
             kind, last_error, ..
-        } => hash_one((1u8, kind.wire_value(), last_error)),
+        } => failed_payload_hash(&kind.wire_value(), last_error),
         TaskState::Unfulfillable {
             reason, last_error, ..
-        } => hash_one((2u8, reason, last_error)),
+        } => unfulfillable_payload_hash(reason, last_error),
         TaskState::InvalidTask {
             reason, last_error, ..
-        } => hash_one((3u8, reason, last_error)),
+        } => invalid_task_payload_hash(reason, last_error),
         // Fixed discriminant tag; a skip carries no error payload, so the
         // content hash is the constant `4u8` (the terminal_rank already
         // separates it as the weakest terminal — two replicas holding the
         // skip for the same hash share this constant and idempotent-NoOp).
-        TaskState::SkippedAlreadyDone { .. } => hash_one(4u8),
+        TaskState::SkippedAlreadyDone { .. } => skipped_payload_hash(),
         TaskState::Pending { .. } | TaskState::InFlight { .. } | TaskState::Blocked { .. } => 0,
     }
+}
+
+// Field-level payload-hash helpers: the per-variant tuples hashed by
+// `terminal_payload_hash`, exposed so a PROBE key built from raw
+// mutation fields (the settled-spill consult path, which has no
+// `TaskState` to rank) folds byte-identically. `String` and `&str`
+// hash identically (std `Hash` for `String` delegates to `str`), so a
+// probe over the wire fields equals the state-borne hash.
+fn completed_payload_hash() -> u64 {
+    hash_one(0u8)
+}
+fn failed_payload_hash(kind_wire: &str, last_error: &str) -> u64 {
+    hash_one((1u8, kind_wire, last_error))
+}
+fn unfulfillable_payload_hash(reason: &str, last_error: &str) -> u64 {
+    hash_one((2u8, reason, last_error))
+}
+fn invalid_task_payload_hash(reason: &str, last_error: &str) -> u64 {
+    hash_one((3u8, reason, last_error))
+}
+fn skipped_payload_hash() -> u64 {
+    hash_one(4u8)
 }
 
 /// Build the ONE canonical convergence key for a task state (§2.2). The
@@ -94,26 +121,10 @@ pub(super) fn task_join_key<I>(state: &TaskState<I>) -> TaskJoinKey {
     match state {
         TaskState::Pending {
             version, attempt, ..
-        } => TaskJoinKey {
-            attempt: *attempt,
-            band: JoinBand::NonTerminal,
-            terminal_rank: TerminalRank::FailedLike,
-            version: *version,
-            nonterminal_rank: NonTerminalRank::Pending,
-            failedlike: FailedLikeRank::Failed,
-            payload_content_hash: 0,
-        },
+        } => key_pending(*attempt, *version),
         TaskState::InFlight {
             version, attempt, ..
-        } => TaskJoinKey {
-            attempt: *attempt,
-            band: JoinBand::NonTerminal,
-            terminal_rank: TerminalRank::FailedLike,
-            version: *version,
-            nonterminal_rank: NonTerminalRank::InFlight,
-            failedlike: FailedLikeRank::Failed,
-            payload_content_hash: 0,
-        },
+        } => key_in_flight(*attempt, *version),
         TaskState::Blocked { attempt, .. } => TaskJoinKey {
             attempt: *attempt,
             band: JoinBand::Blocked,
@@ -123,63 +134,149 @@ pub(super) fn task_join_key<I>(state: &TaskState<I>) -> TaskJoinKey {
             failedlike: FailedLikeRank::Failed,
             payload_content_hash: 0,
         },
-        TaskState::Completed { attempt, .. } => TaskJoinKey {
-            attempt: *attempt,
-            band: JoinBand::Terminal,
-            terminal_rank: TerminalRank::Completed,
-            // Completed carries no version; the terminal rank already
-            // separates it from FailedLike below and InvalidTask above.
-            version: TaskVersion::default(),
-            nonterminal_rank: NonTerminalRank::Pending,
-            failedlike: FailedLikeRank::Failed,
-            payload_content_hash: terminal_payload_hash(state),
-        },
+        TaskState::Completed { attempt, .. } => key_completed(*attempt),
         TaskState::Failed {
             version, attempt, ..
-        } => TaskJoinKey {
-            attempt: *attempt,
-            band: JoinBand::Terminal,
-            terminal_rank: TerminalRank::FailedLike,
-            version: *version,
-            nonterminal_rank: NonTerminalRank::Pending,
-            failedlike: FailedLikeRank::Failed,
-            payload_content_hash: terminal_payload_hash(state),
-        },
+        } => key_failed(*attempt, *version, terminal_payload_hash(state)),
         TaskState::Unfulfillable {
             version, attempt, ..
-        } => TaskJoinKey {
-            attempt: *attempt,
-            band: JoinBand::Terminal,
-            terminal_rank: TerminalRank::FailedLike,
-            version: *version,
-            nonterminal_rank: NonTerminalRank::Pending,
-            failedlike: FailedLikeRank::Unfulfillable,
-            payload_content_hash: terminal_payload_hash(state),
-        },
+        } => key_unfulfillable(*attempt, *version, terminal_payload_hash(state)),
         TaskState::InvalidTask {
             version, attempt, ..
-        } => TaskJoinKey {
-            attempt: *attempt,
-            band: JoinBand::Terminal,
-            terminal_rank: TerminalRank::InvalidTask,
-            version: *version,
-            nonterminal_rank: NonTerminalRank::Pending,
-            failedlike: FailedLikeRank::Failed,
-            payload_content_hash: terminal_payload_hash(state),
-        },
-        TaskState::SkippedAlreadyDone { attempt, .. } => TaskJoinKey {
-            attempt: *attempt,
-            band: JoinBand::Terminal,
-            // The WEAKEST terminal rank: a real terminal for the same hash
-            // always wins the join over the spawn-time skip. A skip carries
-            // no version; the terminal rank already places it below every
-            // other terminal.
-            terminal_rank: TerminalRank::SkippedAlreadyDone,
-            version: TaskVersion::default(),
-            nonterminal_rank: NonTerminalRank::Pending,
-            failedlike: FailedLikeRank::Failed,
-            payload_content_hash: terminal_payload_hash(state),
-        },
+        } => key_invalid_task(*attempt, *version, terminal_payload_hash(state)),
+        TaskState::SkippedAlreadyDone { attempt, .. } => key_skipped(*attempt),
+    }
+}
+
+// Per-variant key constructors: the ONE spelling of each variant's
+// `TaskJoinKey` shape, shared by `task_join_key` (ranking a held
+// `TaskState`) and the settled-spill PROBE keys (ranking an incoming
+// mutation against a settled — fat-body-evicted — entry, where no
+// candidate `TaskState` can be built because the `TaskInfo` is on
+// disk). A probe built here is BY CONSTRUCTION identical to the key
+// the candidate state would rank to.
+
+pub(super) fn key_pending(attempt: u32, version: TaskVersion) -> TaskJoinKey {
+    TaskJoinKey {
+        attempt,
+        band: JoinBand::NonTerminal,
+        terminal_rank: TerminalRank::FailedLike,
+        version,
+        nonterminal_rank: NonTerminalRank::Pending,
+        failedlike: FailedLikeRank::Failed,
+        payload_content_hash: 0,
+    }
+}
+
+pub(super) fn key_in_flight(attempt: u32, version: TaskVersion) -> TaskJoinKey {
+    TaskJoinKey {
+        attempt,
+        band: JoinBand::NonTerminal,
+        terminal_rank: TerminalRank::FailedLike,
+        version,
+        nonterminal_rank: NonTerminalRank::InFlight,
+        failedlike: FailedLikeRank::Failed,
+        payload_content_hash: 0,
+    }
+}
+
+pub(super) fn key_completed(attempt: u32) -> TaskJoinKey {
+    TaskJoinKey {
+        attempt,
+        band: JoinBand::Terminal,
+        terminal_rank: TerminalRank::Completed,
+        // Completed carries no version; the terminal rank already
+        // separates it from FailedLike below and InvalidTask above.
+        version: TaskVersion::default(),
+        nonterminal_rank: NonTerminalRank::Pending,
+        failedlike: FailedLikeRank::Failed,
+        payload_content_hash: completed_payload_hash(),
+    }
+}
+
+pub(super) fn key_failed(attempt: u32, version: TaskVersion, payload_hash: u64) -> TaskJoinKey {
+    TaskJoinKey {
+        attempt,
+        band: JoinBand::Terminal,
+        terminal_rank: TerminalRank::FailedLike,
+        version,
+        nonterminal_rank: NonTerminalRank::Pending,
+        failedlike: FailedLikeRank::Failed,
+        payload_content_hash: payload_hash,
+    }
+}
+
+pub(super) fn key_unfulfillable(
+    attempt: u32,
+    version: TaskVersion,
+    payload_hash: u64,
+) -> TaskJoinKey {
+    TaskJoinKey {
+        attempt,
+        band: JoinBand::Terminal,
+        terminal_rank: TerminalRank::FailedLike,
+        version,
+        nonterminal_rank: NonTerminalRank::Pending,
+        failedlike: FailedLikeRank::Unfulfillable,
+        payload_content_hash: payload_hash,
+    }
+}
+
+pub(super) fn key_invalid_task(
+    attempt: u32,
+    version: TaskVersion,
+    payload_hash: u64,
+) -> TaskJoinKey {
+    TaskJoinKey {
+        attempt,
+        band: JoinBand::Terminal,
+        terminal_rank: TerminalRank::InvalidTask,
+        version,
+        nonterminal_rank: NonTerminalRank::Pending,
+        failedlike: FailedLikeRank::Failed,
+        payload_content_hash: payload_hash,
+    }
+}
+
+pub(super) fn key_skipped(attempt: u32) -> TaskJoinKey {
+    TaskJoinKey {
+        attempt,
+        band: JoinBand::Terminal,
+        // The WEAKEST terminal rank: a real terminal for the same hash
+        // always wins the join over the spawn-time skip. A skip carries
+        // no version; the terminal rank already places it below every
+        // other terminal.
+        terminal_rank: TerminalRank::SkippedAlreadyDone,
+        version: TaskVersion::default(),
+        nonterminal_rank: NonTerminalRank::Pending,
+        failedlike: FailedLikeRank::Failed,
+        payload_content_hash: skipped_payload_hash(),
+    }
+}
+
+/// The PROBE key for an incoming `TaskFailed { kind, error, version,
+/// attempt }` mutation: mirrors the apply arm's `ErrorType → discrete
+/// variant` translation (Unfulfillable / InvalidTask demultiplex) so the
+/// settled consult ranks the mutation exactly as the candidate state the
+/// arm would build.
+pub(super) fn probe_key_for_failed_mutation(
+    kind: &dynrunner_core::ErrorType,
+    error: &str,
+    version: TaskVersion,
+    attempt: u32,
+) -> TaskJoinKey {
+    match kind {
+        dynrunner_core::ErrorType::Unfulfillable { reason } => key_unfulfillable(
+            attempt,
+            version,
+            unfulfillable_payload_hash(reason.as_str(), error),
+        ),
+        dynrunner_core::ErrorType::InvalidTask { reason } => key_invalid_task(
+            attempt,
+            version,
+            invalid_task_payload_hash(reason.as_str(), error),
+        ),
+        other => key_failed(attempt, version, failed_payload_hash(&other.wire_value(), error)),
     }
 }
 
@@ -271,6 +368,22 @@ impl<I: Identifier> ClusterState<I> {
         incoming_outputs: Option<TaskOutputs>,
         resumed: &mut Vec<dynrunner_core::TaskInfo<I>>,
     ) -> MergeOutcome {
+        // 0. Settled consult: a hash absent from the fat map may be a
+        // SETTLED entry (fat body evicted to the spill file, slim index
+        // retained). The stored join key answers the dominance question
+        // without touching the disk: the common late-duplicate /
+        // re-restore NoOps right here; the lattice-allowed (but
+        // practically-unreachable for a join fixed-point) dominating
+        // incoming REHYDRATES the fat body back into `tasks` first, so
+        // the normal occupied-slot path below runs with full fidelity
+        // (`was_completed`, tally bump, event build all see the true
+        // pre-merge state).
+        if !self.tasks.contains_key(hash)
+            && self.settled_contains(hash)
+            && !self.unsettle_if_dominated(hash, &task_join_key(&incoming))
+        {
+            return MergeOutcome::NoOp;
+        }
         // 1+2. Look up; on a present slot compare keys and bail on a NoOp.
         let was_completed = match self.tasks.get(hash) {
             None => false,

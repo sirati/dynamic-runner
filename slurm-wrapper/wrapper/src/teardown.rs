@@ -291,6 +291,7 @@ mod tests {
             src_tmp: root.join("src"),
             out_tmp: root.join("out"),
             log_tmp: root.join("log"),
+            work_tmp: root.join("work"),
             podman_storage: root.join("storage"),
             podman_run,
             socket_dir: root.join("sockets"),

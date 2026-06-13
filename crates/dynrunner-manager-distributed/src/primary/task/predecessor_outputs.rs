@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use dynrunner_core::{
-    Identifier, PhaseId, TaskInfo, TaskOutputs, gather_predecessor_outputs as core_gather,
+    Identifier, TaskInfo, TaskOutputs, gather_predecessor_outputs as core_gather,
 };
 
 use crate::cluster_state::ClusterState;
@@ -35,27 +35,16 @@ pub(crate) fn gather_predecessor_outputs<I: Identifier>(
         // `(phase_id, task_id)` identity to its hash and read the
         // hash-keyed CRDT output cache.
         |phase_id, task_id| state.outputs_for(phase_id, task_id).cloned(),
-        // Deps-of lookup: linear scan over `state.iter_all()`, matching
-        // the full `(phase_id, task_id)` identity. The CRDT does not
-        // maintain a reverse index by design; the ancestry walk fires
-        // only at dispatch time (not the hot path) and per-task chains
-        // are short, so the O(n) scan is acceptable. Adding a
-        // replicated reverse index would be a larger refactor
-        // (PhaseDepsSet / TaskAdded apply paths must agree).
-        |phase_id, task_id| {
-            find_task_info_by_id(state, phase_id, task_id).map(|t| t.task_depends_on.clone())
-        },
+        // Deps-of lookup: the settled-aware identity scan owned by
+        // `cluster_state` (`task_deps_for_identity`) — a dep target here
+        // is typically a COMPLETED (and often SETTLED/spilled)
+        // predecessor, whose dep edges the slim index retains for
+        // exactly this walk. The CRDT does not maintain a reverse index
+        // by design; the ancestry walk fires only at dispatch time (not
+        // the hot path) and per-task chains are short, so the O(n) scan
+        // is acceptable.
+        |phase_id, task_id| state.task_deps_for_identity(phase_id, task_id),
     )
-}
-
-fn find_task_info_by_id<'a, I: Identifier>(
-    state: &'a ClusterState<I>,
-    phase_id: &PhaseId,
-    task_id: &str,
-) -> Option<&'a TaskInfo<I>> {
-    state.iter_all().find_map(|(_, task)| {
-        (task.task_id == task_id && &task.phase_id == phase_id).then_some(task)
-    })
 }
 
 #[cfg(test)]

@@ -110,7 +110,12 @@ fn stamp_versions<I: Identifier>(
                 attempt,
                 ..
             } => {
-                *attempt = state.task_state(hash).map_or(0, |s| s.attempt());
+                // Settled-aware attempt read (`task_view`, not `task_state`):
+                // a copy-current mutation for a hash whose fat body spilled
+                // must stamp the TRUE generation off the slim index, not a
+                // cold 0 — a 0 would lose the join on every replica still
+                // holding the entry fat.
+                *attempt = state.task_view(hash).map_or(0, |v| v.attempt());
                 *version = state.next_task_version(hash);
             }
             ClusterMutation::TaskPreferredSecondariesUpdated { hash, version, .. }
@@ -124,7 +129,12 @@ fn stamp_versions<I: Identifier>(
             // current generation so the completion preserves the attempt it
             // completed under.
             ClusterMutation::TaskCompleted { hash, attempt, .. } => {
-                *attempt = state.task_state(hash).map_or(0, |s| s.attempt());
+                // Settled-aware attempt read (`task_view`, not `task_state`):
+                // a copy-current mutation for a hash whose fat body spilled
+                // must stamp the TRUE generation off the slim index, not a
+                // cold 0 — a 0 would lose the join on every replica still
+                // holding the entry fat.
+                *attempt = state.task_view(hash).map_or(0, |v| v.attempt());
             }
             // Capability mutations carry the SAME monotone stamp keyed by
             // PEER id (C6): the `cap_version` arbitrates a `can_be_primary`

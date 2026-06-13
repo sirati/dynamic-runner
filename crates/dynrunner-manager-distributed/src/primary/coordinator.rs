@@ -854,6 +854,11 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// operational-loop wakeup — see `crate::snapshot_stream`. The
     /// loop's wake arm drains it; the request handler feeds it.
     pub(super) snapshot_streams: crate::snapshot_stream::SnapshotStreamResponder,
+    /// Settled-CRDT spill driver: sweeps join-fixed-point ledger
+    /// entries to the node-local spill file on a cadence (one
+    /// `spawn_blocking` write in flight, durable-then-evict) — see
+    /// `crate::settled_spill`. The operational loop owns its one arm.
+    pub(super) settled_spill: crate::settled_spill::SettledSpillDriver,
     /// Inbound snapshot-stream progress (per responder): lets this
     /// node's own anti-entropy pulls RESUME an interrupted stream
     /// (same stream id + cursor) instead of re-pulling from scratch.
@@ -1457,6 +1462,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         );
         let snapshot_streams = crate::snapshot_stream::SnapshotStreamResponder::new(&config.node_id);
         let inbound_snapshots = crate::snapshot_stream::InboundSnapshotStreams::new(&config.node_id);
+        // Settled-CRDT spill: attach this coordinator's spill segment to
+        // the state it owns (degrades to disabled — fat-but-correct — on
+        // any setup failure; see `settled_spill`).
+        let mut cluster_state = ClusterState::new();
+        let settled_spill =
+            crate::settled_spill::SettledSpillDriver::start("primary", &mut cluster_state);
         let mut this = Self {
             config,
             client,
@@ -1507,8 +1518,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             mesh_gate_veto_warned: HashSet::new(),
             primary_id: None,
             pending_stage_files: Vec::new(),
-            cluster_state: ClusterState::new(),
+            cluster_state,
             snapshot_streams,
+            settled_spill,
             inbound_snapshots,
             command_rx: Some(command_rx),
             command_tx,
@@ -1875,6 +1887,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// replicated ledger. This is a NORMAL pre-`run` construction input — NOT
     /// a `run_activated` resume (which is gone): the seeded primary then
     /// enters the ordinary `run` path and originates `PrimaryChanged` itself.
+    /// Install the promoting host's settled-CRDT base as THIS primary's
+    /// settled base — the slim index + the shared read fds onto the
+    /// promoting host's (still-mapped) spill file. The promoted primary's
+    /// local file+index IS its settled base: the join-fixed-point ledger
+    /// slice is inherited WITHOUT replaying any fat body through memory
+    /// (the no-redo failover decision). Called by the
+    /// [`crate::process::PromotedPrimaryBuilder`] BEFORE
+    /// [`Self::seed_from_promotion_snapshot`] — the fat snapshot restore
+    /// then merges the disjoint fat half over this settled half. Legal
+    /// only on a freshly-built (empty) state; debug-asserts that.
+    pub fn adopt_settled_base(&mut self, base: crate::cluster_state::SettledStore) {
+        self.cluster_state.install_settled_base(base);
+    }
+
     pub fn seed_from_promotion_snapshot(
         &mut self,
         snapshot: crate::cluster_state::ClusterStateSnapshot<I>,
@@ -2976,11 +3002,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             SlotState::Idle => return InheritedSlotReconcile::NotInherited,
         };
         // Terminal veto: the requeue heuristic yields to a terminal that
-        // has already landed in the replicated ledger.
+        // has already landed in the replicated ledger. `task_view` (not
+        // `task_state`) — a SETTLED hash IS a recorded terminal, and
+        // missing it here would re-queue completed work.
         if self
             .cluster_state
-            .task_state(&task_hash)
-            .is_some_and(crate::cluster_state::TaskState::is_terminal)
+            .task_view(&task_hash)
+            .is_some_and(|v| v.is_terminal())
         {
             tracing::info!(
                 secondary = %self.workers[worker_idx].secondary_id,

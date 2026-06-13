@@ -257,6 +257,7 @@ mod tests {
             src_tmp: PathBuf::from("/tmp/asm-abc123/src"),
             out_tmp: PathBuf::from("/tmp/asm-abc123/out"),
             log_tmp: PathBuf::from("/tmp/asm-abc123/log"),
+            work_tmp: PathBuf::from("/tmp/asm-abc123/work"),
             podman_storage: PathBuf::from("/tmp/asm-abc123/storage"),
             podman_run: PathBuf::from("/tmp/asm-abc123/run"),
             socket_dir: PathBuf::from("/tmp/asm-abc123/sockets"),

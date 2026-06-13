@@ -1470,7 +1470,7 @@ pub(super) fn build_test_promote_recipe_with_config_and_hooks(
     // invocation.
     let mut config = Some(config);
     let mut hooks = Some(hooks);
-    Box::new(move |client, inbox, demote_rx, snapshot| {
+    Box::new(move |client, inbox, demote_rx, snapshot, settled_base| {
         let config = config
             .take()
             .expect("promote recipe invoked more than once");
@@ -1485,6 +1485,7 @@ pub(super) fn build_test_promote_recipe_with_config_and_hooks(
         if let Some(sd) = setup_discovery.take() {
             primary.register_setup_discovery(sd);
         }
+        primary.adopt_settled_base(settled_base);
         primary.seed_from_promotion_snapshot(snapshot);
         let (on_phase_start, on_phase_end) =
             (hooks.take().expect("promote recipe invoked more than once"))(
@@ -1551,7 +1552,7 @@ pub(super) fn build_test_promote_recipe_from_producer(
         source_dir,
     } = flags;
     let mut setup_discovery = setup_discovery;
-    Box::new(move |client, inbox, demote_rx, snapshot| {
+    Box::new(move |client, inbox, demote_rx, snapshot, settled_base| {
         // The cell is captured (on the live promotion path) but deliberately
         // NOT read for the stamped flags — assert it is still at `Default` to
         // pin that a relocate-target gets no `InitialAssignment` pre-promotion.
@@ -1591,6 +1592,7 @@ pub(super) fn build_test_promote_recipe_from_producer(
         if let Some(sd) = setup_discovery.take() {
             primary.register_setup_discovery(sd);
         }
+        primary.adopt_settled_base(settled_base);
         primary.seed_from_promotion_snapshot(snapshot);
         crate::process::PromotedPrimary {
             coordinator: primary,

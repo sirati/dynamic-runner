@@ -347,16 +347,36 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // hydrate-time projection (`Unfulfillable`/`InvalidTask` count in
         // the completed mirror — disjoint from `failed_tasks`).
         let (counter_completed, failed_kind, success_like) =
-            match self.cluster_state.task_state(task_hash) {
-                Some(TaskState::Completed { .. }) | Some(TaskState::SkippedAlreadyDone { .. }) => {
-                    (true, None, true)
+            match self.cluster_state.task_view(task_hash) {
+                Some(crate::cluster_state::TaskView::Live(state)) => match state {
+                    TaskState::Completed { .. } | TaskState::SkippedAlreadyDone { .. } => {
+                        (true, None, true)
+                    }
+                    TaskState::Failed { kind, .. } => (false, Some(kind.clone()), false),
+                    TaskState::Unfulfillable { .. } | TaskState::InvalidTask { .. } => {
+                        (true, None, false)
+                    }
+                    // Not terminal: nothing to settle.
+                    _ => return false,
+                },
+                // A SETTLED (spilled) hash classifies off its slim index
+                // class — the identical projection as the fat arms above.
+                // Load-bearing: the spill sweep may evict a terminal
+                // between the apply that fired this event and this
+                // dispatcher-side settle; reading `task_state` here would
+                // see `None` and LEAK the residue (slot / requeue copy).
+                Some(crate::cluster_state::TaskView::Settled(entry)) => {
+                    use crate::cluster_state::SettledClass;
+                    match &entry.class {
+                        SettledClass::Completed | SettledClass::SkippedAlreadyDone => {
+                            (true, None, true)
+                        }
+                        SettledClass::FailedFinal(kind) => (false, Some(kind.clone()), false),
+                        SettledClass::InvalidTask => (true, None, false),
+                    }
                 }
-                Some(TaskState::Failed { kind, .. }) => (false, Some(kind.clone()), false),
-                Some(TaskState::Unfulfillable { .. }) | Some(TaskState::InvalidTask { .. }) => {
-                    (true, None, false)
-                }
-                // Not terminal (or unknown hash): nothing to settle.
-                _ => return false,
+                // Unknown hash: nothing to settle.
+                None => return false,
             };
 
         // 1. Local execution residue: a held slot, or a queued requeue copy.

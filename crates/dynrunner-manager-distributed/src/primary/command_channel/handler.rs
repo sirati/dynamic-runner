@@ -94,18 +94,11 @@ where
         &self,
         hash: &str,
     ) -> Option<(dynrunner_core::PhaseId, String)> {
-        let state = self.cluster_state.task_state(hash)?;
-        let task = match state {
-            TaskState::Pending { task, .. }
-            | TaskState::InFlight { task, .. }
-            | TaskState::Completed { task, .. }
-            | TaskState::Failed { task, .. }
-            | TaskState::Unfulfillable { task, .. }
-            | TaskState::InvalidTask { task, .. }
-            | TaskState::SkippedAlreadyDone { task, .. }
-            | TaskState::Blocked { task, .. } => task,
-        };
-        Some((task.phase_id.clone(), task.task_id.clone()))
+        // `task_view` (not `task_state`): a SETTLED hash's identity is
+        // served off the slim index — exactly the post-terminal metadata
+        // this lookup exists for.
+        let view = self.cluster_state.task_view(hash)?;
+        Some((view.phase_id().clone(), view.task_id().to_string()))
     }
 
     /// Handler for `PrimaryCommand::FailPermanent`. Wraps the existing
@@ -237,6 +230,15 @@ where
                     "reinject_task: hash {hash} not in Unfulfillable state"
                 ));
             }
+            // A SETTLED hash is a known terminal (never Unfulfillable —
+            // Unfulfillable entries stay fat by the settle predicate), so
+            // the honest refusal names the state mismatch, not an unknown
+            // hash.
+            None if self.cluster_state.contains_task(&hash) => {
+                return Err(format!(
+                    "reinject_task: hash {hash} not in Unfulfillable state"
+                ));
+            }
             None => {
                 return Err(format!("reinject_task: unknown task hash {hash}"));
             }
@@ -323,7 +325,11 @@ where
         hash: String,
         secondaries: Vec<String>,
     ) -> Result<(), String> {
-        if self.cluster_state.task_state(&hash).is_none() {
+        // Presence over the LOGICAL ledger (`contains_task`): a SETTLED
+        // hash is a known task — the pool match below finds nothing (a
+        // terminal never re-dispatches) and the broadcast NoOps, but the
+        // command must not mis-report a real task as unknown.
+        if !self.cluster_state.contains_task(&hash) {
             return Err(format!(
                 "update_preferred_secondaries: unknown task hash {hash}"
             ));
@@ -424,7 +430,10 @@ where
         // `dynrunner-core` (no `ClusterState` dependency); each backend
         // supplies two closures that probe its own ledger shape.
         let (valid_tasks, errors) = validate_spawn_tasks(
-            |hash| self.cluster_state.task_state(hash).is_some(),
+            // Duplicate detection over the LOGICAL ledger: a SETTLED hash
+            // is a present task — re-spawning it must be rejected exactly
+            // like a fat duplicate.
+            |hash| self.cluster_state.contains_task(hash),
             // Phase-aware dep resolution: a dep names a full
             // `(phase_id, task_id)`. Reuse the SAME `task_hash_for_dep`
             // lookup `apply_tasks_spawned` uses, so the pre-validator and

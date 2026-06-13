@@ -142,6 +142,14 @@ impl StatsSnapshot {
                 }
             }
         }
+        // SETTLED (spilled) entries are terminal by construction; their
+        // ids come off the slim index (the fat iterator above no longer
+        // yields them).
+        for (_, entry) in state.settled_entries() {
+            if !entry.task_id.is_empty() {
+                terminal_task_ids.insert(entry.task_id.as_str());
+            }
+        }
 
         // Per-phase derived view (has_any / has_live / dispatchable),
         // recomputed from the CRDT by the single owning accessor in
