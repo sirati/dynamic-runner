@@ -55,7 +55,9 @@
 
 use std::time::{Duration, Instant};
 
-use dynrunner_protocol_primary_secondary::{Destination, DistributedMessage, StateDigest};
+use dynrunner_protocol_primary_secondary::{
+    Destination, DistributedMessage, RangeDigest, StateDigest,
+};
 
 use crate::anti_entropy::role_destination;
 use crate::snapshot_stream::InboundSnapshotStreams;
@@ -111,6 +113,21 @@ struct Candidate {
     /// against the role hint the caller passes (see [`ProbeReply`]).
     responder_is_observer: bool,
     inbox_size: u64,
+    /// The responder's piggybacked task-ledger [`RangeDigest`] (P1). Carried
+    /// per-candidate so that when THIS candidate is committed as the pull
+    /// target — at window-end, via the first-answer fallback, OR via the
+    /// `on_fail` fall-to-next path — the role can compute the divergent
+    /// range-set against its OWN range digest and stream only those buckets.
+    /// The coordinator never reads its internals (it is pure data threaded
+    /// to the role through the `PullFrom` directive); the FSM stays free of
+    /// the fold concern.
+    ///
+    /// `Box`ed: a `RangeDigest` is `RANGE_COUNT × (u64 + u32)` ≈ 3 KiB, so
+    /// inlining it would bloat every `Candidate` (and the `State` enum that
+    /// holds one as the `Pulling` target) — boxing keeps the FSM states
+    /// pointer-sized while the digest lives on the heap until the role reads
+    /// it once at pull time.
+    range_digest: Box<RangeDigest>,
 }
 
 /// One probe reply, as the role hands it to [`PullCoordinator::on_probe_reply`]
@@ -126,6 +143,15 @@ pub struct ProbeReply<'a> {
     /// Whether the responder is ahead of the requester (the reply's `ahead`
     /// bit). Non-`ahead` replies are dropped (never a pull candidate).
     pub ahead: bool,
+    /// The responder's piggybacked task-ledger [`RangeDigest`] (P1 Decision
+    /// A). Retained on the candidate so the eventual pull to this responder
+    /// can be narrowed to the divergent buckets. A pre-field responder's
+    /// reply carries the all-zero default, which yields no narrowing and
+    /// falls back to the all-ranges full stream (the data-loss fail-safe).
+    /// `Box`ed end-to-end (the wire variant boxes it too) to keep the ~3 KiB
+    /// digest off the by-value stack-move paths; the role hands the boxed
+    /// value straight off the decoded `PullProbeReply` frame.
+    pub range_digest: Box<RangeDigest>,
 }
 
 /// What the coordinator asks the role to do next. The role TRANSLATES each
@@ -139,10 +165,21 @@ pub enum PullDirective {
     /// Send a `RequestSnapshotStream` to this peer (resume-from-last-good).
     /// The role mints the stream id + resume cursor from its
     /// `InboundSnapshotStreams` tracker and types the `Destination` off
-    /// `target_is_observer`.
+    /// `target_is_observer`. The `target_range_digest` is the chosen
+    /// responder's piggybacked [`RangeDigest`]: the role compares it to its
+    /// OWN range digest (`ClusterState::tasks_range_digest`) to compute the
+    /// divergent buckets it stamps on the request's `task_ranges` (P1), so
+    /// only the divergent ranges stream. The coordinator threads it through
+    /// without inspecting it (the fold/compare is a `cluster_state`
+    /// concern); the role owns the comparison + frame stamp.
     PullFrom {
         target_id: String,
         target_is_observer: bool,
+        /// `Box`ed for the same reason as `Candidate::range_digest`: a
+        /// ~3 KiB `RangeDigest` inlined here would make every `PullDirective`
+        /// (returned by value from `note_behind`/`tick`/`on_*`) carry it on
+        /// the stack; boxing keeps the directive small.
+        target_range_digest: Box<RangeDigest>,
     },
 }
 
@@ -257,11 +294,15 @@ impl PullCoordinator {
         {
             existing.inbox_size = reply.inbox_size;
             existing.responder_is_observer = reply.responder_is_observer;
+            // Write through the existing box (no fresh allocation on a
+            // re-reply update).
+            *existing.range_digest = (*reply.range_digest).clone();
         } else {
             candidates.push(Candidate {
                 responder_id: reply.responder_id.to_string(),
                 responder_is_observer: reply.responder_is_observer,
                 inbox_size: reply.inbox_size,
+                range_digest: reply.range_digest.clone(),
             });
         }
         // First-answer fallback: if the 1s window has ALREADY elapsed when
@@ -302,6 +343,7 @@ impl PullCoordinator {
             let directive = PullDirective::PullFrom {
                 target_id: next.responder_id.clone(),
                 target_is_observer: next.responder_is_observer,
+                target_range_digest: next.range_digest.clone(),
             };
             self.state = State::Pulling {
                 target: next,
@@ -474,6 +516,7 @@ impl PullCoordinator {
         let directive = PullDirective::PullFrom {
             target_id: target.responder_id.clone(),
             target_is_observer: target.responder_is_observer,
+            target_range_digest: target.range_digest.clone(),
         };
         // The rebalance clock starts at the COMMIT instant (`now`), not the
         // probe broadcast — the 1-minute source-stickiness is measured from
@@ -559,10 +602,14 @@ pub fn pull_probe<I>(node_id: &str, timestamp: f64, digest: StateDigest) -> Dist
 }
 
 /// Build the `PullProbeReply` a node sends back to a probe's `requester`:
-/// its own inbox depth + the responder-side `ahead` bit. Typed DIRECTLY at
-/// the requester (`Secondary(id)`/`Observer(id)`) — a reply that cannot
+/// its own inbox depth + the responder-side `ahead` bit + the responder's
+/// task-ledger [`RangeDigest`] (P1 Decision A — piggybacked so the requester
+/// computes the divergent buckets with no extra round-trip). Typed DIRECTLY
+/// at the requester (`Secondary(id)`/`Observer(id)`) — a reply that cannot
 /// reach the requester directly is simply lost (the requester's 30s
-/// re-probe recovers), so it is never relayed.
+/// re-probe recovers), so it is never relayed. The role folds its own
+/// `cluster_state.tasks_range_digest()` and passes it here; this function
+/// only frames it (the fold is a `cluster_state` concern).
 pub fn pull_probe_reply<I>(
     node_id: &str,
     timestamp: f64,
@@ -570,6 +617,7 @@ pub fn pull_probe_reply<I>(
     requester_is_observer: bool,
     inbox_size: u64,
     ahead: bool,
+    range_digest: Box<RangeDigest>,
 ) -> (Destination, DistributedMessage<I>) {
     let dst = role_destination(requester, requester_is_observer);
     let frame = DistributedMessage::PullProbeReply {
@@ -579,6 +627,7 @@ pub fn pull_probe_reply<I>(
         requester: requester.to_string(),
         inbox_size,
         ahead,
+        range_digest,
     };
     (dst, frame)
 }
@@ -593,27 +642,58 @@ pub fn pull_probe_reply<I>(
 /// `RequestSnapshotStream`/`request_params` path the eager
 /// `anti_entropy::reconcile_against_peer` used — the chunk transfer is
 /// unchanged; only the TRIGGER (single-flight, probe-selected) differs.
+// A frame-builder with an inherently wide, FLAT parameter surface (it
+// mirrors the `RequestSnapshotStream` wire frame's fields one-to-one);
+// grouping them into a struct would be artificial ceremony that hides the
+// 1:1 frame mapping. The `task_ranges` slice is the role-computed divergent
+// bucket set (see [`divergent_ranges_for_pull`]).
+#[allow(clippy::too_many_arguments)]
 pub fn pull_request<I>(
     requester_id: &str,
     requester_is_observer: bool,
     requester_can_be_primary: bool,
     target_id: &str,
     target_is_observer: bool,
+    task_ranges: Vec<u16>,
     streams: &mut InboundSnapshotStreams,
     timestamp: f64,
 ) -> (Destination, DistributedMessage<I>, String) {
     let dst = role_destination(target_id, target_is_observer);
     let (stream_id, resume_after) = streams.request_params(target_id);
+    // P1 range-scoped delta: `task_ranges` is the set of buckets in which the
+    // chosen responder holds task data this requester lacks (the per-bucket
+    // image of `StateDigest::is_behind`'s task rule), computed by the role
+    // via [`divergent_ranges_for_pull`]. The responder's
+    // `SnapshotStreamPlan` filters its keys to these buckets, so a one-task
+    // change re-pulls ~one bucket. An EMPTY set (converged, OR a legacy
+    // responder's all-zero digest) means ALL ranges — the P0 full stream,
+    // the data-loss fail-safe: a missing delta NEVER drops a divergent
+    // range, it only forgoes the narrowing.
     let frame = DistributedMessage::RequestSnapshotStream {
         target: None,
         sender_id: requester_id.to_string(),
         timestamp,
         stream_id: stream_id.clone(),
         resume_after,
+        task_ranges,
         is_observer: requester_is_observer,
         can_be_primary: requester_can_be_primary,
     };
     (dst, frame, stream_id)
+}
+
+/// The divergent bucket set for a pull: the buckets in which the chosen
+/// `target` responder holds task data the `requester` lacks (the per-bucket
+/// image of `StateDigest::is_behind`'s task rule). The role computes this
+/// from its own range digest + the responder's piggybacked one, then hands
+/// the slice to [`pull_request`]. A thin re-export of
+/// [`RangeDigest::divergent_ranges`] so the role names ONE pull-model
+/// vocabulary (it never reaches into the wire type directly).
+pub fn divergent_ranges_for_pull(
+    requester_range_digest: &RangeDigest,
+    target_range_digest: &RangeDigest,
+) -> Vec<u16> {
+    requester_range_digest.divergent_ranges(target_range_digest)
 }
 
 /// Build the `PullFail` a pull responder sends when it could not serve a
@@ -654,6 +734,23 @@ mod tests {
             responder_is_observer: false,
             inbox_size: inbox,
             ahead,
+            // The pull-coordinator FSM threads the range digest opaquely; its
+            // CONTENT is exercised by the cluster_state range_digest tests +
+            // the differential delta≡full test, not the FSM unit tests, so
+            // the default (all-zero) digest suffices here.
+            range_digest: Box::new(RangeDigest::default()),
+        }
+    }
+
+    /// A `PullFrom` directive for `target` carrying the default range digest
+    /// — the FSM tests assert target SELECTION, not the range-set content
+    /// (which the cluster_state tests own), so they compare against the
+    /// default-digest directive.
+    fn pull_from(target: &str) -> PullDirective {
+        PullDirective::PullFrom {
+            target_id: target.to_string(),
+            target_is_observer: false,
+            target_range_digest: Box::new(RangeDigest::default()),
         }
     }
 
@@ -695,13 +792,7 @@ mod tests {
         assert_eq!(pc.state_name(), "probing");
         // Window elapses → tick commits the smallest-inbox ahead target.
         let directives = pc.tick(start + SELECTION_WINDOW);
-        assert_eq!(
-            directives,
-            vec![PullDirective::PullFrom {
-                target_id: "b".to_string(),
-                target_is_observer: false,
-            }]
-        );
+        assert_eq!(directives, vec![pull_from("b")]);
         assert_eq!(pc.state_name(), "pulling");
         assert_eq!(pc.pull_target(), Some("b"));
     }
@@ -739,13 +830,7 @@ mod tests {
         // First reply AFTER the window → committed on arrival.
         let after = start + SELECTION_WINDOW + Duration::from_millis(250);
         let d = pc.on_probe_reply(after, &reply("late", 5, true));
-        assert_eq!(
-            d,
-            Some(PullDirective::PullFrom {
-                target_id: "late".to_string(),
-                target_is_observer: false,
-            })
-        );
+        assert_eq!(d, Some(pull_from("late")));
         assert_eq!(pc.pull_target(), Some("late"));
     }
 
@@ -790,23 +875,11 @@ mod tests {
         assert_eq!(pc.on_fail(start, "stale"), None);
         assert_eq!(pc.pull_target(), Some("t2"));
         // The in-flight stream's fail → fall to the next smallest (t5).
-        assert_eq!(
-            pc.on_fail(start, "me/0"),
-            Some(PullDirective::PullFrom {
-                target_id: "t5".to_string(),
-                target_is_observer: false,
-            })
-        );
+        assert_eq!(pc.on_fail(start, "me/0"), Some(pull_from("t5")));
         assert_eq!(pc.pull_target(), Some("t5"));
         pc.note_pull_stream("me/1");
         // Next fail → t8.
-        assert_eq!(
-            pc.on_fail(start, "me/1"),
-            Some(PullDirective::PullFrom {
-                target_id: "t8".to_string(),
-                target_is_observer: false,
-            })
-        );
+        assert_eq!(pc.on_fail(start, "me/1"), Some(pull_from("t8")));
         assert_eq!(pc.pull_target(), Some("t8"));
         pc.note_pull_stream("me/2");
         // List exhausted → Idle; the next divergence re-probes.

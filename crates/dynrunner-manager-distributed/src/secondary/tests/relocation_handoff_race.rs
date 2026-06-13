@@ -121,6 +121,7 @@ async fn fake_relocated_observer(
                             requester: sender_id,
                             inbox_size: 0,
                             ahead: true,
+                            range_digest: Box::new(dynrunner_protocol_primary_secondary::RangeDigest::default()),
                         })
                         .unwrap();
                 }
@@ -558,6 +559,7 @@ async fn registration_gated_observer(
                             requester: sender_id,
                             inbox_size: 0,
                             ahead: true,
+                            range_digest: Box::new(dynrunner_protocol_primary_secondary::RangeDigest::default()),
                         })
                         .unwrap();
                 }

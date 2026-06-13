@@ -1051,6 +1051,11 @@ where
                 timestamp: timestamp_now(),
                 stream_id,
                 resume_after,
+                // Bootstrap recovery pulls the FULL ledger (empty =
+                // all-ranges, the P0 full stream): an observer entering the
+                // loop has no range digest of its own to compute a delta. P1
+                // narrows STEADY-STATE anti-entropy pulls, not bootstrap.
+                task_ranges: Vec::new(),
                 is_observer: true,
                 can_be_primary: false,
             };
@@ -1894,10 +1899,17 @@ where
                 requester,
                 inbox_size,
                 ahead,
+                range_digest,
                 ..
             } => {
-                self.handle_pull_probe_reply(&sender_id, &requester, inbox_size, ahead)
-                    .await;
+                self.handle_pull_probe_reply(
+                    &sender_id,
+                    &requester,
+                    inbox_size,
+                    ahead,
+                    range_digest,
+                )
+                .await;
             }
             // Pull-model FAIL (chosen target's direct leg to us dropped,
             // delivered INDIRECTLY via the relay) → fall to next target.
@@ -1912,6 +1924,7 @@ where
                 sender_id,
                 stream_id,
                 resume_after,
+                task_ranges,
                 is_observer,
                 ..
             } => {
@@ -1920,6 +1933,7 @@ where
                     is_observer,
                     &stream_id,
                     resume_after.as_deref(),
+                    &task_ranges,
                 );
             }
             // Respawn EXECUTION requests from the primary (the decision
@@ -2310,13 +2324,21 @@ where
             crate::pull_coordinator::PullDirective::PullFrom {
                 target_id,
                 target_is_observer,
+                target_range_digest,
             } => {
+                // P1: narrow to the buckets divergent from the chosen
+                // responder (compare its piggybacked range digest to ours).
+                let task_ranges = crate::pull_coordinator::divergent_ranges_for_pull(
+                    &self.cluster_state.tasks_range_digest(),
+                    &target_range_digest,
+                );
                 let (dst, frame, stream_id) = crate::pull_coordinator::pull_request::<I>(
                     &self.config.node_id,
                     true,
                     false,
                     &target_id,
                     target_is_observer,
+                    task_ranges,
                     &mut self.inbound_snapshots,
                     timestamp_now(),
                 );
@@ -2332,6 +2354,10 @@ where
     async fn handle_pull_probe(&mut self, prober_id: &str, prober_digest: &StateDigest) {
         let local = self.cluster_state.digest();
         let ahead = crate::pull_coordinator::probe_reply_ahead(&local, prober_digest);
+        // P1: piggyback this observer's task-ledger range digest so the
+        // prober computes the divergent buckets (an observer holds the same
+        // replicated ledger, so it can serve a delta like any peer).
+        let range_digest = self.cluster_state.tasks_range_digest();
         let (dst, frame) = crate::pull_coordinator::pull_probe_reply::<I>(
             &self.config.node_id,
             timestamp_now(),
@@ -2339,6 +2365,7 @@ where
             false,
             self.inbox.depth() as u64,
             ahead,
+            range_digest,
         );
         let _ = self.send_to(dst, frame).await;
     }
@@ -2351,6 +2378,7 @@ where
         requester: &str,
         inbox_size: u64,
         ahead: bool,
+        range_digest: Box<dynrunner_protocol_primary_secondary::RangeDigest>,
     ) {
         if requester != self.config.node_id {
             return;
@@ -2360,6 +2388,7 @@ where
             responder_is_observer: false,
             inbox_size,
             ahead,
+            range_digest,
         };
         if let Some(directive) = self
             .pull_coordinator
@@ -2410,6 +2439,7 @@ where
         requester_is_observer: bool,
         stream_id: &str,
         resume_after: Option<&str>,
+        task_ranges: &[u16],
     ) {
         self.snapshot_streams.accept_request(
             &self.cluster_state,
@@ -2417,6 +2447,7 @@ where
             requester_is_observer,
             stream_id,
             resume_after,
+            task_ranges,
         );
     }
 

@@ -40,7 +40,9 @@ mod broadcast;
 mod digest;
 mod events;
 mod grow_max;
+mod keyspace;
 mod merge;
+mod range_digest;
 mod settled;
 mod snapshot;
 mod state;
@@ -87,6 +89,11 @@ pub use types::{
 // `cluster_state::DiscoveryDebt` resolves at the original path for callers
 // that read it off `ClusterState`.
 pub use dynrunner_protocol_primary_secondary::DiscoveryDebt;
+
+// Test seam: the keyspace bucket function, so the range-digest tests assert
+// a changed key's bucket without re-deriving the hash-prefix rule.
+#[cfg(test)]
+pub(crate) use keyspace::range_index_for_test;
 
 #[cfg(test)]
 mod tests;

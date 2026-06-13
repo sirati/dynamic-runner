@@ -126,6 +126,7 @@ fn roundtrip_all_message_types() {
             timestamp: 0.0,
             stream_id: "s/0".into(),
             resume_after: None,
+            task_ranges: Vec::new(),
             is_observer: false,
             can_be_primary: true,
         },
@@ -337,6 +338,7 @@ fn request_snapshot_stream_mirrors_literal_sender_bytes() {
             timestamp,
             stream_id,
             resume_after,
+            task_ranges,
             is_observer,
             can_be_primary,
         } => {
@@ -345,6 +347,11 @@ fn request_snapshot_stream_mirrors_literal_sender_bytes() {
             assert_eq!(*timestamp, 3.25);
             assert_eq!(stream_id, "joiner-1/0");
             assert_eq!(resume_after.as_deref(), Some("crate-000100"));
+            // The literal carries no `task_ranges` key (empty = all-ranges,
+            // the P0 full stream); it decodes as an empty vec via
+            // serde(default) and re-encodes WITHOUT the key
+            // (skip_serializing_if), so the literal-mirror below holds.
+            assert!(task_ranges.is_empty());
             assert!(*is_observer);
             assert!(!*can_be_primary);
         }
@@ -358,11 +365,32 @@ fn request_snapshot_stream_mirrors_literal_sender_bytes() {
     let pre_field = r#"{"msg_type":"request_snapshot_stream","sender_id":"j","timestamp":0.0,"stream_id":"j/0","is_observer":false,"can_be_primary":true}"#;
     let decoded_pre: DistributedMessage<TestId> = serde_json::from_str(pre_field).unwrap();
     match decoded_pre {
-        DistributedMessage::RequestSnapshotStream { resume_after, .. } => {
+        DistributedMessage::RequestSnapshotStream {
+            resume_after,
+            task_ranges,
+            ..
+        } => {
             assert!(resume_after.is_none());
+            // A pre-`task_ranges` sender decodes as empty = all-ranges =
+            // the P0 full stream: a missing delta NEVER silently drops a
+            // range, it only forgoes the narrowing (the data-loss fail-safe).
+            assert!(task_ranges.is_empty());
         }
         other => panic!("expected RequestSnapshotStream, got {:?}", other.msg_type()),
     }
+    // Wire-shape mirror for a POPULATED delta: the EXACT bytes a P1
+    // requester's framing layer emits with a non-empty `task_ranges`, so a
+    // field rename or a u16-vs-uXX encoding drift is caught against the
+    // other side's literal (not a re-encode of our own value).
+    let delta = r#"{"msg_type":"request_snapshot_stream","sender_id":"behind","timestamp":1.0,"stream_id":"behind/2","resume_after":null,"task_ranges":[3,17,255],"is_observer":false,"can_be_primary":false}"#;
+    let decoded_delta: DistributedMessage<TestId> = serde_json::from_str(delta).unwrap();
+    match &decoded_delta {
+        DistributedMessage::RequestSnapshotStream { task_ranges, .. } => {
+            assert_eq!(*task_ranges, vec![3u16, 17, 255]);
+        }
+        other => panic!("expected RequestSnapshotStream, got {:?}", other.msg_type()),
+    }
+    assert_eq!(serde_json::to_string(&decoded_delta).unwrap(), delta);
 }
 
 /// Wire-shape mirror for `SnapshotStreamPackage`: the exact bytes the

@@ -77,6 +77,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             sender_id,
             stream_id,
             resume_after,
+            task_ranges,
             is_observer,
             can_be_primary,
             ..
@@ -97,6 +98,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             is_observer,
             &stream_id,
             resume_after.as_deref(),
+            &task_ranges,
         );
         // Originate the requester's `PeerJoined` over the canonical
         // local-apply + broadcast path. The joiner declared its own
@@ -300,13 +302,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             crate::pull_coordinator::PullDirective::PullFrom {
                 target_id,
                 target_is_observer,
+                target_range_digest,
             } => {
+                // P1: narrow the request to the buckets divergent from the
+                // chosen responder (compare the responder's piggybacked range
+                // digest against our own).
+                let task_ranges = crate::pull_coordinator::divergent_ranges_for_pull(
+                    &self.cluster_state.tasks_range_digest(),
+                    &target_range_digest,
+                );
                 let (dst, frame, stream_id) = crate::pull_coordinator::pull_request(
                     &self.config.node_id,
                     false,
                     true,
                     &target_id,
                     target_is_observer,
+                    task_ranges,
                     &mut self.inbound_snapshots,
                     timestamp_now(),
                 );
@@ -328,6 +339,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         };
         let local = self.cluster_state.digest();
         let ahead = crate::pull_coordinator::probe_reply_ahead(&local, &digest);
+        // P1: piggyback this node's task-ledger range digest so the prober
+        // computes the divergent buckets without a second round-trip.
+        let range_digest = self.cluster_state.tasks_range_digest();
         let (dst, frame) = crate::pull_coordinator::pull_probe_reply(
             &self.config.node_id,
             timestamp_now(),
@@ -335,6 +349,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             false,
             self.inbox.depth() as u64,
             ahead,
+            range_digest,
         );
         let _ = self.send_to(dst, frame).await;
     }
@@ -346,6 +361,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             requester,
             inbox_size,
             ahead,
+            range_digest,
             ..
         } = msg
         else {
@@ -359,6 +375,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             responder_is_observer: false,
             inbox_size,
             ahead,
+            range_digest,
         };
         if let Some(directive) = self
             .pull_coordinator

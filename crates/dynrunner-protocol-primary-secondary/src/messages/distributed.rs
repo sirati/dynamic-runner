@@ -13,6 +13,7 @@ use crate::address::Destination;
 use crate::cluster_mutation::ClusterMutation;
 use crate::messages::binary_info::{DistributedBinaryInfo, StagedFileRecord, ZipFileAssignment};
 use crate::messages::peer_info::{PeerConnectionInfo, WorkerReadyInfo};
+use crate::messages::range_digest::RangeDigest;
 use crate::messages::state_digest::StateDigest;
 
 /// The typed message enum. Each variant carries exactly the payload
@@ -374,6 +375,23 @@ pub enum DistributedMessage<I> {
         /// from-the-start stream, the conservative shape).
         #[serde(default)]
         resume_after: Option<String>,
+        /// P1 range-scoped delta: the DIVERGENT task-keyspace buckets the
+        /// requester wants streamed (the bucket indices its own
+        /// [`RangeDigest`](crate::RangeDigest) flagged behind the chosen
+        /// responder's). The responder's `SnapshotStreamPlan` filters its
+        /// task keys to `range_index(key) ∈ task_ranges`, so a one-task
+        /// change re-pulls ~one bucket, not the full O(34027) ledger.
+        ///
+        /// An EMPTY vec means "ALL ranges" — the P0 full-resume stream.
+        /// This is the wire-compatible safe default: `#[serde(default)]`
+        /// decodes a pre-field requester (or a requester that could not
+        /// compute the range delta, e.g. it lacked the responder's
+        /// `RangeDigest`) as empty, and the responder then serves the full
+        /// stream exactly as P0 did — a missing/uncomputed delta can never
+        /// silently DROP a divergent range (the failure mode that loses CRDT
+        /// entries); it only forgoes the narrowing.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        task_ranges: Vec<u16>,
         /// The joiner's own role. The snapshot responder is the first
         /// existing member to observe a late-joiner; it broadcasts a
         /// `ClusterMutation::PeerJoined { is_observer }` so every peer
@@ -633,6 +651,30 @@ pub enum DistributedMessage<I> {
         /// responder is never selected as a pull target.
         #[serde(default)]
         ahead: bool,
+        /// P1 range-scoped delta (Decision A — piggybacked on the reply, no
+        /// extra round-trip): the responder's per-bucket task-ledger
+        /// [`RangeDigest`](crate::RangeDigest). The requester compares it to
+        /// its OWN range digest ([`RangeDigest::divergent_ranges`]) the
+        /// moment it commits this responder as the pull target, and stamps
+        /// the divergent bucket set on its `RequestSnapshotStream`'s
+        /// `task_ranges` so only those buckets stream.
+        ///
+        /// `#[serde(default)]` decodes a pre-field responder as the all-zero
+        /// digest; the requester then computes an empty divergent set (or
+        /// falls back to the empty `task_ranges` = all-ranges full stream),
+        /// so a legacy responder degrades to a P0 full pull — never a
+        /// dropped range. Carried ONLY on the reply (which is sent direct +
+        /// only when the responder answers a probe at all), so the few-KiB
+        /// cost lands exclusively on the behind-node's direct selection leg.
+        ///
+        /// `Box`ed: a `RangeDigest` is `RANGE_COUNT × (u64 + u32)` ≈ 3 KiB.
+        /// Inlining it would make EVERY `DistributedMessage` carry that 3 KiB
+        /// on the stack on every by-value move through the hot recv/dispatch
+        /// loops (which overflows the constrained `spawn_local` task stacks);
+        /// boxing keeps the enum pointer-sized. Serde encodes `Box<T>`
+        /// identically to `T`, so the wire bytes are unchanged.
+        #[serde(default)]
+        range_digest: Box<RangeDigest>,
     },
     /// Pull-model FAIL: the chosen pull TARGET could not serve the
     /// requester's `RequestSnapshotStream` because the DIRECT link to the

@@ -296,6 +296,22 @@ impl SettledStore {
         self.tasks_hash_acc
     }
 
+    /// Per-settled-entry `(key, digest_contribution)` pairs — the persisted
+    /// per-entry fold term each settled entry contributes to `tasks_hash`
+    /// (`digest_contribution` was stamped at spill-commit as the SAME
+    /// `hash_one((key, hashable_join_key))` the live fold uses). The P1
+    /// range-digest projection buckets these by `range_index(key)` so the
+    /// settled half of the ledger folds into the right ranges, keeping the
+    /// `XOR(range-folds) == tasks_hash` invariant whole across the
+    /// fat/settled split. Keeps `digest_contribution` private to this
+    /// module (the store owns the term's lifecycle); callers see only the
+    /// `(key, term)` pair, never the entry internals.
+    pub(super) fn digest_contributions(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.index
+            .iter()
+            .map(|(key, entry)| (key.as_str(), entry.digest_contribution))
+    }
+
     pub(crate) fn records_committed(&self) -> u64 {
         self.records_committed
     }

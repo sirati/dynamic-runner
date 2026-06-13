@@ -552,6 +552,7 @@ where
                 sender_id,
                 stream_id,
                 resume_after,
+                task_ranges,
                 is_observer,
                 can_be_primary,
                 ..
@@ -578,6 +579,7 @@ where
                     is_observer,
                     &stream_id,
                     resume_after.as_deref(),
+                    &task_ranges,
                 );
                 // Explicit `PeerJoined` origination on late-joiner accept.
                 //
@@ -724,10 +726,17 @@ where
                 requester,
                 inbox_size,
                 ahead,
+                range_digest,
                 ..
             } => {
-                self.handle_pull_probe_reply(&sender_id, &requester, inbox_size, ahead)
-                    .await;
+                self.handle_pull_probe_reply(
+                    &sender_id,
+                    &requester,
+                    inbox_size,
+                    ahead,
+                    range_digest,
+                )
+                .await;
                 Ok(())
             }
             // Pull-model FAIL: the chosen target could not serve our pull
