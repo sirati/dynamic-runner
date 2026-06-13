@@ -215,7 +215,7 @@ pub enum RunError {
     /// return their structured variants before this gate is consulted).
     /// The run is over cluster-wide; this node ADOPTS the verdict and
     /// stands down — it authors no verdict of its own and never claims
-    /// "primary finished". The zombie split-brain fix's verdict-adoption
+    /// "run complete:". The zombie split-brain fix's verdict-adoption
     /// half: a deposed primary that hears ANY peer converges to the
     /// CRDT-resident terminal fact and exits non-zero with the cluster's
     /// reason (run_20260610_221140: the deposed epoch-2 primary instead
@@ -232,7 +232,7 @@ pub enum RunError {
     /// this node holds no authority to conclude the run. The terminal
     /// verdict (`RunComplete` / `RunAborted`) is gated on holding the
     /// CURRENT epoch — a deposed primary authors NO verdict and never
-    /// logs "primary finished"; its local totals are not authoritative
+    /// logs "run complete:"; its local totals are not authoritative
     /// (the production zombie reported succeeded=165/fail_final=108
     /// against the cluster's 153/120 abort verdict). The mid-run
     /// stand-down is the BUG-6 demote signal's jurisdiction; this is the
