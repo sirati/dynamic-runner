@@ -53,6 +53,7 @@
           install -m 0644 ${./deploy/lib.sh}             $out/share/slurm-test-env/lib.sh
           install -m 0755 ${./deploy/up.sh}              $out/bin/slurm-test-env-up
           install -m 0755 ${./deploy/down.sh}            $out/bin/slurm-test-env-down
+          install -m 0755 ${./deploy/reset.sh}           $out/bin/slurm-test-env-reset
           install -m 0755 ${./deploy/reboot-node.sh}     $out/bin/slurm-test-env-reboot-node
           install -m 0755 ${./scripts/provision-user.sh} $out/bin/slurm-test-env-provision-user
           install -m 0755 ${./scripts/smoke-test.sh}     $out/bin/slurm-test-env-smoke-test
@@ -72,6 +73,7 @@
               --prefix PATH : "$out/bin" \
               --prefix PATH : ${
                 pkgs.lib.makeBinPath [
+                  pkgs.bash
                   pkgs.podman
                   pkgs.openssh
                   pkgs.coreutils
@@ -101,6 +103,10 @@
           down = {
             type = "app";
             program = "${deploy}/bin/slurm-test-env-down";
+          };
+          reset = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-reset";
           };
           reboot-node = {
             type = "app";

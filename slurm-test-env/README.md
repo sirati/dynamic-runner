@@ -98,6 +98,23 @@ INSTANCE_ID=<tag> nix run .#reboot-node -- slurm-worker1
     systemctl daemon-reload && systemctl restart polkit'
   ```
 
+## Reset
+
+Clear run state to a fresh baseline **without** tearing the cluster
+down (no slow image rebuild on the next run):
+
+```sh
+INSTANCE_ID=<tag> nix run .#reset
+```
+
+Empties the two bind-mounted scratch surfaces: every user's `/home`
+contents (job output, logs, caches, framework state) are removed,
+leaving only each user's home directory plus their SSH access
+(`.ssh/`) and stable cluster-UID marker (`.cluster_uid`) — so the
+user can still log in and keeps their UID, but starts from an empty
+home, no re-provision needed. Each worker's `/tmp` is cleared too.
+Safe to run whether the cluster is up or down.
+
 ## Tear down
 
 ```sh
