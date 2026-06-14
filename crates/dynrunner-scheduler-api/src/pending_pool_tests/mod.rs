@@ -7,13 +7,14 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(super) use super::{PendingPool, PendingPoolError, PhaseState};
+pub(super) use super::{DispatchRank, PendingPool, PendingPoolError, PhaseState};
 pub(super) use dynrunner_core::{
     AffinityId, PhaseId, SoftPreferredSecondaries, TaskInfo, TaskKind, TypeId,
 };
 
 mod bucket_dispatch;
 mod dispatch_backoff;
+mod dispatch_rank;
 mod partition;
 mod phase_graph;
 mod phase_lifecycle;

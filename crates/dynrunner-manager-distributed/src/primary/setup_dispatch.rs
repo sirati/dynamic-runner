@@ -46,7 +46,7 @@ use dynrunner_core::{ErrorType, Identifier, PhaseId};
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, Destination, DistributedMessage, PeerId,
 };
-use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{DispatchRank, ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::cluster_state::PeerMembership;
@@ -120,28 +120,50 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
     }
 
-    /// Find the FIRST queued setup task whose executor affinity is routable
-    /// right now (unset / self affinity, or an explicit affinity that is a
-    /// live replicated member), returning its content hash. `None` when no
-    /// queued setup task is currently routable.
+    /// Pick the routable queued setup task whose dependents we most want to
+    /// start next — the upload whose gated WORK tasks have the BEST would-be
+    /// dispatch standing — returning its content hash. `None` when no queued
+    /// setup task is currently routable.
+    ///
+    /// PRIORITY, not FIFO (#336 P3): among the currently-routable setup tasks
+    /// (the routability gate is UNCHANGED — [`Self::is_setup_routable`]) the
+    /// pick is `min-by` the pool's [`dependent_dispatch_rank`], so an upload
+    /// feeding a dispatch-imminent build (transitively, through a #497
+    /// `SecondaryAffine` import gate) uploads ahead of one feeding a late
+    /// phase. A setup task with no known dependent yet ranks
+    /// [`DispatchRank::WORST`] → it routes LAST (deferred until a dependent
+    /// spawns, never starved: it re-ranks the moment one appears). This only
+    /// ROUTES a setup task — it never drops one, so no dependent is stranded.
+    ///
+    /// [`dependent_dispatch_rank`]: dynrunner_scheduler_api::PendingPool::dependent_dispatch_rank
     ///
     /// Reads cluster membership (`&self.cluster_state`) and the pool's queued
     /// view (`&self.cluster_state`-independent) in ONE `&self` borrow, so the
     /// caller can then take the task by hash without a borrow conflict.
     fn pool_ref_setup_routable(&self, own_id: &str) -> Option<String> {
-        self.pool().iter().find_map(|task| {
-            if !task.kind.is_setup() {
-                return None;
-            }
-            let routable = match task.setup_affinity.as_deref() {
-                None => true,
-                Some(a) if a == own_id => true,
-                Some(a) => {
-                    self.cluster_state.peer_membership(a) == PeerMembership::AliveMember
-                }
-            };
-            routable.then(|| compute_task_hash(task))
-        })
+        self.pool()
+            .iter()
+            .filter(|task| task.kind.is_setup() && self.is_setup_routable(task, own_id))
+            .min_by_key(|task| {
+                self.pool()
+                    .dependent_dispatch_rank(&task.task_id)
+                    .unwrap_or(DispatchRank::WORST)
+            })
+            .map(compute_task_hash)
+    }
+
+    /// Whether a setup task's executor affinity is routable right now: unset
+    /// / self affinity is always routable; an explicit affinity is routable
+    /// iff it is a live replicated member. The routability gate shared by the
+    /// priority picker ([`Self::pool_ref_setup_routable`]) and its tests —
+    /// extracted so the gate has ONE owner (the pick changed from FIFO to
+    /// min-by-rank; the gate did not).
+    fn is_setup_routable(&self, task: &dynrunner_core::TaskInfo<I>, own_id: &str) -> bool {
+        match task.setup_affinity.as_deref() {
+            None => true,
+            Some(a) if a == own_id => true,
+            Some(a) => self.cluster_state.peer_membership(a) == PeerMembership::AliveMember,
+        }
     }
 
     /// Run a setup task IN-PROCESS on the primary and originate its terminal.

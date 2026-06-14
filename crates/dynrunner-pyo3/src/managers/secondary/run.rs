@@ -201,20 +201,25 @@ impl PySecondaryCoordinator {
         // built inside the detached runtime where `self` is gone.
         let promote_pre_staged_root = self.src_network.clone();
         let promote_source_dir = Some(self.source_dir.clone());
-        // The two run-config dispatch flags the PROMOTE recipe stamps into the
-        // relocated primary's `PrimaryConfig`, sourced from this node's OWN
-        // LOCAL PRODUCER (the `task_definition` / `task_args` it booted with) —
-        // NOT the `InitialAssignment`-fed `StagingDispatchContext` cell. A
-        // relocate-TARGET never receives an `InitialAssignment` before it is
-        // promoted (the setup peer relocates → the target promotes → the
-        // PROMOTED primary runs `perform_initial_assignment`), so its cell is
-        // still at `Default { pre_staged_mode: false, uses_file_based_items:
-        // true }` at the promotion instant — reading it stamps the wrong flags
-        // (the relocate-staging bug). The local producer is run-uniform, so it
-        // carries the value the submitter primary stamped. Mirrors
-        // `managers/primary/new.rs` (`uses_file_based_items`) and the
-        // `discover_items_under_gil` pre-staged probe (`source_already_staged`).
-        let (promote_uses_file_based_items, promote_pre_staged_mode) =
+        // The PROMOTE recipe stamps `uses_file_based_items` into the relocated
+        // primary's `PrimaryConfig` from this node's OWN `task_definition` (a
+        // CLASS fact, run-uniform across every node) — NOT the
+        // `InitialAssignment`-fed `StagingDispatchContext` cell. A relocate-
+        // TARGET never receives an `InitialAssignment` before it is promoted
+        // (the setup peer relocates → the target promotes → the PROMOTED primary
+        // runs `perform_initial_assignment`), so its cell is still at `Default {
+        // uses_file_based_items: true }` at the promotion instant — reading it
+        // stamps the wrong flag. Mirrors `managers/primary/new.rs`.
+        //
+        // The run-level `pre_staged_mode` (the second flag the recipe stamps) is
+        // deliberately NOT read from the boot `task_args` here: on a compute
+        // secondary `--source-already-staged` is absent from the flag-less boot
+        // CLI and rides the delivered `forwarded_argv` (the post-welcome
+        // `RunConfig` push), landing ONLY in the resolved COMPLETE namespace.
+        // The recipe derives it there from the `run_config` cell (see
+        // `PromotedPrimaryRecipeInputs::run_config`); reading the boot
+        // `task_args` here stamped every mid-run joiner not-pre-staged (#488).
+        let (promote_uses_file_based_items, _boot_pre_staged_unused) =
             extract_staging_dispatch_flags(
                 self.task_definition_py.bind(py),
                 self.task_args_py.bind(py),
@@ -884,6 +889,11 @@ impl PySecondaryCoordinator {
                 // cell, so on_run_start, discovery, and the finalize all see ONE
                 // namespace.
                 let on_run_start_run_config = discovery_run_config.clone();
+                // The promote recipe derives the run-level `pre_staged_mode`
+                // from this SAME cell at the promotion instant: the delivered
+                // `--source-already-staged` lands only in the resolved complete
+                // namespace, never on a compute secondary's flag-less boot CLI.
+                let promote_run_config = discovery_run_config.clone();
                 let setup_discovery = dynrunner_manager_distributed::SetupDiscovery {
                     discover: build_setup_discovery_fn(
                         discovery_task_definition_py,
@@ -929,7 +939,7 @@ impl PySecondaryCoordinator {
                     }),
                     forwarded_argv: promote_run_config_handle,
                     uses_file_based_items: promote_uses_file_based_items,
-                    pre_staged_mode: promote_pre_staged_mode,
+                    run_config: promote_run_config,
                     source_pre_staged_root: promote_pre_staged_root,
                     source_dir: promote_source_dir,
                     staging_strategy: promote_staging_strategy,
@@ -1196,15 +1206,27 @@ pub(crate) struct PromotedPrimaryRecipeInputs {
     /// keeps reading the wire-fed cell — a PLAIN secondary executing assigned
     /// tasks always has a populated cell, so that path is unchanged.
     pub uses_file_based_items: bool,
-    /// Whether the run is in pre-staged mode (`--source-already-staged`).
-    /// Sourced from this node's OWN LOCAL PRODUCER (the SLURM secondary reads
-    /// `task_args.source_already_staged` non-None — mirroring the submitter's
-    /// `source_pre_staged_root.is_some()`; the in-process path passes
-    /// `source_pre_staged_root.is_some()` directly) for the SAME reason
-    /// `uses_file_based_items` is: the relocate-target's wire-fed cell is at
-    /// its `pre_staged_mode: false` default at promotion. Gates whether
-    /// `source_pre_staged_root` is threaded into the promoted `PrimaryConfig`.
-    pub pre_staged_mode: bool,
+    /// The COMPLETE-namespace single source of truth
+    /// ([`crate::managers::run_config::SharedRunConfig`]) — the SAME cell
+    /// discovery / `on_run_start` / the finalize resolve. The recipe resolves
+    /// it under the GIL at the promotion instant to derive the run-level
+    /// `pre_staged_mode` (`source_already_staged` non-`None`), which gates
+    /// whether `source_pre_staged_root` is threaded into the promoted
+    /// `PrimaryConfig`.
+    ///
+    /// WHY the namespace, not a boot-derived bool: `--source-already-staged` is
+    /// a RUN-LEVEL fact the submitter knows but a compute secondary's flag-less
+    /// boot `task_args` does NOT carry — it rides the delivered `forwarded_argv`
+    /// (the post-welcome `RunConfig` push) and lands ONLY in this resolved
+    /// complete namespace. A pre-fix promote recipe read the boot `task_args`,
+    /// derived `pre_staged_mode=false`, and stamped every mid-run joiner's
+    /// `InitialAssignment` not-pre-staged — the joiner then hash-verified
+    /// bind-mounted files and lost every task `NonRecoverable` (#488). The
+    /// in-process path's `pre_resolved` namespace carries the flag too (the
+    /// setup peer IS the submitter), so this one source derives correctly on
+    /// both paths. (Distinct from `uses_file_based_items`, a `task_definition`
+    /// CLASS fact run-uniform on every node — the boot producer reads that one.)
+    pub run_config: crate::managers::run_config::SharedRunConfig,
     /// The staged-corpus root the secondary's source is bind-mounted under
     /// (`--source-already-staged` → the secondary's `src_network`). Threaded
     /// into the promoted `PrimaryConfig.source_pre_staged_root` IFF the
@@ -1285,24 +1307,22 @@ pub(crate) struct PromotedPrimaryRecipeInputs {
     pub custom_message_handler_def: Option<Py<PyAny>>,
 }
 
-/// Read the run's two staging-dispatch flags from this node's OWN LOCAL
-/// PRODUCER — the consumer `task_definition` + `task_args` it booted with.
+/// Read the run's two staging-dispatch flags from a `task_definition` +
+/// a run-config namespace.
 ///
-/// Single concern: "what does the local producer say the run's dispatch mode
-/// is?". This is the SOURCE the promote recipe must consult (NOT the
-/// `InitialAssignment`-fed `StagingDispatchContext` cell): a relocate-TARGET
-/// has no `InitialAssignment` before it is promoted, so its cell is still at
-/// `Default { pre_staged_mode: false, uses_file_based_items: true }`. The local
-/// producer is run-uniform (every node booted from the same consumer
-/// `task_definition`), so it carries the value the original submitter primary
-/// stamped.
-///
-/// Mirrors the two existing reads verbatim:
-///   * `uses_file_based_items` — `managers/primary/new.rs`: missing/unparseable
-///     attribute defaults to `true` (the historical file-based contract).
-///   * `pre_staged_mode` — the `discover_items_under_gil` pre-staged probe:
-///     `task_args.source_already_staged` non-`None`, mirroring the submitter's
-///     `source_pre_staged_root.is_some()`.
+/// Single concern: "what does this producer say the run's dispatch mode is?".
+///   * `uses_file_based_items` is a `task_definition` CLASS fact — run-uniform
+///     on every node, so the boot `task_definition` is the correct source the
+///     promote recipe consults (NOT the `InitialAssignment`-fed cell, which a
+///     relocate-target holds at `Default` at promotion). Mirrors
+///     `managers/primary/new.rs`: a missing/unparseable attribute defaults to
+///     `true` (the historical file-based contract).
+///   * `pre_staged_mode` is delegated to [`pre_staged_mode_from_namespace`] —
+///     `source_already_staged` non-`None`. CAUTION: on a compute secondary the
+///     BOOT `task_args` does NOT carry `--source-already-staged` (it rides the
+///     delivered `forwarded_argv`), so the promote recipe derives this half
+///     from the RESOLVED COMPLETE namespace, not the boot args (#488). The
+///     in-process path passes the submitter's namespace, which does carry it.
 fn extract_staging_dispatch_flags(
     task_definition: &Bound<'_, PyAny>,
     task_args: &Bound<'_, PyAny>,
@@ -1312,12 +1332,29 @@ fn extract_staging_dispatch_flags(
         .ok()
         .and_then(|v| v.extract().ok())
         .unwrap_or(true);
-    let pre_staged_mode = task_args
+    (
+        uses_file_based_items,
+        pre_staged_mode_from_namespace(task_args),
+    )
+}
+
+/// Read the run-level `pre_staged_mode` from a run-config namespace —
+/// `source_already_staged` non-`None`, mirroring the submitter's
+/// `source_pre_staged_root.is_some()` discriminant.
+///
+/// Single concern + single source of truth for "what does
+/// `source_already_staged` mean as pre_staged_mode?": both
+/// [`extract_staging_dispatch_flags`] (the local-producer read) and the
+/// promotion recipe (which reads the resolved COMPLETE namespace — the only
+/// place `--source-already-staged` lands on a compute secondary, since it
+/// rides the delivered `forwarded_argv`) consult THIS one predicate. A missing
+/// attribute defaults to not-pre-staged (the historical mode-1 contract).
+fn pre_staged_mode_from_namespace(namespace: &Bound<'_, PyAny>) -> bool {
+    namespace
         .getattr("source_already_staged")
         .ok()
         .filter(|v| !v.is_none())
-        .is_some();
-    (uses_file_based_items, pre_staged_mode)
+        .is_some()
 }
 
 /// Derive the framework file-staging strategy (#489 P3/P4) for a PROMOTED
@@ -1388,7 +1425,7 @@ pub(crate) fn build_promoted_primary_recipe(
         on_run_start,
         forwarded_argv,
         uses_file_based_items,
-        pre_staged_mode,
+        run_config,
         source_pre_staged_root,
         source_dir,
         staging_strategy,
@@ -1428,14 +1465,47 @@ pub(crate) fn build_promoted_primary_recipe(
     // single-use, taken on the one fire (the closure is built there,
     // from the promoted coordinator's live command sender).
     let mut custom_message_handler_def = custom_message_handler_def;
-    // The run-config handle is shared (not single-use): the recipe READS it at
-    // promotion, leaving the secondary's copy intact. No `Option`/`take` — it
-    // is cloned-in and read by value at the promotion instant. The two staging
-    // flags (`uses_file_based_items` / `pre_staged_mode`) were extracted from
-    // this node's OWN local producer on the GIL thread and captured by value;
-    // they are NOT read off the `InitialAssignment`-fed cell (a relocate-target
-    // has no `InitialAssignment` before promotion — its cell is at `Default`).
+    // The forwarded-argv handle is shared (not single-use): the recipe READS it
+    // at promotion, leaving the secondary's copy intact. No `Option`/`take` — it
+    // is cloned-in and read by value at the promotion instant.
+    //
+    // `uses_file_based_items` is a `task_definition` class fact (run-uniform on
+    // every node), captured by value on the GIL thread — correct as-is. The
+    // run-level `pre_staged_mode`, by contrast, is derived INSIDE the closure
+    // from the resolved COMPLETE namespace (`run_config`, the single source of
+    // truth discovery/on_run_start/finalize share), NOT from the boot
+    // `task_args`: on a compute secondary `--source-already-staged` is absent
+    // from the flag-less boot CLI and rides the delivered `forwarded_argv` —
+    // landing ONLY in this resolved namespace. The relocate-target's
+    // `InitialAssignment`-fed cell is irrelevant here (it is at `Default` at
+    // promotion — the target receives no `InitialAssignment` before it
+    // promotes).
     Box::new(move |client, inbox, demote_rx, snapshot, settled_base, bootstrap_kind| {
+        // Derive the run-level `pre_staged_mode` from the resolved complete
+        // namespace at the promotion instant (the delivered `forwarded_argv`
+        // has landed — the recipe fires AFTER the post-welcome push). This is
+        // the FIRST resolve on a relocate-target/in-process path (discovery and
+        // on_run_start read the SAME cached namespace afterwards — lazy,
+        // idempotent). A resolve failure (finalize raised / mutex poisoned)
+        // collapses to not-pre-staged: the safe historical default (the
+        // promoted primary RE-STAGES via StageFile records rather than assuming
+        // a bind-mount it cannot confirm). `uses_file_based_items` reads the
+        // run-uniform `task_definition`; only the `source_already_staged` half
+        // of the resolved namespace is consulted.
+        let pre_staged_mode = Python::attach(|py| {
+            run_config
+                .resolve_under_gil(py)
+                .map(|ns| pre_staged_mode_from_namespace(ns.bind(py)))
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "promoted primary: could not resolve the run-config \
+                         namespace to derive pre_staged_mode; defaulting to \
+                         not-pre-staged (the primary will re-stage via StageFile)"
+                    );
+                    false
+                })
+        });
         let config = PrimaryConfig {
             node_id: secondary_id.clone(),
             keepalive_interval,
@@ -1457,11 +1527,14 @@ pub(crate) fn build_promoted_primary_recipe(
             // fix). `uses_file_based_items` and `source_pre_staged_root` feed
             // `assignment.rs`'s `InitialAssignment` stamps + `wire_local_path`;
             // `source_dir` feeds `maybe_auto_stage_initial`'s re-walk (the
-            // relocated primary re-stages from scratch). Both staging flags are
-            // sourced from this node's OWN local producer (extracted on the GIL
-            // thread), NOT the `InitialAssignment`-fed cell — the relocate-
-            // target's cell is at `Default` at promotion. `source_pre_staged_root`
-            // is consulted only in pre-staged mode — mirror the submitter's
+            // relocated primary re-stages from scratch). `uses_file_based_items`
+            // is the run-uniform `task_definition` class fact (captured on the
+            // GIL thread); `pre_staged_mode` is derived above from the resolved
+            // COMPLETE namespace (the delivered `--source-already-staged`), NOT
+            // the boot `task_args` — neither reads the `InitialAssignment`-fed
+            // cell (the relocate-target's cell is at `Default` at promotion).
+            // `source_pre_staged_root` (the secondary's OWN bind-mount root) is
+            // consulted only in pre-staged mode — mirror the submitter's
             // `is_some()` discriminant by gating on `pre_staged_mode`.
             uses_file_based_items,
             source_pre_staged_root: if pre_staged_mode {
@@ -2641,7 +2714,10 @@ task = Task()
                 on_run_start: None,
                 forwarded_argv: Arc::new(Mutex::new(Vec::new())),
                 uses_file_based_items: true,
-                pre_staged_mode: false,
+                // A not-pre-staged run-config namespace (no
+                // `source_already_staged`) → the recipe derives
+                // `pre_staged_mode=false`, matching this test's facet.
+                run_config: not_pre_staged_run_config(py),
                 source_pre_staged_root: None,
                 source_dir: None,
                 staging_strategy: dynrunner_manager_distributed::StagingStrategy::Disabled,
@@ -2658,6 +2734,7 @@ task = Task()
                 demote_rx,
                 snapshot,
                 dynrunner_manager_distributed::SettledStore::empty(),
+                dynrunner_manager_distributed::process::BootstrapKind::Failover,
             );
             // Keep the slot alive for the coordinator's lifetime.
             let _slot = slot;
@@ -2745,12 +2822,12 @@ task = Task()
                 on_run_start: Some(OnRunStartContext {
                     task_definition_py: task_def,
                     source_dir: "/local/src".to_string(),
-                    run_config,
+                    run_config: run_config.clone(),
                     primary_handle: handle,
                 }),
                 forwarded_argv: Arc::new(Mutex::new(Vec::new())),
                 uses_file_based_items: true,
-                pre_staged_mode: false,
+                run_config,
                 source_pre_staged_root: None,
                 source_dir: None,
                 staging_strategy: dynrunner_manager_distributed::StagingStrategy::Disabled,
@@ -2767,6 +2844,7 @@ task = Task()
                 demote_rx,
                 snapshot,
                 dynrunner_manager_distributed::SettledStore::empty(),
+                dynrunner_manager_distributed::process::BootstrapKind::Failover,
             );
             let _slot = slot;
 
@@ -2854,12 +2932,12 @@ task = Task()
                 on_run_start: Some(OnRunStartContext {
                     task_definition_py: task_def,
                     source_dir: "/local/src".to_string(),
-                    run_config,
+                    run_config: run_config.clone(),
                     primary_handle: handle,
                 }),
                 forwarded_argv: Arc::new(Mutex::new(Vec::new())),
                 uses_file_based_items: true,
-                pre_staged_mode: false,
+                run_config,
                 source_pre_staged_root: None,
                 source_dir: None,
                 staging_strategy: dynrunner_manager_distributed::StagingStrategy::Disabled,
@@ -2876,6 +2954,7 @@ task = Task()
                 demote_rx,
                 snapshot,
                 dynrunner_manager_distributed::SettledStore::empty(),
+                dynrunner_manager_distributed::process::BootstrapKind::Failover,
             );
             let _slot = slot;
 
@@ -2897,6 +2976,173 @@ task = Task()
                 reason.contains("on_run_start") && reason.contains("raised"),
                 "the recorded directive must name the raised on_run_start hook; \
                  got: {reason}"
+            );
+            drop(built.coordinator);
+        });
+    }
+
+    /// A `pre_resolved` `SharedRunConfig` over a namespace WITHOUT
+    /// `source_already_staged` — the recipe derives `pre_staged_mode=false`.
+    fn not_pre_staged_run_config(py: Python<'_>) -> SharedRunConfig {
+        let m = PyModule::from_code(
+            py,
+            std::ffi::CString::new(
+                "from types import SimpleNamespace\nns = SimpleNamespace(output='/run/out')\n",
+            )
+            .unwrap()
+            .as_c_str(),
+            std::ffi::CString::new("not_prestaged_ns.py").unwrap().as_c_str(),
+            std::ffi::CString::new("not_prestaged_ns").unwrap().as_c_str(),
+        )
+        .unwrap();
+        SharedRunConfig::pre_resolved(m.getattr("ns").unwrap().unbind())
+    }
+
+    /// #488 facet-1 RED-first repro: the PROMOTION-CONFIG DERIVATION at a
+    /// compute secondary's promotion, replayed verbatim.
+    ///
+    /// Production shape (run_20260613_154821): a SLURM compute secondary boots
+    /// WITHOUT `--source-already-staged` on its flag-less CLI — that run-level
+    /// flag rides the post-welcome `forwarded_argv` push and lands ONLY in the
+    /// resolved COMPLETE namespace (the deferred reparse). The secondary
+    /// bootstrap-relocates to primary; the promote recipe builds its
+    /// `PrimaryConfig`. A pre-fix recipe derived `pre_staged_mode` from the
+    /// boot `task_args` (which lacks the flag) → stamped every mid-run joiner's
+    /// `InitialAssignment` not-pre-staged → the joiner hash-verified
+    /// bind-mounted files and lost every task `NonRecoverable` (the consumer
+    /// saw secondary-4 fail every assigned task "not pre-staged … expected
+    /// StageFile").
+    ///
+    /// WHY THE PRIOR REPRO MISSED IT: `primary/tests/midrun_join.rs`'s test-6
+    /// PRE-CONSTRUCTED the promoted primary's `PrimaryConfig` with
+    /// `source_pre_staged_root: Some(_)` — a test artifact that exercised the
+    /// send/apply path, NOT the config DERIVATION at promotion. This test
+    /// drives the REAL `build_promoted_primary_recipe` and asserts the derived
+    /// config stamps pre-staged.
+    ///
+    /// The replay: boot is flag-less (no `source_already_staged` here); the
+    /// DELIVERED `forwarded_argv` carries `--source-already-staged <root>`; the
+    /// secondary knows its OWN bind-mount root (`source_pre_staged_root`). The
+    /// recipe must resolve the complete namespace, see the delivered flag, and
+    /// stamp `pre_staged_mode=true` (`stamps_pre_staged_mode()` — the EXACT
+    /// predicate `assignment::send_initial_assignment_to` reads).
+    ///
+    /// RED before the fix (the derivation read the boot `task_args` →
+    /// not-pre-staged); GREEN after (it derives from the resolved namespace).
+    #[test]
+    fn promotion_derives_pre_staged_mode_from_delivered_forwarded_argv() {
+        Python::attach(|py| {
+            // The promote recipe's run-config reparse: a SLURM secondary's
+            // `make_reparse_finalizer` parses `[*boot, *delivered]`. Here boot
+            // is flag-less; the DELIVERED argv carries `--source-already-staged`.
+            let source = r#"
+import argparse
+def finalize_run_config(delivered):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source-already-staged", dest="source_already_staged",
+                        default=None)
+    parser.add_argument("--output", default="/run/out")
+    return parser.parse_args(delivered)
+"#;
+            let module = PyModule::from_code(
+                py,
+                std::ffi::CString::new(source).unwrap().as_c_str(),
+                std::ffi::CString::new("prestaged_finalize.py").unwrap().as_c_str(),
+                std::ffi::CString::new("prestaged_finalize").unwrap().as_c_str(),
+            )
+            .unwrap();
+            let task = task_module(py);
+            let task_def = task.getattr("task").unwrap().unbind();
+
+            // The DELIVERED forwarded argv (post-welcome push) carries the
+            // run-level flag the flag-less boot CLI lacked. THIS is the only
+            // place `--source-already-staged` reaches a compute secondary.
+            let delivered = Arc::new(Mutex::new(vec![
+                "--source-already-staged".to_string(),
+                "/cluster/nfs/staged".to_string(),
+                "--output".to_string(),
+                "/run/out".to_string(),
+            ]));
+            let finalize = module.getattr("finalize_run_config").unwrap().unbind();
+            // Deferred mode — the SLURM compute-secondary path. NOTE: we do NOT
+            // pre-resolve / pre-set pre_staged; the boot side is flag-less, so
+            // ONLY the delivered argv carries the flag (the real derivation).
+            let run_config = SharedRunConfig::deferred(finalize, delivered);
+
+            let on_phase_start: crate::managers::lifecycle::OnPhaseStart =
+                Box::new(crate::managers::lifecycle::make_on_phase_start(task_def.clone_ref(py)));
+            let raise_latch = dynrunner_manager_distributed::PhaseHookRaiseLatch::new();
+            let on_phase_end: crate::managers::lifecycle::OnPhaseEnd =
+                Box::new(crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
+                    task_def.clone_ref(py),
+                    raise_latch.clone(),
+                ));
+
+            let ((tx, rx), _handle, mut mesh) = recipe_inputs();
+            let (slot, client, inbox) =
+                mesh.register_local_role(LocalRole::Primary, PeerId::from("primary"));
+            let (_demote_tx, demote_rx) = tokio::sync::mpsc::unbounded_channel();
+            let snapshot = dynrunner_manager_distributed::ClusterState::<RunnerIdentifier>::new()
+                .snapshot();
+            let estimator =
+                PyMemoryEstimatorBridge::from_python(&task.getattr("task").unwrap(), &[]).unwrap();
+
+            let mut recipe = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
+                secondary_id: "primary".to_string(),
+                custom_message_handler_def: None,
+                keepalive_interval: std::time::Duration::from_secs(5),
+                peer_timeout: std::time::Duration::from_secs(30),
+                keepalive_miss_threshold: 3,
+                retry_max_passes: 0,
+                oom_retry_max_passes: 0,
+                scheduler_config: crate::config::scheduler::SchedulerConfig::default(),
+                estimator,
+                command_channel: promoted_command_channel_cell(tx, rx),
+                on_phase_start,
+                on_phase_end,
+                phase_hook_raise_latch: raise_latch,
+                // No on_run_start — isolate the staging-flag derivation (the
+                // recipe resolves `run_config` itself for `pre_staged_mode`).
+                on_run_start: None,
+                forwarded_argv: Arc::new(Mutex::new(Vec::new())),
+                uses_file_based_items: true,
+                run_config,
+                // The secondary's OWN bind-mount root — it always knows this
+                // (its `src_network`). The bug is the run-level BOOLEAN gating
+                // whether this path is threaded in, not the path itself.
+                source_pre_staged_root: Some(std::path::PathBuf::from("/cluster/nfs/staged")),
+                source_dir: None,
+                staging_strategy: dynrunner_manager_distributed::StagingStrategy::Disabled,
+                setup_discovery: None,
+                liveness_ping_rx: None,
+                peer_liveness_addrs: None,
+                op_loop_arm_stats_cell:
+                    dynrunner_manager_distributed::oploop_instrumentation::OpLoopArmStatsCell::new(),
+            });
+
+            let built = recipe(
+                client,
+                inbox,
+                demote_rx,
+                snapshot,
+                dynrunner_manager_distributed::SettledStore::empty(),
+                dynrunner_manager_distributed::process::BootstrapKind::BootstrapRelocation,
+            );
+            let _slot = slot;
+
+            // The decisive assertion: the promoted primary stamps PRE-STAGED
+            // (the EXACT `config.source_pre_staged_root.is_some()` predicate
+            // `assignment::send_initial_assignment_to` reads to set every
+            // joiner's `InitialAssignment.pre_staged_mode`). Pre-fix the
+            // derivation read the flag-less boot `task_args` → `false` → the
+            // mid-run joiner lost every task NonRecoverable (#488).
+            assert!(
+                built.coordinator.stamps_pre_staged_mode(),
+                "the promoted primary must derive pre_staged_mode=true from the \
+                 DELIVERED forwarded_argv (--source-already-staged rides the \
+                 run-config push, never the compute secondary's boot CLI); \
+                 reading the boot task_args stamps every mid-run joiner \
+                 not-pre-staged and loses its tasks NonRecoverable (#488)"
             );
             drop(built.coordinator);
         });

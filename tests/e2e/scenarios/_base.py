@@ -204,6 +204,34 @@ class Scenario(abc.ABC):
         ``--keep-tmp`` is set.
         """
 
+    def teardown_grace_s(self, env: DispatchEnv) -> float | None:
+        """Per-scenario override of the driver's post-run teardown grace.
+
+        The driver's teardown gate (``run_e2e.py``) polls the gateway's
+        SLURM queue and the compute nodes for leftover framework state
+        for up to a grace window after the scenario's assertions pass —
+        time for the framework's ``RunComplete`` terminal to propagate
+        through the peer mesh and every wrapper to finish its cleanup.
+
+        The driver's baseline grace is sized for a CLEAN run: one primary
+        broadcasts ``RunComplete`` and a fixed handful of wrappers drain.
+        A scenario whose terminal path is heavier than that — e.g. a
+        promoted primary that, post-failover, first inherits and finalizes
+        a large ledger before it can even originate ``RunComplete``, then
+        fans the terminal out to a larger surviving fleet — legitimately
+        drains later. Such a scenario returns a wider grace here so the
+        gate doesn't false-positive on a still-converging-but-healthy
+        teardown.
+
+        Mirrors :attr:`ScenarioPlan.timeout_s`: ``None`` means "use the
+        driver's baseline"; a number overrides it. The driver clamps the
+        return to be no smaller than its baseline so a scenario can only
+        widen, never tighten, the gate (a tighter gate would risk
+        false-failing a healthy slow drain).
+        """
+        del env
+        return None
+
     def run_hook(
         self, env: DispatchEnv, plan: ScenarioPlan, dispatch_pid: int
     ) -> None:
