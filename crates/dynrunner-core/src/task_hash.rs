@@ -75,6 +75,7 @@ mod tests {
             preferred_secondaries: SoftPreferredSecondaries::default(),
             preferred_version: Default::default(),
             upload_file: None,
+            required_files: None,
             resolved_path: None,
         }
     }

@@ -119,6 +119,7 @@ fn make_binary(name: &str) -> dynrunner_core::TaskInfo<TestId> {
         kind: Default::default(),
         setup_affinity: None,
         upload_file: None,
+        required_files: None,
         resolved_path: None,
     }
 }

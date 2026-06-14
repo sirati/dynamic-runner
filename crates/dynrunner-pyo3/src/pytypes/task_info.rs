@@ -18,6 +18,7 @@ use pyo3::prelude::*;
 
 use dynrunner_core::{
     AffinityId, PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskDep, TaskInfo, TypeId,
+    UploadFileRef,
 };
 
 use super::identifier::{PyBinaryIdentifier, split_identifier};
@@ -100,6 +101,18 @@ pub(crate) struct PyTaskInfo {
     /// `From<&PyTaskInfo>` / `From<&TaskInfo>` conversions thread it.
     #[pyo3(get)]
     pub(super) setup_affinity: Option<String>,
+    /// Consumer-boundary surface of the core
+    /// [`dynrunner_core::TaskInfo::required_files`] (#336 P2): the files this
+    /// WORK task needs UPLOADED to the cluster before it runs, each a
+    /// `(source, optional dest)` pair. Empty (the default) ⇒ no attached
+    /// files — the task behaves exactly as today. The framework's files-attach
+    /// transform DEDUPS these across the batch into one upload setup task per
+    /// unique file + the work task's deps; a consumer declares them via the
+    /// Python `TaskInfo.files=[path, ...]` (or `[(src, dest), ...]`) list. The
+    /// `From<&PyTaskInfo>` / `From<&TaskInfo>` conversions thread it onto
+    /// `required_files`.
+    #[pyo3(get)]
+    pub(super) required_files: Vec<(String, Option<String>)>,
 }
 
 #[pymethods]
@@ -126,6 +139,7 @@ impl PyTaskInfo {
         skipped_already_done = false,
         is_setup = false,
         setup_affinity = None,
+        required_files = Vec::new(),
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -144,6 +158,7 @@ impl PyTaskInfo {
         skipped_already_done: bool,
         is_setup: bool,
         setup_affinity: Option<String>,
+        required_files: Vec<(String, Option<String>)>,
     ) -> PyResult<Self> {
         if task_id.is_empty() {
             return Err(PyValueError::new_err(
@@ -166,8 +181,30 @@ impl PyTaskInfo {
             skipped_already_done,
             is_setup,
             setup_affinity,
+            required_files,
         })
     }
+}
+
+/// Convert a `PyTaskInfo`'s `(source, optional dest)` pairs into the core
+/// `TaskInfo::required_files` STORAGE shape (`Option<Box<Vec<UploadFileRef>>>`).
+/// The SINGLE point the pyclass file-attach surface crosses into the core
+/// type. A `None` dest is the derive-destination case (strip-prefix under
+/// srcbins), a `Some` dest is explicit placement. An empty list normalizes to
+/// `None` via [`TaskInfo::required_files_storage`] (the common case never
+/// allocates / never rides the wire).
+pub(super) fn required_files_to_core(
+    pairs: &[(String, Option<String>)],
+) -> Option<Box<[UploadFileRef]>> {
+    dynrunner_core::required_files_storage(
+        pairs
+            .iter()
+            .map(|(source, dest)| UploadFileRef {
+                source: PathBuf::from(source),
+                dest: dest.as_ref().map(PathBuf::from),
+            })
+            .collect(),
+    )
 }
 
 impl From<&PyTaskInfo> for TaskInfo<RunnerIdentifier> {
@@ -227,13 +264,17 @@ impl From<&PyTaskInfo> for TaskInfo<RunnerIdentifier> {
             // it to target the in-process executor member. Threaded only for
             // the routing concern; the kind decides whether it is consulted.
             setup_affinity: py.setup_affinity.clone(),
-            // #336 P1 adds the upload-file ref as a CORE-side action
-            // payload, but the consumer-facing ATTACH API (how a Python
-            // task declares its files) is P2 — so this boundary always
-            // produces `None` for now (the no-op gate). P2 threads a real
-            // kwarg here; the field is already wire-present so that change
-            // is purely additive.
+            // #336 P1's `upload_file` is the SETUP task's own action payload;
+            // a `PyTaskInfo` from a consumer is always a WORK task, so it
+            // never carries one (the framework derives the upload setup tasks
+            // from `required_files`). Always `None` here.
             upload_file: None,
+            // #336 P2: the consumer-declared required files (a WORK task's
+            // `files=[...]`) cross verbatim onto the core `required_files`.
+            // The framework's files-attach transform then DEDUPS them into
+            // upload setup tasks + deps — this boundary only carries the
+            // declaration through.
+            required_files: required_files_to_core(&py.required_files),
             resolved_path: None,
         }
     }
@@ -279,6 +320,20 @@ impl From<&TaskInfo<RunnerIdentifier>> for PyTaskInfo {
             // `setup_affinity` IS carried on the core `TaskInfo<I>`, so the
             // round-trip-back faithfully reflects it.
             setup_affinity: bi.setup_affinity.clone(),
+            // `required_files` IS carried on the core `TaskInfo<I>` (#336 P2),
+            // so the round-trip-back faithfully reflects it — each core
+            // `UploadFileRef` projects back to its `(source, optional dest)`
+            // pair.
+            required_files: bi
+                .required_files()
+                .iter()
+                .map(|f| {
+                    (
+                        f.source.to_string_lossy().into_owned(),
+                        f.dest.as_ref().map(|d| d.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -313,6 +368,7 @@ mod tests {
             skipped_already_done: false,
             is_setup: false,
             setup_affinity: None,
+            required_files: Vec::new(),
         }
     }
 
@@ -349,6 +405,47 @@ mod tests {
         assert!(py_empty_back.preferred_secondaries.is_empty());
     }
 
+    #[test]
+    fn pytaskinfo_required_files_round_trip_to_core() {
+        // #336 P2: the consumer-boundary `required_files` (a list of
+        // `(source, optional dest)` pairs on `PyTaskInfo`) crosses verbatim
+        // onto the core `TaskInfo::required_files` as `UploadFileRef`s, and
+        // round-trips back to the same pairs. A `None` dest is the
+        // derive-destination case; a `Some` dest is explicit placement.
+        let mut py = sample_pytask(Vec::new());
+        py.required_files = vec![
+            ("/src/a".to_string(), None),
+            ("/src/b".to_string(), Some("/dst/b".to_string())),
+        ];
+        let rust: TaskInfo<RunnerIdentifier> = TaskInfo::from(&py);
+        assert_eq!(rust.required_files().len(), 2);
+        assert_eq!(rust.required_files()[0].source, PathBuf::from("/src/a"));
+        assert_eq!(rust.required_files()[0].dest, None);
+        assert_eq!(rust.required_files()[1].source, PathBuf::from("/src/b"));
+        assert_eq!(rust.required_files()[1].dest, Some(PathBuf::from("/dst/b")));
+
+        // Reverse direction preserves the pairs (incl. the dest option).
+        let py_back: PyTaskInfo = PyTaskInfo::from(&rust);
+        assert_eq!(
+            py_back.required_files,
+            vec![
+                ("/src/a".to_string(), None),
+                ("/src/b".to_string(), Some("/dst/b".to_string())),
+            ],
+        );
+
+        // Empty stays empty (the common case — no spurious entries).
+        let py_empty = sample_pytask(Vec::new());
+        let rust_empty: TaskInfo<RunnerIdentifier> = TaskInfo::from(&py_empty);
+        assert!(rust_empty.required_files().is_empty());
+        assert!(
+            rust_empty.required_files.is_none(),
+            "empty normalizes to None storage (no wire bloat)"
+        );
+        let py_empty_back: PyTaskInfo = PyTaskInfo::from(&rust_empty);
+        assert!(py_empty_back.required_files.is_empty());
+    }
+
     fn sample_identifier() -> PyBinaryIdentifier {
         PyBinaryIdentifier {
             binary_name: "bin".into(),
@@ -380,6 +477,7 @@ mod tests {
             false,
             false,
             None,
+            Vec::new(),
         )
         .expect_err("empty task_id must fail");
         // We assert against the rendered message (no Python
@@ -409,6 +507,7 @@ mod tests {
             false,
             false,
             None,
+            Vec::new(),
         )
         .expect("non-empty task_id must succeed");
         assert_eq!(ok.task_id, "stable-id");

@@ -803,6 +803,7 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                     kind: Default::default(),
                     setup_affinity: None,
                     upload_file: None,
+                    required_files: None,
                     resolved_path: None,
                 }
             }

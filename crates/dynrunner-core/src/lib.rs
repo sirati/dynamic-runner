@@ -24,5 +24,5 @@ pub use types::{
     AffinityId, DonePayload, ErrorType, FailedTask, INLINE_VALUE_HARD_CAP_BYTES, Identifier,
     PhaseId, ResourceAmount, ResourceKind, ResourceMap, ResultValue, RunnerIdentifier,
     SoftPreferredSecondaries, TaskDep, TaskInfo, TaskInput, TaskKind, TaskOutputs, TaskResult,
-    TaskVersion, TypeId, UploadFileRef, WorkerId, check_soft_caps,
+    TaskVersion, TypeId, UploadFileRef, WorkerId, check_soft_caps, required_files_storage,
 };

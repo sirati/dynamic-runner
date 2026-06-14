@@ -388,6 +388,7 @@ fn view_construction_clones_no_candidates() {
             kind: base.kind,
             setup_affinity: None,
             upload_file: None,
+            required_files: None,
             resolved_path: base.resolved_path,
         }
     };

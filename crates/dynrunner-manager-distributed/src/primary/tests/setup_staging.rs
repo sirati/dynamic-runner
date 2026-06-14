@@ -18,6 +18,28 @@ use crate::primary::StagingStrategy;
 /// names the framework stage task.
 const STAGE_PREFIX: &str = "__framework_stage__";
 
+/// The synthetic id-prefix for a #336 P2 per-file UPLOAD setup task — mirrors
+/// `setup_staging::UPLOAD_TASK_ID_PREFIX`.
+const UPLOAD_PREFIX: &str = "__framework_upload__";
+
+/// A `make_binary`-shaped work task declaring `required_files` (#336 P2). The
+/// files attach is DATA-driven (no flag), so the config can stay the default.
+/// The return type carries the test-harness `TestId` (both re-exported via the
+/// module glob).
+fn work_with_required_files(name: &str, sources: &[&str]) -> TaskInfo<TestId> {
+    let mut t = make_binary(name, 100);
+    t.required_files = dynrunner_core::required_files_storage(
+        sources
+            .iter()
+            .map(|s| dynrunner_core::UploadFileRef {
+                source: std::path::PathBuf::from(s),
+                dest: None,
+            })
+            .collect(),
+    );
+    t
+}
+
 /// A `PrimaryConfig` with the framework staging-via-setup-tasks flag ON.
 fn staging_config() -> PrimaryConfig {
     PrimaryConfig {
@@ -304,4 +326,306 @@ fn flag_off_old_path_is_unchanged() {
         work_deps.is_empty(),
         "flag off: the work task gains NO staging dep"
     );
+}
+
+// ── #336 P2: per-work-task required-files attach (seed-level) ───────────────
+
+/// Headline P2 seed behaviour: a work task declaring `required_files=[a, b]`
+/// cold-seeds into TWO upload setup tasks (seeded `Pending` — they EXECUTE the
+/// upload, NOT pre-succeeded) + a work task that is BLOCKED at seed (its deps
+/// are not satisfied until the uploads run). Drive both uploads to
+/// `SetupCompleted` and the work task becomes DISPATCHABLE. This proves the
+/// gate is real: the work task dispatches ONLY after both upload terminals.
+/// DATA-driven — the staging flag is OFF (default), so this is orthogonal to
+/// the #489 mode-2 path.
+#[test]
+fn required_files_seed_uploads_pending_and_work_blocked_until_completed() {
+    let (transport, _ends) = setup_test(1);
+    let (mut primary, _mesh) = build_test_primary(
+        test_primary_config(), // staging Disabled — P2 attach is DATA-driven
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    let work = work_with_required_files("build-task", &["/src/a", "/src/b"]);
+    let work_hash = compute_task_hash(&work);
+
+    primary
+        .originate_cold_seed(vec![(work, false)], HashMap::new())
+        .expect("P2 files-attach cold seed");
+    primary
+        .hydrate_from_cluster_state()
+        .expect("composed task graph is valid");
+
+    let cs = primary.cluster_state_for_test();
+
+    // THREE ledger entries: the work task + TWO upload setup tasks (one per
+    // unique file).
+    assert_eq!(
+        cs.task_count(),
+        3,
+        "the work task + two per-file upload setup tasks"
+    );
+
+    // Both upload setup tasks are seeded PENDING (NOT pre-succeeded — they
+    // execute the upload), carry an `upload_file` ref + source-owner affinity,
+    // and the framework upload id.
+    let uploads: Vec<_> = cs
+        .tasks_iter()
+        .filter(|(_, s)| s.task().kind.is_setup())
+        .map(|(h, s)| (h.clone(), s.task().clone()))
+        .collect();
+    assert_eq!(uploads.len(), 2, "two upload setup tasks");
+    for (hash, task) in &uploads {
+        assert!(
+            task.task_id.starts_with(UPLOAD_PREFIX),
+            "upload task carries the framework upload id; got {:?}",
+            task.task_id
+        );
+        assert!(task.upload_file.is_some(), "upload task carries its file");
+        assert_eq!(
+            task.setup_affinity.as_deref(),
+            Some(dynrunner_core::SETUP_NODE_ID),
+            "source-owner affinity"
+        );
+        assert!(
+            matches!(
+                cs.task_state(hash),
+                Some(crate::cluster_state::TaskState::Pending { .. })
+            ),
+            "the upload setup task must be seeded PENDING (it executes); got {:?}",
+            cs.task_state(hash)
+        );
+    }
+
+    // The work task is BLOCKED at seed — its upload deps are NOT yet satisfied
+    // (the uploads have not run).
+    assert_eq!(
+        primary.pool().blocked_len(),
+        1,
+        "the work task is BLOCKED until its uploads complete"
+    );
+    let queued_before: Vec<String> = primary
+        .pool()
+        .iter()
+        .map(|t| t.task_id.clone())
+        .collect();
+    assert!(
+        !queued_before.contains(&"build-task".to_string()),
+        "the work task is NOT dispatchable before its uploads complete; got {queued_before:?}"
+    );
+
+    // Drive BOTH uploads to SetupCompleted (the terminal the upload-action
+    // executor originates on a successful upload), then re-hydrate. The work
+    // task's deps are now satisfied from the ledger.
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        for (hash, _) in &uploads {
+            cs.apply(ClusterMutation::SetupCompleted { hash: hash.clone() });
+        }
+    }
+    primary
+        .hydrate_from_cluster_state()
+        .expect("re-hydrate after the uploads completed");
+
+    // Now the work task is DISPATCHABLE: Pending, queued, nothing blocked.
+    let cs = primary.cluster_state_for_test();
+    assert!(
+        matches!(
+            cs.task_state(&work_hash),
+            Some(crate::cluster_state::TaskState::Pending { .. })
+        ),
+        "after both uploads complete, the work task is Pending/dispatchable; got {:?}",
+        cs.task_state(&work_hash)
+    );
+    let queued_after: Vec<String> = primary
+        .pool()
+        .iter()
+        .map(|t| t.task_id.clone())
+        .collect();
+    assert_eq!(
+        queued_after,
+        vec!["build-task".to_string()],
+        "exactly the work task is queued+dispatchable after both uploads; got {queued_after:?}"
+    );
+    assert_eq!(
+        primary.pool().blocked_len(),
+        0,
+        "nothing blocked once both upload deps are satisfied"
+    );
+}
+
+/// DEDUP at the seed level (the multi-era subset-sharing shape): N work tasks
+/// declaring the SAME shared file produce EXACTLY ONE upload setup task that
+/// all N depend on — NOT N uploads. Plus a per-task delta file. Asserts the
+/// ledger holds one upload per UNIQUE file and every sharer is gated on the
+/// single shared upload.
+#[test]
+fn required_files_dedup_one_upload_shared_by_all_sharers() {
+    let (transport, _ends) = setup_test(1);
+    let (mut primary, _mesh) = build_test_primary(
+        test_primary_config(),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    // Three builds share /tc/common; b1 also needs its own /tc/delta1.
+    let b1 = work_with_required_files("b1", &["/tc/common", "/tc/delta1"]);
+    let b2 = work_with_required_files("b2", &["/tc/common"]);
+    let b3 = work_with_required_files("b3", &["/tc/common"]);
+
+    primary
+        .originate_cold_seed(
+            vec![(b1, false), (b2, false), (b3, false)],
+            HashMap::new(),
+        )
+        .expect("P2 dedup cold seed");
+    primary
+        .hydrate_from_cluster_state()
+        .expect("composed task graph is valid");
+
+    let cs = primary.cluster_state_for_test();
+
+    // 3 work tasks + 2 unique-file uploads (common, delta1) = 5 — NOT 4
+    // uploads (which is what one-upload-per-(task,file) would give).
+    assert_eq!(
+        cs.task_count(),
+        5,
+        "3 work tasks + EXACTLY 2 deduped upload setup tasks (common, delta1)"
+    );
+    let uploads: Vec<_> = cs
+        .tasks_iter()
+        .filter(|(_, s)| s.task().kind.is_setup())
+        .map(|(_, s)| s.task().clone())
+        .collect();
+    assert_eq!(uploads.len(), 2, "exactly one upload per unique file");
+
+    // The /tc/common upload's id — the single task all three builds gate on.
+    let common_upload_id = uploads
+        .iter()
+        .find(|t| {
+            t.upload_file.as_ref().unwrap().source.as_path()
+                == std::path::Path::new("/tc/common")
+        })
+        .expect("a /tc/common upload task")
+        .task_id
+        .clone();
+
+    // Each of b1/b2/b3 depends on the SAME common upload id.
+    for name in ["b1", "b2", "b3"] {
+        let deps = cs
+            .tasks_iter()
+            .find(|(_, s)| s.task().task_id == name)
+            .map(|(_, s)| s.task().task_depends_on.clone())
+            .unwrap_or_else(|| panic!("{name} in ledger"));
+        assert!(
+            deps.iter().any(|d| d.task_id == common_upload_id),
+            "{name} must gate on the SINGLE shared /tc/common upload"
+        );
+    }
+    // b1 additionally gates on its delta upload; b2/b3 do not.
+    let b1_dep_count = cs
+        .tasks_iter()
+        .find(|(_, s)| s.task().task_id == "b1")
+        .map(|(_, s)| s.task().task_depends_on.len())
+        .unwrap();
+    assert_eq!(b1_dep_count, 2, "b1 gates on common + its own delta1");
+    for name in ["b2", "b3"] {
+        let n = cs
+            .tasks_iter()
+            .find(|(_, s)| s.task().task_id == name)
+            .map(|(_, s)| s.task().task_depends_on.len())
+            .unwrap();
+        assert_eq!(n, 1, "{name} gates on common only");
+    }
+}
+
+/// Manual-spawn: a consumer directly spawns a file-setup-task (a `Setup` task
+/// carrying an `upload_file`, NOT tied to any task's `required_files`), and a
+/// separate work task depends on it by id. The upload executes (seeded
+/// Pending), the dependent is Blocked until the upload's SetupCompleted, then
+/// dispatchable — the SAME gate the auto-attach uses, confirming a
+/// consumer-spawned file-setup-task composes with `task_depends_on`.
+#[test]
+fn manual_spawned_file_setup_task_gates_a_dependent_work_task() {
+    let (transport, _ends) = setup_test(1);
+    let (mut primary, _mesh) = build_test_primary(
+        test_primary_config(),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    // A directly-spawned file-setup-task: a Setup task carrying an upload_file.
+    let mut shared_upload = make_binary("shared-closure", 0);
+    shared_upload.kind = dynrunner_core::TaskKind::Setup;
+    shared_upload.setup_affinity = Some(dynrunner_core::SETUP_NODE_ID.to_string());
+    shared_upload.upload_file = Some(Box::new(dynrunner_core::UploadFileRef {
+        source: std::path::PathBuf::from("/shared/closure.tar"),
+        dest: None,
+    }));
+    let upload_hash = compute_task_hash(&shared_upload);
+
+    // A work task depending on the manually-spawned file-setup-task by id.
+    let mut dependent = make_binary("consumer-build", 100);
+    let dep_hash = compute_task_hash(&dependent);
+    dependent.task_depends_on = vec![dynrunner_core::TaskDep {
+        task_id: "shared-closure".into(),
+        phase_id: dynrunner_core::PhaseId::from("default"),
+        inherit_outputs: false,
+    }];
+
+    primary
+        .originate_cold_seed(
+            vec![(shared_upload, false), (dependent, false)],
+            HashMap::new(),
+        )
+        .expect("manual-spawn cold seed");
+    primary
+        .hydrate_from_cluster_state()
+        .expect("composed task graph is valid");
+
+    // The upload setup task is seeded Pending (it executes); the dependent is
+    // Blocked until it completes.
+    let cs = primary.cluster_state_for_test();
+    assert!(
+        matches!(
+            cs.task_state(&upload_hash),
+            Some(crate::cluster_state::TaskState::Pending { .. })
+        ),
+        "the manually-spawned file-setup-task is seeded Pending (it uploads)"
+    );
+    assert_eq!(
+        primary.pool().blocked_len(),
+        1,
+        "the dependent work task is Blocked until the upload completes"
+    );
+
+    // Drive the upload to SetupCompleted, re-hydrate: the dependent unblocks.
+    primary
+        .cluster_state_mut_for_test()
+        .apply(ClusterMutation::SetupCompleted {
+            hash: upload_hash.clone(),
+        });
+    primary
+        .hydrate_from_cluster_state()
+        .expect("re-hydrate after the manual upload completed");
+
+    let cs = primary.cluster_state_for_test();
+    assert!(
+        matches!(
+            cs.task_state(&dep_hash),
+            Some(crate::cluster_state::TaskState::Pending { .. })
+        ),
+        "the dependent work task unblocks once the manual upload completes"
+    );
+    let queued: Vec<String> = primary.pool().iter().map(|t| t.task_id.clone()).collect();
+    assert_eq!(
+        queued,
+        vec!["consumer-build".to_string()],
+        "the dependent is dispatchable after the manual file-setup-task completes"
+    );
+    assert_eq!(primary.pool().blocked_len(), 0);
 }

@@ -56,6 +56,7 @@ fn task(phase: &str, id: &str, deps: &[(&str, &str)]) -> TaskInfo<TestId> {
         kind: Default::default(),
         setup_affinity: None,
         upload_file: None,
+        required_files: None,
         resolved_path: None,
         preferred_version: Default::default(),
     }

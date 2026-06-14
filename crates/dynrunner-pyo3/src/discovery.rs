@@ -196,6 +196,7 @@ fn pytaskinfo_from_mark(
         kind: Default::default(),
         setup_affinity: None,
         upload_file: None,
+        required_files: None,
         resolved_path: None,
     };
     Ok(PyTaskInfo::from(&task))

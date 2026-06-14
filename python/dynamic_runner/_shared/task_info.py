@@ -162,6 +162,27 @@ class TaskInfo:
     # concern (like ``affinity_id``), NOT folded into the task's content
     # hash.
     setup_affinity: str | None = None
+    # Files this WORK task needs UPLOADED to the cluster before it can run
+    # (#336 P2). Each entry is either a bare source path (``str`` / ``Path``
+    # — the framework derives the cluster-side destination, the common case)
+    # or a ``(source, dest)`` pair for explicit placement of a shared
+    # resource that does not live under ``--source``.
+    #
+    # The framework DEDUPS these across ALL work tasks by ``(source, dest)``:
+    # each unique file becomes EXACTLY ONE upload setup task (uploaded once on
+    # the source-owning member), and this work task is gated on the upload
+    # tasks for ITS OWN files via the dependency machinery — so it dispatches
+    # only after every one of its files has uploaded, and a file shared by
+    # several tasks is uploaded a single time. A consumer just declares
+    # ``files=[...]`` per task; the framework owns the dedup + setup-task
+    # creation.
+    #
+    # Default ``()`` ⇒ no attached files; the task behaves exactly as today
+    # (no upload setup tasks, the bulk-walk / pre-staged path unchanged).
+    # Carried through the PyO3 boundary (``crate::pytypes::extract_binaries``)
+    # onto the core Rust ``TaskInfo.required_files``; an attach concern, NOT
+    # folded into the task's content hash.
+    files: tuple["str | tuple[str, str | None]", ...] = field(default_factory=tuple)
 
     @property
     def binary_name(self) -> str:
@@ -200,6 +221,11 @@ class TaskInfo:
             "task_id": self.task_id,
             "is_setup": self.is_setup,
             "setup_affinity": self.setup_affinity,
+            # Normalise each required-file entry to a JSON-friendly shape:
+            # a bare source stays a string; a ``(source, dest)`` pair renders
+            # as a 2-element list. The PyO3 extractor has its own boundary
+            # (attribute-based) — this is the on-disk projection only.
+            "files": [list(f) if isinstance(f, tuple) else f for f in self.files],
             # Normalise each dep to a JSON-friendly shape: bare-strings
             # stay strings (legacy wire), ``TaskDep`` instances render as
             # ``{"task_id": ..., "inherit_outputs": ...}``. Matches the

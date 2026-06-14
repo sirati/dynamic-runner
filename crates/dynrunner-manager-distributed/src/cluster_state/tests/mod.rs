@@ -57,6 +57,7 @@ pub(super) fn mk_task(name: &str) -> TaskInfo<RunnerIdentifier> {
         kind: Default::default(),
         setup_affinity: None,
         upload_file: None,
+        required_files: None,
         resolved_path: None,
     }
 }

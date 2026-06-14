@@ -27,6 +27,7 @@ fn mk_task(name: &str, payload_bytes: usize) -> TaskInfo<RunnerIdentifier> {
         kind: Default::default(),
         setup_affinity: None,
         upload_file: None,
+        required_files: None,
         resolved_path: None,
     }
 }

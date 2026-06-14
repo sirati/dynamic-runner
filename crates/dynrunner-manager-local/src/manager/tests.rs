@@ -829,6 +829,7 @@ async fn ensure_worker_for_type_respawns_on_type_shift_and_is_idempotent_on_matc
             kind: Default::default(),
             setup_affinity: None,
             upload_file: None,
+            required_files: None,
             resolved_path: None,
         }
     }

@@ -194,6 +194,7 @@ fn task(label: &str, depends_on: &[(&str, &str)]) -> TaskInfo<TestId> {
         kind: Default::default(),
         setup_affinity: None,
         upload_file: None,
+        required_files: None,
         resolved_path: None,
     }
 }
@@ -289,6 +290,7 @@ async fn dead_secondary_requeues_in_flight_task() {
         kind: Default::default(),
         setup_affinity: None,
         upload_file: None,
+        required_files: None,
         resolved_path: None,
     };
     primary.stage_in_flight_for_test("dead-sec".into(), 0, in_flight.clone());
@@ -494,6 +496,7 @@ fn register_operational_secondary<S, E>(
             kind: Default::default(),
             setup_affinity: None,
             upload_file: None,
+            required_files: None,
             resolved_path: None,
         },
     );
@@ -860,6 +863,7 @@ async fn r1_dead_secondary_requeue_then_hydrate_redispatches_exactly_once() {
         kind: Default::default(),
         setup_affinity: None,
         upload_file: None,
+        required_files: None,
         resolved_path: None,
     };
     let victim_hash = primary.stage_in_flight_for_test("dead-sec".into(), 0, victim.clone());

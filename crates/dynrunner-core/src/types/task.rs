@@ -164,6 +164,41 @@ pub struct TaskInfo<I> {
     /// so the wire shape is identical to an inline `UploadFileRef`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_file: Option<Box<UploadFileRef>>,
+    /// Files a [`TaskKind::Work`] task needs UPLOADED to the cluster before
+    /// it can run (#336 P2). DISTINCT from [`Self::upload_file`]: that is the
+    /// file a SETUP task's own upload action transfers; THIS is the set of
+    /// files a WORK task declares as prerequisites. The framework's
+    /// files-attach transform turns each unique `(source, dest)` across the
+    /// whole batch into EXACTLY ONE upload setup task (deduped — a file shared
+    /// by N work tasks produces one upload, not N) and wires each work task's
+    /// `task_depends_on` to the setup tasks for ITS files, so the work task
+    /// dispatches only after every one of its files has uploaded.
+    ///
+    /// `None` (the overwhelmingly-common case) ⇒ no attached files; the task
+    /// behaves exactly as today (no upload setup tasks, the bulk-walk / #489
+    /// no-op gate path unchanged). Only a `Work` task ever carries entries;
+    /// the derived upload setup tasks carry their file on `upload_file`
+    /// instead. NOT part of `compute_task_hash` (the recipe is `{phase_id,
+    /// path, identifier}`), so declaring required files never changes the
+    /// ledger key — it is attach metadata, exactly like `upload_file` is
+    /// action metadata.
+    ///
+    /// Stored as `Option<Box<[UploadFileRef]>>` so the (rare) attach payload
+    /// does not bloat the common `TaskInfo` (and thus
+    /// `ClusterMutation::TaskAdded`, which embeds it) — the empty case is a
+    /// `None` (one machine word, niche-optimized), and a boxed slice keeps the
+    /// non-empty case to a fat pointer rather than a `Vec`'s three words inline
+    /// on the struct. (Mirrors why `upload_file` is `Option<Box<_>>`.) Serde
+    /// treats `Box<[T]>` transparently as an array and `skip_serializing_if`
+    /// flattens the `None` empty case away, so the wire shape is an optional
+    /// array of `UploadFileRef`. `#[serde(default)]` keeps the wire
+    /// backward-compatible (a frame from a peer that predates this field
+    /// decodes as `None`); a rolling upgrade is indistinguishable for every
+    /// task that declares no files. Use [`Self::required_files`] for a flat
+    /// `&[UploadFileRef]` view that erases the `Option`/`Box`, and
+    /// [`required_files_storage`] to build this shape from a flat list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_files: Option<Box<[UploadFileRef]>>,
     /// Optional soft worker-pinning class. Items with the same `Some(id)` prefer
     /// the same worker for kernel page-cache reuse; `None` joins the free pool.
     pub affinity_id: Option<AffinityId>,
@@ -269,6 +304,33 @@ pub struct TaskInfo<I> {
 }
 
 pub type TaskInput<I> = TaskInfo<I>;
+
+impl<I> TaskInfo<I> {
+    /// A flat `&[UploadFileRef]` view of [`Self::required_files`] (#336 P2),
+    /// erasing the `Option`/`Box` indirection the storage uses to keep the
+    /// common (no-files) `TaskInfo` small. `None` ⇒ the empty slice, so every
+    /// caller iterates a slice without minding the storage shape. This is the
+    /// SINGLE read seam for the attach payload — the framework's files-attach
+    /// transform and every consumer of the declared files go through here.
+    pub fn required_files(&self) -> &[UploadFileRef] {
+        self.required_files.as_deref().unwrap_or(&[])
+    }
+}
+
+/// Build the `Option<Box<[…]>>` storage shape for [`TaskInfo::required_files`]
+/// from a flat list (#336 P2) — the SINGLE write seam, so no construction site
+/// spells the `Option`/`Box` wrapping. An empty list normalizes to `None` (the
+/// common case; the empty payload never bloats the wire or the
+/// `ClusterMutation::TaskAdded` enum). A free function (not a `TaskInfo<I>`
+/// associated fn) because the shaping is independent of the identifier type —
+/// callers must not have to spell `I` to wrap a file list.
+pub fn required_files_storage(files: Vec<UploadFileRef>) -> Option<Box<[UploadFileRef]>> {
+    if files.is_empty() {
+        None
+    } else {
+        Some(files.into_boxed_slice())
+    }
+}
 
 /// The file a [`TaskKind::Setup`] upload-action task uploads to the
 /// cluster (#336 P1). Deliberately MINIMAL for P1: a `source` path on

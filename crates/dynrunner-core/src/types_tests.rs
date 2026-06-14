@@ -203,6 +203,7 @@ fn task_info_generic() {
         kind: Default::default(),
         setup_affinity: None,
         upload_file: None,
+        required_files: None,
         resolved_path: None,
     };
     assert_eq!(bi.size, 1024);
@@ -226,6 +227,7 @@ fn task_info_serde_roundtrip_with_phase_fields() {
         kind: Default::default(),
         setup_affinity: None,
         upload_file: None,
+        required_files: None,
         resolved_path: None,
     };
     let json = serde_json::to_string(&bi).unwrap();
@@ -399,6 +401,7 @@ fn task_info_preferred_secondaries_default_empty() {
         kind: Default::default(),
         setup_affinity: None,
         upload_file: None,
+        required_files: None,
         resolved_path: None,
     };
     let re_json = serde_json::to_value(&bi).unwrap();

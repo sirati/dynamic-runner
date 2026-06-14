@@ -156,6 +156,18 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             // it to `None` — same rides-the-CRDT-path rationale as `kind`
             // and `setup_affinity`.
             upload_file: _upload_file,
+            // ── not transferred on the dispatch descriptor ──
+            // A work task's required-files attach (#336 P2) is a
+            // discovery/ledger concern: the framework's files-attach
+            // transform has ALREADY converted these into upload setup tasks
+            // + `task_depends_on` gates BEFORE dispatch, so by the time a work
+            // task reaches this primary↔secondary DISPATCH projection its
+            // files have been resolved into deps (which DO ride
+            // `task_depends_on`). The raw list itself is not needed by the
+            // worker. `to_task_info` resets it to empty — same
+            // rides-the-CRDT/ledger-path rationale as `kind`, `setup_affinity`
+            // and `upload_file`.
+            required_files: _required_files,
             // ── node-local: not transferred ──
             // `#[serde(skip)]` on the struct — the local on-disk resolved
             // location is host-specific and the receiving secondary
@@ -219,6 +231,10 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             // affinity (it is worker work); the executor affinity rides the
             // CRDT path on `TaskInfo`, see the destructure note above.
             setup_affinity: None,
+            // Reset to empty — a dispatched work task's required-files attach
+            // was already resolved into upload setup tasks + deps at discovery
+            // (see the destructure note); the worker never reads the raw list.
+            required_files: None,
             resolved_path: None,
         }
     }
