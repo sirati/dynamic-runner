@@ -195,35 +195,54 @@ impl<I: Identifier> RemoteWorkerState<I> {
         self.state.task()
     }
 
-    /// Move the slot `Idle -> Assigned` with explicit `provenance`. The
-    /// slot MUST be `Idle`; the `debug_assert` makes a reassign-before-
-    /// terminal bug a test-time panic, while production faithfully
-    /// overwrites (the caller has already gated on idleness through the
-    /// dispatch view / scheduler decision). Mirrors
-    /// `WorkerHandle::assign_task`'s `take_idle().ok_or(...)` contract on
-    /// the worker-process side.
+    /// Move the slot `Idle -> Assigned` with explicit `provenance`, IFF
+    /// the slot is currently `Idle`. Returns `true` when the assign took
+    /// effect, `false` when it was REFUSED because the slot already holds
+    /// a task.
+    ///
+    /// #517 hardened the idle precondition from advisory to ENFORCED: the
+    /// pre-#517 `assign` `debug_assert`ed idle but in release builds
+    /// "faithfully overwrote" a non-idle slot — a SILENT reassignment-
+    /// before-terminal that clobbered the held task's slot state and
+    /// desynced the primary's per-`(secondary, worker_id)` occupancy model
+    /// from physical reality. The overwrite is now refused: a commit onto a
+    /// non-idle slot leaves the slot untouched, WARNs (so an operator sees
+    /// the would-be double-dispatch), and returns `false` so the caller
+    /// skips the send rather than dispatching a task the model can't track.
+    /// Mirrors `WorkerHandle::assign_task`'s `take_idle().ok_or(...)`
+    /// contract on the worker-process side (refuse, don't overwrite).
     ///
     /// `provenance` is [`SlotProvenance::Dispatched`] at every live
     /// dispatch site (this primary sent the `TaskAssignment`) and
     /// [`SlotProvenance::Inherited`] only at the failover-resume occupancy
     /// crossing (reconstructed from replicated `InFlight`).
+    #[must_use]
     pub(super) fn assign(
         &mut self,
         task_hash: String,
         task: TaskInfo<I>,
         estimated: ResourceMap,
         provenance: SlotProvenance,
-    ) {
-        debug_assert!(
-            self.state.is_idle(),
-            "slot assigned while not Idle (reassignment-before-terminal)"
-        );
+    ) -> bool {
+        if !self.state.is_idle() {
+            tracing::warn!(
+                worker_id = self.worker_id,
+                secondary_id = %self.secondary_id,
+                refused_hash = %task_hash,
+                "REFUSED assign onto a non-idle slot (reassignment-before-\
+                 terminal): the slot already holds a task; skipping rather \
+                 than silently overwriting (the held task's slot state is \
+                 preserved and its terminal still settles it by hash)"
+            );
+            return false;
+        }
         self.state = SlotState::Assigned {
             task_hash,
             task,
             estimated,
             provenance,
         };
+        true
     }
 
     /// True iff the slot holds an `Inherited` (unconfirmed-occupancy)
@@ -2956,33 +2975,47 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// all. The `take_selected` that removes the binary from the pool
     /// precedes this call (it yields the owned `task`).
     ///
-    /// Reachable only from an `Idle` slot (enforced by
-    /// `RemoteWorkerState::assign`'s `debug_assert`); the caller has
-    /// already established idleness via the dispatch view / scheduler
-    /// decision.
+    /// Reachable only from an `Idle` slot (the caller has established
+    /// idleness via the dispatch view / scheduler decision). #517 made the
+    /// idle precondition ENFORCED, not advisory: returns `true` when the
+    /// commit took effect and `false` when `RemoteWorkerState::assign`
+    /// REFUSED a non-idle slot (it WARNs and leaves the slot untouched).
+    /// On refusal the type-slot reservation and the ledger insert are
+    /// SKIPPED too — the triple stays atomic (all three or none) — so the
+    /// caller MUST skip the `TaskAssignment` send (a commit that didn't
+    /// take must not put a task on the wire the model can't track). This is
+    /// the belt-and-braces backstop to the secondary's honor-or-bounce: the
+    /// honor-or-bounce removes the drift that produces a non-idle commit;
+    /// this refuses to silently overwrite if one ever arrives.
+    #[must_use]
     pub(super) fn commit_assignment(
         &mut self,
         worker_idx: usize,
         task: TaskInfo<I>,
         task_hash: String,
         estimated: ResourceMap,
-    ) {
+    ) -> bool {
         let secondary_id = self.workers[worker_idx].secondary_id.clone();
         // Record the STABLE secondary-local id (retain-immune), NOT the
         // positional Vec index — the terminal path re-resolves it via
         // `worker_idx_for` against the live Vec.
         let local_worker_id = self.local_worker_id_in_secondary(worker_idx);
         let phase = task.phase_id.clone();
-        self.reserve_type_slot(&task.type_id);
         // Live dispatch: THIS primary just sent the `TaskAssignment`, so
         // the occupancy is known-live — `Dispatched` provenance. The
-        // failover-resume reconciliation never touches such a slot.
-        self.workers[worker_idx].assign(
+        // failover-resume reconciliation never touches such a slot. Assign
+        // FIRST: if the slot is not idle the assign refuses (WARN) and we
+        // commit NOTHING — no type-slot reserve, no ledger insert — keeping
+        // the triple atomic.
+        if !self.workers[worker_idx].assign(
             task_hash.clone(),
             task.clone(),
             estimated,
             crate::primary::SlotProvenance::Dispatched,
-        );
+        ) {
+            return false;
+        }
+        self.reserve_type_slot(&task.type_id);
         self.in_flight.insert(
             task_hash,
             InFlightEntry {
@@ -2992,6 +3025,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 task,
             },
         );
+        true
     }
 
     /// Undo a `commit_assignment` whose `TaskAssignment` send failed:
@@ -3827,7 +3861,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         });
         let idx = self.workers.len() - 1;
         let task_hash = crate::primary::wire::compute_task_hash(&task);
-        self.commit_assignment(idx, task, task_hash.clone(), ResourceMap::new());
+        // The slot was just pushed Idle, so the commit always takes.
+        assert!(
+            self.commit_assignment(idx, task, task_hash.clone(), ResourceMap::new()),
+            "stage_in_flight_for_test must commit onto the freshly-idle slot"
+        );
         task_hash
     }
 

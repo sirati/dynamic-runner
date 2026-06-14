@@ -9,6 +9,10 @@
 //!   (`TASK_ALREADY_HELD_WIRE_MESSAGE`, recognised at the top of the
 //!   `TaskFailed` handler): the holder is ALREADY RUNNING the assigned
 //!   hash, so the task stays in flight on it (no requeue, no terminal).
+//! - [`illegal_assignment`] — the `IllegallyAssignedToNonidleWorker`
+//!   bounce (#517): the secondary refused to run a task on a non-idle
+//!   slot and never re-picked. NOT a `TaskFailed` — reconcile the
+//!   diverged `(secondary, worker_id)` occupancy + requeue the task.
 //! - [`mutation`] — `ClusterMutation` apply + the CRDT-mirroring
 //!   helpers (`mirror_mutation_to_accounting`,
 //!   `mirror_tasks_spawned_post_apply`).
@@ -26,6 +30,7 @@
 mod already_held;
 mod complete;
 mod failed;
+mod illegal_assignment;
 mod mutation;
 pub(crate) mod predecessor_outputs;
 mod request;

@@ -113,6 +113,7 @@ mod generation_gate;
 mod graceful_drain;
 mod hold_probe_responder;
 mod honest_liveness;
+mod illegal_assignment;
 mod instant_crash_accounting;
 mod keepalive_emission;
 mod keepalive_recognition;

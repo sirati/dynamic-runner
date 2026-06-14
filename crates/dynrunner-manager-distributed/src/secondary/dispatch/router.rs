@@ -20,7 +20,7 @@ use dynrunner_core::{ErrorType, Identifier, ResourceMap, TaskInfo, TaskOutputs, 
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, Destination, DistributedMessage, PeerId,
+    AssignedTaskRef, ClusterMutation, Destination, DistributedMessage, PeerId,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -657,29 +657,26 @@ where
         file_hash: String,
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<(), String> {
-        // Select the dispatch target worker SAFELY. Prefer the
-        // primary's requested slot IF it is a valid, idle worker;
-        // otherwise fall back to any idle worker. Both `.get()` and
-        // `position()` return `None` for an empty pool, so a
-        // 0-worker `Operational` node (late-joiner / observer /
-        // phase-end observer — a VALID state on this path) is just
-        // the degenerate case of "no idle worker": no out-of-range
-        // `len() - 1` arithmetic, no unconditional index into the
-        // pool. An out-of-range `worker_id` likewise resolves to
-        // `None` on the preference and falls back to an idle worker
-        // — never silently clamped onto the wrong (last) slot.
-        let pool = &self.op_mut().pool;
-        let target_wid: Option<u32> = pool
-            .workers
-            .get(worker_id as usize)
-            .filter(|w| w.is_idle_state())
-            .map(|_| worker_id)
-            .or_else(|| {
-                pool.workers
-                    .iter()
-                    .position(|w| w.is_idle_state())
-                    .map(|i| i as u32)
-            });
+        // HONOR the primary's assigned `worker_id` — never re-pick (#517).
+        // The secondary holds no scheduling authority: it dispatches onto
+        // the EXACT slot the primary chose IFF that slot is idle, else it
+        // bounces a typed `IllegallyAssignedToNonidleWorker` so the primary
+        // reconciles its diverged occupancy + requeues (NOT a failure). The
+        // shared `select_honored_target_or_bounce` owns the honor-or-bounce
+        // decision AND the bounce send (the SAME seam the setup-time
+        // initial-assignment loop uses), so the two can never diverge into
+        // the pre-#517 any-idle re-pick. SAFETY (preserves cabd34ab): the
+        // `.get()` Option path inside makes an out-of-range id / 0-worker
+        // pool a clean bounce — no `len() - 1` underflow, no unconditional
+        // index. `None` ⇒ the task was bounced for re-dispatch and this node
+        // dispatches nothing.
+        let assigned_ref = AssignedTaskRef {
+            hash: file_hash.clone(),
+            task_id: binary.identifier.clone(),
+        };
+        let target_wid = self
+            .select_honored_target_or_bounce(worker_id, assigned_ref)
+            .await?;
 
         if let Some(target_wid) = target_wid {
             let estimated_mb =
@@ -901,38 +898,16 @@ where
                     self.send_to_primary(msg).await?;
                 }
             }
-        } else {
-            // No idle worker to take the task — including the
-            // degenerate 0-worker pool (a late-joiner / phase-end
-            // observer), which selected `None` above without any
-            // bounds arithmetic or index. Report backpressure to
-            // the primary keyed by the ORIGINAL wire `worker_id`
-            // (there is no chosen slot).
-            tracing::warn!(worker_id, "no idle worker available for task assignment");
-            let msg = DistributedMessage::TaskFailed {
-                target: None,
-                sender_id: self.config.secondary_id.clone(),
-                timestamp: timestamp_now(),
-                secondary_id: self.config.secondary_id.clone(),
-                worker_id,
-                task_hash: file_hash,
-                error_type: ErrorType::Recoverable,
-                error_message: "No idle worker available".into(),
-                // Stamped at the send_to_primary chokepoint (#352).
-                delivery_seq: None,
-                // Stamped at the send_to_primary chokepoint (ordering gate).
-                msgs_posted_through: None,
-            };
-            // Report to the primary only — the authority owns
-            // mesh propagation. Routing across a primary
-            // changeover is opaque: `send_to_primary`
-            // (`Destination::Primary`) resolves at the egress
-            // edge to whichever node currently holds the role.
-            // The promoted peer's `handle_primary_peer_rejection`
-            // recovery is hash-keyed, so the single report
-            // suffices.
-            self.send_to_primary(msg).await?;
         }
+        // `target_wid == None`: `select_honored_target_or_bounce` ALREADY
+        // bounced the typed `IllegallyAssignedToNonidleWorker` (the
+        // requested slot was busy / out-of-range / 0-worker) — the task is
+        // back at the authority for reconcile + requeue, NOT failed. Nothing
+        // more to send here. The pre-#517 "No idle worker available"
+        // TaskFailed bounce is GONE from this path: it existed only to cover
+        // the re-pick fallback's exhaustion, and the typed bounce subsumes
+        // it (the authority reconciles its occupancy instead of merely
+        // requeuing onto a model that keeps re-assigning the busy slot).
         Ok(())
     }
 }

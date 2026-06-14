@@ -9,9 +9,9 @@
 //! the router and its setup-time counterpart share, so each rule has
 //! exactly one writer.
 
-use dynrunner_core::{ErrorType, Identifier};
+use dynrunner_core::{ErrorType, Identifier, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
+use dynrunner_protocol_primary_secondary::{AssignedTaskRef, ClusterMutation, DistributedMessage};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::SecondaryCoordinator;
@@ -930,6 +930,130 @@ where
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// HONOR the primary's assigned `worker_id` or BOUNCE the assignment
+    /// (#517). THE single dispatch-target selection seam, shared by the
+    /// operational router (`assign_resolved_task`) and the setup-time
+    /// initial-assignment loop (`handle_initial_assignment`) so neither can
+    /// diverge into the pre-#517 any-idle re-pick.
+    ///
+    /// The secondary holds NO scheduling authority (the dispatch-decoupling
+    /// law): it must run the task on the EXACT worker the primary chose, or
+    /// not at all. So:
+    ///   - the requested slot exists and is idle ⇒ `Ok(Some(worker_id))`:
+    ///     the caller dispatches onto it;
+    ///   - the requested slot is NOT idle (busy with an incumbent, in a
+    ///     respawn transition) OR out of range OR the pool is empty
+    ///     (0-worker observer / late-joiner) ⇒ `Ok(None)`: the caller does
+    ///     NOT dispatch. We bounce a typed
+    ///     [`DistributedMessage::IllegallyAssignedToNonidleWorker`] to the
+    ///     primary so it reconciles its diverged `(secondary, worker_id)`
+    ///     occupancy and REQUEUES the task. This is NOT a `TaskFailed`: the
+    ///     task is never accounted as a failure (no retry-budget burn).
+    ///
+    /// SAFETY (preserves cabd34ab): `pool.workers.get(worker_id)` is the
+    /// Option path — an out-of-range id or a 0-worker pool resolves to
+    /// `None` and bounces, never a `len() - 1` underflow and never an
+    /// unconditional index. There is NO `.or_else(any-idle)` re-pick.
+    ///
+    /// `incumbent` is filled from the requested slot's `current_binary`
+    /// (the task it is actually running) when present — the busy case —
+    /// and is `None` for the degenerate non-idle cases that carry no
+    /// running task (out-of-range / 0-worker / mid-respawn transition).
+    pub(in crate::secondary) async fn select_honored_target_or_bounce(
+        &mut self,
+        worker_id: WorkerId,
+        assigned: AssignedTaskRef<I>,
+    ) -> Result<Option<WorkerId>, String> {
+        // Honor: dispatch ONLY onto the exact requested slot, and only if
+        // it is idle. `.get()` keeps an out-of-range id / 0-worker pool a
+        // clean `None` (no index, no clamp) — the cabd34ab safety. Reach the
+        // pool via `pool_mut()` (NOT `op_mut()`): this seam runs from BOTH
+        // the operational router AND the setup-time initial-assignment loop
+        // (lifecycle `Configuring`), and only `pool_mut()` carries the pool
+        // in both states.
+        let slot = self.pool_mut().workers.get(worker_id as usize);
+        if slot.is_some_and(|w| w.is_idle_state()) {
+            return Ok(Some(worker_id));
+        }
+
+        // Not idle: derive the incumbent (the task the slot is actually
+        // running) from the worker's own `current_binary`, if any. Absent
+        // for out-of-range / 0-worker / mid-respawn — those carry no
+        // incumbent but still bounce + requeue. Clone the identifier OUT of
+        // the pool borrow FIRST (dropping the borrow) so the subsequent
+        // `holding_hash_for_worker` immutable self-borrow doesn't overlap.
+        let incumbent_identifier: Option<I> = self
+            .pool_mut()
+            .workers
+            .get(worker_id as usize)
+            .and_then(|w| w.current_binary.as_ref())
+            .map(|task| task.identifier.clone());
+        let incumbent: Option<AssignedTaskRef<I>> = incumbent_identifier.map(|task_id| {
+            AssignedTaskRef {
+                // Reverse-resolve the incumbent's wire hash from the
+                // own-worker bookkeeping (`active_tasks: hash -> worker`),
+                // the same single truth source `holding_worker` reads;
+                // fall back to an empty hash only if the slot is busy
+                // without an `active_tasks` entry (a transition window).
+                hash: self.holding_hash_for_worker(worker_id).unwrap_or_default(),
+                task_id,
+            }
+        });
+
+        match &incumbent {
+            Some(inc) => tracing::error!(
+                secondary_id = %self.config.secondary_id,
+                worker_id,
+                assigned_hash = %assigned.hash,
+                incumbent_hash = %inc.hash,
+                "primary illegally assigned task to a worker that is BUSY \
+                 running another task; bouncing for re-dispatch (NOT failing) \
+                 — the secondary never re-picks another worker"
+            ),
+            None => tracing::error!(
+                secondary_id = %self.config.secondary_id,
+                worker_id,
+                assigned_hash = %assigned.hash,
+                "primary assigned task to a worker slot that cannot take it \
+                 (out-of-range id / 0-worker pool / mid-respawn); bouncing for \
+                 re-dispatch (NOT failing) — the secondary never re-picks"
+            ),
+        }
+
+        let msg = DistributedMessage::IllegallyAssignedToNonidleWorker {
+            target: None,
+            sender_id: self.config.secondary_id.clone(),
+            timestamp: timestamp_now(),
+            secondary_id: self.config.secondary_id.clone(),
+            worker_id,
+            assigned,
+            incumbent,
+        };
+        self.send_to_primary(msg).await?;
+        Ok(None)
+    }
+
+    /// The wire hash of the task currently running on `worker_id`, read off
+    /// the own-worker `active_tasks` map (`hash -> worker`) by reverse
+    /// lookup — the same single truth source `holding_worker` consults. A
+    /// helper so the illegal-assignment bounce names the incumbent's hash
+    /// without re-hashing the binary.
+    fn holding_hash_for_worker(&self, worker_id: WorkerId) -> Option<String> {
+        match &self.lifecycle {
+            super::super::SecondaryLifecycle::Configuring(cfg) => cfg
+                .active_tasks
+                .iter()
+                .find(|&(_, &wid)| wid == worker_id)
+                .map(|(hash, _)| hash.clone()),
+            super::super::SecondaryLifecycle::Operational(op) => op
+                .active_tasks
+                .iter()
+                .find(|&(_, &wid)| wid == worker_id)
+                .map(|(hash, _)| hash.clone()),
+            _ => None,
+        }
     }
 
     /// Store an inbound run-config PUSH from the primary.

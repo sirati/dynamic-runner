@@ -621,13 +621,13 @@ async fn post_ready_assigned_binaryless_pipe_eof_disconnect_is_reported_terminal
 /// post-Ready-assigned task.
 ///
 /// "The tail churn then hits that worker with ANOTHER type-shift dispatch."
-/// The router selects ONLY idle workers (router.rs:162-173 `is_idle_state`
-/// filter). A post-Ready-assigned slot is Transitioning (BUSY), and this
-/// fixture has a single worker, so the new dispatch finds NO idle target
-/// and reports the NEW task as backpressure — it must NOT touch / cannibalize
-/// the ORIGINAL active task. This pins that a router dispatch can never
-/// strand a busy worker's in-flight task: the original stays tracked (and a
-/// later real terminal resolves it), and only the new task is bounced.
+/// Post-#517 the router HONORS the assigned `worker_id` and never re-picks:
+/// the requested slot is BUSY (Transitioning), so the new task is BOUNCED
+/// via the typed `IllegallyAssignedToNonidleWorker` (naming the incumbent)
+/// — it must NOT touch / cannibalize the ORIGINAL active task. This pins
+/// that a router dispatch can never strand a busy worker's in-flight task:
+/// the original stays tracked (and a later real terminal resolves it), and
+/// only the new task is bounced (NOT as a failure).
 #[tokio::test(flavor = "current_thread")]
 async fn second_assignment_while_busy_does_not_strand_original_task() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -649,8 +649,8 @@ async fn second_assignment_while_busy_does_not_strand_original_task() {
                 drive_to_post_ready_assigned(&mut secondary, &oom, &orig_binary, &orig_hash).await;
 
             // A SECOND TaskAssignment for the same worker_id 0 arrives while
-            // the slot is BUSY. No idle worker exists, so the router bounces
-            // the NEW task and leaves the ORIGINAL active task untouched.
+            // the slot is BUSY. The router HONORS the slot (never re-picks),
+            // so it BOUNCES the NEW task and leaves the ORIGINAL untouched.
             let new_binary = make_binary("clang21-O0-ltothin", 50);
             let new_hash = "deadbeef".to_string();
             let assignment2 = task_assignment("setup", "sec-2", 0, &new_binary, &new_hash);
@@ -665,37 +665,44 @@ async fn second_assignment_while_busy_does_not_strand_original_task() {
                 secondary.op_mut().active_tasks.get(&orig_hash),
                 Some(&0u32),
                 "the busy worker's original active task must survive a second \
-                 assignment that found no idle slot"
+                 assignment to its (busy) slot"
             );
             assert_eq!(
                 secondary.op_mut().pool.workers[0].generation,
                 assigned_gen,
-                "a no-idle-target dispatch must not replace the busy slot"
+                "a bounced dispatch must not replace the busy slot"
+            );
+            // The NEW task never ran here (no re-pick onto a sibling — there
+            // is none, but the contract holds regardless).
+            assert!(
+                !secondary.op_mut().active_tasks.contains_key(&new_hash),
+                "the bounced task must never be recorded as running here"
             );
 
-            // The NEW task is reported back as backpressure (Recoverable),
-            // keyed by the NEW hash — never the original's.
+            // The NEW task is BOUNCED via the typed report (#517), keyed by
+            // the NEW hash, naming worker 0 — NOT a TaskFailed for either
+            // hash. The incumbent named is the original (the slot may report
+            // it once active_tasks is populated; the bounce is what matters).
             let reported = log.borrow();
             assert!(
                 reported.iter().any(|m| matches!(
                     m,
-                    DistributedMessage::TaskFailed {
-                        task_hash,
-                        error_type: dynrunner_core::ErrorType::Recoverable,
+                    DistributedMessage::IllegallyAssignedToNonidleWorker {
+                        worker_id: 0,
+                        assigned,
                         ..
-                    } if *task_hash == new_hash
+                    } if assigned.hash == new_hash
                 )),
-                "the second (un-takeable) assignment must be reported as \
-                 backpressure for its OWN hash; got {reported:?}"
+                "the second (un-takeable) assignment must BOUNCE \
+                 IllegallyAssignedToNonidleWorker for its OWN hash; got {reported:?}"
             );
             assert!(
                 !reported.iter().any(|m| matches!(
                     m,
-                    DistributedMessage::TaskFailed { task_hash, .. }
-                    if *task_hash == orig_hash
+                    DistributedMessage::TaskFailed { .. }
                 )),
-                "the original task must NOT be reported terminal by the second \
-                 assignment (it is still running); got {reported:?}"
+                "the bounce must NOT be a TaskFailed (no failure accounting); \
+                 got {reported:?}"
             );
         })
         .await;

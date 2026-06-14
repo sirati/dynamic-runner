@@ -410,6 +410,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // and the pull never converged — the deposed-zombie
             // starvation (see `handle_snapshot_stream_package`).
             MessageType::SnapshotStreamPackage => self.handle_snapshot_stream_package(msg),
+            // #517 illegal-assignment bounce: a secondary refused to run a
+            // task because the assigned worker slot was NOT idle, and never
+            // re-picked. This is NOT a `TaskFailed` (it never routes through
+            // the terminal gate / `handle_task_failed` — no failure
+            // accounting), it is an occupancy-DIVERGENCE report: reconcile
+            // this primary's `(secondary, worker_id)` model so it stops
+            // believing the slot is idle, then requeue the bounced task for
+            // a genuinely-idle worker. See `handle_illegally_assigned`.
+            MessageType::IllegallyAssignedToNonidleWorker => {
+                self.handle_illegally_assigned(msg).await
+            }
             other => {
                 tracing::debug!(?other, "unhandled message type");
             }
