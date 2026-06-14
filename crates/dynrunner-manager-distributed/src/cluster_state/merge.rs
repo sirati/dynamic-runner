@@ -467,6 +467,17 @@ impl<I: Identifier> ClusterState<I> {
             return MergeOutcome::NoOp;
         }
         // 1+2. Look up; on a present slot compare keys and bail on a NoOp.
+        // Capture the PRE-merge per-entry range term while we hold the old
+        // state, so the memo update below can XOR it OUT (the new term goes IN
+        // after the insert). `None` (the entry never existed — not fat, not
+        // settled) makes this insert a logical CREATE, so no old term to
+        // remove. After an `unsettle_if_dominated` rehydrate above the entry
+        // is fat here, so its old term is captured and the rehydrate's count
+        // (added back by unsettle moving it fat) is correctly conserved.
+        let old_range_term = self
+            .tasks
+            .get(hash)
+            .map(|local| super::keyspace::task_digest_term(hash, local));
         let was_completed = match self.tasks.get(hash) {
             None => false,
             Some(local) => {
@@ -542,6 +553,17 @@ impl<I: Identifier> ClusterState<I> {
             let key = (incoming.task().phase_id.clone(), kind);
             let next = self.phase_event_tally_for(&key) + 1;
             self.record_phase_event_tally(key, next);
+        }
+        // Range-fold memo: XOR the OLD term out (if the slot was occupied)
+        // and the NEW winning term in. A `None` old term is a logical CREATE
+        // (count bumps); a `Some` is a state CHANGE under a fixed key (count
+        // conserved). Done as raw memo ops (not the `range_memo_*` bridges)
+        // because the winning `incoming` is moved into the map on the very
+        // next line — capture its term first.
+        let new_range_term = super::keyspace::task_digest_term(hash, &incoming);
+        match old_range_term {
+            Some(old) => self.range_fold_memo.swap(hash, old, new_range_term),
+            None => self.range_fold_memo.add(hash, new_range_term),
         }
         self.tasks.insert(hash.to_string(), incoming);
         // 4. Newly-completed cross-task side-effects.

@@ -312,6 +312,15 @@ impl SettledStore {
     /// fat/settled split. Keeps `digest_contribution` private to this
     /// module (the store owns the term's lifecycle); callers see only the
     /// `(key, term)` pair, never the entry internals.
+    ///
+    /// Test-only now (#492): the production [`super::ClusterState::tasks_range_digest`]
+    /// reads the incrementally-maintained `RangeFoldMemo` instead of folding
+    /// the settled half on every probe; this one-pass settled fold survives as
+    /// the `#[cfg(test)] fresh_tasks_range_digest` the differential memo
+    /// invariant recomputes against. The settled-entry term is XOR-maintained
+    /// into the memo at the same logical-create/change sites the fat entries
+    /// are (a spill is memo-neutral), so the memo stays whole across the split.
+    #[cfg(test)]
     pub(super) fn digest_contributions(&self) -> impl Iterator<Item = (&str, u64)> {
         self.index
             .iter()
@@ -694,6 +703,12 @@ impl<I: Identifier> ClusterState<I> {
             self.settled.records_committed += 1;
             self.settled.index.insert(rec.hash.clone(), entry);
             self.tasks.remove(&rec.hash);
+            // Range-fold memo: a spill is memo-NEUTRAL. The entry stays a
+            // LOGICAL ledger entry (its term moves from the fat `tasks` half
+            // into the settled half the range fold sums over, identical
+            // value), so its bucket fold + count are unchanged — exactly as
+            // this spill leaves `tasks_hash` unchanged (the term is XORed out
+            // of the live fold and into `tasks_hash_acc` above). No memo touch.
             evicted += 1;
         }
         evicted
@@ -741,6 +756,14 @@ impl<I: Identifier> ClusterState<I> {
             .saturating_sub(entry.approx_bytes());
         // The outputs never left the in-memory map, so only the task
         // state is reinstated.
+        //
+        // Range-fold memo: an unsettle is memo-NEUTRAL — the inverse of a
+        // spill. The entry was already a LOGICAL ledger entry counted in the
+        // memo (as the settled term, which equals the rehydrated fat term);
+        // moving it from the settled half back to fat changes neither its
+        // bucket fold nor its count, exactly as it leaves `tasks_hash`
+        // unchanged (the term is XORed out of `tasks_hash_acc` above). No memo
+        // touch. A subsequent dominating merge then swaps to the winning term.
         self.tasks.insert(hash.to_string(), record.state);
         true
     }

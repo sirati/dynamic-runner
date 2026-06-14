@@ -727,6 +727,203 @@ fn ghost_fixture(binaries: Vec<TaskInfo<TestId>>, ghost_in_flight: Option<TaskIn
     }
 }
 
+// ─── #504: the range-digest probe-herd wedge (oploop-no-stall) ───
+//
+// Production signature (run before this fix): at a large (66k) build-phase
+// START, every behind secondary detected divergence off the primary's first
+// post-TasksSpawned digest and broadcast a PullProbe to Destination::All in
+// the same instant. The primary's inbox arm then ran ~14× O(66k) range folds
+// back-to-back inside ONE 256-frame inbox batch-drain (one un-memoized
+// `tasks_range_digest()` per inbound probe), a synchronous CPU burst that
+// froze the single-threaded oploop → the GIL thread's `block_on` wedged. The
+// fix memoizes the range digest (O(1) read), so the probe burst no longer
+// folds the ledger and the loop keeps servicing its sibling timer arms.
+
+/// Build a probe-burst fixture: a primary seeded with a LARGE ledger via ONE
+/// `TasksSpawned` apply (the production wedge trigger) + an inherited ghost
+/// in-flight task (so the run stays open for the observation window), wired to
+/// one real secondary so the pre-loop mesh chain is satisfied, with a FAST
+/// keepalive so the heartbeat arm ticks many times inside the window (the
+/// sibling-arm liveness oracle). Returns the retained coordinator + the wire
+/// inbound the test injects probes into.
+fn probe_burst_fixture(ledger_size: usize) -> GhostFixture {
+    let max_res = dynrunner_core::ResourceMap::from([(
+        dynrunner_core::ResourceKind::memory(),
+        1024 * 1024 * 1024u64,
+    )]);
+    let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
+        spawn_real_secondary("sec-0".to_string(), 2, max_res);
+
+    let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+    let mut outgoing = HashMap::new();
+    outgoing.insert("sec-0".to_string(), pri_to_sec_tx);
+    {
+        let tx = incoming_tx.clone();
+        tokio::task::spawn_local(async move {
+            let mut rx = sec_to_pri_rx;
+            while let Some(msg) = rx.recv().await {
+                if tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    let transport =
+        ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
+    let config = PrimaryConfig {
+        connect_timeout: Duration::from_secs(10),
+        peer_timeout: Duration::from_secs(10),
+        // Fast keepalive ⇒ the heartbeat arm ticks ~every 50ms, so the
+        // sibling-arm liveness oracle has many chances to win inside the
+        // window (the default 5s would not fire within a snappy test).
+        keepalive_interval: StdDuration::from_millis(50),
+        ..test_primary_config()
+    };
+    let (mut primary, mesh_keepalive) = build_test_primary(
+        config,
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    // Seed the LARGE ledger in ONE TasksSpawned apply — the production wedge
+    // trigger (the first post-spawn digest is what the herd probes against).
+    let binaries: Vec<TaskInfo<TestId>> = (0..ledger_size)
+        .map(|i| make_binary(&format!("bin_{i:06}"), 50 + (i as u64)))
+        .collect();
+    primary
+        .cluster_state_mut_for_test()
+        .apply(ClusterMutation::TasksSpawned { tasks: binaries });
+
+    // An inherited ghost in-flight task keeps the run open for the whole
+    // observation window (so the arm stats are still live to read).
+    let ghost = make_binary("bin_ghost_keepalive", 7);
+    let ghost_hash = crate::primary::wire::compute_task_hash(&ghost);
+    primary
+        .cluster_state_mut_for_test()
+        .apply(ClusterMutation::TaskAdded {
+            hash: ghost_hash.clone(),
+            task: ghost,
+        });
+    primary
+        .cluster_state_mut_for_test()
+        .apply(ClusterMutation::TaskAssigned {
+            hash: ghost_hash,
+            secondary: "ghost-sec".into(),
+            worker: 0,
+            version: Default::default(),
+            attempt: 0,
+        });
+
+    GhostFixture {
+        primary,
+        mesh_keepalive,
+        wire_tx: incoming_tx,
+        _sec_handle: sec_handle,
+    }
+}
+
+/// A `PullProbe` frame from a behind peer (a default/empty digest ⇒ the peer
+/// is far behind ⇒ the primary is `ahead`, the realistic phase-start herd
+/// case). The primary's `handle_pull_probe` folds its `tasks_range_digest`
+/// for the reply REGARDLESS of the ahead bit, so every probe exercises the
+/// (now O(1)) range-digest read.
+fn pull_probe_frame(requester: &str) -> DistributedMessage<TestId> {
+    DistributedMessage::PullProbe {
+        target: None,
+        sender_id: requester.into(),
+        timestamp: 1.0,
+        digest: dynrunner_protocol_primary_secondary::StateDigest::default(),
+    }
+}
+
+/// ── #504 repro: a 14-probe herd over a 60k ledger must NOT stall the loop ──
+///
+/// Seed a 60k-task ledger in one TasksSpawned, let the loop settle, then inject
+/// 14 simultaneous PullProbe frames (the phase-start herd). Each probe makes
+/// the inbox arm build a `PullProbeReply` whose range digest — pre-fix — was an
+/// O(60k) fold, so 14 of them in one inbox batch were a synchronous CPU burst
+/// that froze the single-threaded oploop.
+///
+/// ORACLE (the loop never stalls): the SIBLING heartbeat arm must keep winning
+/// THROUGH and AFTER the probe burst — its win count must advance across the
+/// post-burst window. With the memo the 14 probe replies are O(1) each, so the
+/// loop services its timers normally; a regression to the per-probe fold would
+/// let the inbox arm monopolize the run-queue while folding 14×60k entries and
+/// the heartbeat arm would visibly stall. The inbox arm must also have
+/// PROCESSED the burst (its count covers the 14 probes).
+#[tokio::test(flavor = "current_thread")]
+async fn probe_herd_over_large_ledger_does_not_stall_oploop() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let fixture = probe_burst_fixture(60_000);
+            let GhostFixture {
+                mut primary,
+                mesh_keepalive: _mesh,
+                wire_tx,
+                _sec_handle,
+            } = fixture;
+
+            // Fire the 14-probe HERD mid-window. The `run` future holds
+            // `&mut primary` for its whole scope, so the arm stats are read
+            // AFTER the run scope ends (the reference fixture's pattern); the
+            // ghost in-flight keeps the run unresolved so the stats are still
+            // live to read post-timeout.
+            let probe_count = 14usize;
+            tokio::task::spawn_local(async move {
+                // Let the loop settle into operational steady state + the
+                // heartbeat arm warm up (so a post-burst stall would be
+                // distinguishable from a slow bring-up).
+                tokio::time::sleep(StdDuration::from_millis(1500)).await;
+                // THE HERD: 14 probes injected back-to-back so they land in
+                // (at most) a couple of inbox batches — the production shape.
+                for i in 0..probe_count {
+                    let _ = wire_tx.send(pull_probe_frame(&format!("behind-sec-{i}")));
+                }
+            });
+
+            // Observation window: settle (1.5s) + burst + ~2s of post-burst
+            // loop activity. At a 50ms heartbeat cadence a HEALTHY loop ticks
+            // the heartbeat arm ~70× across this window.
+            let window = StdDuration::from_millis(3500);
+            {
+                let (_deps, ops, ope) = noop_phase_args();
+                let run = primary.run(SeedSource::PromotionSnapshot, ops, ope);
+                tokio::pin!(run);
+                let _ = tokio::time::timeout(window, &mut run).await;
+            }
+
+            // ORACLE 1 (the loop never stalled): the sibling heartbeat arm
+            // ticked a healthy number of times across the window that CONTAINS
+            // the 14-probe burst. A per-probe O(60k) fold would freeze the
+            // single-threaded loop during the burst; here the memoized O(1)
+            // read lets the timers keep firing. The floor (20) is far below the
+            // ~70 a 50ms cadence yields over ~3.5s, but far above the handful a
+            // stalled loop would manage — a wide, non-flaky margin.
+            let heartbeat = arm_count_of(&primary, "heartbeat");
+            assert!(
+                heartbeat >= 20,
+                "OPLOOP STALL (#504): the heartbeat arm ticked only {heartbeat}× \
+                 across a ~3.5s window containing the 14-probe burst over a 60k \
+                 ledger. A per-probe O(ledger) range fold would freeze the \
+                 single-threaded loop; the memoized O(1) read must let the \
+                 sibling timer arms keep winning.",
+            );
+            // ORACLE 2 (the burst was actually serviced, not dropped): the
+            // inbox arm processed at least the 14 probes (plus mesh traffic).
+            let inbox = arm_count_of(&primary, "inbox");
+            assert!(
+                inbox >= probe_count as u64,
+                "the inbox arm must have PROCESSED the 14-probe burst \
+                 (inbox wins={inbox}); a stalled loop would not have drained it"
+            );
+        })
+        .await;
+}
+
 /// ── ROUND 6 repro #1 (the capture's spin, deterministic) ──
 ///
 /// One TaskRequest from a never-welcomed secondary lands on the live

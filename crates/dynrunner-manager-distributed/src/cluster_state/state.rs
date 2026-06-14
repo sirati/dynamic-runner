@@ -454,6 +454,28 @@ pub struct ClusterState<I> {
     /// does NOT recompute". Carries no convergence signal — classified
     /// node-local in every destructure guard.
     pub(super) digest_fold_count: std::cell::Cell<u64>,
+    /// Node-local incremental memo of the per-bucket range fold (#492 P2),
+    /// the O(1)-read twin of the O(ledger) [`Self::tasks_range_digest`]
+    /// one-pass fold. Maintained INCREMENTALLY (not invalidate-and-recompute
+    /// like `digest_cache`): every task-state mutation XORs the old per-entry
+    /// term out and the new term in, co-located at the SAME sites that change
+    /// a task's stored state, so a probe read is a cheap clone instead of the
+    /// O(66k) fold that wedged the single-threaded oploop (#504).
+    ///
+    /// Tracks the LOGICAL ledger (fat `tasks` ∪ spilled `settled`), the same
+    /// universe `tasks_range_digest` folds; a spill / unsettle MOVES an entry
+    /// between the two halves without changing its term or bucket, so it is
+    /// memo-neutral (exactly as it is `tasks_hash`-neutral). The invariant
+    /// `XOR(memo-folds) == tasks_hash` (and `sum(memo-counts) ==
+    /// tasks_count`) is pinned by `range_digest_memo_matches_fresh_fold` and
+    /// asserted across every apply/settle/hydrate/promotion path.
+    ///
+    /// Classification: a pure DERIVATION of the replicated `tasks` + `settled`
+    /// (like `digest_cache`/`settled`'s accumulator) — NOT replicated, NOT
+    /// folded into the digest, NOT cloned (a cloned replica rebuilds it from
+    /// its restored ledger, see `clone`), NOT snapshotted. Bound to a
+    /// `_`-name in every exhaustive-destructure guard.
+    pub(super) range_fold_memo: super::range_fold_memo::RangeFoldMemo,
     /// Settled-entry disk spill: the node-local STORAGE BACKEND for the
     /// join-fixed-point slice of `tasks` (see `cluster_state::settled`).
     /// A settled entry's fat body lives in the append-only spill file;
@@ -529,6 +551,12 @@ where
             // counter). Bound for the exhaustive-destructure guard.
             digest_cache: _digest_cache,
             digest_fold_count: _digest_fold_count,
+            // Node-local range-fold memo — a pure derivation of the (cloned)
+            // logical ledger, so it is copied through verbatim below: the
+            // clone's `tasks` + `settled` are byte-identical to the source's,
+            // so the source's maintained fold is exactly correct for the
+            // clone (and a direct copy is cheaper than re-folding the ledger).
+            range_fold_memo,
             // Settled store: carried READ-ONLY (index + shared read fds;
             // the writer affiliation is dropped — one-writer rule).
             settled,
@@ -594,6 +622,11 @@ where
             // digest on first use, so it never inherits the source's memo).
             digest_cache: std::cell::Cell::new(None),
             digest_fold_count: std::cell::Cell::new(0),
+            // Node-local range-fold memo — copied verbatim: the clone's
+            // logical ledger is byte-identical to the source's, so the
+            // source's maintained fold already satisfies the invariant for
+            // the clone (no re-fold needed).
+            range_fold_memo: range_fold_memo.clone(),
             // Settled store: read-only carry — the cloned replica keeps
             // serving settled reads through the shared `Arc<File>`
             // segments but never writes the source's file.
@@ -645,6 +678,7 @@ where
             dead_rejoin_warn,
             digest_cache,
             digest_fold_count,
+            range_fold_memo: _range_fold_memo,
             settled,
         } = self;
         f.debug_struct("ClusterState")
@@ -724,6 +758,7 @@ impl<I> Default for ClusterState<I> {
             dead_rejoin_warn: HashMap::new(),
             digest_cache: std::cell::Cell::new(None),
             digest_fold_count: std::cell::Cell::new(0),
+            range_fold_memo: super::range_fold_memo::RangeFoldMemo::default(),
             settled: super::settled::SettledStore::default(),
         }
     }

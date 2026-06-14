@@ -60,6 +60,42 @@ pub fn tick_period(node_id: &str) -> Duration {
     Duration::from_millis((base_ms + offset_ms).max(1) as u64)
 }
 
+/// The peak deterministic stagger applied to a node's FIRST anti-entropy
+/// PROBE (the Idle→Probing transition in [`crate::pull_coordinator`]). Sized
+/// to the pull selection window so a phase-START probe HERD — every behind
+/// secondary detecting divergence off the SAME first post-spawn digest
+/// broadcast — spreads its probes across the window instead of firing in one
+/// instant, which is what made every node fold its O(ledger) range digest
+/// back-to-back inside one inbox batch (#504). The probe still fires WITHIN
+/// the window, so single-flight + the cooldown bounds are unchanged; only the
+/// phase of the FIRST probe is staggered.
+const PROBE_HERD_JITTER: Duration = crate::pull_coordinator::SELECTION_WINDOW;
+
+/// A per-node deterministic delay in `[0, PROBE_HERD_JITTER)` for the first
+/// probe of a pull cycle, folded from `node_id` the SAME way [`tick_period`]
+/// derives its digest-broadcast jitter (no wall-clock / RNG — the runtime is
+/// deterministic and reproducibility must hold). Two distinct ids almost
+/// always land on different phases, so a 14-node phase-start probe herd
+/// staggers across the selection window instead of bursting together; the
+/// SAME id always yields the SAME delay. A zero delay (some ids hash to the
+/// low end) is fine — it is the un-jittered immediate probe, and the OTHER
+/// nodes still spread out around it.
+pub fn probe_jitter(node_id: &str) -> Duration {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    // Distinct seed from `tick_period`'s fold so a node's probe stagger is
+    // not correlated with its digest-broadcast phase (they are independent
+    // cadences; correlating them would re-synchronise the two herds).
+    "probe-herd".hash(&mut hasher);
+    node_id.hash(&mut hasher);
+    let h = hasher.finish();
+    let span_ms = PROBE_HERD_JITTER.as_millis() as u64;
+    // `span_ms` is the selection window (≥ 1s in prod, the `cfg(test)`-scaled
+    // value in tests) — never zero, so the modulo is well-defined.
+    Duration::from_millis(h % span_ms.max(1))
+}
+
 /// Build this node's anti-entropy broadcast frame from its current
 /// `digest`. Sent to [`Destination::All`] on each cadence tick so every
 /// peer can compare and pull if behind.

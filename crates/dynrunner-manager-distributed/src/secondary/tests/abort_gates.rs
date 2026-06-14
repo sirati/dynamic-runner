@@ -203,6 +203,9 @@ async fn missed_abort_broadcast_converges_via_digest() {
             )
             .await
             .expect("StateDigest dispatch succeeds");
+            // #504: the divergence is NOTED (which schedules a staggered
+            // probe); the pull arm fires it at its deadline — driven here.
+            sec.fire_staggered_probe_for_test().await;
             sec.drain_egress().await;
             assert!(
                 peer_log

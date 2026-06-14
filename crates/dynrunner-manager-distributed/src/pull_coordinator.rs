@@ -189,6 +189,15 @@ pub enum PullDirective {
 enum State {
     /// No pull in flight. `note_behind` here starts a probe.
     Idle,
+    /// A probe has been SCHEDULED (the Idle→Probing transition) but is held
+    /// back by a per-node deterministic stagger until `fire_at`, so a
+    /// phase-START probe herd does not fold every node's range digest in the
+    /// same instant (#504). `tick` at `fire_at` emits the `Probe` and moves to
+    /// `Probing`. This IS the single-flight gate's first stop: `note_behind`
+    /// while `ProbePending` is a NoOp exactly as while `Probing`/`Pulling`, so
+    /// the stagger never opens a second cycle. `wake_deadline` parks the
+    /// persistent arm on `fire_at` so the deferred probe fires under load.
+    ProbePending { fire_at: Instant },
     /// A probe is outstanding. `since` stamps the broadcast; the selection
     /// window ends at `since + SELECTION_WINDOW`. `candidates` accumulates
     /// every AHEAD reply seen so far (de-duplicated by responder id — a
@@ -248,22 +257,32 @@ impl PullCoordinator {
     }
 
     /// IDEMPOTENT trigger: the role detected (via an inbound digest or its
-    /// recovery tick) that the local replica is behind some peer. Starts a
-    /// fresh probe cycle iff Idle; a NoOp while already Probing or Pulling
-    /// — this collapse to a SINGLE in-flight cycle is what kills the
-    /// one-pull-per-digest storm. Returns `Some(PullDirective::Probe)` on
-    /// the cold (Idle) trigger, `None` otherwise.
+    /// recovery tick) that the local replica is behind some peer. Schedules a
+    /// fresh probe cycle iff Idle; a NoOp while already ProbePending, Probing,
+    /// or Pulling — this collapse to a SINGLE in-flight cycle is what kills the
+    /// one-pull-per-digest storm.
+    ///
+    /// The cold (Idle) trigger does NOT emit the probe inline: it stamps a
+    /// per-node deterministic stagger ([`crate::anti_entropy::probe_jitter`])
+    /// and parks in [`State::ProbePending`] until `fire_at`, so a phase-START
+    /// herd (every behind secondary detecting divergence off the SAME first
+    /// post-spawn digest) spreads its probes across the selection window
+    /// instead of all folding their range digests in one instant (the #504
+    /// oploop wedge). The role's persistent-deadline arm fires the deferred
+    /// probe via [`Self::tick`] at `fire_at`. A node whose jitter folds to 0
+    /// fires immediately on the next tick — the un-staggered case, around
+    /// which the rest of the herd spreads. Always returns `None` (the probe is
+    /// a `tick` directive now); single-flight is unchanged.
     pub fn note_behind(&mut self, now: Instant) -> Option<PullDirective> {
         match self.state {
             State::Idle => {
-                self.state = State::Probing {
-                    since: now,
-                    candidates: Vec::new(),
-                    window_closed: false,
-                };
-                Some(PullDirective::Probe)
+                let fire_at = now + crate::anti_entropy::probe_jitter(&self.node_id);
+                self.state = State::ProbePending { fire_at };
+                None
             }
-            // Already Probing or Pulling — single-flight: ignore.
+            // Already ProbePending, Probing, or Pulling — single-flight: the
+            // stagger window and the rest of the cycle absorb every further
+            // trigger so no second cycle ever opens.
             _ => None,
         }
     }
@@ -408,6 +427,20 @@ impl PullCoordinator {
     pub fn tick(&mut self, now: Instant) -> Vec<PullDirective> {
         match &mut self.state {
             State::Idle => Vec::new(),
+            State::ProbePending { fire_at } => {
+                // The deferred (staggered) first probe is due: emit it and
+                // enter the selection window. Before `fire_at` the persistent
+                // arm is parked (see `wake_deadline`), so this only fires once.
+                if now >= *fire_at {
+                    self.state = State::Probing {
+                        since: now,
+                        candidates: Vec::new(),
+                        window_closed: false,
+                    };
+                    return vec![PullDirective::Probe];
+                }
+                Vec::new()
+            }
             State::Probing { since, .. } => {
                 if now.duration_since(*since) >= SELECTION_WINDOW {
                     // Window over: commit the best candidate if we have one
@@ -466,6 +499,9 @@ impl PullCoordinator {
     pub fn wake_deadline(&self) -> Option<Instant> {
         match &self.state {
             State::Idle => None,
+            // The deferred first probe is due at `fire_at`: park the
+            // persistent arm there so the staggered probe fires under load.
+            State::ProbePending { fire_at } => Some(*fire_at),
             State::Probing {
                 since,
                 window_closed,
@@ -538,6 +574,7 @@ impl PullCoordinator {
     pub(crate) fn state_name(&self) -> &'static str {
         match self.state {
             State::Idle => "idle",
+            State::ProbePending { .. } => "probe_pending",
             State::Probing { .. } => "probing",
             State::Pulling { .. } => "pulling",
         }
@@ -728,6 +765,25 @@ mod tests {
         Instant::now()
     }
 
+    /// Drive a fresh coordinator from Idle through the STAGGERED first probe
+    /// to `Probing`, returning the instant the probe actually fired (`>=
+    /// start`, by the per-node jitter). The FSM tests below exercise target
+    /// selection / fallback / rebalance, NOT the stagger itself (the
+    /// `note_behind_staggers_first_probe` test owns that), so they start from
+    /// this helper to reach `Probing` regardless of the node's jitter phase.
+    fn probe_now(pc: &mut PullCoordinator, start: Instant) -> Instant {
+        assert_eq!(pc.note_behind(start), None, "note_behind now DEFERS the probe");
+        assert_eq!(pc.state_name(), "probe_pending");
+        let fire_at = pc.wake_deadline().expect("ProbePending arms the probe deadline");
+        assert_eq!(
+            pc.tick(fire_at),
+            vec![PullDirective::Probe],
+            "the staggered probe fires at its deadline"
+        );
+        assert_eq!(pc.state_name(), "probing");
+        fire_at
+    }
+
     fn reply<'a>(id: &'a str, inbox: u64, ahead: bool) -> ProbeReply<'a> {
         ProbeReply {
             responder_id: id,
@@ -761,17 +817,82 @@ mod tests {
     fn note_behind_is_idempotent_single_flight() {
         let mut pc = PullCoordinator::new("me");
         let now = t0();
-        assert_eq!(pc.note_behind(now), Some(PullDirective::Probe));
-        assert_eq!(pc.state_name(), "probing");
-        // Ten more triggers within the window — all NoOps (single-flight).
+        // The cold trigger DEFERS the probe (single-flight starts at
+        // ProbePending). Every further trigger — while ProbePending AND after
+        // it advances to Probing — must NoOp (no second cycle).
+        assert_eq!(pc.note_behind(now), None, "the cold note defers the probe");
+        assert_eq!(pc.state_name(), "probe_pending");
         for i in 1..=10 {
             assert_eq!(
                 pc.note_behind(now + Duration::from_millis(i * 10)),
+                None,
+                "a note_behind while ProbePending must NOT start a second cycle"
+            );
+        }
+        assert_eq!(pc.state_name(), "probe_pending", "still the SAME pending cycle");
+        // Advance through the staggered probe → Probing; triggers there NoOp too.
+        let fire_at = pc.wake_deadline().expect("ProbePending arms a deadline");
+        assert_eq!(pc.tick(fire_at), vec![PullDirective::Probe]);
+        assert_eq!(pc.state_name(), "probing");
+        for i in 1..=10 {
+            assert_eq!(
+                pc.note_behind(fire_at + Duration::from_millis(i * 10)),
                 None,
                 "a note_behind while Probing must NOT start a second cycle"
             );
         }
         assert_eq!(pc.state_name(), "probing");
+    }
+
+    /// STAGGER: `note_behind` defers the first probe by a per-node
+    /// deterministic jitter in `[0, SELECTION_WINDOW)`, so a phase-start herd
+    /// spreads across the window. The probe is NOT emitted inline; it fires
+    /// from `tick` at the staggered deadline. Two distinct ids stagger to
+    /// (almost always) different phases; the SAME id is reproducible.
+    #[test]
+    fn note_behind_staggers_first_probe() {
+        let start = t0();
+        // The deferral is bounded by the selection window and reproducible.
+        let mut pc = PullCoordinator::new("node-7");
+        assert_eq!(pc.note_behind(start), None, "the probe is deferred, not inline");
+        assert_eq!(pc.state_name(), "probe_pending");
+        let fire_at = pc.wake_deadline().expect("ProbePending arms a deadline");
+        let delay = fire_at.duration_since(start);
+        assert!(
+            delay < SELECTION_WINDOW,
+            "the stagger is bounded by the selection window ({delay:?} < {SELECTION_WINDOW:?})"
+        );
+        // Before the deadline: tick emits nothing, stays pending.
+        assert!(
+            pc.tick(start).is_empty() || delay.is_zero(),
+            "a tick before the staggered deadline emits no probe"
+        );
+        // At/after the deadline: the probe fires and the window opens.
+        assert_eq!(pc.tick(fire_at), vec![PullDirective::Probe]);
+        assert_eq!(pc.state_name(), "probing");
+        // Reproducible: the SAME id stagger is identical across coordinators.
+        let mut pc2 = PullCoordinator::new("node-7");
+        pc2.note_behind(start);
+        assert_eq!(
+            pc2.wake_deadline().unwrap().duration_since(start),
+            delay,
+            "the per-node stagger is deterministic for a given id"
+        );
+        // Different ids almost always land on different phases — smoke-check a
+        // spread across a handful of ids (the herd de-synchronisation).
+        let phases: std::collections::HashSet<u64> = ["a", "b", "c", "node-7", "obs-1", "s-13"]
+            .iter()
+            .map(|id| {
+                let mut p = PullCoordinator::new(id);
+                p.note_behind(start);
+                p.wake_deadline().unwrap().duration_since(start).as_millis() as u64
+            })
+            .collect();
+        assert!(
+            phases.len() >= 4,
+            "distinct ids must stagger to distinct phases (got {} of 6)",
+            phases.len()
+        );
     }
 
     /// SMALLEST-INBOX-AMONG-AHEAD selection: three ahead replies + one
@@ -782,16 +903,16 @@ mod tests {
     fn selects_smallest_inbox_among_ahead() {
         let mut pc = PullCoordinator::new("me");
         let start = t0();
-        pc.note_behind(start);
+        let probed = probe_now(&mut pc, start);
         // Not-ahead with the smallest inbox of all — must be filtered out.
-        assert_eq!(pc.on_probe_reply(start, &reply("low-but-behind", 1, false)), None);
+        assert_eq!(pc.on_probe_reply(probed, &reply("low-but-behind", 1, false)), None);
         // Ahead candidates: inbox 9, 4, 7. Smallest ahead = "b" (4).
-        assert_eq!(pc.on_probe_reply(start, &reply("a", 9, true)), None);
-        assert_eq!(pc.on_probe_reply(start, &reply("b", 4, true)), None);
-        assert_eq!(pc.on_probe_reply(start, &reply("c", 7, true)), None);
+        assert_eq!(pc.on_probe_reply(probed, &reply("a", 9, true)), None);
+        assert_eq!(pc.on_probe_reply(probed, &reply("b", 4, true)), None);
+        assert_eq!(pc.on_probe_reply(probed, &reply("c", 7, true)), None);
         assert_eq!(pc.state_name(), "probing");
         // Window elapses → tick commits the smallest-inbox ahead target.
-        let directives = pc.tick(start + SELECTION_WINDOW);
+        let directives = pc.tick(probed + SELECTION_WINDOW);
         assert_eq!(directives, vec![pull_from("b")]);
         assert_eq!(pc.state_name(), "pulling");
         assert_eq!(pc.pull_target(), Some("b"));
@@ -804,14 +925,14 @@ mod tests {
     fn no_ahead_reply_commits_no_pull() {
         let mut pc = PullCoordinator::new("me");
         let start = t0();
-        pc.note_behind(start);
-        pc.on_probe_reply(start, &reply("a", 1, false));
-        pc.on_probe_reply(start, &reply("b", 2, false));
+        let probed = probe_now(&mut pc, start);
+        pc.on_probe_reply(probed, &reply("a", 1, false));
+        pc.on_probe_reply(probed, &reply("b", 2, false));
         // Window elapses with no ahead candidate → still Probing.
-        assert!(pc.tick(start + SELECTION_WINDOW).is_empty());
+        assert!(pc.tick(probed + SELECTION_WINDOW).is_empty());
         assert_eq!(pc.state_name(), "probing");
         // Past the re-probe deadline → a fresh Probe.
-        let d = pc.tick(start + REPROBE_AFTER);
+        let d = pc.tick(probed + REPROBE_AFTER);
         assert_eq!(d, vec![PullDirective::Probe]);
         assert_eq!(pc.state_name(), "probing");
     }
@@ -823,12 +944,12 @@ mod tests {
     fn first_reply_after_empty_window_is_chosen() {
         let mut pc = PullCoordinator::new("me");
         let start = t0();
-        pc.note_behind(start);
+        let probed = probe_now(&mut pc, start);
         // No replies during the window.
-        assert!(pc.tick(start + SELECTION_WINDOW).is_empty());
+        assert!(pc.tick(probed + SELECTION_WINDOW).is_empty());
         assert_eq!(pc.state_name(), "probing");
         // First reply AFTER the window → committed on arrival.
-        let after = start + SELECTION_WINDOW + Duration::from_millis(250);
+        let after = probed + SELECTION_WINDOW + Duration::from_millis(250);
         let d = pc.on_probe_reply(after, &reply("late", 5, true));
         assert_eq!(d, Some(pull_from("late")));
         assert_eq!(pc.pull_target(), Some("late"));
@@ -841,13 +962,13 @@ mod tests {
     fn straggler_after_commit_is_ignored() {
         let mut pc = PullCoordinator::new("me");
         let start = t0();
-        pc.note_behind(start);
-        pc.on_probe_reply(start, &reply("chosen", 3, true));
-        pc.tick(start + SELECTION_WINDOW); // commits "chosen"
+        let probed = probe_now(&mut pc, start);
+        pc.on_probe_reply(probed, &reply("chosen", 3, true));
+        pc.tick(probed + SELECTION_WINDOW); // commits "chosen"
         assert_eq!(pc.pull_target(), Some("chosen"));
         // A smaller-inbox straggler after commit — ignored.
         let d = pc.on_probe_reply(
-            start + SELECTION_WINDOW + Duration::from_millis(10),
+            probed + SELECTION_WINDOW + Duration::from_millis(10),
             &reply("smaller", 0, true),
         );
         assert_eq!(d, None);
@@ -863,29 +984,30 @@ mod tests {
     fn fail_falls_to_next_smallest_inbox_target() {
         let mut pc = PullCoordinator::new("me");
         let start = t0();
-        pc.note_behind(start);
+        let probed = probe_now(&mut pc, start);
         // Three ahead candidates with inbox 2, 5, 8 → order t2, t5, t8.
-        pc.on_probe_reply(start, &reply("t8", 8, true));
-        pc.on_probe_reply(start, &reply("t2", 2, true));
-        pc.on_probe_reply(start, &reply("t5", 5, true));
-        pc.tick(start + SELECTION_WINDOW);
+        pc.on_probe_reply(probed, &reply("t8", 8, true));
+        pc.on_probe_reply(probed, &reply("t2", 2, true));
+        pc.on_probe_reply(probed, &reply("t5", 5, true));
+        pc.tick(probed + SELECTION_WINDOW);
         assert_eq!(pc.pull_target(), Some("t2"), "smallest inbox first");
         pc.note_pull_stream("me/0");
         // A fail for a STALE stream is ignored.
-        assert_eq!(pc.on_fail(start, "stale"), None);
+        assert_eq!(pc.on_fail(probed, "stale"), None);
         assert_eq!(pc.pull_target(), Some("t2"));
         // The in-flight stream's fail → fall to the next smallest (t5).
-        assert_eq!(pc.on_fail(start, "me/0"), Some(pull_from("t5")));
+        assert_eq!(pc.on_fail(probed, "me/0"), Some(pull_from("t5")));
         assert_eq!(pc.pull_target(), Some("t5"));
         pc.note_pull_stream("me/1");
         // Next fail → t8.
-        assert_eq!(pc.on_fail(start, "me/1"), Some(pull_from("t8")));
+        assert_eq!(pc.on_fail(probed, "me/1"), Some(pull_from("t8")));
         assert_eq!(pc.pull_target(), Some("t8"));
         pc.note_pull_stream("me/2");
-        // List exhausted → Idle; the next divergence re-probes.
-        assert_eq!(pc.on_fail(start, "me/2"), None);
+        // List exhausted → Idle; the next divergence re-probes (deferred).
+        assert_eq!(pc.on_fail(probed, "me/2"), None);
         assert_eq!(pc.state_name(), "idle");
-        assert_eq!(pc.note_behind(start), Some(PullDirective::Probe));
+        assert_eq!(pc.note_behind(probed), None, "the re-probe is staggered too");
+        assert_eq!(pc.state_name(), "probe_pending");
     }
 
     /// PULL DONE → Idle → re-probe on next divergence (not after rebalance):
@@ -897,9 +1019,9 @@ mod tests {
     fn pull_done_returns_to_idle_and_allows_immediate_reprobe() {
         let mut pc = PullCoordinator::new("me");
         let start = t0();
-        pc.note_behind(start);
-        pc.on_probe_reply(start, &reply("src", 1, true));
-        pc.tick(start + SELECTION_WINDOW);
+        let probed = probe_now(&mut pc, start);
+        pc.on_probe_reply(probed, &reply("src", 1, true));
+        pc.tick(probed + SELECTION_WINDOW);
         pc.note_pull_stream("me/0");
         assert_eq!(pc.state_name(), "pulling");
         // A `done` for a STALE stream is ignored.
@@ -909,11 +1031,10 @@ mod tests {
         pc.on_pull_done("me/0");
         assert_eq!(pc.state_name(), "idle");
         // Still behind (the package was WARN-dropped) → the NEXT divergence
-        // re-probes immediately, NOT after the 60s rebalance.
-        assert_eq!(
-            pc.note_behind(start + Duration::from_millis(1)),
-            Some(PullDirective::Probe)
-        );
+        // re-arms a (staggered) probe cycle right away, NOT after the 60s
+        // rebalance: it goes to ProbePending immediately.
+        assert_eq!(pc.note_behind(probed + Duration::from_millis(1)), None);
+        assert_eq!(pc.state_name(), "probe_pending");
     }
 
     /// 1-MINUTE REBALANCE: after pulling from one source past
@@ -923,14 +1044,14 @@ mod tests {
     fn rebalance_reprobes_after_one_minute() {
         let mut pc = PullCoordinator::new("me");
         let start = t0();
-        pc.note_behind(start);
-        pc.on_probe_reply(start, &reply("src", 1, true));
-        pc.tick(start + SELECTION_WINDOW);
+        let probed = probe_now(&mut pc, start);
+        pc.on_probe_reply(probed, &reply("src", 1, true));
+        pc.tick(probed + SELECTION_WINDOW);
         assert_eq!(pc.state_name(), "pulling");
-        // The rebalance clock starts at the COMMIT instant (start +
+        // The rebalance clock starts at the COMMIT instant (probed +
         // SELECTION_WINDOW), not the probe broadcast. Before that + 60s —
         // nothing.
-        let commit = start + SELECTION_WINDOW;
+        let commit = probed + SELECTION_WINDOW;
         // Halfway through the rebalance window (symbolic — adapts to the
         // cfg(test)-scaled constant) → still Pulling, no re-probe yet.
         assert!(pc.tick(commit + REBALANCE_AFTER / 2).is_empty());
@@ -948,14 +1069,20 @@ mod tests {
         let mut pc = PullCoordinator::new("me");
         assert_eq!(pc.wake_deadline(), None, "Idle arms no timer");
         let start = t0();
+        // ProbePending arms the staggered probe deadline (`< SELECTION_WINDOW`
+        // out, the per-node jitter).
         pc.note_behind(start);
-        assert_eq!(pc.wake_deadline(), Some(start + SELECTION_WINDOW));
-        pc.on_probe_reply(start, &reply("x", 1, true));
-        pc.tick(start + SELECTION_WINDOW);
+        let fire_at = pc.wake_deadline().expect("ProbePending arms a deadline");
+        assert!(fire_at.duration_since(start) < SELECTION_WINDOW);
+        // After the probe fires, Probing arms the window-end deadline.
+        pc.tick(fire_at);
+        assert_eq!(pc.wake_deadline(), Some(fire_at + SELECTION_WINDOW));
+        pc.on_probe_reply(fire_at, &reply("x", 1, true));
+        pc.tick(fire_at + SELECTION_WINDOW);
         // The rebalance clock (and thus the Pulling wake deadline) is
-        // measured from the COMMIT instant (start + SELECTION_WINDOW), not
+        // measured from the COMMIT instant (fire_at + SELECTION_WINDOW), not
         // the probe broadcast.
-        let commit = start + SELECTION_WINDOW;
+        let commit = fire_at + SELECTION_WINDOW;
         assert_eq!(pc.wake_deadline(), Some(commit + REBALANCE_AFTER));
     }
 

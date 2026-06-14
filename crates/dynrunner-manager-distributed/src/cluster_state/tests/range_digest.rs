@@ -247,3 +247,290 @@ fn empty_local_is_behind_every_populated_peer_bucket() {
         .sum();
     assert_eq!(pulled, peer.task_count() as u64);
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// FIX 1 (#492): the incremental range-fold memo and its correctness invariant.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Assert the memo invariant on `s`: the memo-served `tasks_range_digest` is
+/// byte-identical to a fresh O(ledger) fold, AND its cross-bucket XOR + count
+/// reconstruct the scalar `tasks_hash`/`tasks_count`. THE load-bearing check:
+/// a single missed XOR site silently desyncs the memo → wrong divergent set →
+/// a delta pull drops CRDT entries. Run after EVERY mutation so a missed site
+/// is caught at the exact path that missed it.
+fn assert_range_memo_invariant(s: &ClusterState<RunnerIdentifier>) {
+    let memo = s.tasks_range_digest();
+    let fresh = s.fresh_tasks_range_digest();
+    assert_eq!(
+        memo.folds, fresh.folds,
+        "memo range-folds diverged from a fresh fold — a mutation site \
+         failed to XOR-maintain the range memo"
+    );
+    assert_eq!(
+        memo.counts, fresh.counts,
+        "memo range-counts diverged from a fresh fold — a mutation site \
+         failed to count-maintain the range memo"
+    );
+    // And the headline: XOR(memo-folds) == scalar tasks_hash, sum == count.
+    let scalar = s.digest();
+    assert_eq!(
+        xor_all_folds(&memo),
+        scalar.tasks_hash,
+        "XOR(memo range-folds) must reconstruct the scalar tasks_hash"
+    );
+    assert_eq!(
+        sum_all_counts(&memo),
+        scalar.tasks_count,
+        "sum(memo range-counts) must equal the scalar tasks_count"
+    );
+}
+
+/// THE memo invariant pin (mirrors `digest_memo_matches_fresh_fold`): the
+/// incrementally-maintained range memo equals a fresh fold after EVERY
+/// mutation across a sequence that exercises every XOR-maintenance site — the
+/// apply chokepoint's create + monotone-join win + all the authoritative
+/// rank-drops + the cascade resume/block, the F2 retry reset, the
+/// TasksSpawned create, and the restore chokepoint. A missed site is caught
+/// at the exact mutation that missed it.
+#[test]
+fn range_digest_memo_matches_fresh_fold() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    assert_range_memo_invariant(&s); // empty ledger
+
+    // --- TaskAdded create (apply.rs vacant insert) ---
+    for i in 0..12 {
+        s.apply(ClusterMutation::TaskAdded {
+            hash: format!("t{i}"),
+            task: mk_task(&format!("t{i}")),
+        });
+        assert_range_memo_invariant(&s);
+    }
+
+    // --- monotone-join win (TaskAssigned Pending→InFlight, via merge) ---
+    s.apply(ClusterMutation::TaskAssigned {
+        hash: "t0".into(),
+        secondary: "s1".into(),
+        worker: 0,
+        version: Default::default(),
+        attempt: 0,
+    });
+    assert_range_memo_invariant(&s);
+
+    // --- join win to terminal (TaskCompleted) + a failure terminal ---
+    s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "t0".into(),
+        result_data: Some(serde_json::to_vec(&serde_json::json!({"out": 1})).unwrap()),
+    });
+    assert_range_memo_invariant(&s);
+    s.apply(ClusterMutation::TaskFailed {
+        hash: "t1".into(),
+        kind: ErrorType::Recoverable,
+        error: "boom".into(),
+        version: Default::default(),
+        attempt: 0,
+    });
+    assert_range_memo_invariant(&s);
+
+    // --- F2 retry reset (Failed→Pending, the in-place rewrite arm) ---
+    s.apply(ClusterMutation::TaskRetried {
+        hash: "t1".into(),
+        attempt: 1,
+        version: Default::default(),
+    });
+    assert_range_memo_invariant(&s);
+
+    // --- cascade block (Pending→Blocked) then resume (the resume cascade) ---
+    // Block t3 on t2, then complete t2 → t3 auto-resumes Blocked→Pending.
+    s.apply(ClusterMutation::TaskBlocked {
+        hash: "t3".into(),
+        on: "t2".into(),
+    });
+    assert_range_memo_invariant(&s);
+    s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "t2".into(),
+        result_data: None,
+    });
+    assert_range_memo_invariant(&s);
+
+    // --- authoritative rank-drops: assign t4, then requeue + reinject ---
+    s.apply(ClusterMutation::TaskAssigned {
+        hash: "t4".into(),
+        secondary: "s1".into(),
+        worker: 1,
+        version: Default::default(),
+        attempt: 0,
+    });
+    assert_range_memo_invariant(&s);
+    s.apply(ClusterMutation::TaskRequeued {
+        hash: "t4".into(),
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 5,
+        },
+    });
+    assert_range_memo_invariant(&s);
+
+    // --- setup-completed (InFlight/Pending→SetupCompleted) + affine-ready ---
+    s.apply(ClusterMutation::SetupCompleted { hash: "t5".into() });
+    assert_range_memo_invariant(&s);
+    s.apply(ClusterMutation::AffineReady { hash: "t6".into() });
+    assert_range_memo_invariant(&s);
+
+    // --- skip (Pending→SkippedAlreadyDone) ---
+    s.apply(ClusterMutation::TaskSkippedAlreadyDone { hash: "t7".into() });
+    assert_range_memo_invariant(&s);
+
+    // --- queued-after-local-dependency (Pending→Queued rank drop) ---
+    s.apply(ClusterMutation::QueuedAfterLocalDependencySet {
+        hash: "t8".into(),
+        secondary: "s1".into(),
+    });
+    assert_range_memo_invariant(&s);
+
+    // --- TasksSpawned create batch (apply_tasks.rs insert) ---
+    s.apply(ClusterMutation::TasksSpawned {
+        tasks: vec![mk_task("spawn-a"), mk_task("spawn-b"), mk_task("spawn-c")],
+    });
+    assert_range_memo_invariant(&s);
+
+    // --- preferred-secondaries update: a TaskInfo-level change that does NOT
+    //     touch the join term, so the memo must be UNCHANGED (no spurious
+    //     swap). The invariant still holds (the memo equals the fresh fold). ---
+    let before = s.tasks_range_digest();
+    s.apply(ClusterMutation::TaskPreferredSecondariesUpdated {
+        hash: "t9".into(),
+        secondaries: vec!["s2".into()],
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 9,
+        },
+    });
+    let after = s.tasks_range_digest();
+    assert_eq!(
+        (before.folds, before.counts),
+        (after.folds, after.counts),
+        "a preferred-secondaries update is term-neutral — the memo must not move"
+    );
+    assert_range_memo_invariant(&s);
+
+    // --- restore chokepoint: merge a divergent peer snapshot (many per-task
+    //     joins at once, all routing through merge_task_state) ---
+    let mut peer = ClusterState::<RunnerIdentifier>::new();
+    for i in 20..30 {
+        peer.apply(ClusterMutation::TaskAdded {
+            hash: format!("t{i}"),
+            task: mk_task(&format!("t{i}")),
+        });
+        peer.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
+            hash: format!("t{i}"),
+            result_data: None,
+        });
+    }
+    s.restore(peer.snapshot());
+    assert_range_memo_invariant(&s);
+    // A second restore (NoOp merge) must also leave the invariant intact.
+    s.restore(peer.snapshot());
+    assert_range_memo_invariant(&s);
+}
+
+/// The invariant holds across the SETTLE + HYDRATE paths: spilling a slice to
+/// disk is memo-NEUTRAL (the entry moves between the fat and settled halves
+/// the logical fold sums over), and a later dominating mutation that
+/// rehydrates a settled entry keeps the invariant whole. This is the half a
+/// naive per-mutation instrumentation would corrupt (double-count on spill,
+/// or lose the rehydrated term).
+#[test]
+fn range_digest_memo_holds_across_settle_and_hydrate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.detach_spill_writer_for_test();
+
+    // Build + terminalize a ledger (Completed entries are settle-eligible).
+    for i in 0..120 {
+        s.apply(ClusterMutation::TaskAdded {
+            hash: format!("k-{i:04}"),
+            task: mk_task(&format!("k-{i:04}")),
+        });
+        s.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
+            hash: format!("k-{i:04}"),
+            result_data: None,
+        });
+    }
+    assert_range_memo_invariant(&s);
+
+    // SPILL: a slice moves to settled. Memo-neutral → invariant still holds.
+    let evicted = s.test_spill_all(&dir.path().join("spill.cbor"));
+    assert!(evicted > 0, "the fixture must actually spill entries");
+    assert_eq!(s.tasks_in_memory(), s.task_count() - evicted);
+    assert_range_memo_invariant(&s);
+
+    // HYDRATE: a dominating mutation against a SETTLED Failed-eligible entry
+    // would rehydrate; here we re-complete a settled hash (idempotent NoOp on
+    // the join, but it still exercises the settled-consult path) and add a
+    // fresh entry, asserting the invariant after each.
+    s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "k-0000".into(),
+        result_data: None,
+    });
+    assert_range_memo_invariant(&s);
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "post-spill".into(),
+        task: mk_task("post-spill"),
+    });
+    assert_range_memo_invariant(&s);
+}
+
+/// BOUND-PER-ITERATION (the #504 wedge fix): a 60k+-task ledger's
+/// `tasks_range_digest` read is O(buckets), not O(ledger) — a burst of N
+/// inbound-probe-shaped reads runs ZERO full re-folds. The fold counter
+/// (mirroring `digest_fold_count`) is bumped ONLY by the test-only fresh fold,
+/// which the production read never calls, so a clean burst leaves it at zero.
+#[test]
+fn range_digest_read_does_zero_full_folds_under_probe_burst() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    for i in 0..60_000 {
+        s.apply(ClusterMutation::TaskAdded {
+            hash: format!("task-{i:06}"),
+            task: mk_task(&format!("task-{i:06}")),
+        });
+    }
+    // Advance a spread so the per-bucket folds carry varied terms.
+    for i in (0..60_000).step_by(1000) {
+        s.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
+            hash: format!("task-{i:06}"),
+            result_data: None,
+        });
+    }
+
+    // One fresh fold to anchor correctness (this DOES bump the counter).
+    ClusterState::<RunnerIdentifier>::reset_range_fresh_fold_count();
+    let fresh = s.fresh_tasks_range_digest();
+    assert_eq!(ClusterState::<RunnerIdentifier>::range_fresh_fold_count(), 1);
+
+    // The probe-burst: N production reads (the shape of N concurrent inbound
+    // PullProbe frames in one inbox batch — the wedge). Each must be O(1)
+    // (a memo clone) and run ZERO full re-folds.
+    ClusterState::<RunnerIdentifier>::reset_range_fresh_fold_count();
+    for _ in 0..256 {
+        let d = s.tasks_range_digest();
+        // Every read is byte-identical to the anchored fresh fold (the memo
+        // is exact) AND served without folding the 60k ledger.
+        assert_eq!(d.folds, fresh.folds);
+        assert_eq!(d.counts, fresh.counts);
+    }
+    assert_eq!(
+        ClusterState::<RunnerIdentifier>::range_fresh_fold_count(),
+        0,
+        "a probe burst over a 60k ledger must run ZERO full re-folds — the \
+         O(ledger)-per-probe wedge (#504) is gone"
+    );
+    // Sanity: the memo reconstructs the scalar hash over the big ledger.
+    assert_eq!(xor_all_folds(&s.tasks_range_digest()), s.digest().tasks_hash);
+    assert_eq!(sum_all_counts(&s.tasks_range_digest()), s.task_count() as u64);
+}

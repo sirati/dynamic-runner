@@ -143,6 +143,11 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
             sec.dispatch_message(digest_frame, &mut FakeWorkerFactory)
                 .await
                 .expect("StateDigest dispatch succeeds");
+            // #504: the divergent digest NOTES the divergence, which now
+            // SCHEDULES a staggered probe (per-node jitter) rather than
+            // emitting it inline. The pull arm fires it at its deadline; this
+            // loop-less test drives that tick explicitly.
+            sec.fire_staggered_probe_for_test().await;
             // Drain the queued egress onto the RecordingPeer so the probe is
             // observable in the log (MeshClient::send is queued).
             sec.drain_egress().await;

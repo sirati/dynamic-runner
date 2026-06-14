@@ -136,7 +136,13 @@ impl<I: Identifier> ClusterState<I> {
             .collect();
         let mut resumed: Vec<TaskInfo<I>> = Vec::with_capacity(to_resume.len());
         for h in to_resume {
-            if let Some(TaskState::Blocked { task, attempt, .. }) = self.tasks.remove(&h) {
+            if let Some(blocked @ TaskState::Blocked { .. }) = self.tasks.remove(&h) {
+                // The OLD term (the just-removed Blocked state) — captured
+                // before we build the new Pending so the memo swap is exact.
+                let old_term = super::keyspace::task_digest_term(&h, &blocked);
+                let TaskState::Blocked { task, attempt, .. } = blocked else {
+                    unreachable!("matched Blocked above");
+                };
                 resumed.push(task.clone());
                 // Auto-resume is an authoritative cross-task transition
                 // (Blocked → Pending), not an assignment; the fresh
@@ -144,14 +150,18 @@ impl<I: Identifier> ClusterState<I> {
                 // genuine assignment mints a higher one. The retry
                 // generation (F2) is PRESERVED from the Blocked entry — a
                 // cascade-resume is not a new retry attempt.
-                self.tasks.insert(
-                    h,
-                    TaskState::Pending {
-                        task,
-                        version: Default::default(),
-                        attempt,
-                    },
-                );
+                let resumed_state = TaskState::Pending {
+                    task,
+                    version: Default::default(),
+                    attempt,
+                };
+                // Range-fold memo: Blocked → Pending under a FIXED key — a
+                // state CHANGE (count conserved). XOR old out, new in. The
+                // `remove`+`insert` above is one logical entry staying in the
+                // ledger, NOT a logical remove, so we swap (never remove).
+                let new_term = super::keyspace::task_digest_term(&h, &resumed_state);
+                self.range_fold_memo.swap(&h, old_term, new_term);
+                self.tasks.insert(h, resumed_state);
             }
         }
         resumed
@@ -420,6 +430,11 @@ impl<I: Identifier> ClusterState<I> {
                 state = ?std::mem::discriminant(&initial),
                 "TasksSpawned: inserted entry"
             );
+            // Range-fold memo: a logical CREATE — XOR the new term in + bump
+            // the bucket count, off the SAME term the fold would see for this
+            // fresh entry. Computed before the move into the map.
+            let term = super::keyspace::task_digest_term(&hash, &initial);
+            self.range_fold_memo.add(&hash, term);
             self.tasks.insert(hash, initial);
             applied_any = true;
         }

@@ -14,6 +14,29 @@ use dynrunner_core::ErrorType;
 
 // ── helpers ──
 
+/// The #492 range-memo invariant, asserted on a converged/applied/restored
+/// state: the incrementally-maintained range memo equals a fresh O(ledger)
+/// fold, AND its cross-bucket XOR/count reconstruct the scalar
+/// `tasks_hash`/`tasks_count`. Threaded through the apply/restore/promotion
+/// convergence tests so a missed XOR-maintenance site anywhere in the merge /
+/// restore / supersede / requeue lattice is caught here, at the convergence
+/// path that exercised it.
+fn assert_range_memo_invariant(s: &ClusterState<RunnerIdentifier>) {
+    let memo = s.tasks_range_digest();
+    let fresh = s.fresh_tasks_range_digest();
+    assert_eq!(
+        (memo.folds, memo.counts),
+        (fresh.folds, fresh.counts),
+        "range memo diverged from a fresh fold — a mutation site failed to \
+         XOR-maintain the range memo on this convergence path"
+    );
+    let scalar = s.digest();
+    let xor = memo.folds.iter().fold(0u64, |acc, f| acc ^ f);
+    let sum: u64 = memo.counts.iter().map(|&c| c as u64).sum();
+    assert_eq!(xor, scalar.tasks_hash, "XOR(range memo) must equal tasks_hash");
+    assert_eq!(sum, scalar.tasks_count, "sum(range memo) must equal tasks_count");
+}
+
 /// Build the seven canonical states for a fixed hash/task, each with a
 /// distinct version where the variant carries one, so the property tests
 /// can enumerate ordered pairs.
@@ -654,6 +677,10 @@ fn apply_restore_digest_agree() {
     assert_eq!(s.digest().tasks_count, joiner.digest().tasks_count);
     assert!(!s.digest().is_behind(&joiner.digest()));
     assert!(!joiner.digest().is_behind(&s.digest()));
+    // #492: the range memo agrees with a fresh fold on BOTH the apply side
+    // and the restored side (the merge_task_state restore path maintains it).
+    assert_range_memo_invariant(&s);
+    assert_range_memo_invariant(&joiner);
 }
 
 /// Local `Failed`, restore a snapshot with `Completed` for the same hash
@@ -716,6 +743,10 @@ fn restore_supersedes_failed_with_completed() {
     ));
     assert_eq!(resumed.len(), 1, "the blocked dependent is surfaced");
     assert_eq!(resumed[0].task_id, "dep");
+    // #492: the supersede (Failed→Completed) + the cascade resume
+    // (Blocked→Pending) both XOR-maintained the range memo — it still equals a
+    // fresh fold after this multi-transition restore.
+    assert_range_memo_invariant(&local);
 }
 
 /// Re-restoring the same snapshot is idempotent AND emits each terminal
@@ -1002,4 +1033,9 @@ fn post_promotion_demoted_and_promoted_outcome_counts_converge() {
     );
     assert!(!observer.digest().is_behind(&primary.digest()));
     assert!(!primary.digest().is_behind(&observer.digest()));
+    // #492: both promoted-and-restored ledgers' range memos still equal a
+    // fresh fold — the bidirectional restore's per-task supersedes
+    // XOR-maintained the memo on the promotion convergence path.
+    assert_range_memo_invariant(&observer);
+    assert_range_memo_invariant(&primary);
 }

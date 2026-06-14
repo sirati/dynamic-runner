@@ -443,17 +443,18 @@ where
     /// cycle is already in flight is a NoOp — so a perpetually-behind
     /// replica under churn initiates pulls at the cooldown rate, NOT one per
     /// inbound digest (the #491 snapshot-package storm the eager
-    /// `reconcile_against_peer` caused). The cold (Idle) note returns a
-    /// `Probe` directive, which the shared `drive_pull_directive` edge
-    /// broadcasts; selection + the actual pull happen on the pull arm's
-    /// timers. The digest beacon + `is_behind` DETECTION are unchanged;
-    /// only the eager per-digest pull is replaced.
+    /// `reconcile_against_peer` caused). The cold (Idle) note SCHEDULES a
+    /// staggered probe (per-node jitter, #504) and returns `None`; the probe
+    /// itself fires from the pull arm's `tick` at the staggered deadline, and
+    /// selection + the actual pull happen on the pull arm's timers. The digest
+    /// beacon + `is_behind` DETECTION are unchanged; only the eager per-digest
+    /// pull is replaced.
     ///
     /// Shared between the operational dispatch router's `StateDigest` arm
     /// and `wait_for_setup`'s receive loop — pre-`Operational` participation
     /// still triggers the heal; the pull arm runs in the operational loop,
-    /// and a pre-operational note simply primes the FSM (the cold probe is
-    /// emitted on the first edge-drive once the loop runs).
+    /// and a pre-operational note simply primes the FSM (the staggered probe
+    /// is emitted by the pull arm's `tick` once the loop runs).
     pub(in crate::secondary) async fn reconcile_state_digest(
         &mut self,
         sender_id: &str,
@@ -471,8 +472,10 @@ where
             .pull_coordinator
             .note_behind(std::time::Instant::now())
         {
-            // Cold trigger ⇒ broadcast the probe now; a note while a cycle
-            // is in flight returns None (single-flight) and emits nothing.
+            // `note_behind` SCHEDULES a staggered probe and returns `None`
+            // (the probe fires from the pull arm's `tick` at the per-node
+            // jitter deadline, #504); this drive stays as the directive sink
+            // in case the FSM ever returns one synchronously again.
             self.drive_pull_directive(directive).await;
         }
     }
@@ -656,13 +659,42 @@ where
             // all-ranges full pull, which is what this helper exercises.
             range_digest: Box::new(dynrunner_protocol_primary_secondary::RangeDigest::default()),
         };
-        // A synthetic `now` strictly past the window guarantees the
-        // first-answer fallback commits on this reply (the FSM's probe
-        // `since` is the real instant at dispatch, always ≤ now).
-        let past_window = std::time::Instant::now()
-            + crate::pull_coordinator::SELECTION_WINDOW
-            + std::time::Duration::from_millis(1);
+        // A synthetic `now` strictly past the selection window guarantees the
+        // first-answer fallback commits on this reply. Derive it from the
+        // coordinator's OWN Probing wake deadline (`since + SELECTION_WINDOW`)
+        // rather than `Instant::now()`, so it is robust to a probe whose
+        // `since` was stamped at a future-relative staggered `fire_at` (#504):
+        // `wake_deadline + 1ms` is always strictly past the window for the
+        // probe in flight. Falls back to a now-relative window if the FSM
+        // somehow armed no deadline (defensive — the caller guarantees Probing).
+        let past_window = self
+            .pull_coordinator
+            .wake_deadline()
+            .map(|d| d + std::time::Duration::from_millis(1))
+            .unwrap_or_else(|| {
+                std::time::Instant::now()
+                    + crate::pull_coordinator::SELECTION_WINDOW
+                    + std::time::Duration::from_millis(1)
+            });
         if let Some(directive) = self.pull_coordinator.on_probe_reply(past_window, &reply) {
+            self.drive_pull_directive(directive).await;
+        }
+    }
+
+    /// Test-only: fire the STAGGERED first probe (#504). `note_behind` defers
+    /// the probe to the pull arm's `tick` at a per-node jitter deadline; a
+    /// loop-less unit test has no pull arm, so this drives the coordinator's
+    /// `tick` at its `wake_deadline` (the deferred probe's `fire_at`) — exactly
+    /// what the operational loop's pull arm does — emitting the `Probe` and
+    /// entering `Probing`, then sends it via the same `drive_pull_directive`
+    /// edge. Call AFTER a digest dispatch has noted the divergence (the FSM is
+    /// `ProbePending`); a NoOp if no probe is pending.
+    #[cfg(test)]
+    pub(in crate::secondary) async fn fire_staggered_probe_for_test(&mut self) {
+        let Some(fire_at) = self.pull_coordinator.wake_deadline() else {
+            return;
+        };
+        for directive in self.pull_coordinator.tick(fire_at) {
             self.drive_pull_directive(directive).await;
         }
     }

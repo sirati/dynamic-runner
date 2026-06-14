@@ -564,6 +564,11 @@ impl<I: Identifier> ClusterState<I> {
             // their own and never cross the wire.
             digest_cache: _digest_cache,
             digest_fold_count: _digest_fold_count,
+            // node-local: the range-fold memo is a pure derivation of the
+            // replicated `tasks` + `settled` (it IS the range fold of this
+            // snapshot's content), so it carries no signal of its own and
+            // never crosses the wire — a restoring replica maintains its own.
+            range_fold_memo: _range_fold_memo,
             // ── task-batch partition, file-served ──: a settled entry is
             // a `tasks` ledger entry whose fat body lives in the spill
             // file; the snapshot STREAM serves it per-key from the file

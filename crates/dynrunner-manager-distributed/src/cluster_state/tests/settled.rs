@@ -152,6 +152,24 @@ fn digest_under_spill_equals_full_fold() {
     // And the memoized read matches a fresh full fold of the spilled
     // state (the #480 differential extended to spill).
     assert_eq!(spilled.digest(), spilled.fresh_digest_fold());
+    // #492: spill is RANGE-memo-neutral too — the incrementally-maintained
+    // range memo (untouched by commit_spill) still equals a fresh fold over
+    // the fat ∪ settled split, and reconstructs the scalar tasks_hash. A
+    // spill that wrongly removed the term from the memo, or a fold that
+    // dropped the settled half, would fail here.
+    let rmemo = spilled.tasks_range_digest();
+    let rfresh = spilled.fresh_tasks_range_digest();
+    assert_eq!(
+        (rmemo.folds, rmemo.counts),
+        (rfresh.folds, rfresh.counts),
+        "the range memo must equal a fresh fold across the fat/settled split \
+         (spill is range-memo-neutral)"
+    );
+    assert_eq!(
+        rmemo.folds.iter().fold(0u64, |a, f| a ^ f),
+        spilled.digest().tasks_hash,
+        "XOR(range memo) must reconstruct tasks_hash after a spill"
+    );
 }
 
 /// A joiner bootstrapped from a SPILLED responder (its terminal slice

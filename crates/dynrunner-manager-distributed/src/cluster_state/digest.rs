@@ -190,6 +190,12 @@ impl<I: Identifier> ClusterState<I> {
             // own result), so they carry no convergence signal.
             digest_cache: _digest_cache,
             digest_fold_count: _digest_fold_count,
+            // node-local: the range-fold memo is the per-bucket REFINEMENT of
+            // the very `tasks_hash` this fold computes — a pure derivation of
+            // the same `tasks` + `settled`, carrying no convergence signal of
+            // its own (it is excluded from the digest exactly like the scalar
+            // memo). Bound for the exhaustive guard.
+            range_fold_memo: _range_fold_memo,
             // Settled spill store: the settled half of the tasks fold.
             // Each settled entry's XOR term was moved from the live fold
             // into `tasks_hash_acc` at spill-commit time (value-preserving

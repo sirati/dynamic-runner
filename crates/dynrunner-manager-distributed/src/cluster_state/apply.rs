@@ -92,13 +92,21 @@ impl<I: Identifier> ClusterState<I> {
                 if self.settled_contains(&hash) {
                     return ApplyOutcome::NoOp;
                 }
-                if let std::collections::hash_map::Entry::Vacant(e) = self.tasks.entry(hash) {
-                    e.insert(TaskState::Pending {
+                if let std::collections::hash_map::Entry::Vacant(e) = self.tasks.entry(hash.clone())
+                {
+                    let state = TaskState::Pending {
                         task,
                         version: Default::default(),
                         // Brand-new task: the cold generation (F2).
                         attempt: 0,
-                    });
+                    };
+                    // Range-fold memo: a logical CREATE — XOR the new term in
+                    // and bump the bucket count, off the SAME term the fold
+                    // would see for this fresh Pending. Computed before the
+                    // move so the memo and the inserted state agree.
+                    let term = super::keyspace::task_digest_term(&hash, &state);
+                    e.insert(state);
+                    self.range_fold_memo.add(&hash, term);
                     ApplyOutcome::Applied
                 } else {
                     ApplyOutcome::NoOp
@@ -450,11 +458,16 @@ impl<I: Identifier> ClusterState<I> {
                     TaskState::Unfulfillable { task, attempt, .. } => (task.clone(), *attempt),
                     _ => return ApplyOutcome::NoOp,
                 };
-                *state = TaskState::Pending {
-                    task,
-                    version,
-                    attempt,
-                };
+                // Memo-maintaining in-place rewrite (XOR old term out, new in;
+                // count conserved). The precondition borrow above has ended.
+                self.rewrite_task_state(
+                    &hash,
+                    TaskState::Pending {
+                        task,
+                        version,
+                        attempt,
+                    },
+                );
                 ApplyOutcome::Applied
             }
             ClusterMutation::TaskRequeued { hash, version } => {
@@ -505,11 +518,15 @@ impl<I: Identifier> ClusterState<I> {
                     }
                     _ => return ApplyOutcome::NoOp,
                 };
-                *state = TaskState::Pending {
-                    task,
-                    version,
-                    attempt,
-                };
+                // Memo-maintaining in-place rewrite (XOR old term out, new in).
+                self.rewrite_task_state(
+                    &hash,
+                    TaskState::Pending {
+                        task,
+                        version,
+                        attempt,
+                    },
+                );
                 ApplyOutcome::Applied
             }
             // The F2 retry reset: `Failed { attempt: n } → Pending {
@@ -557,11 +574,17 @@ impl<I: Identifier> ClusterState<I> {
                     TaskState::Failed { task, .. } => task.clone(),
                     _ => return ApplyOutcome::NoOp,
                 };
-                *state = TaskState::Pending {
-                    task,
-                    version,
-                    attempt,
-                };
+                // Memo-maintaining in-place rewrite. After the rehydrate above
+                // the entry is fat (and stayed counted in the memo as the
+                // settled entry), so this swap conserves its count.
+                self.rewrite_task_state(
+                    &hash,
+                    TaskState::Pending {
+                        task,
+                        version,
+                        attempt,
+                    },
+                );
                 ApplyOutcome::Applied
             }
             ClusterMutation::TaskBlocked { hash, on } => {
@@ -579,7 +602,10 @@ impl<I: Identifier> ClusterState<I> {
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                match state {
+                // The winning transition's new state (built from the cloned
+                // precondition), or `None` for a NoOp arm. The `state` borrow
+                // ends with the match; the memo-maintaining rewrite runs after.
+                let new_state = match state {
                     TaskState::Completed { .. }
                     | TaskState::Failed { .. }
                     | TaskState::Unfulfillable { .. }
@@ -597,13 +623,13 @@ impl<I: Identifier> ClusterState<I> {
                     // worker's observed assignment that a stale TaskBlocked
                     // must not regress.
                     | TaskState::QueuedAfterLocalDependency { .. }
-                    | TaskState::InFlight { .. } => ApplyOutcome::NoOp,
+                    | TaskState::InFlight { .. } => None,
                     TaskState::Blocked { .. } => {
                         // Already blocked: idempotent on a matching `on`,
                         // and the first observed cascade root wins on a
                         // divergent one — a re-cascade against the same
                         // dependent is silent either way.
-                        ApplyOutcome::NoOp
+                        None
                     }
                     TaskState::Pending { task, attempt, .. } => {
                         // Preserve the generation across the cascade-pause
@@ -611,9 +637,15 @@ impl<I: Identifier> ClusterState<I> {
                         // same attempt it was Pending under.
                         let attempt = *attempt;
                         let task = task.clone();
-                        *state = TaskState::Blocked { task, on, attempt };
+                        Some(TaskState::Blocked { task, on, attempt })
+                    }
+                };
+                match new_state {
+                    Some(new) => {
+                        self.rewrite_task_state(&hash, new);
                         ApplyOutcome::Applied
                     }
+                    None => ApplyOutcome::NoOp,
                 }
             }
             ClusterMutation::PhaseEnded { phase } => {
@@ -644,13 +676,20 @@ impl<I: Identifier> ClusterState<I> {
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                match state {
+                let new_state = match state {
                     TaskState::Pending { task, attempt, .. } => {
                         let (task, attempt) = (task.clone(), *attempt);
-                        *state = TaskState::SkippedAlreadyDone { task, attempt };
+                        Some(TaskState::SkippedAlreadyDone { task, attempt })
+                    }
+                    _ => None,
+                };
+                match new_state {
+                    Some(new) => {
+                        // Memo-maintaining in-place rewrite (the borrow ended).
+                        self.rewrite_task_state(&hash, new);
                         ApplyOutcome::Applied
                     }
-                    _ => ApplyOutcome::NoOp,
+                    None => ApplyOutcome::NoOp,
                 }
             }
             ClusterMutation::SetupCompleted { hash } => {
@@ -680,16 +719,24 @@ impl<I: Identifier> ClusterState<I> {
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                match state {
+                let new_state = match state {
                     TaskState::InFlight { task, attempt, .. }
                     | TaskState::Pending { task, attempt, .. } => {
                         let (task, attempt) = (task.clone(), *attempt);
-                        *state = TaskState::SetupCompleted { task, attempt };
+                        Some(TaskState::SetupCompleted { task, attempt })
+                    }
+                    _ => None,
+                };
+                match new_state {
+                    Some(new) => {
+                        // Memo-maintaining in-place rewrite, THEN the cascade
+                        // resume (itself memo-maintained on the resume path).
+                        self.rewrite_task_state(&hash, new);
                         let just_resumed = self.resume_blocked_on(&hash);
                         resumed.extend(just_resumed);
                         ApplyOutcome::Applied
                     }
-                    _ => ApplyOutcome::NoOp,
+                    None => ApplyOutcome::NoOp,
                 }
             }
             ClusterMutation::AffineReady { hash } => {
@@ -719,15 +766,23 @@ impl<I: Identifier> ClusterState<I> {
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                match state {
+                let new_state = match state {
                     TaskState::Pending { task, attempt, .. } => {
                         let (task, attempt) = (task.clone(), *attempt);
-                        *state = TaskState::AffineReady { task, attempt };
+                        Some(TaskState::AffineReady { task, attempt })
+                    }
+                    _ => None,
+                };
+                match new_state {
+                    Some(new) => {
+                        // Memo-maintaining in-place rewrite, THEN the cascade
+                        // resume (itself memo-maintained on the resume path).
+                        self.rewrite_task_state(&hash, new);
                         let just_resumed = self.resume_blocked_on(&hash);
                         resumed.extend(just_resumed);
                         ApplyOutcome::Applied
                     }
-                    _ => ApplyOutcome::NoOp,
+                    None => ApplyOutcome::NoOp,
                 }
             }
             ClusterMutation::QueuedAfterLocalDependencySet { hash, secondary } => {
@@ -770,12 +825,16 @@ impl<I: Identifier> ClusterState<I> {
                     } => (task.clone(), *version, *attempt),
                     _ => return ApplyOutcome::NoOp,
                 };
-                *state = TaskState::QueuedAfterLocalDependency {
-                    task,
-                    secondary,
-                    version,
-                    attempt,
-                };
+                // Memo-maintaining in-place rewrite (the borrow ended).
+                self.rewrite_task_state(
+                    &hash,
+                    TaskState::QueuedAfterLocalDependency {
+                        task,
+                        secondary,
+                        version,
+                        attempt,
+                    },
+                );
                 ApplyOutcome::Applied
             }
             ClusterMutation::TaskPreferredSecondariesUpdated {
