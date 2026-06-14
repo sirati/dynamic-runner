@@ -810,6 +810,27 @@ impl<I: Identifier> ClusterState<I> {
                 };
                 let new_state = match state {
                     TaskState::Pending { task, attempt, .. } => {
+                        // Diagnosability (#514): on the ACTUAL `Pending →
+                        // AffineReady` transition (this `Pending` arm) — the one
+                        // edge every emission surface (seed / live delta /
+                        // post-seed dispatch) converges through — log the gate's
+                        // CONTENT-hash + identity. An idempotent re-apply against
+                        // an already-`AffineReady` entry takes the `_ => None`
+                        // arm below and is a silent NoOp, so anti-entropy /
+                        // snapshot-restore / gossip re-delivery never re-log
+                        // (no convergence-point spam). The consumption side logs
+                        // the hash it is LOOKING FOR when a gate cannot be
+                        // resolved, so an operator greps both and tells an ABSENT
+                        // gate (this line never fired for the hash) from a
+                        // HASH-MISMATCH (it fired for a DIFFERENT hash) — they
+                        // need different remediation.
+                        tracing::info!(
+                            gate_content_hash = %hash,
+                            phase = %task.phase_id,
+                            task_id = %task.task_id,
+                            "SecondaryAffine gate EMITTED AffineReady (resolved \
+                             to READY-not-EXECUTED)"
+                        );
                         let (task, attempt) = (task.clone(), *attempt);
                         Some(TaskState::AffineReady { task, attempt })
                     }

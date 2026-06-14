@@ -612,6 +612,21 @@ where
                 // RECOVERABLE absent verdict straight to the completion arm,
                 // which re-routes the queued dependents (per #495) so they
                 // retry once the gate's TaskAdded syncs.
+                //
+                // Diagnosability (#514): log the gate content-hash this node is
+                // LOOKING FOR but cannot resolve. Pairs with the emission-side
+                // `gate_content_hash` log on the AffineReady transition: an
+                // operator greps both and disambiguates an ABSENT gate (no
+                // emission line ever fired for this hash) from a HASH-MISMATCH
+                // (the emission fired for a DIFFERENT hash) — different
+                // remediations.
+                tracing::warn!(
+                    target: "dynrunner_affine",
+                    looking_for_gate_content_hash = %affine_hash,
+                    "SecondaryAffine gate body NOT resolvable on this node (in \
+                     neither the fat ledger nor the settled index); delivering a \
+                     RECOVERABLE absent verdict so its queued dependents re-route"
+                );
                 let _ = tx.send(AffineImportComplete {
                     outcome: Self::affine_gate_absent_failure(&affine_hash),
                     affine_hash,
