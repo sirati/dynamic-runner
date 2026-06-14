@@ -171,14 +171,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // initial dispatch. The wire `InitialAssignment` is
                 // built+sent below in the per-secondary fan-out loop; the
                 // ledger/slot must already reflect the assignment so a
-                // completion that races back is attributed by hash.
+                // completion that races back is attributed by hash. Workers
+                // are all-idle by construction here (cold roster), so the
+                // enforced idle-guard (#517) refuses only on a broken
+                // invariant: requeue + un-count + skip rather than dispatch
+                // a task the model can't track (the silent-overwrite
+                // backstop).
                 let task_hash = compute_task_hash(&binary);
-                self.commit_assignment(
+                if !self.commit_assignment(
                     worker_idx,
                     binary.clone(),
                     task_hash,
                     estimated_usage.clone(),
-                );
+                ) {
+                    self.pool_mut().requeue(binary);
+                    total_assigned_resources.sub(&estimated_usage);
+                    continue;
+                }
 
                 assignments_per_secondary
                     .entry(secondary_id)

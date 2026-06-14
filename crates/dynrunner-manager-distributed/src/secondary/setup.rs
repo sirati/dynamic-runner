@@ -4,7 +4,8 @@ use dynrunner_core::Identifier;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    Destination, DistributedBinaryInfo, DistributedMessage, MessageType, SetupBootstrapMessage,
+    AssignedTaskRef, Destination, DistributedBinaryInfo, DistributedMessage, MessageType,
+    SetupBootstrapMessage,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -1300,40 +1301,6 @@ where
                 }
             }
 
-            // Select the dispatch target worker SAFELY, mirroring the
-            // operational `dispatch_message` selection. Prefer the primary's
-            // requested slot IF it is a valid, idle worker; otherwise fall
-            // back to any idle worker. Both `.get()` and `position()` return
-            // `None` for an empty pool, so a 0-worker pool (an observer /
-            // late-joiner that spawned no slots) is just the degenerate "no
-            // idle worker" case — no `pool.workers.len() - 1` underflow and
-            // no unconditional index into the slice. An out-of-range
-            // `worker_id` likewise resolves to `None` on the preference and
-            // falls back to an idle worker, never silently clamped onto the
-            // last slot. `None` ⇒ skip this task's assignment (no worker can
-            // take it); the authority still holds it Pending.
-            let pool = self.pool_mut();
-            let target_wid: Option<u32> = pool
-                .workers
-                .get(worker_id as usize)
-                .filter(|w| w.is_idle_state())
-                .map(|_| worker_id)
-                .or_else(|| {
-                    pool.workers
-                        .iter()
-                        .position(|w| w.is_idle_state())
-                        .map(|i| i as u32)
-                });
-
-            let Some(wid) = target_wid else {
-                tracing::debug!(
-                    requested_worker_id = worker_id,
-                    "no idle worker for initial task assignment; leaving it for the \
-                     authority to dispatch"
-                );
-                continue;
-            };
-
             // Hydrate from the wire info first (preserves
             // phase/type/affinity/payload), then surface the locally-
             // resolved on-disk path via the dedicated `resolved_path`
@@ -1341,10 +1308,47 @@ where
             // identifier so consumers' `task.relative_path` keeps
             // its mirror-against-source-tree meaning regardless of
             // where the secondary's extraction cache landed the file.
+            // Hydrated BEFORE worker selection so the honor-or-bounce
+            // helper can name the assigned task's `task_id`.
             let mut binary = distributed_to_binary(&binary_info);
             if let Some(path) = resolved_path {
                 binary.resolved_path = Some(path);
             }
+
+            // HONOR the primary's assigned `worker_id` — never re-pick
+            // (#517). The SAME shared seam the operational dispatch uses:
+            // dispatch onto the EXACT requested slot iff idle, else bounce a
+            // typed `IllegallyAssignedToNonidleWorker` (the authority
+            // reconciles + requeues — NOT a failure) and skip this task.
+            // SAFETY (preserves cabd34ab): the helper's `.get()` Option path
+            // makes an out-of-range id / 0-worker pool a clean bounce — no
+            // `len() - 1` underflow, no unconditional index, no any-idle
+            // re-pick.
+            let assigned_ref = AssignedTaskRef {
+                hash: hash.clone(),
+                task_id: binary.identifier.clone(),
+            };
+            // `handle_initial_assignment` returns `()`, so a bounce-send
+            // failure is logged and skipped (matching the unresolvable-task
+            // guard above) rather than `?`-propagated.
+            let target = match self
+                .select_honored_target_or_bounce(worker_id, assigned_ref)
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(
+                        requested_worker_id = worker_id,
+                        error = %e,
+                        "failed to bounce illegal initial-assignment to the authority"
+                    );
+                    continue;
+                }
+            };
+            let Some(wid) = target else {
+                // Bounced for re-dispatch by the helper; nothing more to do.
+                continue;
+            };
 
             let estimated = self.estimator.estimate(&binary);
 

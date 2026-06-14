@@ -260,24 +260,28 @@ async fn observer_skips_setup_and_exits_on_run_complete() {
 }
 
 /// Regression: a `TaskAssignment` reaching a 0-worker `Operational`
-/// node MUST (1) NOT panic / `u32`-underflow, AND (2) report the task
-/// back to the primary as `Recoverable` backpressure.
+/// node MUST (1) NOT panic / `u32`-underflow, AND (2) BOUNCE the task
+/// back to the primary as a typed `IllegallyAssignedToNonidleWorker`
+/// (#517 honor-or-bounce) — never the old generic backpressure
+/// `TaskFailed`.
 ///
 /// A late-joiner / observer (and any node that ends a phase as a
 /// 0-worker observer) constructs `Operational` with an EMPTY pool —
 /// `operational_observer` installs `WorkerPool::new()` — and that
-/// state IS on the inbound dispatch path. The root-cause fix selects
-/// the dispatch target as an `Option` (`.get()` / `position()`), so a
-/// 0-worker pool yields `None` with no `pool.workers.len() as u32 - 1`
-/// underflow and no index into the empty slice; `None` is simply the
-/// degenerate case of the existing "no idle worker available" path,
-/// which sends the primary a `TaskFailed { Recoverable }` so the task
-/// is requeued rather than silently dropped.
+/// state IS on the inbound dispatch path. The honor-or-bounce seam
+/// (`select_honored_target_or_bounce`) selects the dispatch target as
+/// an `Option` (`.get()`), so a 0-worker pool yields `None` with no
+/// `pool.workers.len() as u32 - 1` underflow and no index into the
+/// empty slice; the secondary NEVER re-picks another worker — it
+/// bounces the typed report so the primary reconciles + requeues
+/// rather than silently dropping or fail-accounting the task. With no
+/// worker there is no incumbent, so the bounce carries `incumbent:
+/// None`.
 ///
-/// The recording transport + `set_bootstrap_primary_id("primary")`
+/// The recording transport + `set_bootstrap_primary_id("setup")`
 /// make `Destination::Primary` resolve to a captured peer send, so the
-/// test asserts the backpressure report actually went out (not merely
-/// "did not panic").
+/// test asserts the bounce report actually went out (not merely "did
+/// not panic").
 ///
 /// `is_observer=false` deliberately: this is the GENERAL 0-worker
 /// `Operational` case (a phase-end observer or a worker that spawned
@@ -334,11 +338,13 @@ async fn task_assignment_to_zero_worker_operational_node_reports_backpressure_no
             };
 
             // The critical call: pre-fix this panicked (debug) / indexed
-            // out of bounds (release) on the empty pool. Post-fix it
-            // returns Ok and reports backpressure.
+            // out of bounds (release) on the empty pool. Post-#517 it
+            // returns Ok and BOUNCES a typed `IllegallyAssignedToNonidleWorker`
+            // (the slot does not exist — no incumbent), NOT the old generic
+            // backpressure TaskFailed.
             let mut factory = super::super::test_helpers::FakeWorkerFactory;
             let result = sec.dispatch_message(assignment, &mut factory).await;
-            // Flush the queued backpressure report onto the RecordingPeer log
+            // Flush the queued bounce report onto the RecordingPeer log
             // (MeshClient::send is queued, drained by the pump).
             sec.drain_egress().await;
             assert!(
@@ -356,42 +362,55 @@ async fn task_assignment_to_zero_worker_operational_node_reports_backpressure_no
                 sec.op_mut().active_tasks,
             );
 
-            // (2) It MUST have reported the task back to the primary as
-            // Recoverable backpressure (the degenerate no-idle-worker
-            // path), so the primary requeues it rather than losing it.
-            let reported = log.borrow().iter().any(|m| {
+            // (2) It MUST bounce the task back to the primary as a typed
+            // `IllegallyAssignedToNonidleWorker` (the #517 honor-or-bounce),
+            // keyed by the original wire `worker_id`, with NO incumbent (a
+            // 0-worker pool has no running task). It is NOT a TaskFailed, so
+            // the primary reconciles + requeues rather than fail-accounting.
+            let bounced = log.borrow().iter().any(|m| {
                 matches!(
                     m,
-                    DistributedMessage::TaskFailed {
-                        target: _,
-                        error_type: dynrunner_core::ErrorType::Recoverable,
-                        task_hash,
+                    DistributedMessage::IllegallyAssignedToNonidleWorker {
+                        worker_id: 0,
+                        assigned,
+                        incumbent: None,
                         ..
-                    } if *task_hash == file_hash
+                    } if assigned.hash == file_hash
                 )
             });
             assert!(
-                reported,
-                "a 0-worker node must report the task back as Recoverable \
-                 backpressure; captured sends: {:?}",
+                bounced,
+                "a 0-worker node must bounce IllegallyAssignedToNonidleWorker \
+                 (no incumbent), not the old backpressure TaskFailed; captured \
+                 sends: {:?}",
                 log.borrow(),
+            );
+            assert!(
+                !log.borrow().iter().any(|m| matches!(
+                    m,
+                    DistributedMessage::TaskFailed { task_hash, .. } if *task_hash == file_hash
+                )),
+                "the bounce must NOT be a TaskFailed (no failure accounting)",
             );
         })
         .await;
 }
 
-/// Regression: an out-of-range `worker_id` on a NON-empty pool falls
-/// back to an idle worker — it is NOT silently clamped onto the last
-/// slot.
+/// Regression (#517): an out-of-range `worker_id` on a NON-empty pool
+/// is BOUNCED — the secondary never re-picks another idle worker, and
+/// never clamps onto the last slot.
 ///
-/// Pre-fix, selection did `worker_id.min(pool.workers.len() as u32 - 1)`,
-/// so a bogus id (e.g. `999`) was clamped to the last worker and the
-/// task ran on the wrong slot. The root-cause fix uses
-/// `pool.workers.get(worker_id)` (→ `None` when out of range) for the
-/// preference and `position(idle)` for the fallback, so an out-of-range
-/// id resolves to the FIRST idle worker, never the last.
+/// Pre-fix #1 (cabd34ab and earlier), selection did
+/// `worker_id.min(pool.workers.len() as u32 - 1)`, so a bogus id (e.g.
+/// `999`) was clamped onto the last worker. Pre-fix #2 (the cabd34ab
+/// `.or_else` fallback) re-picked the FIRST idle worker — still running
+/// the task on a slot the primary never assigned (the occupancy-drift
+/// root). #517 honors the assigned slot: an out-of-range id has no idle
+/// slot to honor, so it bounces `IllegallyAssignedToNonidleWorker` (no
+/// incumbent) and the task lands on NO worker here — the primary
+/// reconciles + requeues onto a genuinely-idle slot it tracks.
 #[tokio::test(flavor = "current_thread")]
-async fn out_of_range_worker_id_falls_back_to_idle_worker_not_clamped_to_last() {
+async fn out_of_range_worker_id_bounces_never_repicks_or_clamps() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
     local
@@ -402,7 +421,7 @@ async fn out_of_range_worker_id_falls_back_to_idle_worker_not_clamped_to_last() 
             // slots are genuinely Idle.
             let mut config = election_config("oob-worker");
             config.num_workers = 2;
-            let (mut sec, _log) = super::super::test_helpers::make_secondary_recording(config, 1);
+            let (mut sec, log) = super::super::test_helpers::make_secondary_recording(config, 1);
             sec.set_bootstrap_primary_id("setup".to_string());
             sec.enter_operational_for_test();
 
@@ -428,8 +447,8 @@ async fn out_of_range_worker_id_falls_back_to_idle_worker_not_clamped_to_last() 
             );
 
             // Assign with a wildly out-of-range `worker_id`. Pre-fix this
-            // clamped to slot 1 (the last); post-fix it falls back to the
-            // first idle slot (0).
+            // clamped to slot 1 (the last) / re-picked slot 0; post-#517 it
+            // bounces (no idle slot to honor at id 999).
             let binary = super::processing::make_binary("oob-task", 50);
             let file_hash = format!("hash_{}", binary.identifier.0);
             let assignment = DistributedMessage::TaskAssignment {
@@ -449,19 +468,44 @@ async fn out_of_range_worker_id_falls_back_to_idle_worker_not_clamped_to_last() 
             };
 
             let result = sec.dispatch_message(assignment, &mut factory).await;
-            // Flush the queued backpressure report onto the RecordingPeer log
+            // Flush the queued bounce report onto the RecordingPeer log
             // (MeshClient::send is queued, drained by the pump).
             sec.drain_egress().await;
             assert!(result.is_ok(), "dispatch must succeed, got {result:?}");
 
-            // The task landed on the FIRST idle slot (0), proving the
-            // out-of-range id was NOT clamped to the last slot (1).
-            assert_eq!(
-                sec.op_mut().active_tasks.get(&file_hash).copied(),
-                Some(0),
-                "out-of-range worker_id must fall back to the first idle \
-                 worker (0), not clamp to the last (1); active_tasks={:?}",
+            // The task landed on NO worker: the secondary never re-picked an
+            // idle slot (slot 0 stays untouched) and never clamped to the
+            // last (slot 1). active_tasks is empty for this hash.
+            assert!(
+                !sec.op_mut().active_tasks.contains_key(&file_hash),
+                "out-of-range worker_id must NOT run the task on any slot \
+                 (no re-pick, no clamp); active_tasks={:?}",
                 sec.op_mut().active_tasks,
+            );
+            assert!(
+                sec.op_mut().pool.workers.iter().all(|w| w.is_idle_state()),
+                "both worker slots must remain idle (no re-pick onto slot 0)",
+            );
+
+            // It bounced the typed report (worker_id echoed verbatim = 999),
+            // with no incumbent (the requested slot does not exist).
+            let bounced = log.borrow().iter().any(|m| {
+                matches!(
+                    m,
+                    DistributedMessage::IllegallyAssignedToNonidleWorker {
+                        worker_id: 999,
+                        assigned,
+                        incumbent: None,
+                        ..
+                    } if assigned.hash == file_hash
+                )
+            });
+            assert!(
+                bounced,
+                "an out-of-range worker_id must bounce \
+                 IllegallyAssignedToNonidleWorker (worker_id=999, no \
+                 incumbent); captured sends: {:?}",
+                log.borrow(),
             );
         })
         .await;

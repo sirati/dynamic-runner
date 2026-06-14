@@ -62,7 +62,8 @@ impl<I> DistributedMessage<I> {
             | Self::SetupAssignment { target, .. }
             | Self::SetupTerminal { target, .. }
             | Self::TaskQueuedAfterLocalDependency { target, .. }
-            | Self::LocalDependencyReleased { target, .. } => target.as_ref(),
+            | Self::LocalDependencyReleased { target, .. }
+            | Self::IllegallyAssignedToNonidleWorker { target, .. } => target.as_ref(),
         }
     }
 
@@ -118,7 +119,8 @@ impl<I> DistributedMessage<I> {
             | Self::SetupAssignment { target, .. }
             | Self::SetupTerminal { target, .. }
             | Self::TaskQueuedAfterLocalDependency { target, .. }
-            | Self::LocalDependencyReleased { target, .. } => target,
+            | Self::LocalDependencyReleased { target, .. }
+            | Self::IllegallyAssignedToNonidleWorker { target, .. } => target,
         };
         *slot = Some(dst);
     }
@@ -188,7 +190,8 @@ impl<I> DistributedMessage<I> {
             | Self::SetupAssignment { target, .. }
             | Self::SetupTerminal { target, .. }
             | Self::TaskQueuedAfterLocalDependency { target, .. }
-            | Self::LocalDependencyReleased { target, .. } => target,
+            | Self::LocalDependencyReleased { target, .. }
+            | Self::IllegallyAssignedToNonidleWorker { target, .. } => target,
         };
         *slot = None;
     }
@@ -239,7 +242,8 @@ impl<I> DistributedMessage<I> {
             | Self::SetupAssignment { sender_id, .. }
             | Self::SetupTerminal { sender_id, .. }
             | Self::TaskQueuedAfterLocalDependency { sender_id, .. }
-            | Self::LocalDependencyReleased { sender_id, .. } => sender_id,
+            | Self::LocalDependencyReleased { sender_id, .. }
+            | Self::IllegallyAssignedToNonidleWorker { sender_id, .. } => sender_id,
         }
     }
 
@@ -289,7 +293,8 @@ impl<I> DistributedMessage<I> {
             | Self::SetupAssignment { timestamp, .. }
             | Self::SetupTerminal { timestamp, .. }
             | Self::TaskQueuedAfterLocalDependency { timestamp, .. }
-            | Self::LocalDependencyReleased { timestamp, .. } => *timestamp,
+            | Self::LocalDependencyReleased { timestamp, .. }
+            | Self::IllegallyAssignedToNonidleWorker { timestamp, .. } => *timestamp,
         }
     }
 
@@ -537,6 +542,9 @@ impl<I> DistributedMessage<I> {
                 MessageType::TaskQueuedAfterLocalDependency
             }
             Self::LocalDependencyReleased { .. } => MessageType::LocalDependencyReleased,
+            Self::IllegallyAssignedToNonidleWorker { .. } => {
+                MessageType::IllegallyAssignedToNonidleWorker
+            }
         }
     }
 }

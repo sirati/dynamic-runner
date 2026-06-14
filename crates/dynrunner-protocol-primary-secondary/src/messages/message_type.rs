@@ -162,4 +162,10 @@ pub enum MessageType {
     /// for a queued work task is done — release it (#497). The primary
     /// originates the EXISTING `ClusterMutation::TaskAssigned`.
     LocalDependencyReleased,
+    /// Secondary -> primary: the primary assigned a task to a NON-idle
+    /// worker slot (#517). The secondary honors the assigned `worker_id`
+    /// (never re-picks) and bounces this typed report — NOT a `TaskFailed`,
+    /// so it is never accounted as a failure; the primary reconciles its
+    /// diverged `(secondary, worker_id)` occupancy and requeues the task.
+    IllegallyAssignedToNonidleWorker,
 }

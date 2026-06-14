@@ -38,6 +38,7 @@ mod e2e;
 mod estimate_escalation;
 mod graceful_abort;
 mod hydrate;
+mod illegal_assignment;
 mod incremental_setup;
 mod initial_assignment;
 mod injected_spread;

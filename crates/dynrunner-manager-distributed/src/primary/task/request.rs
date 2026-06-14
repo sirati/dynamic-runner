@@ -174,13 +174,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         // Assigned{task_hash}` + ledger insert, committed
                         // together. The slot is idle here: the outer arm
                         // gated on `is_idle()`, so assignment is reachable
-                        // only from an idle slot.
-                        self.commit_assignment(
+                        // only from an idle slot. The enforced idle-guard
+                        // (#517) refuses only if that invariant ever broke:
+                        // requeue the taken binary + return (the requester
+                        // re-polls) rather than dispatch a task the model
+                        // can't track (the silent-overwrite backstop).
+                        if !self.commit_assignment(
                             idx,
                             binary.clone(),
                             task_hash.clone(),
                             estimated_usage.clone(),
-                        );
+                        ) {
+                            self.pool_mut().requeue(binary);
+                            return Ok(());
+                        }
                         // Resolve the per-edge predecessor-output map from the
                         // replicated `cluster_state.task_outputs` cache. The
                         // helper handles both the direct-dep present-but-empty

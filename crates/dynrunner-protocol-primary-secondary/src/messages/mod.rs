@@ -14,6 +14,7 @@
 pub mod accessors;
 pub mod binary_info;
 pub mod distributed;
+pub mod illegal_assignment;
 pub mod message_type;
 pub mod peer_info;
 pub mod range_digest;
@@ -21,6 +22,7 @@ pub mod state_digest;
 
 pub use binary_info::{DistributedBinaryInfo, StagedFileRecord, ZipBinaryEntry, ZipFileAssignment};
 pub use distributed::{DistributedMessage, KeepaliveRole};
+pub use illegal_assignment::AssignedTaskRef;
 pub use message_type::MessageType;
 pub use peer_info::{PeerConnectionInfo, WorkerReadyInfo};
 pub use range_digest::{RANGE_COUNT, RangeDigest};

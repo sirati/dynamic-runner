@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::address::Destination;
 use crate::cluster_mutation::ClusterMutation;
 use crate::messages::binary_info::{DistributedBinaryInfo, StagedFileRecord, ZipFileAssignment};
+use crate::messages::illegal_assignment::AssignedTaskRef;
 use crate::messages::peer_info::{PeerConnectionInfo, WorkerReadyInfo};
 use crate::messages::range_digest::RangeDigest;
 use crate::messages::state_digest::StateDigest;
@@ -1500,6 +1501,57 @@ pub enum DistributedMessage<I> {
         task_hash: String,
         /// The worker slot on `S` that will run `B`.
         worker_id: u32,
+    },
+    /// Secondary -> primary: "you assigned a task to a worker slot that is
+    /// NOT idle" (#517). The secondary HONORS the primary's assigned
+    /// `worker_id` and MUST NOT silently re-pick another idle worker (the
+    /// dispatch-decoupling law: a secondary holds no scheduling authority).
+    /// When the requested slot is busy (running an incumbent task), this
+    /// report bounces the illegally-assigned task back to the authority —
+    /// it is NOT a [`Self::TaskFailed`], so it can never be mis-accounted
+    /// as a failure (no retry-budget burn, no fail counter): the typed
+    /// variant routes to the primary's dedicated reconcile-and-requeue
+    /// handler, which heals its diverged per-`(secondary, worker_id)`
+    /// occupancy model and re-queues the bounced task for a genuinely-idle
+    /// worker.
+    ///
+    /// Root cause this surfaces: the secondary's pre-#517 dispatch fell
+    /// back to ANY idle worker when the requested slot was busy, running
+    /// the task on a DIFFERENT physical worker than the primary's ledger
+    /// recorded — the primary keys occupancy by `(secondary, worker_id)`,
+    /// so the re-pick rotted its per-worker model (it kept assigning a
+    /// physically-busy slot) until the secondary ran out of idle workers
+    /// and bounced the generic "No idle worker available" backpressure: a
+    /// fleet-wide assign→bounce→requeue loop. Honoring the slot + this
+    /// typed bounce makes the divergence observable and self-healing.
+    ///
+    /// `incumbent` is `None` for the degenerate non-idle cases that carry
+    /// no running task — an out-of-range `worker_id` or a 0-worker
+    /// `Operational` node (late-joiner / observer): there is no incumbent,
+    /// only "the requested slot cannot take the task". The illegally
+    /// assigned task is requeued in every case.
+    IllegallyAssignedToNonidleWorker {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// The reporting secondary (the member that received the illegal
+        /// assignment).
+        secondary_id: String,
+        /// The worker slot the primary illegally assigned to — echoed back
+        /// VERBATIM (the un-clamped wire id the assignment carried), so the
+        /// primary reconciles the exact `(secondary, worker_id)` it tracks.
+        worker_id: u32,
+        /// The task the primary illegally assigned (the one being bounced
+        /// for re-dispatch).
+        assigned: AssignedTaskRef<I>,
+        /// The task the worker is CURRENTLY running (the incumbent the
+        /// requested slot is busy with), or `None` when the slot carries no
+        /// running task (out-of-range `worker_id` / 0-worker node).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incumbent: Option<AssignedTaskRef<I>>,
     },
 }
 
