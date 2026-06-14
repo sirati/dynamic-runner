@@ -659,3 +659,232 @@ async fn midrun_joiner_unregistered_leg_still_receives_peerinfo_directed() {
         })
         .await;
 }
+
+/// Test 6 (#488): the SOURCE-ALREADY-STAGED respawn-replacement loss,
+/// replayed end-to-end at the manager level.
+///
+/// Production shape (consumer test-env repro @ 942efb93): a primary
+/// running `--source-already-staged` (`source_pre_staged_root.is_some()`)
+/// loses a member mid-run; its respawned replacement joins after the
+/// run-start batch fired and is served the trio at its cert edge. In
+/// pre-staged mode the primary sends RELATIVE wire `local_path`s and a
+/// 16-char identifier `file_hash` (NOT a content SHA) and NEVER pushes a
+/// `StageFile` (the bind-mount IS the contract). The replacement's
+/// dispatch resolver can accept the bind-mounted file by EXISTENCE alone
+/// ONLY when its `staging_ctx.pre_staged_mode` is true — otherwise it
+/// hash-verifies the file against the identifier hash, mismatches, and
+/// reports the task `NonRecoverable` "not pre-staged … expected StageFile
+/// first". The primary does not re-route a NonRecoverable, so the task is
+/// permanently lost (the consumer saw 274/660 lost, run falsely
+/// "complete").
+///
+/// What is under test: the mid-run serve must carry `pre_staged_mode`
+/// into the replacement's `InitialAssignment` EXACTLY as the bring-up
+/// batch does, so the replacement's resolver accepts the bind-mounted
+/// corpus by existence and completes the dead member's remaining work.
+///
+/// The fixture isolates the `pre_staged_mode`-propagation concern: the
+/// corpus files exist under the pre-staged root, the wire `file_hash` is
+/// the identifier hash (so existence-acceptance is the ONLY way to
+/// resolve), and the replacement boots with `src_network` = the
+/// pre-staged root (its bind-mount). With `pre_staged_mode` propagated it
+/// resolves + completes; without it every assigned task fails
+/// NonRecoverable and the replacement runs zero work.
+#[tokio::test(flavor = "current_thread")]
+async fn midrun_joiner_inherits_pre_staged_mode_and_resolves_bind_mounted_corpus() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // The pre-staged corpus root — the bind-mount the secondary
+            // sees as `src_network` and the primary knows as
+            // `source_pre_staged_root`. Real files live here; the wire
+            // never carries a content hash for them.
+            let pre_staged_root = std::env::temp_dir().join(format!(
+                "midrun_prestaged_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&pre_staged_root).unwrap();
+            // 8 pre-staged binaries: `path` sits UNDER the root (absolute),
+            // so the wire `local_path` is the relative tail `bin_N` and the
+            // secondary resolves via `src_network.join("bin_N")`.
+            let binaries: Vec<TaskInfo<TestId>> = (0..8)
+                .map(|i| {
+                    let name = format!("bin_{i}");
+                    let path = pre_staged_root.join(&name);
+                    std::fs::write(&path, format!("staged-payload-{i}")).unwrap();
+                    TaskInfo {
+                        path,
+                        size: 16,
+                        identifier: TestId(name.clone()),
+                        phase_id: dynrunner_core::PhaseId::from("default"),
+                        type_id: dynrunner_core::TypeId::from("default"),
+                        affinity_id: None,
+                        payload: serde_json::Value::Null,
+                        task_id: name,
+                        task_depends_on: vec![],
+                        preferred_secondaries: Default::default(),
+                        preferred_version: Default::default(),
+                        kind: Default::default(),
+                        setup_affinity: None,
+                        upload_file: None,
+                        resolved_path: None,
+                    }
+                })
+                .collect();
+
+            let max_res = dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                2 * 1024 * 1024 * 1024u64,
+            )]);
+            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+
+            // The doomed bring-up member sec-0: 1 worker, SLOW so most of
+            // the corpus is still pending when it dies. It also boots with
+            // the bind-mount so it can resolve its own slice.
+            let mut sec0_config = real_secondary_config("sec-0".into(), 1, max_res.clone());
+            sec0_config.src_network = Some(pre_staged_root.clone());
+            let (to_sec0_tx, from_sec0_rx, sec0_handle) = spawn_real_secondary_node(
+                sec0_config,
+                SlowFakeWorkerFactory::with_markers(vec![(
+                    "bin_".into(),
+                    Duration::from_millis(250),
+                )]),
+                Vec::new(),
+            );
+            outgoing.insert("sec-0".to_string(), to_sec0_tx);
+            {
+                let tx = incoming_tx.clone();
+                tokio::task::spawn_local(async move {
+                    let mut rx = from_sec0_rx;
+                    while let Some(msg) = rx.recv().await {
+                        if tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            // The replacement's wire (transport-level link) exists from the
+            // start; the replacement PROCESS spawns mid-run in the driver.
+            let (joiner_wire_tx, joiner_wire_rx) = tokio_mpsc::unbounded_channel();
+            outgoing.insert("sec-1".to_string(), joiner_wire_tx);
+
+            let transport =
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
+            let config = PrimaryConfig {
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                keepalive_interval: Duration::from_millis(100),
+                silence_warn_multiples: vec![2, 4, 6],
+                silence_hard_multiple: 8,
+                // The mode under test: source-already-staged. The wire then
+                // carries relative paths + identifier hashes and NO
+                // StageFile, and `pre_staged_mode` must reach every member's
+                // resolver — including a mid-run replacement's.
+                source_pre_staged_root: Some(pre_staged_root.clone()),
+                uses_file_based_items: true,
+                ..test_primary_config()
+            };
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Driver: kill sec-0 mid-corpus, wait out the silence judgment,
+            // then bring up the REAL replacement booted with the bind-mount.
+            #[allow(clippy::async_yields_async)]
+            let driver = async {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                sec0_handle.abort();
+                tokio::time::sleep(Duration::from_millis(2000)).await;
+                // A fresh process has no history: discard anything broadcast
+                // onto the wire before the replacement existed.
+                let mut joiner_wire_rx = joiner_wire_rx;
+                while joiner_wire_rx.try_recv().is_ok() {}
+                let (to_joiner_tx, from_joiner_rx, joiner_handle) =
+                    spawn_real_secondary_with_src_network(
+                        "sec-1".into(),
+                        2,
+                        max_res.clone(),
+                        Some(pre_staged_root.clone()),
+                    );
+                tokio::task::spawn_local(async move {
+                    while let Some(msg) = joiner_wire_rx.recv().await {
+                        if to_joiner_tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                });
+                let tx = incoming_tx.clone();
+                tokio::task::spawn_local(async move {
+                    let mut rx = from_joiner_rx;
+                    while let Some(msg) = rx.recv().await {
+                        if tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                });
+                joiner_handle
+            };
+
+            let (deps, ops, ope) = noop_phase_args();
+            seed_operational_ledger(&mut primary, binaries, deps);
+            let (run_res, joiner_handle) =
+                tokio::join!(primary.run(SeedSource::PromotionSnapshot, ops, ope), driver);
+            run_res.unwrap();
+
+            // The decisive #488 assertion: zero tasks may be lost. A
+            // replacement that did not inherit `pre_staged_mode` reports
+            // every assigned task NonRecoverable, which the primary does NOT
+            // re-route — so the corpus the dead member did not finish is
+            // permanently lost and `completed_count` falls short.
+            assert_eq!(
+                primary.completed_count(),
+                8,
+                "all tasks must complete — a pre-staged replacement that \
+                 inherits `pre_staged_mode` resolves the bind-mounted corpus \
+                 by existence; without it the dead member's remaining work \
+                 is lost (failed={})",
+                primary.failed_count()
+            );
+            assert_eq!(
+                primary.failed_count(),
+                0,
+                "no task may fail NonRecoverable: the bind-mounted file \
+                 exists and the resolver must accept it by existence in \
+                 pre-staged mode"
+            );
+            // Prove the replacement took the mid-run cert-edge trio serve
+            // (it reached MeshReady + keepalive-proof), so this asserts the
+            // pre_staged_mode propagated THROUGH that serve, not via some
+            // bypass.
+            assert!(
+                primary.mesh_ready_secondaries.contains("sec-1"),
+                "the replacement must reach MeshReady via the mid-run serve \
+                 (confirmed set: {:?})",
+                primary.mesh_ready_secondaries
+            );
+
+            drop(primary);
+            let joiner_ran = joiner_handle.await.unwrap();
+            assert!(
+                joiner_ran >= 1,
+                "the replacement must pick up + complete the dead member's \
+                 remaining pre-staged corpus (ran {joiner_ran}) — a \
+                 replacement stuck in non-pre-staged resolution runs zero \
+                 work and strands the corpus"
+            );
+
+            let _ = std::fs::remove_dir_all(&pre_staged_root);
+        })
+        .await;
+}
