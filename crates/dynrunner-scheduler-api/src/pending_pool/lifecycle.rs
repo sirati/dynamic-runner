@@ -71,56 +71,94 @@ impl<I: Identifier> PendingPool<I> {
         }
         if let Some(id) = task_id {
             self.in_flight_tasks.remove(id);
-            self.completed_tasks.insert(id.to_string());
-            // Terminal: forget the task's re-dispatch backoff streak.
-            self.dispatch_backoff.clear(id);
-            // Walk dependents and possibly unblock them. Collect ids
-            // first to avoid borrowing `self.dependents_of` while we
-            // mutate `self.blocked` / `self.task_deps`.
-            let dependents = self.dependents_of.remove(id).unwrap_or_default();
-            for dep_id in dependents {
-                let still_blocked = if let Some(remaining) = self.task_deps.get_mut(&dep_id) {
-                    remaining.remove(id);
-                    !remaining.is_empty()
-                } else {
-                    // Already unblocked / not present — defensive no-op.
-                    continue;
-                };
-                if still_blocked {
-                    continue;
-                }
-                self.task_deps.remove(&dep_id);
-                let item = match self.blocked.remove(&dep_id) {
-                    Some(it) => it,
-                    None => continue,
-                };
-                let dep_phase = item.phase_id.clone();
-                if let Some(c) = self.blocked_per_phase.get_mut(&dep_phase) {
-                    *c = c.saturating_sub(1);
-                }
-                let key = (
-                    item.phase_id.clone(),
-                    item.type_id.clone(),
-                    affinity_key(&item),
-                );
-                self.buckets
-                    .entry(key)
-                    .or_insert_with(Bucket::new)
-                    .items
-                    .push_front(item);
-                // Unblocking grew this phase's queue: if it was
-                // `Draining` only because everything was blocked, flip
-                // it back to `Active`. Mirrors `requeue` behaviour.
-                if self.phase_state.get(&dep_phase) == Some(&PhaseState::Draining) {
-                    self.phase_state
-                        .insert(dep_phase.clone(), PhaseState::Active);
-                }
-                // A drained-pending entry for this phase is now stale —
-                // the phase is no longer drained.
-                self.drained_pending.retain(|p| p != &dep_phase);
-            }
+            self.resolve_completed_dependents(id);
         }
         self.maybe_transition_drain(phase_id);
+    }
+
+    /// Notify the pool that a `TaskKind::SecondaryAffine` GATE resolved to
+    /// its terminal `AffineReady` (#506) — the gate's own deps are all done,
+    /// so it satisfies its dependents WITHOUT ever having been dispatched.
+    ///
+    /// The gate is the structural twin of a `Setup` task on the
+    /// dispatch-eligibility seam: NEVER worker-assignable, so it never enters
+    /// `in_flight_per_phase` — a free worker can't run it, and the primary
+    /// resolves it in-process (originating `AffineReady`) the moment its deps
+    /// complete. So this is `on_item_finished` WITHOUT the in-flight
+    /// decrement: a decrement would corrupt the phase's count when a sibling
+    /// IS in-flight (the gate's `on_item_finished` twin would wrongly drop a
+    /// real in-flight task's slot). It records the gate completed and runs
+    /// the SAME dependent-unblock walk + drain transition `on_item_finished`
+    /// uses (one walk owner), so a build gated on the gate moves
+    /// `blocked → queued` exactly as it would behind a completed work task.
+    ///
+    /// The caller has ALREADY removed the gate item from its bucket (the
+    /// drain pass takes it by hash before resolving), so the gate never
+    /// lingers as an inert non-dispatchable queued item wedging its phase.
+    pub fn on_gate_resolved(&mut self, phase_id: &PhaseId, task_id: &str) {
+        self.resolve_completed_dependents(task_id);
+        self.maybe_transition_drain(phase_id);
+    }
+
+    /// Record `id` completed and unblock every dependent whose final
+    /// unresolved prereq this resolves: move it `blocked → FRONT of its
+    /// bucket` (matching `requeue` so freshly-unblocked tasks dispatch ahead
+    /// of newly-extended items), flip its phase `Draining → Active` if the
+    /// phase was draining only because everything was blocked, and stale out
+    /// any pending-drained record for it.
+    ///
+    /// The SINGLE dependent-unblock walk, shared by the in-flight terminal
+    /// path ([`Self::on_item_finished`], which additionally owns the
+    /// in-flight decrement) and the never-dispatched gate path
+    /// ([`Self::on_gate_resolved`], which does not). Collects the dependent
+    /// ids first to avoid borrowing `self.dependents_of` while mutating
+    /// `self.blocked` / `self.task_deps`.
+    fn resolve_completed_dependents(&mut self, id: &str) {
+        self.completed_tasks.insert(id.to_string());
+        // Terminal: forget the task's re-dispatch backoff streak.
+        self.dispatch_backoff.clear(id);
+        let dependents = self.dependents_of.remove(id).unwrap_or_default();
+        for dep_id in dependents {
+            let still_blocked = if let Some(remaining) = self.task_deps.get_mut(&dep_id) {
+                remaining.remove(id);
+                !remaining.is_empty()
+            } else {
+                // Already unblocked / not present — defensive no-op.
+                continue;
+            };
+            if still_blocked {
+                continue;
+            }
+            self.task_deps.remove(&dep_id);
+            let item = match self.blocked.remove(&dep_id) {
+                Some(it) => it,
+                None => continue,
+            };
+            let dep_phase = item.phase_id.clone();
+            if let Some(c) = self.blocked_per_phase.get_mut(&dep_phase) {
+                *c = c.saturating_sub(1);
+            }
+            let key = (
+                item.phase_id.clone(),
+                item.type_id.clone(),
+                affinity_key(&item),
+            );
+            self.buckets
+                .entry(key)
+                .or_insert_with(Bucket::new)
+                .items
+                .push_front(item);
+            // Unblocking grew this phase's queue: if it was
+            // `Draining` only because everything was blocked, flip
+            // it back to `Active`. Mirrors `requeue` behaviour.
+            if self.phase_state.get(&dep_phase) == Some(&PhaseState::Draining) {
+                self.phase_state
+                    .insert(dep_phase.clone(), PhaseState::Active);
+            }
+            // A drained-pending entry for this phase is now stale —
+            // the phase is no longer drained.
+            self.drained_pending.retain(|p| p != &dep_phase);
+        }
     }
 
     /// Notify the pool that a task has terminated PERMANENTLY (e.g.

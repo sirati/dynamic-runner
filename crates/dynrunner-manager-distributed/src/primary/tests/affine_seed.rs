@@ -30,6 +30,7 @@ use dynrunner_core::{TaskDep, TaskKind};
 
 use crate::cluster_state::TaskState;
 use crate::primary::wire::compute_task_hash;
+use crate::worker_signal::{WorkerMgmtSignal, WorkerSignalBatch};
 
 /// A no-dep `TaskKind::SecondaryAffine` gate (the per-secondary import gate
 /// `I` between an upload and a build) on `make_binary`'s default phase.
@@ -229,6 +230,161 @@ async fn discover_on_promotion_originate_resolves_gate_and_build_is_dispatchable
             assert_eq!(fire.get(), 1, "discovery policy fired once");
 
             assert_gate_resolved_and_build_dispatchable(&primary, &gate_hash, &build_hash);
+        })
+        .await;
+}
+
+// ─────────────────────── #506: with-dep gate ───────────────────────
+
+/// A `TaskKind::Setup` task (the upload `U`) with the PRIMARY's own affinity
+/// (`None` defaults to the primary) on `make_binary`'s default phase, so it
+/// self-execs in-process to `SetupCompleted` when the setup pass runs.
+fn upload_setup(name: &str) -> TaskInfo<TestId> {
+    let mut t = make_binary(name, 100);
+    t.kind = TaskKind::Setup;
+    t
+}
+
+/// A `SecondaryAffine` gate depending on `dep` (same default phase, resolved
+/// by id) — the WITH-dep gate the #506 deadlock hinges on.
+fn affine_gate_depending_on(name: &str, dep: &str) -> TaskInfo<TestId> {
+    let mut t = affine_gate(name);
+    t.task_depends_on = vec![TaskDep {
+        task_id: dep.into(),
+        phase_id: t.phase_id.clone(),
+        inherit_outputs: false,
+    }];
+    t
+}
+
+fn one_tasks_added_batch() -> WorkerSignalBatch {
+    WorkerSignalBatch {
+        signals: vec![WorkerMgmtSignal::TasksAdded],
+    }
+}
+
+/// (b) #506 — a WITH-dep gate whose dependency completes AFTER seed.
+///
+/// REPRO (the minimal #506 deadlock): `U`(Setup) → `I_dep`(SecondaryAffine,
+/// TaskDep `U`) → two builds(TaskDep `I_dep`), seeded via the REAL
+/// `TaskAdded` + hydrate path. Drive ONE worker-management reaction (exactly
+/// the operational loop's arm): its setup-dispatch pass self-execs `U` to
+/// `SetupCompleted` (which unblocks `I_dep` `blocked → bucket` in the pool and
+/// emits `TasksAdded`), and the SAME reaction's affine-resolve pass then
+/// drains the now-queued, dependency-satisfied `I_dep` to `AffineReady`,
+/// unblocking the builds.
+///
+/// FAILS on trunk-without-the-fix (revert-confirmed): with the affine-resolve
+/// pass removed, `U` completes but `I_dep` rides NEITHER existing firing
+/// surface — the seed scan skipped it (its dep `U` was not terminal at seed),
+/// and `resume_blocked_on(U)` finds nothing (`I_dep` was seeded CRDT-`Pending`,
+/// never CRDT-`Blocked`), so `became_pending` is empty and the originator never
+/// re-fires. `I_dep` sits `Pending` forever (a gate is not worker-assignable,
+/// so the pool never dispatches it) and the builds stay Blocked behind it →
+/// deadlock. Each clause below is exactly what trunk-without-the-fix violates.
+#[tokio::test(flavor = "current_thread")]
+async fn with_dep_gate_resolves_when_dependency_completes_post_seed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let upload = upload_setup("upload");
+            let gate = affine_gate_depending_on("import", "upload");
+            let build_a = build_depending_on("build-a", "import");
+            let build_b = build_depending_on("build-b", "import");
+            let gate_hash = compute_task_hash(&gate);
+            let build_a_hash = compute_task_hash(&build_a);
+            let build_b_hash = compute_task_hash(&build_b);
+
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // SEED via the production `TaskAdded` path, then hydrate — the gate
+            // is born CRDT-`Pending` and pool-`blocked` on `upload`; the builds
+            // are pool-`blocked` on `import`.
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                for task in [&upload, &gate, &build_a, &build_b] {
+                    cs.apply(ClusterMutation::TaskAdded {
+                        hash: compute_task_hash(task),
+                        task: task.clone(),
+                    });
+                }
+            }
+            primary
+                .hydrate_from_cluster_state()
+                .expect("the U → I_dep → builds graph is valid");
+
+            // Pre-completion: the gate is NOT yet ready (its dep is live), so
+            // it stays Pending and the builds stay Blocked — no premature fire.
+            assert!(
+                matches!(
+                    primary.cluster_state.task_state(&gate_hash),
+                    Some(TaskState::Pending { .. })
+                ),
+                "before its dep completes, the with-dep gate is Pending (the \
+                 seed scan correctly skips it); got {:?}",
+                primary.cluster_state.task_state(&gate_hash)
+            );
+
+            // Drive ONE worker-management reaction: the setup pass self-execs
+            // `upload` → `SetupCompleted` (unblocking the gate in the pool +
+            // emitting `TasksAdded`), and the affine pass resolves the gate.
+            primary
+                .react_to_worker_signal_batch(one_tasks_added_batch(), &mut None)
+                .await;
+            settle_pump().await;
+
+            // (a) the gate is originated `AffineReady` — NOT stuck Pending.
+            assert!(
+                matches!(
+                    primary.cluster_state.task_state(&gate_hash),
+                    Some(TaskState::AffineReady { .. })
+                ),
+                "the with-dep gate resolves to AffineReady once its dependency \
+                 completes post-seed (pre-fix it stays Pending forever → \
+                 deadlock); got {:?}",
+                primary.cluster_state.task_state(&gate_hash)
+            );
+            assert_eq!(
+                primary.cluster_state.outcome_counts().affine_ready,
+                1,
+                "the resolved gate counts in the affine_ready terminal bucket"
+            );
+
+            // (b) BOTH builds are unblocked (CRDT Pending) and dispatchable in
+            // the pool — the chain actually completes, not just the gate flip.
+            for (name, hash) in [("build-a", &build_a_hash), ("build-b", &build_b_hash)] {
+                assert!(
+                    matches!(
+                        primary.cluster_state.task_state(hash),
+                        Some(TaskState::Pending { .. })
+                    ),
+                    "{name} must be Pending once the gate resolved (pre-fix it \
+                     is Blocked on the never-ready gate); got {:?}",
+                    primary.cluster_state.task_state(hash)
+                );
+            }
+            let mut queued: Vec<String> =
+                primary.pool().iter().map(|t| t.task_id.clone()).collect();
+            queued.sort();
+            assert_eq!(
+                queued,
+                vec!["build-a".to_string(), "build-b".to_string()],
+                "exactly the two builds are queued + dispatchable; the resolved \
+                 gate is a terminal and left the pool, the upload self-executed; \
+                 got {queued:?}"
+            );
+            assert_eq!(
+                primary.pool().blocked_len(),
+                0,
+                "nothing is Blocked — the gate's resolution unblocked both \
+                 builds (pre-fix they are Blocked on the never-ready gate)"
+            );
         })
         .await;
 }
