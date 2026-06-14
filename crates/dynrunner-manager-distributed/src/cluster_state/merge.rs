@@ -43,6 +43,7 @@ use super::types::{
     TerminalRank,
 };
 use crate::task_completed::TaskCompletedEvent;
+use crate::task_state_change::TaskStateChangeEvent;
 
 // === per-task join ===
 
@@ -420,6 +421,20 @@ pub(super) enum MergeOutcome {
         /// transition); built once here via `to_completed_event` so apply
         /// and restore emit byte-identical events.
         event: Option<TaskCompletedEvent>,
+        /// Pre-built #520 per-transition narration event — ALWAYS `Some`
+        /// on a win (every winning transition, terminal or not, is a
+        /// narration-worthy CRDT change). Built here from the POST-merge
+        /// state's classification + the holder (post-merge for an
+        /// assignment, the PRE-merge holder captured below for a terminal
+        /// that superseded an `InFlight`), so apply and restore narrate
+        /// byte-identically and path-independently. The caller does the
+        /// actual `emit_task_state_change_event` (the emit sink is the
+        /// caller's concern, exactly like `event`). `Box`ed to keep the
+        /// `Applied` variant from dominating `MergeOutcome`'s size
+        /// (`large_enum_variant`): every `merge_task_state` return moves
+        /// this enum, and the narration event (which carries the holder
+        /// strings + the fail reason/last_error) is the largest field.
+        state_change_event: Box<TaskStateChangeEvent>,
     },
 }
 
@@ -489,6 +504,15 @@ impl<I: Identifier> ClusterState<I> {
                 matches!(local, TaskState::Completed { .. })
             }
         };
+        // The PRE-merge holder (`InFlight`/`QueuedAfterLocalDependency`
+        // secondary+worker), captured while the old state is still in the
+        // slot — for the #520 narration event. A terminal (Completed /
+        // Failed) carries no holder of its own, so "task X completed/failed
+        // ON which worker" is exactly the holder of the `InFlight` this
+        // terminal superseded. `None` if the prior state named no holder
+        // (e.g. a Pending → InFlight assignment, whose holder is on the
+        // POST-merge state instead).
+        let prior_holder = self.tasks.get(hash).and_then(TaskState::holder);
         // Replace the slot with the winning incoming state.
         let post_is_completed = matches!(incoming, TaskState::Completed { .. });
         let post_is_failure_terminal = matches!(
@@ -509,6 +533,18 @@ impl<I: Identifier> ClusterState<I> {
         } else {
             None
         };
+        // #520 narration event — built once here from the POST-merge state's
+        // classification, ALWAYS on a win (every winning transition is a
+        // narration-worthy change). The holder is the POST-merge state's own
+        // (an assignment's new `InFlight` holder) when it names one, else the
+        // PRE-merge `prior_holder` (a terminal that superseded an `InFlight`
+        // — "completed/failed ON which worker"). Built BEFORE `incoming` is
+        // moved into the map.
+        let state_change_event = Box::new(TaskStateChangeEvent {
+            task_id: incoming.task().task_id.clone(),
+            change: incoming.to_state_change(),
+            holder: incoming.holder().or(prior_holder),
+        });
         // F4 per-phase EVENT tally bump (#358) — the SINGLE owner of the
         // bump, exactly here because this join is the one place a terminal
         // OBSERVATION lands on ANY node (originator apply-locally, mirror
@@ -576,6 +612,7 @@ impl<I: Identifier> ClusterState<I> {
             newly_completed,
             failure_won,
             event,
+            state_change_event,
         }
     }
 }

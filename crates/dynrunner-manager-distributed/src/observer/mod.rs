@@ -46,6 +46,7 @@ pub mod lost_visibility;
 pub mod reconnect;
 pub mod reporting;
 mod setup_exec;
+mod task_narrator;
 
 pub use announcer::{
     AnnounceTrigger, AnnouncerOutboxItem, AnnouncerSender, PeerMeshAnnouncerSender,

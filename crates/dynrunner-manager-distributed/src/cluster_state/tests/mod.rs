@@ -41,6 +41,7 @@ mod settled;
 mod snapshot;
 mod stream;
 mod task_outputs;
+mod task_state_change;
 
 pub(super) fn mk_task(name: &str) -> TaskInfo<RunnerIdentifier> {
     TaskInfo {

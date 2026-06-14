@@ -107,6 +107,10 @@ impl<I: Identifier> ClusterState<I> {
                     let term = super::keyspace::task_digest_term(&hash, &state);
                     e.insert(state);
                     self.range_fold_memo.add(&hash, term);
+                    // #520: a fresh Pending is a narration-worthy transition
+                    // (its "changed state to pending" line). The arm bypasses
+                    // the merge join, so emit through the shared helper here.
+                    self.emit_task_state_change_for(&hash);
                     ApplyOutcome::Applied
                 } else {
                     ApplyOutcome::NoOp
@@ -959,10 +963,18 @@ impl<I: Identifier> ClusterState<I> {
     ) -> ApplyOutcome {
         match self.merge_task_state(hash, incoming, incoming_outputs, resumed) {
             MergeOutcome::NoOp => ApplyOutcome::NoOp,
-            MergeOutcome::Applied { event, .. } => {
+            MergeOutcome::Applied {
+                event,
+                state_change_event,
+                ..
+            } => {
                 if let Some(ev) = event {
                     self.emit_task_completed_event(ev);
                 }
+                // #520: every winning transition is a narration-worthy CRDT
+                // change — emit it on the observer's narration channel (a
+                // silent no-op on primary/secondary, which install no sender).
+                self.emit_task_state_change_event(*state_change_event);
                 ApplyOutcome::Applied
             }
         }

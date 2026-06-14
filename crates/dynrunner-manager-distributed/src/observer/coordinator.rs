@@ -97,11 +97,13 @@ use crate::observer::run_observer_announcer;
 use crate::panik_watcher::{self, PanikSignal, PanikWatcherConfig};
 use crate::primary::RunError;
 use crate::process::{MeshClient, RoleInbox};
+use crate::observer::task_narrator::ObserverTaskNarrator;
 use crate::run_narrator::RunNarrator;
 use crate::task_completed::{
     TaskCompletedEvent, TaskCompletedListener, run_collector, run_task_completed_dispatcher,
     windowed_failure_collector,
 };
+use crate::task_state_change::TaskStateChangeEvent;
 use crate::warn_throttle::WarnThrottle;
 
 /// Minimum spacing between two anti-entropy fault WARNs (empty mesh
@@ -319,6 +321,15 @@ where
     /// Policy B/D listeners. `None` only on the relocation path (the
     /// inherited dispatcher already owns the receiver).
     task_completed_rx: Option<mpsc::UnboundedReceiver<TaskCompletedEvent>>,
+    /// Receiver end of the #520 per-task narration channel. Captured at
+    /// construction (the sender is installed into `cluster_state` at the
+    /// SAME point, BEFORE any restore — so the bootstrap baseline's
+    /// transitions buffer here as the catch-up batch). [`Self::run`] takes
+    /// it, narrates the buffered baseline as ONE summary line, then drains
+    /// each subsequent LIVE transition per-event. Set by BOTH constructors
+    /// (the observer is the operator narrator on every path); the primary /
+    /// secondary install no such sender, so this channel is observer-only.
+    task_state_change_rx: Option<mpsc::UnboundedReceiver<TaskStateChangeEvent>>,
     /// AE-3 recovery-cadence state: the LAST-SEEN `(declared-observer bit,
     /// [`StateDigest`])` of each peer that has broadcast one, keyed by
     /// sender-id. The timer-driven recovery arm intersects this with the
@@ -559,6 +570,15 @@ where
         // dispatcher, which `run` spawns with the Policy B/D listeners.
         let (task_tx, task_rx) = mpsc::unbounded_channel::<TaskCompletedEvent>();
         cluster_state.install_task_completed_sender(task_tx);
+        // Install the #520 per-task narration channel on the moved-in
+        // `cluster_state` (the observer is the operator narrator). On the
+        // relocation path the moved-in ledger is already converged and no
+        // post-construction restore runs, so this channel buffers nothing as
+        // baseline — `run`'s drain finds it empty and the baseline summary
+        // reflects the converged counts.
+        let (state_change_tx, state_change_rx) =
+            mpsc::unbounded_channel::<TaskStateChangeEvent>();
+        cluster_state.install_task_state_change_sender(state_change_tx);
         // Attach the resource-holdings announcer's role-change hook on the
         // moved-in (already-converged) ledger. The relocation path does no
         // post-attach restore, so no initial trigger is dropped here; the
@@ -602,6 +622,7 @@ where
             panik_signal_rx,
             announcer_handle: Some(announcer_handle),
             task_completed_rx: Some(task_rx),
+            task_state_change_rx: Some(state_change_rx),
             peer_digests: std::collections::HashMap::new(),
             snapshot_streams,
             settled_spill,
@@ -663,6 +684,15 @@ where
         // install so restore-delivered events are captured too.
         let (task_tx, task_rx) = mpsc::unbounded_channel::<TaskCompletedEvent>();
         cluster_state.install_task_completed_sender(task_tx);
+        // Install the #520 per-task narration channel HERE too — BEFORE the
+        // cold-join factory's bootstrap restore, so every baseline
+        // transition the restore fires buffers in this unbounded channel as
+        // the catch-up batch. `run` drains it into ONE baseline summary line
+        // (never narrating the 66k-task bootstrap mirror as 66k changes),
+        // then narrates each subsequent LIVE transition per-event.
+        let (state_change_tx, state_change_rx) =
+            mpsc::unbounded_channel::<TaskStateChangeEvent>();
+        cluster_state.install_task_state_change_sender(state_change_tx);
         // Attach the resource-holdings announcer's role-change hook HERE,
         // BEFORE the cold-join factory's snapshot restore runs. The
         // restore's `primary_epoch > local` branch fires
@@ -704,6 +734,7 @@ where
             panik_signal_rx,
             announcer_handle: Some(announcer_handle),
             task_completed_rx: Some(task_rx),
+            task_state_change_rx: Some(state_change_rx),
             peer_digests: std::collections::HashMap::new(),
             snapshot_streams,
             settled_spill,
@@ -1033,6 +1064,14 @@ where
                 vec![invalid_task_listener, aggregation_listener];
             tokio::task::spawn_local(run_task_completed_dispatcher(task_rx, listeners))
         });
+        // #520 per-task narration channel receiver (the same take-once
+        // shape): drained by the loop's narration arm below. The buffered
+        // baseline (bootstrap restore's transitions) is drained ONCE at loop
+        // entry into the one-line summary before the live arm engages.
+        let mut task_state_change_rx = self
+            .task_state_change_rx
+            .take()
+            .expect("task_state_change_rx is set by both constructors and taken once by run");
 
         // Drive each policy's window timer.
         let (invalid_cancel_tx, invalid_cancel_rx) = oneshot::channel::<()>();
@@ -1132,6 +1171,22 @@ where
             // ── Loop-local state ──
             let mut narrator =
                 RunNarrator::with_started_phases(std::mem::take(&mut self.started_phases));
+            // #520 per-task narrator + the arm-after-catch-up bootstrap
+            // guard (owner directive). The channel buffered every transition
+            // the bootstrap restore fired BEFORE this loop; drain that batch
+            // NON-blockingly here and narrate it as ONE baseline summary line
+            // (the converged mirror's per-state partition), NEVER as N
+            // per-task changes. From the next line on, the select! arm
+            // narrates each LIVE transition individually. A `Disconnected`
+            // here is impossible — `self.cluster_state` still holds the
+            // sender — so `try_recv` only ever returns `Empty` at the batch
+            // end.
+            let mut task_narrator = ObserverTaskNarrator::default();
+            let mut baseline_transitions = 0usize;
+            while task_state_change_rx.try_recv().is_ok() {
+                baseline_transitions += 1;
+            }
+            task_narrator.narrate_baseline(baseline_transitions, self.cluster_state.counts());
             // The report-lost-and-keep-observing state machine (BUG-B): the
             // observer's loss of its OWN transport view is reported + retried,
             // NEVER a run verdict — see [`crate::observer::lost_visibility`].
@@ -1497,6 +1552,19 @@ where
                     // one sender alive for the coordinator's lifetime.
                     Some(outcome) = respawn_exec_rx.recv() => {
                         self.on_respawn_exec_complete(outcome).await;
+                    }
+                    // #520 per-task narration arm: one LIVE transition the
+                    // CRDT merge applied (live broadcast OR snapshot restore
+                    // — path-independent) → one operator wake-line at the
+                    // spec-fixed level. Never `None`: `self.cluster_state`
+                    // holds the sender for the coordinator's lifetime.
+                    // Cancel-safe: a single mpsc recv. A narrated transition
+                    // is a wake-stream HOST — flush the parked reconnection
+                    // note right after, exactly like `RunNarrator::observe`.
+                    Some(change) = task_state_change_rx.recv() => {
+                        if task_narrator.narrate_live(&change) {
+                            self.wake_note.flush_after_host();
+                        }
                     }
                     // Policy B fatal-exit (item 13): the invalid_task
                     // monitor signalled; the OBSERVER exits non-zero. Typed as

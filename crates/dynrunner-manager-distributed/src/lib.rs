@@ -26,6 +26,7 @@ pub mod setup_exec;
 pub mod state;
 pub mod upload_action;
 pub mod task_completed;
+pub mod task_state_change;
 pub mod worker_messages;
 pub mod worker_signal;
 pub mod zip_extract;
