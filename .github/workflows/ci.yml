@@ -47,9 +47,12 @@ jobs:
 
       # dynrunner-pyo3 with default features off (no `extension-module`) and
       # `test-with-python` on (pyo3/auto-initialize), so the test binary links
-      # against libpython and brings up a CPython interpreter at runtime.
+      # against libpython and brings up a CPython interpreter at runtime. The
+      # interpreter is a single process-global, so the suite MUST run serially
+      # (--test-threads=1) — concurrent test threads contend on the GIL and
+      # make the interpreter-driven tests flaky.
       - name: Test pyo3 (python-linked)
-        run: cargo test -p dynrunner-pyo3 --no-default-features --features test-with-python
+        run: cargo test -p dynrunner-pyo3 --no-default-features --features test-with-python -- --test-threads=1
 
   nix:
     name: nix flake check

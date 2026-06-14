@@ -24,9 +24,12 @@ default = ["extension-module"]
 extension-module = ["pyo3/extension-module"]
 # Opt-in for `cargo test`: drop `extension-module` (which strips the
 # `libpython` link) and add `auto-initialize` so PyO3 brings up a
-# CPython interpreter on first `Python::attach`. Run as
+# CPython interpreter on first `Python::attach`. That interpreter is a
+# single process-global, so these tests MUST run serially — concurrent
+# test threads contend on the GIL / interpreter state and make the
+# interpreter-driven tests flaky. Run as
 # `cargo test -p dynrunner-pyo3 --lib --no-default-features
-#   --features test-with-python <pattern>`.
+#   --features test-with-python -- --test-threads=1 <pattern>`.
 test-with-python = ["pyo3/auto-initialize"]
 
 [dependencies]
