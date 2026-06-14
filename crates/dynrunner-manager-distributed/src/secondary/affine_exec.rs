@@ -288,16 +288,14 @@ where
         affine_hash: String,
         factory: &mut impl dynrunner_manager_local::WorkerFactory<M>,
     ) -> Result<(), String> {
-        // Resolve `I`'s TaskInfo from this node's replicated CRDT mirror (a
-        // prior `TaskAdded` broadcast seeded it; the Phase-2 originator put it
-        // in `AffineReady`). CLONE it out so the `cluster_state` borrow ends
-        // before the async import runs against `&self.import_action`. A hash
-        // this node does not know is a structural wiring fault — fail every
-        // queued dependent non-recoverably rather than leave them stranded.
-        let task = self
-            .cluster_state
-            .task_state(&affine_hash)
-            .map(|state| state.task().clone());
+        // Resolve `I`'s TaskInfo over the FULL LOGICAL ledger (fat OR the
+        // spilled settled record) — the resolution twin of the spill-safe
+        // gate DETECTION (`unmet_local_affine_dep`). CLONE it out so the
+        // `cluster_state` borrow ends before the async import runs against
+        // `&self.import_action`. A hash in NEITHER half is the #509 sync race
+        // (TaskAdded not yet synced): fail every queued dependent
+        // RECOVERABLY (re-routable per #495) rather than dropping the build.
+        let task = self.cluster_state.affine_gate_task(&affine_hash);
 
         let outcome = match task {
             Some(task) => execute_affine_with_action(&task, &self.import_action).await,
@@ -308,20 +306,36 @@ where
             .await
     }
 
-    /// The structural-wiring failure used when a SecondaryAffine gate is
-    /// absent from this node's local ledger at import time (assignment outran
-    /// the gate's `TaskAdded` broadcast, or a concurrent removal): every
-    /// queued dependent is failed NON-recoverably rather than left stranded.
-    /// Shared by the inline ([`Self::run_affine_import_once`]) and off-loop
+    /// The TRANSIENT verdict used when a SecondaryAffine gate's body cannot
+    /// be resolved over the FULL LOGICAL ledger at import time — the gate is
+    /// in NEITHER the fat map NOR the settled index, so the build's
+    /// ASSIGNMENT frame outran the gate's `TaskAdded` CRDT propagation to
+    /// this node (#509). This is a transient SYNC RACE, NOT a permanent
+    /// fault: a `Recoverable` verdict re-routes each queued dependent per
+    /// #495 (`report_deferred_task_failed` → the primary re-injects into the
+    /// pool, BOUNDED by the per-phase `retry_max_passes` budget), so on
+    /// re-assignment — once the gate's `TaskAdded` has synced — the build is
+    /// gated behind the import and runs. A NonRecoverable here was the #509
+    /// bug: the primary does NOT re-route a NonRecoverable, so a build lost
+    /// the race and was permanently dropped. A gate that genuinely NEVER
+    /// appears fails-final after the budget, never silently lost and never
+    /// looped — the SAME Recoverable-vs-NonRecoverable shape as
+    /// [`Self::report_unresolvable_task`] (#495).
+    ///
+    /// A SPILLED gate is NOT absent — its body is read back from the spill
+    /// file by [`crate::cluster_state::ClusterState::affine_gate_task`], so
+    /// the import proceeds normally and never reaches this verdict. Shared by
+    /// the inline ([`Self::run_affine_import_once`]) and off-loop
     /// ([`Self::drive_affine_import`]) drives so the absent-gate verdict has
     /// one definition.
     pub(in crate::secondary) fn affine_gate_absent_failure(affine_hash: &str) -> AffineOutcome {
         AffineOutcome::Failure {
-            error_type: dynrunner_core::ErrorType::NonRecoverable,
+            error_type: dynrunner_core::ErrorType::Recoverable,
             reason: format!(
-                "SecondaryAffine gate '{affine_hash}' absent from the local \
-                 ledger (assignment outran TaskAdded, or a concurrent \
-                 removal) — failing its queued dependents non-recoverably",
+                "SecondaryAffine gate '{affine_hash}' not yet synced to the \
+                 local ledger (assignment outran its TaskAdded) — re-routing \
+                 its queued dependents (Recoverable) so they retry once the \
+                 gate's TaskAdded arrives",
             ),
         }
     }
@@ -560,17 +574,19 @@ where
     ///
     /// Task resolution happens HERE (on the loop, reading `cluster_state`) so
     /// the cloned `TaskInfo` + the cloned `Arc<dyn ImportAction>` (both
-    /// moveable) cross into the spawned task without holding any borrow. An
-    /// absent gate is the structural-wiring fault delivered as a NonRecoverable
-    /// completion (no spawn — there is nothing to import), so its queued
-    /// dependents are failed by the SAME release body.
+    /// moveable) cross into the spawned task without holding any borrow. The
+    /// gate body is resolved over the FULL LOGICAL ledger
+    /// ([`crate::cluster_state::ClusterState::affine_gate_task`] — fat OR the
+    /// spilled settled record), mirroring the spill-safe gate DETECTION, so a
+    /// gate that resolved-then-SPILLED still imports (the fat-only read went
+    /// blind). A gate in NEITHER half is the #509 sync race (TaskAdded not yet
+    /// synced) delivered as a RECOVERABLE completion (no spawn — there is
+    /// nothing yet to import), so its queued dependents are RE-ROUTED (per
+    /// #495) by the SAME release body, retrying once the gate syncs.
     ///
     /// [`spawn_local`]: tokio::task::spawn_local
     pub(in crate::secondary) fn drive_affine_import(&mut self, affine_hash: String) {
-        let task = self
-            .cluster_state
-            .task_state(&affine_hash)
-            .map(|state| state.task().clone());
+        let task = self.cluster_state.affine_gate_task(&affine_hash);
         let tx = self.affine_import_tx.clone();
 
         match task {
@@ -591,8 +607,11 @@ where
                 });
             }
             None => {
-                // No body to import — deliver the absent-gate failure straight
-                // to the completion arm (which fails the queued dependents).
+                // Gate body in NEITHER the fat map nor the settled index —
+                // the #509 sync race. No body to import yet; deliver the
+                // RECOVERABLE absent verdict straight to the completion arm,
+                // which re-routes the queued dependents (per #495) so they
+                // retry once the gate's TaskAdded syncs.
                 let _ = tx.send(AffineImportComplete {
                     outcome: Self::affine_gate_absent_failure(&affine_hash),
                     affine_hash,
