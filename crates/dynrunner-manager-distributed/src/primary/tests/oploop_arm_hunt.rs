@@ -437,8 +437,8 @@ async fn arm_hunt_discovery_settle_races_burst_over_quic() {
             let binaries: Vec<TaskInfo<TestId>> = (0..tasks)
                 .map(|i| make_binary(&format!("bin_{i}"), 50 + (i as u64) * 10))
                 .collect();
-            let fire_count = std::rc::Rc::new(std::cell::Cell::new(0u32));
-            let fc = std::rc::Rc::clone(&fire_count);
+            let fire_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let fc = std::sync::Arc::clone(&fire_count);
 
             let config = PrimaryConfig {
                 node_id: "sec-0".to_string(),
@@ -470,7 +470,7 @@ async fn arm_hunt_discovery_settle_races_burst_over_quic() {
             .await;
 
             assert_eq!(
-                fire_count.get(),
+                fire_count.load(std::sync::atomic::Ordering::Relaxed),
                 1,
                 "the discovery policy must have fired exactly once \
                  (the discover_on_promotion pre-loop path)",

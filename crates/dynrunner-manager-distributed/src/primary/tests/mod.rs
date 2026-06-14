@@ -166,7 +166,7 @@ pub(super) fn make_phased_typed_binary(
 pub(super) fn fixed_discovery(
     binaries: Vec<TaskInfo<TestId>>,
     phase_deps: HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>,
-    fire_count: std::rc::Rc<std::cell::Cell<u32>>,
+    fire_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) -> crate::discovery::SetupDiscovery<TestId> {
     fixed_discovery_marked(
         binaries.into_iter().map(|b| (b, false)).collect(),
@@ -181,11 +181,11 @@ pub(super) fn fixed_discovery(
 pub(super) fn fixed_discovery_marked(
     binaries: Vec<(TaskInfo<TestId>, bool)>,
     phase_deps: HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>,
-    fire_count: std::rc::Rc<std::cell::Cell<u32>>,
+    fire_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) -> crate::discovery::SetupDiscovery<TestId> {
     crate::discovery::SetupDiscovery {
         discover: Box::new(move || {
-            fire_count.set(fire_count.get() + 1);
+            fire_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let out = binaries.clone();
             Box::pin(async move { Ok(out) })
         }),

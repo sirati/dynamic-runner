@@ -224,7 +224,7 @@ async fn flag_on_discovery_path_seeds_setup_completed_and_dependent_dispatchable
             // file-backed work task, then run the discovery originator.
             let work = make_binary("discovered-work", 100);
             let work_hash = compute_task_hash(&work);
-            let fire = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fire = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             primary.register_setup_discovery(fixed_discovery(
                 vec![work],
                 HashMap::new(),
@@ -238,7 +238,7 @@ async fn flag_on_discovery_path_seeds_setup_completed_and_dependent_dispatchable
                 .discover_on_promotion()
                 .await
                 .expect("discovery seam with flagged staging");
-            assert_eq!(fire.get(), 1, "discovery policy fired once");
+            assert_eq!(fire.load(std::sync::atomic::Ordering::Relaxed), 1, "discovery policy fired once");
 
             let cs = primary.cluster_state_for_test();
             assert_eq!(

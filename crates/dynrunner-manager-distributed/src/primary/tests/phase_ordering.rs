@@ -545,7 +545,7 @@ async fn mode2_zero_to_run_phase1_with_lazy_spawn_phase2_does_not_prematurely_co
                 });
                 cs.apply(ClusterMutation::DiscoveryDebtDeclared);
             }
-            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             primary.register_setup_discovery(fixed_discovery_marked(
                 probe_items,
                 phase_deps,
@@ -595,7 +595,7 @@ async fn mode2_zero_to_run_phase1_with_lazy_spawn_phase2_does_not_prematurely_co
             );
             exit.expect("the mode-2 run must exit Ok, not error");
 
-            assert_eq!(fires.get(), 1, "discovery runs exactly once");
+            assert_eq!(fires.load(std::sync::atomic::Ordering::Relaxed), 1, "discovery runs exactly once");
             let completed = primary.completed_count();
             let failed = primary.failed_count();
             let log = events.lock().unwrap().clone();
@@ -736,7 +736,7 @@ async fn mode2_all_skipped_phase1_fires_on_phase_end_once_and_lazy_spawn_lands()
                 });
                 cs.apply(ClusterMutation::DiscoveryDebtDeclared);
             }
-            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             primary.register_setup_discovery(fixed_discovery_marked(
                 probe_items,
                 phase_deps,
@@ -784,7 +784,7 @@ async fn mode2_all_skipped_phase1_fires_on_phase_end_once_and_lazy_spawn_lands()
                  empty-drain fail-loud",
             );
 
-            assert_eq!(fires.get(), 1, "discovery runs exactly once");
+            assert_eq!(fires.load(std::sync::atomic::Ordering::Relaxed), 1, "discovery runs exactly once");
             let completed = primary.completed_count();
             let failed = primary.failed_count();
             let log = events.lock().unwrap().clone();

@@ -24,6 +24,7 @@
 //! coordinator's internals.
 
 mod compose;
+mod coordinator_host;
 mod outcome;
 mod promotion;
 mod select;
@@ -42,6 +43,7 @@ use crate::primary::{PrimaryCoordinator, PrimaryRunOutcome};
 use crate::secondary::SecondaryCoordinator;
 
 use compose::{empty_primary_args, first_live_peer_id};
+use coordinator_host::CoordinatorThread;
 use outcome::{ObserverJoinHandle, SecondaryJoinHandle, finalize_observer, secondary_terminal};
 use promotion::{self_build_promoted_primary, spawn_primary_with};
 use select::{join_opt_run, join_secondary, recv_opt, recv_primary};
@@ -59,8 +61,17 @@ impl<I, Mgr, Sched, Est>
 where
     I: Identifier + 'static,
     Mgr: ManagerEndpoint + 'static,
-    Sched: Scheduler<I> + Clone + 'static,
-    Est: ResourceEstimator<I> + Clone + 'static,
+    // `Send` on the scheduler + estimator: on a real-network node the primary
+    // coordinator (which owns a `Sched` + `Est`) is MOVED onto its own dedicated
+    // thread by `coordinator_host::spawn_primary` (the one-time spawn-move that
+    // isolates the primary loop from a co-located secondary). The in-process
+    // flavor keeps it on the shared `LocalSet` and needs no `Send`, but the bound
+    // is uniform on the impl. `I: Identifier` already requires `Send`; the
+    // secondary/observer are never moved, so this bound is satisfied by every
+    // real implementor (the pyo3 estimator's `Arc<Py<PyAny>>` + the plain-struct
+    // scheduler are both `Send`).
+    Sched: Scheduler<I> + Clone + Send + 'static,
+    Est: ResourceEstimator<I> + Clone + Send + 'static,
 {
     /// Compose + drive this node's roles to a single [`NodeRunOutcome`].
     ///
@@ -91,6 +102,17 @@ where
         // drives it solely through the control handle.
         let control = host.control().clone();
 
+        // The coordinator-executor decision (the SAME composition flavor the
+        // mesh runs on): a dedicated-thread mesh marks a real-network node where
+        // a primary (bootstrap OR promoted) co-resides in-process with a live
+        // secondary, so the primary's loop runs on its OWN thread (a primary CPU
+        // burst can no longer starve the secondary's loop). A `LocalSet`-hosted
+        // mesh marks the in-process `--multi-computer local` node, whose
+        // pure-`mpsc` mesh + co-located roles share one runtime — the primary
+        // stays on that shared `LocalSet`. See
+        // `MeshHost::runs_on_dedicated_thread` + `coordinator_host::spawn_primary`.
+        let dedicated_primary = host.runs_on_dedicated_thread();
+
         // ── Spawn the bootstrap roles ───────────────────────────────────
 
         // PRIMARY (the submitter): register its BUG-6 demote hook (on its own
@@ -99,6 +121,11 @@ where
         // (Relocated{handoff}). The outcome (and any handoff) rides back on
         // `primary_done`.
         let mut primary_done: Option<oneshot::Receiver<PrimaryRunOutcome<I>>> = None;
+        // The dedicated coordinator thread the primary's loop runs on (bootstrap
+        // OR promoted). The node holds it as the teardown lever and joins it at
+        // wind-down, after the outcome has arrived over `primary_done`. `None`
+        // when this node never hosts a primary (a pure secondary / observer).
+        let mut primary_thread: Option<CoordinatorThread> = None;
         if let Some(entry) = primary {
             let args = inputs
                 .primary_run_args
@@ -114,12 +141,22 @@ where
             let (tx, rx) = oneshot::channel();
             primary_done = Some(rx);
             // Hold the slot Arc for the primary's lifetime (teardown lever).
+            // Parked on the NODE's `LocalSet`, NOT the primary's dedicated
+            // thread: the slot belongs to the mesh (the pump delivers loopback
+            // frames through it), independent of where the coordinator's loop
+            // executes.
             let slot = entry.slot;
             tokio::task::spawn_local(async move {
                 let _slot = slot;
                 std::future::pending::<()>().await;
             });
-            spawn_primary_with(coordinator, args, &control, tx);
+            primary_thread = Some(spawn_primary_with(
+                coordinator,
+                args,
+                &control,
+                tx,
+                dedicated_primary,
+            ));
         }
 
         // SECONDARY: run it with the supplied factory. Its `run` drains its
@@ -191,14 +228,20 @@ where
                     // One primary per node: a promotion while a primary
                     // already runs here is a no-op (the duplicate-build guard).
                     if primary_done.is_none()
-                        && let Some(rx) = self_build_promoted_primary(
+                        && let Some((rx, coord_thread)) = self_build_promoted_primary(
                             signal,
                             &mut inputs.promote,
                             &control,
                             &own_peer_id,
+                            dedicated_primary,
                         ).await
                     {
                         primary_done = Some(rx);
+                        // The promoted primary's loop runs on its OWN dedicated
+                        // thread, isolated from this node's still-live secondary
+                        // (the co-location the thread split fixes). Hold the
+                        // thread for teardown at wind-down.
+                        primary_thread = Some(coord_thread);
                     }
                 }
 
@@ -289,6 +332,18 @@ where
         if let Some(h) = secondary_done {
             h.abort();
             let _ = h.await;
+        }
+        // Join the primary's dedicated coordinator thread (bootstrap OR
+        // promoted). By the time the lifecycle loop broke, the primary's
+        // outcome had already arrived over `primary_done` (its `run_consuming`
+        // returned) OR it relocated into the observer (the thread is exiting
+        // either way), so this join is bounded and completes in milliseconds; a
+        // pathological wedge is reported loudly and detached rather than
+        // hanging teardown (see `CoordinatorThread::teardown`). Dropping it here
+        // would also join (the `Drop` impl), but the explicit join keeps the
+        // wind-down ordering legible alongside the sibling teardown above.
+        if let Some(mut t) = primary_thread.take() {
+            t.teardown();
         }
 
         outcome

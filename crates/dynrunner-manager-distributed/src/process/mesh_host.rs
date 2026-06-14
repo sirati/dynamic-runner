@@ -299,6 +299,25 @@ impl<I: Identifier> MeshHost<I> {
         &self.control
     }
 
+    /// Whether this mesh runs on a DEDICATED runtime thread
+    /// ([`Self::on_dedicated_thread`]) rather than the caller's `LocalSet`
+    /// ([`Self::on_local_set`]).
+    ///
+    /// The composition flavor IS the coordinator-executor decision: a
+    /// dedicated-thread mesh marks a REAL-network node (the SLURM/network
+    /// secondary, the submitter primary) where a promoted primary co-resides
+    /// in-process with a live secondary and MUST run its loop on its own thread
+    /// so a primary CPU burst cannot starve the secondary (see
+    /// [`super::run`]'s `Node::run` + the `coordinator_host` executor). A
+    /// `LocalSet`-hosted mesh marks the in-process `--multi-computer local`
+    /// node, whose pure-`mpsc` mesh AND every co-located role deliberately
+    /// share ONE runtime (no wire QoS to protect, and the single-runtime model
+    /// is load-bearing for the in-process harness's cooperative scheduling) —
+    /// there the primary stays on the shared `LocalSet`.
+    pub fn runs_on_dedicated_thread(&self) -> bool {
+        matches!(self.runner, HostRunner::Thread(_))
+    }
+
     /// Stop the hosted mesh: drain any still-queued egress THROUGH the pump
     /// (`wind_down` — so a final keepalive/completion broadcast queued in
     /// the same sync step as the headline role resolving is applied, not
@@ -439,6 +458,51 @@ mod tests {
                 assert_eq!(frame.sender_id(), "node-1");
                 drop(slot);
                 host.stop().await;
+            })
+            .await;
+    }
+
+    /// The executor-flavor predicate the coordinator host keys on (see
+    /// `process::run::coordinator_host` + `Node::run`): a dedicated-thread mesh
+    /// reports `true` (the promoted primary co-resides with a live secondary →
+    /// isolate its loop on its own thread); a `LocalSet`-hosted mesh reports
+    /// `false` (the in-process node shares one runtime). Pinning this predicate
+    /// pins the decision that routes the production relocation path to the
+    /// thread executor and the in-process / paused-clock path to the shared
+    /// `LocalSet`.
+    #[tokio::test]
+    async fn runs_on_dedicated_thread_distinguishes_the_two_flavors() {
+        // Thread flavor: a real dedicated mesh runtime thread.
+        let (thread_host, _extra) = MeshHost::<TestId>::on_dedicated_thread(|| async {
+            let mut nodes = peer_mesh::<TestId>(&["node-1".to_string(), "node-2".to_string()]);
+            let sibling = nodes.remove(1);
+            let transport = nodes.remove(0);
+            tokio::task::spawn_local(async move {
+                let _sibling = sibling;
+                std::future::pending::<()>().await;
+            });
+            Ok((transport, ()))
+        })
+        .await
+        .expect("mesh runtime spawn");
+        assert!(
+            thread_host.runs_on_dedicated_thread(),
+            "an on_dedicated_thread mesh must select the dedicated-thread primary executor"
+        );
+        thread_host.stop().await;
+
+        // Local flavor: pump on the caller's LocalSet.
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let transport = peer_mesh::<TestId>(&["node-1".to_string()]).remove(0);
+                let mesh = Mesh::new(transport);
+                let local_host = MeshHost::on_local_set(mesh);
+                assert!(
+                    !local_host.runs_on_dedicated_thread(),
+                    "an on_local_set mesh must keep the primary on the shared LocalSet"
+                );
+                local_host.stop().await;
             })
             .await;
     }

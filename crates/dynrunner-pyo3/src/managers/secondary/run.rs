@@ -1878,7 +1878,10 @@ pub(crate) fn build_setup_discovery_fn(
         };
         Box::pin(fut)
             as Pin<
-                Box<dyn Future<Output = Result<Vec<(TaskInfo<RunnerIdentifier>, bool)>, String>>>,
+                Box<
+                    dyn Future<Output = Result<Vec<(TaskInfo<RunnerIdentifier>, bool)>, String>>
+                        + Send,
+                >,
             >
     })
 }

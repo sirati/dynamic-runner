@@ -66,12 +66,12 @@ async fn promoted_populated_crdt_does_not_redo_discovery_phase_start_or_reassign
                 });
             }
             // A discovery policy IS registered — NO-REDO must hold even so.
-            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             promoted.register_setup_discovery(crate::discovery::SetupDiscovery {
                 discover: {
                     let fires = fires.clone();
                     Box::new(move || {
-                        fires.set(fires.get() + 1);
+                        fires.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         Box::pin(async { Ok(vec![(make_binary("SHOULD-NOT-RUN", 1), false)]) })
                     })
                 },
@@ -106,7 +106,7 @@ async fn promoted_populated_crdt_does_not_redo_discovery_phase_start_or_reassign
                 .await
                 .expect("Settled → no-op");
             assert_eq!(
-                fires.get(),
+                fires.load(std::sync::atomic::Ordering::Relaxed),
                 0,
                 "a populated (Settled) CRDT must NOT re-run discovery"
             );

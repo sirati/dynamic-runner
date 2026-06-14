@@ -213,7 +213,7 @@ async fn discover_on_promotion_originate_resolves_gate_and_build_is_dispatchable
             // Mode-2: declare debt + register a discovery policy that yields
             // the gate + dependent build, then run the discovery originator
             // (the production `discover_on_promotion` seam).
-            let fire = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fire = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             primary.register_setup_discovery(fixed_discovery(
                 vec![gate, build],
                 HashMap::new(),
@@ -227,7 +227,7 @@ async fn discover_on_promotion_originate_resolves_gate_and_build_is_dispatchable
                 .discover_on_promotion()
                 .await
                 .expect("discovery originate seam");
-            assert_eq!(fire.get(), 1, "discovery policy fired once");
+            assert_eq!(fire.load(std::sync::atomic::Ordering::Relaxed), 1, "discovery policy fired once");
 
             assert_gate_resolved_and_build_dispatchable(&primary, &gate_hash, &build_hash);
         })

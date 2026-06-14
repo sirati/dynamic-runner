@@ -79,7 +79,7 @@ async fn discover_on_promotion_duplicate_task_id_aborts_run_with_verdict() {
             primary
                 .cluster_state_mut_for_test()
                 .apply(ClusterMutation::DiscoveryDebtDeclared);
-            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             primary.register_setup_discovery(fixed_discovery(
                 duplicate_task_id_discovery_batch(),
                 HashMap::new(),
@@ -162,7 +162,7 @@ async fn invalid_composition_verdict_is_broadcast_to_the_fleet() {
             primary
                 .cluster_state_mut_for_test()
                 .apply(ClusterMutation::DiscoveryDebtDeclared);
-            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             primary.register_setup_discovery(fixed_discovery(
                 duplicate_task_id_discovery_batch(),
                 HashMap::new(),

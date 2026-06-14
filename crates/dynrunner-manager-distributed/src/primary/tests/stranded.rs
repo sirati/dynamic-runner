@@ -690,7 +690,7 @@ async fn stranded_after_owed_discovery_collapse_returns_err_not_run_complete() {
             let discovered: Vec<TaskInfo<TestId>> = (0..N)
                 .map(|i| make_binary(&format!("disc_{i}"), 50 + (i as u64) * 10))
                 .collect();
-            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             primary.register_setup_discovery(fixed_discovery(
                 discovered,
                 HashMap::new(),
@@ -719,7 +719,7 @@ async fn stranded_after_owed_discovery_collapse_returns_err_not_run_complete() {
             let outcome = primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope).await;
 
             assert_eq!(
-                fires.get(),
+                fires.load(std::sync::atomic::Ordering::Relaxed),
                 1,
                 "the discovery policy must run exactly once on the Owed path"
             );

@@ -18,6 +18,7 @@ use super::super::node::PromotionSignal;
 use super::super::pump::MeshControlHandle;
 use super::super::role::LocalRole;
 use super::super::run_inputs::PrimaryRunArgs;
+use super::coordinator_host::{CoordinatorThread, spawn_primary};
 use crate::primary::{PrimaryCoordinator, PrimaryRunOutcome};
 
 /// Build, seed, register, and spawn a promoted primary on a promotion
@@ -37,11 +38,16 @@ pub(super) async fn self_build_promoted_primary<I, Sched, Est>(
     promote: &mut Option<super::super::run_inputs::PromotedPrimaryBuilder<Sched, Est, I>>,
     control: &MeshControlHandle<I>,
     own_peer_id: &PeerId,
-) -> Option<oneshot::Receiver<PrimaryRunOutcome<I>>>
+    // Whether to isolate the promoted primary on its OWN thread (a real-network
+    // node, where it co-resides in-process with a live secondary) vs keep it on
+    // the node's shared `LocalSet` (the in-process `--multi-computer local`
+    // node). Sourced by the node from `MeshHost::runs_on_dedicated_thread`.
+    dedicated: bool,
+) -> Option<(oneshot::Receiver<PrimaryRunOutcome<I>>, CoordinatorThread)>
 where
     I: Identifier + 'static,
-    Sched: Scheduler<I> + Clone + 'static,
-    Est: ResourceEstimator<I> + Clone + 'static,
+    Sched: Scheduler<I> + Clone + Send + 'static,
+    Est: ResourceEstimator<I> + Clone + Send + 'static,
 {
     let builder = promote.as_mut()?;
     // Register the Primary slot + mint its trio through the pump.
@@ -80,53 +86,48 @@ where
     built.coordinator.register_demote_on_displaced(demote_tx);
 
     let (tx, rx) = oneshot::channel();
-    spawn_primary_with(built.coordinator, built.run_args, control, tx);
+    let coord_thread =
+        spawn_primary_with(built.coordinator, built.run_args, control, tx, dedicated);
     // Hold the slot `Arc` for the primary's lifetime — dropping it is the
     // role-teardown lever (the mesh `Weak` then stops upgrading). Park it in a
-    // detached task so it lives as long as the run.
+    // detached task on the NODE's `LocalSet` (NOT the primary's dedicated
+    // thread): the slot belongs to the mesh (the pump delivers loopback frames
+    // through it), so it must outlive on the node's runtime, independent of
+    // where the primary coordinator's loop executes.
     tokio::task::spawn_local(async move {
         let _slot = slot;
         std::future::pending::<()>().await;
     });
-    Some(rx)
+    Some((rx, coord_thread))
 }
 
-/// Spawn a primary's `run_consuming`, sending the outcome back. The BUG-6
-/// demote hook is registered by the caller BEFORE this (bootstrap path) or
-/// inside the promotion build, so the consuming run can already race its
-/// demote receiver.
+/// Spawn a primary's `run_consuming` via the coordinator-host executor, sending
+/// the outcome back. The BUG-6 demote hook is registered by the caller BEFORE
+/// this (bootstrap path) or inside the promotion build, so the consuming run can
+/// already race its demote receiver.
+///
+/// `dedicated` selects the executor flavor (see
+/// [`super::coordinator_host::spawn_primary`]): `true` isolates the primary loop
+/// on its own thread (real-network node, co-located with a live secondary);
+/// `false` keeps it on the node's shared `LocalSet` (in-process node). The
+/// boundary is channel-shaped either way (mesh ends + the outcome `oneshot`
+/// cross runtimes natively), so the node's `select!` loop is unchanged; the
+/// returned [`CoordinatorThread`] is the node's teardown lever. `control` is not
+/// needed (the executor reaches the mesh only through the coordinator's
+/// already-wired `MeshClient` / `RoleInbox`), kept in the signature for
+/// call-site symmetry.
 pub(super) fn spawn_primary_with<I, Sched, Est>(
     coordinator: PrimaryCoordinator<Sched, Est, I>,
     args: PrimaryRunArgs<I>,
     control: &MeshControlHandle<I>,
     done: oneshot::Sender<PrimaryRunOutcome<I>>,
-) where
+    dedicated: bool,
+) -> CoordinatorThread
+where
     I: Identifier + 'static,
-    Sched: Scheduler<I> + Clone + 'static,
-    Est: ResourceEstimator<I> + Clone + 'static,
+    Sched: Scheduler<I> + Clone + Send + 'static,
+    Est: ResourceEstimator<I> + Clone + Send + 'static,
 {
     let _ = control;
-    tokio::task::spawn_local(async move {
-        let PrimaryRunArgs {
-            seed,
-            on_phase_start,
-            on_phase_end,
-        } = args;
-        match coordinator
-            .run_consuming(seed, on_phase_start, on_phase_end)
-            .await
-        {
-            Ok(outcome) => {
-                let _ = done.send(outcome);
-            }
-            Err(e) => {
-                let _ = done.send(PrimaryRunOutcome::Local {
-                    result: Err(e),
-                    completed: 0,
-                    failed: 0,
-                    stranded: 0,
-                });
-            }
-        }
-    });
+    spawn_primary(coordinator, args, done, dedicated)
 }

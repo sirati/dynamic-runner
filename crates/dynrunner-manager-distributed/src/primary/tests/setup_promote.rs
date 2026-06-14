@@ -80,7 +80,7 @@ async fn discover_on_promotion_noop_when_undeclared() {
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             primary.register_setup_discovery(fixed_discovery(
                 vec![make_binary("x", 100)],
                 HashMap::new(),
@@ -92,7 +92,7 @@ async fn discover_on_promotion_noop_when_undeclared() {
                 .await
                 .expect("Undeclared → no-op Ok");
 
-            assert_eq!(fires.get(), 0, "the policy must NOT run when Undeclared");
+            assert_eq!(fires.load(std::sync::atomic::Ordering::Relaxed), 0, "the policy must NOT run when Undeclared");
             assert_eq!(
                 primary.cluster_state_for_test().task_count(),
                 0,
@@ -128,7 +128,7 @@ async fn discover_on_promotion_noop_when_settled() {
                 cs.apply(ClusterMutation::DiscoveryDebtDeclared);
                 cs.apply(ClusterMutation::DiscoverySettled);
             }
-            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             primary.register_setup_discovery(fixed_discovery(
                 vec![make_binary("x", 100)],
                 HashMap::new(),
@@ -140,7 +140,7 @@ async fn discover_on_promotion_noop_when_settled() {
                 .await
                 .expect("Settled → no-op Ok");
 
-            assert_eq!(fires.get(), 0, "the policy must NOT run when Settled");
+            assert_eq!(fires.load(std::sync::atomic::Ordering::Relaxed), 0, "the policy must NOT run when Settled");
             assert_eq!(
                 primary.cluster_state_for_test().task_count(),
                 0,
@@ -172,7 +172,7 @@ async fn discover_on_promotion_owed_nonempty_seeds_tasks_and_settles() {
             let t2 = make_binary("disc-2", 100);
             let h1 = compute_task_hash(&t1);
             let h2 = compute_task_hash(&t2);
-            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             primary.register_setup_discovery(fixed_discovery(
                 vec![t1, t2],
                 HashMap::new(),
@@ -184,7 +184,7 @@ async fn discover_on_promotion_owed_nonempty_seeds_tasks_and_settles() {
                 .await
                 .expect("Owed + non-empty → Ok");
 
-            assert_eq!(fires.get(), 1, "the policy runs EXACTLY once");
+            assert_eq!(fires.load(std::sync::atomic::Ordering::Relaxed), 1, "the policy runs EXACTLY once");
             assert_eq!(
                 primary.cluster_state_for_test().discovery_debt(),
                 DiscoveryDebt::Settled,
@@ -235,7 +235,7 @@ async fn discover_on_promotion_owed_empty_settles_and_counter_finalizes() {
             );
             primary.cluster_state_mut_for_test().apply(ClusterMutation::DiscoveryDebtDeclared);
 
-            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             primary.register_setup_discovery(fixed_discovery(
                 Vec::new(),
                 HashMap::new(),
@@ -247,7 +247,7 @@ async fn discover_on_promotion_owed_empty_settles_and_counter_finalizes() {
                 .await
                 .expect("Owed + empty → Ok");
 
-            assert_eq!(fires.get(), 1, "the policy runs exactly once");
+            assert_eq!(fires.load(std::sync::atomic::Ordering::Relaxed), 1, "the policy runs exactly once");
             assert_eq!(
                 primary.cluster_state_for_test().discovery_debt(),
                 DiscoveryDebt::Settled,
@@ -305,7 +305,7 @@ async fn discover_on_promotion_marked_item_lands_skipped_unmarked_lands_pending(
             let to_run = make_binary("needs-run", 100);
             let skipped_hash = compute_task_hash(&skipped);
             let to_run_hash = compute_task_hash(&to_run);
-            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             // The marked item rides through the SetupDiscoveryFn as
             // `(task, true)` — exactly the shape `extract_binaries` yields
             // for a Python item with `skipped_already_done=True`.
@@ -387,7 +387,7 @@ async fn discover_on_promotion_all_skipped_settles_and_counter_finalizes() {
             let s2 = make_binary("done-2", 100);
             let h1 = compute_task_hash(&s1);
             let h2 = compute_task_hash(&s2);
-            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             primary.register_setup_discovery(fixed_discovery_marked(
                 vec![(s1, true), (s2, true)],
                 HashMap::new(),
@@ -497,7 +497,7 @@ async fn discover_on_promotion_zero_to_run_with_dependent_phase_no_run_complete(
             let mut s2 = make_binary("p1-done-2", 100);
             s2.phase_id = dynrunner_core::PhaseId::from("phase1");
 
-            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             primary.register_setup_discovery(fixed_discovery_marked(
                 vec![(s1, true), (s2, true)],
                 deps,
@@ -721,7 +721,7 @@ async fn discovery_owed_suppresses_phase_cascade_until_settled() {
 
             // The driver's seed batch lands (the discovered tasks for "build"
             // + DiscoverySettled): debt flips to Settled.
-            let fires2 = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let fires2 = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let mut t = make_binary("build-1", 100);
             t.phase_id = dynrunner_core::PhaseId::from("build");
             primary.register_setup_discovery(fixed_discovery(

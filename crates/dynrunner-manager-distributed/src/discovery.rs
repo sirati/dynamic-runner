@@ -27,19 +27,30 @@ use dynrunner_core::{Identifier, TaskInfo};
 ///
 /// # Why it returns a FUTURE (the non-blocking contract — correctness)
 ///
-/// The run loop shares ONE single-threaded runtime with the `Node`'s
-/// mesh-pump. If discovery blocked that thread (a slow
-/// `--source-already-staged` scan, or a GIL-held Python excursion), the
-/// pump would stall: keepalives stop flowing AND the node stops receiving
-/// its peers', so a peer declares it dead and STRANDS the run — the exact
-/// §14/§15 fleet-collapse the one-mesh work fixed. So the closure returns a
-/// future the driver `.await`s, yielding the thread to the pump; the
-/// consumer is responsible for making that future non-thread-blocking (e.g.
-/// the pyo3 wrapper runs the GIL excursion on a `spawn_blocking` thread and
-/// awaits its handle). `Err` aborts the run.
+/// The discovery future is awaited inside the primary coordinator's
+/// operational loop. If discovery blocked that thread (a slow
+/// `--source-already-staged` scan, or a GIL-held Python excursion), the loop
+/// would stall — and a stalled loop cannot consume the mesh-delivered
+/// keepalives, so a peer declares the node dead and STRANDS the run (the
+/// §14/§15 fleet-collapse the one-mesh work fixed). So the closure returns a
+/// future the driver `.await`s, yielding the thread; the consumer is
+/// responsible for making that future non-thread-blocking (e.g. the pyo3
+/// wrapper runs the GIL excursion on a `spawn_blocking` thread and awaits its
+/// `Send` handle). `Err` aborts the run.
 ///
-/// `FnMut` because the driver takes it on the one fire; the boxed future
-/// need not be `Send` — it is awaited on the node's own `!Send` task.
+/// # Why `Send` (the thread-move contract)
+///
+/// The primary coordinator's operational loop runs on its OWN dedicated thread
+/// (`process::run::coordinator_host` — isolating a primary CPU burst from a
+/// co-located secondary). The coordinator OWNS its `SetupDiscovery`, so it is
+/// MOVED onto that thread with the coordinator. The closure and its returned
+/// future are therefore `Send`. This is satisfied for free by the real builder:
+/// the future captures only `Send` data (the consumer's `Py<PyAny>` handles are
+/// `Send + Sync`; the GIL excursion is `spawn_blocking`-ed and its `JoinHandle`
+/// is `Send`), so the only Python re-entry happens on a blocking thread under a
+/// fresh `Python::attach`, never by holding a GIL token across the boundary.
+///
+/// `FnMut` because the driver takes it on the one fire.
 ///
 /// Each discovered task is PAIRED with its discovery-time
 /// `skipped_already_done` marker (`true` ⇒ the producer found the item's
@@ -48,7 +59,8 @@ use dynrunner_core::{Identifier, TaskInfo};
 /// discovery boundary, NOT `TaskInfo<I>` — `discover_on_promotion`
 /// partitions on it via the shared `skip_transitions` helper.
 pub type SetupDiscoveryFn<I> = Box<
-    dyn FnMut() -> Pin<Box<dyn Future<Output = Result<Vec<(TaskInfo<I>, bool)>, String>>>>,
+    dyn FnMut() -> Pin<Box<dyn Future<Output = Result<Vec<(TaskInfo<I>, bool)>, String>> + Send>>
+        + Send,
 >;
 
 /// The consumer's setup-discovery policy plus the phase-dependency graph
