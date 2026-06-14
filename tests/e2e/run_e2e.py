@@ -202,7 +202,7 @@ def _fetch_published_outputs_from_gateway(
         )
 
 
-def _list_user_jobs_on_gateway(env: DispatchEnv) -> list[str]:
+def _list_user_jobs_on_gateway(env: DispatchEnv, grace_s: float) -> list[str]:
     """Return SLURM job IDs still present for our SSH user.
 
     Used as the post-scenario teardown gate: a healthy run must end
@@ -211,12 +211,14 @@ def _list_user_jobs_on_gateway(env: DispatchEnv) -> list[str]:
     exited yet — usually a sign of a framework completion-signal
     regression.
 
-    Polls for up to ``_TEARDOWN_GRACE_S`` seconds so the framework's
+    Polls for up to ``grace_s`` seconds so the framework's
     `RunComplete` broadcast has time to propagate through the peer
     mesh and the wrapper scripts can finish their cleanup (podman
     container exit + ``podman unshare rm -rf $RNDTMP`` is the
-    standard ~5-15s teardown). Returns the leftover job ids if the
-    grace window expires with jobs still in the queue.
+    standard ~5-15s teardown). The grace is the driver's baseline
+    (:data:`_TEARDOWN_GRACE_S`) unless the scenario widened it via
+    :meth:`Scenario.teardown_grace_s`. Returns the leftover job ids if
+    the grace window expires with jobs still in the queue.
 
     Empty list on `squeue` failures (e.g. transient SSH hiccup) so
     the gate doesn't false-positive on flaky transport. The check is
@@ -225,7 +227,7 @@ def _list_user_jobs_on_gateway(env: DispatchEnv) -> list[str]:
     """
     if env.ssh_config_path is None:
         return []
-    deadline = time.monotonic() + _TEARDOWN_GRACE_S
+    deadline = time.monotonic() + grace_s
     last: list[str] = []
     while True:
         rc = subprocess.run(
@@ -250,13 +252,38 @@ def _list_user_jobs_on_gateway(env: DispatchEnv) -> list[str]:
         time.sleep(_TEARDOWN_POLL_S)
 
 
-# Grace window for SLURM jobs to drain post-RunComplete. The wrapper
-# script's `podman unshare rm -rf $RNDTMP` cleanup typically takes
-# 5-15s, but on the slurm-test-env the CG (completing) state can
+# Baseline grace window for SLURM jobs to drain post-RunComplete. The
+# wrapper script's `podman unshare rm -rf $RNDTMP` cleanup typically
+# takes 5-15s, but on the slurm-test-env the CG (completing) state can
 # linger up to ~60s before slurmstepd reaps the wrapper PID;
 # 90s gives headroom without making flaky scenarios block forever.
+#
+# This is sized for a CLEAN run: one primary broadcasts RunComplete and
+# a fixed handful of wrappers drain. A scenario whose terminal path is
+# heavier — e.g. a promoted primary that, post-failover, first inherits
+# and finalizes a large ledger before it can originate RunComplete, then
+# fans the terminal out to a larger surviving fleet — widens the gate
+# per-scenario via `Scenario.teardown_grace_s` (mirrors how the failover
+# scenario already scales its convergence budget with the ledger size).
+# The driver clamps each scenario's override up to at least this
+# baseline so a scenario can only widen, never tighten, the gate.
 _TEARDOWN_GRACE_S = 90.0
 _TEARDOWN_POLL_S = 2.0
+
+
+def _teardown_grace_for(scenario: "Scenario", env: DispatchEnv) -> float:
+    """Resolve the teardown-gate grace for one scenario.
+
+    Asks the scenario for its override (``None`` → use the baseline),
+    then clamps up to :data:`_TEARDOWN_GRACE_S` so a scenario can only
+    widen the gate. A scenario must never tighten it: a too-short gate
+    would false-fail a healthy-but-slow drain, the very failure mode
+    this knob exists to prevent.
+    """
+    override = scenario.teardown_grace_s(env)
+    if override is None:
+        return _TEARDOWN_GRACE_S
+    return max(_TEARDOWN_GRACE_S, float(override))
 
 
 def _scancel_user_jobs_on_gateway(env: DispatchEnv) -> None:
@@ -513,24 +540,25 @@ def _shell_quote(s: str) -> str:
 
 
 def _list_worker_node_leaks(
-    env: DispatchEnv, worker_hostnames: list[str]
+    env: DispatchEnv, worker_hostnames: list[str], grace_s: float
 ) -> list[_WorkerLeak]:
     """Per-worker drain-and-check loop, mirroring the gateway gate.
 
     Submits the probe on every worker each iteration; clears the loop
-    when every worker reports empty leaks. Polls for up to
-    ``_TEARDOWN_GRACE_S`` seconds — the wrapper's
-    ``podman unshare rm -rf $RNDTMP`` is the slowest cleanup step,
-    and on slurm-test-env that runs ~5-15s after the SLURM job exits
-    (the watchdog spawns from `setsid -f` so it survives wrapper EXIT
-    by ~5s by design).
+    when every worker reports empty leaks. Polls for up to ``grace_s``
+    seconds — the wrapper's ``podman unshare rm -rf $RNDTMP`` is the
+    slowest cleanup step, and on slurm-test-env that runs ~5-15s after
+    the SLURM job exits (the watchdog spawns from `setsid -f` so it
+    survives wrapper EXIT by ~5s by design). The grace is the driver's
+    baseline unless the scenario widened it (same value the gateway gate
+    above uses, so both gates share one window).
 
     Returns the list of non-empty ``_WorkerLeak`` snapshots from the
     final iteration. Empty list means clean.
     """
     if env.ssh_config_path is None or not worker_hostnames:
         return []
-    deadline = time.monotonic() + _TEARDOWN_GRACE_S
+    deadline = time.monotonic() + grace_s
     last: list[_WorkerLeak] = []
     while True:
         last = []
@@ -797,7 +825,8 @@ def _run_one_scenario(
         # framework has a teardown regression. Either way, the run
         # is NOT honestly green if SLURM slots are still occupied.
         if env.mode == "slurm":
-            leftover = _list_user_jobs_on_gateway(env)
+            teardown_grace = _teardown_grace_for(scenario, env)
+            leftover = _list_user_jobs_on_gateway(env, teardown_grace)
             if leftover:
                 print(
                     f"[run_e2e]   FAIL: {scenario.name} — "
@@ -823,7 +852,7 @@ def _run_one_scenario(
             # worker for leaked tempdirs / containers / processes
             # the wrapper script was responsible for cleaning up.
             workers = _discover_worker_hostnames(env)
-            leaks = _list_worker_node_leaks(env, workers)
+            leaks = _list_worker_node_leaks(env, workers, teardown_grace)
             if leaks:
                 for line in _format_worker_leak_report(scenario.name, leaks):
                     print(line, flush=True)
