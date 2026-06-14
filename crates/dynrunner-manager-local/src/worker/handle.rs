@@ -38,6 +38,59 @@ type PollTaskOutput<M> = (
     Option<mpsc::UnboundedReceiver<CustomOutboxItem>>,
 );
 
+/// Where a restart-time SIGKILL should land.
+///
+/// The negative-PID idiom `kill(-pgid, …)` signals every process in
+/// a group; the positive-PID `kill(pid, …)` signals one process. The
+/// variant decides which, encoding the safety rule that the group
+/// form is only ever used when the worker LEADS that group (see
+/// [`restart_kill_target`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartKillTarget {
+    /// Worker is its own process-group leader; signal the whole
+    /// group (worker + abandoned build descendants) via `-pgid`.
+    Group(i32),
+    /// Worker is NOT a group leader (or pgid unknown); signal only
+    /// the worker process, never a group it does not lead.
+    Process(i32),
+}
+
+impl RestartKillTarget {
+    /// The argument to pass to `kill(…)`: negative for the group
+    /// form, positive for the bare-PID form.
+    fn signal_pid(self) -> i32 {
+        match self {
+            RestartKillTarget::Group(pgid) => -pgid,
+            RestartKillTarget::Process(pid) => pid,
+        }
+    }
+
+    /// Human-readable label for logging.
+    fn kind(self) -> &'static str {
+        match self {
+            RestartKillTarget::Group(_) => "process-group",
+            RestartKillTarget::Process(_) => "bare-pid",
+        }
+    }
+}
+
+/// Decide where a restart-time SIGKILL must land, given the worker's
+/// PID and its RESOLVED process group (`None` if `getpgid` failed).
+///
+/// Pure targeting policy — no syscalls — so the decision can be
+/// unit-tested without a fork. Group-kill ONLY when the worker is
+/// confirmed its own process-group leader (`pgid == worker_pid`);
+/// every other case (non-leader, or unresolvable pgid) falls back to
+/// the bare-PID kill. The fallback is the safety floor: signalling a
+/// group the worker does not lead could SIGKILL the manager's own
+/// group.
+fn restart_kill_target(worker_pid: i32, resolved_pgid: Option<i32>) -> RestartKillTarget {
+    match resolved_pgid {
+        Some(pgid) if pgid == worker_pid => RestartKillTarget::Group(worker_pid),
+        _ => RestartKillTarget::Process(worker_pid),
+    }
+}
+
 /// Manager-side handle for one worker.
 ///
 /// Wraps the ZST protocol state machine plus per-worker metadata used by the
@@ -239,13 +292,12 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         }
     }
 
-    /// Actively SIGKILL the worker subprocess. Used by the
-    /// secondary's restart path to ensure a stuck or otherwise
-    /// non-responsive worker is dead BEFORE its replacement comes
-    /// up, rather than relying on the worker to notice EOF on its
-    /// transport and exit on its own. Idempotent on absence: no-op
-    /// if `pid` is None, the kernel already reaped, or the process
-    /// is otherwise gone (ESRCH).
+    /// Actively SIGKILL the worker BEFORE its replacement comes up,
+    /// rather than relying on the worker to notice EOF on its
+    /// transport and exit on its own. Used by the secondary's
+    /// restart / type-shift respawn path. Idempotent on absence:
+    /// no-op if `pid` is None, the kernel already reaped, or the
+    /// process is otherwise gone (ESRCH).
     ///
     /// SIGKILL (not SIGTERM) is intentional here: by the time
     /// this is called, the framework has already decided the
@@ -255,29 +307,69 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     /// to enter a graceful-exit code path that's slower than
     /// the manager wants to wait. SIGKILL is the "no graceful
     /// shutdown" lever.
+    ///
+    /// Targets the worker's process GROUP, not just its bare PID,
+    /// so the abandoned in-flight build descendant tree (e.g.
+    /// `make` → `clang`, spawned under the worker's group) dies
+    /// WITH the worker instead of reparenting to PID 1 and
+    /// orphaning on every restart. No grace period: we are
+    /// abandoning the task, so the build children needn't finish —
+    /// this preserves the fast-restart intent, just signalling the
+    /// group instead of the lone leader.
+    ///
+    /// SAFETY: `kill(-pgid, …)` signals the WHOLE group, which is
+    /// safe ONLY when the worker is its OWN process-group leader
+    /// (the factory contract — `Command::process_group(0)` /
+    /// `Popen(start_new_session=True)` — establishes that). A
+    /// worker spawned WITHOUT becoming a group leader sits in the
+    /// MANAGER's group, so group-signalling its real pgid would
+    /// SIGKILL the manager itself. We therefore resolve the real
+    /// pgid and only group-kill when `pgid == worker_pid`; any
+    /// other case (non-leader, or `getpgid` failure) falls back to
+    /// the legacy bare-PID kill. See [`restart_kill_target`].
     #[cfg(unix)]
     pub fn kill_subprocess(&self) {
         use nix::sys::signal::{Signal, kill};
-        use nix::unistd::Pid;
-        let Some(pid) = self.pid else {
+        use nix::unistd::{Pid, getpgid};
+        let Some(pid_raw) = self.pid else {
             return;
         };
-        let pid_raw = pid;
-        let pid = Pid::from_raw(pid as i32);
-        match kill(pid, Signal::SIGKILL) {
+        let worker_pid = pid_raw as i32;
+
+        // Resolve the worker's REAL process group so we never
+        // signal a group the worker does not lead.
+        let resolved_pgid = getpgid(Some(Pid::from_raw(worker_pid)))
+            .ok()
+            .map(|p| p.as_raw());
+        let target = restart_kill_target(worker_pid, resolved_pgid);
+        if matches!(target, RestartKillTarget::Process(_)) {
+            tracing::debug!(
+                worker_id = self.worker_id,
+                pid = worker_pid,
+                resolved_pgid,
+                "worker: restart-kill falling back to bare-PID SIGKILL \
+                 (worker is not its own process-group leader)"
+            );
+        }
+
+        match kill(Pid::from_raw(target.signal_pid()), Signal::SIGKILL) {
             Ok(()) => {
                 tracing::debug!(
                     worker_id = self.worker_id,
-                    pid = %pid,
+                    pid = worker_pid,
+                    target = %target.kind(),
                     "worker: sent SIGKILL before restart"
                 );
-                // The kill edge OWNS the reap: nothing downstream waits
-                // this child (the replacement aborts its poll task, so
-                // no Disconnected event — and therefore no
-                // `try_reap_exit` — ever fires for it). Without this,
-                // every type-shift/restart kill leaks a zombie for the
-                // life of the manager process (the #370 procfs shape).
-                // Detached + bounded, off the runtime thread.
+                // The kill edge OWNS the reap of the worker LEADER:
+                // nothing downstream waits this child (the
+                // replacement aborts its poll task, so no
+                // Disconnected event — and therefore no
+                // `try_reap_exit` — ever fires for it). Without
+                // this, every type-shift/restart kill leaks a
+                // zombie for the life of the manager process (the
+                // #370 procfs shape). The group's descendants are
+                // not our children, so init reaps them once they
+                // die. Detached + bounded, off the runtime thread.
                 super::exit_status::reap_detached(self.worker_id, pid_raw);
             }
             Err(nix::errno::Errno::ESRCH) => {
@@ -288,7 +380,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
             Err(e) => {
                 tracing::warn!(
                     worker_id = self.worker_id,
-                    pid = %pid,
+                    pid = worker_pid,
                     error = %e,
                     "worker: SIGKILL pre-restart failed; \
                      proceeding with restart anyway"
@@ -1020,5 +1112,225 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     pub fn set_memory_charge(&mut self, charge: crate::monitor::MemoryCharge) {
         self.actual_swap_bytes = charge.swap_bytes;
         self.actual_usage = charge.to_resource_map();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod restart_kill_tests {
+    use super::{RestartKillTarget, restart_kill_target};
+
+    // ---- Pure targeting policy (no syscalls; always run) ----
+
+    #[test]
+    fn leader_targets_its_own_group() {
+        // Worker is its own group leader (pgid == pid) → group-kill
+        // the whole abandoned tree via the negative pgid.
+        let t = restart_kill_target(4242, Some(4242));
+        assert_eq!(t, RestartKillTarget::Group(4242));
+        assert_eq!(t.signal_pid(), -4242, "group form must signal -pgid");
+        assert_eq!(t.kind(), "process-group");
+    }
+
+    #[test]
+    fn non_leader_falls_back_to_bare_pid() {
+        // Worker sits in some OTHER group (e.g. the manager's) →
+        // NEVER signal that foreign group; bare-PID fallback only.
+        let t = restart_kill_target(4242, Some(100));
+        assert_eq!(t, RestartKillTarget::Process(4242));
+        assert_eq!(t.signal_pid(), 4242, "bare form must signal +pid");
+        assert_eq!(t.kind(), "bare-pid");
+    }
+
+    #[test]
+    fn unresolvable_pgid_falls_back_to_bare_pid() {
+        // getpgid failed (ESRCH / etc.) → we cannot prove leadership,
+        // so we must NOT group-kill. Bare-PID fallback.
+        let t = restart_kill_target(4242, None);
+        assert_eq!(t, RestartKillTarget::Process(4242));
+        assert_eq!(t.signal_pid(), 4242);
+    }
+
+    // ---- Effectful proof: group-kill reaps the descendant tree ----
+
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, kill};
+    use nix::sys::wait::{WaitStatus, waitpid};
+    use nix::unistd::{ForkResult, Pid, getpgid, getpid, setsid};
+    use std::time::{Duration, Instant};
+
+    /// Poll `kill(pid, 0)` until the process is gone (ESRCH) or the
+    /// deadline elapses. Returns true iff the process is gone. Used
+    /// to observe a NON-child (the grandchild, reparented to init)
+    /// disappearing, which `waitpid` cannot do for a non-child.
+    fn wait_gone(pid: Pid, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match kill(pid, None) {
+                Err(Errno::ESRCH) => return true,
+                _ => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    /// A leader worker's group-kill must reap the WHOLE tree: the
+    /// worker (group leader) AND its grandchild build descendant —
+    /// the grandchild must NOT survive as an orphan. This replays
+    /// the #500 shape: a worker that is its own group leader with an
+    /// in-flight descendant (stand-in for `make`→`clang`).
+    #[test]
+    fn group_kill_reaps_descendant_no_orphan() {
+        // Channel the grandchild PID back to the parent over a pipe;
+        // the parent needs it to observe the grandchild dying.
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe");
+
+        // SAFETY: between fork() and exec/_exit in the child we use
+        // only async-signal-safe calls (setsid, fork, write, pause,
+        // _exit) and no heap allocation.
+        match unsafe { nix::unistd::fork() }.expect("fork worker") {
+            ForkResult::Child => {
+                // Become our own session + process-group leader, so
+                // pgid == our pid (the factory contract).
+                let _ = setsid();
+                match unsafe { nix::unistd::fork() } {
+                    Ok(ForkResult::Child) => {
+                        // Grandchild: the "build" descendant. Sleep
+                        // long; the group-kill should take us out.
+                        std::thread::sleep(Duration::from_secs(30));
+                        unsafe { nix::libc::_exit(0) };
+                    }
+                    Ok(ForkResult::Parent { child }) => {
+                        // Report the grandchild PID to the parent.
+                        // `write` takes the owned fd by `AsFd`; the
+                        // underlying syscall is async-signal-safe.
+                        let bytes = child.as_raw().to_ne_bytes();
+                        let _ = nix::unistd::write(&write_fd, &bytes);
+                        std::thread::sleep(Duration::from_secs(30));
+                        unsafe { nix::libc::_exit(0) };
+                    }
+                    Err(_) => unsafe { nix::libc::_exit(1) },
+                }
+            }
+            ForkResult::Parent { child } => {
+                drop(write_fd); // parent only reads
+                let worker_pid = child.as_raw();
+
+                // Read the grandchild PID the worker reported.
+                let mut buf = [0u8; 4];
+                read_exact(&read_fd, &mut buf);
+                drop(read_fd);
+                let grandchild = Pid::from_raw(i32::from_ne_bytes(buf));
+
+                // The worker must be its own group leader.
+                let pgid = getpgid(Some(child)).expect("getpgid");
+                assert_eq!(
+                    pgid.as_raw(),
+                    worker_pid,
+                    "test worker must lead its own group"
+                );
+
+                // Targeting policy must pick the group form.
+                let target = restart_kill_target(worker_pid, Some(pgid.as_raw()));
+                assert_eq!(target, RestartKillTarget::Group(worker_pid));
+
+                // Group-kill exactly as kill_subprocess does.
+                kill(Pid::from_raw(target.signal_pid()), Signal::SIGKILL)
+                    .expect("group SIGKILL");
+
+                // Reap the worker leader (our child) so it is not a
+                // zombie, and confirm it died by signal.
+                let status = waitpid(child, None).expect("waitpid worker");
+                assert!(
+                    matches!(status, WaitStatus::Signaled(_, Signal::SIGKILL, _)),
+                    "worker leader must be SIGKILLed, got {status:?}"
+                );
+
+                // The grandchild is NOT our child (it reparents to
+                // init when the worker dies); observe it disappear.
+                assert!(
+                    wait_gone(grandchild, Duration::from_secs(5)),
+                    "grandchild build descendant ORPHANED — it survived \
+                     the worker's group-kill (the #500 leak)"
+                );
+            }
+        }
+    }
+
+    /// The non-leader case must NOT signal a foreign group. We model
+    /// a worker that is NOT a group leader: a sibling process in the
+    /// TEST RUNNER's own group. `kill_subprocess`'s targeting must
+    /// pick the bare-PID form for it, so a hypothetical group-kill
+    /// would never reach the runner's group. We assert the decision,
+    /// and (belt-and-braces) that the runner process itself — a
+    /// member of that same group — is untouched.
+    #[test]
+    fn non_leader_does_not_signal_foreign_group() {
+        // Fork a child but do NOT setsid: it inherits the runner's
+        // process group, so it is NOT its own group leader.
+        match unsafe { nix::unistd::fork() }.expect("fork non-leader") {
+            ForkResult::Child => {
+                std::thread::sleep(Duration::from_secs(30));
+                unsafe { nix::libc::_exit(0) };
+            }
+            ForkResult::Parent { child } => {
+                let worker_pid = child.as_raw();
+                let pgid = getpgid(Some(child)).expect("getpgid");
+
+                // The child's real pgid is the RUNNER's group, not
+                // its own pid — confirm the precondition.
+                assert_ne!(
+                    pgid.as_raw(),
+                    worker_pid,
+                    "non-leader child must inherit the runner's group"
+                );
+                assert_eq!(
+                    pgid.as_raw(),
+                    getpgid(Some(getpid())).expect("self getpgid").as_raw(),
+                    "non-leader child must share the runner's group"
+                );
+
+                // Targeting MUST fall back to bare-PID — never the
+                // group form (which would be the runner's group and
+                // would SIGKILL the manager in production).
+                let target = restart_kill_target(worker_pid, Some(pgid.as_raw()));
+                assert_eq!(target, RestartKillTarget::Process(worker_pid));
+                assert_eq!(target.signal_pid(), worker_pid);
+
+                // Deliver the bare-PID kill the fallback prescribes;
+                // the runner (a co-member of the foreign group) must
+                // be alive afterwards.
+                kill(Pid::from_raw(target.signal_pid()), Signal::SIGKILL)
+                    .expect("bare SIGKILL");
+                assert_eq!(
+                    kill(getpid(), None),
+                    Ok(()),
+                    "test runner must survive the non-leader kill"
+                );
+
+                let _ = waitpid(child, None);
+            }
+        }
+    }
+
+    /// Blocking read of exactly `buf.len()` bytes from `fd`, looping
+    /// over short reads. Test-only helper for the PID handshake.
+    /// nix 0.29's `read` takes a `RawFd`; the borrowed raw fd stays
+    /// valid because the caller owns the pipe end for the duration.
+    fn read_exact(fd: &std::os::fd::OwnedFd, buf: &mut [u8]) {
+        use std::os::fd::AsRawFd;
+        let raw = fd.as_raw_fd();
+        let mut off = 0;
+        while off < buf.len() {
+            match nix::unistd::read(raw, &mut buf[off..]) {
+                Ok(0) => panic!("EOF before grandchild PID handshake completed"),
+                Ok(n) => off += n,
+                Err(Errno::EINTR) => continue,
+                Err(e) => panic!("pipe read failed: {e}"),
+            }
+        }
     }
 }
