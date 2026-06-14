@@ -53,6 +53,7 @@ mod peer_credentials_persist;
 mod phase_decision;
 mod phase_end_raise;
 mod phase_ordering;
+mod prefer_dependency;
 mod preferred_secondaries;
 mod producer_backstop;
 mod promotion;

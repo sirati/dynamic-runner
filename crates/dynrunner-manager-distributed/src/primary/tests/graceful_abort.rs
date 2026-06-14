@@ -163,7 +163,7 @@ async fn graceful_abort_freezes_dispatch_at_the_view_seam() {
             // The ONE seam: every worker's dispatch view is emptied.
             for worker_idx in 0..frozen.workers.len() {
                 assert!(
-                    frozen.dispatch_view_for_worker(worker_idx).is_empty(),
+                    frozen.dispatch_view_for_worker(worker_idx, false).is_empty(),
                     "worker {worker_idx} must see an EMPTY dispatch view under \
                      the graceful-abort freeze"
                 );

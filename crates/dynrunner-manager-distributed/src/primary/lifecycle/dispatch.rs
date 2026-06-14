@@ -59,12 +59,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             if self.should_skip_worker_for_dispatch(worker_idx, bypass_backpressure, false) {
                 continue;
             }
+            // #519 per-decision bias: only a worker that reaches
+            // view-construction makes a real dispatch DECISION, so this runs
+            // AFTER the skip gate (a backpressured / OOM-masked worker is not
+            // a decision and must not advance the counter or consume a toggle
+            // flip — that would desync the deterministic alternation). The
+            // call folds the decision-count bump, the every-W gate re-eval,
+            // and the toggle flip; it returns `false` whenever the cached
+            // gate verdict is disarmed (pre-#519 view).
+            let prefer_dependency = self.prefer_dependency_for_decision();
             // Dispatch-shape view pipeline: pool view → soft
             // preferred-secondaries tie-break → strict
             // preferred-secondaries gate (OOM bucket only) → cap
             // filter. The full pipeline lives behind a single
             // accessor so OOM-bucket policy never leaks here.
-            let view = self.dispatch_view_for_worker(worker_idx);
+            let view = self.dispatch_view_for_worker(worker_idx, prefer_dependency);
             if view.is_empty() {
                 continue;
             }

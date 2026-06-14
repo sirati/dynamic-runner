@@ -403,7 +403,7 @@ async fn normal_pass_unmasked_when_oom_bucket_inactive() {
                     "worker idx {worker_idx} must be dispatch-eligible \
                      outside the OOM bucket"
                 );
-                let view = primary.dispatch_view_for_worker(worker_idx);
+                let view = primary.dispatch_view_for_worker(worker_idx, false);
                 assert_eq!(
                     view.as_slice().len(),
                     2,

@@ -122,6 +122,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             if !batch_eligible.contains(&self.workers[worker_idx].secondary_id) {
                 continue;
             }
+            // #519 per-decision bias: runs only for a worker that reaches
+            // view-construction (a real dispatch decision), after the
+            // payload-eligibility skip — a skipped worker must not advance
+            // the counter or consume a toggle flip. The call folds the
+            // decision-count bump + every-W gate re-eval + toggle flip;
+            // returns `false` while disarmed (pre-#519 view).
+            let prefer_dependency = self.prefer_dependency_for_decision();
             let worker_info = self.workers[worker_idx].budget_info();
             let max_res = self.workers[worker_idx].resource_budgets.clone();
             // The ONE dispatch-shape view pipeline (soft preferred-
@@ -138,7 +145,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // other dispatch path (load-bearing on the promoted-primary
             // path: a freeze inherited via the promotion snapshot must
             // also stop the post-promotion initial assignment).
-            let view = self.dispatch_view_for_worker(worker_idx);
+            let view = self.dispatch_view_for_worker(worker_idx, prefer_dependency);
             if view.is_empty() {
                 continue;
             }
