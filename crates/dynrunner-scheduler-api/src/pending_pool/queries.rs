@@ -20,7 +20,7 @@
 use dynrunner_core::{Identifier, PhaseId, TaskInfo};
 
 use super::pool::PendingPool;
-use super::types::{BucketKey, PhaseState};
+use super::types::{BucketKey, DispatchRank, PhaseState, affinity_key, no_affinity};
 
 impl<I: Identifier> PendingPool<I> {
     /// True iff the entire pool is empty AND no phase is `Active` or
@@ -232,5 +232,126 @@ impl<I: Identifier> PendingPool<I> {
     /// so evicting a holder would be premature).
     pub fn blocked_len(&self) -> usize {
         self.blocked.len()
+    }
+
+    /// The would-be dispatch standing of the WORK tasks gated (transitively)
+    /// on `setup_task_id` — the ordering key the primary uses to route the
+    /// upload whose dependents are most dispatch-imminent FIRST.
+    ///
+    /// `None` ⇒ no Work dependent is reachable yet (the dependent work task
+    /// has not spawned, or only non-Work pass-through nodes are wired). The
+    /// caller treats `None` as [`DispatchRank::WORST`] (route last), so a
+    /// discovered-dependent upload always wins and an as-yet-dependent-less
+    /// one is deferred, never starved (it re-ranks the moment a dependent
+    /// spawns).
+    ///
+    /// ## Transitive walk (single dep-resolution owner)
+    /// The pool's dependency reverse-index `dependents_of` is the ONE graph
+    /// the dependent walks (the same edges [`Self::resolve_completed_dependents`]
+    /// and the permanent-failure cascade traverse). A dependent that is not a
+    /// `Work` task — a `Setup` upload feeding another upload, or a #497
+    /// `SecondaryAffine` import gate between an upload and its builds — is a
+    /// PASS-THROUGH node: it never dispatches to a worker itself, so it
+    /// contributes no rank of its own; the walk recurses through it to the
+    /// `Work` leaves whose dispatch standing the upload truly serves
+    /// (upload → import → build ⇒ the build's standing). Only `Work` leaves
+    /// score.
+    ///
+    /// ## Per-leaf rank + aggregation
+    /// Each `Work` leaf's [`DispatchRank`] is derived from the SAME reads the
+    /// dispatch view uses — its phase's [`PhaseState`] (→ `phase_tier`) and
+    /// its `affinity_key` vs the `no_affinity` sentinel (→ `class_tier`) — so
+    /// no soft-pin logic is duplicated. The aggregate is the MIN (best) leaf
+    /// rank: the hottest dependent pulls the upload forward. The
+    /// `neg_dependent_count` of the returned rank is set to `-(number of Work
+    /// leaves)` so that two uploads whose best leaf is the same (phase, class)
+    /// tier are tie-broken toward the one feeding MORE builds (the asm-dataset
+    /// `group_common` file shared across a GROUP outranks a single-dependent
+    /// `delta`).
+    pub fn dependent_dispatch_rank(&self, setup_task_id: &str) -> Option<DispatchRank> {
+        // Collect the transitive WORK-leaf dependents reachable from the
+        // setup task, recursing through non-Work pass-through nodes. A
+        // `visited` set guards against a diamond (a leaf reached via two
+        // pass-through paths is counted once) and any defensive cycle.
+        let mut work_leaves: Vec<&TaskInfo<I>> = Vec::new();
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut frontier: Vec<&str> = vec![setup_task_id];
+        while let Some(dep_owner_id) = frontier.pop() {
+            let Some(dependents) = self.dependents_of.get(dep_owner_id) else {
+                continue;
+            };
+            for dependent_id in dependents {
+                if !visited.insert(dependent_id.as_str()) {
+                    continue;
+                }
+                match self.task_by_id(dependent_id) {
+                    // A Work leaf: it scores. (A dependent referenced by
+                    // `dependents_of` is normally still `blocked`, but a
+                    // bucket lookup covers the case where a sibling dep
+                    // already unblocked it.)
+                    Some(item) if item.kind.is_worker_assignable() => work_leaves.push(item),
+                    // A non-Work pass-through (Setup / SecondaryAffine): it
+                    // never dispatches itself; recurse to ITS dependents.
+                    Some(_) => frontier.push(dependent_id.as_str()),
+                    // Referenced by the index but no longer resolvable
+                    // (terminal): nothing to score, nothing to recurse.
+                    None => {}
+                }
+            }
+        }
+
+        if work_leaves.is_empty() {
+            return None;
+        }
+        // MIN over leaves on (phase_tier, class_tier); the dependent count
+        // sets the tiebreak field on the aggregate.
+        let count = work_leaves.len() as i32;
+        let best = work_leaves
+            .into_iter()
+            .map(|item| self.work_task_rank(item))
+            .min()
+            .expect("non-empty (checked above)");
+        Some(DispatchRank {
+            phase_tier: best.phase_tier,
+            class_tier: best.class_tier,
+            neg_dependent_count: -count,
+        })
+    }
+
+    /// Per-leaf dispatch rank of one `Work` task, derived from the SAME
+    /// phase-state + affinity reads the dispatch view uses. The
+    /// `neg_dependent_count` is left at the single-leaf default (`-1`); the
+    /// aggregate count is stamped by [`Self::dependent_dispatch_rank`].
+    fn work_task_rank(&self, item: &TaskInfo<I>) -> DispatchRank {
+        let phase_tier = match self.phase_state.get(&item.phase_id) {
+            // Mirrors the dispatch view's class gates: Active dispatches now,
+            // Draining still drains requeued/reinjected items, everything
+            // else (Blocked-will-activate, or an absent/terminal phase) is
+            // not dispatchable now but the dependent will still reach it.
+            Some(PhaseState::Active) => 0,
+            Some(PhaseState::Draining) => 1,
+            _ => 2,
+        };
+        // Typed (pinned) vs free-pool, via the same `no_affinity` sentinel
+        // `view_for_worker` keys its typed-vs-free-pool classes on.
+        let class_tier = if affinity_key(item) == no_affinity() { 1 } else { 0 };
+        DispatchRank {
+            phase_tier,
+            class_tier,
+            neg_dependent_count: -1,
+        }
+    }
+
+    /// Resolve a task by its `task_id` to the live `TaskInfo` the pool holds
+    /// — checking the task-level `blocked` map first (where a dependent
+    /// referenced by `dependents_of` normally sits), then the queued buckets
+    /// (a dependent already unblocked by a sibling dep). Returns `None` for a
+    /// task the pool no longer holds (terminal / never seen). Read-only;
+    /// shared by the dependent-rank walk.
+    fn task_by_id(&self, task_id: &str) -> Option<&TaskInfo<I>> {
+        if let Some(item) = self.blocked.get(task_id) {
+            return Some(item);
+        }
+        self.iter().find(|t| t.task_id == task_id)
     }
 }

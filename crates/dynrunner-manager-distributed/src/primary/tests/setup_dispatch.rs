@@ -601,3 +601,194 @@ async fn upload_setup_task_permanent_failure_cascades() {
         })
         .await;
 }
+
+// ── #336 P3: priority-ordered (min-by-rank) setup-upload routing ───────────
+
+/// A `Work` build on `phase`/`affinity` depending on `dep` — same shape as
+/// [`dependent_work`] but with an explicit affinity so the dependent's
+/// dispatch-rank class (typed vs free-pool) is controllable.
+fn dependent_build(name: &str, phase: &str, affinity: Option<&str>, dep: &str) -> TaskInfo<TestId> {
+    let mut t = make_binary(name, 100);
+    t.phase_id = PhaseId::from(phase);
+    t.type_id = TypeId::from("default");
+    t.affinity_id = affinity.map(dynrunner_core::AffinityId::from);
+    t.task_depends_on = vec![TaskDep {
+        task_id: dep.into(),
+        phase_id: PhaseId::from(phase),
+        inherit_outputs: false,
+    }];
+    t
+}
+
+/// A `SecondaryAffine` import gate on `phase` depending on `dep` (#497).
+fn affine_import(name: &str, phase: &str, dep: &str) -> TaskInfo<TestId> {
+    let mut t = make_binary(name, 100);
+    t.phase_id = PhaseId::from(phase);
+    t.type_id = TypeId::from("default");
+    t.kind = TaskKind::SecondaryAffine;
+    t.task_depends_on = vec![TaskDep {
+        task_id: dep.into(),
+        phase_id: PhaseId::from(phase),
+        inherit_outputs: false,
+    }];
+    t
+}
+
+/// PRIORITY ROUTING (vs FIFO) — two routable upload setup tasks A and B (both
+/// affine to one connected member, so both route over the wire in PICK order).
+/// A is seeded FIRST (FIFO would route A→B) but B feeds a dispatch-imminent
+/// (typed-affinity, Active phase) build while A feeds a free-pool build, so B
+/// out-ranks A and routes BEFORE it (min-by-rank).
+#[tokio::test(flavor = "current_thread")]
+async fn routes_higher_ranked_upload_before_lower_ranked_fifo_earlier() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // A queued first (FIFO would pick A first). Both affine to sec-0.
+            let up_a = setup_task("up-a", Some("sec-0"));
+            let up_b = setup_task("up-b", Some("sec-0"));
+            let a_hash = compute_task_hash(&up_a);
+            let b_hash = compute_task_hash(&up_b);
+            let (mut primary, mut ends, _mesh) = primary_with_tasks(vec![up_a, up_b]);
+            mark_alive(&mut primary, "sec-0");
+
+            // Seed the dependents directly into the pool's blocked map (they
+            // never dispatch — they only feed the rank). B's build is typed
+            // (affinity "x") → class_tier 0; A's build is free-pool → 1. Both
+            // on the Active "work" phase.
+            primary
+                .pool_mut()
+                .extend(vec![
+                    dependent_build("b-build", "work", Some("x"), "up-b"),
+                    dependent_build("a-build", "work", None, "up-a"),
+                ])
+                .expect("valid extend");
+
+            // Drive the setup-dispatch pass — it drains BOTH routable uploads
+            // in PICK order onto sec-0's channel.
+            primary
+                .react_to_worker_signal_batch(one_tasks_added_batch(), &mut None)
+                .await;
+            settle_pump().await;
+
+            let assignments = drained_setup_assignments(&mut ends[0].1);
+            let order: Vec<&String> = assignments.iter().map(|(_, h)| h).collect();
+            assert_eq!(
+                order,
+                vec![&b_hash, &a_hash],
+                "B (typed-affinity dependent) routes BEFORE A (free-pool dependent), \
+                 NOT the FIFO A-then-B order"
+            );
+        })
+        .await;
+}
+
+/// TRANSITIVE-THROUGH-AFFINE (#497) — B's build is gated on B's upload only
+/// through a `SecondaryAffine` import gate (upload → import → build); the rank
+/// walk recurses through the import to the build, so B (whose transitive build
+/// is Active+typed) still out-ranks A (whose direct build is free-pool). Routes
+/// B before A.
+#[tokio::test(flavor = "current_thread")]
+async fn routes_upload_by_transitive_through_affine_import() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let up_a = setup_task("up-a", Some("sec-0"));
+            let up_b = setup_task("up-b", Some("sec-0"));
+            let a_hash = compute_task_hash(&up_a);
+            let b_hash = compute_task_hash(&up_b);
+            let (mut primary, mut ends, _mesh) = primary_with_tasks(vec![up_a, up_b]);
+            mark_alive(&mut primary, "sec-0");
+
+            // up-b → import (SecondaryAffine) → b-build (Work, typed, Active).
+            // up-a → a-build (Work, free-pool, Active) directly.
+            primary
+                .pool_mut()
+                .extend(vec![
+                    affine_import("import", "work", "up-b"),
+                    dependent_build("b-build", "work", Some("x"), "import"),
+                    dependent_build("a-build", "work", None, "up-a"),
+                ])
+                .expect("valid extend");
+
+            primary
+                .react_to_worker_signal_batch(one_tasks_added_batch(), &mut None)
+                .await;
+            settle_pump().await;
+
+            let assignments = drained_setup_assignments(&mut ends[0].1);
+            let order: Vec<&String> = assignments.iter().map(|(_, h)| h).collect();
+            assert_eq!(
+                order,
+                vec![&b_hash, &a_hash],
+                "B routes before A even though B's build is reachable only TRANSITIVELY \
+                 through the affine import gate"
+            );
+        })
+        .await;
+}
+
+/// DEP-MODEL INVARIANT — reordering only ROUTES; it never strands a dependent.
+/// After the higher-ranked upload routes FIRST and reports SetupCompleted, its
+/// dependent unblocks (per-file SetupCompleted → resume) to dispatchable; the
+/// lower-ranked upload is still routed (not dropped) and its dependent still
+/// unblocks on ITS completion. Pure ordering: the mutation kind + per-file
+/// granularity are unchanged.
+#[tokio::test(flavor = "current_thread")]
+async fn reorder_routes_both_and_strands_no_dependent() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Both affine to the primary itself → self-exec synchronously, so
+            // each SetupCompleted (and its dependent resume) settles in-pass.
+            // up-b's dependent is typed (ranks first); up-a's is free-pool.
+            let up_a = setup_task("up-a", Some("setup"));
+            let up_b = setup_task("up-b", Some("setup"));
+            let a_hash = compute_task_hash(&up_a);
+            let b_hash = compute_task_hash(&up_b);
+            let (mut primary, _ends, _mesh) = primary_with_tasks(vec![up_a, up_b]);
+
+            // The dependents, spawned CRDT-Blocked on their uploads (the live
+            // resume surface the per-file SetupCompleted apply unblocks).
+            let b_build = dependent_build("b-build", "work", Some("x"), "up-b");
+            let a_build = dependent_build("a-build", "work", None, "up-a");
+            let b_build_hash = compute_task_hash(&b_build);
+            let a_build_hash = compute_task_hash(&a_build);
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::TasksSpawned {
+                    tasks: vec![b_build, a_build],
+                });
+
+            // Drive the dispatch pass: both uploads self-exec to SetupCompleted.
+            primary
+                .react_to_worker_signal_batch(one_tasks_added_batch(), &mut None)
+                .await;
+            settle_pump().await;
+
+            // BOTH uploads routed (self-exec'd to SetupCompleted) — neither
+            // dropped by the reorder. The mutation kind is the UNCHANGED
+            // SetupCompleted (the success terminal), per-file, for each.
+            for h in [&a_hash, &b_hash] {
+                assert!(
+                    matches!(
+                        primary.cluster_state.task_state(h),
+                        Some(crate::cluster_state::TaskState::SetupCompleted { .. })
+                    ),
+                    "every routed upload settles the UNCHANGED SetupCompleted terminal"
+                );
+            }
+            // And NEITHER dependent is stranded — each unblocked to dispatchable
+            // (Pending) once ITS upload completed.
+            for h in [&a_build_hash, &b_build_hash] {
+                assert!(
+                    matches!(
+                        primary.cluster_state.task_state(h),
+                        Some(crate::cluster_state::TaskState::Pending { .. })
+                    ),
+                    "each dependent unblocks to dispatchable after its upload — none stranded"
+                );
+            }
+        })
+        .await;
+}
