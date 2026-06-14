@@ -4292,9 +4292,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     // secondaries / observers idle into their own timeouts
                     // holding SLURM slots. Same reason string as the local
                     // error so both sides of the wire agree.
-                    self.broadcast_terminal_verdict(ClusterMutation::RunAborted {
-                        reason: RunError::NoRelocationTarget.to_string(),
-                    })
+                    self.broadcast_terminal_verdict(super::lifecycle::TerminalVerdict::Aborted(
+                        RunError::NoRelocationTarget.to_string(),
+                    ))
                     .await;
                     return Err(RunError::NoRelocationTarget);
                 };
@@ -4670,9 +4670,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // classification (panik and generic `Other` bootstrap/transport
             // failures deliberately do NOT broadcast: those are failover's
             // jurisdiction).
-            self.broadcast_terminal_verdict(ClusterMutation::RunAborted {
-                reason: outcome.to_string(),
-            })
+            self.broadcast_terminal_verdict(super::lifecycle::TerminalVerdict::Aborted(
+                outcome.to_string(),
+            ))
             .await;
             return Err(outcome);
         }
@@ -4725,12 +4725,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // which the `?` propagated. Reaching here means a genuinely clean
         // finish.
 
-        let outcome = self.outcome_summary();
+        // Narrate from the verdict's CARRIED counts — the SAME single source
+        // the observer's terminal summary reads (`terminal_outcome()`), so
+        // the primary and observer lines agree by construction (the
+        // no-observer-only-CRDT unification). `finalize_terminal_accounting`
+        // above broadcast `RunComplete`, which applied locally and latched
+        // the counts, so `terminal_outcome()` is `Some` on this clean-finish
+        // path. (Falls back to a live `outcome_summary()` read only if the
+        // latch were somehow absent — defensive; the broadcast just ran.)
+        let counts = self
+            .cluster_state
+            .terminal_outcome()
+            .unwrap_or_else(|| self.outcome_summary().into());
         tracing::info!(
-            succeeded = outcome.succeeded,
-            fail_retry = outcome.fail_retry,
-            fail_oom = outcome.fail_oom,
-            fail_final = outcome.fail_final,
+            succeeded = counts.succeeded,
+            fail_retry = counts.fail_retry,
+            fail_oom = counts.fail_oom,
+            fail_final = counts.fail_final,
             total = self.total_tasks,
             "run complete:"
         );
@@ -4897,7 +4908,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // AND from a hard abort), whether or not any task was left
         // unscheduled.
         if self.cluster_state.graceful_abort_requested() {
-            self.broadcast_terminal_verdict(ClusterMutation::RunComplete)
+            self.broadcast_terminal_verdict(super::lifecycle::TerminalVerdict::Complete)
                 .await;
             tracing::warn!(
                 target: super::important_events::IMPORTANT_TARGET,
@@ -4949,21 +4960,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // render (the per-class breakdown / the rejected-id list), so the
         // primary-side exception and the peer-side report agree; `outcome`
         // is `Copy`, so the later `ClusterCollapsed` return is unaffected.
-        let terminal_mutation = if stranded > 0 {
-            ClusterMutation::RunAborted {
-                reason: RunError::ClusterCollapsed { stranded, outcome }.to_string(),
-            }
+        let terminal_verdict = if stranded > 0 {
+            super::lifecycle::TerminalVerdict::Aborted(
+                RunError::ClusterCollapsed { stranded, outcome }.to_string(),
+            )
         } else if !self.spawn_rejected_task_ids.is_empty() {
-            ClusterMutation::RunAborted {
-                reason: RunError::SpawnRejected {
+            super::lifecycle::TerminalVerdict::Aborted(
+                RunError::SpawnRejected {
                     rejected_task_ids: self.spawn_rejected_task_ids.clone(),
                 }
                 .to_string(),
-            }
+            )
         } else {
-            ClusterMutation::RunComplete
+            super::lifecycle::TerminalVerdict::Complete
         };
-        self.broadcast_terminal_verdict(terminal_mutation).await;
+        self.broadcast_terminal_verdict(terminal_verdict).await;
 
         if stranded > 0 {
             tracing::error!(

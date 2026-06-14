@@ -48,7 +48,7 @@ fn graceful_abort_independent_of_run_terminals() {
     assert!(!s.run_complete());
     assert!(s.run_aborted().is_none());
 
-    s.apply(ClusterMutation::RunComplete);
+    s.apply(ClusterMutation::RunComplete { counts: Default::default() });
     assert!(s.run_complete() && s.graceful_abort_requested());
 }
 

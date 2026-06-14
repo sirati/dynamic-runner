@@ -5,7 +5,9 @@
 
 use std::collections::HashMap;
 
-use dynrunner_core::{ErrorType, PhaseId, ResourceAmount, TaskInfo, TaskVersion, WorkerId};
+use dynrunner_core::{
+    ErrorType, PhaseId, ResourceAmount, TaskInfo, TaskVersion, TerminalOutcomeCounts, WorkerId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::removal_cause::RemovalCause;
@@ -258,7 +260,19 @@ pub enum ClusterMutation<I> {
     /// loop's exit condition broadens to `run_complete && pool
     /// drained` so the post-promotion residual peers all exit
     /// shortly after the primary returns.
-    RunComplete,
+    ///
+    /// `counts` carries the primary's FINALIZED per-class outcome partition
+    /// at the instant it DECIDED this verdict, so the latch and the counts
+    /// converge to every replica ATOMICALLY (one mutation). The narrator —
+    /// on the primary AND on a zero-authority observer — reads the carried
+    /// counts back rather than re-folding its own (possibly unconverged)
+    /// ledger mirror: observing the verdict means its counts are in hand,
+    /// with no separate per-task convergence to wait on (the pre-fix bug —
+    /// the observer narrated a clean success off an unconverged local
+    /// `outcome_counts()` while the primary's real ledger held failures).
+    RunComplete {
+        counts: TerminalOutcomeCounts,
+    },
     /// "The run was ABORTED — every secondary and observer should exit
     /// non-zero." The failure twin of [`Self::RunComplete`].
     ///
@@ -291,6 +305,13 @@ pub enum ClusterMutation<I> {
     /// it inherits the identical delivery / settle semantics.
     RunAborted {
         reason: String,
+        /// The primary's FINALIZED per-class outcome partition at the
+        /// instant it decided the abort — same atomic latch+counts carriage
+        /// as [`Self::RunComplete`]. For a PRE-DISPATCH abort (bring-up /
+        /// pre-phase-duplicate, broadcast before any task ran) this is the
+        /// honest all-zero default; for a routing-collapse abort it carries
+        /// the partial successes/failures recorded before the collapse.
+        counts: TerminalOutcomeCounts,
     },
     /// "STOP scheduling new work — let the running work finish and let
     /// the fleet drain." The graceful sibling of [`Self::RunAborted`]:

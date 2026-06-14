@@ -4,6 +4,17 @@ use dynrunner_protocol_primary_secondary::{
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
+/// Which terminal verdict the primary is broadcasting — the caller's intent,
+/// WITHOUT the count payload. [`PrimaryCoordinator::broadcast_terminal_verdict`]
+/// is the SINGLE owner of stamping the authoritative finalized counts onto
+/// the verdict (so no call site has to know about — or could diverge on —
+/// the count payload). `Complete` is the clean / graceful terminal;
+/// `Aborted` carries the abort reason for the PyO3-boundary log.
+pub(crate) enum TerminalVerdict {
+    Complete,
+    Aborted(String),
+}
+
 use crate::cluster_state::apply_locally_for_broadcast;
 use crate::primary::PrimaryCoordinator;
 use crate::primary::wire::timestamp_now;
@@ -324,7 +335,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///   errors: transport-shaped failures a promoted successor may well
     ///   survive — a verdict here would tear down a salvageable run;
     /// - crashes / panics / SIGKILL: no code runs; failover handles it.
-    pub(crate) async fn broadcast_terminal_verdict(&mut self, mutation: ClusterMutation<I>) {
+    pub(crate) async fn broadcast_terminal_verdict(&mut self, verdict: TerminalVerdict) {
+        // STAMP the authoritative counts onto the verdict HERE — the single
+        // owner, so no call site knows about (or could diverge on) the count
+        // payload. The read is `&self.outcome_summary()` at the instant of
+        // broadcast; for the finalize path this equals the count the verdict
+        // DECISION was computed from (coordinator.rs `finalize_terminal_
+        // accounting`: the `outcome` read and this broadcast are the SAME
+        // `&self`, the SAME synchronous oploop turn, with NO `.await` and NO
+        // cluster_state mutation between them — verified). For the
+        // pre-dispatch abort sites (bring-up / pre-phase duplicate / no-
+        // relocation-target) the live read is the honest zero, exactly what
+        // those verdicts should carry. So `verdict-counts == verdict-
+        // decision-counts` holds at every site.
+        let counts = self.outcome_summary().into();
+        let mutation = match verdict {
+            TerminalVerdict::Complete => ClusterMutation::RunComplete { counts },
+            TerminalVerdict::Aborted(reason) => ClusterMutation::RunAborted { reason, counts },
+        };
         self.apply_and_broadcast_cluster_mutations(vec![mutation.clone()])
             .await;
         // Brief settle window so the broadcast lands on every peer before

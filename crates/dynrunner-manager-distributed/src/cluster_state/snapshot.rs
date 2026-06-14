@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use dynrunner_core::{Identifier, PhaseId, TaskInfo, TaskOutputs};
+use dynrunner_core::{Identifier, PhaseId, TaskInfo, TaskOutputs, TerminalOutcomeCounts};
 use dynrunner_protocol_primary_secondary::{DiscoveryDebt, SecondaryCapacityRecord};
 use serde::{Deserialize, Serialize};
 
@@ -286,6 +286,16 @@ pub struct ClusterStateSnapshot<I> {
     /// pre-field shape).
     #[serde(default)]
     pub run_aborted: Option<String>,
+    /// The terminal verdict's FINALIZED per-class outcome counts (the
+    /// replicated `terminal_outcome` payload carried atomically on
+    /// `RunComplete`/`RunAborted`). Merge rule on `restore`: the first
+    /// `Some` wins and never overwrites an already-`Some` local value —
+    /// mirroring the `run_aborted` latch — so a behind replica pulling a
+    /// snapshot receives the counts ALONGSIDE the run latch (the same atomic
+    /// carriage the live broadcast gives). `#[serde(default)]` keeps wire
+    /// compat with pre-field senders (missing decodes as `None`).
+    #[serde(default)]
+    pub terminal_outcome: Option<TerminalOutcomeCounts>,
     /// Sticky-monotonic graceful-abort latch (the replicated
     /// `GracefulAbortRequested` dispatch freeze). Merge rule on `restore`:
     /// ratchets `false → true` only, never regresses — mirroring the
@@ -449,6 +459,7 @@ impl<I> Default for ClusterStateSnapshot<I> {
             member_generations: HashMap::new(),
             run_complete: false,
             run_aborted: None,
+            terminal_outcome: None,
             graceful_abort_requested: false,
             wind_down_requested: HashSet::new(),
             discovery_debt: DiscoveryDebt::default(),
@@ -522,6 +533,7 @@ impl<I: Identifier> ClusterState<I> {
             phase_may_be_empty,
             run_complete,
             run_aborted,
+            terminal_outcome,
             graceful_abort_requested,
             wind_down_requested,
             discovery_debt,
@@ -646,6 +658,11 @@ impl<I: Identifier> ClusterState<I> {
             // from a snapshot learns the run is already over / aborted.
             run_complete: *run_complete,
             run_aborted: run_aborted.clone(),
+            // The verdict's finalized counts — carried with the run latches
+            // so a node seeded from a snapshot narrates the SAME
+            // authoritative terminal partition (atomic latch+counts carriage,
+            // here via the snapshot rather than the live mutation).
+            terminal_outcome: *terminal_outcome,
             // Sticky-monotonic graceful-abort latch — carried so a
             // failover-promoted primary inherits the dispatch freeze.
             graceful_abort_requested: *graceful_abort_requested,
@@ -771,6 +788,7 @@ impl<I: Identifier> ClusterState<I> {
             member_generations,
             run_complete,
             run_aborted,
+            terminal_outcome,
             graceful_abort_requested,
             wind_down_requested,
             discovery_debt,
@@ -990,6 +1008,16 @@ impl<I: Identifier> ClusterState<I> {
             && let Some(reason) = run_aborted
         {
             self.run_aborted = Some(reason);
+        }
+        // Verdict-count payload: first-`Some`-wins, the same latch rule as
+        // `run_aborted` — a behind replica seeded from a snapshot receives
+        // the authoritative terminal counts ALONGSIDE the run latch (the
+        // snapshot-borne twin of the live mutation's atomic latch+counts),
+        // and an already-latched local value is never overwritten.
+        if self.terminal_outcome.is_none()
+            && let Some(counts) = terminal_outcome
+        {
+            self.terminal_outcome = Some(counts);
         }
         // Graceful-abort latch: the same false→true ratchet as
         // `run_complete` — a promoted primary restoring a frozen snapshot

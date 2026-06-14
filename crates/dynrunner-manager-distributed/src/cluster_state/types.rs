@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use dynrunner_core::{ErrorType, TaskInfo, TaskVersion, WorkerId};
+use dynrunner_core::{ErrorType, TaskInfo, TaskVersion, TerminalOutcomeCounts, WorkerId};
 use dynrunner_protocol_primary_secondary::{RemovalCause, RoleTable};
 use serde::{Deserialize, Serialize};
 
@@ -933,6 +933,25 @@ impl OutcomeSummary {
             + self.skipped
             + self.setup_succeeded
             + self.affine_ready
+    }
+}
+
+/// The SINGLE mapping from the manager-crate live partition onto the
+/// wire-carried [`TerminalOutcomeCounts`] (defined in `dynrunner-core` so the
+/// protocol crate can carry it on the terminal verdict). Folding the
+/// `usize` buckets to `u64` is the wire-width widen; the bucket semantics are
+/// identical, so this conversion is the one place the two shapes meet.
+impl From<OutcomeSummary> for TerminalOutcomeCounts {
+    fn from(o: OutcomeSummary) -> Self {
+        TerminalOutcomeCounts {
+            succeeded: o.succeeded as u64,
+            fail_retry: o.fail_retry as u64,
+            fail_oom: o.fail_oom as u64,
+            fail_final: o.fail_final as u64,
+            skipped: o.skipped as u64,
+            setup_succeeded: o.setup_succeeded as u64,
+            affine_ready: o.affine_ready as u64,
+        }
     }
 }
 

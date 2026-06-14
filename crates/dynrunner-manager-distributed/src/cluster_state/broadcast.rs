@@ -199,7 +199,7 @@ fn stamp_versions<I: Identifier>(
             // (join = OR) needs no arbitration — there is no competing
             // writer and no transition out of the set.
             | ClusterMutation::PhaseEnded { .. }
-            | ClusterMutation::RunComplete
+            | ClusterMutation::RunComplete { .. }
             | ClusterMutation::RunAborted { .. }
             // `GracefulAbortRequested` is version-LESS: a payload-free
             // sticky false→true latch (join = OR), like `RunComplete`.

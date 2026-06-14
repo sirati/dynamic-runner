@@ -218,11 +218,11 @@ async fn invalidation_latches_verdict_first_and_suppresses_phase_hooks() {
             // abort attempt (the worker-mgmt broadcast carrying a hook-raise
             // render) must not overwrite the latched verdict.
             primary
-                .broadcast_terminal_verdict(ClusterMutation::RunAborted {
-                    reason: "on_phase_end hook for phase p1 raised: handoff incomplete: \
-                             no summary message received (spawned=0)"
+                .broadcast_terminal_verdict(crate::primary::lifecycle::TerminalVerdict::Aborted(
+                    "on_phase_end hook for phase p1 raised: handoff incomplete: \
+                     no summary message received (spawned=0)"
                         .into(),
-                })
+                ))
                 .await;
             assert_eq!(
                 primary.cluster_state_for_test().run_aborted(),

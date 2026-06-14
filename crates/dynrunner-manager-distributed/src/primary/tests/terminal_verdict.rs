@@ -129,7 +129,9 @@ async fn terminal_verdict_holds_for_a_transiently_down_observer_leg() {
             let started = std::time::Instant::now();
             tokio::time::timeout(
                 Duration::from_secs(20),
-                primary.broadcast_terminal_verdict(ClusterMutation::RunComplete),
+                primary.broadcast_terminal_verdict(
+                    crate::primary::lifecycle::TerminalVerdict::Complete,
+                ),
             )
             .await
             .expect("terminal verdict delivery must complete within the grace cap");
@@ -158,7 +160,7 @@ async fn terminal_verdict_holds_for_a_transiently_down_observer_leg() {
                     matches!(
                         m,
                         DistributedMessage::ClusterMutation { mutations, .. }
-                            if mutations.iter().any(|cm| matches!(cm, ClusterMutation::RunComplete))
+                            if mutations.iter().any(|cm| matches!(cm, ClusterMutation::RunComplete { .. }))
                     )
                 })
                 .count();
@@ -405,6 +407,115 @@ async fn no_relocation_target_broadcasts_run_aborted() {
                 "the abort reason must carry the NoRelocationTarget render, \
                  got: {abort_reason}"
             );
+        })
+        .await;
+}
+
+/// #513 — THE INVARIANT: the counts STAMPED on the verdict equal the counts
+/// the verdict DECISION was computed from. `broadcast_terminal_verdict` stamps
+/// `self.outcome_summary()` at broadcast time; this proves that read equals
+/// the primary's authoritative decision count (no divergence) and that it
+/// lands in `terminal_outcome()` for the narrator.
+///
+/// Seed a KNOWN terminal partition (2 completed, 1 failed-final), capture the
+/// decision count (`outcome_summary()`) BEFORE the broadcast, broadcast the
+/// `Complete` verdict, then assert the CARRIED `terminal_outcome()` equals
+/// that decision count exactly — `verdict-counts == verdict-decision-counts`.
+/// No observer is seeded, so the delivery gate returns after the bounded
+/// fixed settle (no hang).
+#[tokio::test(flavor = "current_thread")]
+async fn stamped_verdict_counts_equal_the_decision_counts() {
+    use crate::primary::test_helpers::ControllableMembershipPeer;
+    use crate::process::{LocalRole, Mesh};
+    use dynrunner_protocol_primary_secondary::address::PeerId;
+    use std::collections::HashSet;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let connected: std::rc::Rc<std::cell::RefCell<HashSet<String>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(HashSet::from(["sec-0".to_string()])));
+            let transport = ControllableMembershipPeer::<TestId>::new(connected.clone());
+            let mut mesh = Mesh::new(transport);
+            let (slot, client, inbox) =
+                mesh.register_local_role(LocalRole::Primary, PeerId::from("setup"));
+            mesh.publish_membership();
+            let (control, control_rx) = crate::process::pump::control_channel::<TestId>();
+            let pump = tokio::task::spawn_local(async move {
+                let _slot = slot;
+                crate::process::pump::run_pump(mesh, control_rx).await;
+            });
+
+            let (_demote_tx, demote_rx) = tokio_mpsc::unbounded_channel();
+            let mut primary = PrimaryCoordinator::new(
+                test_primary_config(),
+                client,
+                inbox,
+                demote_rx,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Seed a KNOWN terminal partition into the ledger: 2 completed,
+            // 1 failed-final. No observer in the roster ⇒ the delivery gate
+            // returns after the bounded settle.
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                for i in 0..3 {
+                    let t = make_binary(&format!("bin_{i}"), 50);
+                    let hash = crate::primary::wire::compute_task_hash(&t);
+                    cs.apply(ClusterMutation::TaskAdded {
+                        hash: hash.clone(),
+                        task: t,
+                    });
+                    if i < 2 {
+                        cs.apply(ClusterMutation::TaskCompleted {
+                            hash,
+                            result_data: None,
+                            attempt: 0,
+                        });
+                    } else {
+                        cs.apply(ClusterMutation::TaskFailed {
+                            hash,
+                            kind: dynrunner_core::ErrorType::NonRecoverable,
+                            error: "boom".into(),
+                            version: Default::default(),
+                            attempt: Default::default(),
+                        });
+                    }
+                }
+            }
+
+            // The DECISION count — what finalize would compute and decide the
+            // verdict from (the same `&self` read `broadcast_terminal_verdict`
+            // re-takes at stamp time, with no await/mutation in between).
+            let decision = primary.outcome_summary();
+            assert_eq!(decision.succeeded, 2);
+            assert_eq!(decision.fail_final, 1);
+
+            primary
+                .broadcast_terminal_verdict(
+                    crate::primary::lifecycle::TerminalVerdict::Complete,
+                )
+                .await;
+
+            // The CARRIED counts (latched by the local apply of the verdict)
+            // EQUAL the decision counts — the non-negotiable invariant.
+            let carried = primary
+                .cluster_state_for_test()
+                .terminal_outcome()
+                .expect("the verdict latched its carried counts locally");
+            assert_eq!(
+                carried,
+                dynrunner_core::TerminalOutcomeCounts::from(decision),
+                "stamped verdict counts MUST equal the verdict-decision counts \
+                 (succeeded={} fail_final={})",
+                decision.succeeded,
+                decision.fail_final
+            );
+
+            drop(control);
+            pump.abort();
         })
         .await;
 }

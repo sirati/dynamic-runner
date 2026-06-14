@@ -504,7 +504,7 @@ async fn relocation_hands_the_trigger_to_the_responding_observer() {
                     timestamp: 0.0,
                     mutations: vec![
                         ClusterMutation::GracefulAbortRequested,
-                        ClusterMutation::RunComplete,
+                        ClusterMutation::RunComplete { counts: Default::default() },
                     ],
                 });
                 let _ = tokio::time::timeout(Duration::from_secs(5), run).await;

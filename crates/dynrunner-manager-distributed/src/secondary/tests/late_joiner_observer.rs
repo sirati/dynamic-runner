@@ -89,6 +89,7 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
         alive_members,
         run_complete: false,
         run_aborted: None,
+        terminal_outcome: None,
         graceful_abort_requested: false,
         wind_down_requested: HashSet::new(),
         discovery_debt: crate::cluster_state::DiscoveryDebt::Undeclared,
@@ -232,7 +233,7 @@ async fn observer_skips_setup_and_exits_on_run_complete() {
             // run finished. The observer's SOLE exit cue is
             // `run_complete()`.
             sec.cluster_state
-                .apply(dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete);
+                .apply(dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete { counts: Default::default() });
             assert!(
                 sec.cluster_state.run_complete(),
                 "precondition: RunComplete applied",

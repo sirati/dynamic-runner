@@ -10,7 +10,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, TaskOutputs, WorkerId};
+use dynrunner_core::{
+    ErrorType, Identifier, PhaseId, TaskInfo, TaskOutputs, TerminalOutcomeCounts, WorkerId,
+};
 use dynrunner_protocol_primary_secondary::{DiscoveryDebt, RoleTable, SecondaryCapacityRecord};
 
 use super::settled::{SettledClass, SettledEntry};
@@ -937,6 +939,20 @@ impl<I: Identifier> ClusterState<I> {
     /// the `mesh_watchdog` disarms on it too.
     pub fn run_aborted(&self) -> Option<&str> {
         self.run_aborted.as_deref()
+    }
+
+    /// The terminal verdict's FINALIZED per-class outcome counts, carried
+    /// atomically on the `RunComplete`/`RunAborted` mutation and latched
+    /// set-once. `Some` exactly when a terminal verdict has landed — so a
+    /// node that observes the verdict (the primary that authored it, OR an
+    /// observer/secondary that applied it) ALSO has the authoritative counts
+    /// in hand, with no separate per-task convergence to wait on. The
+    /// run-narrator's terminal summary reads THIS (the single source of
+    /// truth the primary decided the verdict from) instead of re-folding its
+    /// own — possibly unconverged — ledger via `outcome_counts()`. `None`
+    /// until the first terminal verdict lands.
+    pub fn terminal_outcome(&self) -> Option<TerminalOutcomeCounts> {
+        self.terminal_outcome
     }
 
     /// Whether a GRACEFUL abort has been requested

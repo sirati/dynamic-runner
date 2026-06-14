@@ -518,9 +518,16 @@ fn consumer_invariants_survive_snapshot_restore() {
         epoch: 1,
         reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
-    s.apply(ClusterMutation::RunComplete);
+    s.apply(ClusterMutation::RunComplete {
+        counts: dynrunner_core::TerminalOutcomeCounts {
+            succeeded: 5,
+            fail_final: 2,
+            ..Default::default()
+        },
+    });
     s.apply(ClusterMutation::RunAborted {
         reason: "abort-reason".into(),
+        counts: Default::default(),
     });
 
     // Seed a FRESH empty node purely from the snapshot — the
@@ -548,6 +555,14 @@ fn consumer_invariants_survive_snapshot_restore() {
         Some("abort-reason"),
         "run_aborted reason must survive restore"
     );
+    // #513 — the verdict's carried counts ride the snapshot ALONGSIDE the run
+    // latches, so a node seeded purely from a snapshot (the late-joiner /
+    // promotion path) narrates the SAME authoritative terminal partition.
+    let counts = relocated
+        .terminal_outcome()
+        .expect("the verdict counts must survive snapshot/restore with the latch");
+    assert_eq!(counts.succeeded, 5);
+    assert_eq!(counts.fail_final, 2);
 }
 
 /// Dead-wins / sticky-removal merge on the `alive_members` field,

@@ -109,7 +109,7 @@ pub(super) async fn fake_primary(
             target: None,
             sender_id: "setup".into(),
             timestamp: 0.0,
-            mutations: vec![dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete],
+            mutations: vec![dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete { counts: Default::default() }],
         })
         .unwrap();
 
@@ -600,7 +600,7 @@ async fn stage_file_then_assign_task_succeeds() {
                     sender_id: "setup".into(),
                     timestamp: 0.0,
                     mutations: vec![
-                        dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete,
+                        dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete { counts: Default::default() },
                     ],
                 });
                 drop(pri_to_sec_tx);
@@ -699,6 +699,7 @@ async fn fake_primary_abort(
             mutations: vec![
                 dynrunner_protocol_primary_secondary::ClusterMutation::RunAborted {
                     reason: "duplicate task identity in the initial batch".into(),
+                    counts: Default::default(),
                 },
             ],
         })
@@ -908,7 +909,7 @@ async fn run_complete_during_setup_yields_terminal_done() {
 
             let config = setup_terminal_config();
             let primary_handle = tokio::task::spawn_local(fake_primary_setup_terminal(
-                dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete,
+                dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete { counts: Default::default() },
                 sec_to_pri_rx,
                 pri_to_sec_tx,
             ));
@@ -962,6 +963,7 @@ async fn run_aborted_during_setup_yields_terminal_aborted() {
             let primary_handle = tokio::task::spawn_local(fake_primary_setup_terminal(
                 dynrunner_protocol_primary_secondary::ClusterMutation::RunAborted {
                     reason: "duplicate task identity in the initial batch".into(),
+                    counts: Default::default(),
                 },
                 sec_to_pri_rx,
                 pri_to_sec_tx,

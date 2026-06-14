@@ -43,6 +43,7 @@ mod operational_loop;
 mod promotion;
 mod worker_mgmt;
 
+pub(crate) use mutations::TerminalVerdict;
 pub(crate) use promotion::RelocationPolicy;
 
 #[cfg(test)]

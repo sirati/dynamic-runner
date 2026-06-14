@@ -98,6 +98,14 @@ impl<I: Identifier> ClusterState<I> {
             phase_deps,
             run_complete,
             run_aborted,
+            // ── NOT independently summarised ──: the verdict's count
+            // payload rides ATOMICALLY with the `run_complete`/`run_aborted`
+            // latches (same mutation, and snapshot-carried alongside them),
+            // so it adds NO convergence signal of its own — a replica that
+            // has the latch already has the counts. Excluded from the digest
+            // for the same reason as the epoch mirror: the presence bits
+            // above already drive the "who's ahead" pull that delivers it.
+            terminal_outcome: _terminal_outcome,
             // The graceful-abort dispatch-freeze latch IS summarised
             // (sticky `|=`-healable via snapshot restore), carried as a
             // presence bit like `run_aborted` — the same false→true

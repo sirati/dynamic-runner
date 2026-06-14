@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use dynrunner_core::{Identifier, PhaseId, TaskOutputs};
+use dynrunner_core::{Identifier, PhaseId, TaskOutputs, TerminalOutcomeCounts};
 use dynrunner_protocol_primary_secondary::{DiscoveryDebt, RoleTable, SecondaryCapacityRecord};
 
 use crate::fulfillability_matcher::MatcherTriggerEvent;
@@ -86,6 +86,17 @@ pub struct ClusterState<I> {
     /// on it too (failover has nothing left to guard once the run is
     /// aborting). Carries the abort reason for the PyO3-boundary log.
     pub(super) run_aborted: Option<String>,
+    /// The primary's FINALIZED per-class outcome partition, carried ON the
+    /// terminal verdict (`RunComplete` / `RunAborted`) and latched here
+    /// set-once together with the latch above — the verdict's COUNT payload.
+    /// Sticky monotonic exactly like `run_aborted`: the FIRST verdict's
+    /// counts win (`Option`, never overwritten once `Some`), so the latch and
+    /// the counts converge to every replica ATOMICALLY (one mutation). The
+    /// narrator — on the primary AND on a zero-authority observer — reads
+    /// THESE counts for its terminal summary instead of re-folding its own
+    /// (possibly unconverged) ledger mirror: observing the verdict means its
+    /// counts are in hand. `None` until the first terminal verdict lands.
+    pub(super) terminal_outcome: Option<TerminalOutcomeCounts>,
     /// Set by `ClusterMutation::GracefulAbortRequested`. The dispatch
     /// FREEZE latch — sticky monotonic, like `run_complete`: once true,
     /// no new work may leave the ready pool toward a worker anywhere in
@@ -529,6 +540,7 @@ where
             phase_deps,
             run_complete,
             run_aborted,
+            terminal_outcome,
             graceful_abort_requested,
             wind_down_requested,
             discovery_debt,
@@ -591,6 +603,9 @@ where
             phase_may_be_empty: phase_may_be_empty.clone(),
             run_complete: *run_complete,
             run_aborted: run_aborted.clone(),
+            // Replicated set-once verdict-count payload — clone preserves it
+            // (the sticky twin of `run_aborted`).
+            terminal_outcome: *terminal_outcome,
             // Replicated sticky latch — clone preserves it (like `run_complete`).
             graceful_abort_requested: *graceful_abort_requested,
             // Replicated grow-only SET — clone preserves it (like `respawn_events`).
@@ -673,6 +688,7 @@ where
             phase_may_be_empty,
             run_complete,
             run_aborted,
+            terminal_outcome,
             graceful_abort_requested,
             wind_down_requested,
             discovery_debt,
@@ -710,6 +726,7 @@ where
             .field("phase_may_be_empty", phase_may_be_empty)
             .field("run_complete", run_complete)
             .field("run_aborted", run_aborted)
+            .field("terminal_outcome", terminal_outcome)
             .field("graceful_abort_requested", graceful_abort_requested)
             .field("wind_down_requested", wind_down_requested)
             .field("discovery_debt", discovery_debt)
@@ -755,6 +772,7 @@ impl<I> Default for ClusterState<I> {
             phase_may_be_empty: std::collections::HashSet::new(),
             run_complete: false,
             run_aborted: None,
+            terminal_outcome: None,
             graceful_abort_requested: false,
             wind_down_requested: HashSet::new(),
             discovery_debt: DiscoveryDebt::default(),

@@ -542,9 +542,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // on every connected secondary and its `process_tasks` loop
         // returns `RunOutcome::Terminal` (projecting to
         // `SecondaryTerminal::Aborted`).
-        self.broadcast_terminal_verdict(ClusterMutation::RunAborted {
-            reason: reason.clone(),
-        })
+        self.broadcast_terminal_verdict(crate::primary::lifecycle::TerminalVerdict::Aborted(
+            reason.clone(),
+        ))
         .await;
         Err(RunError::DuplicateTaskIdPrePhase { reason })
     }
@@ -575,9 +575,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             reason = %reason,
             "consumer on_run_start raised on the promoted primary; aborting run"
         );
-        self.broadcast_terminal_verdict(ClusterMutation::RunAborted {
-            reason: reason.clone(),
-        })
+        self.broadcast_terminal_verdict(crate::primary::lifecycle::TerminalVerdict::Aborted(
+            reason.clone(),
+        ))
         .await;
         Err(RunError::FatalPolicyExit { reason })
     }
@@ -616,9 +616,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ) -> RunError {
         let reason = format!("invalid composed task graph in cluster_state: {e}");
         tracing::error!(reason = %reason, "aborting run on invalid composed task graph");
-        self.broadcast_terminal_verdict(ClusterMutation::RunAborted {
-            reason: reason.clone(),
-        })
+        self.broadcast_terminal_verdict(crate::primary::lifecycle::TerminalVerdict::Aborted(
+            reason.clone(),
+        ))
         .await;
         RunError::InvalidComposedGraph { reason }
     }
@@ -674,9 +674,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         //    duplicate-identity reason. Single origination mechanism
         //    (#313): same apply/broadcast/settle path as every other
         //    terminal verdict.
-        self.broadcast_terminal_verdict(ClusterMutation::RunAborted {
-            reason: reason.clone(),
-        })
+        self.broadcast_terminal_verdict(crate::primary::lifecycle::TerminalVerdict::Aborted(
+            reason.clone(),
+        ))
         .await;
         // 2. Synchronously freeze dispatch + drive the primary's own
         //    structured exit through the decoupled worker-management bus

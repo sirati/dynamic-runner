@@ -177,7 +177,7 @@ async fn invalid_composition_verdict_is_broadcast_to_the_fleet() {
             while let Ok(msg) = to_sec_rx.try_recv() {
                 if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
                     for m in mutations {
-                        if let ClusterMutation::RunAborted { reason } = m {
+                        if let ClusterMutation::RunAborted { reason, .. } = m {
                             assert!(
                                 reason.contains("g2o-git-libg2o_types_slam3d_addons.so"),
                                 "the broadcast RunAborted must carry the dup \

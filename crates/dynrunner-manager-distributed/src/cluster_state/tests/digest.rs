@@ -479,7 +479,7 @@ fn digest_memo_matches_fresh_fold() {
     assert_memo_fresh!();
     s.apply(ClusterMutation::DiscoveryDebtDeclared);
     assert_memo_fresh!();
-    s.apply(ClusterMutation::RunComplete);
+    s.apply(ClusterMutation::RunComplete { counts: Default::default() });
     assert_memo_fresh!();
 
     // --- the four grow-max originators (mutate folded fields OUTSIDE the

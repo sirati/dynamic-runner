@@ -39,6 +39,7 @@ fn latch_run_aborted(cs: &mut ClusterState<test_helpers::TestId>) {
         reason: "1 duplicate task identity/identities within a single runtime \
                  spawn batch: duplicate task hash deadbeef"
             .into(),
+        counts: Default::default(),
     });
 }
 
@@ -176,6 +177,7 @@ async fn missed_abort_broadcast_converges_via_digest() {
                 reason: "1 duplicate task identity/identities within a single \
                          runtime spawn batch: duplicate task hash deadbeef"
                     .into(),
+                counts: Default::default(),
             });
 
             assert!(

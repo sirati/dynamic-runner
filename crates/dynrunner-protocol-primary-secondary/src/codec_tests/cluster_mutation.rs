@@ -311,13 +311,14 @@ fn roundtrip_task_requeued() {
 fn roundtrip_run_aborted() {
     let mutation: ClusterMutation<TestId> = ClusterMutation::RunAborted {
         reason: "2 duplicate task identities in the initial batch".into(),
+        counts: dynrunner_core::TerminalOutcomeCounts::default(),
     };
 
     let json = serde_json::to_string(&mutation).unwrap();
     let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
 
     match decoded {
-        ClusterMutation::RunAborted { reason } => {
+        ClusterMutation::RunAborted { reason, .. } => {
             assert_eq!(reason, "2 duplicate task identities in the initial batch");
         }
         _ => panic!("expected RunAborted"),
@@ -1116,4 +1117,141 @@ fn respawn_policy_set_mirrors_wire_bytes() {
         cooldown_ms: 30_000,
     };
     assert_eq!(serde_json::to_string(&encoded).unwrap(), wire);
+}
+
+/// `RunComplete` (#513) round-trips with its carried `TerminalOutcomeCounts`
+/// preserved — the verdict's finalized per-class partition the primary
+/// stamps and the observer narrates from. A non-default `fail_final` is
+/// pinned so the assertion catches a dropped count field on the wire.
+#[test]
+fn roundtrip_run_complete_with_counts() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::RunComplete {
+        counts: dynrunner_core::TerminalOutcomeCounts {
+            succeeded: 2,
+            fail_retry: 0,
+            fail_oom: 0,
+            fail_final: 538,
+            skipped: 0,
+            setup_succeeded: 1,
+            affine_ready: 44,
+        },
+    };
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+    match decoded {
+        ClusterMutation::RunComplete { counts } => {
+            assert_eq!(counts.succeeded, 2);
+            assert_eq!(counts.fail_final, 538);
+            assert_eq!(counts.setup_succeeded, 1);
+            assert_eq!(counts.affine_ready, 44);
+        }
+        _ => panic!("expected RunComplete"),
+    }
+}
+
+/// `RunAborted` (#513) round-trips with BOTH its `reason` and its carried
+/// `TerminalOutcomeCounts` preserved.
+#[test]
+fn roundtrip_run_aborted_with_reason_and_counts() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::RunAborted {
+        reason: "cluster routing collapsed".into(),
+        counts: dynrunner_core::TerminalOutcomeCounts {
+            succeeded: 7,
+            fail_final: 3,
+            ..Default::default()
+        },
+    };
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+    match decoded {
+        ClusterMutation::RunAborted { reason, counts } => {
+            assert_eq!(reason, "cluster routing collapsed");
+            assert_eq!(counts.succeeded, 7);
+            assert_eq!(counts.fail_final, 3);
+        }
+        _ => panic!("expected RunAborted"),
+    }
+}
+
+/// Wire-shape mirror (NOT symmetric-on-the-wrong-shape): decode the EXACT
+/// externally-tagged JSON bytes the primary's terminal-verdict broadcast
+/// emits for `RunComplete` — `{"RunComplete":{"counts":{...all 7 buckets...}}}`
+/// — pinning the literal shape the OTHER side must produce/consume. A
+/// renamed/reordered count field or a changed enum tag fails HERE even if the
+/// crate's own encode/decode stay self-consistent.
+#[test]
+fn run_complete_decodes_literal_sender_bytes() {
+    let bytes = r#"{"RunComplete":{"counts":{"succeeded":2,"fail_retry":0,"fail_oom":0,"fail_final":538,"skipped":0,"setup_succeeded":1,"affine_ready":44}}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
+    match decoded {
+        ClusterMutation::RunComplete { counts } => {
+            assert_eq!(counts.succeeded, 2);
+            assert_eq!(counts.fail_final, 538);
+            assert_eq!(counts.setup_succeeded, 1);
+            assert_eq!(counts.affine_ready, 44);
+        }
+        _ => panic!("expected RunComplete"),
+    }
+    // The OTHER direction of the mirror: the crate's encoder produces EXACTLY
+    // these bytes (field order is the struct declaration order), so a sender
+    // on this crate and a decoder expecting the literal above agree verbatim.
+    let encoded: ClusterMutation<TestId> = ClusterMutation::RunComplete {
+        counts: dynrunner_core::TerminalOutcomeCounts {
+            succeeded: 2,
+            fail_retry: 0,
+            fail_oom: 0,
+            fail_final: 538,
+            skipped: 0,
+            setup_succeeded: 1,
+            affine_ready: 44,
+        },
+    };
+    assert_eq!(serde_json::to_string(&encoded).unwrap(), bytes);
+}
+
+/// Wire-shape mirror for `RunAborted` — the EXACT bytes the routing-collapse
+/// abort emits: `{"RunAborted":{"reason":"...","counts":{...}}}`.
+#[test]
+fn run_aborted_decodes_literal_sender_bytes() {
+    let bytes = r#"{"RunAborted":{"reason":"collapsed","counts":{"succeeded":7,"fail_retry":0,"fail_oom":0,"fail_final":3,"skipped":0,"setup_succeeded":0,"affine_ready":0}}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
+    match decoded {
+        ClusterMutation::RunAborted { reason, counts } => {
+            assert_eq!(reason, "collapsed");
+            assert_eq!(counts.succeeded, 7);
+            assert_eq!(counts.fail_final, 3);
+        }
+        _ => panic!("expected RunAborted"),
+    }
+    let encoded: ClusterMutation<TestId> = ClusterMutation::RunAborted {
+        reason: "collapsed".into(),
+        counts: dynrunner_core::TerminalOutcomeCounts {
+            succeeded: 7,
+            fail_final: 3,
+            ..Default::default()
+        },
+    };
+    assert_eq!(serde_json::to_string(&encoded).unwrap(), bytes);
+}
+
+/// Back-compat: a PRE-#513 sender's `RunComplete` / `RunAborted` bytes carry
+/// NO `counts` field. `#[serde(default)]` is NOT on the enum-variant struct
+/// fields (externally-tagged variants take the variant body verbatim), so a
+/// missing `counts` would REFUSE the frame — this test PINS that the carried
+/// shape is the agreed wire contract going forward. A rolling upgrade across
+/// this field is a coordinated cut (both crates ship together — same wheel),
+/// so the strict shape is intentional; this test documents + guards it.
+#[test]
+fn run_complete_literal_carries_counts_object() {
+    // The encoder always emits the `counts` object (no flatten / skip), so a
+    // decoder can rely on its presence — the contract the narrator's
+    // carried-count read depends on.
+    let encoded: ClusterMutation<TestId> = ClusterMutation::RunComplete {
+        counts: dynrunner_core::TerminalOutcomeCounts::default(),
+    };
+    let json = serde_json::to_string(&encoded).unwrap();
+    assert!(
+        json.contains("\"counts\""),
+        "RunComplete must serialize a counts object: {json}"
+    );
 }

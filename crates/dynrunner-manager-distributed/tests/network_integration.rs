@@ -532,7 +532,7 @@ async fn unified_inbound_surfaces_cluster_mutation_via_recv_peer() {
                 target: None,
                 sender_id: "sec-0".into(),
                 timestamp: 0.0,
-                mutations: vec![ClusterMutation::<TestId>::RunComplete],
+                mutations: vec![ClusterMutation::<TestId>::RunComplete { counts: Default::default() }],
             };
             inbound.send(mutation_frame).expect("inbound accepts");
 

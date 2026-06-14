@@ -354,14 +354,24 @@ impl<I: Identifier> ClusterState<I> {
                 });
                 ApplyOutcome::Applied
             }
-            ClusterMutation::RunComplete => {
+            ClusterMutation::RunComplete { counts } => {
                 if self.run_complete {
                     return ApplyOutcome::NoOp;
                 }
                 self.run_complete = true;
+                // Latch the verdict's carried counts set-once together with
+                // the flag — the atomic latch+counts carriage (same mutation),
+                // so observing the verdict means its authoritative counts are
+                // in hand with no separate per-task convergence to wait on.
+                // First-writer-wins, mirroring `run_aborted` below: a later
+                // duplicate verdict NoOps above before ever reaching here, so
+                // the guard is belt-and-suspenders for an interleaved abort.
+                if self.terminal_outcome.is_none() {
+                    self.terminal_outcome = Some(counts);
+                }
                 ApplyOutcome::Applied
             }
-            ClusterMutation::RunAborted { reason } => {
+            ClusterMutation::RunAborted { reason, counts } => {
                 // Sticky monotonic: the FIRST abort reason wins. A
                 // re-applied / duplicate `RunAborted` (at-least-once
                 // delivery, a snapshot re-broadcast, or a second abort
@@ -383,6 +393,13 @@ impl<I: Identifier> ClusterState<I> {
                     return ApplyOutcome::NoOp;
                 }
                 self.run_aborted = Some(reason);
+                // Latch the carried counts set-once with the abort reason —
+                // the verdict's COUNT payload, same atomic carriage as the
+                // `RunComplete` arm. First-writer-wins (the `run_aborted`
+                // guard above already short-circuits a duplicate).
+                if self.terminal_outcome.is_none() {
+                    self.terminal_outcome = Some(counts);
+                }
                 ApplyOutcome::Applied
             }
             ClusterMutation::GracefulAbortRequested => {

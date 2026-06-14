@@ -196,7 +196,7 @@ async fn watchdog_silent_after_run_complete() {
     // `dispatch.rs::apply_cluster_mutations` arm.
     secondary
         .cluster_state
-        .apply(ClusterMutation::<TestId>::RunComplete);
+        .apply(ClusterMutation::<TestId>::RunComplete { counts: Default::default() });
 
     secondary.check_peer_mesh_watchdog().await;
     // Flush the queued MeshReady/etc. egress onto the folded primary

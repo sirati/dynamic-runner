@@ -276,7 +276,7 @@ async fn lost_relocation_announcement_non_chosen_follows_new_primary() {
             // configured.
             let round1 = donor_with_primary("sec-0");
             let mut round2 = donor_with_primary("sec-0");
-            round2.apply(ClusterMutation::RunComplete);
+            round2.apply(ClusterMutation::RunComplete { counts: Default::default() });
 
             let config = race_config("sec-1");
             let observer_handle = tokio::task::spawn_local(fake_relocated_observer(

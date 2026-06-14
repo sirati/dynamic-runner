@@ -75,6 +75,7 @@ async fn cluster_snapshot_reply_is_ingested_and_fires_demote() {
             });
             ahead.apply(ClusterMutation::RunAborted {
                 reason: "cluster routing collapsed (replayed verdict)".into(),
+                counts: Default::default(),
             });
             for reply in
                 crate::snapshot_stream::stream_frames_for_test(&ahead, "sec-0", "prim/0")
@@ -165,6 +166,7 @@ async fn replicated_abort_verdict_stands_primary_down_without_clean_finish() {
                 .cluster_state_mut_for_test()
                 .apply(ClusterMutation::RunAborted {
                     reason: "cluster routing collapsed (replayed verdict)".into(),
+                    counts: Default::default(),
                 });
 
             let (_deps, on_start, on_end) = noop_phase_args();

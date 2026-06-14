@@ -57,10 +57,31 @@
 
 use std::collections::HashSet;
 
-use dynrunner_core::{IMPORTANT_TARGET, Identifier, PhaseId};
+use dynrunner_core::{IMPORTANT_TARGET, Identifier, PhaseId, TerminalOutcomeCounts};
 
 use crate::ClusterState;
 use crate::primary::retry_bucket::BucketKind;
+
+/// The terminal-summary count source for the narrator: the verdict's CARRIED
+/// counts (`terminal_outcome()`), the primary's authoritative finalized
+/// partition latched ATOMICALLY with the `run_complete`/`run_aborted` latch.
+///
+/// Callers reach the terminal branches ONLY when a latch is set, and the
+/// counts ride the SAME mutation as that latch, so `terminal_outcome()` is
+/// `Some` here by construction — this is the #513 fix: the narrator no longer
+/// re-folds its own (possibly unconverged) ledger via `outcome_counts()`,
+/// which is exactly what let an observer narrate a false "0 failed-final"
+/// success on a RunComplete observed before the per-task terminals merged.
+///
+/// The `unwrap_or_else` fallback to the local fold is purely DEFENSIVE (a
+/// latch with no carried counts cannot occur on any current path — apply
+/// latches both together); it guarantees the narrator never panics and, in
+/// that impossible case, degrades to the pre-fix read rather than crashing.
+fn terminal_outcome_or_local<I: Identifier>(state: &ClusterState<I>) -> TerminalOutcomeCounts {
+    state
+        .terminal_outcome()
+        .unwrap_or_else(|| state.outcome_counts().into())
+}
 
 /// Stateful, pure projection that diffs the replicated [`ClusterState`]
 /// against its accumulated edge-sets and emits the operator's run
@@ -379,7 +400,15 @@ impl RunNarrator {
         if !self.completion_emitted {
             if let Some(reason) = state.run_aborted() {
                 self.completion_emitted = true;
-                let o = state.outcome_counts();
+                // Narrate the verdict's CARRIED counts (the primary's
+                // finalized partition, latched ATOMICALLY with the abort) —
+                // NOT a re-fold of this node's local ledger via
+                // `outcome_counts()`. The latch and the counts arrive on the
+                // SAME mutation, so reaching this branch (`run_aborted` set)
+                // guarantees the counts are in hand: no partial-ledger
+                // re-derivation, no convergence wait. `c` stays live for the
+                // observability-only `in_flight`/`blocked` fields.
+                let o = terminal_outcome_or_local(state);
                 let c = state.counts();
                 tracing::error!(
                     target: IMPORTANT_TARGET,
@@ -402,7 +431,10 @@ impl RunNarrator {
                 // was requested). Checked BEFORE the plain-complete branch
                 // so a graceful run never narrates as a clean success.
                 self.completion_emitted = true;
-                let o = state.outcome_counts();
+                // Carried verdict counts (atomic with the latch) — see the
+                // abort branch above. `unscheduled` is the LIVE residue
+                // (pending + blocked), an observability read, kept on `c`.
+                let o = terminal_outcome_or_local(state);
                 let c = state.counts();
                 let unscheduled = c.pending + c.blocked;
                 tracing::warn!(
@@ -425,7 +457,14 @@ impl RunNarrator {
                 emitted = true;
             } else if state.run_complete() {
                 self.completion_emitted = true;
-                let o = state.outcome_counts();
+                // Carried verdict counts (atomic with the RunComplete latch) —
+                // see the abort branch above. THIS is the #513 fix: pre-fix
+                // this read `outcome_counts()` (the observer's LOCAL, possibly
+                // unconverged fold), so a RunComplete observed before the
+                // per-task terminals merged narrated a false "0 failed-final"
+                // success. The carried counts are the primary's authoritative
+                // finalized partition, in hand the moment the latch is.
+                let o = terminal_outcome_or_local(state);
                 let c = state.counts();
                 // This RICH line doubles as the final-stats flush the
                 // owner requires before finishing: it is both the
@@ -1110,8 +1149,16 @@ mod tests {
             narrator.observe(&state); // idempotent
 
             // The drain terminal: the composed verdict narrates once,
-            // DISTINCT from the clean-success summary.
-            state.apply(ClusterMutation::RunComplete);
+            // DISTINCT from the clean-success summary. The verdict carries the
+            // primary's authoritative partition (the one completed task); the
+            // `unscheduled` residue is read LIVE from the frozen pool, not the
+            // carried counts.
+            state.apply(ClusterMutation::RunComplete {
+                counts: dynrunner_core::TerminalOutcomeCounts {
+                    succeeded: 1,
+                    ..Default::default()
+                },
+            });
             narrator.observe(&state);
             narrator.observe(&state); // idempotent
         });
@@ -1169,7 +1216,15 @@ mod tests {
                 error: "boom".into(),
                 version: Default::default(),
             });
-            state.apply(ClusterMutation::RunComplete);
+            // The verdict carries the primary's authoritative partition
+            // (2 succeeded, 1 failed-final) — the narrator reports THESE.
+            state.apply(ClusterMutation::RunComplete {
+                counts: dynrunner_core::TerminalOutcomeCounts {
+                    succeeded: 2,
+                    fail_final: 1,
+                    ..Default::default()
+                },
+            });
 
             let mut narrator = RunNarrator::new();
             narrator.observe(&state);
@@ -1209,8 +1264,16 @@ mod tests {
             let mut state = ClusterState::<RunnerIdentifier>::new();
             add(&mut state, &task("p", "a", &[]));
             complete(&mut state, "a");
+            // The verdict carries the primary's authoritative partition (the
+            // one succeeded task) — what the narrator now reports (the carried
+            // counts, NOT the local fold). `succeeded: 1` is exactly what the
+            // primary's `outcome_summary()` stamps here.
             state.apply(ClusterMutation::RunAborted {
                 reason: "fleet collapsed".into(),
+                counts: dynrunner_core::TerminalOutcomeCounts {
+                    succeeded: 1,
+                    ..Default::default()
+                },
             });
 
             let mut narrator = RunNarrator::new();
@@ -1234,6 +1297,138 @@ mod tests {
         assert!(
             events.iter().all(|e| !e.message.contains("run complete")),
             "an aborted run must NOT narrate as completed: {events:?}"
+        );
+    }
+
+    /// #513 — the terminal summary narrates the VERDICT's CARRIED counts, NOT
+    /// a re-fold of the observer's LOCAL (possibly unconverged) ledger.
+    ///
+    /// Replays the production sequence VERBATIM: the observer's mirror still
+    /// holds the work task as `Blocked` (its `TaskFailed` has NOT converged),
+    /// yet the `RunComplete` verdict — carrying the primary's authoritative
+    /// `fail_final` — has landed (the latch+counts arrive ATOMICALLY on the
+    /// one mutation, so a converged latch implies converged counts). The
+    /// narrator MUST report the carried `fail_final`, never the local fold.
+    ///
+    /// REVERT-CONFIRM: the pre-fix narrator read `outcome_counts()` (the
+    /// LOCAL fold), which on this exact mirror reads `fail_final = 0` (the
+    /// build is `Blocked` → folded into nothing) — the false "0 failed-final"
+    /// success on the operator's --important-stdio stream. The assertion
+    /// below (`Some("3")`) FAILS against that local read, so reverting the
+    /// `terminal_outcome_or_local` change re-reds this test.
+    #[test]
+    fn terminal_summary_uses_carried_counts_not_local_unconverged_fold() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            // 2 succeeded work tasks (converged) ...
+            add(&mut state, &task("p", "ok0", &[]));
+            add(&mut state, &task("p", "ok1", &[]));
+            complete(&mut state, "ok0");
+            complete(&mut state, "ok1");
+            // ... and 3 builds the OBSERVER still sees as Blocked (their
+            // TaskFailed terminals have NOT converged to this mirror).
+            for i in 0..3 {
+                let b = task("build", &format!("b{i}"), &[]);
+                add(&mut state, &b);
+                state.apply(ClusterMutation::TaskBlocked {
+                    hash: format!("b{i}"),
+                    on: "absent-gate".to_string(),
+                });
+            }
+            // The PRIMARY's verdict: RunComplete carrying the AUTHORITATIVE
+            // partition (2 succeeded, 3 failed-final) — what the primary
+            // finalized. Atomic latch+counts: applying RunComplete latches
+            // both.
+            state.apply(ClusterMutation::RunComplete {
+                counts: dynrunner_core::TerminalOutcomeCounts {
+                    succeeded: 2,
+                    fail_final: 3,
+                    ..Default::default()
+                },
+            });
+            // Sanity: the LOCAL fold still under-counts (the pre-fix source).
+            assert_eq!(
+                state.outcome_counts().fail_final,
+                0,
+                "precondition: the local fold sees the builds as Blocked → 0 \
+                 failed-final (the unconverged mirror the bug narrated from)"
+            );
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state);
+            narrator.observe(&state);
+        });
+
+        let summary: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("run complete:"))
+            .collect();
+        assert_eq!(summary.len(), 1, "exactly one run-complete summary");
+        assert_eq!(
+            summary[0].fields.get("fail_final").map(String::as_str),
+            Some("3"),
+            "the terminal summary must narrate the VERDICT's carried \
+             fail_final (3), NOT the observer's local unconverged fold (0): {:?}",
+            summary[0].fields
+        );
+        assert_eq!(
+            summary[0].fields.get("succeeded").map(String::as_str),
+            Some("2"),
+        );
+    }
+
+    /// #513 / #469 regression guard — the terminal summary derives ENTIRELY
+    /// from the carried verdict counts, so it NEVER waits on per-task
+    /// convergence. Models the cluster-gone-before-convergence shape: a
+    /// `RunAborted` verdict carrying the authoritative failure partition lands
+    /// while the observer's mirror still has the work tasks non-terminal
+    /// (`Blocked` — their terminals will NEVER converge, the fleet is gone).
+    /// The narrator must emit the carried counts on the FIRST observe — no
+    /// hang, no convergence dependence, and NEVER success-zeros.
+    #[test]
+    fn aborted_summary_does_not_wait_on_convergence() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            // Work tasks the observer will NEVER see terminalize (cluster gone).
+            for i in 0..4 {
+                let b = task("build", &format!("b{i}"), &[]);
+                add(&mut state, &b);
+                state.apply(ClusterMutation::TaskBlocked {
+                    hash: format!("b{i}"),
+                    on: "gate".to_string(),
+                });
+            }
+            // The primary's abort verdict, carrying its finalized partition.
+            state.apply(ClusterMutation::RunAborted {
+                reason: "cluster routing collapsed".into(),
+                counts: dynrunner_core::TerminalOutcomeCounts {
+                    succeeded: 1,
+                    fail_final: 4,
+                    ..Default::default()
+                },
+            });
+
+            let mut narrator = RunNarrator::new();
+            // ONE observe — the summary must already be emitted (no second
+            // pass / convergence wait needed).
+            assert!(
+                narrator.observe(&state),
+                "the terminal summary must emit on the FIRST observe — no \
+                 convergence wait (the #469 hang guard)"
+            );
+        });
+
+        let aborted: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("run aborted"))
+            .collect();
+        assert_eq!(aborted.len(), 1, "exactly one aborted summary: {events:?}");
+        assert_eq!(
+            aborted[0].fields.get("fail_final").map(String::as_str),
+            Some("4"),
+            "the aborted summary narrates the carried failure count (4), \
+             never success-zeros off the unconverged local fold: {:?}",
+            aborted[0].fields
         );
     }
 

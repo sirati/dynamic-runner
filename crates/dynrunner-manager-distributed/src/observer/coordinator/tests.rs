@@ -266,7 +266,7 @@ async fn observer_returns_on_run_complete() {
         .run_until(async {
             let (transport, _inbound, _peers) = transport_with_peers("obs", 1);
             let mut cs = ClusterState::<TestId>::new();
-            cs.apply(ClusterMutation::RunComplete);
+            cs.apply(ClusterMutation::RunComplete { counts: Default::default() });
             let (client, inbox, pump) = observer_mesh(transport, "obs");
             tokio::task::spawn_local(pump);
             let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
@@ -291,7 +291,7 @@ async fn observer_reports_graceful_abort_verdict() {
             let (transport, _inbound, _peers) = transport_with_peers("obs", 1);
             let mut cs = ClusterState::<TestId>::new();
             cs.apply(ClusterMutation::GracefulAbortRequested);
-            cs.apply(ClusterMutation::RunComplete);
+            cs.apply(ClusterMutation::RunComplete { counts: Default::default() });
             let (client, inbox, pump) = observer_mesh(transport, "obs");
             tokio::task::spawn_local(pump);
             let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
@@ -327,7 +327,7 @@ async fn observer_keeps_observing_until_drain_terminal() {
                     target: None,
                     sender_id: "primary".into(),
                     timestamp: 0.0,
-                    mutations: vec![ClusterMutation::RunComplete],
+                    mutations: vec![ClusterMutation::RunComplete { counts: Default::default() }],
                 });
             });
             let terminal = observer.run().await.expect("Ok on the drain terminal");
@@ -427,7 +427,7 @@ async fn observer_does_not_collapse_on_dead_fleet_exits_on_observed_run_complete
                         target: None,
                         sender_id: "primary".into(),
                         timestamp: 0.0,
-                        mutations: vec![CM::RunComplete],
+                        mutations: vec![CM::RunComplete { counts: Default::default() }],
                     });
                 });
 
@@ -495,7 +495,7 @@ async fn observer_does_not_strand_on_silent_primary_exits_on_observed_run_comple
                         target: None,
                         sender_id: "sec-0".into(),
                         timestamp: 0.0,
-                        mutations: vec![CM::RunComplete],
+                        mutations: vec![CM::RunComplete { counts: Default::default() }],
                     });
                 });
 
@@ -558,7 +558,15 @@ async fn observer_narrates_phases_and_one_completion_summary() {
                 error: "boom".into(),
                 version: Default::default(),
             });
-            cs.apply(ClusterMutation::RunComplete);
+            // The verdict carries the primary's authoritative partition
+            // (2 succeeded, 1 failed-final) — the narrator reports THESE.
+            cs.apply(ClusterMutation::RunComplete {
+                counts: dynrunner_core::TerminalOutcomeCounts {
+                    succeeded: 2,
+                    fail_final: 1,
+                    ..Default::default()
+                },
+            });
 
             // Drive the real observer to its terminal so the narration is
             // asserted over the ledger `run()` actually converged + exited on.
@@ -681,7 +689,7 @@ async fn observer_rides_through_failover_and_exits_on_run_complete() {
                             target: None,
                             sender_id: "sec-1".into(),
                             timestamp: 0.0,
-                            mutations: vec![ClusterMutation::RunComplete],
+                            mutations: vec![ClusterMutation::RunComplete { counts: Default::default() }],
                         })
                         .expect("inbound open");
                 });
@@ -723,7 +731,7 @@ async fn observer_recovers_from_snapshot_reply() {
                         add(&mut donor, &t);
                         complete(&mut donor, name);
                     }
-                    donor.apply(ClusterMutation::RunComplete);
+                    donor.apply(ClusterMutation::RunComplete { counts: Default::default() });
                     crate::snapshot_stream::stream_frames_for_test(
                         &donor,
                         "promoted-sec",
@@ -792,8 +800,9 @@ async fn observer_run_aborted_exits_non_zero() {
             // Both aborted AND complete latched: aborted must win.
             cs.apply(ClusterMutation::RunAborted {
                 reason: "duplicate task id in initial batch".into(),
+                counts: Default::default(),
             });
-            cs.apply(ClusterMutation::RunComplete);
+            cs.apply(ClusterMutation::RunComplete { counts: Default::default() });
             let (client, inbox, pump) = observer_mesh(transport, "obs");
             tokio::task::spawn_local(pump);
             let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
@@ -950,7 +959,7 @@ async fn observer_refreshes_primary_clock_on_restore_repoint() {
                             target: None,
                             sender_id: "promoted-sec".into(),
                             timestamp: 0.0,
-                            mutations: vec![ClusterMutation::RunComplete],
+                            mutations: vec![ClusterMutation::RunComplete { counts: Default::default() }],
                         })
                         .expect("inbound open");
                 });
@@ -1077,7 +1086,7 @@ async fn from_handoff_resumes_moved_in_state_and_exits_on_run_complete() {
                 add(&mut cs, &t);
                 complete(&mut cs, id);
             }
-            cs.apply(ClusterMutation::RunComplete);
+            cs.apply(ClusterMutation::RunComplete { counts: Default::default() });
 
             let rig = build_test_handoff("obs", cs, observer_config("obs"));
             tokio::task::spawn_local(rig.pump);
@@ -1152,7 +1161,7 @@ async fn from_handoff_fresh_sender_supersedes_inherited_dispatcher() {
                             target: None,
                             sender_id: "p".into(),
                             timestamp: 0.0,
-                            mutations: vec![ClusterMutation::RunComplete],
+                            mutations: vec![ClusterMutation::RunComplete { counts: Default::default() }],
                         })
                         .expect("inbound open");
                 });
@@ -1297,7 +1306,7 @@ async fn cold_join_announces_initial_holdings_after_restore() {
                             target: None,
                             sender_id: "promoted-sec".into(),
                             timestamp: 0.0,
-                            mutations: vec![ClusterMutation::RunComplete],
+                            mutations: vec![ClusterMutation::RunComplete { counts: Default::default() }],
                         })
                         .expect("inbound open");
                 });
@@ -1346,7 +1355,7 @@ async fn warn_dropped_decode_is_repulled_and_converges_via_recovery() {
                     let t = task("p", "t1", &[]);
                     add(&mut donor, &t);
                     complete(&mut donor, "t1");
-                    donor.apply(ClusterMutation::RunComplete);
+                    donor.apply(ClusterMutation::RunComplete { counts: Default::default() });
                     donor
                 };
                 // The (single) digest the named primary broadcasts — ahead of
@@ -1614,7 +1623,7 @@ async fn recovery_cadence_quiesces_when_converged() {
                             target: None,
                             sender_id: "promoted-sec".into(),
                             timestamp: 0.0,
-                            mutations: vec![ClusterMutation::RunComplete],
+                            mutations: vec![ClusterMutation::RunComplete { counts: Default::default() }],
                         })
                         .expect("inbound open");
                     // Give the drain a beat to observe any straggler frame.
@@ -1893,7 +1902,7 @@ async fn lost_visibility_drives_tunnel_reconnect_with_roster() {
                         target: None,
                         sender_id: "sec-0".into(),
                         timestamp: 0.0,
-                        mutations: vec![CM::RunComplete],
+                        mutations: vec![CM::RunComplete { counts: Default::default() }],
                     });
                 });
 
@@ -2494,7 +2503,7 @@ async fn reconnect_roster_excludes_recently_delivering_peers() {
                         target: None,
                         sender_id: "sec-0".into(),
                         timestamp: 0.0,
-                        mutations: vec![ClusterMutation::RunComplete],
+                        mutations: vec![ClusterMutation::RunComplete { counts: Default::default() }],
                     });
                 });
 
@@ -2586,7 +2595,7 @@ async fn reconnect_trigger_is_single_flight() {
                         target: None,
                         sender_id: "sec-0".into(),
                         timestamp: 0.0,
-                        mutations: vec![ClusterMutation::RunComplete],
+                        mutations: vec![ClusterMutation::RunComplete { counts: Default::default() }],
                     });
                     blocked_calls
                 })
@@ -2827,7 +2836,7 @@ async fn one_empty_then_jobs_reappear_renders_no_verdict() {
                         target: None,
                         sender_id: "sec-0".into(),
                         timestamp: 0.0,
-                        mutations: vec![CM::RunComplete],
+                        mutations: vec![CM::RunComplete { counts: Default::default() }],
                     });
                 });
 
@@ -2884,7 +2893,7 @@ async fn cold_join_observer_without_ledger_keeps_observing() {
                         target: None,
                         sender_id: "sec-0".into(),
                         timestamp: 0.0,
-                        mutations: vec![CM::RunComplete],
+                        mutations: vec![CM::RunComplete { counts: Default::default() }],
                     });
                 });
 
@@ -2930,7 +2939,7 @@ async fn clean_run_complete_is_not_reclassified_by_the_ledger_consult() {
                     reason: PrimaryChangeReason::Transferred,
                 });
                 // The primary's clean verdict is ALREADY converged.
-                cs.apply(ClusterMutation::RunComplete);
+                cs.apply(ClusterMutation::RunComplete { counts: Default::default() });
                 let config = observer_config("obs");
                 let (client, inbox, pump) = observer_mesh(transport, "obs");
                 tokio::task::spawn_local(pump);

@@ -287,7 +287,7 @@ async fn latched_preseat_abort_delivers_on_seat_to_primary() {
                     timestamp: 0.0,
                     mutations: vec![
                         ClusterMutation::GracefulAbortRequested,
-                        ClusterMutation::RunComplete,
+                        ClusterMutation::RunComplete { counts: Default::default() },
                     ],
                 });
                 let terminal = run

@@ -23,6 +23,7 @@ fn run_aborted_sets_accessor_and_is_idempotent() {
     assert_eq!(
         s.apply(ClusterMutation::RunAborted {
             reason: "dup task identity in initial batch".into(),
+            counts: Default::default(),
         }),
         ApplyOutcome::Applied
     );
@@ -36,6 +37,7 @@ fn run_aborted_sets_accessor_and_is_idempotent() {
     assert_eq!(
         s.apply(ClusterMutation::RunAborted {
             reason: "a different reason".into(),
+            counts: Default::default(),
         }),
         ApplyOutcome::NoOp
     );
@@ -46,14 +48,76 @@ fn run_aborted_sets_accessor_and_is_idempotent() {
 fn run_aborted_independent_of_run_complete() {
     // The two flags are orthogonal twins — one does not imply the other.
     let mut s = ClusterState::<RunnerIdentifier>::new();
-    s.apply(ClusterMutation::RunComplete);
+    s.apply(ClusterMutation::RunComplete { counts: Default::default() });
     assert!(s.run_complete());
     assert!(s.run_aborted().is_none());
 
     let mut s2 = ClusterState::<RunnerIdentifier>::new();
-    s2.apply(ClusterMutation::RunAborted { reason: "x".into() });
+    s2.apply(ClusterMutation::RunAborted {
+        reason: "x".into(),
+        counts: Default::default(),
+    });
     assert!(s2.run_aborted().is_some());
     assert!(!s2.run_complete());
+}
+
+/// #513 — the verdict's carried counts latch ATOMICALLY with the run latch
+/// (one mutation), set-once, and a `RunComplete` exposes them via
+/// `terminal_outcome()`. This is the property the narrator depends on:
+/// observing the latch implies the authoritative counts are in hand.
+#[test]
+fn run_complete_latches_carried_counts_atomically() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    assert!(
+        s.terminal_outcome().is_none(),
+        "fresh state carries no verdict counts"
+    );
+    s.apply(ClusterMutation::RunComplete {
+        counts: dynrunner_core::TerminalOutcomeCounts {
+            succeeded: 2,
+            fail_final: 538,
+            affine_ready: 44,
+            ..Default::default()
+        },
+    });
+    assert!(s.run_complete(), "the latch is set");
+    let counts = s
+        .terminal_outcome()
+        .expect("the carried counts latch with the run-complete flag");
+    assert_eq!(counts.succeeded, 2);
+    assert_eq!(counts.fail_final, 538, "the authoritative fail_final is in hand");
+    assert_eq!(counts.affine_ready, 44);
+}
+
+/// #513 — first-writer-wins on the carried counts, mirroring `run_aborted`'s
+/// sticky reason: a re-applied verdict NoOps and never churns the latched
+/// counts.
+#[test]
+fn terminal_outcome_is_first_writer_wins() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::RunComplete {
+        counts: dynrunner_core::TerminalOutcomeCounts {
+            fail_final: 538,
+            ..Default::default()
+        },
+    });
+    // A second (duplicate / re-broadcast) verdict with DIFFERENT counts must
+    // NOT overwrite the first.
+    assert_eq!(
+        s.apply(ClusterMutation::RunComplete {
+            counts: dynrunner_core::TerminalOutcomeCounts {
+                fail_final: 0,
+                ..Default::default()
+            },
+        }),
+        ApplyOutcome::NoOp,
+        "a re-applied RunComplete is a NoOp (sticky latch)"
+    );
+    assert_eq!(
+        s.terminal_outcome().unwrap().fail_final,
+        538,
+        "the FIRST verdict's counts win; a later one never churns them"
+    );
 }
 
 #[test]

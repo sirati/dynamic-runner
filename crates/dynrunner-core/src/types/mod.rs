@@ -23,6 +23,7 @@ pub mod identifiers;
 pub mod outputs;
 pub mod resource;
 pub mod task;
+pub mod terminal_outcome;
 pub mod version;
 
 pub use done_payload::DonePayload;
@@ -31,6 +32,7 @@ pub use identifiers::{AffinityId, Identifier, PhaseId, ResourceKind, RunnerIdent
 pub use outputs::{INLINE_VALUE_HARD_CAP_BYTES, ResultValue, TaskOutputs, check_soft_caps};
 pub use resource::{ResourceAmount, ResourceMap, SoftPreferredSecondaries};
 pub use task::{TaskDep, TaskInfo, TaskInput, TaskKind, UploadFileRef, required_files_storage};
+pub use terminal_outcome::TerminalOutcomeCounts;
 pub use version::TaskVersion;
 
 pub type WorkerId = u32;
