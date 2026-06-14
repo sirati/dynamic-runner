@@ -893,6 +893,28 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     // primary promotion
     pub(super) primary_id: Option<String>,
 
+    /// A node that GRACEFULLY RELOCATED its primary role onto this host and
+    /// is becoming a standalone observer, but may not have ANNOUNCED itself
+    /// (its bootstrap `RequestSnapshotStream { is_observer: true }`, which
+    /// originates the `PeerJoined { is_observer: true }` that populates
+    /// `role_table().observers`) by the time this relocated primary decides
+    /// the run's terminal verdict. `Some` ONLY on a `Transferred` relocation
+    /// build (set by the node-wiring promotion path from
+    /// `PromotionSignal::relocating_from`); `None` on a bootstrap submitter,
+    /// a failover promotion, or once the pending observer has announced.
+    ///
+    /// Consumed by [`Self::await_terminal_observer_delivery`]: it holds the
+    /// terminal-verdict broadcast (re-broadcasting on the surviving mesh leg)
+    /// until this node enters the role-table observer projection, bounded by
+    /// [`crate::primary::PENDING_OBSERVER_ANNOUNCE_GRACE`] so a node that
+    /// died mid-swap cannot stall teardown. Without it, a fast relocation
+    /// where the verdict is decided before the observer announces skips the
+    /// delivery hold entirely (the role-table projection is still empty), so
+    /// the zero-authority observer — which exits ONLY on observing the
+    /// `RunComplete` latch — misses the verdict and strands on the long
+    /// fleet-death / cluster-gone cadences.
+    pub(super) pending_observer: Option<String>,
+
     // Stage-file notifications queued before `run()` (or during init,
     // before secondary connections are up). Flushed once the welcome
     // + peer-connect handshake completes — at that point `send_to`
@@ -1604,6 +1626,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             mesh_ready_secondaries: HashSet::new(),
             mesh_gate_veto_warned: HashSet::new(),
             primary_id: None,
+            pending_observer: None,
             pending_stage_files: Vec::new(),
             cluster_state,
             snapshot_streams,
@@ -2134,6 +2157,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// [`Self::slurm_job_manager`] back to the concrete handle it parked.
     pub fn set_slurm_job_manager(&mut self, jm: Arc<dyn Any + Send + Sync>) {
         self.slurm_job_manager = Some(jm);
+    }
+
+    /// Record the node that gracefully RELOCATED its primary role onto this
+    /// host and is becoming a standalone observer (the
+    /// `PromotionSignal::relocating_from`). The relocated primary holds its
+    /// terminal-verdict delivery for this node until it announces itself as
+    /// an observer (or a bounded grace), so a fast relocation cannot tear
+    /// the mesh down before the still-arriving observer converges the
+    /// `RunComplete` latch. See the `pending_observer` field doc and
+    /// [`Self::await_terminal_observer_delivery`]. Set on the promotion
+    /// build BEFORE `run()` (pre-run wiring contract); absent on a bootstrap
+    /// submitter / a failover promotion (no node is becoming an observer).
+    pub fn set_pending_observer(&mut self, former_primary: String) {
+        self.pending_observer = Some(former_primary);
     }
 
     /// Install the transport-recovery port (BUG-B reconnect) the submitter

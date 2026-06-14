@@ -114,3 +114,23 @@ pub(crate) const PRIMARY_BROADCAST_SETTLE: std::time::Duration =
 /// finished run open for an unbounded stretch.
 pub(crate) const TERMINAL_OBSERVER_DELIVERY_GRACE: std::time::Duration =
     std::time::Duration::from_secs(60);
+
+/// Upper bound on how long a RELOCATED primary holds its terminal-verdict
+/// broadcast waiting for the node that relocated its role away (the
+/// `PromotionSignal::relocating_from`, recorded as the coordinator's
+/// `pending_observer`) to ANNOUNCE itself as a standalone observer.
+///
+/// Distinct from [`TERMINAL_OBSERVER_DELIVERY_GRACE`]: that grace covers a
+/// KNOWN observer (already in the role-table projection) whose transport leg
+/// is transiently DOWN and re-folding — the observed `-R` re-establish takes
+/// tens of seconds, so its cap is 60s. THIS grace covers the much faster
+/// in-process / same-mesh swap→announce hop: the relocating-away node's mesh
+/// leg SURVIVES the primary→observer retag (the slot's stable channel), so it
+/// only has to finish `ObserverCoordinator::from_handoff` and fire its
+/// bootstrap snapshot request — sub-second on a healthy node. 5s comfortably
+/// covers that with margin while staying well under the relocation e2e's 20s
+/// convergence bound; on cap expiry the primary PROCEEDS to teardown (a
+/// becoming-observer that died mid-swap is the only way the cap is reached,
+/// and a dead node has nothing to deliver to).
+pub(crate) const PENDING_OBSERVER_ANNOUNCE_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(5);

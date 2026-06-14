@@ -178,6 +178,274 @@ async fn terminal_verdict_holds_for_a_transiently_down_observer_leg() {
         .await;
 }
 
+/// #526 — the terminal verdict must reach a node still RELOCATING INTO an
+/// observer (it has not yet ANNOUNCED itself) before the relocated primary
+/// tears down.
+///
+/// The relocation race (distinct from the #415 down-leg case above): a
+/// submitter primary relocates its role onto a compute peer, which becomes
+/// the operational primary and — on a fast 5-task run — decides + broadcasts
+/// `RunComplete` BEFORE the relocating-away node has finished its
+/// primary→observer swap and fired its bootstrap snapshot request (the one
+/// that originates the `PeerJoined { is_observer: true }` populating
+/// `RoleTable.observers`). So at broadcast time the role-table observer
+/// projection is EMPTY: the #415 known-leg hold sees no observer and is a
+/// no-op, leaving only the fixed 500ms settle. The relocating-away node's
+/// mesh LEG survives the retag (so it is reachable), but it misses the single
+/// broadcast and — being a zero-authority observer that exits ONLY on the
+/// `RunComplete` latch (BUG-B) — strands on the long fleet-death cadences
+/// once the compute peers exit (`peer_count → 0`).
+///
+/// The fix records the relocating-away node as the primary's
+/// `pending_observer` (from `PromotionSignal::relocating_from`, set on a
+/// `Transferred` build) and HOLDS the verdict — re-broadcasting on the
+/// surviving leg — until it ANNOUNCES (joins `RoleTable.observers`), bounded
+/// by the 5s announce grace so a becoming-observer that died mid-swap cannot
+/// stall teardown. This test seeds the pending observer with its leg UP but
+/// NOT in the roster (the empty-observers projection that makes the #415 hold
+/// a no-op), broadcasts, and — with the observer NEVER announcing (the
+/// worst-case slow/dead-swap leg) — asserts the call HOLDS past the fixed
+/// 500ms settle and tears down at the BOUNDED 5s cap, never the long
+/// fleet-death cadences, AND re-broadcasts (so an observer that DOES announce
+/// mid-hold receives the verdict in its buffered inbox).
+///
+/// `broadcast_terminal_verdict` borrows `&mut self` for the whole wait, so a
+/// mid-wait CRDT announce cannot be applied from this same task; the
+/// deterministic RESOLUTION-on-real-announce coverage is the relocation e2e
+/// (`cluster_state_converges_on_primary_and_secondary`), which fires the
+/// observer's actual bootstrap announce mid-relocation.
+///
+/// REVERT-CHECK: without the pending-observer hold the role-table projection
+/// is empty at broadcast time, so `await_terminal_observer_delivery`
+/// early-returns and the call resolves after only the fixed 500ms settle —
+/// the `held >= 5s cap` assertion FAILS — with exactly ONE broadcast, the
+/// exact strand (the observer announces after teardown, no peer left to pull
+/// the verdict from).
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_verdict_holds_for_a_relocating_in_observer_not_yet_announced() {
+    use crate::primary::test_helpers::ControllableMembershipPeer;
+    use crate::process::{LocalRole, Mesh};
+    use dynrunner_protocol_primary_secondary::address::PeerId;
+    use std::collections::HashSet;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // The relocating-away node's mesh leg SURVIVES its primary→observer
+            // retag, so "obs" is reachable from the start — what is missing is
+            // its ANNOUNCE (it is not yet in RoleTable.observers). A compute
+            // secondary is also present.
+            let connected: std::rc::Rc<std::cell::RefCell<HashSet<String>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(HashSet::from([
+                    "sec-0".to_string(),
+                    "obs".to_string(),
+                ])));
+            let transport = ControllableMembershipPeer::<TestId>::new(connected.clone());
+            let broadcasts = transport.broadcast_log();
+
+            let mut mesh = Mesh::new(transport);
+            let (slot, client, inbox) =
+                mesh.register_local_role(LocalRole::Primary, PeerId::from("sec-0"));
+            mesh.publish_membership();
+            let (control, control_rx) = crate::process::pump::control_channel::<TestId>();
+            let pump = tokio::task::spawn_local(async move {
+                let _slot = slot;
+                crate::process::pump::run_pump(mesh, control_rx).await;
+            });
+
+            let (_demote_tx, demote_rx) = tokio_mpsc::unbounded_channel();
+            let mut primary = PrimaryCoordinator::new(
+                test_primary_config(),
+                client,
+                inbox,
+                demote_rx,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            // Seed ONLY the compute secondary in the roster — the relocating-in
+            // observer has NOT announced yet (its bootstrap RequestSnapshotStream
+            // has not reached this just-promoted primary), so it is ABSENT from
+            // RoleTable.observers, exactly as in the fast-relocation race.
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PeerJoined {
+                    peer_id: "sec-0".to_string(),
+                    is_observer: false,
+                    can_be_primary: true,
+                    cap_version: Default::default(),
+                    member_gen: 0,
+                });
+            }
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .role_table()
+                    .observers
+                    .is_empty(),
+                "the relocating-in observer must NOT yet be announced (empty roster \
+                 observers) — this is what makes the #415 known-leg hold a no-op"
+            );
+
+            // Record the relocating-away node as the pending observer — the
+            // PromotionSignal::relocating_from this primary was built with.
+            primary.set_pending_observer("obs".to_string());
+
+            // The relocating-in observer NEVER announces in this fixture (its
+            // swap is modeled as not completing within the window — the
+            // worst-case "becoming-observer is slow / died mid-swap" leg). The
+            // call must therefore HOLD past the fixed 500ms settle and tear down
+            // ONLY at the bounded 5s announce cap — never the multi-minute
+            // fleet-death / cluster-gone cadences the unfixed observer stranded
+            // on. Bounding the test wait at 10s (> the 5s cap, < the 20s e2e
+            // bound) catches BOTH a regression (returns at ~500ms — the pre-fix
+            // strand) via the lower-bound assertion AND a runaway (no cap) via
+            // the timeout. The companion `..not_yet_announced` deterministic
+            // RESOLUTION-on-announce coverage is the relocation e2e
+            // (`cluster_state_converges_on_primary_and_secondary`), which fires
+            // the real bootstrap announce; here `broadcast_terminal_verdict`
+            // holds `&mut self` for the whole wait, so a mid-wait CRDT announce
+            // cannot be applied from this same task — the cap path is the
+            // single-call seam this unit test can drive deterministically.
+            let started = std::time::Instant::now();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                primary.broadcast_terminal_verdict(
+                    crate::primary::lifecycle::TerminalVerdict::Complete,
+                ),
+            )
+            .await
+            .expect(
+                "broadcast_terminal_verdict must tear down at the bounded 5s announce \
+                 cap, NEVER hang on the long fleet-death cadences",
+            );
+            let held = started.elapsed();
+
+            // It HELD (past the fixed 500ms settle) — pre-fix the empty-observers
+            // early-out returned after ~500ms, stranding the observer.
+            assert!(
+                held >= crate::primary::PENDING_OBSERVER_ANNOUNCE_GRACE,
+                "broadcast_terminal_verdict must HOLD for the pending relocating-in \
+                 observer until the 5s announce cap, not return after the fixed 500ms \
+                 settle (pre-fix the empty-observers early-out stranded the observer); \
+                 held only {held:?}"
+            );
+            // It was BOUNDED by the cap (not the long cadences): a small margin
+            // over the 5s cap covers the trailing 500ms re-broadcast settle.
+            assert!(
+                held < crate::primary::PENDING_OBSERVER_ANNOUNCE_GRACE + Duration::from_secs(2),
+                "the hold must be BOUNDED by the 5s announce cap, not run to the \
+                 fleet-death / cluster-gone cadences; held {held:?}"
+            );
+
+            // The verdict was RE-BROADCAST (more than the single pre-fix send) so
+            // a relocating-in observer that announces mid-hold (the e2e path)
+            // receives it in its buffered inbox.
+            let sends = broadcasts.borrow();
+            let verdict_sends = sends
+                .iter()
+                .filter(|m| {
+                    matches!(
+                        m,
+                        DistributedMessage::ClusterMutation { mutations, .. }
+                            if mutations.iter().any(|cm| matches!(cm, ClusterMutation::RunComplete { .. }))
+                    )
+                })
+                .count();
+            assert!(
+                verdict_sends >= 2,
+                "the terminal verdict must be RE-BROADCAST while the relocating-in \
+                 observer is unannounced + once after it announces, so its buffered \
+                 inbox receives the verdict; saw {verdict_sends} RunComplete broadcast(s)"
+            );
+
+            drop(sends);
+            drop(control);
+            pump.abort();
+        })
+        .await;
+}
+
+/// #526 happy-path latency: when the relocating-in observer has ALREADY
+/// announced by the time the verdict is decided (the common case — the swap
+/// completes before the run does), the pending-observer hold adds ~0 latency.
+/// The pending id is already in `RoleTable.observers` with a reachable leg, so
+/// `delivery_complete` is satisfied on the pre-loop check and
+/// `broadcast_terminal_verdict` returns after only the fixed settle. Guards
+/// refinement 3 (no routine cap-wait on the happy path).
+#[tokio::test(flavor = "current_thread")]
+async fn terminal_verdict_pending_observer_already_announced_adds_no_hold() {
+    use crate::primary::test_helpers::ControllableMembershipPeer;
+    use crate::process::{LocalRole, Mesh};
+    use dynrunner_protocol_primary_secondary::address::PeerId;
+    use std::collections::HashSet;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let connected: std::rc::Rc<std::cell::RefCell<HashSet<String>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(HashSet::from([
+                    "sec-0".to_string(),
+                    "obs".to_string(),
+                ])));
+            let transport = ControllableMembershipPeer::<TestId>::new(connected.clone());
+            let mut mesh = Mesh::new(transport);
+            let (slot, client, inbox) =
+                mesh.register_local_role(LocalRole::Primary, PeerId::from("sec-0"));
+            mesh.publish_membership();
+            let (control, control_rx) = crate::process::pump::control_channel::<TestId>();
+            let pump = tokio::task::spawn_local(async move {
+                let _slot = slot;
+                crate::process::pump::run_pump(mesh, control_rx).await;
+            });
+
+            let (_demote_tx, demote_rx) = tokio_mpsc::unbounded_channel();
+            let mut primary = PrimaryCoordinator::new(
+                test_primary_config(),
+                client,
+                inbox,
+                demote_rx,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            // The pending observer has ALREADY announced (it is in the roster
+            // with a reachable leg) by verdict time.
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PeerJoined {
+                    peer_id: "obs".to_string(),
+                    is_observer: true,
+                    can_be_primary: false,
+                    cap_version: Default::default(),
+                    member_gen: 0,
+                });
+            }
+            primary.set_pending_observer("obs".to_string());
+
+            // Give the pump a tick to publish the membership so `has_route(obs)`
+            // is true, then the delivery must return after only the fixed settle.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let started = std::time::Instant::now();
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                primary.broadcast_terminal_verdict(
+                    crate::primary::lifecycle::TerminalVerdict::Complete,
+                ),
+            )
+            .await
+            .expect("delivery must complete promptly when the observer is already announced");
+            let held = started.elapsed();
+            assert!(
+                held < crate::primary::PENDING_OBSERVER_ANNOUNCE_GRACE,
+                "an already-announced pending observer must add NO hold (return after \
+                 the fixed settle, well under the 5s cap); held {held:?}"
+            );
+
+            drop(control);
+            pump.abort();
+        })
+        .await;
+}
+
 /// 1 real primary + 1 real secondary, 5 single-phase tasks that all
 /// complete cleanly; `on_phase_end` then spawns a runtime batch whose
 /// EVERY task the validator rejects (`UnknownDependency`). The run must

@@ -370,10 +370,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     }
 
     /// Hold the authority alive — re-broadcasting `mutation` — until every
-    /// observer the roster names has a reachable transport leg, bounded by
-    /// [`crate::primary::TERMINAL_OBSERVER_DELIVERY_GRACE`].
+    /// observer the roster names has a reachable transport leg AND any node
+    /// still RELOCATING into an observer has announced itself, bounded by
+    /// [`crate::primary::TERMINAL_OBSERVER_DELIVERY_GRACE`] (the known-leg
+    /// cap) and [`crate::primary::PENDING_OBSERVER_ANNOUNCE_GRACE`] (the
+    /// relocating-in cap).
     ///
-    /// # Single concern (#415 face (b1))
+    /// # Single concern (#415 face (b1) + the relocation-in race)
     ///
     /// The terminal verdict must reach the OBSERVER before the fleet tears
     /// down. A zero-authority observer exits ONLY on observing the CRDT
@@ -385,56 +388,107 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// `RoleTable.observers` projection the primary already holds, against the
     /// pump-published reachability (`MeshClient::has_route`).
     ///
-    /// No-op when the roster names no observer (the common single-process /
-    /// no-observer topology returns after the fixed settle alone). The
-    /// re-broadcast is idempotent (`apply_and_broadcast_cluster_mutations`
-    /// filters the CRDT NoOp), so a leg that recovers mid-wait re-receives
-    /// the verdict; a leg that never recovers (the observer host genuinely
-    /// died) gives up at the cap and tears down exactly as the pre-#415
-    /// fixed settle did — the bound is what keeps a finished run from
-    /// stalling forever on a gone observer.
+    /// TWO ways an observer can miss the broadcast, both covered by the SAME
+    /// re-broadcast loop:
+    ///   1. a KNOWN observer (already in the role-table projection) whose
+    ///      transport leg is transiently DOWN and re-folding — waited up to
+    ///      the 60s known-leg cap; and
+    ///   2. a node that GRACEFULLY RELOCATED its primary role onto this host
+    ///      and is becoming a standalone observer ([`Self::pending_observer`],
+    ///      from `PromotionSignal::relocating_from`) but has NOT YET announced
+    ///      itself — in a fast relocation the verdict is decided before its
+    ///      swap→announce completes, so its id is not yet in the role-table
+    ///      projection and the known-leg check alone would skip the hold
+    ///      entirely. Its leg SURVIVES the retag (the slot's stable channel),
+    ///      so once it announces the known-leg machinery covers actual
+    ///      delivery; this just keeps re-broadcasting (the observer's inbox
+    ///      buffers the frame) until it joins the projection, bounded by the
+    ///      shorter 5s announce cap (a node that died mid-swap is the only way
+    ///      that cap is reached, and a dead node has nothing to deliver to).
+    ///
+    /// No-op when the roster names no observer AND no relocation is pending
+    /// (the common single-process / no-observer topology returns after the
+    /// fixed settle alone). The re-broadcast is idempotent
+    /// (`broadcast_applied_mutations` re-emits the already-latched verdict),
+    /// so a leg that recovers — or an observer that announces — mid-wait
+    /// re-receives the verdict; a leg/announce that never lands gives up at
+    /// its cap and tears down exactly as the pre-fix fixed settle did.
     async fn await_terminal_observer_delivery(&mut self, mutation: ClusterMutation<I>) {
-        let observers: Vec<PeerId> = self
-            .cluster_state
-            .role_table()
-            .observers
-            .iter()
-            .map(|id| PeerId::from(id.as_str()))
-            .collect();
-        if observers.is_empty() {
+        // The relocating-in node (becoming an observer) still being awaited:
+        // dropped from the wait the instant it ANNOUNCES (joins the role-table
+        // observer projection) OR its shorter announce cap expires. Cleared so
+        // a second terminal broadcast (idempotent re-fire) never re-waits.
+        let pending = self.pending_observer.take().map(|id| {
+            (
+                PeerId::from(id.as_str()),
+                tokio::time::Instant::now() + crate::primary::PENDING_OBSERVER_ANNOUNCE_GRACE,
+            )
+        });
+
+        // Delivery is complete when every KNOWN observer (the live role-table
+        // projection, which the pending node JOINS on announce) is reachable
+        // AND the pending node is no longer being awaited (announced, so it is
+        // itself a known observer the reachability check now covers, or its
+        // cap passed). Re-reads the projection each call so an announce that
+        // landed between polls is observed.
+        let delivery_complete = |client: &crate::process::MeshClient<I>,
+                                  state: &crate::cluster_state::ClusterState<I>,
+                                  pending: &Option<(PeerId, tokio::time::Instant)>|
+         -> bool {
+            let known_all_reachable = state
+                .role_table()
+                .observers
+                .iter()
+                .all(|id| client.has_route(&PeerId::from(id.as_str())));
+            let pending_settled = match pending {
+                None => true,
+                Some((id, cap)) => {
+                    state.role_table().observers.contains(id.as_str())
+                        || tokio::time::Instant::now() >= *cap
+                }
+            };
+            known_all_reachable && pending_settled
+        };
+
+        if pending.is_none() && self.cluster_state.role_table().observers.is_empty() {
             return;
         }
-        let all_reachable = |client: &crate::process::MeshClient<I>| {
-            observers.iter().all(|id| client.has_route(id))
-        };
-        if all_reachable(&self.client) {
+        if delivery_complete(&self.client, &self.cluster_state, &pending) {
             return;
         }
         let deadline =
             tokio::time::Instant::now() + crate::primary::TERMINAL_OBSERVER_DELIVERY_GRACE;
         tracing::info!(
-            observers = observers.len(),
+            known_observers = self.cluster_state.role_table().observers.len(),
+            awaiting_relocating_in = pending.is_some(),
             grace_secs = crate::primary::TERMINAL_OBSERVER_DELIVERY_GRACE.as_secs(),
-            "terminal verdict broadcast but an observer leg is not yet reachable; \
-             holding + re-broadcasting until it re-folds (or the grace cap)"
+            "terminal verdict broadcast but an observer leg is not yet reachable / a \
+             relocating-in observer has not yet announced; holding + re-broadcasting \
+             until it converges (or the grace cap)"
         );
         loop {
-            // Re-broadcast each poll so a leg that re-folds mid-wait
-            // re-receives the verdict (the pump only fans NEW sends to a
-            // freshly-registered connection — there is no retransmit-on-
-            // reconnect for the original broadcast). `broadcast_applied_
-            // mutations` (NOT `apply_and_broadcast_cluster_mutations`)
-            // because the verdict already latched on the FIRST broadcast's
-            // local apply: the apply-and-broadcast path NoOp-filters an
-            // already-applied mutation off the wire (#50's N²-amplification
-            // guard), which would silently swallow every re-send. The
-            // raw re-broadcast re-emits the frame; the receiving observer
-            // applies it idempotently (it observes the terminal → exits).
+            // Re-broadcast each poll so a leg that re-folds — or an observer
+            // that announces — mid-wait re-receives the verdict (the pump only
+            // fans NEW sends to a freshly-registered connection; there is no
+            // retransmit-on-reconnect for the original broadcast). A
+            // relocating-in observer's inbox (an unbounded channel that
+            // survives its primary→observer retag) BUFFERS each re-send and
+            // applies it idempotently the moment its run loop starts draining,
+            // so it converges the latch and exits. `broadcast_applied_
+            // mutations` (NOT `apply_and_broadcast_cluster_mutations`) because
+            // the verdict already latched on the FIRST broadcast's local apply:
+            // the apply-and-broadcast path NoOp-filters an already-applied
+            // mutation off the wire (#50's N²-amplification guard), which would
+            // silently swallow every re-send. The raw re-broadcast re-emits the
+            // frame; the receiving observer applies it idempotently.
             self.broadcast_applied_mutations(vec![mutation.clone()])
                 .await;
             tokio::time::sleep(crate::primary::PRIMARY_BROADCAST_SETTLE).await;
-            if all_reachable(&self.client) {
-                tracing::info!("observer leg re-folded; terminal verdict delivered");
+            if delivery_complete(&self.client, &self.cluster_state, &pending) {
+                tracing::info!(
+                    "observer leg re-folded / relocating-in observer announced; \
+                     terminal verdict delivered"
+                );
                 return;
             }
             if tokio::time::Instant::now() >= deadline {

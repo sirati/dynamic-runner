@@ -206,9 +206,12 @@ where
         // `current_primary`: did THIS node hold the primary role going
         // into this advance? Consumed by `on_primary_identity_advanced`
         // to latch `deposed_primary` (see the field doc in
-        // `secondary/mod.rs`).
+        // `secondary/mod.rs`). The same pre-advance read also names the
+        // FORMER primary (the node relocating away on a `Transferred`
+        // advance), threaded so the built primary can hold delivery for it.
+        let former_primary = self.cluster_state.current_primary().map(str::to_owned);
         let was_primary_before =
-            self.cluster_state.current_primary() == Some(self.config.secondary_id.as_str());
+            former_primary.as_deref() == Some(self.config.secondary_id.as_str());
 
         // (2) Epoch-LWW apply. Side effects below only on a genuine
         // identity advance.
@@ -228,7 +231,13 @@ where
             return false;
         }
 
-        self.on_primary_identity_advanced(&new, epoch, reason, was_primary_before);
+        self.on_primary_identity_advanced(
+            &new,
+            epoch,
+            reason,
+            was_primary_before,
+            former_primary.as_deref(),
+        );
         true
     }
 
@@ -249,12 +258,22 @@ where
     /// primary and the advance names a peer), cleared whenever an advance
     /// names this node again. The latch gates the election's lone-survivor
     /// fast path (see the field doc in `secondary/mod.rs`).
+    ///
+    /// `former_primary` is the caller's pre-advance `current_primary()`
+    /// (captured at the SAME point as `was_primary_before`, before the
+    /// apply/restore moved the identity). When this advance is a graceful
+    /// `Transferred` relocation naming THIS node, that former primary is
+    /// the node relocating away to become a standalone observer — carried
+    /// onto the `PromotionSignal`'s `relocating_from` so the built primary
+    /// can hold its terminal-verdict delivery for that still-arriving
+    /// observer (see [`super::super::super::node::PromotionSignal`]).
     fn on_primary_identity_advanced(
         &mut self,
         new: &str,
         epoch: u64,
         reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason,
         was_primary_before: bool,
+        former_primary: Option<&str>,
     ) {
         if new == self.config.secondary_id {
             // Named primary again through an applied advance: any earlier
@@ -294,12 +313,25 @@ where
                 // restoring `snapshot`, inheriting the join-fixed-point
                 // slice without replaying fat bodies (hydrate-from-index).
                 let settled_base = self.cluster_state.settled_base_clone();
+                // GRACEFUL relocation only: the former primary is handing
+                // its role to this node and becomes a standalone observer,
+                // so carry it as the built primary's pending observer. A
+                // `Election` failover names no `relocating_from` — the
+                // former primary CRASHED, so the built primary must not
+                // wait for it (it will never announce as an observer).
+                let relocating_from = match reason {
+                    dynrunner_protocol_primary_secondary::PrimaryChangeReason::Transferred => {
+                        former_primary.map(str::to_owned)
+                    }
+                    dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election => None,
+                };
                 if tx
                     .send(PromotionSignal {
                         reason,
                         epoch,
                         snapshot,
                         settled_base,
+                        relocating_from,
                     })
                     .is_err()
                 {
@@ -429,6 +461,7 @@ where
                 epoch,
                 dynrunner_protocol_primary_secondary::PrimaryChangeReason::default(),
                 was_primary_before,
+                before.0.as_deref(),
             );
             return true;
         }

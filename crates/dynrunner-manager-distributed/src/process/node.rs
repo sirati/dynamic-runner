@@ -126,6 +126,23 @@ pub struct PromotionSignal<I: Identifier> {
     /// disjoint (a hash is fat XOR settled), so their union is the full
     /// logical ledger.
     pub settled_base: crate::cluster_state::SettledStore,
+    /// The node that is GRACEFULLY RELOCATING its primary role away onto
+    /// this host — `Some(former_primary_id)` ONLY on a `Transferred`
+    /// relocation (a submitter primary handing off to a chosen compute
+    /// peer, which then becomes a standalone observer); `None` on a
+    /// `Election` failover (the former primary CRASHED — it is not becoming
+    /// an observer, so the built primary must NOT wait for it at teardown).
+    ///
+    /// Captured at the promotion-fire instant (the relocating-away node was
+    /// `current_primary` going INTO the advance). The built primary records
+    /// it as a PENDING observer in its terminal-verdict delivery wait set
+    /// (`await_terminal_observer_delivery`): in a fast relocation the
+    /// relocated primary can decide + broadcast `RunComplete` BEFORE the
+    /// relocating-away node has finished its primary→observer swap and
+    /// announced itself, so the role-table observer projection is still
+    /// empty and the delivery hold would otherwise be skipped — leaving the
+    /// observer to miss the verdict and strand on the long cadences.
+    pub relocating_from: Option<String>,
 }
 
 /// The OS-process role composition shell (see the module docs).

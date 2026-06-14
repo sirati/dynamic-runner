@@ -34,7 +34,7 @@ use crate::primary::{PrimaryCoordinator, PrimaryRunOutcome};
 /// the latter as the teardown lever). `None` if the promotion cannot proceed
 /// (no builder, or the pump is gone).
 pub(super) async fn self_build_promoted_primary<I, Sched, Est>(
-    signal: PromotionSignal<I>,
+    mut signal: PromotionSignal<I>,
     promote: &mut Option<super::super::run_inputs::PromotedPrimaryBuilder<Sched, Est, I>>,
     control: &MeshControlHandle<I>,
     own_peer_id: &PeerId,
@@ -67,6 +67,14 @@ where
     // opens ONLY on a `BootstrapRelocation`.
     let bootstrap_kind = super::super::BootstrapKind::from(signal.reason);
 
+    // The node relocating its primary away onto this host (graceful
+    // `Transferred` handoff only — `None` on a failover). Captured before
+    // `signal.snapshot` is moved into the builder; recorded on the built
+    // primary as a PENDING observer so its terminal-verdict broadcast holds
+    // delivery for that node while it completes its primary→observer swap
+    // and announces itself (see `PrimaryCoordinator::set_pending_observer`).
+    let relocating_from = signal.relocating_from.take();
+
     // The caller's recipe builds + snapshot-seeds the primary from the
     // converged `cluster_state` the secondary captured ON the signal at the
     // promotion-fire instant. The node only threads the snapshot (fat
@@ -84,6 +92,13 @@ where
         bootstrap_kind,
     );
     built.coordinator.register_demote_on_displaced(demote_tx);
+    // Record the relocating-away node as a pending observer (graceful
+    // relocation only — `None` on a failover, so a crashed former primary is
+    // never waited on). Set AFTER the builder seeds the coordinator and
+    // BEFORE its run starts, on the same synchronous build turn.
+    if let Some(former) = relocating_from {
+        built.coordinator.set_pending_observer(former);
+    }
 
     let (tx, rx) = oneshot::channel();
     let coord_thread =
