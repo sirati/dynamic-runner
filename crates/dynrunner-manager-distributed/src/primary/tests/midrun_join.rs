@@ -732,6 +732,7 @@ async fn midrun_joiner_inherits_pre_staged_mode_and_resolves_bind_mounted_corpus
                         kind: Default::default(),
                         setup_affinity: None,
                         upload_file: None,
+                        required_files: None,
                         resolved_path: None,
                     }
                 })
