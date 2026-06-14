@@ -104,7 +104,31 @@ from ._ssh import gateway_ssh
 from ._staging import stage_inputs
 
 
-_NUM_TASKS_PER_PHASE = 12
+def _num_tasks_per_phase() -> int:
+    """Per-phase task count, env-overridable for the #504 delta-pull
+    corroboration.
+
+    Defaults to 12 (the original distribution-shape rationale below). The
+    ``DYNRUNNER_E2E_FAILOVER_NUM_TASKS`` env knob raises it to a NON-trivial
+    ledger (a few hundred to low-thousands) so the post-failover convergence
+    exercises the range-digest DELTA pull / anti-entropy machinery (#504): a
+    buggy incremental range-digest memo would DROP CRDT entries on a delta
+    convergence, surfacing here as a permanently-missing output. A single
+    knob (not a new scenario) keeps the failover mechanic un-duplicated;
+    absent → the historical 12-task shape, so every existing run is
+    unchanged."""
+    raw = os.environ.get("DYNRUNNER_E2E_FAILOVER_NUM_TASKS", "")
+    if raw:
+        try:
+            n = int(raw)
+            if n > 0:
+                return n
+        except ValueError:
+            pass
+    return 12
+
+
+_NUM_TASKS_PER_PHASE = _num_tasks_per_phase()
 """12 tasks distributed across 3 secondaries → 4 per secondary in the
 round-robin initial-assignment phase (post-#33). Enough work that
 some completions happen pre-kill AND some assignments remain pending
@@ -140,7 +164,21 @@ _KILL_PROBE_INTERVAL_S = 1.0
 so the SIGKILL lands close to the moment the cluster goes operational
 — while the bulk of the work is still in flight to fail over."""
 
-_POST_KILL_DEADLINE_S = 90.0
+def _post_kill_deadline_s() -> float:
+    """Convergence budget AFTER dispatcher exit. The base 90s covers the R1
+    threshold + election + the original 12-task remaining-work tail. A large
+    #504 delta-pull ledger (hundreds–thousands of tasks) adds a real
+    post-failover execution tail (each task takes ~_TASK_SLEEP_S to publish,
+    spread across the surviving secondaries), so the budget scales with the
+    ledger above the original shape: +0.5s per task beyond 12, which
+    comfortably covers the slowest-secondary tail at the test env's worker
+    throughput. Absent the knob → the historical 90s, unchanged."""
+    base = 90.0
+    extra_tasks = max(0, _NUM_TASKS_PER_PHASE - 12)
+    return base + 0.5 * extra_tasks
+
+
+_POST_KILL_DEADLINE_S = _post_kill_deadline_s()
 """How long the test waits AFTER dispatcher exit for the cluster to
 converge on the expected outputs.
 
@@ -153,7 +191,9 @@ Two slow phases live in this window:
 90s is conservative but bounded — the unit tests at
 ``crates/dynrunner-manager-distributed/src/secondary/election.rs``
 pin the election path at <500ms once R1 has armed, so the
-dominant cost is R1's threshold delay + the remaining work."""
+dominant cost is R1's threshold delay + the remaining work. For a large
+#504 delta-pull ledger the budget scales with the ledger (see
+``_post_kill_deadline_s``)."""
 
 _POLL_INTERVAL_S = 2.0
 
