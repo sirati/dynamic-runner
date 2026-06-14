@@ -12,8 +12,15 @@
 //!   `report_unresolvable_task`. Used by both the router and by
 //!   `wait_for_setup` / `handle_initial_assignment` so each rule has
 //!   exactly one writer.
+//! - [`inflight_roster`] — the #518 worker-source-of-truth seam: answer
+//!   the primary's `RequestInFlightRoster` (report the tasks this node's
+//!   workers are ACTUALLY running, read off `active_tasks`) and honor a
+//!   `WithdrawTask` (drop a not-yet-started duplicate copy; a copy
+//!   already executing is left to the primary's terminal-dedup, as no
+//!   mid-run worker abort exists).
 
 mod helpers;
+mod inflight_roster;
 mod router;
 
 /// Wire `error_message` marker for the duplicate-assignment reply: the

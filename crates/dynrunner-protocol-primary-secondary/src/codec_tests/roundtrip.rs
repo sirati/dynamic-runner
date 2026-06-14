@@ -1456,3 +1456,184 @@ fn respawn_revoke_result_decodes_literal_sender_bytes() {
         _ => panic!("expected RespawnRevokeResult"),
     }
 }
+
+/// #518 `RequestInFlightRoster` carries no payload beyond the
+/// routing/common fields; the round-trip pins the length-prefixed codec
+/// preserving the variant + `sender_id`.
+#[test]
+fn roundtrip_request_inflight_roster() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::RequestInFlightRoster {
+        target: None,
+        sender_id: "primary".into(),
+        timestamp: 55.0,
+    };
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+    match decoded {
+        DistributedMessage::RequestInFlightRoster { sender_id, .. } => {
+            assert_eq!(sender_id, "primary");
+        }
+        _ => panic!("expected RequestInFlightRoster"),
+    }
+}
+
+/// #518 `InFlightRoster` round-trips: the reporting member, its membership
+/// generation, AND every entry (hash + worker_id + typed identity) survive
+/// the wire. The `member_gen` is carried on a NON-default value so a
+/// dropped field would be caught, and the entries vec holds two members so
+/// order + count are pinned.
+#[test]
+fn roundtrip_inflight_roster() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::InFlightRoster {
+        target: None,
+        sender_id: "sec-A".into(),
+        timestamp: 7.0,
+        secondary_id: "sec-A".into(),
+        member_gen: 4,
+        entries: vec![
+            InFlightRosterEntry {
+                hash: "h-1".into(),
+                worker_id: 0,
+                task_id: test_id("task-one"),
+            },
+            InFlightRosterEntry {
+                hash: "h-2".into(),
+                worker_id: 3,
+                task_id: test_id("task-two"),
+            },
+        ],
+    };
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+    match decoded {
+        DistributedMessage::InFlightRoster {
+            secondary_id,
+            member_gen,
+            entries,
+            ..
+        } => {
+            assert_eq!(secondary_id, "sec-A");
+            assert_eq!(member_gen, 4, "the member generation must survive the wire");
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].hash, "h-1");
+            assert_eq!(entries[0].worker_id, 0);
+            assert_eq!(entries[0].task_id.binary_name, "task-one");
+            assert_eq!(entries[1].hash, "h-2");
+            assert_eq!(entries[1].worker_id, 3);
+            assert_eq!(entries[1].task_id.binary_name, "task-two");
+        }
+        _ => panic!("expected InFlightRoster"),
+    }
+}
+
+/// #518 `WithdrawTask` round-trips: the addressed member, the worker id,
+/// and the duplicate hash survive the wire — the primary directs exactly
+/// one member's worker to stand down.
+#[test]
+fn roundtrip_withdraw_task() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::WithdrawTask {
+        target: None,
+        sender_id: "primary".into(),
+        timestamp: 8.0,
+        secondary_id: "sec-B".into(),
+        worker_id: 2,
+        task_hash: "h-dup".into(),
+    };
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+    match decoded {
+        DistributedMessage::WithdrawTask {
+            secondary_id,
+            worker_id,
+            task_hash,
+            ..
+        } => {
+            assert_eq!(secondary_id, "sec-B");
+            assert_eq!(worker_id, 2);
+            assert_eq!(task_hash, "h-dup");
+        }
+        _ => panic!("expected WithdrawTask"),
+    }
+}
+
+/// Wire-shape mirror (NOT symmetric-on-the-wrong-shape): decode the EXACT
+/// JSON bytes each #518 sender emits — internally tagged, snake_case, with
+/// the `target` routing header elided via `skip_serializing_if` — rather
+/// than re-encoding our own value, so a tag/field rename that still
+/// round-trips against itself is caught against the other side's bytes.
+#[test]
+fn inflight_reconcile_frames_decode_literal_sender_bytes() {
+    // Primary -> re-admitted member: the pull request.
+    let req = r#"{"msg_type":"request_in_flight_roster","sender_id":"primary","timestamp":1.0}"#;
+    match serde_json::from_str::<DistributedMessage<TestId>>(req).unwrap() {
+        DistributedMessage::RequestInFlightRoster {
+            target, sender_id, ..
+        } => {
+            assert!(target.is_none(), "elided target must decode as None");
+            assert_eq!(sender_id, "primary");
+        }
+        _ => panic!("expected RequestInFlightRoster"),
+    }
+
+    // Re-admitted member -> primary: the roster answer (one entry).
+    let roster = r#"{"msg_type":"in_flight_roster","sender_id":"sec-A","timestamp":2.0,"secondary_id":"sec-A","member_gen":4,"entries":[{"hash":"h-1","worker_id":0,"task_id":{"binary_name":"task-one","platform":"x86_64","compiler":"gcc","version":"12.0","opt_level":"O2"}}]}"#;
+    match serde_json::from_str::<DistributedMessage<TestId>>(roster).unwrap() {
+        DistributedMessage::InFlightRoster {
+            secondary_id,
+            member_gen,
+            entries,
+            ..
+        } => {
+            assert_eq!(secondary_id, "sec-A");
+            assert_eq!(member_gen, 4);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].hash, "h-1");
+            assert_eq!(entries[0].worker_id, 0);
+        }
+        _ => panic!("expected InFlightRoster"),
+    }
+
+    // Primary -> duplicate-holder: the withdraw command.
+    let withdraw = r#"{"msg_type":"withdraw_task","sender_id":"primary","timestamp":3.0,"secondary_id":"sec-B","worker_id":2,"task_hash":"h-dup"}"#;
+    match serde_json::from_str::<DistributedMessage<TestId>>(withdraw).unwrap() {
+        DistributedMessage::WithdrawTask {
+            secondary_id,
+            worker_id,
+            task_hash,
+            ..
+        } => {
+            assert_eq!(secondary_id, "sec-B");
+            assert_eq!(worker_id, 2);
+            assert_eq!(task_hash, "h-dup");
+        }
+        _ => panic!("expected WithdrawTask"),
+    }
+}
+
+/// The three #518 frames carry the EXPECTED `msg_type` discriminators on
+/// the wire (the receiver demuxes on these), and a peer mirrors the
+/// literal bytes back into the right variant — catches a `rename_all`
+/// drift that would still round-trip against itself.
+#[test]
+fn inflight_reconcile_frames_wire_tags_mirror() {
+    for (literal, want_tag) in [
+        (
+            r#"{"msg_type":"request_in_flight_roster","sender_id":"p","timestamp":0.0}"#,
+            MessageType::RequestInFlightRoster,
+        ),
+        (
+            r#"{"msg_type":"in_flight_roster","sender_id":"a","timestamp":0.0,"secondary_id":"a","member_gen":0,"entries":[]}"#,
+            MessageType::InFlightRoster,
+        ),
+        (
+            r#"{"msg_type":"withdraw_task","sender_id":"p","timestamp":0.0,"secondary_id":"b","worker_id":0,"task_hash":"h"}"#,
+            MessageType::WithdrawTask,
+        ),
+    ] {
+        let decoded: DistributedMessage<TestId> = serde_json::from_str(literal).unwrap();
+        assert_eq!(decoded.msg_type(), want_tag, "literal: {literal}");
+    }
+}

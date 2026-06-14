@@ -72,7 +72,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // through would account a still-running task as a terminal
             // failure.
             if error_message == crate::secondary::TASK_ALREADY_HELD_WIRE_MESSAGE {
-                self.note_task_already_held(secondary_id, *worker_id, task_hash);
+                self.note_task_already_held(secondary_id, *worker_id, task_hash)
+                    .await;
                 return;
             }
             // Dedup gate (#50 peer-forwarding redundancy):

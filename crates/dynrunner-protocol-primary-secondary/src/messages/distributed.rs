@@ -13,6 +13,7 @@ use crate::address::Destination;
 use crate::cluster_mutation::ClusterMutation;
 use crate::messages::binary_info::{DistributedBinaryInfo, StagedFileRecord, ZipFileAssignment};
 use crate::messages::illegal_assignment::AssignedTaskRef;
+use crate::messages::inflight_roster::InFlightRosterEntry;
 use crate::messages::peer_info::{PeerConnectionInfo, WorkerReadyInfo};
 use crate::messages::range_digest::RangeDigest;
 use crate::messages::state_digest::StateDigest;
@@ -1552,6 +1553,79 @@ pub enum DistributedMessage<I> {
         /// running task (out-of-range `worker_id` / 0-worker node).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         incumbent: Option<AssignedTaskRef<I>>,
+    },
+    /// Primary -> a just-re-admitted member (#518): "report your ACTUAL
+    /// in-flight work." A member falsely declared dead kept running its
+    /// tasks while the primary requeued them onto OTHER members; on
+    /// re-admission the member is the source of truth for what its workers
+    /// run, so the primary pulls that roster to reconcile + dedup the
+    /// cross-member duplicates. Carries no payload beyond the routing/common
+    /// fields — the addressee (the re-admitted member) is the routing
+    /// `target` the egress stamps.
+    RequestInFlightRoster {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a content
+        /// classifier. `None` on a freshly-constructed frame; the egress
+        /// stamps `Some(resolved)` once the coordinators are rewired.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+    },
+    /// Re-admitted member -> primary (#518): the answer to
+    /// `RequestInFlightRoster` — the tasks its workers are ACTUALLY running
+    /// right now, read off the member's own `active_tasks` bookkeeping (the
+    /// source of truth). The primary reconciles each reported entry: a hash
+    /// it had requeued onto a DIFFERENT member is authoritatively the
+    /// reporter's, so the duplicate copy is withdrawn (`WithdrawTask`).
+    ///
+    /// `member_gen` is the reporter's membership incarnation at report time
+    /// (read from its replicated `peer_state`): a roster that crossed a
+    /// re-removal in flight is stale and the primary ignores it.
+    InFlightRoster {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// The reporting member (the re-admitted original — the holder these
+        /// entries are authoritative for).
+        secondary_id: String,
+        /// The reporter's membership incarnation at report time. The primary
+        /// compares it against the live `peer_member_gen` and ignores a
+        /// roster that crossed a re-removal.
+        member_gen: u64,
+        /// The hashes (+ their stable secondary-local worker ids) the
+        /// reporter's workers are running right now. Each `entry.hash`
+        /// equals the `TaskAssignment.file_hash` the primary's ledger keys
+        /// on; `worker_id` is the holding worker for the per-`(secondary,
+        /// worker_id)` re-seat (mirrors the #517 incumbent re-seat).
+        entries: Vec<InFlightRosterEntry<I>>,
+    },
+    /// Primary -> the member running a DUPLICATE copy (#518): withdraw the
+    /// named task from the named worker. The authoritative holder is the
+    /// re-admitted original; this member's copy is the requeued duplicate
+    /// and stands down. NOT a `TaskFailed` (no terminal accounting, no
+    /// retry-budget burn) — the requeue-inverse, like the #517 bounce. The
+    /// member drops a copy that has NOT yet started running on its worker; a
+    /// copy already executing is left in place (no mid-run abort exists) and
+    /// the primary's terminal-dedup absorbs its eventual terminal.
+    WithdrawTask {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// The member that must withdraw the duplicate copy.
+        secondary_id: String,
+        /// The secondary-local worker id the duplicate was dispatched to —
+        /// the same id namespace `TaskAssignment.worker_id` uses.
+        worker_id: u32,
+        /// The wire hash of the duplicate task to withdraw.
+        task_hash: String,
     },
 }
 

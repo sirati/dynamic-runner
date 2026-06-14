@@ -130,6 +130,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // replacement is no longer in `pending_replacements`, so close the
         // gap here by winding it down at its next quiescence.
         self.schedule_seated_replacement_winddown(&sender).await;
+        // (5) #518 cross-member double-exec heal: the falsely-removed member
+        // kept running its in-flight tasks while the primary requeued them
+        // onto OTHER members (the requeue deleted A's ledger entries and
+        // re-keyed them to whichever member B took the re-dispatch). A is the
+        // source of truth for what its workers run, so PULL its actual
+        // in-flight roster; the answer (`InFlightRoster`) drives the
+        // primary-side dedup that re-seats each task onto A and withdraws the
+        // duplicate copy from B (`handle_inflight_roster`).
+        self.request_inflight_roster(&sender).await;
     }
 
     /// #467: schedule the graceful wind-down of every SEATED respawn

@@ -63,7 +63,10 @@ impl<I> DistributedMessage<I> {
             | Self::SetupTerminal { target, .. }
             | Self::TaskQueuedAfterLocalDependency { target, .. }
             | Self::LocalDependencyReleased { target, .. }
-            | Self::IllegallyAssignedToNonidleWorker { target, .. } => target.as_ref(),
+            | Self::IllegallyAssignedToNonidleWorker { target, .. }
+            | Self::RequestInFlightRoster { target, .. }
+            | Self::InFlightRoster { target, .. }
+            | Self::WithdrawTask { target, .. } => target.as_ref(),
         }
     }
 
@@ -120,7 +123,10 @@ impl<I> DistributedMessage<I> {
             | Self::SetupTerminal { target, .. }
             | Self::TaskQueuedAfterLocalDependency { target, .. }
             | Self::LocalDependencyReleased { target, .. }
-            | Self::IllegallyAssignedToNonidleWorker { target, .. } => target,
+            | Self::IllegallyAssignedToNonidleWorker { target, .. }
+            | Self::RequestInFlightRoster { target, .. }
+            | Self::InFlightRoster { target, .. }
+            | Self::WithdrawTask { target, .. } => target,
         };
         *slot = Some(dst);
     }
@@ -191,7 +197,10 @@ impl<I> DistributedMessage<I> {
             | Self::SetupTerminal { target, .. }
             | Self::TaskQueuedAfterLocalDependency { target, .. }
             | Self::LocalDependencyReleased { target, .. }
-            | Self::IllegallyAssignedToNonidleWorker { target, .. } => target,
+            | Self::IllegallyAssignedToNonidleWorker { target, .. }
+            | Self::RequestInFlightRoster { target, .. }
+            | Self::InFlightRoster { target, .. }
+            | Self::WithdrawTask { target, .. } => target,
         };
         *slot = None;
     }
@@ -243,7 +252,10 @@ impl<I> DistributedMessage<I> {
             | Self::SetupTerminal { sender_id, .. }
             | Self::TaskQueuedAfterLocalDependency { sender_id, .. }
             | Self::LocalDependencyReleased { sender_id, .. }
-            | Self::IllegallyAssignedToNonidleWorker { sender_id, .. } => sender_id,
+            | Self::IllegallyAssignedToNonidleWorker { sender_id, .. }
+            | Self::RequestInFlightRoster { sender_id, .. }
+            | Self::InFlightRoster { sender_id, .. }
+            | Self::WithdrawTask { sender_id, .. } => sender_id,
         }
     }
 
@@ -294,7 +306,10 @@ impl<I> DistributedMessage<I> {
             | Self::SetupTerminal { timestamp, .. }
             | Self::TaskQueuedAfterLocalDependency { timestamp, .. }
             | Self::LocalDependencyReleased { timestamp, .. }
-            | Self::IllegallyAssignedToNonidleWorker { timestamp, .. } => *timestamp,
+            | Self::IllegallyAssignedToNonidleWorker { timestamp, .. }
+            | Self::RequestInFlightRoster { timestamp, .. }
+            | Self::InFlightRoster { timestamp, .. }
+            | Self::WithdrawTask { timestamp, .. } => *timestamp,
         }
     }
 
@@ -545,6 +560,9 @@ impl<I> DistributedMessage<I> {
             Self::IllegallyAssignedToNonidleWorker { .. } => {
                 MessageType::IllegallyAssignedToNonidleWorker
             }
+            Self::RequestInFlightRoster { .. } => MessageType::RequestInFlightRoster,
+            Self::InFlightRoster { .. } => MessageType::InFlightRoster,
+            Self::WithdrawTask { .. } => MessageType::WithdrawTask,
         }
     }
 }

@@ -305,6 +305,24 @@ where
                 tracing::trace!(task_hash, "observed TaskFailed report (no-op)");
                 Ok(())
             }
+            // #518 worker-source-of-truth: the primary (which just
+            // re-admitted this falsely-removed-but-alive member) asks for
+            // the tasks this node's workers are ACTUALLY running, so it can
+            // dedup the requeued copies it dispatched onto other members.
+            // Answer off the live `active_tasks` bookkeeping.
+            DistributedMessage::RequestInFlightRoster { .. } => {
+                self.report_inflight_roster().await;
+                Ok(())
+            }
+            // #518: the primary directs this member to stand down a
+            // DUPLICATE copy (the original holder re-admitted). Drop a
+            // not-yet-started deferral; a copy already running is left to
+            // complete (no mid-run abort) and the primary's terminal-dedup
+            // absorbs it. See `withdraw_task`.
+            DistributedMessage::WithdrawTask { .. } => {
+                self.withdraw_task(&msg);
+                Ok(())
+            }
             DistributedMessage::RequestSnapshotStream {
                 sender_id,
                 stream_id,

@@ -168,4 +168,27 @@ pub enum MessageType {
     /// so it is never accounted as a failure; the primary reconciles its
     /// diverged `(secondary, worker_id)` occupancy and requeues the task.
     IllegallyAssignedToNonidleWorker,
+    /// Primary -> a just-re-admitted member: report your ACTUAL in-flight
+    /// work (#518). A falsely-removed-but-alive member kept running its
+    /// tasks while the primary requeued them onto OTHER members; on
+    /// re-admission the member is the source of truth for what its workers
+    /// run, so the primary pulls that roster to reconcile + dedup the
+    /// cross-member duplicates. Carries no payload beyond the routing/common
+    /// fields (the addressee is the re-admitted member).
+    RequestInFlightRoster,
+    /// Re-admitted member -> primary: the answer to `RequestInFlightRoster`
+    /// (#518) — the hashes its workers are ACTUALLY running right now, read
+    /// off the member's own `active_tasks` bookkeeping (the source of
+    /// truth). The primary reconciles each reported hash: a hash it had
+    /// requeued onto a DIFFERENT member is authoritatively the reporter's,
+    /// so the duplicate copy is withdrawn (`WithdrawTask`).
+    InFlightRoster,
+    /// Primary -> the member running a DUPLICATE copy (#518): withdraw the
+    /// named task from the named worker. The authoritative holder is the
+    /// re-admitted original; this member's copy is the requeued duplicate
+    /// and stands down. NOT a `TaskFailed` (no terminal accounting, no
+    /// retry-budget burn) — the requeue-inverse, like the #517 bounce. The
+    /// member drops a not-yet-started copy; a copy already executing is left
+    /// to the primary's terminal-dedup (no mid-run abort exists).
+    WithdrawTask,
 }

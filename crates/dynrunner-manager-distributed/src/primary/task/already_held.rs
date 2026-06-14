@@ -48,49 +48,61 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// Deliberately NO backpressure window and NO requeue in either
     /// case: an already-held answer is not a capacity signal, and a
     /// requeue is exactly the loop this report exists to break.
-    pub(crate) fn note_task_already_held(
+    ///
+    /// CASE 1b (#518) — the ledger's holder is a DIFFERENT member than the
+    /// reporter: the hash is executing on BOTH (a cross-member duplicate,
+    /// the requeued copy from a false-dead recovery). The reporter is
+    /// AUTHORITATIVELY running it (it told us so — the worker is the source
+    /// of truth), so this no longer TOLERATES the double-exec: it routes
+    /// through the SAME [`Self::reconcile_authoritative_holder`] primitive
+    /// the #518 re-admission roster uses — re-seat the ledger onto the
+    /// reporter and WITHDRAW the duplicate copy from the ledger's member.
+    /// One dedup concern, two triggers (the re-admission roster pull and
+    /// this already-held report).
+    pub(crate) async fn note_task_already_held(
         &mut self,
         secondary_id: &str,
         worker_id: u32,
         task_hash: &str,
     ) {
-        if let Some(entry) = self.in_flight.get(task_hash) {
-            if entry.secondary_id == secondary_id {
-                tracing::info!(
-                    secondary = %secondary_id,
-                    holding_worker_id = worker_id,
-                    task_hash = %task_hash,
-                    "holder confirmed it is already running the dispatched \
-                     task (duplicate assignment after an in-flight-fact \
-                     loss); keeping it in flight on the holder — the real \
-                     terminal settles it"
-                );
-            } else {
-                // The ledger's holder is a DIFFERENT member: the hash is
-                // executing on both (a cross-member duplicate dispatch —
-                // the inherent at-least-once cost of a lost in-flight
-                // fact). Keep the ledger's record; the first terminal
-                // settles it and the second deduplicates.
-                tracing::warn!(
-                    reporting_secondary = %secondary_id,
-                    ledger_secondary = %entry.secondary_id,
-                    task_hash = %task_hash,
-                    "already-held report from a different member than the \
-                     ledger's holder: the hash is executing on both (a \
-                     duplicate dispatch crossed members); keeping the \
-                     ledger's holder — the first terminal settles, the \
-                     duplicate terminal dedups"
-                );
-            }
+        let Some(entry) = self.in_flight.get(task_hash) else {
+            tracing::debug!(
+                secondary = %secondary_id,
+                holding_worker_id = worker_id,
+                task_hash = %task_hash,
+                "already-held report for an un-tracked hash (it raced a \
+                 recovery requeue or a terminal); no action — a queued copy \
+                 re-converges on the next dispatch recheck"
+            );
+            return;
+        };
+        if entry.secondary_id == secondary_id {
+            tracing::info!(
+                secondary = %secondary_id,
+                holding_worker_id = worker_id,
+                task_hash = %task_hash,
+                "holder confirmed it is already running the dispatched \
+                 task (duplicate assignment after an in-flight-fact \
+                 loss); keeping it in flight on the holder — the real \
+                 terminal settles it"
+            );
             return;
         }
-        tracing::debug!(
-            secondary = %secondary_id,
-            holding_worker_id = worker_id,
+        // CASE 1b (#518): cross-member duplicate. The reporter is the
+        // authoritative holder (it IS running the hash); reconcile + cancel
+        // the duplicate copy on the ledger's member through the one dedup
+        // primitive instead of leaving both to run.
+        tracing::warn!(
+            reporting_secondary = %secondary_id,
+            ledger_secondary = %entry.secondary_id,
             task_hash = %task_hash,
-            "already-held report for an un-tracked hash (it raced a \
-             recovery requeue or a terminal); no action — a queued copy \
-             re-converges on the next dispatch recheck"
+            "already-held report from a DIFFERENT member than the ledger's \
+             holder: the hash is executing on both (a duplicate dispatch \
+             crossed members). The reporter is the authoritative holder — \
+             reconciling the ledger onto it and withdrawing the duplicate \
+             copy (#518)"
         );
+        self.reconcile_authoritative_holder(secondary_id, worker_id, task_hash)
+            .await;
     }
 }

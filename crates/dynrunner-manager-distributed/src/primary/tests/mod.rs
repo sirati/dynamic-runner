@@ -40,6 +40,7 @@ mod graceful_abort;
 mod hydrate;
 mod illegal_assignment;
 mod incremental_setup;
+mod inflight_reconcile;
 mod initial_assignment;
 mod injected_spread;
 mod instant_crash_run;

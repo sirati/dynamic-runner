@@ -421,6 +421,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             MessageType::IllegallyAssignedToNonidleWorker => {
                 self.handle_illegally_assigned(msg).await
             }
+            // #518 cross-member dedup: a just-re-admitted member reported
+            // the tasks its workers are AUTHORITATIVELY running. For each,
+            // recognise the member as the holder and withdraw any requeued
+            // duplicate copy on another member. See `handle_inflight_roster`.
+            MessageType::InFlightRoster => self.handle_inflight_roster(msg).await,
             other => {
                 tracing::debug!(?other, "unhandled message type");
             }
