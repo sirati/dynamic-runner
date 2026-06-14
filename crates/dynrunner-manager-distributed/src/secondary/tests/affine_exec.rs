@@ -1375,3 +1375,94 @@ async fn affine_gate_detected_after_settled_restore() {
         })
         .await;
 }
+
+/// HEADLINE (#516 drift-class invariant): the unified resolver
+/// [`crate::cluster_state::ClusterState::resolve_affine_ready_gate`] answers
+/// BOTH "is this a ready gate?" (detection) AND "what is its body?"
+/// (import-drive) from ONE fat∪settled read. For a SPILLED `AffineReady` gate —
+/// where `task_state` (fat) returns `None` — a SINGLE resolve call must return
+/// `Some` with `is_ready_gate == true` AND a body. This is the exact property
+/// the OLD two-read split (`is_affine_ready_gate` over fat∪settled, but
+/// `affine_gate_task` once fat-only — fe840943/#515) could violate: detection
+/// said "gate" while the body read went blind → phantom "absent gate". One read
+/// makes "detected ⟹ body-resolvable" tautological. The truly-absent hash (the
+/// #509 sync race) resolves to `None`, which is the precondition the drive maps
+/// to the Recoverable re-route — that classification is asserted end-to-end by
+/// `unsynced_gate_reroutes_recoverable_then_runs_once_synced`.
+#[tokio::test(flavor = "current_thread")]
+async fn unified_resolver_one_read_recognizes_and_resolves_spilled_gate() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, _log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            let mut factory = FakeWorkerFactory;
+            let pool = sec.initialize_workers(&mut factory).await.unwrap();
+            sec.enter_operational_for_test();
+            *sec.pool_mut() = pool;
+
+            let gate_hash = "import-monolith";
+            seed_affine_ready_gate(&mut sec, gate_hash, "import");
+
+            // SPILL the gate so its fat body is evicted and only the slim
+            // settled `AffineReady` index entry remains — the case the old
+            // fat-only body read went blind on.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let evicted = sec.force_settled_spill_for_test(&dir.path().join("spill.cbor"));
+            assert_eq!(evicted, 1, "the AffineReady gate spills + evicts its fat body");
+            assert!(
+                sec.cluster_state.task_state(gate_hash).is_none(),
+                "post-spill the fat body is gone — the fat-only body read would go blind"
+            );
+
+            // THE INVARIANT: ONE resolve call yields BOTH the recognition fact
+            // AND the body over the settled half — they cannot disagree because
+            // there is one read.
+            let resolved = sec
+                .cluster_state
+                .resolve_affine_ready_gate(gate_hash)
+                .expect("the spilled gate resolves over fat∪settled in one read");
+            assert!(
+                resolved.is_ready_gate,
+                "the SAME single read recognizes the spilled entry as a ready gate"
+            );
+            assert_eq!(
+                resolved.task.task_id, "import",
+                "the SAME single read returns the spilled gate's body (read back from disk)"
+            );
+
+            // The thin projections agree with the unified read by construction
+            // (they ARE the resolver): detection sees the gate, body resolves.
+            assert!(
+                sec.cluster_state.is_affine_ready_gate(gate_hash),
+                "detection projection: the spilled gate is a ready gate"
+            );
+            assert_eq!(
+                sec.cluster_state
+                    .affine_gate_task(gate_hash)
+                    .expect("body projection resolves the spilled gate")
+                    .task_id,
+                "import",
+                "body projection: the spilled gate's body resolves to the same task"
+            );
+
+            // A truly-absent hash (the #509 sync race) resolves to `None` — the
+            // precondition the drive maps to the Recoverable re-route.
+            assert!(
+                sec.cluster_state
+                    .resolve_affine_ready_gate("never-synced")
+                    .is_none(),
+                "a hash in NEITHER half resolves to None (→ Recoverable re-route, #509)"
+            );
+            assert!(
+                !sec.cluster_state.is_affine_ready_gate("never-synced"),
+                "an absent hash is not a ready gate"
+            );
+            assert!(
+                sec.cluster_state.affine_gate_task("never-synced").is_none(),
+                "an absent hash has no body"
+            );
+        })
+        .await;
+}
