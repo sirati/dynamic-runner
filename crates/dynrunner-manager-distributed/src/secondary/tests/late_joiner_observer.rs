@@ -690,3 +690,124 @@ async fn initial_assignment_to_zero_worker_pool_does_not_underflow() {
         })
         .await;
 }
+
+/// Defense-in-depth (#488): a STAGING-mode node (`src_network` set — a
+/// pre-staged bind-mount or a StageFile destination) that cannot resolve
+/// an assigned file LOCALLY must report the failure RECOVERABLE, not
+/// NonRecoverable.
+///
+/// Why: with `src_network` set the file is reinjectable ELSEWHERE — a
+/// DIFFERENT secondary may hold it staged (the bind-mount is per-node;
+/// in a respawn/partial-stage topology not every node has every file).
+/// A `NonRecoverable` report is terminal AND not re-routed by the
+/// primary, so the task is permanently lost (the #488 consumer symptom:
+/// 274/660 tasks silently lost, run falsely "complete"). `Recoverable`
+/// re-enters the per-phase retry bucket: the primary re-injects it into
+/// the pool (where a staged peer can pick it up) and the
+/// `retry_max_passes` budget BOUNDS it — a task placeable nowhere
+/// fails-final after the budget, never silently lost and never looped.
+///
+/// The genuine-misconfig case (`src_network` unset + a relative path the
+/// worker can never open) stays NonRecoverable — pinned by the two
+/// `unresolvable_task_*` / `initial_assignment_*` tests above; rerouting
+/// it would only bounce it to identically-unconfigured peers.
+#[tokio::test(flavor = "current_thread")]
+async fn unresolvable_task_in_staging_mode_is_recoverable_not_lost() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // A staging-mode node: `src_network` points at a real (empty)
+            // directory — staging is CONFIGURED, but THIS node never staged
+            // the assigned file. Production shape: a member's bind-mount
+            // lacks a file that a sibling's bind-mount holds.
+            let staging_root = std::env::temp_dir().join(format!(
+                "staging_recoverable_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&staging_root).unwrap();
+
+            let mut config = election_config("staging-unresolvable");
+            config.src_network = Some(staging_root.clone());
+            let (mut sec, log) =
+                super::super::test_helpers::make_secondary_recording(config, 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            sec.enter_operational_for_test();
+
+            // An ABSOLUTE local_path that does NOT exist + a 16-char
+            // identifier hash (NOT a content SHA) + an empty staging dir ⇒
+            // `resolve_for_dispatch` returns None and the staging guard
+            // (`src_network.is_some()`) fires. The wire `worker_id` is
+            // echoed back verbatim.
+            let binary = super::processing::make_binary("staging-missing", 50);
+            let file_hash = format!("hash_{}", binary.identifier.0);
+            let assignment = DistributedMessage::TaskAssignment {
+                target: None,
+                sender_id: "setup".into(),
+                timestamp: 0.0,
+                secondary_id: "staging-unresolvable".into(),
+                worker_id: 2,
+                zip_file: None,
+                binary_info:
+                    dynrunner_protocol_primary_secondary::DistributedBinaryInfo::from_task_info(
+                        &binary,
+                    ),
+                local_path: binary.path.to_string_lossy().into_owned(),
+                file_hash: file_hash.clone(),
+                predecessor_outputs: std::collections::BTreeMap::new(),
+            };
+
+            let mut factory = super::super::test_helpers::FakeWorkerFactory;
+            let result = sec.dispatch_message(assignment, &mut factory).await;
+            sec.drain_egress().await;
+            assert!(result.is_ok(), "dispatch must not error, got {result:?}");
+
+            // The decisive assertion: the report MUST be Recoverable so the
+            // primary re-routes the task to a staged member instead of
+            // losing it. Pre-fix this was NonRecoverable and the task was
+            // permanently lost.
+            let recoverable = log.borrow().iter().any(|m| {
+                matches!(
+                    m,
+                    DistributedMessage::TaskFailed {
+                        error_type: dynrunner_core::ErrorType::Recoverable,
+                        task_hash,
+                        worker_id,
+                        ..
+                    } if *task_hash == file_hash && *worker_id == 2
+                )
+            });
+            assert!(
+                recoverable,
+                "a staging-mode node that cannot resolve a file locally must \
+                 report it RECOVERABLE (reinjectable to a staged peer), not \
+                 lose it as NonRecoverable; captured sends: {:?}",
+                log.borrow(),
+            );
+            // And it must NOT also have emitted a NonRecoverable for the same
+            // hash (the classification is exactly one).
+            let nonrecoverable = log.borrow().iter().any(|m| {
+                matches!(
+                    m,
+                    DistributedMessage::TaskFailed {
+                        error_type: dynrunner_core::ErrorType::NonRecoverable,
+                        task_hash,
+                        ..
+                    } if *task_hash == file_hash
+                )
+            });
+            assert!(
+                !nonrecoverable,
+                "the staging-mode unresolvable report must not be \
+                 NonRecoverable; captured sends: {:?}",
+                log.borrow(),
+            );
+
+            let _ = std::fs::remove_dir_all(&staging_root);
+        })
+        .await;
+}

@@ -813,13 +813,12 @@ where
     /// filesystem-view path through to the worker, which crashes at
     /// exec time and the primary re-enqueues as Recoverable.
     ///
-    /// Returns `Ok(true)` when the task is unresolvable: a
-    /// `TaskFailed` NonRecoverable was sent to the primary and the
-    /// caller MUST skip the worker assignment. Returns `Ok(false)`
-    /// when resolution either succeeded or the path can plausibly
-    /// resolve at the worker (in-process distributed mode where
-    /// primary and secondary share a filesystem view); the caller
-    /// should proceed with the assignment.
+    /// Returns `Ok(true)` when the task is unresolvable: a `TaskFailed`
+    /// was sent to the primary and the caller MUST skip the worker
+    /// assignment. Returns `Ok(false)` when resolution either succeeded
+    /// or the path can plausibly resolve at the worker (in-process
+    /// distributed mode where primary and secondary share a filesystem
+    /// view); the caller should proceed with the assignment.
     ///
     /// Two ways the worker can succeed without `resolved_path`:
     ///   - the secondary has a staging directory (`src_network`
@@ -829,6 +828,27 @@ where
     ///     AND `local_path` is the primary's absolute path
     ///     (in-process distributed mode); for that to be plausible
     ///     `local_path` must at minimum be absolute.
+    ///
+    /// The failure is classified by WHY it is unresolvable — the same
+    /// `src_network` predicate that gates the report:
+    ///   - `src_network.is_some()` — staging IS configured but THIS
+    ///     node never staged the file (a per-node bind-mount lacks a
+    ///     file a sibling holds; a respawn/partial-stage topology; a
+    ///     StageFile-vs-assignment race). The file is REINJECTABLE
+    ///     ELSEWHERE, so the failure is `Recoverable`: the primary
+    ///     re-injects it into the pool (where a staged peer can pick it
+    ///     up) and the per-phase `retry_max_passes` budget BOUNDS it —
+    ///     a task placeable nowhere fails-final after the budget, never
+    ///     silently lost and never looped. A `NonRecoverable` here was
+    ///     the #495 silent-loss bug: the primary does not re-route a
+    ///     NonRecoverable, so a not-staged-HERE task was lost cluster-
+    ///     wide (274/660 lost, run falsely "complete").
+    ///   - `src_network` unset + a RELATIVE `local_path` — the worker
+    ///     can never open it AND no peer is configured differently
+    ///     (the wire path is identical for every node in non-staging
+    ///     mode), so rerouting would only bounce it to identically-
+    ///     unconfigured peers. This is a genuine misconfiguration and
+    ///     stays `NonRecoverable` (the historical fail-loud behaviour).
     pub(in crate::secondary) async fn report_unresolvable_task(
         &mut self,
         worker_id: u32,
@@ -837,8 +857,16 @@ where
         resolved_path: &Option<std::path::PathBuf>,
     ) -> Result<bool, String> {
         let local_path_is_relative = std::path::Path::new(local_path).is_relative();
-        if resolved_path.is_none() && (self.config.src_network.is_some() || local_path_is_relative)
-        {
+        let staging_configured = self.config.src_network.is_some();
+        if resolved_path.is_none() && (staging_configured || local_path_is_relative) {
+            // Staging configured ⇒ reinjectable to a staged peer
+            // (Recoverable); otherwise a relative path the worker can
+            // never open and no peer resolves differently (NonRecoverable).
+            let error_type = if staging_configured {
+                ErrorType::Recoverable
+            } else {
+                ErrorType::NonRecoverable
+            };
             // Report against the ORIGINAL wire `worker_id`: this value is
             // only echoed back to the primary in the `TaskFailed` frame, it
             // never indexes the pool here. The prior
@@ -856,7 +884,7 @@ where
                 secondary_id: self.config.secondary_id.clone(),
                 worker_id,
                 task_hash: file_hash.into(),
-                error_type: ErrorType::NonRecoverable,
+                error_type,
                 error_message: format!(
                     "file_hash {file_hash} not pre-staged at {local_path}; \
                      expected StageFile notification first"
