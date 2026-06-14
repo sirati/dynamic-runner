@@ -33,6 +33,7 @@ mod coordinator;
 mod custom_message;
 mod discovery;
 mod error;
+mod estimate_escalation;
 mod fulfillability_matcher;
 mod heartbeat;
 mod hydrate;

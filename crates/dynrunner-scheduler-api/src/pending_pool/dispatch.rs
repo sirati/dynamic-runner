@@ -420,4 +420,16 @@ impl<I: Identifier> PendingPool<I> {
     fn dispatch_eligible(&self, item: &TaskInfo<I>, now: std::time::Instant) -> bool {
         item.kind.is_worker_assignable() && self.dispatch_backoff.is_eligible(&item.task_id, now)
     }
+
+    /// [`Self::dispatch_eligible`] sampled at the current instant — the
+    /// public seam for callers OUTSIDE the dispatch read paths that need
+    /// the SAME worker-dispatch-eligibility gate without threading a
+    /// `now`. Used by the primary's estimate-escalation pass to decide
+    /// which queued tasks the best-effort rescue should consider (it must
+    /// see exactly the tasks a worker view would, never a re-implemented
+    /// filter). Stays on the SINGLE eligibility seam so the two never
+    /// diverge.
+    pub fn dispatch_eligible_now(&self, item: &TaskInfo<I>) -> bool {
+        self.dispatch_eligible(item, std::time::Instant::now())
+    }
 }

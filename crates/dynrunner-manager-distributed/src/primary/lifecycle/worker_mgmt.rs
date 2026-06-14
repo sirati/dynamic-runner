@@ -132,6 +132,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // not synchronous recursion. Consulted as the two boundary
             // methods only; dispatch never learns the silence policy.
             self.maybe_requeue_silent_held_work().await;
+            // Best-effort estimate-escalation rescue (#499). LAST in the
+            // post-dispatch chain: every normal path (worker recheck,
+            // setup/affine passes, silent-held requeue) has already had its
+            // chance, so this fires ONLY on work that is genuinely
+            // estimate-stalled — no queued task fits any per-worker budget
+            // while an assignable worker idles. It re-attempts the stuck
+            // tasks against the largest secondary's full capacity (the
+            // distributed analog of local's unassigned-phase budget boost)
+            // and fails the genuinely-unfittable ones individually as
+            // ResourceExhausted, converting a whole-pool strand into
+            // best-effort dispatch + actionable per-task failure.
+            // Self-contained in `primary::estimate_escalation`; the worker
+            // recheck never learns the escalation concern.
+            self.escalate_estimate_stalled_dispatch(command_rx).await;
         }
     }
 
