@@ -561,3 +561,246 @@ fn seeded_failure_ids_reject_duplicate_task_id_on_extend() {
         Err(PendingPoolError::DuplicateTaskId(_))
     ));
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Re-block on reinject of an ALREADY-COMPLETED dep (the inverse of
+// completion's unblock).
+//
+// When a dep `a` completes, its dependent `b` is unblocked `blocked → ready`.
+// If `a` is then REINJECTED (a finished task re-run, its output regenerated),
+// a still-READY `b` must be RE-BLOCKED — it must not dispatch against the
+// stale/torn predecessor output. `reinject` inverts the unblock by
+// re-deriving the lingering dependents from the queued items (the consumed
+// reverse index is gone) and re-routing each through `commit_item`. The
+// boundary: a dependent already DISPATCHED cannot be un-run, and `requeue`
+// (which never completed the task) is unaffected.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// THE HEADLINE: complete `a` → `b` ready; reinject `a` → `b` RE-BLOCKED.
+#[test]
+fn reinject_completed_dep_reblocks_ready_dependent() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t_with_id("P", "T", "", 1, "a", &[]),
+        t_with_id("P", "T", "", 1, "b", &["a"]),
+    ])
+    .expect("valid extend");
+    assert_eq!(p.blocked_len(), 1, "b starts blocked on a");
+    let a = p.pop_for_worker(1).expect("a dispatchable");
+    assert_eq!(a.task_id, "a");
+    p.on_item_finished(&phase("P"), Some("a"));
+    // b is now READY (queued, not blocked).
+    assert_eq!(p.blocked_len(), 0);
+    assert_eq!(
+        p.iter().map(|i| i.task_id.clone()).collect::<Vec<_>>(),
+        vec!["b".to_string()],
+    );
+    // Reinject a (the finished task is re-run, regenerating its output).
+    p.reinject(a);
+    // b must be RE-BLOCKED — not dispatchable against a's regenerating output.
+    assert_eq!(p.blocked_len(), 1, "b re-blocked on the reinjected a");
+    let queued: Vec<_> = p.iter().map(|i| i.task_id.clone()).collect();
+    assert_eq!(queued, vec!["a".to_string()], "only a is queued; b is blocked");
+    // A worker can pick up a, but NOT b (b is invisible while blocked).
+    let picked = p.pop_for_worker(1).expect("a re-dispatchable");
+    assert_eq!(picked.task_id, "a");
+    assert!(p.pop_for_worker(1).is_none(), "b stays blocked, not dispatchable");
+}
+
+/// Round-trip: after the re-block, re-completing `a` re-unblocks `b`.
+#[test]
+fn reinject_then_recomplete_reunblocks_dependent() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t_with_id("P", "T", "", 1, "a", &[]),
+        t_with_id("P", "T", "", 1, "b", &["a"]),
+    ])
+    .expect("valid extend");
+    let a = p.pop_for_worker(1).expect("a");
+    p.on_item_finished(&phase("P"), Some("a"));
+    p.reinject(a);
+    assert_eq!(p.blocked_len(), 1, "b re-blocked");
+    // Re-run a to completion; b unblocks again exactly as the first time.
+    let a2 = p.pop_for_worker(1).expect("a re-dispatchable");
+    assert_eq!(a2.task_id, "a");
+    p.on_item_finished(&phase("P"), Some("a"));
+    assert_eq!(p.blocked_len(), 0, "b unblocked on re-completion");
+    let b = p.pop_for_worker(1).expect("b re-unblocked");
+    assert_eq!(b.task_id, "b");
+}
+
+/// Diamond `a → b`, `a → c`: reinjecting `a` re-blocks BOTH dependents.
+#[test]
+fn reinject_completed_dep_reblocks_diamond_dependents() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t_with_id("P", "T", "", 1, "a", &[]),
+        t_with_id("P", "T", "", 1, "b", &["a"]),
+        t_with_id("P", "T", "", 1, "c", &["a"]),
+    ])
+    .expect("valid extend");
+    assert_eq!(p.blocked_len(), 2, "b and c blocked on a");
+    let a = p.pop_for_worker(1).expect("a");
+    p.on_item_finished(&phase("P"), Some("a"));
+    assert_eq!(p.blocked_len(), 0, "both unblocked");
+    p.reinject(a);
+    assert_eq!(p.blocked_len(), 2, "both b and c re-blocked");
+    let queued: Vec<_> = p.iter().map(|i| i.task_id.clone()).collect();
+    assert_eq!(queued, vec!["a".to_string()], "only a queued");
+}
+
+/// The BLOCKED-shape hole (must NOT regress): `b` depends on `a` AND `x`.
+/// Completing only `a` leaves `b` BLOCKED on `x`, but `a` was silently
+/// dropped from `b`'s unmet set. Reinjecting `a` MUST re-add that dep —
+/// otherwise, when `x` later completes, `b` would unblock and dispatch
+/// against the regenerating `a`. The re-route covers the blocked side, so
+/// `b` stays blocked until BOTH `a` (re-completed) and `x` are met — and
+/// is never double-counted (`blocked_len` stays 1, not 2).
+#[test]
+fn reinject_completed_dep_reblocks_blocked_dependent_with_other_unmet_deps() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t_with_id("P", "T", "", 1, "a", &[]),
+        t_with_id("P", "T", "", 1, "x", &[]),
+        t_with_id("P", "T", "", 1, "b", &["a", "x"]),
+    ])
+    .expect("valid extend");
+    assert_eq!(p.blocked_len(), 1, "b blocked on a and x");
+    // Complete a only; b stays blocked on x (never queued).
+    let a = p.pop_for_worker(1).expect("a");
+    assert_eq!(a.task_id, "a");
+    p.on_item_finished(&phase("P"), Some("a"));
+    assert_eq!(p.blocked_len(), 1, "b still blocked on x");
+    // Reinject a: b is BLOCKED (not queued), but the re-route still finds
+    // it via its declared task_depends_on and re-adds the now-unmet a.
+    p.reinject(a);
+    assert_eq!(p.blocked_len(), 1, "b re-blocked on {{a, x}}, never double-counted");
+    // Completing x must NOT unblock b — a is unmet again post-reinject.
+    let x = p.pop_for_worker(1).expect("x dispatchable");
+    assert_eq!(x.task_id, "x");
+    p.on_item_finished(&phase("P"), Some("x"));
+    // b is still blocked because a (reinjected, not yet re-completed) is unmet.
+    assert_eq!(p.blocked_len(), 1, "b waits on the reinjected a");
+    // Re-complete a → b unblocks.
+    let a2 = p.pop_for_worker(1).expect("a re-dispatchable");
+    p.on_item_finished(&phase("P"), Some("a"));
+    assert_eq!(p.blocked_len(), 0);
+    assert_eq!(a2.task_id, "a");
+    let b = p.pop_for_worker(1).expect("b unblocks once both deps met");
+    assert_eq!(b.task_id, "b");
+}
+
+/// Boundary: a dependent already DISPATCHED (in flight, gone from every
+/// bucket) when its dep is reinjected cannot be un-run — it is left
+/// alone (no panic, no spurious re-block).
+#[test]
+fn reinject_completed_dep_leaves_inflight_dependent_alone() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t_with_id("P", "T", "", 1, "a", &[]),
+        t_with_id("P", "T", "", 1, "b", &["a"]),
+    ])
+    .expect("valid extend");
+    let a = p.pop_for_worker(1).expect("a");
+    p.on_item_finished(&phase("P"), Some("a"));
+    // Dispatch b — it is now in flight, gone from its bucket.
+    let b = p.pop_for_worker(1).expect("b ready");
+    assert_eq!(b.task_id, "b");
+    assert_eq!(p.in_flight(&phase("P")), 1, "b is in flight");
+    // Reinject a: b cannot be un-run; the re-block finds nothing queued.
+    p.reinject(a);
+    assert_eq!(p.blocked_len(), 0, "in-flight b is not re-blocked");
+    assert_eq!(p.in_flight(&phase("P")), 1, "b stays in flight, untouched");
+    // a is re-queued and dispatchable; b's in-flight slot is preserved.
+    let a2 = p.pop_for_worker(2).expect("a re-dispatchable");
+    assert_eq!(a2.task_id, "a");
+}
+
+/// The CONTRAST: `requeue` (a never-completed task back to the queue) does
+/// NOT trigger any re-block — it never unblocked dependents in the first
+/// place, so there is nothing to invert. `b` stays blocked throughout.
+#[test]
+fn requeue_does_not_reblock_dependents() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t_with_id("P", "T", "", 1, "a", &[]),
+        t_with_id("P", "T", "", 1, "b", &["a"]),
+    ])
+    .expect("valid extend");
+    assert_eq!(p.blocked_len(), 1, "b blocked on a");
+    let a = p.pop_for_worker(1).expect("a");
+    // a was dispatched but NEVER completed — requeue (worker death / transient).
+    p.requeue(a);
+    // b was never unblocked, so it is still blocked — requeue did not touch it.
+    assert_eq!(p.blocked_len(), 1, "b stays blocked; requeue invented no re-block");
+    let queued: Vec<_> = p.iter().map(|i| i.task_id.clone()).collect();
+    assert_eq!(queued, vec!["a".to_string()]);
+}
+
+/// Transitive scope: `a → b → c`. After all complete and `b`, `c` are
+/// ready, reinjecting `a` re-blocks ONLY the DIRECT dependent `b`; `c`
+/// (which names `b`, not `a`) is NOT re-blocked by this reinject —
+/// matching `resolve_completed_dependents`' own direct-dependent scope.
+#[test]
+fn reinject_completed_dep_reblocks_only_direct_dependents() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t_with_id("P", "T", "", 1, "a", &[]),
+        t_with_id("P", "T", "", 1, "b", &["a"]),
+        t_with_id("P", "T", "", 1, "c", &["b"]),
+    ])
+    .expect("valid extend");
+    // Drive a → b → c all to completion so b and c become ready in turn.
+    let a = p.pop_for_worker(1).expect("a");
+    p.on_item_finished(&phase("P"), Some("a"));
+    let b = p.pop_for_worker(1).expect("b ready");
+    assert_eq!(b.task_id, "b");
+    p.on_item_finished(&phase("P"), Some("b"));
+    // c is now ready (queued). b is in flight; complete it back to queued state
+    // by re-extending? No — instead leave c ready and reinject a.
+    assert_eq!(
+        p.iter().map(|i| i.task_id.clone()).collect::<Vec<_>>(),
+        vec!["c".to_string()],
+        "c is ready; a and b already dispatched"
+    );
+    // Reinject a: only DIRECT dependents of a are re-derived. b is in flight
+    // (gone), c names b (not a) — so c is NOT re-blocked here.
+    p.reinject(a);
+    assert_eq!(p.blocked_len(), 0, "c is not a direct dependent of a");
+    let queued: Vec<_> = p.iter().map(|i| i.task_id.clone()).collect();
+    let mut sorted = queued.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec!["a".to_string(), "c".to_string()], "a re-queued; c still ready");
+}
+
+/// Cross-phase re-block: `a` in phase Q, `b` in phase P depends on it.
+/// Completing `a` unblocks `b` into P's bucket; reinjecting `a` re-blocks
+/// `b` and re-evaluates P's drain state (P had only `b` queued).
+#[test]
+fn reinject_completed_dep_reblocks_cross_phase_dependent() {
+    let mut p = pool_with(&["Q", "P"], &[]);
+    p.extend([
+        t_cross("Q", "a", &[]),
+        t_cross("P", "b", &[("Q", "a")]),
+    ])
+    .expect("valid extend");
+    assert_eq!(p.blocked_len(), 1, "b blocked on Q's a");
+    let a = p.pop_for_worker(1).expect("a");
+    assert_eq!(a.task_id, "a");
+    p.on_item_finished(&phase("Q"), Some("a"));
+    assert_eq!(p.blocked_len(), 0, "b unblocked into P");
+    assert_eq!(p.phase_state(&phase("P")), Some(crate::PhaseState::Active));
+    // Reinject a into Q; b in P must re-block, and P (now queue-empty with
+    // a live blocked b) must reflect Draining, not Drained.
+    p.reinject(a);
+    assert_eq!(p.blocked_len(), 1, "b re-blocked in P");
+    assert_eq!(
+        p.phase_state(&phase("P")),
+        Some(crate::PhaseState::Draining),
+        "P holds open with live-blocked b, queue empty"
+    );
+    assert!(
+        p.poll_drain_transitions().is_empty(),
+        "P is not Drained — b is live-blocked work"
+    );
+}

@@ -226,7 +226,15 @@ impl<I: Identifier> PendingPool<I> {
     /// Commit one validated item: pre-resolve `task_depends_on` against
     /// `completed_tasks` / `failed_tasks`; route to bucket, blocked,
     /// or cascaded-fail accordingly.
-    fn commit_item(&mut self, item: TaskInfo<I>) {
+    ///
+    /// `pub(super)` — the SINGLE edge-builder. Besides `extend`'s ingest
+    /// loop, the lifecycle re-block path ([`PendingPool::reinject`] when
+    /// it un-completes an already-finished dep) re-routes a freshly
+    /// re-pulled queued dependent through this same routine so the
+    /// blocked-map edges (`dependents_of`, `task_deps`, `blocked`,
+    /// `blocked_per_phase`) are rebuilt identically to ingest — never a
+    /// hand-rolled parallel builder.
+    pub(super) fn commit_item(&mut self, item: TaskInfo<I>) {
         // Cascade-fail at extend time: if any prereq is already in
         // `failed_tasks`, this item is itself a cascaded failure.
         let any_failed_dep = item

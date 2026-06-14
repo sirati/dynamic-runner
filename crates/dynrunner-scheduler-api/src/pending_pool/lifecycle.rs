@@ -161,6 +161,144 @@ impl<I: Identifier> PendingPool<I> {
         }
     }
 
+    /// Inverse of [`Self::resolve_completed_dependents`]: un-complete `id`
+    /// and re-route every LIVE direct dependent so its dep on `id` becomes
+    /// unmet again.
+    ///
+    /// Called by [`Self::reinject`] when an already-FINISHED task is
+    /// re-run: its predecessor OUTPUT is being regenerated, so a dependent
+    /// must not dispatch (nor unblock toward dispatch) against the
+    /// stale/torn input. A no-op when `id` was never completed (the
+    /// soft-failed / dormant revival cases had no unblock to invert).
+    ///
+    /// ## Two live-dependent shapes, ONE re-route
+    /// `id`'s prior completion ran `resolve_completed_dependents`, which
+    /// for EVERY direct dependent `b` removed `id` from `b`'s unmet set
+    /// (`task_deps[b]`) and dropped `b` from the now-removed
+    /// `dependents_of[id]`. Where `b` ended up split into two shapes that
+    /// BOTH still carry a (now-stale) resolution of the dep on `id`:
+    ///   * `b` had NO other unmet dep → it moved `blocked → a bucket`
+    ///     (READY); its `task_deps` entry was deleted entirely.
+    ///   * `b` had OTHER unmet deps → it STAYED in `blocked` with `id`
+    ///     silently dropped from its `task_deps[b]` set (the hole a
+    ///     queued-only scan would miss: when those other deps later
+    ///     resolve, `b` would unblock against the regenerating `id`).
+    ///
+    /// Either way `b`'s declared `task_depends_on` (carried on its stored
+    /// `TaskInfo`) still names `id`, so a single scan over BOTH the queued
+    /// buckets and the `blocked` map finds every `b`. Each is extracted
+    /// (tearing down any stale blocked-edges) and re-routed through the
+    /// single edge-builder [`Self::commit_item`], which recomputes `b`'s
+    /// FULL unmet set against the current `completed_tasks` — now that
+    /// `id` is no longer completed, `id` re-enters that set and `b`'s
+    /// edges (`dependents_of` / `task_deps` / `blocked` /
+    /// `blocked_per_phase`) are rebuilt identically to ingest. Never a
+    /// hand-rolled parallel edge builder.
+    ///
+    /// ## Scope + boundaries
+    /// * DIRECT dependents only — matching the unblock walk's own scope.
+    ///   A transitive `a → b → c` does not touch `c` here (it names `b`,
+    ///   not `id`); the manager reinjects each regenerated task it wants
+    ///   re-run, and re-blocking `b` does not disturb `c`.
+    /// * A dependent ALREADY DISPATCHED (in flight, gone from both the
+    ///   buckets and `blocked`) is not re-pulled — a running task cannot
+    ///   be un-run.
+    /// * A dependent with OTHER unmet deps is re-routed too (the blocked
+    ///   shape above); `commit_item` re-blocks it on its FULL unmet set
+    ///   (its old deps PLUS the freshly-unmet `id`) without double-counting.
+    /// * A dependent that has itself gone terminal is in neither the
+    ///   buckets nor `blocked`, so it is a no-op.
+    /// * Diamonds (`id → b`, `id → c`) re-route both — both name `id`.
+    ///
+    /// Collects the matching ids first (an immutable scan over both
+    /// sources), then extracts + recommits them, to avoid mutating the
+    /// collections while iterating. Each re-route may empty its phase's
+    /// queue, so a drain transition is re-evaluated per affected phase.
+    fn reblock_dependents_on_uncompleted(&mut self, id: &str) {
+        // Only a previously-completed id has dependents to re-block.
+        if !self.completed_tasks.remove(id) {
+            return;
+        }
+        // Every LIVE direct dependent — queued OR blocked — whose declared
+        // `task_depends_on` names `id` (bare task_id, the keying
+        // `commit_item` resolves on). The blocked side closes the hole a
+        // queued-only scan leaves: a dependent kept blocked by ANOTHER
+        // unmet dep had `id` silently dropped from its `task_deps` at
+        // unblock time and would otherwise resolve against the
+        // regenerating `id` once that other dep completes.
+        let names_id = |item: &TaskInfo<I>| item.task_depends_on.iter().any(|d| d.task_id == id);
+        let reroute_ids: Vec<String> = self
+            .buckets
+            .values()
+            .flat_map(|b| b.items.iter())
+            .chain(self.blocked.values())
+            .filter(|item| names_id(item))
+            .map(|item| item.task_id.clone())
+            .collect();
+        if reroute_ids.is_empty() {
+            return;
+        }
+        let mut affected_phases: HashSet<PhaseId> = HashSet::new();
+        for dep_id in reroute_ids {
+            // Extract the dependent from wherever it currently lives
+            // (queued bucket or the blocked map, tearing down its stale
+            // blocked-edges in the latter case), then re-route it through
+            // the single edge-builder now that `id` is unresolved again —
+            // it lands back in `blocked` against its full unmet set.
+            if let Some(item) = self.extract_live_dependent(&dep_id) {
+                affected_phases.insert(item.phase_id.clone());
+                self.commit_item(item);
+            }
+        }
+        // Re-routing dependents may have emptied a phase's queue while
+        // leaving live blocked work behind: re-run the drain transition
+        // so each touched phase's state reflects its new counts.
+        for ph in &affected_phases {
+            self.maybe_transition_drain(ph);
+        }
+    }
+
+    /// Remove a live dependent `dep_id` from wherever it currently sits —
+    /// a queued bucket OR the `blocked` map — returning its owned
+    /// `TaskInfo` for an immediate re-route through [`Self::commit_item`].
+    /// `None` if the id is in neither (already dispatched / terminal).
+    ///
+    /// The blocked-map branch tears down the item's STALE blocked-edges so
+    /// the subsequent `commit_item` rebuilds them without duplication:
+    /// `task_deps[dep_id]` is dropped, `dep_id` is removed from each of its
+    /// recorded prereqs' `dependents_of` reverse lists, and
+    /// `blocked_per_phase` is decremented. A queued item carries no
+    /// blocked-edges (its `task_deps` entry was consumed when it unblocked
+    /// into the bucket), so the bucket branch is a plain
+    /// [`Self::take_first_match`] removal.
+    ///
+    /// Sole caller is [`Self::reblock_dependents_on_uncompleted`]; kept a
+    /// named helper so the extract-then-rebuild symmetry with
+    /// `commit_item` is explicit and the borrow of `self.blocked` is
+    /// scoped away from the recommit.
+    fn extract_live_dependent(&mut self, dep_id: &str) -> Option<TaskInfo<I>> {
+        // Queued: a plain removal — queued items hold no blocked-edges.
+        if let Some(item) = self.take_first_match(|it| it.task_id == dep_id) {
+            return Some(item);
+        }
+        // Blocked: remove the item and tear down its stale blocked-edges.
+        let item = self.blocked.remove(dep_id)?;
+        if let Some(c) = self.blocked_per_phase.get_mut(&item.phase_id) {
+            *c = c.saturating_sub(1);
+        }
+        if let Some(deps) = self.task_deps.remove(dep_id) {
+            for dep in deps {
+                if let Some(rev) = self.dependents_of.get_mut(&dep) {
+                    rev.retain(|d| d != dep_id);
+                    if rev.is_empty() {
+                        self.dependents_of.remove(&dep);
+                    }
+                }
+            }
+        }
+        Some(item)
+    }
+
     /// Notify the pool that a task has terminated PERMANENTLY (e.g.
     /// retry budget exhausted or a NonRecoverable error). Cascades
     /// the failure to every transitive dependent so dependents that
@@ -431,6 +569,23 @@ impl<I: Identifier> PendingPool<I> {
     /// without re-firing `on_phase_start` — the manager owns
     /// lifecycle bookkeeping (phase_started_emitted) and decides
     /// whether the second-pass dispatch is observable to consumers.
+    ///
+    /// ## Re-block of dependents (the inverse of completion's unblock)
+    /// If the reinjected `item` was already recorded COMPLETED (a
+    /// finished task being re-run, the dominant reinject case), its
+    /// completion had previously resolved its dep on each dependent via
+    /// [`Self::resolve_completed_dependents`]. Re-running the task means
+    /// its predecessor OUTPUT is being regenerated, so every still-LIVE
+    /// direct dependent must have that dep made unmet again — otherwise
+    /// it would dispatch (or later unblock toward dispatch) against the
+    /// stale/torn output. [`Self::reblock_dependents_on_uncompleted`]
+    /// (the symmetric inverse of the unblock) re-routes both shapes the
+    /// dependent could be in: a READY one (queued) and a still-BLOCKED
+    /// one whose other deps kept it blocked. A dependent already
+    /// dispatched (gone from both the buckets and `blocked`) cannot be
+    /// un-run and is left alone — the documented boundary. A reinject of
+    /// a NEVER-completed task (the soft-failed / dormant revival cases)
+    /// had no unblock to invert, so the inverse is a no-op for it.
     pub fn reinject(&mut self, item: TaskInfo<I>) {
         // A reinject follows a FAILED attempt (retry bucket / operator
         // revival), so it stamps the same re-dispatch backoff a
@@ -456,6 +611,11 @@ impl<I: Identifier> PendingPool<I> {
         // through its bucket entry from here on.
         self.soft_failed.remove(&item.task_id);
         self.dormant_tasks.remove(&item.task_id);
+        // Un-complete: if this id was a finished task being re-run, its
+        // prior completion had unblocked its dependents — invert that
+        // now (re-block the still-ready ones) before it re-enters the
+        // queue. No-op when the id was never completed.
+        self.reblock_dependents_on_uncompleted(&item.task_id);
         let key = (
             item.phase_id.clone(),
             item.type_id.clone(),
