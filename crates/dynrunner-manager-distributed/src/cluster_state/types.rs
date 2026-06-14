@@ -796,6 +796,33 @@ impl std::ops::Add for PhaseTaskPartition {
     }
 }
 
+/// Setup-task lifecycle progress over the replicated ledger — the value
+/// shape of [`ClusterState::setup_progress`], the SINGLE owner of the
+/// "how far has the setup-task phase got" projection (#508). Counts the
+/// SETUP-kind tasks (`TaskKind::is_setup`) the primary's setup-dispatch
+/// already drives through the SAME `tasks` ledger; it is a pure projection
+/// of those facts, never a separate replicated tally.
+///
+///   - `total`: every setup-kind task the run planned (terminal or not).
+///   - `complete`: the setup-kind tasks that reached a terminal state —
+///     a setup SUCCESS (`SetupCompleted`) OR a setup terminal FAILURE
+///     (`Failed` / `Unfulfillable` / `InvalidTask`, the path a failed
+///     setup task takes through `apply_fail_permanent`). "Complete" here
+///     means "no longer pending", the operator's setup-progress concern;
+///     the success/failure split is the run summary's concern, not this
+///     phase-progress view (mirroring how `phase_task_partition` folds
+///     `SetupCompleted` into `done`).
+///
+/// `complete <= total`; `complete == total` (with `total > 0`) is the
+/// "all setup done" edge the narrator gates the dependent-phase handoff
+/// on. Ledger-derived, so it is failover-consistent — every replica
+/// converges to the same answer after the same mutation set lands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SetupProgress {
+    pub complete: usize,
+    pub total: usize,
+}
+
 /// Per-phase derived view used by every reader that needs the phase
 /// state machine recomputed from the CRDT rather than from the
 /// primary-only `PendingPool`. Pure projection of the replicated

@@ -16,14 +16,14 @@ FOUND that the two surfaces are NOT both wired in the distributed seed flow:
 
 * ``secondary-affine-withdep`` (WITH-DEP) — a gate depending on a no-op
   upload stand-in ``U`` (the CANONICAL upload→import→build production shape
-  asm-dataset will use). This currently **DEADLOCKS** (filed as #506): the
-  seed fans every task out as ``TaskAdded`` so the gate is born CRDT
-  ``Pending`` (never ``Blocked``); when ``U`` completes, the only post-seed
-  AffineReady firing surface (``became_pending``, fed by ``resume_blocked_on``)
-  never sees the gate (it was never ``Blocked``), so it stays ``Pending``
-  forever and its dependents hang. This scenario QUARANTINES that repro: it
-  runs under a BOUNDED timeout and XFAILs (passes WHILE the deadlock exists,
-  FAILS LOUDLY once #506 lands so we flip its polarity to expect-pass).
+  asm-dataset uses). The seed fans every task out as ``TaskAdded`` so the gate
+  is born CRDT ``Pending`` (never ``Blocked``); #506 added the post-seed firing
+  surface that ORIGINATES ``AffineReady`` when the gate's dep ``U`` completes,
+  so the gate resolves the moment ``U`` finishes and its dependents unblock
+  (per-secondary run-once import first). This scenario is EXPECT-PASS: it
+  asserts the SAME full #497 invariants as the no-dep variant (the run
+  converges, import-once-per-secondary, all builds done, assertion 4 via the
+  post-U-completion transition). A failure is a real #497/#506 regression.
 
 The proof (no-dep, the passing gate)
 ------------------------------------
@@ -88,13 +88,6 @@ _TASK_SLEEP_S = "0.4"
 _CONVERGE_DEADLINE_S = 120.0
 _POLL_INTERVAL_S = 2.0
 
-# Bounded dispatch budget for the WITH-DEP (#506) quarantine plan: long enough
-# for the cluster to bring up + drain the no-op upload stand-in (so the run
-# genuinely reaches the deadlock window, not a bring-up timeout), short enough
-# that a suite run is never wedged. The dispatch runner SIGKILLs at this
-# deadline (exit 124), which the scenario declares via allows_nonzero_exit.
-_WITHDEP_DISPATCH_TIMEOUT_S = 180
-
 
 def _gateway_out_dir(env: DispatchEnv) -> str:
     """The gateway-side shared NFS dir SLURM workers publish to
@@ -104,10 +97,16 @@ def _gateway_out_dir(env: DispatchEnv) -> str:
 
 
 def _prepare_variant(
-    env: DispatchEnv, tmp_root: Path, variant: str, *, dispatch_timeout_s: int | None
+    env: DispatchEnv, tmp_root: Path, variant: str
 ) -> list[ScenarioPlan]:
     """Shared prepare: stage one input file per emitted task and build the
-    ``--secondary-affine --secondary-affine-variant <variant>`` dispatch."""
+    ``--secondary-affine --secondary-affine-variant <variant>`` dispatch.
+
+    Both the no-dep and with-dep variants run under the driver's default
+    ``--timeout`` and are expected to converge + exit 0 (the with-dep #506
+    deadlock is fixed), so neither sets a bounded plan timeout nor declares a
+    non-zero exit. A hang now surfaces honestly as the driver's overall-timeout
+    (exit 124), the real failure signal."""
     n_files = affine_input_file_count(variant)
     paths = stage_inputs(tmp_root, n_files)
     # The gateway out dir is SHARED across runs; clear it so the markers +
@@ -129,12 +128,6 @@ def _prepare_variant(
             # Slow tasks force multi-secondary distribution so the
             # per-secondary run-once proof is non-vacuous.
             extra_env={"DYNRUNNER_E2E_TASK_SLEEP_S": _TASK_SLEEP_S},
-            timeout_s=dispatch_timeout_s,
-            # The with-dep plan is SIGKILLed at its bounded timeout (exit 124,
-            # the expected #506 deadlock); declare the non-zero exit so the
-            # driver's plan-exit gate doesn't pre-fail the xfail verdict. The
-            # no-dep plan passes dispatch_timeout_s=None and exits 0.
-            allows_nonzero_exit=dispatch_timeout_s is not None,
         )
     ]
 
@@ -216,8 +209,8 @@ def _assert_affine_invariants(
     """The full #497 owner-spec invariant check for an affine run of
     ``variant``. Returns ``(converged, failures)``: ``converged`` is whether
     ALL builds completed (assertion 2) AND every marker invariant held;
-    ``failures`` carries the diagnostics. Shared by the no-dep PASS scenario
-    and the with-dep XFAIL scenario (which inverts the verdict)."""
+    ``failures`` carries the diagnostics. Shared verbatim by both the no-dep
+    and with-dep scenarios — both are expect-pass (the #506 fix proven)."""
     publish_dst = result.plan.paths.publish_dst
     failures: list[str] = []
 
@@ -346,9 +339,7 @@ class SecondaryAffineNoDepScenario(Scenario):
     def prepare(
         self, env: DispatchEnv, tmp_root: Path
     ) -> list[ScenarioPlan]:
-        return _prepare_variant(
-            env, tmp_root, _VARIANT_NODEP, dispatch_timeout_s=None
-        )
+        return _prepare_variant(env, tmp_root, _VARIANT_NODEP)
 
     def assert_outputs(
         self, env: DispatchEnv, results: list[ScenarioResult]
@@ -360,71 +351,49 @@ class SecondaryAffineNoDepScenario(Scenario):
 
 
 class SecondaryAffineWithDepScenario(Scenario):
-    """The with-dep affine gate (#497) — DEADLOCKS until #506 lands (XFAIL).
+    """The with-dep affine gate (#497) — the canonical upload→import→build shape.
 
-    The canonical upload→import→build shape. A with-dep SecondaryAffine gate
-    is born CRDT ``Pending`` by the seed (TaskAdded fan-out, never ``Blocked``);
-    when its dep ``U`` completes, the only post-seed AffineReady firing surface
-    (``became_pending``, fed by ``resume_blocked_on``) never sees it, so it
-    stays ``Pending`` forever and its dependents deadlock. Filed as #506.
+    A with-dep SecondaryAffine gate ``I_dep`` depends on a no-op upload
+    stand-in ``U`` (the production shape: the affine import sits between the
+    toolchain upload and the builds). The seed fans every task out as
+    ``TaskAdded`` so the gate is born CRDT ``Pending`` (never ``Blocked``);
+    #506 added the post-seed firing surface that originates ``AffineReady``
+    when the gate's dep ``U`` completes, so the gate resolves the moment ``U``
+    finishes and its k builds dispatch (per-secondary run-once import first).
 
-    This scenario runs the repro under a BOUNDED dispatch timeout (so the suite
-    is never wedged) and XFAILs: it PASSES while the deadlock exists and FAILS
-    LOUDLY once #506 lands (the run converges), prompting whoever fixes #506 to
-    FLIP this scenario to a real expect-pass assertion (delete the inversion,
-    set ``dispatch_timeout_s=None`` in prepare, assert
-    ``_assert_affine_invariants`` directly like the no-dep scenario).
+    Expect-pass (#506 fix proven). Asserts the SAME full #497 owner-spec
+    invariants as the no-dep scenario via :func:`_assert_affine_invariants`:
+    the run CONVERGES (no deadlock — assertion 2 all builds completed),
+    ``import_action`` ran EXACTLY ONCE per building secondary (assertion 1),
+    multi-dependent-same-secondary imports once (assertion 3), and the gate
+    unblocked its dependents (assertion 4 — here the post-U-completion
+    AffineReady transition). A failure here is a real #497/#506 regression
+    (RCA it, don't paper over).
     """
 
     name = "secondary-affine-withdep"
     description = (
         "SecondaryAffine WITH-DEP import gate (#497) — the canonical "
-        "upload→import→build shape. XFAIL: currently DEADLOCKS (#506 — the "
-        "post-seed dep-completion AffineReady firing surface is missing). "
-        "Runs under a bounded timeout; passes WHILE the deadlock exists, fails "
-        "loudly once #506 lands so its polarity is flipped to expect-pass."
+        "upload→import→build shape. The gate becomes AffineReady when its "
+        "upload-stand-in dep completes (#506 fix). Asserts the run CONVERGES "
+        "(all k builds done, none stranded), import_action ran EXACTLY ONCE "
+        "per building secondary, multi-dependent imports once, and the gate "
+        "unblocked its dependents after the dep completed."
     )
-    requires = ("affine-497", "506-withdep-affine-firing-surface")
+    requires = ("affine-497",)
 
     def prepare(
         self, env: DispatchEnv, tmp_root: Path
     ) -> list[ScenarioPlan]:
-        return _prepare_variant(
-            env,
-            tmp_root,
-            _VARIANT_WITHDEP,
-            dispatch_timeout_s=_WITHDEP_DISPATCH_TIMEOUT_S,
-        )
+        return _prepare_variant(env, tmp_root, _VARIANT_WITHDEP)
 
     def assert_outputs(
         self, env: DispatchEnv, results: list[ScenarioResult]
     ) -> tuple[bool, list[str]]:
-        # XFAIL inversion: the run is EXPECTED to deadlock (#506). If it did
-        # NOT converge, that is the expected state → PASS (xfail). If it DID
-        # converge, #506 is fixed → FAIL loudly so we flip this scenario.
         converged, failures = _assert_affine_invariants(
             env, results[0], _VARIANT_WITHDEP
         )
-        if not converged:
-            print(
-                "[secondary-affine-withdep] XFAIL #506: with-dep affine gate "
-                "deadlocked as expected (no post-seed dep-completion "
-                "AffineReady firing surface). Reason: "
-                f"{failures[0] if failures else 'did not converge'}. "
-                "Flip this scenario to expect-pass when #506 lands.",
-                flush=True,
-            )
-            return (True, [])
-        return (
-            False,
-            [
-                "secondary-affine-withdep CONVERGED — #506 appears FIXED. "
-                "FLIP this scenario to a real expect-pass: remove the XFAIL "
-                "inversion in assert_outputs, set dispatch_timeout_s=None in "
-                "prepare, and drop the '506-…' requires tag. The with-dep "
-                "affine path is now distributed-proven."
-            ],
-        )
+        return (converged, failures)
 
 
 SCENARIO = SecondaryAffineNoDepScenario()
