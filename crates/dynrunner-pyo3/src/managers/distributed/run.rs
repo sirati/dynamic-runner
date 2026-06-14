@@ -302,6 +302,19 @@ impl PyDistributedManager {
             .take()
             .map(crate::task_completed_bridge::PyTaskCompletedListener::new);
 
+        // Take the Python SecondaryAffine import callable (if any) out of
+        // `self` and wrap it as an `Arc<dyn ImportAction<RunnerIdentifier>>` at
+        // the bridge boundary, once under the GIL before `py.detach`. UNLIKE the
+        // two listeners above (installed on the in-process PRIMARY), the import
+        // action is a per-secondary affine-executor concern: the cloneable
+        // `Arc` is captured into the detached runtime and cloned per spawned
+        // secondary below, then installed via `set_import_action`. `Send + Sync`
+        // (the bridge's trait-object contract) lets the `Arc` cross `py.detach`.
+        let import_action = self
+            .import_action
+            .take()
+            .map(crate::affine_action_bridge::PyImportAction::new);
+
         // Snapshot the cap, flip `run_started`, and consume the
         // receiver for the detached runtime in one step. The helper
         // owns the single-shot guard and the snapshot ordering; the
@@ -457,6 +470,11 @@ impl PyDistributedManager {
                     let sec_scheduler_config = scheduler_config.clone();
                     let sec_panik_paths = panik_watcher_paths.clone();
                     let sec_panik_poll = panik_watcher_poll_interval;
+                    // Per-secondary clone of the affine import action (a cheap
+                    // `Arc` refcount bump). Each spawned secondary installs its
+                    // own clone via `set_import_action` below; the underlying
+                    // Python callable is shared (one consumer `import_task`).
+                    let sec_import_action = import_action.clone();
                     let sec_memprofile_output_dir = memprofile_output_dir.clone();
                     let sec_memuse_log_path = memuse_log_path.clone();
                     // Per-secondary clone so the spawned `move` task owns its
@@ -645,6 +663,19 @@ impl PyDistributedManager {
                                 sec_scheduler_config.build_memory_scheduler(),
                                 estimator,
                             );
+                        // Install the Python import action (#497 / #501) BEFORE
+                        // `run` enters — same pre-run contract as the
+                        // out-of-process secondary (`managers/secondary/run.rs`).
+                        // The run-once affine executor reads it when a work task
+                        // gates on a not-yet-locally-imported SecondaryAffine
+                        // dependency; absence leaves the executor with no
+                        // importer (a work task with no affine dependency runs
+                        // unchanged). Each in-process secondary gets its own
+                        // `Arc` clone sharing the one consumer callable.
+                        if let Some(action) = sec_import_action {
+                            secondary.set_import_action(action);
+                        }
+
                         // The egress edge resolves `Destination::Primary` to
                         // the in-process submitter id while the role table is
                         // cold — matching the folded primary mesh-link's key.

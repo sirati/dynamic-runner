@@ -825,6 +825,13 @@ def _dispatch_secondary(task, args, logger) -> None:
         # out-of-tree caller driving `_dispatch_secondary` directly) → None →
         # the Rust side keeps the boot-CLI cmd_args.
         finalize_run_config=getattr(args, "_finalize_run_config", None),
+        # The consumer's SecondaryAffine import callable (#497 / #501),
+        # mirroring the `fulfillability_matcher` forwarding idiom. The Rust
+        # `run_secondary` threads it into the `RustSecondaryCoordinator`
+        # constructor's `import_action` kwarg, which installs it on the inner
+        # secondary's affine executor. Absent (a task with no affine deps / an
+        # out-of-tree caller with a bare Namespace) → None → no importer.
+        import_action=getattr(task, "import_action", None),
         **_panik_kwargs(args),
     )
 
@@ -973,6 +980,12 @@ def _dispatch_single_process(task, args, config, logger) -> None:
         fulfillability_matcher=getattr(task, "fulfillability_matcher", None),
         peer_lifecycle_listener=getattr(task, "peer_lifecycle_listener", None),
         task_completed_listener=getattr(task, "task_completed_listener", None),
+        # The consumer's SecondaryAffine import callable (#497 / #501),
+        # mirroring the listener-forwarding idiom. `run_distributed` threads it
+        # into `RustDistributedManager`, which installs it on EVERY in-process
+        # secondary it spawns (a per-secondary affine-executor concern, unlike
+        # the primary-side listeners above).
+        import_action=getattr(task, "import_action", None),
         unfulfillable_reinject_max_per_task=unfulfillable_cap,
         log_dir=getattr(args, "log_dir", None),
         scheduler_config=_build_scheduler_config(args),

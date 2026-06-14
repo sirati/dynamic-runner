@@ -88,6 +88,16 @@ task_args = SimpleNamespace()
 /// calls can flow through the PyO3 method-dispatch surface (the
 /// production call path).
 fn build_manager(py: Python<'_>, cap: Option<u32>) -> PyResult<Py<PyDistributedManager>> {
+    build_manager_with(py, cap, None)
+}
+
+/// As [`build_manager`] but also threads an optional `import_action`
+/// Python callable — the #501 affine-import forwarding surface.
+fn build_manager_with(
+    py: Python<'_>,
+    cap: Option<u32>,
+    import_action: Option<Py<PyAny>>,
+) -> PyResult<Py<PyDistributedManager>> {
     let module = build_task_definition_module(py);
     let task = module.getattr("task")?;
     let task_args = module.getattr("task_args")?;
@@ -110,6 +120,7 @@ fn build_manager(py: Python<'_>, cap: Option<u32>) -> PyResult<Py<PyDistributedM
         /* stage_via_setup_tasks */ false,
         /* peer_lifecycle_listener */ None,
         /* task_completed_listener */ None,
+        /* import_action */ import_action,
         /* unfulfillable_reinject_max_per_task */ cap,
         /* log_dir */ None,
         /* scheduler_config */ None,
@@ -200,6 +211,42 @@ fn handle_clones_share_same_command_channel() {
                 .control_plane
                 .same_command_channel(&r2.borrow().sender),
             "second handle must share the manager's command channel"
+        );
+    });
+}
+
+/// #501 regression: the `import_action` kwarg must be STORED on the
+/// in-process distributed manager at `__init__`, so the `run()` spawn
+/// loop can install it on every in-process secondary's affine
+/// executor. Pre-fix `PyDistributedManager::new` had no such param at
+/// all, so `run_distributed(import_action=...)` could not thread the
+/// consumer's callable through and every in-process affine gate
+/// deadlocked "upstream unfulfillable". A `None` import_action leaves
+/// the field empty (a task with no affine deps runs unchanged).
+#[test]
+fn import_action_kwarg_is_stored_on_manager() {
+    Python::attach(|py| {
+        // A bare callable stands in for the consumer's `import_task`;
+        // the manager stores the unbound handle verbatim.
+        let import_callable = py
+            .eval(c"lambda task_id, payload_json: None", None, None)
+            .expect("compile import stub")
+            .unbind();
+
+        let with_action = build_manager_with(py, None, Some(import_callable))
+            .expect("manager constructs with import_action");
+        assert!(
+            with_action.borrow(py).import_action.is_some(),
+            "import_action kwarg must be stored so run()'s spawn loop can \
+             install it on every in-process secondary"
+        );
+
+        // Absence stays absent — no accidental default importer.
+        let without_action =
+            build_manager_with(py, None, None).expect("manager constructs without import_action");
+        assert!(
+            without_action.borrow(py).import_action.is_none(),
+            "no import_action kwarg must leave the field empty"
         );
     });
 }

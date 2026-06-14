@@ -52,9 +52,11 @@ impl PySecondaryCoordinator {
         quic_bind_port = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
-    // API refactor.
+    // API refactor. `pub(super)` (mirroring `PyDistributedManager::new`)
+    // so the sibling `secondary::tests` module can drive the constructor
+    // directly in the `test-with-python` suite.
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub(super) fn new(
         py: Python<'_>,
         primary_url: String,
         secondary_id: String,
