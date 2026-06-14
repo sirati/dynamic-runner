@@ -101,6 +101,16 @@ pub(crate) struct PySecondaryCoordinator {
     /// start. Constructor-only — see the matching field on
     /// `PyPrimaryCoordinator` for the rationale.
     pub(super) peer_lifecycle_listener: Option<Py<PyAny>>,
+    /// Optional Python import callable supplied at `__init__`. `Some` iff the
+    /// caller passed `import_action=<callable>`; bridged through
+    /// [`crate::affine_action_bridge::PyImportAction`] and installed on the
+    /// inner `SecondaryCoordinator` via `set_import_action` at `run()` start
+    /// (#497 P6 — the secondary is the executor that holds the import-action
+    /// handle). Constructor-only, mirroring `peer_lifecycle_listener`. A
+    /// secondary whose dependent work tasks gate on a SecondaryAffine import
+    /// MUST register one; a secondary with no affine-dependent work leaves it
+    /// `None` and is never asked to import.
+    pub(super) import_action: Option<Py<PyAny>>,
     /// Scheduler tuning forwarded into the `ResourceStealingScheduler`
     /// the coordinator constructs at `run()` start. Carries the
     /// `cgroup_safety_margin` / `pressure_threshold` knobs so the

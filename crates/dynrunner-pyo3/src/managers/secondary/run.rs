@@ -241,6 +241,17 @@ impl PySecondaryCoordinator {
             .take()
             .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
 
+        // Same shape for the import-action kwarg (#497 P6): take the Python
+        // import callable out of `self` and wrap it as an
+        // `Arc<dyn ImportAction<RunnerIdentifier>>` at the bridge boundary.
+        // Installed on the inner coordinator BEFORE `run()` enters — the
+        // run-once affine executor consults it when a work task gates on a
+        // not-yet-locally-imported SecondaryAffine dependency.
+        let import_action = self
+            .import_action
+            .take()
+            .map(crate::affine_action_bridge::PyImportAction::new);
+
         // Duck-typed consumer hook (the `task_completed_listener`
         // idiom): an optional `worker_message_listener` attribute on
         // the consumer's TaskDefinition. Captured on the GIL thread
@@ -553,6 +564,17 @@ impl PySecondaryCoordinator {
                 // into the spawned dispatcher on first entry.
                 if let Some(listener) = peer_lifecycle_listener {
                     secondary.register_lifecycle_listener(listener);
+                }
+
+                // Install the Python import action (#497 P6) BEFORE `run`
+                // enters — the run-once affine executor reads it when a work
+                // task gates on a not-yet-locally-imported SecondaryAffine
+                // dependency. Absence leaves the executor with no importer (a
+                // work task with no affine dependency runs unchanged; a work
+                // task that DOES gate fails as a wiring error). Same pre-run
+                // contract + `?Send`/relocation rationale as the upload action.
+                if let Some(action) = import_action {
+                    secondary.set_import_action(action);
                 }
 
                 // Register the consumer's `worker_message_listener`
