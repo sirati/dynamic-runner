@@ -130,7 +130,12 @@ impl SnapshotStreamResponder {
             );
             return;
         }
-        tracing::info!(
+        // TRACE, not INFO: per-stream/per-requester lifecycle, fired on every
+        // anti-entropy pull — high-frequency, low-signal for the observer's
+        // operator-facing INFO default. Primary/secondary default to TRACE so
+        // they still surface it; the observer (INFO default) suppresses it
+        // unless raised via `--log-level trace`.
+        tracing::trace!(
             stream_id,
             requester,
             resume = resume_after.is_some(),
@@ -209,7 +214,11 @@ impl SnapshotStreamResponder {
         };
         let dst = reply_destination(&stream.requester, stream.requester_is_observer);
         if built.done {
-            tracing::info!(
+            // TRACE, not INFO: the per-stream lifecycle twin of "snapshot
+            // stream opened" — suppressed on the observer's INFO default,
+            // visible at the primary/secondary TRACE default or via
+            // `--log-level trace`.
+            tracing::trace!(
                 stream_id,
                 requester = %stream.requester,
                 packages = stream.seq,
