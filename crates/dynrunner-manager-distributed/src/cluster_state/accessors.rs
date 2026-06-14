@@ -92,6 +92,35 @@ impl<I> TaskView<'_, I> {
     }
 }
 
+/// A SecondaryAffine gate resolved over the FULL LOGICAL ledger in ONE
+/// fat∪settled read — the SINGLE source both the gate DETECTION
+/// ([`ClusterState::is_affine_ready_gate`]) and the import-DRIVE body
+/// ([`ClusterState::affine_gate_task`]) now derive from (#516). Carries the
+/// OWNED gate [`TaskInfo`] (`task`) AND the gate-recognition fact
+/// (`is_ready_gate`).
+///
+/// Why a struct, not two reads: detection and the body resolve used to be
+/// SEPARATE ledger reads that merely had to AGREE on the same fat∪settled
+/// universe — the #515 RCA was exactly a DRIFT between them (fe840943 made
+/// detection fat∪settled but left the body fat-only, so a spilled gate was
+/// detected-but-could-not-resolve → phantom "absent gate"). #509 re-aligned
+/// them, but two reads can drift again. Folding both answers into ONE read
+/// makes the invariant "detected ⟹ body-resolvable" TAUTOLOGICAL: there is one
+/// lookup, one hit, both fields off the same entry.
+#[derive(Debug)]
+pub(crate) struct ResolvedAffineGate<I> {
+    /// The gate's body — the OWNED [`TaskInfo`] the import drives, cloned so
+    /// the `cluster_state` borrow ends at the call site (the body crosses into
+    /// the off-loop import task).
+    pub(crate) task: TaskInfo<I>,
+    /// Whether the resolved entry IS a `AffineReady` SecondaryAffine gate (the
+    /// `unmet_local_affine_dep` recognition predicate). The body resolves for
+    /// ANY state/class (an import re-routed by the #509 sync race re-runs once
+    /// its `TaskAdded` lands the gate `Pending`); this flag isolates the
+    /// ready-gate fact detection keys on.
+    pub(crate) is_ready_gate: bool,
+}
+
 impl<I: Identifier> ClusterState<I> {
     /// Borrow the IN-MEMORY (fat) state for `hash`. A SETTLED entry —
     /// fat body spilled to disk — returns `None` here: callers asking
@@ -118,44 +147,78 @@ impl<I: Identifier> ClusterState<I> {
         self.settled_entry(hash).map(TaskView::Settled)
     }
 
-    /// Whether `hash` is a RESOLVED SecondaryAffine import gate
-    /// (`AffineReady`) — the #497 P5 spill-safe gate detector the
-    /// secondary's `unmet_local_affine_dep` keys on. Answered over the
-    /// FULL logical ledger (fat OR settled index, no disk read), so a gate
-    /// that SPILLED after resolving — where `task_state` returns `None`
-    /// and went blind — is STILL detected via its `SettledClass::AffineReady`
-    /// index entry. A hash the ledger does not know is `false`.
-    pub(crate) fn is_affine_ready_gate(&self, hash: &str) -> bool {
-        self.task_view(hash)
-            .is_some_and(|view| view.is_affine_ready_gate())
+    /// Resolve `hash`'s SecondaryAffine gate over the FULL LOGICAL ledger
+    /// in ONE fat∪settled read — the unified resolver (#516) both the gate
+    /// DETECTION and the import-DRIVE body route through, so they can NEVER
+    /// again key DIFFERENT ledger universes.
+    ///
+    /// Reads fat (`tasks.get`) FIRST, else the settled index (`settled.get`,
+    /// then the per-key pread of the spilled fat body — the SAME pread the
+    /// snapshot-stream responder uses). `None` ONLY when the hash is in
+    /// NEITHER half — the gate's `TaskAdded` has genuinely not synced to this
+    /// node yet (the #509 sync race), which the drive classifies as a
+    /// transient (re-routable) condition, never a permanent loss. A gate that
+    /// resolved-then-SPILLED (its `AffineReady` join fixed-point is
+    /// settle-eligible) is NOT absent — its body is read back from disk and
+    /// `is_ready_gate` stays `true` via the slim `SettledClass::AffineReady`
+    /// index entry.
+    ///
+    /// `is_ready_gate` answers the SAME gate-recognition question as the
+    /// fat/settled arms of [`TaskView::is_affine_ready_gate`]: a fat entry
+    /// must be `AffineReady` with a SecondaryAffine kind; a settled entry's
+    /// `SettledClass::AffineReady` IS the "AffineReady SecondaryAffine gate"
+    /// fact (the class is produced ONLY from `TaskState::AffineReady`, which
+    /// only a SecondaryAffine gate ever reaches).
+    pub(crate) fn resolve_affine_ready_gate(&self, hash: &str) -> Option<ResolvedAffineGate<I>> {
+        // ONE fat∪settled lookup. The gate-recognition fact is the single
+        // [`TaskView::is_affine_ready_gate`] predicate (its sole owner); the
+        // body comes off the SAME resolved entry — fat in-place, or the
+        // spilled fat body read back from disk. Detection and body can no
+        // longer key different ledger universes: there is one `task_view`.
+        let view = self.task_view(hash)?;
+        let is_ready_gate = view.is_affine_ready_gate();
+        let task = match view {
+            // Fat: the body is the live state's TaskInfo, already in memory.
+            TaskView::Live(state) => state.task().clone(),
+            // Settled: read the fat body back from the spill file (the same
+            // per-key pread the snapshot-stream responder uses). `None` here
+            // would mean a settled index entry whose record is unreadable —
+            // the SAME absent outcome `affine_gate_task` returned before, so
+            // the resolver returns `None` and the drive re-routes (#509).
+            TaskView::Settled(_) => self.settled_record(hash)?.0.task().clone(),
+        };
+        Some(ResolvedAffineGate {
+            task,
+            is_ready_gate,
+        })
     }
 
-    /// The OWNED [`TaskInfo`] of a SecondaryAffine gate, resolved over the
-    /// FULL LOGICAL ledger (fat `task_state`, else the settled record read
-    /// back from the spill file). This is the resolution TWIN of
-    /// [`Self::is_affine_ready_gate`]: detection already answers
-    /// "is this hash a resolved gate?" over fat OR settled, so the
-    /// secondary's import DRIVE must resolve the gate's body over the SAME
-    /// universe — a `task_state` (fat-only) read went BLIND on a gate that
-    /// resolved-then-SPILLED (its `AffineReady` join fixed-point is
-    /// settle-eligible), turning a recoverable spilled body into a phantom
-    /// "absent gate". `None` ONLY when the hash is in NEITHER the fat map
-    /// NOR the settled index — i.e. the gate's `TaskAdded` has genuinely
-    /// not synced to this node yet (the #509 sync race), which the drive
-    /// then classifies as a transient (re-routable) condition, never a
-    /// permanent loss.
+    /// Whether `hash` is a RESOLVED SecondaryAffine import gate
+    /// (`AffineReady`) — the #497 P5 spill-safe gate detector the
+    /// secondary's `unmet_local_affine_dep` keys on. A thin projection of
+    /// the unified [`Self::resolve_affine_ready_gate`] (#516): the gate is
+    /// detected IFF the hash resolves over the fat∪settled ledger AND that
+    /// SAME resolved entry IS a ready gate. A hash the ledger does not know
+    /// is `false`.
+    pub(crate) fn is_affine_ready_gate(&self, hash: &str) -> bool {
+        self.resolve_affine_ready_gate(hash)
+            .is_some_and(|gate| gate.is_ready_gate)
+    }
+
+    /// The OWNED [`TaskInfo`] of a SecondaryAffine gate — a thin projection
+    /// of the unified [`Self::resolve_affine_ready_gate`] (#516): the gate
+    /// body the import drives, resolved over the SAME fat∪settled read
+    /// detection uses, so a gate that resolved-then-SPILLED still resolves
+    /// (the fat-only read went blind pre-#509) and a detected gate is ALWAYS
+    /// body-resolvable (the drift class #515 flagged is structurally gone).
+    /// `None` ONLY for the #509 sync race (hash in neither half), which the
+    /// drive classifies as transient (re-routable), never a permanent loss.
     ///
-    /// Owned clone so the `cluster_state` borrow ends at the call site
-    /// (the body crosses into the off-loop import task).
+    /// The body resolves for ANY resolved state/class (NOT gated on
+    /// `is_ready_gate`): a #509-rerouted import re-runs once its `TaskAdded`
+    /// lands the gate `Pending`, before it reaches `AffineReady`.
     pub(crate) fn affine_gate_task(&self, hash: &str) -> Option<TaskInfo<I>> {
-        if let Some(state) = self.task_state(hash) {
-            return Some(state.task().clone());
-        }
-        // Spilled: read the fat body back from the settled store (the same
-        // per-key pread the snapshot-stream responder uses); the recovered
-        // state's `TaskInfo` is the gate body the import needs.
-        self.settled_record(hash)
-            .map(|(state, _outputs)| state.task().clone())
+        self.resolve_affine_ready_gate(hash).map(|gate| gate.task)
     }
 
     /// Iterator over `(&hash, &TaskState)` for every FAT (in-memory)
