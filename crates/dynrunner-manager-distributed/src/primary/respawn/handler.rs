@@ -159,6 +159,37 @@ where
     /// (`respawn_budget == None`) early-returns BEFORE any ledger write, so
     /// the replicated set is never touched when respawn is off.
     pub(crate) fn dispatch_respawn_request(&mut self, request: RespawnRequest) {
+        // Deliberate-self-departure admission gate: a `SelfDeparture` is a
+        // node leaving the mesh ON PURPOSE (a panik-file teardown, a
+        // graceful-abort drain exit, or a #467 per-peer wind-down) — it is
+        // NEVER an unexpected death, so it must never be "replaced" by a
+        // respawn. Checked FIRST (before the fleet-wide graceful-abort gate
+        // and the budget) because the cause alone settles it regardless of
+        // any other cluster state: the per-peer wind-down departure carries
+        // NO global freeze (the rest of the run continues), so the
+        // graceful-abort gate below would NOT catch it, and the
+        // re-admitted-original `is_peer_alive` gate is about a DIFFERENT id
+        // (the original, not the departing replacement). Without this guard
+        // a #467 wind-down would self-defeat: wind down → respawn →
+        // re-seat → wind down. A cause-based suppression is the general,
+        // correct rule and subsumes the graceful-abort gate's purpose for
+        // self-departures.
+        if matches!(
+            request.cause,
+            dynrunner_protocol_primary_secondary::RemovalCause::SelfDeparture(_)
+        ) {
+            tracing::info!(
+                target: "dynrunner_respawn",
+                peer_id = %request.original_id,
+                cause = ?request.cause,
+                event = "respawn_suppressed_self_departure",
+                "secondary departed deliberately (self-departure); not \
+                 spawning a replacement (a deliberate departure is never an \
+                 unexpected death — covers panik teardown, graceful-abort \
+                 drain, and per-peer wind-down)",
+            );
+            return;
+        }
         // Graceful-abort admission gate: under the replicated
         // `graceful_abort_requested` freeze the fleet is draining DOWN by
         // design — every secondary departure (the drain self-departures

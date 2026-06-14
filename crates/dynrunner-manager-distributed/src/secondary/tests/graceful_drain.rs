@@ -11,6 +11,14 @@
 //! nothing on the primary side reads the exit as a failover trigger (the
 //! respawn suppression for the resulting lifecycle event is pinned on the
 //! primary side in `primary::respawn::tests`).
+//!
+//! Also pins the #467 PER-PEER wind-down drain exit: with the replicated
+//! `WindDownRequested { secondary_id: <self>, member_gen }` directive set
+//! (NOT the fleet-wide graceful-abort latch — the rest of the run
+//! continues) and NO local active work, THIS directed secondary drains
+//! and departs through the SAME deliberate self-departure path. Its
+//! incarnation generation must match the directive (the directed-vs-stale
+//! discrimination).
 
 use super::super::test_helpers::{
     FakeWorkerFactory, TestId, channel_mesh_to_primary, make_secondary_channel,
@@ -23,12 +31,16 @@ use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
 /// A fake primary that completes the full setup trio, broadcasts the
-/// `GracefulAbortRequested` latch (NO `RunComplete` — the drain exit must
-/// fire mid-run), keeps the loop awake with periodic keepalives, and
+/// caller-supplied `drain_directive` (NO `RunComplete` — the drain exit
+/// must fire mid-run), keeps the loop awake with periodic keepalives, and
 /// COLLECTS every frame the secondary sends until the secondary drops its
-/// end — the test asserts the departure shape on the returned frames.
+/// end — the test asserts the departure shape on the returned frames. The
+/// directive is a parameter so this one collector drives BOTH the
+/// fleet-wide `GracefulAbortRequested` drain and the #467 per-peer
+/// `WindDownRequested` drain.
 async fn fake_primary_graceful(
     secondary_id: String,
+    drain_directive: dynrunner_protocol_primary_secondary::ClusterMutation<TestId>,
     mut from_secondary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
     to_secondary: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
 ) -> Vec<DistributedMessage<TestId>> {
@@ -79,15 +91,17 @@ async fn fake_primary_graceful(
             total_bytes: 0,
         })
         .unwrap();
-    // The graceful-abort latch (the freeze) — NOT a run terminal.
+    // The drain directive (the freeze / per-peer wind-down) — NOT a run
+    // terminal. The caller chooses which directive to broadcast so this
+    // one collector serves BOTH the fleet-wide graceful-abort drain and
+    // the #467 per-peer wind-down drain (the secondary's exit shape is
+    // identical — both ride the same deliberate self-departure path).
     to_secondary
         .send(DistributedMessage::ClusterMutation {
             target: None,
             sender_id: "setup".into(),
             timestamp: 0.0,
-            mutations: vec![
-                dynrunner_protocol_primary_secondary::ClusterMutation::GracefulAbortRequested,
-            ],
+            mutations: vec![drain_directive],
         })
         .unwrap();
     // Collect the secondary's outbound until the SelfDeparture
@@ -162,6 +176,7 @@ async fn drained_secondary_departs_deliberately_without_election() {
             let secondary_id = config.secondary_id.clone();
             let primary_handle = tokio::task::spawn_local(fake_primary_graceful(
                 secondary_id.clone(),
+                dynrunner_protocol_primary_secondary::ClusterMutation::GracefulAbortRequested,
                 sec_to_pri_rx,
                 pri_to_sec_tx,
             ));
@@ -237,6 +252,129 @@ async fn drained_secondary_departs_deliberately_without_election() {
                             | MessageType::SecondaryFatalError
                     ),
                     "a draining secondary must never emit election / fatal \
+                     traffic; saw {:?}",
+                    f.msg_type()
+                );
+            }
+        })
+        .await;
+}
+
+/// #467 (the secondary half): a single seated replacement marked for
+/// wind-down via the replicated `WindDownRequested { secondary_id:
+/// <self>, member_gen }` directive (NOT the fleet-wide graceful-abort
+/// latch) drains and departs MID-RUN through the SAME deliberate
+/// self-departure path — clean `SecondaryTerminal::Done`, one `PeerRemoved
+/// { SelfDeparture }` on the wire, ZERO election / fatal traffic — while
+/// the global graceful-abort latch is never set (the rest of the run
+/// continues untouched).
+///
+/// Revert-confirm: without the per-peer wind-down drain gate in
+/// `process_tasks`, the directed secondary never reacts to
+/// `WindDownRequested` — it sits in failover-detection mode holding its
+/// SLURM job to run-end and `run_until_setup_or_done` never returns
+/// `Terminal` here (no self-departure is ever emitted).
+#[tokio::test(flavor = "current_thread")]
+async fn wound_down_secondary_departs_deliberately_at_quiescence() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+
+            let config = setup_terminal_config();
+            let secondary_id = config.secondary_id.clone();
+            // The directive names THIS secondary at its cold incarnation
+            // generation 0 (the self-gen the harness's secondary holds,
+            // matching `announce_graceful_drain_departure`'s own read).
+            let directive =
+                dynrunner_protocol_primary_secondary::ClusterMutation::WindDownRequested {
+                    secondary_id: secondary_id.clone(),
+                    member_gen: 0,
+                };
+            let primary_handle = tokio::task::spawn_local(fake_primary_graceful(
+                secondary_id.clone(),
+                directive,
+                sec_to_pri_rx,
+                pri_to_sec_tx,
+            ));
+
+            let unified =
+                channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
+            let mut secondary = make_secondary_channel(config, unified);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+            let (mut secondary, guard) = start_secondary_pump(secondary);
+
+            let mut factory = FakeWorkerFactory;
+            let outcome = secondary
+                .run_until_setup_or_done(&mut factory)
+                .await
+                .expect("the wind-down drain exit returns Ok(RunOutcome::Terminal)");
+            assert!(
+                matches!(outcome, RunOutcome::Terminal),
+                "expected RunOutcome::Terminal, got {outcome:?}"
+            );
+            match secondary.terminal() {
+                Some(SecondaryTerminal::Done) => {}
+                other => panic!("expected SecondaryTerminal::Done, got {other:?}"),
+            }
+            // This is the PER-PEER path: the directive is recorded for this
+            // incarnation, and the fleet-wide graceful-abort latch is NOT
+            // set (the rest of the run continues).
+            assert!(
+                secondary
+                    .cluster_state()
+                    .wind_down_requested(&secondary_id, 0),
+                "the per-peer wind-down directive was applied before the exit"
+            );
+            assert!(
+                !secondary.cluster_state().graceful_abort_requested(),
+                "the #467 wind-down is per-peer — the fleet-wide graceful-abort \
+                 latch must never be set by it"
+            );
+            assert!(
+                !secondary.cluster_state().run_complete(),
+                "the exit fired MID-RUN — no RunComplete was ever broadcast"
+            );
+
+            drop(secondary);
+            drop(guard);
+            let frames = primary_handle.await.expect("collector task");
+
+            // Exactly one deliberate departure announcement on the wire.
+            let self_departures = frames
+                .iter()
+                .filter(|f| {
+                    matches!(
+                        f,
+                        DistributedMessage::ClusterMutation { mutations, .. }
+                            if mutations.iter().any(|m| matches!(
+                                m,
+                                dynrunner_protocol_primary_secondary::ClusterMutation::PeerRemoved {
+                                    id,
+                                    cause: RemovalCause::SelfDeparture(_),
+                                    ..
+                                } if id == &secondary_id
+                            ))
+                    )
+                })
+                .count();
+            assert_eq!(
+                self_departures, 1,
+                "exactly one deliberate SelfDeparture announcement: {frames:?}"
+            );
+
+            // No failover machinery fired on the way out.
+            for f in &frames {
+                assert!(
+                    !matches!(
+                        f.msg_type(),
+                        MessageType::PromotionVote
+                            | MessageType::PromotionConfirm
+                            | MessageType::TimeoutDetected
+                            | MessageType::SecondaryFatalError
+                    ),
+                    "a wound-down secondary must never emit election / fatal \
                      traffic; saw {:?}",
                     f.msg_type()
                 );

@@ -162,6 +162,19 @@ pub struct StateDigest {
     /// decision converges cluster-wide).
     #[serde(default)]
     pub phases_ended_hash: u64,
+    /// Number of per-peer wind-down directives (#467 grow-only SET of
+    /// `(secondary_id, member_gen)`, replicated via
+    /// `ClusterMutation::WindDownRequested`).
+    #[serde(default)]
+    pub wind_down_requested_count: u64,
+    /// XOR-fold over the wind-down directive `(secondary_id, member_gen)`
+    /// pairs (#467): key-only, like `phases_ended_hash` — the pair IS the
+    /// key. A peer that recorded a wind-down directive this replica lacks
+    /// makes the replica behind; the snapshot pull's union-merge heals it
+    /// so the directed secondary still stands down after a primary
+    /// failover.
+    #[serde(default)]
+    pub wind_down_requested_hash: u64,
     /// Number of respawn-ledger entries (F7 grow-only SET).
     #[serde(default)]
     pub respawn_events_count: u64,
@@ -337,6 +350,17 @@ impl StateDigest {
                 self.phases_ended_hash,
                 other.phases_ended_count,
                 other.phases_ended_hash,
+            )
+            // #467 grow-only SET of per-peer wind-down directives:
+            // count-OR-hash compare, same shape as `phases_ended`. A peer
+            // that recorded a wind-down directive this replica lacks makes
+            // the replica behind; the snapshot pull's union-merge heals it
+            // so the directed secondary still stands down after failover.
+            || field_behind(
+                self.wind_down_requested_count,
+                self.wind_down_requested_hash,
+                other.wind_down_requested_count,
+                other.wind_down_requested_hash,
             )
             // F7 grow-only SET: count-OR-hash compare, same shape as the
             // other count-bearing fields. A peer that recorded a respawn

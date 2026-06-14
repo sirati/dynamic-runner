@@ -924,6 +924,22 @@ impl<I: Identifier> ClusterState<I> {
         self.graceful_abort_requested
     }
 
+    /// Whether THIS exact secondary incarnation has been marked for
+    /// graceful wind-down (`ClusterMutation::WindDownRequested` with a
+    /// matching `(secondary_id, member_gen)`) — the per-peer,
+    /// incarnation-scoped sibling of [`Self::graceful_abort_requested`].
+    /// The directed secondary consults this with its OWN id and its OWN
+    /// live `member_gen`; a directive minted for a prior incarnation
+    /// (lower generation) never matches, so a re-seated id is not wound
+    /// down by a stale directive. Grow-only + monotone, like the global
+    /// graceful-abort latch: once the pair is recorded, it stays. Consumed
+    /// by the directed secondary's graceful-drain exit gate (it departs at
+    /// its next quiescence; see `process_tasks`).
+    pub fn wind_down_requested(&self, secondary_id: &str, member_gen: u64) -> bool {
+        self.wind_down_requested
+            .contains(&(secondary_id.to_string(), member_gen))
+    }
+
     /// Count of `InFlight` ledger entries currently assigned to
     /// `secondary` — the CRDT-derived "active workers" occupancy of one
     /// secondary. Pure projection of the replicated `tasks` ledger, so

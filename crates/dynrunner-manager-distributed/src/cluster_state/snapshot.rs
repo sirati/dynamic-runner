@@ -295,6 +295,19 @@ pub struct ClusterStateSnapshot<I> {
     /// (missing field decodes as `false`, the pre-field shape).
     #[serde(default)]
     pub graceful_abort_requested: bool,
+    /// Replicated per-peer wind-down directive set (#467) — grow-only SET
+    /// of `(secondary_id, member_gen)` pairs, the per-incarnation sibling
+    /// of `graceful_abort_requested`. Carried so a failover-promoted
+    /// primary INHERITS every in-flight wind-down directive and the
+    /// directed secondary still stands down at quiescence after the
+    /// primary relocates (the no-redo law, per-peer). Merge rule on
+    /// `restore`: union (a grow-only set never regresses). `#[serde(default)]`
+    /// keeps wire compat with pre-field senders (missing field decodes as
+    /// an empty set, the pre-field shape). Tuple element, so the wire shape
+    /// is a list of `[secondary_id, member_gen]` pairs (serde handles a
+    /// `HashSet` of tuples as a JSON array of 2-element arrays).
+    #[serde(default)]
+    pub wind_down_requested: HashSet<(String, u64)>,
     /// Sticky-monotonic discovery-debt latch (the replicated discovery
     /// lattice). Merge rule on `restore`: join = `max` over
     /// `Undeclared ⊑ Owed ⊑ Settled` (a replica only moves UP; a `Settled`
@@ -437,6 +450,7 @@ impl<I> Default for ClusterStateSnapshot<I> {
             run_complete: false,
             run_aborted: None,
             graceful_abort_requested: false,
+            wind_down_requested: HashSet::new(),
             discovery_debt: DiscoveryDebt::default(),
             phase_event_tallies: HashMap::new(),
             retry_passes_used: HashMap::new(),
@@ -509,6 +523,7 @@ impl<I: Identifier> ClusterState<I> {
             run_complete,
             run_aborted,
             graceful_abort_requested,
+            wind_down_requested,
             discovery_debt,
             role_table: _role_table,
             peer_state,
@@ -634,6 +649,11 @@ impl<I: Identifier> ClusterState<I> {
             // Sticky-monotonic graceful-abort latch — carried so a
             // failover-promoted primary inherits the dispatch freeze.
             graceful_abort_requested: *graceful_abort_requested,
+            // Grow-only per-peer wind-down directive set (#467) — carried
+            // so a failover-promoted primary inherits every in-flight
+            // wind-down and the directed secondary still stands down after
+            // the relocation.
+            wind_down_requested: wind_down_requested.clone(),
             // Sticky-monotonic discovery-debt latch — carried so a promoted
             // primary inherits "discovery already settled" and does NOT
             // re-run discovery on failover.
@@ -752,6 +772,7 @@ impl<I: Identifier> ClusterState<I> {
             run_complete,
             run_aborted,
             graceful_abort_requested,
+            wind_down_requested,
             discovery_debt,
             phase_event_tallies,
             retry_passes_used,
@@ -974,6 +995,12 @@ impl<I: Identifier> ClusterState<I> {
         // `run_complete` — a promoted primary restoring a frozen snapshot
         // inherits the dispatch freeze and refuses to schedule (no-redo).
         self.graceful_abort_requested |= graceful_abort_requested;
+        // Per-peer wind-down directive set (#467): plain set UNION (the
+        // grow-only join the directive declares) so a promoted primary
+        // inherits every in-flight wind-down and a stale snapshot can
+        // never un-request one. Idempotent + order-insensitive (set
+        // insert), the same shape as `phases_ended` below.
+        self.wind_down_requested.extend(wind_down_requested);
         // Discovery-debt latch: sticky-monotonic join = `max` over the
         // total order `Undeclared ⊑ Owed ⊑ Settled` (the derived `Ord`).
         // A replica only moves UP: an incoming `Settled` ratchets a local
