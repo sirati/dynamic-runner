@@ -32,6 +32,7 @@
 //! arm doc.
 
 mod accessors;
+mod affine;
 mod apply;
 mod apply_custom;
 mod apply_peer;

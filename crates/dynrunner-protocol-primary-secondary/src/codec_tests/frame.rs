@@ -311,6 +311,22 @@ fn roundtrip_all_message_types() {
             success: true,
             error_message: String::new(),
         },
+        DistributedMessage::TaskQueuedAfterLocalDependency {
+            target: None,
+            sender_id: "s".into(),
+            timestamp: 0.0,
+            secondary_id: "s".into(),
+            task_hash: "h".into(),
+            affine_hash: "g".into(),
+        },
+        DistributedMessage::LocalDependencyReleased {
+            target: None,
+            sender_id: "s".into(),
+            timestamp: 0.0,
+            secondary_id: "s".into(),
+            task_hash: "h".into(),
+            worker_id: 0,
+        },
     ];
 
     for msg in &messages {
@@ -512,4 +528,70 @@ fn setup_terminal_mirrors_literal_sender_bytes() {
         other => panic!("expected SetupTerminal, got {:?}", other.msg_type()),
     }
     assert_eq!(serde_json::to_string(&decoded_fail).unwrap(), fail);
+}
+
+/// Wire-shape mirror for `TaskQueuedAfterLocalDependency` (#497, secondary →
+/// primary): the EXACT bytes the reporting secondary emits — the
+/// snake_case `msg_type` tag, the `task_hash` (B) + `affine_hash` (the gate
+/// I) field names, `target` elided while `None` — decode, pin every field,
+/// then re-encode and require identical bytes back (NOT
+/// symmetric-on-the-wrong-shape).
+#[test]
+fn task_queued_after_local_dependency_mirrors_literal_sender_bytes() {
+    let literal = r#"{"msg_type":"task_queued_after_local_dependency","sender_id":"sec-0","timestamp":9.0,"secondary_id":"sec-0","task_hash":"build-h","affine_hash":"import-h"}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(literal).unwrap();
+    match &decoded {
+        DistributedMessage::TaskQueuedAfterLocalDependency {
+            target,
+            sender_id,
+            timestamp,
+            secondary_id,
+            task_hash,
+            affine_hash,
+        } => {
+            assert!(target.is_none());
+            assert_eq!(sender_id, "sec-0");
+            assert_eq!(*timestamp, 9.0);
+            assert_eq!(secondary_id, "sec-0");
+            assert_eq!(task_hash, "build-h");
+            assert_eq!(affine_hash, "import-h");
+        }
+        other => panic!(
+            "expected TaskQueuedAfterLocalDependency, got {:?}",
+            other.msg_type()
+        ),
+    }
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), literal);
+}
+
+/// Wire-shape mirror for `LocalDependencyReleased` (#497, secondary →
+/// primary): the EXACT bytes the releasing secondary emits — the snake_case
+/// tag, the `task_hash` (B) + integer `worker_id` field names, `target`
+/// elided while `None`.
+#[test]
+fn local_dependency_released_mirrors_literal_sender_bytes() {
+    let literal = r#"{"msg_type":"local_dependency_released","sender_id":"sec-0","timestamp":9.5,"secondary_id":"sec-0","task_hash":"build-h","worker_id":4}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(literal).unwrap();
+    match &decoded {
+        DistributedMessage::LocalDependencyReleased {
+            target,
+            sender_id,
+            timestamp,
+            secondary_id,
+            task_hash,
+            worker_id,
+        } => {
+            assert!(target.is_none());
+            assert_eq!(sender_id, "sec-0");
+            assert_eq!(*timestamp, 9.5);
+            assert_eq!(secondary_id, "sec-0");
+            assert_eq!(task_hash, "build-h");
+            assert_eq!(*worker_id, 4);
+        }
+        other => panic!(
+            "expected LocalDependencyReleased, got {:?}",
+            other.msg_type()
+        ),
+    }
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), literal);
 }

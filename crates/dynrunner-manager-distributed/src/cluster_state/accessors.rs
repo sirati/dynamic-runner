@@ -133,10 +133,16 @@ impl<I: Identifier> ClusterState<I> {
                 TaskState::InvalidTask { .. } => c.invalid_task += 1,
                 TaskState::SkippedAlreadyDone { .. } => c.skipped_already_done += 1,
                 TaskState::SetupCompleted { .. } => c.setup_succeeded += 1,
+                TaskState::AffineReady { .. } => c.affine_ready += 1,
+                TaskState::QueuedAfterLocalDependency { .. } => {
+                    c.queued_after_local_dependency += 1
+                }
             }
         }
         // Settled (spilled) entries are LOGICAL ledger entries — fold
         // their slim classes into the same buckets the fat states feed.
+        // (`QueuedAfterLocalDependency` is non-terminal and never settles,
+        // so it has no `SettledClass` arm.)
         for (_, entry) in self.settled_entries() {
             match entry.class {
                 SettledClass::Completed => c.completed += 1,
@@ -144,6 +150,7 @@ impl<I: Identifier> ClusterState<I> {
                 SettledClass::InvalidTask => c.invalid_task += 1,
                 SettledClass::SkippedAlreadyDone => c.skipped_already_done += 1,
                 SettledClass::SetupCompleted => c.setup_succeeded += 1,
+                SettledClass::AffineReady => c.affine_ready += 1,
             }
         }
         c
@@ -205,21 +212,33 @@ impl<I: Identifier> ClusterState<I> {
                 // `skipped`, it IS a terminal outcome so `total_terminal()`
                 // counts it.
                 TaskState::SetupCompleted { .. } => o.setup_succeeded += 1,
-                // Non-terminal: Pending, InFlight, and Blocked all
-                // contribute to neither bucket. Blocked tasks are
-                // cascade-paused dependents that will auto-resume to
-                // Pending when their prereq completes; they're not a
-                // terminal outcome and counting them as one would
-                // double-tally on the eventual resumed run.
+                // SecondaryAffine gate (READY-not-EXECUTED): an INERT
+                // terminal in its OWN bucket (`affine_ready`), NEVER
+                // `succeeded`/`setup_succeeded`/any failure class (the
+                // primary never executed it). Like `skipped`/`setup_succeeded`
+                // it IS a terminal outcome so `total_terminal()` counts it
+                // (no STRANDED false-abort at finalize).
+                TaskState::AffineReady { .. } => o.affine_ready += 1,
+                // Non-terminal: Pending, InFlight, QueuedAfterLocalDependency,
+                // and Blocked all contribute to neither bucket.
+                // `QueuedAfterLocalDependency` is a live work task awaiting
+                // its secondary's local import — counting it would double-
+                // tally on the eventual run. Blocked tasks are cascade-paused
+                // dependents that will auto-resume to Pending when their
+                // prereq completes; they're not a terminal outcome and
+                // counting them as one would double-tally on the eventual
+                // resumed run.
                 TaskState::Pending { .. }
                 | TaskState::InFlight { .. }
+                | TaskState::QueuedAfterLocalDependency { .. }
                 | TaskState::Blocked { .. } => {}
             }
         }
         // Settled (spilled) entries: the same per-class mapping, off the
         // slim index. `FailedFinal` routes through the ONE shared
         // `fold_failed_kind` so the kind partition cannot drift from the
-        // fat arm's.
+        // fat arm's. (`QueuedAfterLocalDependency` is non-terminal and never
+        // settles, so it has no `SettledClass` arm.)
         for (_, entry) in self.settled_entries() {
             match &entry.class {
                 SettledClass::Completed => o.succeeded += 1,
@@ -227,6 +246,7 @@ impl<I: Identifier> ClusterState<I> {
                 SettledClass::InvalidTask => o.fail_final += 1,
                 SettledClass::SkippedAlreadyDone => o.skipped += 1,
                 SettledClass::SetupCompleted => o.setup_succeeded += 1,
+                SettledClass::AffineReady => o.affine_ready += 1,
             }
         }
         o
@@ -251,6 +271,8 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::InvalidTask { task, .. }
                 | TaskState::SkippedAlreadyDone { task, .. }
                 | TaskState::SetupCompleted { task, .. }
+                | TaskState::AffineReady { task, .. }
+                | TaskState::QueuedAfterLocalDependency { task, .. }
                 | TaskState::Blocked { task, .. } => task,
             };
             (h, t)
@@ -259,9 +281,10 @@ impl<I: Identifier> ClusterState<I> {
 
     /// Iterator over `(task_hash, &TaskInfo)` for FAT (in-memory)
     /// terminal entries (`Completed`, `Failed`, `Unfulfillable`,
-    /// `InvalidTask`, `SkippedAlreadyDone`). `Blocked` is non-terminal
-    /// (auto-resumes to `Pending` when its prereq completes) and is
-    /// excluded. A `SkippedAlreadyDone` IS surfaced — its dependents
+    /// `InvalidTask`, `SkippedAlreadyDone`, `SetupCompleted`,
+    /// `AffineReady`). `Blocked` and `QueuedAfterLocalDependency` are
+    /// non-terminal and are excluded. A `SkippedAlreadyDone` IS surfaced —
+    /// its dependents
     /// resolve their `task_depends_on` reference against it exactly as
     /// against a `Completed` prereq. SETTLED terminals are not yielded
     /// (no in-memory `TaskInfo`); pair with [`Self::settled_entries`]
@@ -273,7 +296,11 @@ impl<I: Identifier> ClusterState<I> {
             | TaskState::Unfulfillable { task, .. }
             | TaskState::InvalidTask { task, .. }
             | TaskState::SkippedAlreadyDone { task, .. }
-            | TaskState::SetupCompleted { task, .. } => Some((h, task)),
+            | TaskState::SetupCompleted { task, .. }
+            // `AffineReady` IS terminal for dependency-resolution: a build
+            // gated on the gate resolves its dep against it exactly as
+            // against a `Completed`/`SetupCompleted` prereq.
+            | TaskState::AffineReady { task, .. } => Some((h, task)),
             _ => None,
         })
     }
@@ -450,6 +477,8 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::InvalidTask { task, .. }
                 | TaskState::SkippedAlreadyDone { task, .. }
                 | TaskState::SetupCompleted { task, .. }
+                | TaskState::AffineReady { task, .. }
+                | TaskState::QueuedAfterLocalDependency { task, .. }
                 | TaskState::Blocked { task, .. } => task,
             };
             let entry = base.entry(&task.phase_id).or_insert((false, false));
@@ -558,6 +587,8 @@ impl<I: Identifier> ClusterState<I> {
                     | TaskState::InvalidTask { task, .. }
                     | TaskState::SkippedAlreadyDone { task, .. }
                     | TaskState::SetupCompleted { task, .. }
+                    | TaskState::AffineReady { task, .. }
+                    | TaskState::QueuedAfterLocalDependency { task, .. }
                     | TaskState::Blocked { task, .. } => task,
                 };
                 (task.task_id == task_id && &task.phase_id == phase_id).then_some(h.as_str())
@@ -654,6 +685,8 @@ impl<I: Identifier> ClusterState<I> {
                     | TaskState::InvalidTask { task, .. }
                     | TaskState::SkippedAlreadyDone { task, .. }
                     | TaskState::SetupCompleted { task, .. }
+                    | TaskState::AffineReady { task, .. }
+                    | TaskState::QueuedAfterLocalDependency { task, .. }
                     | TaskState::Blocked { task, .. } => task,
                 };
                 if &task.phase_id != phase_id {
@@ -701,13 +734,24 @@ impl<I: Identifier> ClusterState<I> {
             match state {
                 TaskState::Pending { .. }
                 | TaskState::InFlight { .. }
+                // `QueuedAfterLocalDependency` is live remaining work — a
+                // task committed to a secondary but not yet running (awaiting
+                // its local import) — so it is `to_run`, exactly like
+                // `InFlight`/`Pending`/`Blocked`.
+                | TaskState::QueuedAfterLocalDependency { .. }
                 | TaskState::Blocked { .. } => p.to_run += 1,
                 // `SetupCompleted` is success-like work this run performed
                 // in-process — folded into `done` for the per-phase
                 // progress partition (the OUTCOME-level `setup_succeeded`
                 // bucket keeps it out of the global success count; this
-                // phase-progress view is a distinct concern).
-                TaskState::Completed { .. } | TaskState::SetupCompleted { .. } => p.done += 1,
+                // phase-progress view is a distinct concern). `AffineReady`
+                // (a resolved SecondaryAffine gate) folds into `done` for the
+                // SAME reason: the gate resolved so the phase advances, while
+                // the OUTCOME-level `affine_ready` bucket keeps it out of the
+                // global success count.
+                TaskState::Completed { .. }
+                | TaskState::SetupCompleted { .. }
+                | TaskState::AffineReady { .. } => p.done += 1,
                 TaskState::Failed { .. }
                 | TaskState::Unfulfillable { .. }
                 | TaskState::InvalidTask { .. } => p.failed += 1,
@@ -721,7 +765,9 @@ impl<I: Identifier> ClusterState<I> {
                 continue;
             }
             match entry.class {
-                SettledClass::Completed | SettledClass::SetupCompleted => p.done += 1,
+                SettledClass::Completed
+                | SettledClass::SetupCompleted
+                | SettledClass::AffineReady => p.done += 1,
                 SettledClass::FailedFinal(_) | SettledClass::InvalidTask => p.failed += 1,
                 SettledClass::SkippedAlreadyDone => p.skipped += 1,
             }

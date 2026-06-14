@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod affine;
 mod apply_basics;
 mod cascade_and_reinject;
 mod convergence;

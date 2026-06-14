@@ -458,11 +458,23 @@ impl<I: Identifier> ClusterState<I> {
                 ApplyOutcome::Applied
             }
             ClusterMutation::TaskRequeued { hash, version } => {
-                // Dead-secondary recovery moves an `InFlight { .. }`
-                // entry back to `Pending` so the live primary re-
-                // dispatches it (and a post-failover hydrate routes it
-                // into the pool rather than the in-flight ledger). Any
-                // other state is a NoOp:
+                // Dead-secondary recovery moves an `InFlight { .. }` OR a
+                // `QueuedAfterLocalDependency { .. }` entry back to `Pending`
+                // so the live primary re-dispatches it (and a post-failover
+                // hydrate routes it into the pool rather than the in-flight
+                // ledger). BOTH are active assignments to the dead secondary:
+                // an `InFlight` task it was running, and a
+                // `QueuedAfterLocalDependency` task it had committed to but
+                // was holding behind a local import (#497) — when that
+                // secondary dies, the queued task is just as lost as the
+                // running one and re-routes to another secondary per #495.
+                // The death seam (`recover_inflight_for_dead_secondary`)
+                // emits ONE `TaskRequeued` for both source states (the work
+                // task stays in the primary's `in_flight` ledger throughout
+                // the queued window), so this arm is the single requeue
+                // originator — no second InFlight-originator is invented.
+                //
+                // Any other state is a NoOp:
                 //   * a terminal (`Completed` / `Failed` /
                 //     `Unfulfillable` / `InvalidTask`) that arrived
                 //     first wins — a worker outcome that raced the
@@ -487,7 +499,10 @@ impl<I: Identifier> ClusterState<I> {
                 // dispatch generation re-dispatches, so version still
                 // arbitrates a redelivered stale `TaskAssigned`).
                 let (task, attempt) = match state {
-                    TaskState::InFlight { task, attempt, .. } => (task.clone(), *attempt),
+                    TaskState::InFlight { task, attempt, .. }
+                    | TaskState::QueuedAfterLocalDependency { task, attempt, .. } => {
+                        (task.clone(), *attempt)
+                    }
                     _ => return ApplyOutcome::NoOp,
                 };
                 *state = TaskState::Pending {
@@ -572,9 +587,16 @@ impl<I: Identifier> ClusterState<I> {
                     // A skip is terminal: it locks out a late cascade-pause
                     // exactly like the other terminals (a TaskBlocked must
                     // not regress an already-done item to Blocked). A
-                    // succeeded setup task is terminal for the same reason.
+                    // succeeded setup task is terminal for the same reason,
+                    // and so is a resolved SecondaryAffine gate (AffineReady).
                     | TaskState::SkippedAlreadyDone { .. }
                     | TaskState::SetupCompleted { .. }
+                    | TaskState::AffineReady { .. }
+                    // An active assignment locks out a late cascade-pause:
+                    // `InFlight` and `QueuedAfterLocalDependency` are both a
+                    // worker's observed assignment that a stale TaskBlocked
+                    // must not regress.
+                    | TaskState::QueuedAfterLocalDependency { .. }
                     | TaskState::InFlight { .. } => ApplyOutcome::NoOp,
                     TaskState::Blocked { .. } => {
                         // Already blocked: idempotent on a matching `on`,
@@ -669,6 +691,92 @@ impl<I: Identifier> ClusterState<I> {
                     }
                     _ => ApplyOutcome::NoOp,
                 }
+            }
+            ClusterMutation::AffineReady { hash } => {
+                // A SecondaryAffine gate `I` became dependency-SATISFIED (all
+                // its own deps resolved while `Pending`). READY-not-EXECUTED:
+                // the primary NEVER runs the gate — it just transitions the
+                // ledger entry to the terminal `AffineReady` and unblocks the
+                // gate's dependents. Authoritative spawn-time transition
+                // (like `TaskSkippedAlreadyDone` / `SetupCompleted`, NOT a
+                // monotone join), so it keeps an explicit precondition arm.
+                //
+                // Gate on `Pending` ONLY (the load-bearing tightening vs.
+                // `SetupCompleted`, which also accepts `InFlight`): a gate is
+                // NEVER worker-dispatched, so it can never legitimately be
+                // `InFlight` — the only state from which it goes ready is the
+                // `Pending` it was born / resumed into. Any non-`Pending`
+                // state — a real terminal (the weakest-terminal lockout) or
+                // an idempotent re-application against an already-`AffineReady`
+                // entry — is the `_ => NoOp` arm.
+                //
+                // Like `SetupCompleted`, the ready transition auto-resumes
+                // every `Blocked { on: <this hash> }` dependent back to
+                // `Pending` via the SAME `resume_blocked_on` cascade (the
+                // single owner of the Blocked → Pending resume): a build task
+                // gated on the gate unblocks the moment the gate is ready.
+                // The `attempt` is preserved from the `Pending` source.
+                let Some(state) = self.tasks.get_mut(&hash) else {
+                    return ApplyOutcome::NoOp;
+                };
+                match state {
+                    TaskState::Pending { task, attempt, .. } => {
+                        let (task, attempt) = (task.clone(), *attempt);
+                        *state = TaskState::AffineReady { task, attempt };
+                        let just_resumed = self.resume_blocked_on(&hash);
+                        resumed.extend(just_resumed);
+                        ApplyOutcome::Applied
+                    }
+                    _ => ApplyOutcome::NoOp,
+                }
+            }
+            ClusterMutation::QueuedAfterLocalDependencySet { hash, secondary } => {
+                // Work task `B` (assigned to `secondary`) is now WAITING on
+                // that secondary's LOCAL SecondaryAffine import (#497). The
+                // secondary REPORTED (its `TaskQueuedAfterLocalDependency`
+                // frame), the primary ORIGINATES this transition (the
+                // work-split law). Authoritative rank-DROP `InFlight |
+                // Pending → QueuedAfterLocalDependency` (an active assignment
+                // is parked behind a local dep), so it keeps an explicit
+                // precondition arm and does NOT route through the monotone
+                // join (the join would reject the `InFlight → Queued` rank
+                // drop). The `TaskInfo`, `version`, and `attempt` are
+                // PRESERVED from the source so the eventual release
+                // `TaskAssigned` (minting a strictly-higher version) cleanly
+                // dominates this queued entry and a stale redelivery never
+                // resurrects an `InFlight` over it.
+                //
+                // Gate on `InFlight` (the standard just-assigned source) OR
+                // `Pending` (a deferred-assignment race where the report
+                // outran the local `TaskAssigned` apply): any other state — a
+                // terminal that already settled `B`, or an idempotent
+                // re-application against an already-queued entry — is the `_
+                // => NoOp` arm.
+                let Some(state) = self.tasks.get_mut(&hash) else {
+                    return ApplyOutcome::NoOp;
+                };
+                let (task, version, attempt) = match state {
+                    TaskState::InFlight {
+                        task,
+                        version,
+                        attempt,
+                        ..
+                    }
+                    | TaskState::Pending {
+                        task,
+                        version,
+                        attempt,
+                        ..
+                    } => (task.clone(), *version, *attempt),
+                    _ => return ApplyOutcome::NoOp,
+                };
+                *state = TaskState::QueuedAfterLocalDependency {
+                    task,
+                    secondary,
+                    version,
+                    attempt,
+                };
+                ApplyOutcome::Applied
             }
             ClusterMutation::TaskPreferredSecondariesUpdated {
                 hash,

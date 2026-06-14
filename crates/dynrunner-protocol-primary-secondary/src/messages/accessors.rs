@@ -60,7 +60,9 @@ impl<I> DistributedMessage<I> {
             | Self::RedialRequest { target, .. }
             | Self::FrameChunk { target, .. }
             | Self::SetupAssignment { target, .. }
-            | Self::SetupTerminal { target, .. } => target.as_ref(),
+            | Self::SetupTerminal { target, .. }
+            | Self::TaskQueuedAfterLocalDependency { target, .. }
+            | Self::LocalDependencyReleased { target, .. } => target.as_ref(),
         }
     }
 
@@ -114,7 +116,9 @@ impl<I> DistributedMessage<I> {
             | Self::RedialRequest { target, .. }
             | Self::FrameChunk { target, .. }
             | Self::SetupAssignment { target, .. }
-            | Self::SetupTerminal { target, .. } => target,
+            | Self::SetupTerminal { target, .. }
+            | Self::TaskQueuedAfterLocalDependency { target, .. }
+            | Self::LocalDependencyReleased { target, .. } => target,
         };
         *slot = Some(dst);
     }
@@ -182,7 +186,9 @@ impl<I> DistributedMessage<I> {
             | Self::RedialRequest { target, .. }
             | Self::FrameChunk { target, .. }
             | Self::SetupAssignment { target, .. }
-            | Self::SetupTerminal { target, .. } => target,
+            | Self::SetupTerminal { target, .. }
+            | Self::TaskQueuedAfterLocalDependency { target, .. }
+            | Self::LocalDependencyReleased { target, .. } => target,
         };
         *slot = None;
     }
@@ -231,7 +237,9 @@ impl<I> DistributedMessage<I> {
             | Self::RedialRequest { sender_id, .. }
             | Self::FrameChunk { sender_id, .. }
             | Self::SetupAssignment { sender_id, .. }
-            | Self::SetupTerminal { sender_id, .. } => sender_id,
+            | Self::SetupTerminal { sender_id, .. }
+            | Self::TaskQueuedAfterLocalDependency { sender_id, .. }
+            | Self::LocalDependencyReleased { sender_id, .. } => sender_id,
         }
     }
 
@@ -279,7 +287,9 @@ impl<I> DistributedMessage<I> {
             | Self::RedialRequest { timestamp, .. }
             | Self::FrameChunk { timestamp, .. }
             | Self::SetupAssignment { timestamp, .. }
-            | Self::SetupTerminal { timestamp, .. } => *timestamp,
+            | Self::SetupTerminal { timestamp, .. }
+            | Self::TaskQueuedAfterLocalDependency { timestamp, .. }
+            | Self::LocalDependencyReleased { timestamp, .. } => *timestamp,
         }
     }
 
@@ -523,6 +533,10 @@ impl<I> DistributedMessage<I> {
             Self::FrameChunk { .. } => MessageType::FrameChunk,
             Self::SetupAssignment { .. } => MessageType::SetupAssignment,
             Self::SetupTerminal { .. } => MessageType::SetupTerminal,
+            Self::TaskQueuedAfterLocalDependency { .. } => {
+                MessageType::TaskQueuedAfterLocalDependency
+            }
+            Self::LocalDependencyReleased { .. } => MessageType::LocalDependencyReleased,
         }
     }
 }

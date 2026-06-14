@@ -55,6 +55,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let crate::cluster_state::AppliedBatch {
             applied,
             resumed_for_dispatch,
+            became_pending,
         } = batch;
         let resumed_any = !resumed_for_dispatch.is_empty();
         for binary in resumed_for_dispatch {
@@ -74,6 +75,31 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         if resumed_any {
             self.cluster_state
                 .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
+        }
+        // SecondaryAffine ready-resolution originator (#497, the WHEN). A
+        // `TaskKind::SecondaryAffine` gate that JUST became Pending-all-
+        // resolved — either born so at spawn (no deps) or resumed so when
+        // its upload dep completed — must transition to the terminal
+        // `AffineReady` (READY-not-EXECUTED) so its dependents unblock
+        // without the primary ever executing it. `became_pending` carries
+        // the union of the resume + spawn surfaces; the detection
+        // (Pending-gate ∧ all-deps-resolved) is owned by `cluster_state`.
+        // Broadcast through THIS method recursively so the follow-up
+        // inherits the identical apply+filter+capture+settle semantics AND
+        // so a CHAIN of gates (I1 depends on I2, both SecondaryAffine)
+        // converges: applying I2's `AffineReady` resumes I1 `Blocked →
+        // Pending`, which rides the recursive call's own `became_pending`
+        // and originates I1's `AffineReady` in turn. The recursion
+        // terminates: each step strictly drains the finite set of
+        // not-yet-ready gates (a gate goes `Pending → AffineReady` exactly
+        // once, and the apply arm NoOps a re-application).
+        if !became_pending.is_empty() {
+            let affine_ready = self
+                .cluster_state
+                .affine_ready_mutations_for(became_pending);
+            if !affine_ready.is_empty() {
+                Box::pin(self.apply_and_broadcast_cluster_mutations(affine_ready)).await;
+            }
         }
         // Worker-roster growth edge — the symmetric twin of the
         // pool-entry edge above. A `SecondaryCapacity` this batch ACTUALLY

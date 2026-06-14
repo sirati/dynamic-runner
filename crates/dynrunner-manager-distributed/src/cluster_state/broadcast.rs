@@ -174,6 +174,21 @@ fn stamp_versions<I: Identifier>(
             // outcome ever competes for (a setup task is never
             // worker-dispatched), so the terminal rank alone settles it.
             | ClusterMutation::SetupCompleted { .. }
+            // `AffineReady` is version-LESS and attempt-LESS for the same
+            // reason as `SetupCompleted`: an authoritative spawn-time
+            // terminal whose `attempt` the apply arm preserves from the
+            // `Pending` source (no stamped transition), and whose hash no
+            // worker outcome ever competes for (a SecondaryAffine gate is
+            // never worker-dispatched), so the terminal rank alone settles it.
+            | ClusterMutation::AffineReady { .. }
+            // `QueuedAfterLocalDependencySet` is version-LESS: an
+            // authoritative rank-DROP (`InFlight | Pending → Queued`) whose
+            // apply arm PRESERVES the source `version`+`attempt` (no stamp,
+            // no bump) — the subsequent release `TaskAssigned` mints the
+            // strictly-higher version that dominates the queued entry, so a
+            // redelivered stale `TaskAssigned` (at the preserved version) only
+            // ties and NoOps, never resurrecting an `InFlight` over the queue.
+            | ClusterMutation::QueuedAfterLocalDependencySet { .. }
             | ClusterMutation::PrimaryChanged { .. }
             | ClusterMutation::PhaseDepsSet { .. }
             | ClusterMutation::PhaseMayBeEmptySet { .. }
@@ -239,6 +254,17 @@ impl<I: Identifier> RoleChangeHookRegistrar for ClusterState<I> {
 pub(crate) struct AppliedBatch<I: Identifier> {
     pub applied: Vec<ClusterMutation<I>>,
     pub resumed_for_dispatch: Vec<TaskInfo<I>>,
+    /// Ledger hashes of every task that transitioned INTO `Pending` in
+    /// this apply pass — the union of the `Blocked → Pending` auto-resumes
+    /// (`resumed_for_dispatch`) and the freshly-`Pending` spawn-classified
+    /// entries (no deps, or all deps already terminal). The originator
+    /// feeds this to `ClusterState::affine_ready_mutations_for` (#497) so a
+    /// `TaskKind::SecondaryAffine` gate that just became Pending-all-resolved
+    /// is detected and its `AffineReady` mutation broadcast — covering BOTH
+    /// the no-dep spawn case (the gate is born Pending all-resolved) and the
+    /// resume case (its upload dep just completed). A non-gate (Work/Setup)
+    /// hash in this list is harmlessly filtered out by the detector.
+    pub became_pending: Vec<String>,
 }
 
 /// Apply each mutation to `state` locally and return the subset that
@@ -282,24 +308,36 @@ pub(crate) fn apply_locally_for_broadcast<I: Identifier>(
     // The originator paths (live primary's `apply_spawn_tasks`,
     // promoted-secondary's `apply_spawn_tasks`) already walk the
     // post-apply CRDT via `task_state(&hash)` lookups to reinject
-    // freshly-Pending entries; the apply rule's
+    // freshly-Pending entries for the POOL; the apply rule's
     // `newly_pending_from_spawn` surface targets the receive-side
-    // callers (`apply_cluster_mutations`) instead, so we accept the
-    // surface here and discard. The scratch buffer is allocated once
-    // and reused across the batch.
-    let mut _newly_pending_scratch: Vec<TaskInfo<I>> = Vec::new();
+    // callers (`apply_cluster_mutations`) for that. But the SecondaryAffine
+    // ready-resolution (#497) needs the union of the resume AND spawn
+    // surfaces to detect a gate that just became Pending-all-resolved, so
+    // we collect both here into `became_pending` (the buffer is allocated
+    // once and reused across the batch).
+    let mut newly_pending_from_spawn: Vec<TaskInfo<I>> = Vec::new();
     for m in mutations {
         let outcome = state.apply_with_resumed_blocked(
             m.clone(),
             &mut resumed_for_dispatch,
-            &mut _newly_pending_scratch,
+            &mut newly_pending_from_spawn,
         );
         if outcome == ApplyOutcome::Applied {
             applied.push(m);
         }
     }
+    // Hashes of every task that transitioned INTO Pending this pass — the
+    // resumed `Blocked → Pending` set ∪ the spawn-classified Pending set —
+    // for the originator's affine-ready detection. Hash via the same
+    // wire-canonical `compute_task_hash` the apply rule keys on.
+    let became_pending: Vec<String> = resumed_for_dispatch
+        .iter()
+        .chain(newly_pending_from_spawn.iter())
+        .map(crate::primary::wire::compute_task_hash)
+        .collect();
     AppliedBatch {
         applied,
         resumed_for_dispatch,
+        became_pending,
     }
 }

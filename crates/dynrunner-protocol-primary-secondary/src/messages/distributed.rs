@@ -1437,6 +1437,70 @@ pub enum DistributedMessage<I> {
         /// The operator-facing failure reason; empty on success.
         error_message: String,
     },
+    /// Secondary `S` -> primary: "work task `B` is now QUEUED behind `S`'s
+    /// LOCAL SecondaryAffine import" (#497). `S` was assigned `B`, found `B`
+    /// depends on a SecondaryAffine gate (`affine_hash`) whose import is not
+    /// yet locally done on `S`, scheduled that import ONCE, and queued `B`
+    /// behind it. The primary originates
+    /// [`crate::ClusterMutation::QueuedAfterLocalDependencySet`] on receipt,
+    /// transitioning `B`'s ledger entry `InFlight | Pending →
+    /// QueuedAfterLocalDependency { secondary: S }` so the queued state is
+    /// CRDT-replicated and observable (primary/observer SEE `B` waiting,
+    /// never silently stuck mid-`InFlight`).
+    ///
+    /// The secondary REPORTS, the primary ORIGINATES (the work-split law):
+    /// this is the report half of the queued state; the run-once import
+    /// tracking + the eventual release report are the secondary's local
+    /// concern (Phase 4). Mirrors `SetupTerminal`'s id/routing shape
+    /// (`target` / `sender_id` / `timestamp` / `secondary_id`); carries
+    /// `task_hash` (`B`'s ledger hash — the `TaskInfo` lives on the
+    /// member's replicated `cluster_state`) and `affine_hash` (the
+    /// SecondaryAffine gate `I` `B` is queued behind, for forensics /
+    /// release correlation).
+    TaskQueuedAfterLocalDependency {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// The reporting secondary (the member that queued `B`).
+        secondary_id: String,
+        /// `B`'s ledger hash — the work task now queued behind the import.
+        task_hash: String,
+        /// The SecondaryAffine gate (`I`) whose local import `B` waits on.
+        affine_hash: String,
+    },
+    /// Secondary `S` -> primary: "`S`'s LOCAL SecondaryAffine import for the
+    /// task queued as `task_hash` is now DONE — release it" (#497). `S`
+    /// finished (or already had locally-done) the per-secondary import the
+    /// work task `B` (`task_hash`) was queued behind, so `B` may now run on
+    /// `worker_id`. The primary originates the EXISTING
+    /// [`crate::ClusterMutation::TaskAssigned`] (`originate_task_assigned`)
+    /// on receipt — the standard `→ InFlight` choke point — transitioning
+    /// `B` `QueuedAfterLocalDependency → InFlight { secondary: S, worker:
+    /// worker_id }`; the death seam then covers `B` normally. Deliberately
+    /// NOT a second InFlight originator (the work-split law: one assignment
+    /// choke point).
+    ///
+    /// Mirrors `SetupTerminal`'s id/routing shape; carries `task_hash`
+    /// (`B`'s ledger hash) and `worker_id` (the slot on `S` that runs `B`,
+    /// so the originated `TaskAssigned` pins the same `(secondary, worker)`
+    /// pair the secondary chose).
+    LocalDependencyReleased {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// The reporting secondary (the member releasing `B`).
+        secondary_id: String,
+        /// `B`'s ledger hash — the work task whose local dep just released.
+        task_hash: String,
+        /// The worker slot on `S` that will run `B`.
+        worker_id: u32,
+    },
 }
 
 /// Which role's liveness a [`DistributedMessage::Keepalive`] asserts.

@@ -69,6 +69,18 @@ pub struct StatsSnapshot {
     pub invalid_task: usize,
     /// Tasks in `TaskState::InFlight` — currently executing somewhere.
     pub in_flight: usize,
+    /// `StateCounts::queued_after_local_dependency` — work tasks assigned
+    /// to a secondary but WAITING on that secondary's local SecondaryAffine
+    /// import (#497). Read from `counts()`: a NON-TERMINAL live state kept
+    /// disjoint from `in_flight` (the task is committed but not yet
+    /// running). Its OWN reported line so the operator sees work parked
+    /// behind a per-secondary import.
+    pub queued_after_local_dependency: usize,
+    /// secondary-id → number of `TaskState::QueuedAfterLocalDependency`
+    /// tasks WAITING on that secondary's local import (#497). Only
+    /// secondaries with ≥1 queued task appear — so the observable
+    /// projection NAMES the secondary `S` parking work behind its import.
+    pub per_secondary_queued_after_local_dep: HashMap<String, usize>,
     /// `Pending` tasks with at least one UNsatisfied `task_depends_on`
     /// prereq (the prereq is not yet terminal). Recomputed from the
     /// CRDT; the pool's `blocked` map analog.
@@ -173,6 +185,10 @@ impl StatsSnapshot {
         // entries pinned to the SAME slot mid-reorder the slot still
         // counts once.
         let mut busy_worker_slots: HashSet<(&str, dynrunner_core::WorkerId)> = HashSet::new();
+        // secondary → number of work tasks WAITING on that secondary's
+        // local SecondaryAffine import (#497). The observable projection of
+        // the `QueuedAfterLocalDependency` state: NAMES the parking secondary.
+        let mut per_secondary_queued_after_local_dep: HashMap<String, usize> = HashMap::new();
 
         for (_, st) in state.tasks_iter() {
             match st {
@@ -183,6 +199,14 @@ impl StatsSnapshot {
                         .entry(secondary.clone())
                         .or_insert(0) += 1;
                     busy_worker_slots.insert((secondary.as_str(), *worker));
+                }
+                // A work task queued behind secondary `S`'s local import —
+                // tallied PER `S` so the observer reports which secondary is
+                // parking work behind its per-secondary import (#497).
+                TaskState::QueuedAfterLocalDependency { secondary, .. } => {
+                    *per_secondary_queued_after_local_dep
+                        .entry(secondary.clone())
+                        .or_insert(0) += 1;
                 }
                 TaskState::Pending { task, .. } => {
                     let deps_satisfied = task
@@ -231,6 +255,8 @@ impl StatsSnapshot {
             unfulfillable: counts.unfulfillable,
             invalid_task: counts.invalid_task,
             in_flight: counts.in_flight,
+            queued_after_local_dependency: counts.queued_after_local_dependency,
+            per_secondary_queued_after_local_dep,
             waiting_on_deps,
             blocked: counts.blocked,
             ready_in_queue,
@@ -266,6 +292,8 @@ fn task_of<I>(state: &TaskState<I>) -> &dynrunner_core::TaskInfo<I> {
         | TaskState::Blocked { task, .. }
         | TaskState::InvalidTask { task, .. }
         | TaskState::SkippedAlreadyDone { task, .. }
-        | TaskState::SetupCompleted { task, .. } => task,
+        | TaskState::SetupCompleted { task, .. }
+        | TaskState::AffineReady { task, .. }
+        | TaskState::QueuedAfterLocalDependency { task, .. } => task,
     }
 }

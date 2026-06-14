@@ -127,6 +127,75 @@ fn setup_completed_decodes_literal_sender_bytes() {
     }
 }
 
+/// `AffineReady` (#497) round-trips with its `hash` preserved — the
+/// SecondaryAffine ready-not-executed gate terminal carries only the hash
+/// (version-LESS / attempt-LESS, like `SetupCompleted`; the `TaskInfo` +
+/// `attempt` live on the ledger entry, not the wire).
+#[test]
+fn roundtrip_affine_ready() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::AffineReady {
+        hash: "h-gate".into(),
+    };
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+    match decoded {
+        ClusterMutation::AffineReady { hash } => assert_eq!(hash, "h-gate"),
+        _ => panic!("expected AffineReady"),
+    }
+}
+
+/// Wire-shape mirror (NOT symmetric-on-the-wrong-shape): decode the EXACT
+/// JSON bytes the primary's ready-resolution originator emits —
+/// `{"AffineReady":{"hash":"..."}}` (externally-tagged) — pinning the shape
+/// the other side must produce.
+#[test]
+fn affine_ready_decodes_literal_sender_bytes() {
+    let bytes = r#"{"AffineReady":{"hash":"h-from-primary"}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
+    match decoded {
+        ClusterMutation::AffineReady { hash } => assert_eq!(hash, "h-from-primary"),
+        _ => panic!("expected AffineReady"),
+    }
+}
+
+/// `QueuedAfterLocalDependencySet` (#497) round-trips with its `hash` +
+/// `secondary` preserved — the queued-behind-local-import transition the
+/// primary originates on the secondary's report (the `TaskInfo` / version /
+/// attempt are preserved from the source state on the ledger, not the wire).
+#[test]
+fn roundtrip_queued_after_local_dependency_set() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::QueuedAfterLocalDependencySet {
+        hash: "h-build".into(),
+        secondary: "sec-2".into(),
+    };
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+    match decoded {
+        ClusterMutation::QueuedAfterLocalDependencySet { hash, secondary } => {
+            assert_eq!(hash, "h-build");
+            assert_eq!(secondary, "sec-2");
+        }
+        _ => panic!("expected QueuedAfterLocalDependencySet"),
+    }
+}
+
+/// Wire-shape mirror: decode the EXACT JSON bytes the primary emits for the
+/// queued-set mutation — `{"QueuedAfterLocalDependencySet":{"hash":"...",
+/// "secondary":"..."}}` — pinning the field names + tag the other side
+/// must produce.
+#[test]
+fn queued_after_local_dependency_set_decodes_literal_sender_bytes() {
+    let bytes = r#"{"QueuedAfterLocalDependencySet":{"hash":"h-from-primary","secondary":"sec-9"}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
+    match decoded {
+        ClusterMutation::QueuedAfterLocalDependencySet { hash, secondary } => {
+            assert_eq!(hash, "h-from-primary");
+            assert_eq!(secondary, "sec-9");
+        }
+        _ => panic!("expected QueuedAfterLocalDependencySet"),
+    }
+}
+
 /// `PhaseEnded` round-trips through serde with its `phase` preserved
 /// (the replicated "on_phase_end edge completed" fact carries only the
 /// phase id — grow-only set semantics live in the apply rule, not on the

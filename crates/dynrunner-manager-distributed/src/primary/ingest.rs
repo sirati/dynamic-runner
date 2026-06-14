@@ -668,17 +668,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .filter_map(|(hash, state)| match state {
                 TaskState::Pending { task, .. }
                 | TaskState::InFlight { task, .. }
+                // A queued-behind-local-import task is not-yet-terminal work
+                // (an active assignment), so a #3b run-wide invalidation
+                // wipes it exactly like an `InFlight`/`Pending`/`Blocked`.
+                | TaskState::QueuedAfterLocalDependency { task, .. }
                 | TaskState::Blocked { task, .. } => Some((hash.clone(), task.clone())),
                 TaskState::Completed { .. }
                 | TaskState::Failed { .. }
                 | TaskState::Unfulfillable { .. }
                 | TaskState::InvalidTask { .. }
                 // Already terminal: a #3b run-wide invalidation must not
-                // overwrite a skip or a succeeded setup task (the apply
-                // rule's weakest-terminal lockout would NoOp it anyway;
-                // skipping it here keeps the broadcast minimal).
+                // overwrite a skip, a succeeded setup task, or a resolved
+                // SecondaryAffine gate (the apply rule's weakest-terminal
+                // lockout would NoOp it anyway; skipping it here keeps the
+                // broadcast minimal).
                 | TaskState::SkippedAlreadyDone { .. }
-                | TaskState::SetupCompleted { .. } => None,
+                | TaskState::SetupCompleted { .. }
+                | TaskState::AffineReady { .. } => None,
             })
             .collect();
         if targets.is_empty() {

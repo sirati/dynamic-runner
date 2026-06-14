@@ -112,10 +112,13 @@ where
         // discard the list here; the CRDT mirror is the only local
         // effect.
         let batch = apply_locally_for_broadcast(&mut self.cluster_state, mutations);
-        let crate::cluster_state::AppliedBatch {
-            applied,
-            resumed_for_dispatch: _,
-        } = batch;
+        // The secondary originator (the panik self-departure announcement)
+        // is never the authority, so neither the resumed-dispatch list nor
+        // the `became_pending` affine-ready surface has a local consumer —
+        // gate ready-resolution is the `PrimaryCoordinator`'s concern,
+        // driven on the authority's pool when it applies the same mutation.
+        // Discard both; the CRDT mirror is the only local effect.
+        let crate::cluster_state::AppliedBatch { applied, .. } = batch;
         if applied.is_empty() {
             return Ok(());
         }

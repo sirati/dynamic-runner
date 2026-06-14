@@ -406,6 +406,42 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         task.clone(),
                     ));
                 }
+                // A resolved SecondaryAffine gate (#497): a terminal that was
+                // NEVER dispatched (the primary does not execute the gate),
+                // so it is seeded like `SkippedAlreadyDone` — its task_id
+                // resolves dependents' `task_depends_on` in `extend()`, it
+                // enters `primary_completed` for the run-completion counter
+                // slot (the gate IS an accounted terminal, so the local
+                // counter must reach it or completion wedges — consistent
+                // with `OutcomeSummary::total_terminal` including
+                // `affine_ready`), and it is CRITICALLY NOT pushed into
+                // `items` (re-dispatching it is meaningless — the primary
+                // never runs a gate). NOT marked started (#343-style: a gate
+                // resolving is spawn-time evidence, not phase activation). The
+                // CRDT entry stays `AffineReady`. The OUTCOME-level success
+                // count reads the CRDT's `succeeded` (which excludes
+                // `affine_ready`), so this counter slot never inflates the
+                // operator success report.
+                TaskState::AffineReady { task, .. } => {
+                    phases_with_terminal.insert(task.phase_id.clone());
+                    primary_completed.insert(hash.clone());
+                    completed_task_ids.insert(task.task_id.clone());
+                }
+                // A work task queued behind a secondary's LOCAL SecondaryAffine
+                // import (#497). The per-secondary import progress is
+                // node-local on that secondary and NOT in the CRDT, so a
+                // promoted primary cannot resume it. Re-seed as live pool work
+                // (like `Blocked`/`Pending`): the new primary re-dispatches it,
+                // which re-triggers the affine-import gate on whichever
+                // secondary it lands on, and the freshly-minted `TaskAssigned`
+                // cleanly dominates the stale `QueuedAfterLocalDependency` in
+                // the join. (Mirrors the death-seam's requeue philosophy: a
+                // queued task whose holder's local state is unknown re-routes
+                // per #495 rather than wedging on an un-observable import.)
+                TaskState::QueuedAfterLocalDependency { task, .. } => {
+                    phases_with_live_work.insert(task.phase_id.clone());
+                    items.push(task.clone());
+                }
             }
         }
 
@@ -460,6 +496,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // re-dispatched).
                 SettledClass::SetupCompleted => {
                     started_phases.insert(entry.phase_id.clone());
+                    phases_with_terminal.insert(entry.phase_id.clone());
+                    primary_completed.insert(hash.clone());
+                    completed_task_ids.insert(entry.task_id.clone());
+                }
+                // AffineReady → terminal + completed mirror + dep seed,
+                // mirroring the fat `AffineReady` arm above (a resolved
+                // SecondaryAffine gate satisfies dependents and counts toward
+                // the run-completion total, but was NEVER dispatched so it
+                // does NOT mark the phase started — #343-style — and is never
+                // re-dispatched).
+                SettledClass::AffineReady => {
                     phases_with_terminal.insert(entry.phase_id.clone());
                     primary_completed.insert(hash.clone());
                     completed_task_ids.insert(entry.task_id.clone());

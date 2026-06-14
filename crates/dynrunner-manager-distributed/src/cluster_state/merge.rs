@@ -89,7 +89,17 @@ fn terminal_payload_hash<I>(state: &TaskState<I>) -> u64 {
         // holding the SetupCompleted for the same hash share this constant
         // and idempotent-NoOp.
         TaskState::SetupCompleted { .. } => setup_completed_payload_hash(),
-        TaskState::Pending { .. } | TaskState::InFlight { .. } | TaskState::Blocked { .. } => 0,
+        // Fixed discriminant tag; a SecondaryAffine gate carries no error
+        // payload (the terminal_rank already separates it) — two replicas
+        // holding the AffineReady for the same hash share this constant and
+        // idempotent-NoOp.
+        TaskState::AffineReady { .. } => affine_ready_payload_hash(),
+        // Non-terminals (incl. the non-terminal `QueuedAfterLocalDependency`)
+        // carry no terminal payload hash.
+        TaskState::Pending { .. }
+        | TaskState::InFlight { .. }
+        | TaskState::QueuedAfterLocalDependency { .. }
+        | TaskState::Blocked { .. } => 0,
     }
 }
 
@@ -116,6 +126,9 @@ fn skipped_payload_hash() -> u64 {
 }
 fn setup_completed_payload_hash() -> u64 {
     hash_one(5u8)
+}
+fn affine_ready_payload_hash() -> u64 {
+    hash_one(6u8)
 }
 
 /// Build the ONE canonical convergence key for a task state (§2.2). The
@@ -154,6 +167,10 @@ pub(super) fn task_join_key<I>(state: &TaskState<I>) -> TaskJoinKey {
         } => key_invalid_task(*attempt, *version, terminal_payload_hash(state)),
         TaskState::SkippedAlreadyDone { attempt, .. } => key_skipped(*attempt),
         TaskState::SetupCompleted { attempt, .. } => key_setup_completed(*attempt),
+        TaskState::AffineReady { attempt, .. } => key_affine_ready(*attempt),
+        TaskState::QueuedAfterLocalDependency {
+            version, attempt, ..
+        } => key_queued_after_local_dependency(*attempt, *version),
     }
 }
 
@@ -278,6 +295,44 @@ pub(super) fn key_setup_completed(attempt: u32) -> TaskJoinKey {
         nonterminal_rank: NonTerminalRank::Pending,
         failedlike: FailedLikeRank::Failed,
         payload_content_hash: setup_completed_payload_hash(),
+    }
+}
+
+pub(super) fn key_affine_ready(attempt: u32) -> TaskJoinKey {
+    TaskJoinKey {
+        attempt,
+        band: JoinBand::Terminal,
+        // A non-competing success-like terminal: a SecondaryAffine gate's
+        // hash is only ever originated terminal by the primary's ready-
+        // resolution hook (it is NEVER worker-dispatched and never
+        // re-failed), so no real worker outcome competes for the same hash.
+        // It carries no version; the terminal rank places it just above
+        // `SetupCompleted` purely for a total order.
+        terminal_rank: TerminalRank::AffineReady,
+        version: TaskVersion::default(),
+        nonterminal_rank: NonTerminalRank::Pending,
+        failedlike: FailedLikeRank::Failed,
+        payload_content_hash: affine_ready_payload_hash(),
+    }
+}
+
+pub(super) fn key_queued_after_local_dependency(
+    attempt: u32,
+    version: TaskVersion,
+) -> TaskJoinKey {
+    TaskJoinKey {
+        attempt,
+        band: JoinBand::NonTerminal,
+        terminal_rank: TerminalRank::SkippedAlreadyDone,
+        version,
+        // The non-terminal sub-rank between `Pending` and `InFlight`: a
+        // queued task is more committed than a bare Pending but less than a
+        // running InFlight, so the release `TaskAssigned` (minting a
+        // strictly-higher version) dominates it and a stale redelivery never
+        // resurrects an InFlight over it.
+        nonterminal_rank: NonTerminalRank::QueuedAfterLocalDependency,
+        failedlike: FailedLikeRank::Failed,
+        payload_content_hash: 0,
     }
 }
 
