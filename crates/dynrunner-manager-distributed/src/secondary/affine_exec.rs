@@ -52,7 +52,6 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use super::wire::timestamp_now;
 use super::{AffineGateOutcome, PendingAffineDependent, SecondaryCoordinator};
 use crate::affine_action::{IMPORT_OUTER_RETRIES, ImportActionHandle, ImportError};
-use crate::cluster_state::TaskState;
 
 /// Completion event delivered back to the secondary's operational `select!`
 /// loop when an OFF-LOOP affine import finishes (#497 P5).
@@ -447,14 +446,24 @@ where
     /// dispatch path runs unchanged.
     ///
     /// Resolution mirrors the primary-side gate detector
-    /// ([`crate::cluster_state::ClusterState::task_hash_for_dep`] →
-    /// `task_state`): each `TaskDep` `(phase_id, task_id)` resolves to the
-    /// dep's content hash, then the dep's LIVE `TaskState` must be
-    /// `AffineReady` (the resolved gate) whose underlying task is
-    /// `kind.is_secondary_affine()`. A dep that is not a SecondaryAffine gate,
-    /// not yet `AffineReady`, or already locally imported is skipped. Keyed on
-    /// the NODE-LOCAL `affine_done` set, so EVERY worker on this node gates on
-    /// the SAME single import (the run-once latch lives in `affine_running`).
+    /// ([`crate::cluster_state::ClusterState::task_hash_for_dep`]): each
+    /// `TaskDep` `(phase_id, task_id)` resolves to the dep's content hash,
+    /// then the dep must be a RESOLVED SecondaryAffine import gate per
+    /// [`crate::cluster_state::ClusterState::is_affine_ready_gate`]. A dep that is not a
+    /// SecondaryAffine gate, not yet `AffineReady`, or already locally
+    /// imported is skipped. Keyed on the NODE-LOCAL `affine_done` set, so
+    /// EVERY worker on this node gates on the SAME single import (the
+    /// run-once latch lives in `affine_running`).
+    ///
+    /// Gate DETECTION is over the FULL logical ledger (fat OR the slim
+    /// settled index), NOT the live-only `task_state` read it superseded:
+    /// `AffineReady` is the gate's join fixed-point and is SETTLE-ELIGIBLE,
+    /// so once it spills, `task_state` returns `None` and the live-only
+    /// check went blind — a build dispatched onto a not-yet-imported node
+    /// AFTER the spill would SKIP the import and fail (#497 P5 hole). The
+    /// settled index keeps the `SettledClass::AffineReady` fact (no disk
+    /// read), so the gate stays visible through the spill and the late-join
+    /// snapshot restore alike.
     ///
     /// Read-only over the replicated `cluster_state` + the node-local
     /// `affine_done`; returns an OWNED hash so the `cluster_state` borrow ends
@@ -467,15 +476,13 @@ where
             let dep_hash = self
                 .cluster_state
                 .task_hash_for_dep(&dep.phase_id, dep.task_id.as_str())?;
-            // The LIVE state must be the resolved gate `AffineReady` AND its
-            // task a SecondaryAffine gate. A SecondaryAffine task only ever
-            // sits Blocked / Pending (not yet ready — `B` would not have been
-            // dispatched) or AffineReady (ready), so this isolates exactly the
+            // The dep must be the resolved SecondaryAffine gate `AffineReady`,
+            // answered over fat OR settled state so a spilled gate stays
+            // visible. A SecondaryAffine task only ever sits Blocked / Pending
+            // (not yet ready — `B` would not have been dispatched) or
+            // AffineReady (ready), so this isolates exactly the
             // ready-but-not-locally-imported gate.
-            let is_ready_affine_gate = matches!(
-                self.cluster_state.task_state(dep_hash),
-                Some(TaskState::AffineReady { task, .. }) if task.kind.is_secondary_affine()
-            );
+            let is_ready_affine_gate = self.cluster_state.is_affine_ready_gate(dep_hash);
             // `affine_done` lives on `OperationalState`; this read is only
             // reached on the operational dispatch path, so a `None` here (not
             // yet Operational) correctly reads as "not locally imported".

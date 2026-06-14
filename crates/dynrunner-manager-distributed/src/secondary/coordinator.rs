@@ -1111,6 +1111,26 @@ where
         self.lifecycle = lifecycle;
     }
 
+    /// Test seam: synchronously spill EVERY settle-eligible ledger entry of
+    /// this coordinator's `cluster_state` to a per-test `spill_path`,
+    /// returning the entries evicted. The affine-gate spill-hole tests need
+    /// the spilled state to live INSIDE the coordinator's `cluster_state`
+    /// (so `unmet_local_affine_dep` reads it); the spill goes to the
+    /// caller-owned unique path — NOT the role-shared file the production
+    /// driver attached at construction — so it is isolated from every other
+    /// secondary the parallel test run constructs. `spill_path` (and its
+    /// parent dir) must outlive every later settled read of these entries.
+    #[cfg(test)]
+    pub(in crate::secondary) fn force_settled_spill_for_test(
+        &mut self,
+        spill_path: &std::path::Path,
+    ) -> usize {
+        // Drop the production driver's writer (bound to the process-shared
+        // `settled_CRDT.secondary.cbor`) and re-spill over the isolated path.
+        self.cluster_state.detach_spill_writer_for_test();
+        self.cluster_state.test_spill_all(spill_path)
+    }
+
     /// Test seam mirroring
     /// `LocalManager::install_worker_subcgroup_for_test`: inject a
     /// `SubcgroupHandle` onto an existing worker slot so the

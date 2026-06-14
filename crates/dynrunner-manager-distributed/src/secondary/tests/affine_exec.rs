@@ -1069,3 +1069,181 @@ async fn all_workers_on_node_gate_on_one_import() {
         })
         .await;
 }
+
+/// HEADLINE (#497 P5 spill hole): a gate that RESOLVED to `AffineReady` and
+/// then SPILLED to disk stays a detected unmet local affine dep. The live
+/// `task_state(hash)` returns `None` after the spill (the fat body is evicted),
+/// so the prior live-only check went BLIND and a build dispatched onto a
+/// not-yet-imported node AFTER the spill would SKIP the import and fail. The
+/// settled index keeps the `SettledClass::AffineReady` fact, so
+/// `unmet_local_affine_dep` STILL returns `Some(hash)` and the import is gated.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_gate_detected_after_spill() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            let mut factory = FakeWorkerFactory;
+            let pool = sec.initialize_workers(&mut factory).await.unwrap();
+            sec.enter_operational_for_test();
+            *sec.pool_mut() = pool;
+
+            let gate_hash = "import-monolith";
+            seed_affine_ready_gate(&mut sec, gate_hash, "import");
+
+            // SPILL the gate: the AffineReady join fixed-point is settle-
+            // eligible, so a full spill sweep evicts its fat body and leaves
+            // only the slim settled index entry. `task_state` now goes blind.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let evicted = sec.force_settled_spill_for_test(&dir.path().join("spill.cbor"));
+            assert_eq!(evicted, 1, "the AffineReady gate spills + evicts its fat body");
+            assert!(
+                sec.cluster_state.task_state(gate_hash).is_none(),
+                "post-spill the fat body is gone — the live-only check would go blind"
+            );
+            assert!(
+                sec.cluster_state.settled_contains(gate_hash),
+                "the settled index retains the gate (the durable detection source)"
+            );
+
+            // The detector STILL sees the gate via the settled index.
+            let b = make_work_with_affine_dep("B", "import");
+            assert_eq!(
+                sec.unmet_local_affine_dep(&b).as_deref(),
+                Some(gate_hash),
+                "a spilled AffineReady gate is STILL detected as an unmet local \
+                 affine dep (the #497 P5 spill hole is closed)"
+            );
+
+            // End-to-end: the build is GATED (queued behind the import), NOT
+            // skipped to a worker — the import drives exactly as the non-spill
+            // path.
+            let (stub, _gate) = StubImporter::blocking(Ok(()));
+            sec.set_import_action(stub.clone());
+            let b_hash = "work-b-hash";
+            sec.handle_inbound(
+                task_assignment("setup", "sec-2", 0, &b, b_hash),
+                &mut FakeWorkerFactory,
+            )
+            .await;
+            sec.drain_egress().await;
+
+            assert!(
+                !sec.op_mut().active_tasks.contains_key(b_hash),
+                "a build gated on a SPILLED affine import must NOT skip to a worker"
+            );
+            assert_eq!(
+                queued_work_hashes(&log, gate_hash),
+                vec![b_hash.to_string()],
+                "the build is reported QueuedAfterLocalDependency behind the spilled gate"
+            );
+            assert_eq!(
+                sec.op_mut().affine_running.get(gate_hash).map(Vec::len),
+                Some(1),
+                "the single per-secondary import is driven behind the spilled gate"
+            );
+        })
+        .await;
+}
+
+/// A LATE JOINER learns the gate via the snapshot STREAM, not a live
+/// `AffineReady` mutation: a node that joins after the gate already spilled on
+/// the responder receives it through the settled-restore path (the responder
+/// reads the settled record back into a fat `AffineReady` in the stream
+/// package). The joiner's `unmet_local_affine_dep` detects it — and continues
+/// to detect it after the joiner ITSELF spills the gate (exercising the
+/// settled arm on the joining node).
+#[tokio::test(flavor = "current_thread")]
+async fn affine_gate_detected_after_settled_restore() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // DONOR: seed the gate to AffineReady, then spill it so it lives in
+            // the donor's settled index (the responder serves it from disk).
+            let (mut donor, _dlog) = make_secondary_recording(one_worker_config("donor"), 1);
+            let gate_hash = "import-monolith";
+            seed_affine_ready_gate(&mut donor, gate_hash, "import");
+            let donor_dir = tempfile::tempdir().expect("donor tempdir");
+            let evicted = donor.force_settled_spill_for_test(&donor_dir.path().join("spill.cbor"));
+            assert_eq!(evicted, 1, "the donor spills its AffineReady gate");
+
+            // Materialise the snapshot-stream frames NOW — the settled gate is
+            // read from the donor's spill file at frame-build time and baked
+            // into the encoded payloads, BEFORE a second coordinator's driver
+            // truncates the role-shared spill file at its own construction.
+            let frames =
+                crate::snapshot_stream::stream_frames_for_test(&donor.cluster_state, "donor", "s1");
+
+            // JOINER: bootstrap from the donor via the production snapshot-
+            // stream package sequence (the settled gate rides as a fat
+            // `AffineReady` decoded from the donor's spill file).
+            let (mut joiner, jlog) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            joiner.set_bootstrap_primary_id("setup".to_string());
+            let mut factory = FakeWorkerFactory;
+            let pool = joiner.initialize_workers(&mut factory).await.unwrap();
+            joiner.enter_operational_for_test();
+            *joiner.pool_mut() = pool;
+            for frame in frames {
+                if let DistributedMessage::SnapshotStreamPackage { payload, .. } = frame {
+                    let snap =
+                        crate::cluster_state::decode_stream_payload::<TestId>(&payload)
+                            .expect("decode package");
+                    joiner.cluster_state.restore(snap);
+                }
+            }
+            assert!(
+                joiner.cluster_state.contains_task(gate_hash),
+                "the joiner learned the gate via the settled-restore stream path"
+            );
+
+            // The joiner detects the gate it learned ONLY from a settled
+            // restore (never a live AffineReady mutation on this node).
+            let b = make_work_with_affine_dep("B", "import");
+            assert_eq!(
+                joiner.unmet_local_affine_dep(&b).as_deref(),
+                Some(gate_hash),
+                "a gate learned via settled-restore is detected as an unmet \
+                 local affine dep on the late joiner"
+            );
+
+            // It stays detected after the JOINER itself spills the gate (the
+            // settled arm on the joining node).
+            let joiner_dir = tempfile::tempdir().expect("joiner tempdir");
+            let n = joiner.force_settled_spill_for_test(&joiner_dir.path().join("spill.cbor"));
+            assert_eq!(n, 1, "the joiner re-spills the restored gate");
+            assert!(
+                joiner.cluster_state.task_state(gate_hash).is_none(),
+                "post re-spill the joiner's fat body is gone"
+            );
+            assert_eq!(
+                joiner.unmet_local_affine_dep(&b).as_deref(),
+                Some(gate_hash),
+                "the gate stays detected after the joiner re-spills it"
+            );
+
+            // End-to-end on the joiner: the build is gated, not skipped.
+            let (stub, _gate) = StubImporter::blocking(Ok(()));
+            joiner.set_import_action(stub.clone());
+            let b_hash = "work-b-hash";
+            joiner
+                .handle_inbound(
+                    task_assignment("setup", "sec-2", 0, &b, b_hash),
+                    &mut FakeWorkerFactory,
+                )
+                .await;
+            joiner.drain_egress().await;
+            assert!(
+                !joiner.op_mut().active_tasks.contains_key(b_hash),
+                "a build gated on a settled-restored gate must NOT skip to a worker"
+            );
+            assert_eq!(
+                queued_work_hashes(&jlog, gate_hash),
+                vec![b_hash.to_string()],
+                "the build is queued behind the settled-restored gate's import"
+            );
+        })
+        .await;
+}

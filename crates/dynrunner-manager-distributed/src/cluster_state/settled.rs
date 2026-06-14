@@ -772,6 +772,22 @@ impl<I: Identifier> ClusterState<I> {
         self.tasks.get(hash)
     }
 
+    /// Test-only: drop any attached spill writer by replacing the settled
+    /// store with a fresh EMPTY (writer-less) one. Only legal while NO entry
+    /// has settled (asserted) — its sole use is to clear the writer a
+    /// coordinator's production spill driver attached at construction (to a
+    /// process-shared, role-named file) so a test can re-attach its OWN
+    /// per-test writer over a unique path via [`Self::test_spill_all`],
+    /// isolated from every other coordinator the parallel test run builds.
+    #[cfg(test)]
+    pub(crate) fn detach_spill_writer_for_test(&mut self) {
+        debug_assert!(
+            self.settled.is_empty(),
+            "detach_spill_writer_for_test before any entry has settled"
+        );
+        self.settled = SettledStore::empty();
+    }
+
     /// Test-only: attach a writer segment over a freshly-truncated spill
     /// file at `path` (the same shape the production driver opens), then
     /// synchronously run ONE full collect → blocking write+flush →

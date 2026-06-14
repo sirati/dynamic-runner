@@ -64,6 +64,32 @@ impl<I> TaskView<'_, I> {
             TaskView::Settled(entry) => entry.attempt(),
         }
     }
+
+    /// Whether this entry is a RESOLVED SecondaryAffine import gate
+    /// (`AffineReady`) — the #497 P5 per-secondary-import gate detector,
+    /// answered identically whether the gate is still FAT or has SPILLED.
+    ///
+    /// `AffineReady` is the join fixed-point a SecondaryAffine gate reaches
+    /// and is therefore SETTLE-ELIGIBLE: once it spills, its fat
+    /// `TaskState::AffineReady` is evicted and only the slim
+    /// `SettledClass::AffineReady` index entry remains. Both arms answer the
+    /// SAME question without a disk read, so a build's gate detection
+    /// survives the spill (the live-`task_state`-only check went blind).
+    ///
+    /// The `Live` arm still confirms `kind.is_secondary_affine()`; the
+    /// `Settled` arm needs no kind check because `SettledClass::AffineReady`
+    /// is produced ONLY from `TaskState::AffineReady`, which a SecondaryAffine
+    /// gate is the only task that ever reaches — the class IS the
+    /// "AffineReady SecondaryAffine gate" fact.
+    pub(crate) fn is_affine_ready_gate(&self) -> bool {
+        match self {
+            TaskView::Live(TaskState::AffineReady { task, .. }) => {
+                task.kind.is_secondary_affine()
+            }
+            TaskView::Live(_) => false,
+            TaskView::Settled(entry) => matches!(entry.class, SettledClass::AffineReady),
+        }
+    }
 }
 
 impl<I: Identifier> ClusterState<I> {
@@ -90,6 +116,18 @@ impl<I: Identifier> ClusterState<I> {
             return Some(TaskView::Live(state));
         }
         self.settled_entry(hash).map(TaskView::Settled)
+    }
+
+    /// Whether `hash` is a RESOLVED SecondaryAffine import gate
+    /// (`AffineReady`) — the #497 P5 spill-safe gate detector the
+    /// secondary's `unmet_local_affine_dep` keys on. Answered over the
+    /// FULL logical ledger (fat OR settled index, no disk read), so a gate
+    /// that SPILLED after resolving — where `task_state` returns `None`
+    /// and went blind — is STILL detected via its `SettledClass::AffineReady`
+    /// index entry. A hash the ledger does not know is `false`.
+    pub(crate) fn is_affine_ready_gate(&self, hash: &str) -> bool {
+        self.task_view(hash)
+            .is_some_and(|view| view.is_affine_ready_gate())
     }
 
     /// Iterator over `(&hash, &TaskState)` for every FAT (in-memory)
