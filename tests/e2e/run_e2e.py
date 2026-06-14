@@ -64,6 +64,7 @@ from pathlib import Path
 # would just reintroduce a meta-import that has the same problem.
 if __package__:
     from ._cluster import bring_cluster_down, bring_cluster_up, is_cluster_running
+    from ._dev_bins import ensure_slurm_bin_sources
     from ._dispatch_runner import run_plan
     from ._heartbeat import (
         HEARTBEAT_PERIOD_S,
@@ -79,6 +80,7 @@ else:
         bring_cluster_up,
         is_cluster_running,
     )
+    from tests.e2e._dev_bins import ensure_slurm_bin_sources  # noqa: E402
     from tests.e2e._dispatch_runner import run_plan  # noqa: E402
     from tests.e2e._heartbeat import (  # noqa: E402
         HEARTBEAT_PERIOD_S,
@@ -988,15 +990,34 @@ def main() -> int:
                 print(f"[run_e2e] cluster bring-up failed: {e}", flush=True)
                 return 1
 
+        # Dev-convenience: editable / ``maturin develop`` installs do
+        # not bundle the musl-static slurm-shutdown/-wrapper binaries
+        # the SLURM dispatch path uploads (only the nix wheel does), so
+        # ``nix build`` the sibling packages and export the
+        # ``DYNRUNNER_SLURM_{SHUTDOWN,WRAPPER}_BIN_SOURCE`` overrides
+        # when the operator has not already set them.
+        ensure_slurm_bin_sources(REPO_ROOT)
+
         # Per-cluster SSH state: keypair under tests/e2e/state/<id>/keys/,
         # provisioned dispatcher user (idempotent), generated ssh_config
-        # pinning the slurm-test-env contract options.
-        from ._ssh_state import (
-            ensure_dispatcher_keypair,
-            generate_ssh_config,
-            provision_dispatcher_user,
-            state_dir_for_instance,
-        )
+        # pinning the slurm-test-env contract options. Lazy because it is
+        # only reached in slurm mode; the script-vs-module branch mirrors
+        # the top-of-file import dance (relative imports raise ImportError
+        # when ``__package__`` is empty under ``python run_e2e.py``).
+        if __package__:
+            from ._ssh_state import (
+                ensure_dispatcher_keypair,
+                generate_ssh_config,
+                provision_dispatcher_user,
+                state_dir_for_instance,
+            )
+        else:
+            from tests.e2e._ssh_state import (  # noqa: E402
+                ensure_dispatcher_keypair,
+                generate_ssh_config,
+                provision_dispatcher_user,
+                state_dir_for_instance,
+            )
         state_root = Path(__file__).resolve().parent / "state"
         instance_state_dir = state_dir_for_instance(state_root, args.instance_id)
         priv, pub = ensure_dispatcher_keypair(instance_state_dir)
