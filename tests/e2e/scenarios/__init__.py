@@ -44,6 +44,8 @@ _SCENARIO_NAMES: tuple[str, ...] = (
     "escape-hatch-external-master",
     "source-already-staged",
     "stage-via-setup-tasks",
+    "secondary-affine",
+    "secondary-affine-withdep",
 )
 
 

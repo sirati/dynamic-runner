@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import socket
 from pathlib import Path
 
 from dynamic_runner.worker import (
@@ -39,6 +40,12 @@ from dynamic_runner.worker.publish import (
     DEFAULT_SRC_ROOT,
     ENV_DST_ROOT,
     ENV_SRC_ROOT,
+)
+
+from .task import (
+    AFFINE_BUILD_MARKER,
+    build_output_filename,
+    setup_output_filename,
 )
 
 
@@ -247,6 +254,64 @@ def _assert_predecessor_nonce(task: Task, idx: int) -> None:
         )
 
 
+def _setup(task: Task) -> WorkerOutput:
+    """The no-op upload stand-in (#497 affine topology): just publish a
+    canonical output so the build phase's cross-phase barrier and the
+    with-dep affine gate's AffineReady-on-completion transition fire on a
+    real terminal."""
+    _maybe_sleep()
+    staging = _staging_root()
+    staging.mkdir(parents=True, exist_ok=True)
+    out_path = staging / setup_output_filename()
+    out_path.write_bytes(b"affine-upload-stand-in\n")
+    _logger.info("affine setup: published %s", out_path)
+    _publish(out_path)
+    return WorkerOutput()
+
+
+def _build(task: Task) -> WorkerOutput:
+    """A SecondaryAffine-gated build (#497).
+
+    Records this build's NODE identity to the shared build marker so the
+    e2e driver can correlate distinct BUILDING secondaries (and
+    per-secondary build counts) against the import marker — then publishes
+    its canonical output so the driver can assert ALL k builds completed
+    (none stranded/deadlocked behind the gate).
+
+    By the run-once invariant this build only runs AFTER this node's single
+    import_action has completed; the marker line is therefore proof that a
+    build landed on a node that already imported exactly once.
+    """
+    _maybe_sleep()
+    payload = task.payload or {}
+    build_id = payload.get("build_id")
+    gate = payload.get("gate")
+    if build_id is None:
+        raise NonRecoverableError(
+            f"build task has no 'build_id' in payload: {payload!r}"
+        )
+    node = socket.gethostname()
+    dst_root = _destination_root()
+    dst_root.mkdir(parents=True, exist_ok=True)
+    marker = dst_root / AFFINE_BUILD_MARKER
+    with marker.open("a", encoding="utf-8") as fh:
+        fh.write(f"{node}\t{build_id}\t{gate}\n")
+
+    staging = _staging_root()
+    staging.mkdir(parents=True, exist_ok=True)
+    out_path = staging / build_output_filename(build_id)
+    out_path.write_bytes(f"build:{build_id}:node={node}\n".encode())
+    _logger.info(
+        "affine build %s ran on node=%s (gate=%s), publishing %s",
+        build_id,
+        node,
+        gate,
+        out_path,
+    )
+    _publish(out_path)
+    return WorkerOutput()
+
+
 @task_function
 def handle(task: Task) -> WorkerOutput:
     """Dispatch on ``task.payload['kind']``.
@@ -268,6 +333,10 @@ def handle(task: Task) -> WorkerOutput:
         return _produce(task, source_dir)
     if kind == "consume":
         return _consume(task, source_dir)
+    if kind == "setup":
+        return _setup(task)
+    if kind == "build":
+        return _build(task)
     raise NonRecoverableError(f"unknown task kind: {kind!r}")
 
 
@@ -320,6 +389,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # tolerates it. The actual per-task branch reads
     # ``task.payload['keyed_outputs']`` set on the dispatcher side.
     parser.add_argument("--keyed-outputs", action="store_true")
+    # Accept-and-ignore: SyntheticTask.build_worker_command_args forwards
+    # --secondary-affine (+ its variant) so the worker argparser tolerates
+    # them. The worker branches on payload["kind"] (setup/build), not these.
+    parser.add_argument("--secondary-affine", action="store_true")
+    parser.add_argument("--secondary-affine-variant", default="both")
     return parser
 
 
