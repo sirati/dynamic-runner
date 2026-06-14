@@ -945,6 +945,186 @@ async fn replacement_join_clears_bookkeeping_and_later_readmission_revokes_nothi
         .await;
 }
 
+/// #467: a removed member's respawn replacement has already SEATED
+/// (operational, a live member) by the time the original re-admits, so
+/// BOTH hold a SLURM job to run-end — the account-quota double-occupancy
+/// #399 does NOT heal (its revoke path only covers a queued / not-yet-
+/// joined replacement). The re-admission seam must mark the SEATED
+/// replacement for graceful wind-down, and that wind-down's deliberate
+/// self-departure must NOT spawn yet another replacement (else the fix
+/// self-defeats / loops).
+///
+/// Revert-confirm: without `schedule_seated_replacement_winddown` no
+/// `WindDownRequested` is recorded — the replacement stays seated to
+/// run-end (the second assertion below fails). Without the
+/// `SelfDeparture` respawn-admission guard the replacement's departure
+/// re-spawns (the third assertion's respawn_events bump / respawn_tasks
+/// non-empty fires).
+#[tokio::test(flavor = "current_thread")]
+async fn seated_replacement_winds_down_on_readmission_and_its_departure_does_not_respawn() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use dynrunner_protocol_primary_secondary::{
+                ClusterMutation, DistributedMessage, KeepaliveRole,
+            };
+
+            let (mut coordinator, _mesh) = make_coordinator();
+            let spawner = Arc::new(MockSpawner::new());
+            let calls = Arc::clone(&spawner.calls);
+            coordinator.enable_respawn(
+                spawner.clone(),
+                permissive_budget(),
+                "tcp://127.0.0.1:5555".into(),
+                "-----BEGIN PUBLIC KEY-----\nFAKE\n".into(),
+            );
+
+            // ── Stage 1: the original joins, is (falsely) removed, and a
+            // replacement is spawned + SEATS (becomes a live member). ──
+            coordinator.cluster_state.apply(ClusterMutation::PeerJoined {
+                peer_id: "sec-x".into(),
+                is_observer: false,
+                can_be_primary: true,
+                cap_version: Default::default(),
+                member_gen: 0,
+            });
+            coordinator
+                .cluster_state
+                .apply(ClusterMutation::PeerRemoved {
+                    id: "sec-x".into(),
+                    cause: RemovalCause::KeepaliveMiss,
+                    member_gen: 0,
+                });
+            coordinator.dispatch_respawn_lifecycle(PeerLifecycleEvent::Removed {
+                id: "sec-x".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            });
+            let outcome = coordinator
+                .respawn_tasks
+                .join_next()
+                .await
+                .expect("the death must spawn a replacement")
+                .expect("no panic");
+            let replacement = outcome.new_id.clone();
+            assert_eq!(replacement, "secondary-1");
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "one replacement spawned");
+            assert_eq!(coordinator.cluster_state.respawn_events().len(), 1);
+
+            // The replacement SEATS: its PeerJoined applies (live member)
+            // and the forwarded `Added` clears the node-local pending
+            // bookkeeping — the exact post-seat state in which #399 holds
+            // nothing for it any more.
+            coordinator.cluster_state.apply(ClusterMutation::PeerJoined {
+                peer_id: replacement.clone(),
+                is_observer: false,
+                can_be_primary: true,
+                cap_version: Default::default(),
+                member_gen: 0,
+            });
+            coordinator.dispatch_respawn_lifecycle(PeerLifecycleEvent::Added {
+                id: replacement.clone(),
+                is_observer: false,
+            });
+            assert!(
+                coordinator.pending_replacements.is_empty(),
+                "the seated replacement is no longer tracked as pending",
+            );
+            assert!(
+                coordinator.cluster_state.is_peer_alive(&replacement),
+                "the replacement is a live (seated) member",
+            );
+
+            // ── Stage 2: the ORIGINAL re-admits via the real frame-ingest
+            // seam (an authenticated keepalive from the removed-but-alive
+            // member). This is the production entry path — it bumps the
+            // original's membership generation AND must now schedule the
+            // seated replacement's wind-down. ──
+            let readmit_frame: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+                target: None,
+                sender_id: "sec-x".into(),
+                timestamp: 1.0,
+                secondary_id: "sec-x".into(),
+                active_workers: 0,
+                emitter_role: KeepaliveRole::Secondary,
+            };
+            coordinator.maybe_readmit_sender(&readmit_frame).await;
+
+            // (a) The re-admitted original is alive again and continues.
+            assert!(
+                coordinator.cluster_state.is_peer_alive("sec-x"),
+                "the re-admitted original is a live member again",
+            );
+            // (b) THE LOAD-BEARING POSITIVE: the seated replacement is
+            // marked for wind-down at its CURRENT incarnation generation.
+            let replacement_gen = coordinator.cluster_state.peer_member_gen(&replacement);
+            assert!(
+                coordinator
+                    .cluster_state
+                    .wind_down_requested(&replacement, replacement_gen),
+                "the seated replacement must be scheduled to wind down once \
+                 its original re-admits (the #467 double-occupancy heal)",
+            );
+            // The re-admitted original must NOT be wound down — it is the
+            // process that was wrongly removed; only the replacement stands
+            // down.
+            let original_gen = coordinator.cluster_state.peer_member_gen("sec-x");
+            assert!(
+                !coordinator
+                    .cluster_state
+                    .wind_down_requested("sec-x", original_gen),
+                "the re-admitted original must never be wound down",
+            );
+
+            // ── Stage 3: THE LOAD-BEARING NEGATIVE (owner-pinned). The
+            // replacement, at its next quiescence, gracefully departs via a
+            // self-authored `PeerRemoved { SelfDeparture }`. That departure
+            // must NOT spawn yet another replacement — drive the resulting
+            // lifecycle `Removed` through the SAME dispatch path the
+            // operational loop uses and assert zero new respawn. ──
+            let respawn_events_before = coordinator.cluster_state.respawn_events().len();
+            let calls_before = calls.load(Ordering::SeqCst);
+            coordinator
+                .cluster_state
+                .apply(ClusterMutation::PeerRemoved {
+                    id: replacement.clone(),
+                    cause: RemovalCause::SelfDeparture(
+                        dynrunner_core::BoundedString::from(
+                            "graceful abort: local work drained".to_string(),
+                        ),
+                    ),
+                    member_gen: replacement_gen,
+                });
+            coordinator.dispatch_respawn_lifecycle(PeerLifecycleEvent::Removed {
+                id: replacement.clone(),
+                cause: RemovalCause::SelfDeparture(dynrunner_core::BoundedString::from(
+                    "graceful abort: local work drained".to_string(),
+                )),
+            });
+            // Let any (erroneously) spawned future settle before asserting.
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                coordinator.respawn_tasks.is_empty(),
+                "a deliberate self-departure (the wound-down replacement) \
+                 must NOT spawn a replacement",
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                calls_before,
+                "the spawner must not be invoked for the wound-down \
+                 replacement's self-departure",
+            );
+            assert_eq!(
+                coordinator.cluster_state.respawn_events().len(),
+                respawn_events_before,
+                "the self-departure must not record a new respawn event \
+                 (no budget consumed) — closing the wind-down→respawn loop",
+            );
+        })
+        .await;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Remote-execution backend (the relocated/promoted-primary topology):
 // the respawn DECISION runs on a primary with NO local provider; the

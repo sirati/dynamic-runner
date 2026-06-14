@@ -1025,6 +1025,41 @@ where
                 break;
             }
 
+            // Per-peer wind-down drain exit (#467): the primary marked THIS
+            // exact secondary incarnation for graceful wind-down (its
+            // re-admitted original re-seated while this respawn replacement
+            // was already operational → double-occupancy of SLURM jobs), so
+            // — once its last running task has drained — it tears down NOW,
+            // mid-run, with the SAME deliberate self-departure path the
+            // global graceful-abort drain uses (so it never trips the
+            // failover/respawn machinery: a `SelfDeparture` is suppressed by
+            // the respawn-admission gate, closing the wind-down→respawn
+            // loop). The directive is read against this node's OWN id and
+            // its CURRENT membership generation, so a stale directive minted
+            // for a prior incarnation never matches. Same quiescence
+            // predicate (`no_active_tasks`) and same recognized-primary-node
+            // exclusion as the graceful-abort drain above (defensive: a
+            // wound-down replacement is never the recognized primary's node,
+            // but the guard keeps the two drain gates uniform — a self-
+            // `PeerRemoved` must never bury a live primary's entry).
+            if no_active_tasks
+                && self.cluster_state.wind_down_requested(
+                    &self.config.secondary_id,
+                    self.cluster_state
+                        .peer_member_gen(&self.config.secondary_id),
+                )
+                && self.cluster_state.current_primary() != Some(self.config.secondary_id.as_str())
+            {
+                tracing::info!(
+                    secondary = %self.config.secondary_id,
+                    "wind-down requested by primary (#467 double-occupancy \
+                     heal); local work drained — announcing deliberate \
+                     departure and exiting cleanly (releasing the SLURM job)"
+                );
+                self.announce_graceful_drain_departure().await;
+                break;
+            }
+
             // Execute the DUE scheduled worker restarts — the slots
             // whose stored deadline has arrived. Sources: the
             // pool-event arm's disconnect handling (typical when a

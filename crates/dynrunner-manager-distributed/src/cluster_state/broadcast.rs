@@ -204,6 +204,12 @@ fn stamp_versions<I: Identifier>(
             // `GracefulAbortRequested` is version-LESS: a payload-free
             // sticky false→true latch (join = OR), like `RunComplete`.
             | ClusterMutation::GracefulAbortRequested
+            // `WindDownRequested` is version-LESS: a grow-only set-insert
+            // of `(secondary_id, member_gen)` (join = union). Incarnation
+            // arbitration rides the carried `member_gen`, not a stamped
+            // `cap_version` — same shape as the per-incarnation
+            // `PeerRemoved` below.
+            | ClusterMutation::WindDownRequested { .. }
             | ClusterMutation::DiscoveryDebtDeclared
             | ClusterMutation::DiscoverySettled
             | ClusterMutation::PeerRemoved { .. }

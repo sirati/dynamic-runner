@@ -90,6 +90,7 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
         run_complete: false,
         run_aborted: None,
         graceful_abort_requested: false,
+        wind_down_requested: HashSet::new(),
         discovery_debt: crate::cluster_state::DiscoveryDebt::Undeclared,
         phase_event_tallies: HashMap::new(),
         retry_passes_used: HashMap::new(),

@@ -101,6 +101,23 @@ pub struct ClusterState<I> {
     /// gate, the drain/relocate/terminal decisions) — the observer only
     /// derives its reported verdict from the same fact.
     pub(super) graceful_abort_requested: bool,
+    /// Set by `ClusterMutation::WindDownRequested`. The PER-PEER,
+    /// incarnation-scoped drain directive — the granular sibling of the
+    /// fleet-wide `graceful_abort_requested` bit. Each `(secondary_id,
+    /// member_gen)` pair names exactly one seated secondary incarnation
+    /// the primary marked to drain its current work and gracefully depart
+    /// at its next quiescence (the #467 re-admit-while-replacement-seated
+    /// case: the redundant replacement winds down so its SLURM job is
+    /// released, while the re-admitted original and the rest of the run
+    /// continue). Grow-only set (join = union), like the respawn-event
+    /// ledger; the carried `member_gen` is the arbiter so a stale
+    /// directive can never re-target a higher incarnation of the same id.
+    /// Replicated (live broadcast + snapshot + AE digest) so it survives a
+    /// primary failover and reaches the directed secondary on any mesh
+    /// hop. Consumed by a SECONDARY decision (its own graceful-drain exit
+    /// gate in `process_tasks`) — the matching `(id, gen)` is the
+    /// directed node's cue to self-depart once `active_tasks` is empty.
+    pub(super) wind_down_requested: HashSet<(String, u64)>,
     /// Replicated "this run still owes discovery" fact (V6). Declared by
     /// the mode-2 seed BEFORE relocation; settled exactly once by the
     /// compute-peer primary's discover-on-promotion driver after it has
@@ -513,6 +530,7 @@ where
             run_complete,
             run_aborted,
             graceful_abort_requested,
+            wind_down_requested,
             discovery_debt,
             role_table,
             // Deliberately not cloned — see field doc.
@@ -575,6 +593,8 @@ where
             run_aborted: run_aborted.clone(),
             // Replicated sticky latch — clone preserves it (like `run_complete`).
             graceful_abort_requested: *graceful_abort_requested,
+            // Replicated grow-only SET — clone preserves it (like `respawn_events`).
+            wind_down_requested: wind_down_requested.clone(),
             // Replicated CRDT data — clone preserves it (like `run_complete`).
             discovery_debt: *discovery_debt,
             role_table: role_table.clone(),
@@ -654,6 +674,7 @@ where
             run_complete,
             run_aborted,
             graceful_abort_requested,
+            wind_down_requested,
             discovery_debt,
             role_table,
             role_change_hooks,
@@ -690,6 +711,7 @@ where
             .field("run_complete", run_complete)
             .field("run_aborted", run_aborted)
             .field("graceful_abort_requested", graceful_abort_requested)
+            .field("wind_down_requested", wind_down_requested)
             .field("discovery_debt", discovery_debt)
             .field("role_table", role_table)
             .field("role_change_hooks", &role_change_hooks.len())
@@ -734,6 +756,7 @@ impl<I> Default for ClusterState<I> {
             run_complete: false,
             run_aborted: None,
             graceful_abort_requested: false,
+            wind_down_requested: HashSet::new(),
             discovery_debt: DiscoveryDebt::default(),
             role_table: RoleTable::default(),
             role_change_hooks: Vec::new(),

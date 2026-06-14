@@ -121,6 +121,77 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // capacity-growth reaction (idempotent wholesale rebuild from
         // the CRDT + the decoupled `TasksAdded` emit).
         self.react_to_capacity_growth();
+        // (4) #467 double-occupancy heal: if a respawn replacement for this
+        // original has ALREADY SEATED (it is a live member), the original's
+        // re-admission means BOTH now hold a SLURM job to run-end (the
+        // shared-account quota waste). #399 only cancels a QUEUED or
+        // not-yet-joined replacement (the `is_peer_alive` dispatch gate +
+        // the `reconcile_replacements_on_join` squatter revoke); a SEATED
+        // replacement is no longer in `pending_replacements`, so close the
+        // gap here by winding it down at its next quiescence.
+        self.schedule_seated_replacement_winddown(&sender).await;
+    }
+
+    /// #467: schedule the graceful wind-down of every SEATED respawn
+    /// replacement of `original` (the just-re-admitted member).
+    ///
+    /// The durable lookup is the REPLICATED respawn ledger
+    /// (`cluster_state.respawn_events()`, `new_id → {original_id, …}`),
+    /// NOT the node-local `pending_replacements` table — the latter is
+    /// CLEARED the moment a replacement seats (see
+    /// `reconcile_replacements_on_join` Case 1), so by the time the
+    /// original re-admits it holds nothing for a seated replacement. The
+    /// ledger entry persists for the run and survives failover, so it is
+    /// the correct "who replaced whom" source even after the seat.
+    ///
+    /// A replacement qualifies only when it is BOTH recorded as replacing
+    /// `original` AND currently a live member (`is_peer_alive`) — the
+    /// SEATED case #467 owns. A still-queued / not-yet-joined replacement
+    /// is left to #399's existing paths (it is not yet alive, so it is not
+    /// matched here, and there is no double-occupancy to heal until it
+    /// seats). For each qualifying replacement the primary originates a
+    /// per-incarnation `WindDownRequested { secondary_id, member_gen }`
+    /// over the canonical apply+broadcast path; the directed secondary
+    /// drains its in-flight work and gracefully departs at its next
+    /// quiescence (releasing its SLURM job). The replacement — never the
+    /// re-admitted original — is the one that stands down: the original is
+    /// the process that was wrongly removed, the replacement was spawned
+    /// only to cover a death that turned out false.
+    async fn schedule_seated_replacement_winddown(&mut self, original: &str) {
+        let seated: Vec<(String, u64)> = self
+            .cluster_state
+            .respawn_events()
+            .iter()
+            .filter(|(new_id, record)| {
+                record.original_id == original && self.cluster_state.is_peer_alive(new_id)
+            })
+            .map(|(new_id, _)| (new_id.clone(), self.cluster_state.peer_member_gen(new_id)))
+            .collect();
+        if seated.is_empty() {
+            return;
+        }
+        let mutations = seated
+            .into_iter()
+            .map(|(new_id, member_gen)| {
+                tracing::warn!(
+                    target: "dynrunner_respawn",
+                    original_id = %original,
+                    new_id = %new_id,
+                    member_gen,
+                    event = "respawn_replacement_winddown_scheduled",
+                    "re-admitted member's respawn replacement is already \
+                     seated (double-occupancy); scheduling the replacement to \
+                     gracefully wind down at its next quiescence so it \
+                     releases its SLURM job (the re-admitted original \
+                     continues)",
+                );
+                ClusterMutation::WindDownRequested {
+                    secondary_id: new_id,
+                    member_gen,
+                }
+            })
+            .collect();
+        self.apply_and_broadcast_cluster_mutations(mutations).await;
     }
 
     /// Restore ONE re-admitted peer's `self.secondaries` +
