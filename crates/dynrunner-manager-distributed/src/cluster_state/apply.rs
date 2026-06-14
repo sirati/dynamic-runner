@@ -92,28 +92,26 @@ impl<I: Identifier> ClusterState<I> {
                 if self.settled_contains(&hash) {
                     return ApplyOutcome::NoOp;
                 }
-                if let std::collections::hash_map::Entry::Vacant(e) = self.tasks.entry(hash.clone())
-                {
+                if self.tasks.contains_key(&hash) {
+                    ApplyOutcome::NoOp
+                } else {
+                    // A vacant slot in the LOGICAL ledger (the `settled_contains`
+                    // guard above already excluded a spilled terminal): a
+                    // logical CREATE. The shared `set_task_state` write path
+                    // inserts, maintains the range-fold memo (`add` — a vacant
+                    // slot has no old term, so the bucket count bumps), and
+                    // emits the #520 "changed state to pending" narration event
+                    // from the post-write state (holder `None` — a spawn-time
+                    // Pending names none). No `fallback_holder` (this arm never
+                    // supersedes an `InFlight`).
                     let state = TaskState::Pending {
                         task,
                         version: Default::default(),
                         // Brand-new task: the cold generation (F2).
                         attempt: 0,
                     };
-                    // Range-fold memo: a logical CREATE — XOR the new term in
-                    // and bump the bucket count, off the SAME term the fold
-                    // would see for this fresh Pending. Computed before the
-                    // move so the memo and the inserted state agree.
-                    let term = super::keyspace::task_digest_term(&hash, &state);
-                    e.insert(state);
-                    self.range_fold_memo.add(&hash, term);
-                    // #520: a fresh Pending is a narration-worthy transition
-                    // (its "changed state to pending" line). The arm bypasses
-                    // the merge join, so emit through the shared helper here.
-                    self.emit_task_state_change_for(&hash);
+                    self.set_task_state(&hash, state, None);
                     ApplyOutcome::Applied
-                } else {
-                    ApplyOutcome::NoOp
                 }
             }
             ClusterMutation::TaskAssigned {
@@ -969,12 +967,14 @@ impl<I: Identifier> ClusterState<I> {
     }
 
     /// Apply-side adapter over the shared [`Self::merge_task_state`] join:
-    /// run the join, emit the pre-built terminal event on a win (the emit
-    /// SINK is the caller's concern — `merge_task_state` only BUILDS the
-    /// event so apply and restore emit byte-identical bytes), and map the
-    /// [`MergeOutcome`] onto the [`ApplyOutcome`] the apply arms return.
-    /// One seam so the monotone arms never re-spell the supersede
-    /// precedence nor the emit.
+    /// run the join, emit the pre-built terminal completion event on a win
+    /// (the emit SINK is the caller's concern — `merge_task_state` only BUILDS
+    /// that event so apply and restore emit byte-identical bytes), and map the
+    /// [`MergeOutcome`] onto the [`ApplyOutcome`] the apply arms return. The
+    /// #520 narration event is NOT emitted here — `merge_task_state` writes
+    /// the winning state through the shared `set_task_state` path, which emits
+    /// it (the forget-proof single write path). One seam so the monotone arms
+    /// never re-spell the supersede precedence nor the emit.
     fn apply_merge(
         &mut self,
         hash: &str,
@@ -984,18 +984,14 @@ impl<I: Identifier> ClusterState<I> {
     ) -> ApplyOutcome {
         match self.merge_task_state(hash, incoming, incoming_outputs, resumed) {
             MergeOutcome::NoOp => ApplyOutcome::NoOp,
-            MergeOutcome::Applied {
-                event,
-                state_change_event,
-                ..
-            } => {
+            MergeOutcome::Applied { event, .. } => {
                 if let Some(ev) = event {
                     self.emit_task_completed_event(ev);
                 }
-                // #520: every winning transition is a narration-worthy CRDT
-                // change — emit it on the observer's narration channel (a
-                // silent no-op on primary/secondary, which install no sender).
-                self.emit_task_state_change_event(*state_change_event);
+                // #520: the winning transition's narration event is emitted by
+                // the shared `set_task_state` write path inside
+                // `merge_task_state` (the forget-proof single write path), so
+                // this seam emits only the terminal-completion event above.
                 ApplyOutcome::Applied
             }
         }

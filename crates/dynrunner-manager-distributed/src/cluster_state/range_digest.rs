@@ -55,51 +55,112 @@ use super::keyspace::task_digest_term;
 use super::keyspace::range_index;
 
 impl<I: Identifier> ClusterState<I> {
-    // ─── Incremental memo maintenance ───
+    // ─── Incremental memo maintenance — the single task-state write path ───
     //
-    // The range-fold memo is touched ONLY through the `range_fold_memo`
-    // primitives (`add` / `swap`), always with the per-entry term computed via
-    // the SHARED `keyspace::task_digest_term` (the SAME term `digest()` folds
-    // into `tasks_hash`), so the memo and the scalar fold can never disagree.
-    // The eight authoritative-rank-drop arms share the rewrite tail through
-    // the one `rewrite_task_state` seam below; the create / merge-win / resume
-    // sites compute the term inline (the value is moved into the map on the
-    // very next line, so the term must be captured first) but route through
-    // the same two primitives. The memo stays equal to a fresh fold by
-    // construction — the `range_digest_memo_matches_fresh_fold` invariant.
+    // EVERY task-state write routes through the ONE `set_task_state` setter
+    // below. It is the post-decision write primitive: it does NOT decide
+    // WHICH state wins (the merge-join's LWW/rank join, the rank-drop arms'
+    // variant preconditions, and the create sites' vacancy checks all decide
+    // that BEFORE calling), it only WRITES an already-decided state and, in
+    // the one place, maintains the two coupled side-tables a write must touch:
+    //   * the range-fold memo (XOR the old per-entry term out + the new term
+    //     in, via the SHARED `keyspace::task_digest_term` — the SAME term
+    //     `digest()` folds into `tasks_hash`, so memo and scalar fold can
+    //     never disagree), and
+    //   * the #520 narration event (built from the POST-write state's
+    //     classification, emitted on the observer channel — a silent no-op
+    //     when nobody narrates).
+    // A NEW transition arm calls `set_task_state` and gets memo maintenance +
+    // narration FOR FREE — it cannot forget either. The memo stays equal to a
+    // fresh fold by construction (the `range_digest_memo_matches_fresh_fold`
+    // invariant), and the narration fires exactly-once per genuine write (the
+    // callers route the setter ONLY on their real-transition branch; a NoOp /
+    // dominated arm short-circuits before calling it).
+
+    /// The ONE task-state write path. Writes `new` into the `hash` slot and,
+    /// in the correct order, maintains the range-fold memo + emits the #520
+    /// narration event:
+    ///
+    /// 1. Capture the PRE-write per-entry range term while the old state is
+    ///    still in the slot (`None` if the slot was vacant — a logical
+    ///    CREATE; `Some` if occupied — a state CHANGE under a fixed key).
+    /// 2. Insert `new`.
+    /// 3. Range-fold memo: a `None` old term is a CREATE (`add` — bumps the
+    ///    bucket count); a `Some` is a CHANGE (`swap` old→new — count
+    ///    conserved). The memo ops are pure XOR on the fold array keyed by
+    ///    `range_index(hash)` and never read `self.tasks`, so doing them after
+    ///    the insert is bit-identical to doing them before.
+    /// 4. #520 emit: build the narration event from the POST-write state's
+    ///    `to_state_change` classification, with the holder = the post-write
+    ///    state's OWN holder, falling back to `fallback_holder` only when the
+    ///    post-write state names none. The merge join passes the PRE-merge
+    ///    holder there so a terminal that superseded an `InFlight` (whose own
+    ///    holder is `None`) narrates the "completed/failed ON which worker"
+    ///    answer the post-write terminal no longer carries; a non-merge write
+    ///    passes `None`, so the holder is exactly the post-write state's own
+    ///    (bit-identical to the pre-refactor `emit_task_state_change_for`).
+    ///    The post-state-FIRST precedence reproduces the merge join's
+    ///    `incoming.holder().or(prior_holder)` exactly (an assignment's own
+    ///    new `InFlight` holder wins; a terminal falls back to the prior). A
+    ///    silent no-op when no observer installed the channel.
+    ///
+    /// This is the POST-decision write: callers run their own join /
+    /// precondition / vacancy decision FIRST and call this only on a genuine
+    /// write, so the emit fires exactly-once per winning transition and the
+    /// NoOp arms stay narration-silent.
+    pub(super) fn set_task_state(
+        &mut self,
+        hash: &str,
+        new: TaskState<I>,
+        fallback_holder: Option<(String, dynrunner_core::WorkerId)>,
+    ) {
+        let old_term = self
+            .tasks
+            .get(hash)
+            .map(|old| task_digest_term(hash, old));
+        let new_term = task_digest_term(hash, &new);
+        self.tasks.insert(hash.to_string(), new);
+        match old_term {
+            Some(old) => self.range_fold_memo.swap(hash, old, new_term),
+            None => self.range_fold_memo.add(hash, new_term),
+        }
+        // #520: build + emit the narration event from the POST-write state.
+        // Skip the read+build entirely when no observer is narrating (the
+        // common case on primary/secondary). The holder is the post-write
+        // state's own, falling back to `fallback_holder` (the merge join's
+        // PRE-merge holder for a terminal) only when the post-write state
+        // names none — the SAME `incoming.holder().or(prior_holder)`
+        // precedence the merge join used inline.
+        if self.task_state_change_tx.is_none() {
+            return;
+        }
+        if let Some(state) = self.tasks.get(hash) {
+            let event = crate::task_state_change::TaskStateChangeEvent {
+                task_id: state.task().task_id.clone(),
+                change: state.to_state_change(),
+                holder: state.holder().or(fallback_holder),
+            };
+            self.emit_task_state_change_event(event);
+        }
+    }
 
     /// The memo-aware in-place state rewrite the authoritative-rank-drop arms
-    /// share (the 8 `*state = ...` sites): look the entry up, XOR the old
-    /// term out + the new term in, then store the new state. Returns `false`
-    /// (a NoOp, no memo touch) when the hash is absent — the same absent-slot
-    /// NoOp the arms' bare `get_mut` took. The arms keep their own
-    /// variant-precondition match (which extracts task/attempt) BEFORE
-    /// calling this; this funnels the common rewrite tail through ONE
-    /// memo-maintaining seam so no `*state =` site can silently skip the memo.
+    /// share (the 8 `*state = ...` sites): a presence-guarded wrapper over the
+    /// single [`Self::set_task_state`] write path. Returns `false` (a NoOp,
+    /// no write) when the hash is absent — the same absent-slot NoOp the arms'
+    /// bare `get_mut` took. The arms keep their own variant-precondition match
+    /// (which extracts task/attempt) BEFORE calling this; this funnels the
+    /// common rewrite tail through the ONE memo-maintaining + narrating seam
+    /// so no `*state =` site can silently skip the memo or the emit. The eight
+    /// arms (Reinjected / Requeued / Retried / Blocked / SkippedAlreadyDone /
+    /// SetupCompleted / AffineReady / QueuedAfterLocalDependencySet) each
+    /// transition to a state whose narration holder is its own (always `None`
+    /// for these target states), so no `fallback_holder` is needed.
     pub(super) fn rewrite_task_state(&mut self, hash: &str, new: TaskState<I>) -> bool {
-        let Some(old) = self.tasks.get(hash) else {
+        if !self.tasks.contains_key(hash) {
             return false;
-        };
-        let old_term = task_digest_term(hash, old);
-        let new_term = task_digest_term(hash, &new);
-        self.range_fold_memo.swap(hash, old_term, new_term);
-        // The entry is present (checked above); overwrite its state.
-        if let Some(slot) = self.tasks.get_mut(hash) {
-            *slot = new;
         }
-        // #520: this ONE seam is the rewrite tail of all eight
-        // authoritative-rank-drop arms (Reinjected / Requeued / Retried /
-        // Blocked / SkippedAlreadyDone / SetupCompleted / AffineReady /
-        // QueuedAfterLocalDependencySet) — every one is a genuine
-        // state-discriminant transition the observer narrates. Emitting the
-        // narration event HERE (the A2 cheap shared-helper route) covers all
-        // eight in one place: a `true` return means the slot transitioned, so
-        // the post-write state is the narration-worthy change. It is a silent
-        // no-op when no observer is narrating. (The merge-join arms — assign /
-        // complete / fail — build their event in `merge_task_state`, NOT here;
-        // and `TaskAdded` / `TasksSpawned`, which insert via `entry`/`insert`
-        // rather than this rewrite seam, emit at their own tail.)
-        self.emit_task_state_change_for(hash);
+        self.set_task_state(hash, new, None);
         true
     }
 

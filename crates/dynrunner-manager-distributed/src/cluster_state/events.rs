@@ -215,36 +215,6 @@ impl<I: Identifier> ClusterState<I> {
         }
     }
 
-    /// Build + emit the #520 narration event for the task currently in the
-    /// `hash` slot — the shared seam (A2) for the task apply arms that do
-    /// NOT route through `merge_task_state` (the spawn-time + deliberate-
-    /// reset transitions: `TaskAdded`/`TasksSpawned` → Pending,
-    /// `TaskReinjected`/`TaskRequeued`/`TaskRetried` → Pending,
-    /// `TaskBlocked`, `TaskSkippedAlreadyDone`, `SetupCompleted`). Called at
-    /// the TAIL of each such arm AFTER it writes the slot, so it reads the
-    /// POST-write state and builds the event through the SAME
-    /// `to_state_change` / `holder` projection the merge join uses — ONE
-    /// classification owner, no per-arm hand-rolled event (the cheap
-    /// shared-helper route, NOT a setter refactor).
-    ///
-    /// Each caller invokes it ONLY on the branch that actually transitioned
-    /// the slot (a NoOp / dominated arm that wrote nothing must NOT call it
-    /// — that would re-narrate the unchanged state). A missing slot is a
-    /// silent no-op. Skips the read+build entirely when no observer is
-    /// narrating (the common case on primary/secondary).
-    pub(crate) fn emit_task_state_change_for(&self, hash: &str) {
-        if self.task_state_change_tx.is_none() {
-            return;
-        }
-        if let Some(state) = self.tasks.get(hash) {
-            self.emit_task_state_change_event(TaskStateChangeEvent {
-                task_id: state.task().task_id.clone(),
-                change: state.to_state_change(),
-                holder: state.holder(),
-            });
-        }
-    }
-
     /// Attach the #520 narration channel's sender end so subsequent
     /// `emit_task_state_change_event` calls route events to the observer's
     /// run-loop narrator. Only the observer calls this. Same

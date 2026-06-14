@@ -814,24 +814,21 @@ impl<I: Identifier> ClusterState<I> {
         // rides the SAME `emit_task_completed_event` sink as apply (TS-5),
         // and a re-restore yields `NoOp` (the key no longer dominates) so
         // the event fires exactly once.
+        // #520: a restore-delivered transition is a CRDT change the observer
+        // narrates exactly like a live one — same merge seam, same
+        // exactly-once contract (a re-restore NoOps). The narration event is
+        // emitted by the shared `set_task_state` write path inside
+        // `merge_task_state`, so narration is PATH-INDEPENDENT by construction:
+        // a TaskCompleted/Assigned that arrives only via snapshot (its live
+        // broadcast dropped) narrates through the same single write path as the
+        // live one. This loop emits only the terminal-completion event the
+        // join pre-builds for the (separate) task-completed channel.
         for (hash, incoming) in tasks {
             let co_present_outputs = task_outputs.get(&hash).cloned();
-            if let super::merge::MergeOutcome::Applied {
-                event,
-                state_change_event,
-                ..
-            } = self.merge_task_state(&hash, incoming, co_present_outputs, resumed)
+            if let super::merge::MergeOutcome::Applied { event: Some(ev), .. } =
+                self.merge_task_state(&hash, incoming, co_present_outputs, resumed)
             {
-                if let Some(ev) = event {
-                    self.emit_task_completed_event(ev);
-                }
-                // #520: a restore-delivered transition is a CRDT change the
-                // observer narrates exactly like a live one — same merge
-                // seam, same exactly-once contract (a re-restore NoOps).
-                // This is what makes the narration PATH-INDEPENDENT: a
-                // TaskCompleted/Assigned that arrives only via snapshot
-                // (its live broadcast dropped) still narrates here.
-                self.emit_task_state_change_event(*state_change_event);
+                self.emit_task_completed_event(ev);
             }
         }
         // Primary register: CRD-2/D-P adopt rule, applied IDENTICALLY to

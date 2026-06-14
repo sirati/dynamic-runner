@@ -136,40 +136,33 @@ impl<I: Identifier> ClusterState<I> {
             .collect();
         let mut resumed: Vec<TaskInfo<I>> = Vec::with_capacity(to_resume.len());
         for h in to_resume {
-            if let Some(blocked @ TaskState::Blocked { .. }) = self.tasks.remove(&h) {
-                // The OLD term (the just-removed Blocked state) — captured
-                // before we build the new Pending so the memo swap is exact.
-                let old_term = super::keyspace::task_digest_term(&h, &blocked);
-                let TaskState::Blocked { task, attempt, .. } = blocked else {
-                    unreachable!("matched Blocked above");
-                };
-                resumed.push(task.clone());
-                // Auto-resume is an authoritative cross-task transition
-                // (Blocked → Pending), not an assignment; the fresh
-                // `Pending` starts at the default version and a later
-                // genuine assignment mints a higher one. The retry
-                // generation (F2) is PRESERVED from the Blocked entry — a
-                // cascade-resume is not a new retry attempt.
-                let resumed_state = TaskState::Pending {
-                    task,
-                    version: Default::default(),
-                    attempt,
-                };
-                // Range-fold memo: Blocked → Pending under a FIXED key — a
-                // state CHANGE (count conserved). XOR old out, new in. The
-                // `remove`+`insert` above is one logical entry staying in the
-                // ledger, NOT a logical remove, so we swap (never remove).
-                let new_term = super::keyspace::task_digest_term(&h, &resumed_state);
-                self.range_fold_memo.swap(&h, old_term, new_term);
-                self.tasks.insert(h.clone(), resumed_state);
-                // #520: a cascade-resume Blocked → Pending is a
-                // narration-worthy transition. This path does remove+insert
-                // (not the `rewrite_task_state` seam), so emit through the
-                // shared helper here. The `to_resume` filter guarantees each
-                // `h` was genuinely Blocked-on the prereq, so this fires only
-                // on a real resume.
-                self.emit_task_state_change_for(&h);
-            }
+            // Read the still-present Blocked entry by reference and clone out
+            // its `task` + `attempt` (the `to_resume` filter guarantees each
+            // `h` is a genuine Blocked-on-prereq entry). Cloning rather than
+            // moving the slot out keeps the old Blocked state in place, so the
+            // shared `set_task_state` write path below re-captures the OLD term
+            // and runs the count-conserving SWAP (Blocked → Pending under a
+            // FIXED key is a state CHANGE, not a logical create/remove).
+            let Some(TaskState::Blocked { task, attempt, .. }) = self.tasks.get(&h) else {
+                continue;
+            };
+            let task = task.clone();
+            let attempt = *attempt;
+            resumed.push(task.clone());
+            // Auto-resume is an authoritative cross-task transition (Blocked →
+            // Pending), not an assignment; the fresh `Pending` starts at the
+            // default version and a later genuine assignment mints a higher
+            // one. The retry generation (F2) is PRESERVED from the Blocked
+            // entry — a cascade-resume is not a new retry attempt. The shared
+            // write path swaps the memo term + emits the #520 "changed state to
+            // pending" narration event (holder `None` — a resumed Pending names
+            // none, so no `fallback_holder`).
+            let resumed_state = TaskState::Pending {
+                task,
+                version: Default::default(),
+                attempt,
+            };
+            self.set_task_state(&h, resumed_state, None);
         }
         resumed
     }
@@ -437,19 +430,14 @@ impl<I: Identifier> ClusterState<I> {
                 state = ?std::mem::discriminant(&initial),
                 "TasksSpawned: inserted entry"
             );
-            // Range-fold memo: a logical CREATE — XOR the new term in + bump
-            // the bucket count, off the SAME term the fold would see for this
-            // fresh entry. Computed before the move into the map.
-            let term = super::keyspace::task_digest_term(&hash, &initial);
-            self.range_fold_memo.add(&hash, term);
-            self.tasks.insert(hash.clone(), initial);
-            // #520: a freshly-spawned entry is a narration-worthy transition
-            // (Pending / Blocked / cascade-Failed at spawn). This batch arm
-            // inserts directly (not via the `rewrite_task_state` seam), so
-            // emit through the shared helper here. A re-spawn of an
-            // already-present hash `continue`d above, so this only fires on a
-            // genuine new entry.
-            self.emit_task_state_change_for(&hash);
+            // A freshly-spawned entry is a logical CREATE (a re-spawn of an
+            // already-present hash `continue`d above). The shared
+            // `set_task_state` write path inserts, maintains the range-fold
+            // memo (`add` — a vacant slot has no old term, so the bucket count
+            // bumps), and emits the #520 narration event for the spawn-time
+            // transition (Pending / Blocked / cascade-Failed — each names no
+            // holder, so no `fallback_holder`).
+            self.set_task_state(&hash, initial, None);
             applied_any = true;
         }
         if applied_any {

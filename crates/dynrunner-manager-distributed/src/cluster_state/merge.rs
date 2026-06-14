@@ -43,7 +43,6 @@ use super::types::{
     TerminalRank,
 };
 use crate::task_completed::TaskCompletedEvent;
-use crate::task_state_change::TaskStateChangeEvent;
 
 // === per-task join ===
 
@@ -404,7 +403,11 @@ pub(super) enum MergeOutcome {
     /// No side-effects.
     NoOp,
     /// `incoming` won; carries the post-merge transition flags + the
-    /// pre-built event a caller emits.
+    /// pre-built terminal event a caller emits. The #520 narration event
+    /// is NOT carried: the winning state is written through the shared
+    /// [`ClusterState::set_task_state`] seam, which emits the narration
+    /// event itself (the forget-proof single write path), so a caller can
+    /// neither double-emit nor forget it.
     Applied {
         /// Post-merge is `Completed` AND pre-merge was NOT `Completed`.
         /// Drives `resume_blocked_on` (TS-2), `record_task_outputs`
@@ -421,20 +424,6 @@ pub(super) enum MergeOutcome {
         /// transition); built once here via `to_completed_event` so apply
         /// and restore emit byte-identical events.
         event: Option<TaskCompletedEvent>,
-        /// Pre-built #520 per-transition narration event — ALWAYS `Some`
-        /// on a win (every winning transition, terminal or not, is a
-        /// narration-worthy CRDT change). Built here from the POST-merge
-        /// state's classification + the holder (post-merge for an
-        /// assignment, the PRE-merge holder captured below for a terminal
-        /// that superseded an `InFlight`), so apply and restore narrate
-        /// byte-identically and path-independently. The caller does the
-        /// actual `emit_task_state_change_event` (the emit sink is the
-        /// caller's concern, exactly like `event`). `Box`ed to keep the
-        /// `Applied` variant from dominating `MergeOutcome`'s size
-        /// (`large_enum_variant`): every `merge_task_state` return moves
-        /// this enum, and the narration event (which carries the holder
-        /// strings + the fail reason/last_error) is the largest field.
-        state_change_event: Box<TaskStateChangeEvent>,
     },
 }
 
@@ -482,17 +471,12 @@ impl<I: Identifier> ClusterState<I> {
             return MergeOutcome::NoOp;
         }
         // 1+2. Look up; on a present slot compare keys and bail on a NoOp.
-        // Capture the PRE-merge per-entry range term while we hold the old
-        // state, so the memo update below can XOR it OUT (the new term goes IN
-        // after the insert). `None` (the entry never existed — not fat, not
-        // settled) makes this insert a logical CREATE, so no old term to
-        // remove. After an `unsettle_if_dominated` rehydrate above the entry
-        // is fat here, so its old term is captured and the rehydrate's count
-        // (added back by unsettle moving it fat) is correctly conserved.
-        let old_range_term = self
-            .tasks
-            .get(hash)
-            .map(|local| super::keyspace::task_digest_term(hash, local));
+        // The PRE-merge per-entry range term the memo XORs OUT is captured by
+        // the shared `set_task_state` write path below (which re-reads the slot
+        // — still occupied by the pre-merge state at that point — so a `None`
+        // there is a logical CREATE and a `Some` a count-conserving CHANGE,
+        // and an `unsettle_if_dominated` rehydrate above leaves the entry fat
+        // so its old term is captured and the count correctly conserved).
         let was_completed = match self.tasks.get(hash) {
             None => false,
             Some(local) => {
@@ -533,18 +517,6 @@ impl<I: Identifier> ClusterState<I> {
         } else {
             None
         };
-        // #520 narration event — built once here from the POST-merge state's
-        // classification, ALWAYS on a win (every winning transition is a
-        // narration-worthy change). The holder is the POST-merge state's own
-        // (an assignment's new `InFlight` holder) when it names one, else the
-        // PRE-merge `prior_holder` (a terminal that superseded an `InFlight`
-        // — "completed/failed ON which worker"). Built BEFORE `incoming` is
-        // moved into the map.
-        let state_change_event = Box::new(TaskStateChangeEvent {
-            task_id: incoming.task().task_id.clone(),
-            change: incoming.to_state_change(),
-            holder: incoming.holder().or(prior_holder),
-        });
         // F4 per-phase EVENT tally bump (#358) — the SINGLE owner of the
         // bump, exactly here because this join is the one place a terminal
         // OBSERVATION lands on ANY node (originator apply-locally, mirror
@@ -590,29 +562,38 @@ impl<I: Identifier> ClusterState<I> {
             let next = self.phase_event_tally_for(&key) + 1;
             self.record_phase_event_tally(key, next);
         }
-        // Range-fold memo: XOR the OLD term out (if the slot was occupied)
-        // and the NEW winning term in. A `None` old term is a logical CREATE
-        // (count bumps); a `Some` is a state CHANGE under a fixed key (count
-        // conserved). Done as raw memo ops (not the `range_memo_*` bridges)
-        // because the winning `incoming` is moved into the map on the very
-        // next line — capture its term first.
-        let new_range_term = super::keyspace::task_digest_term(hash, &incoming);
-        match old_range_term {
-            Some(old) => self.range_fold_memo.swap(hash, old, new_range_term),
-            None => self.range_fold_memo.add(hash, new_range_term),
-        }
-        self.tasks.insert(hash.to_string(), incoming);
-        // 4. Newly-completed cross-task side-effects.
+        // Newly-completed cross-task CASCADE-RESUME, run BEFORE the winning
+        // write so the resumed dependents' #520 narration events precede this
+        // completion's own (the pre-refactor order: `resume_blocked_on`
+        // emitted inside the join, the completion event after the join
+        // returned). `resume_blocked_on` scans for `Blocked { on == hash }`
+        // entries — it never reads THIS hash's slot — so its result is
+        // identical whether the completed slot still holds the pre-merge state
+        // (here) or the post-merge `Completed`. The output CACHE write, which
+        // requires the completed slot to be present, runs AFTER the write.
         if newly_completed {
-            self.record_task_outputs_value(hash, incoming_outputs);
             let just_resumed = self.resume_blocked_on(hash);
             resumed.extend(just_resumed);
+        }
+        // The winning write through the ONE task-state write path: it captures
+        // the old term, inserts `incoming`, maintains the range-fold memo (XOR
+        // old out / new in — CREATE if the slot was vacant, else a count-
+        // conserving CHANGE), and emits the #520 narration event from the
+        // POST-write state. `prior_holder` is the fallback holder so a
+        // terminal that superseded an `InFlight` narrates the prior holder
+        // (the post-write terminal names none) — the SAME
+        // `incoming.holder().or(prior_holder)` precedence built inline
+        // pre-refactor.
+        self.set_task_state(hash, incoming, prior_holder);
+        // Newly-completed output cache (TS-3) — requires the completed slot to
+        // be present, so it runs after the write.
+        if newly_completed {
+            self.record_task_outputs_value(hash, incoming_outputs);
         }
         MergeOutcome::Applied {
             newly_completed,
             failure_won,
             event,
-            state_change_event,
         }
     }
 }
