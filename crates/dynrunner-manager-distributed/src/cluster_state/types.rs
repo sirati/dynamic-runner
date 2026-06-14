@@ -455,6 +455,97 @@ impl<I> TaskState<I> {
             | TaskState::QueuedAfterLocalDependency { .. } => None,
         }
     }
+
+    /// The `(secondary, worker)` holder this state names, if any — ONLY
+    /// `InFlight` names a full `(secondary, worker)`: it is the one state a
+    /// task is RUNNING on a specific worker slot. `QueuedAfterLocalDependency`
+    /// carries only a `secondary` (committed to a secondary but not yet on a
+    /// worker — it is narrated as the "changed state to
+    /// queued-after-local-dependency" Other line, which needs no worker
+    /// holder); every other state (`Pending`, `Blocked`, the terminals)
+    /// names no holder. Read by the merge join to stamp the #520 narration
+    /// event's holder (post-merge for an `InFlight` assignment; the PRE-merge
+    /// holder for a terminal that superseded an `InFlight`).
+    pub(crate) fn holder(&self) -> Option<(String, WorkerId)> {
+        match self {
+            TaskState::InFlight {
+                secondary, worker, ..
+            } => Some((secondary.clone(), *worker)),
+            _ => None,
+        }
+    }
+
+    /// Project this (POST-merge) `TaskState` onto the #520
+    /// [`crate::task_state_change::TaskStateChange`] classification — the
+    /// SINGLE place the discriminant + the fail-class fold map onto the
+    /// operator-narration level/wording, so apply and restore narrate
+    /// byte-identically. The fail classes fold `kind` the SAME way
+    /// [`ClusterState::outcome_counts`]'s `fold_failed_kind` does
+    /// (`Recoverable` → recoverable/WARN, `ResourceExhausted("memory")` →
+    /// oom/WARN, everything else terminal → terminal/ERROR), so the level
+    /// is the CRDT's own authoritative bucketing.
+    ///
+    /// Returns the human state tag for the `Other` arm as a `&'static str`
+    /// so the non-terminal/non-fail transitions narrate "changed state to
+    /// {state}" without allocating.
+    pub(crate) fn to_state_change(&self) -> crate::task_state_change::TaskStateChange {
+        use crate::task_state_change::TaskStateChange;
+        match self {
+            TaskState::InFlight { .. } => TaskStateChange::Assigned,
+            TaskState::Completed { .. } => TaskStateChange::Completed,
+            TaskState::Failed {
+                kind, last_error, ..
+            } => match kind {
+                ErrorType::Recoverable => TaskStateChange::RecoverableFailure {
+                    reason: kind.wire_value(),
+                },
+                ErrorType::ResourceExhausted(k) if k.as_str() == "memory" => {
+                    TaskStateChange::OomFailure {
+                        reason: kind.wire_value(),
+                    }
+                }
+                // Everything else folded as `fail_final` (NonRecoverable,
+                // non-memory ResourceExhausted, and the
+                // defensively-unreachable Unfulfillable/InvalidTask kinds a
+                // legacy wire path could land inside a `Failed`) is a
+                // TERMINAL failure with the full last_error.
+                _ => TaskStateChange::TerminalFailure {
+                    reason: kind.wire_value(),
+                    last_error: last_error.clone(),
+                },
+            },
+            // Discrete terminal failure variants — both `fail_final`.
+            TaskState::Unfulfillable {
+                reason, last_error, ..
+            } => TaskStateChange::TerminalFailure {
+                reason: format!("unfulfillable:{reason}"),
+                last_error: last_error.clone(),
+            },
+            TaskState::InvalidTask {
+                reason, last_error, ..
+            } => TaskStateChange::TerminalFailure {
+                reason: format!("invalid_task:{reason}"),
+                last_error: last_error.clone(),
+            },
+            // Every other winning transition narrates "changed state to
+            // {state}" at INFO — the non-terminal live states and the
+            // non-fail terminals the completion channel stays silent on.
+            TaskState::Pending { .. } => TaskStateChange::Other { state: "pending" },
+            TaskState::Blocked { .. } => TaskStateChange::Other { state: "blocked" },
+            TaskState::QueuedAfterLocalDependency { .. } => TaskStateChange::Other {
+                state: "queued-after-local-dependency",
+            },
+            TaskState::SkippedAlreadyDone { .. } => TaskStateChange::Other {
+                state: "skipped-already-done",
+            },
+            TaskState::SetupCompleted { .. } => TaskStateChange::Other {
+                state: "setup-completed",
+            },
+            TaskState::AffineReady { .. } => TaskStateChange::Other {
+                state: "affine-ready",
+            },
+        }
+    }
 }
 
 /// Which per-phase EVENT counter a [`ClusterState::phase_event_tally_for`]

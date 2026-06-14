@@ -214,6 +214,144 @@ impl<I: Identifier> PendingPool<I> {
             .any(|(key, bucket)| !bucket.items.is_empty() && active.contains(&key.0))
     }
 
+    /// True iff the number of READY (deps-met, worker-dispatchable) queued
+    /// items is strictly below `threshold` — answered by a SHORT-CIRCUITING
+    /// scan that stops the moment it has counted `threshold` eligible items.
+    /// Worst case `O(threshold)` eligible items observed (plus the skipped
+    /// non-eligible prefix), NEVER `O(queued)`: at 66k queued items the gate
+    /// caller (#519) must not pay a range-digest-fold (#504-class) sweep per
+    /// recheck, so this returns `false` as soon as the `threshold`-th
+    /// eligible item is seen and abandons the rest of the queue.
+    ///
+    /// "Ready" is the SAME gate the dispatch view emits: an item in an
+    /// `Active` phase that is [`Self::dispatch_eligible_now`] (worker-
+    /// assignable kind AND not parked under an unexpired re-dispatch
+    /// backoff). A `Setup`/`SecondaryAffine` task, a backed-off task, or an
+    /// item in a non-`Active` phase is NOT ready — exactly the items a
+    /// worker view would skip. Composes `active_phases()` (the dispatchable-
+    /// phase set, as `has_queued_dispatchable`) with the single eligibility
+    /// seam, so it can never diverge from what a dispatch actually sees.
+    ///
+    /// Single concern: a bounded "is the ready pool shallower than N" read.
+    /// `threshold == 0` is vacuously `false` (zero items is not "below 0").
+    pub fn ready_dispatchable_below(&self, threshold: usize) -> bool {
+        if threshold == 0 {
+            return false;
+        }
+        let active: std::collections::HashSet<PhaseId> = self.active_phases().into_iter().collect();
+        let mut counted = 0usize;
+        for (key, bucket) in &self.buckets {
+            if !active.contains(&key.0) {
+                continue;
+            }
+            for item in &bucket.items {
+                if !self.dispatch_eligible_now(item) {
+                    continue;
+                }
+                counted += 1;
+                if counted >= threshold {
+                    // Reached the threshold — the ready pool is NOT below it.
+                    // Abandon the rest of the queue (the short-circuit that
+                    // keeps this `O(threshold)`, never `O(queued)`).
+                    return false;
+                }
+            }
+        }
+        // Exhausted every bucket without reaching `threshold` eligible items.
+        counted < threshold
+    }
+
+    /// True iff at least one currently-`blocked` task is LIVE — none of its
+    /// unmet prereqs is [`Self::is_dead_ended`] (definitely never-runnable).
+    /// Short-circuits at the FIRST live blocked task found.
+    ///
+    /// This is the #519 gate's clause-2 ("∃ a blocked task whose unmet deps
+    /// are all NON-FAILED — it can still complete, so deepening the pipeline
+    /// toward it refills the ready pool"). A task blocked on a dead-ended
+    /// prereq is excluded: it can never run, so a ready prerequisite of it
+    /// is not worth preferring. Per the owner guardrail, "dead-ended" is the
+    /// DEFINITELY-doomed set only (`failed_tasks` via [`Self::is_dead_ended`]);
+    /// a retry-eligible `soft_failed` prereq may yet recover, so its
+    /// dependents stay LIVE (their prerequisites still matter).
+    ///
+    /// Cost: `O(blocked · deps_per_blocked)` worst case, but bounded by the
+    /// FIRST live hit (typically immediate). The #519 gate evaluates this
+    /// ONLY when [`Self::ready_dispatchable_below`] already holds, so the
+    /// combined gate stays cheap.
+    pub fn has_live_blocked(&self) -> bool {
+        self.blocked
+            .keys()
+            .any(|id| !self.is_blocked_task_dead_ended(id))
+    }
+
+    /// True iff the ready (deps-met, worker-dispatchable) queued task
+    /// `task_id` is a DIRECT prerequisite of at least one LIVE blocked task
+    /// — i.e. completing it would shrink some live blocked task's unmet-dep
+    /// set, refilling the ready pool. The #519 selection bias's per-candidate
+    /// test.
+    ///
+    /// Reuses the pool's ONE dependency reverse index `dependents_of` (the
+    /// same edges [`Self::dependent_dispatch_rank`] and the cascade walk
+    /// traverse): `dependents_of[task_id]` lists the tasks that blocked ON
+    /// `task_id` at commit time and have not since gone terminal. A
+    /// dependent counts only if it is still `blocked` AND is LIVE (not
+    /// dead-ended, the same [`Self::is_dead_ended`]-based liveness clause-2
+    /// uses) — preferring a prerequisite of an already-doomed dependent
+    /// would deepen toward never-runnable work.
+    ///
+    /// DIRECT prerequisites only (no transitive walk): the owner spec is "a
+    /// ready task that is a direct prerequisite of a blocked-non-failed
+    /// task". Cost: `O(direct dependents of task_id)`, bounded by the view
+    /// size at the call site, so it is safe to evaluate per dispatch
+    /// candidate.
+    pub fn is_ready_prerequisite_of_live_blocked(&self, task_id: &str) -> bool {
+        let Some(dependents) = self.dependents_of.get(task_id) else {
+            return false;
+        };
+        dependents.iter().any(|dep_id| {
+            self.blocked.contains_key(dep_id) && !self.is_blocked_task_dead_ended(dep_id)
+        })
+    }
+
+    /// True iff the blocked task `blocked_id` is dead-ended — at least one of
+    /// its unmet prereqs is [`Self::is_dead_ended`] (the DEFINITELY-doomed
+    /// set). The per-blocked-task liveness leaf shared by
+    /// [`Self::has_live_blocked`] and
+    /// [`Self::is_ready_prerequisite_of_live_blocked`] so the two agree on
+    /// what "live" means.
+    ///
+    /// A blocked task with no recorded `task_deps` entry (defensive — a
+    /// blocked item always has one) is treated as LIVE, matching
+    /// `live_blocked_count`'s same defensive default.
+    fn is_blocked_task_dead_ended(&self, blocked_id: &str) -> bool {
+        match self.task_deps.get(blocked_id) {
+            Some(deps) => deps.iter().any(|d| self.is_dead_ended(d)),
+            None => false,
+        }
+    }
+
+    /// True iff task `id` is DEFINITELY dead-ended — its latest terminal is
+    /// permanent and no future pass can revive it. The canonical "never
+    /// runnable again" leaf: `failed_tasks` membership ONLY.
+    ///
+    /// Deliberately excludes the OTHER terminal-but-revivable classes:
+    ///   * `soft_failed` — retry-decision-pending; a drain-edge reinject may
+    ///     revive it, so its dependents are still LIVE work (the #519 owner
+    ///     guardrail: do not deepen AWAY from a prerequisite of a
+    ///     soft-failed-dep dependent, it may yet recover).
+    ///   * `dormant_tasks` — operator-revivable (`Unfulfillable`); its
+    ///     dependents legitimately hold the run open.
+    ///
+    /// The phase-SCOPED doom in [`Self::live_blocked_count`] (which ALSO
+    /// treats a `soft_failed`-in-the-gating-phase prereq as dead, because
+    /// that phase's drain edge is the retry-decision point) is a DIFFERENT,
+    /// drain-edge-local concern; it composes this predicate as its
+    /// permanent-failure disjunct rather than re-reading `failed_tasks`, so
+    /// the "permanent failure" concept has ONE owner here.
+    pub(super) fn is_dead_ended(&self, id: &str) -> bool {
+        self.failed_tasks.contains(id)
+    }
+
     /// State of one phase. Useful for tests and diagnostic logging.
     pub fn phase_state(&self, phase_id: &PhaseId) -> Option<PhaseState> {
         self.phase_state.get(phase_id).copied()

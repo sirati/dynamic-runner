@@ -17,6 +17,7 @@ use dynrunner_protocol_primary_secondary::{DiscoveryDebt, RoleTable, SecondaryCa
 use crate::fulfillability_matcher::MatcherTriggerEvent;
 use crate::peer_lifecycle::PeerLifecycleEvent;
 use crate::task_completed::TaskCompletedEvent;
+use crate::task_state_change::TaskStateChangeEvent;
 use crate::worker_signal::WorkerMgmtSignal;
 
 use crate::primary::retry_bucket::BucketKind;
@@ -247,6 +248,17 @@ pub struct ClusterState<I> {
     /// violating the CCD-9 "apply path never crosses node boundaries"
     /// invariant.
     pub(super) task_completed_tx: Option<tokio::sync::mpsc::UnboundedSender<TaskCompletedEvent>>,
+    /// Sender for the #520 per-transition narration channel. Installed
+    /// via [`Self::install_task_state_change_sender`] when the OBSERVER
+    /// wires its narrator; `None` everywhere else (primary / secondary
+    /// never narrate, so they never install it — the emit is a silent drop
+    /// for them, like every other apply-path channel with no receiver).
+    /// Carries EVERY winning task transition (assign / complete / fail /
+    /// non-terminal) with the holder, built at the merge join so the
+    /// observer narrates it path-independently. Skipped from `Clone`,
+    /// snapshot, and restore — same CCD-9 rationale as `task_completed_tx`.
+    pub(super) task_state_change_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<TaskStateChangeEvent>>,
     /// Per-peer set of opaque resource strings each peer announces
     /// it currently holds locally. Maintained by the
     /// `PeerResourceHoldingsUpdated` apply rule and round-tripped via
@@ -558,6 +570,8 @@ where
             worker_mgmt_tx: _worker_mgmt_tx,
             // Deliberately not cloned — same rationale as `lifecycle_tx`.
             task_completed_tx: _task_completed_tx,
+            // Deliberately not cloned — same rationale as `lifecycle_tx`.
+            task_state_change_tx: _task_state_change_tx,
             peer_holdings,
             task_outputs,
             secondary_capacities,
@@ -627,6 +641,8 @@ where
             worker_mgmt_tx: None,
             // Deliberately not cloned — same rationale as `lifecycle_tx`.
             task_completed_tx: None,
+            // Deliberately not cloned — same rationale as `lifecycle_tx`.
+            task_state_change_tx: None,
             // Replicated CRDT data — clone preserves it.
             peer_holdings: peer_holdings.clone(),
             // Replicated CRDT data — clone preserves it.
@@ -700,6 +716,7 @@ where
             matcher_trigger_tx,
             worker_mgmt_tx,
             task_completed_tx,
+            task_state_change_tx,
             peer_holdings,
             task_outputs,
             secondary_capacities,
@@ -738,6 +755,7 @@ where
             .field("matcher_trigger_tx", &matcher_trigger_tx.is_some())
             .field("worker_mgmt_tx", &worker_mgmt_tx.is_some())
             .field("task_completed_tx", &task_completed_tx.is_some())
+            .field("task_state_change_tx", &task_state_change_tx.is_some())
             .field("peer_holdings", peer_holdings)
             .field("task_outputs", &task_outputs.len())
             .field("secondary_capacities", secondary_capacities)
@@ -784,6 +802,7 @@ impl<I> Default for ClusterState<I> {
             matcher_trigger_tx: None,
             worker_mgmt_tx: None,
             task_completed_tx: None,
+            task_state_change_tx: None,
             peer_holdings: HashMap::new(),
             task_outputs: HashMap::new(),
             secondary_capacities: HashMap::new(),

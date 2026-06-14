@@ -195,6 +195,7 @@ impl<I: Identifier> ClusterState<I> {
             matcher_trigger_tx: _matcher_trigger_tx,
             worker_mgmt_tx: _worker_mgmt_tx,
             task_completed_tx: _task_completed_tx,
+            task_state_change_tx: _task_state_change_tx,
             // node-local: the originator's per-hash version counter carries
             // no convergence signal (each replica mints its own).
             task_seq: _task_seq,

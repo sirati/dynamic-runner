@@ -577,6 +577,7 @@ impl<I: Identifier> ClusterState<I> {
             matcher_trigger_tx: _matcher_trigger_tx,
             worker_mgmt_tx: _worker_mgmt_tx,
             task_completed_tx: _task_completed_tx,
+            task_state_change_tx: _task_state_change_tx,
             // node-local: the originator's per-hash version counter is not
             // part of the converged ledger (each replica mints its own on
             // origination; a restoring replica cold-starts it).
@@ -816,10 +817,21 @@ impl<I: Identifier> ClusterState<I> {
         for (hash, incoming) in tasks {
             let co_present_outputs = task_outputs.get(&hash).cloned();
             if let super::merge::MergeOutcome::Applied {
-                event: Some(ev), ..
+                event,
+                state_change_event,
+                ..
             } = self.merge_task_state(&hash, incoming, co_present_outputs, resumed)
             {
-                self.emit_task_completed_event(ev);
+                if let Some(ev) = event {
+                    self.emit_task_completed_event(ev);
+                }
+                // #520: a restore-delivered transition is a CRDT change the
+                // observer narrates exactly like a live one — same merge
+                // seam, same exactly-once contract (a re-restore NoOps).
+                // This is what makes the narration PATH-INDEPENDENT: a
+                // TaskCompleted/Assigned that arrives only via snapshot
+                // (its live broadcast dropped) still narrates here.
+                self.emit_task_state_change_event(*state_change_event);
             }
         }
         // Primary register: CRD-2/D-P adopt rule, applied IDENTICALLY to

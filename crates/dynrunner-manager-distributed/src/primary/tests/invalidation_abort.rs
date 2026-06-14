@@ -233,7 +233,7 @@ async fn invalidation_latches_verdict_first_and_suppresses_phase_hooks() {
             // (4) The invalidation synchronously froze dispatch: nothing is
             // assignable in the invalidation→break window (same step-0 seam
             // as the on_phase_end-raise emit).
-            let view = primary.dispatch_view_for_worker(0);
+            let view = primary.dispatch_view_for_worker(0, false);
             assert!(
                 view.is_empty(),
                 "the invalidation must synchronously empty the dispatch view \

@@ -18,6 +18,7 @@ use super::ClusterState;
 use crate::fulfillability_matcher::MatcherTriggerEvent;
 use crate::peer_lifecycle::PeerLifecycleEvent;
 use crate::task_completed::TaskCompletedEvent;
+use crate::task_state_change::TaskStateChangeEvent;
 use crate::worker_signal::WorkerMgmtSignal;
 
 impl<I: Identifier> ClusterState<I> {
@@ -192,5 +193,66 @@ impl<I: Identifier> ClusterState<I> {
         tx: tokio::sync::mpsc::UnboundedSender<TaskCompletedEvent>,
     ) {
         self.task_completed_tx = Some(tx);
+    }
+
+    /// Enqueue a [`TaskStateChangeEvent`] onto the #520 narration channel.
+    ///
+    /// Same best-effort / non-blocking / non-panicking contract as
+    /// [`Self::emit_task_completed_event`]: a missing or closed receiver is
+    /// a silent drop. ONLY the observer installs this sender (it is the
+    /// operator-facing narrator); on every other role the emit is a silent
+    /// no-op, so the merge join builds the event unconditionally but pays
+    /// nothing when nobody narrates.
+    ///
+    /// CCD-9 invariant: this method must never invoke a consumer directly.
+    /// Consumption happens off the apply/merge path on the observer's run
+    /// loop; the channel is the only synchronization crossing.
+    pub(crate) fn emit_task_state_change_event(&self, event: TaskStateChangeEvent) {
+        if let Some(tx) = &self.task_state_change_tx {
+            // `send` on `UnboundedSender` only fails when the receiver is
+            // dropped; silent drop matches the best-effort contract above.
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Build + emit the #520 narration event for the task currently in the
+    /// `hash` slot — the shared seam (A2) for the task apply arms that do
+    /// NOT route through `merge_task_state` (the spawn-time + deliberate-
+    /// reset transitions: `TaskAdded`/`TasksSpawned` → Pending,
+    /// `TaskReinjected`/`TaskRequeued`/`TaskRetried` → Pending,
+    /// `TaskBlocked`, `TaskSkippedAlreadyDone`, `SetupCompleted`). Called at
+    /// the TAIL of each such arm AFTER it writes the slot, so it reads the
+    /// POST-write state and builds the event through the SAME
+    /// `to_state_change` / `holder` projection the merge join uses — ONE
+    /// classification owner, no per-arm hand-rolled event (the cheap
+    /// shared-helper route, NOT a setter refactor).
+    ///
+    /// Each caller invokes it ONLY on the branch that actually transitioned
+    /// the slot (a NoOp / dominated arm that wrote nothing must NOT call it
+    /// — that would re-narrate the unchanged state). A missing slot is a
+    /// silent no-op. Skips the read+build entirely when no observer is
+    /// narrating (the common case on primary/secondary).
+    pub(crate) fn emit_task_state_change_for(&self, hash: &str) {
+        if self.task_state_change_tx.is_none() {
+            return;
+        }
+        if let Some(state) = self.tasks.get(hash) {
+            self.emit_task_state_change_event(TaskStateChangeEvent {
+                task_id: state.task().task_id.clone(),
+                change: state.to_state_change(),
+                holder: state.holder(),
+            });
+        }
+    }
+
+    /// Attach the #520 narration channel's sender end so subsequent
+    /// `emit_task_state_change_event` calls route events to the observer's
+    /// run-loop narrator. Only the observer calls this. Same
+    /// re-installation semantics as [`Self::install_lifecycle_sender`].
+    pub fn install_task_state_change_sender(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<TaskStateChangeEvent>,
+    ) {
+        self.task_state_change_tx = Some(tx);
     }
 }

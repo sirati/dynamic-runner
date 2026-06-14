@@ -161,7 +161,14 @@ impl<I: Identifier> ClusterState<I> {
                 // ledger, NOT a logical remove, so we swap (never remove).
                 let new_term = super::keyspace::task_digest_term(&h, &resumed_state);
                 self.range_fold_memo.swap(&h, old_term, new_term);
-                self.tasks.insert(h, resumed_state);
+                self.tasks.insert(h.clone(), resumed_state);
+                // #520: a cascade-resume Blocked → Pending is a
+                // narration-worthy transition. This path does remove+insert
+                // (not the `rewrite_task_state` seam), so emit through the
+                // shared helper here. The `to_resume` filter guarantees each
+                // `h` was genuinely Blocked-on the prereq, so this fires only
+                // on a real resume.
+                self.emit_task_state_change_for(&h);
             }
         }
         resumed
@@ -435,7 +442,14 @@ impl<I: Identifier> ClusterState<I> {
             // fresh entry. Computed before the move into the map.
             let term = super::keyspace::task_digest_term(&hash, &initial);
             self.range_fold_memo.add(&hash, term);
-            self.tasks.insert(hash, initial);
+            self.tasks.insert(hash.clone(), initial);
+            // #520: a freshly-spawned entry is a narration-worthy transition
+            // (Pending / Blocked / cascade-Failed at spawn). This batch arm
+            // inserts directly (not via the `rewrite_task_state` seam), so
+            // emit through the shared helper here. A re-spawn of an
+            // already-present hash `continue`d above, so this only fires on a
+            // genuine new entry.
+            self.emit_task_state_change_for(&hash);
             applied_any = true;
         }
         if applied_any {

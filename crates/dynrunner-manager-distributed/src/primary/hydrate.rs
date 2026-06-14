@@ -869,8 +869,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     // reconcile it (free + requeue) rather than wedging on
                     // a phantom-busy slot. A slot whose worker is genuinely
                     // still running resolves normally when the broadcast
-                    // `TaskComplete` lands.
-                    self.workers[idx].assign(
+                    // `TaskComplete` lands. The slot was freshly rebuilt
+                    // Idle just above, so the enforced idle-guard (#517)
+                    // takes; it refuses only the pathological case of two
+                    // InFlight ledger entries naming the SAME (secondary,
+                    // worker), which the guard's WARN surfaces (the ledger
+                    // still tracks the second by hash, as the `None` arm).
+                    let _assigned = self.workers[idx].assign(
                         hash,
                         task,
                         estimated,

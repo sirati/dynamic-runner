@@ -183,11 +183,15 @@ fn make_worker_busy(primary: &mut TestPrimary, sec: &str, local_worker_id: u32) 
         .expect("worker exists in roster");
     let occupier = one_task("occupier");
     let hash = compute_task_hash(&occupier);
-    primary.commit_assignment(
-        idx,
-        occupier,
-        hash,
-        ResourceMap::from([(ResourceKind::memory(), GIB)]),
+    // The slot is idle here, so the commit always takes (#517 guard).
+    assert!(
+        primary.commit_assignment(
+            idx,
+            occupier,
+            hash,
+            ResourceMap::from([(ResourceKind::memory(), GIB)]),
+        ),
+        "make_worker_busy must commit onto the idle slot"
     );
 }
 

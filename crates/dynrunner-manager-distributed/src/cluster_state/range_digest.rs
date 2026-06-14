@@ -87,6 +87,19 @@ impl<I: Identifier> ClusterState<I> {
         if let Some(slot) = self.tasks.get_mut(hash) {
             *slot = new;
         }
+        // #520: this ONE seam is the rewrite tail of all eight
+        // authoritative-rank-drop arms (Reinjected / Requeued / Retried /
+        // Blocked / SkippedAlreadyDone / SetupCompleted / AffineReady /
+        // QueuedAfterLocalDependencySet) — every one is a genuine
+        // state-discriminant transition the observer narrates. Emitting the
+        // narration event HERE (the A2 cheap shared-helper route) covers all
+        // eight in one place: a `true` return means the slot transitioned, so
+        // the post-write state is the narration-worthy change. It is a silent
+        // no-op when no observer is narrating. (The merge-join arms — assign /
+        // complete / fail — build their event in `merge_task_state`, NOT here;
+        // and `TaskAdded` / `TasksSpawned`, which insert via `entry`/`insert`
+        // rather than this rewrite seam, emit at their own tail.)
+        self.emit_task_state_change_for(hash);
         true
     }
 
