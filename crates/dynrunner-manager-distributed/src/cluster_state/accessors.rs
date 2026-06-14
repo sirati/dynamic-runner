@@ -130,6 +130,34 @@ impl<I: Identifier> ClusterState<I> {
             .is_some_and(|view| view.is_affine_ready_gate())
     }
 
+    /// The OWNED [`TaskInfo`] of a SecondaryAffine gate, resolved over the
+    /// FULL LOGICAL ledger (fat `task_state`, else the settled record read
+    /// back from the spill file). This is the resolution TWIN of
+    /// [`Self::is_affine_ready_gate`]: detection already answers
+    /// "is this hash a resolved gate?" over fat OR settled, so the
+    /// secondary's import DRIVE must resolve the gate's body over the SAME
+    /// universe — a `task_state` (fat-only) read went BLIND on a gate that
+    /// resolved-then-SPILLED (its `AffineReady` join fixed-point is
+    /// settle-eligible), turning a recoverable spilled body into a phantom
+    /// "absent gate". `None` ONLY when the hash is in NEITHER the fat map
+    /// NOR the settled index — i.e. the gate's `TaskAdded` has genuinely
+    /// not synced to this node yet (the #509 sync race), which the drive
+    /// then classifies as a transient (re-routable) condition, never a
+    /// permanent loss.
+    ///
+    /// Owned clone so the `cluster_state` borrow ends at the call site
+    /// (the body crosses into the off-loop import task).
+    pub(crate) fn affine_gate_task(&self, hash: &str) -> Option<TaskInfo<I>> {
+        if let Some(state) = self.task_state(hash) {
+            return Some(state.task().clone());
+        }
+        // Spilled: read the fat body back from the settled store (the same
+        // per-key pread the snapshot-stream responder uses); the recovered
+        // state's `TaskInfo` is the gate body the import needs.
+        self.settled_record(hash)
+            .map(|(state, _outputs)| state.task().clone())
+    }
+
     /// Iterator over `(&hash, &TaskState)` for every FAT (in-memory)
     /// entry. A SETTLED entry's fat body lives in the spill file and is
     /// NOT yielded — callers that need the full logical ledger pair
@@ -922,6 +950,22 @@ impl<I: Identifier> ClusterState<I> {
     /// the graceful-abort verdict).
     pub fn graceful_abort_requested(&self) -> bool {
         self.graceful_abort_requested
+    }
+
+    /// Whether THIS exact secondary incarnation has been marked for
+    /// graceful wind-down (`ClusterMutation::WindDownRequested` with a
+    /// matching `(secondary_id, member_gen)`) — the per-peer,
+    /// incarnation-scoped sibling of [`Self::graceful_abort_requested`].
+    /// The directed secondary consults this with its OWN id and its OWN
+    /// live `member_gen`; a directive minted for a prior incarnation
+    /// (lower generation) never matches, so a re-seated id is not wound
+    /// down by a stale directive. Grow-only + monotone, like the global
+    /// graceful-abort latch: once the pair is recorded, it stays. Consumed
+    /// by the directed secondary's graceful-drain exit gate (it departs at
+    /// its next quiescence; see `process_tasks`).
+    pub fn wind_down_requested(&self, secondary_id: &str, member_gen: u64) -> bool {
+        self.wind_down_requested
+            .contains(&(secondary_id.to_string(), member_gen))
     }
 
     /// Count of `InFlight` ledger entries currently assigned to

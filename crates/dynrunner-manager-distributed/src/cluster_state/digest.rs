@@ -103,6 +103,14 @@ impl<I: Identifier> ClusterState<I> {
             // presence bit like `run_aborted` — the same false→true
             // ratchet shape.
             graceful_abort_requested,
+            // The per-peer wind-down directive set (#467) IS summarised: a
+            // grow-only SET, snapshot-healable via the union merge in
+            // `restore`, so a behind replica that missed a live
+            // `WindDownRequested` broadcast must be able to detect the gap
+            // and pull. Count + KEY-only XOR-fold over the `(id, gen)`
+            // pairs (the pair IS the key; the set carries no separate
+            // value), same shape as `phases_ended`.
+            wind_down_requested,
             // The discovery-debt latch IS summarised (it is snapshot-healable
             // via the sticky `max`-join), carried VERBATIM (the full
             // `DiscoveryDebt` value, NOT a bool) into the digest so the
@@ -299,6 +307,15 @@ impl<I: Identifier> ClusterState<I> {
             phases_ended_hash ^= hash_one(phase);
         }
 
+        // Grow-only SET of per-peer wind-down directives (#467): count +
+        // order-independent XOR-fold over the `(secondary_id, member_gen)`
+        // pairs (key-only — the pair IS the key, like the `phases_ended`
+        // fold).
+        let mut wind_down_requested_hash = 0u64;
+        for pair in wind_down_requested {
+            wind_down_requested_hash ^= hash_one(pair);
+        }
+
         // F5 custom-message inbox: count + KEY+VALUE fold (an
         // `Unhandled → Handled` transition at an equal count changes the
         // fold; the snapshot pull's sticky-latch merge heals the lagging
@@ -350,6 +367,8 @@ impl<I: Identifier> ClusterState<I> {
             respawn_events_hash,
             phases_ended_count: phases_ended.len() as u64,
             phases_ended_hash,
+            wind_down_requested_count: wind_down_requested.len() as u64,
+            wind_down_requested_hash,
             custom_messages_count: custom_messages.len() as u64,
             custom_messages_hash,
             custom_terminal_watermarks_count: custom_terminal_watermarks.len() as u64,

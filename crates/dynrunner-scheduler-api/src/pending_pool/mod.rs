@@ -72,7 +72,7 @@ pub use backoff::{DISPATCH_BACKOFF_BASE, DISPATCH_BACKOFF_CAP};
 pub use partition::IngestPartition;
 pub use pool::PendingPool;
 pub use reservation::ReservationKey;
-pub use types::{BucketKey, PendingPoolError, PhaseState, PreferencePredicate};
+pub use types::{BucketKey, DispatchRank, PendingPoolError, PhaseState, PreferencePredicate};
 pub use view::{ViewSelection, WorkerView};
 
 #[cfg(test)]

@@ -531,6 +531,117 @@ async fn import_failure_does_not_poison_done_set() {
         .await;
 }
 
+/// #509 — a build whose SecondaryAffine gate is NOT YET in the local ledger
+/// (its `TaskAdded` was outrun by the build's assignment frame — a transient
+/// CRDT sync race) must be RE-ROUTED (`TaskFailed{Recoverable}`), NOT failed
+/// `NonRecoverable`. The primary does not re-route a NonRecoverable, so the
+/// pre-fix verdict permanently LOST the build to a transient race. Once the
+/// gate's `TaskAdded` syncs, a fresh assignment runs the import + releases the
+/// build.
+///
+/// Revert-confirm: with the absent-gate verdict reverted to NonRecoverable,
+/// the first-phase `error_type == Recoverable` assertion FAILS (the build is
+/// dropped) — the test pins exactly the #509 regression.
+#[tokio::test(flavor = "current_thread")]
+async fn unsynced_gate_reroutes_recoverable_then_runs_once_synced() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            sec.enter_operational_for_test();
+
+            let affine_hash = "import-not-yet-synced";
+
+            // The gate's TaskAdded has NOT yet reached this node — the hash is
+            // in NEITHER the fat map nor the settled index. A succeeding
+            // importer is registered to PROVE the absent verdict is decided by
+            // the missing body, not the action (the action is never invoked
+            // while the gate is unsynced).
+            let importer = StubImporter::immediate(Ok(()));
+            sec.set_import_action(importer.clone());
+
+            // The build is assigned + queued behind the (absent) gate, then the
+            // single drive runs. Because the gate body resolves over NEITHER
+            // half of the logical ledger, the drive emits the transient absent
+            // verdict.
+            let first = sec
+                .ensure_affine_import(affine_hash.to_string(), make_dependent("B0", 0))
+                .await
+                .unwrap();
+            assert_eq!(first, AffineGateOutcome::StartedRun);
+            sec.run_affine_import_once(affine_hash.to_string(), &mut FakeWorkerFactory)
+                .await
+                .unwrap();
+
+            // The importer was NEVER called (there was no body to import yet),
+            // and the done set is NOT poisoned (a synced retry runs its own
+            // import).
+            assert_eq!(
+                importer.call_count(),
+                0,
+                "an unsynced gate runs NO import (there is no body yet)"
+            );
+            assert!(
+                !sec.op_mut().affine_done.contains(affine_hash),
+                "an unsynced gate must not mark the hash locally-done"
+            );
+
+            // The build was RE-ROUTED, not permanently lost: a single
+            // TaskFailed{Recoverable} (#509 — NonRecoverable would have dropped
+            // it), and NOTHING released.
+            sec.drain_egress().await;
+            assert!(
+                log.borrow().iter().any(|m| matches!(
+                    m,
+                    DistributedMessage::TaskFailed { task_hash, error_type, .. }
+                    if task_hash == "B0" && *error_type == ErrorType::Recoverable
+                )),
+                "an unsynced gate must re-route its queued build \
+                 TaskFailed{{Recoverable}} (#509), NOT NonRecoverable; got {:?}",
+                log.borrow()
+            );
+            assert!(
+                released_hashes(&log).is_empty(),
+                "an unsynced gate releases NOTHING — the build re-routes instead"
+            );
+
+            // The gate's TaskAdded NOW syncs (the build's retry re-assignment
+            // arrives once the gate is in the ledger). A fresh dependent finds
+            // the hash neither done nor running → StartedRun, and this time the
+            // body resolves, so the single import RUNS and the build releases.
+            seed_affine_task(&mut sec, affine_hash);
+            let retry = sec
+                .ensure_affine_import(affine_hash.to_string(), make_dependent("B0", 0))
+                .await
+                .unwrap();
+            assert_eq!(
+                retry,
+                AffineGateOutcome::StartedRun,
+                "once the gate syncs, the re-routed build starts a fresh single run"
+            );
+            sec.run_affine_import_once(affine_hash.to_string(), &mut FakeWorkerFactory)
+                .await
+                .unwrap();
+            assert_eq!(
+                importer.call_count(),
+                1,
+                "the synced retry runs the import exactly once"
+            );
+            assert!(
+                sec.op_mut().affine_done.contains(affine_hash),
+                "the synced import completes and marks the hash locally-done"
+            );
+            sec.drain_egress().await;
+            assert!(
+                released_hashes(&log).contains(&"B0".to_string()),
+                "the synced import releases the build (LocalDependencyReleased)"
+            );
+        })
+        .await;
+}
+
 /// The shared core's bounded OUTER retry: a `Transient` the provider could not
 /// absorb is re-attempted, and an eventual success releases the queued
 /// dependent (the import is locally done).
@@ -1143,6 +1254,23 @@ async fn affine_gate_detected_after_spill() {
                 sec.op_mut().affine_running.get(gate_hash).map(Vec::len),
                 Some(1),
                 "the single per-secondary import is driven behind the spilled gate"
+            );
+            // The drive resolves the SPILLED gate's body from the settled
+            // record (`affine_gate_task` — fat OR settled) and actually RUNS
+            // the import. Before the #509 fix the fat-only `task_state` read
+            // went blind here and the spilled-gate import silently fell into
+            // the absent verdict (the stub was never called).
+            for _ in 0..100 {
+                if stub.call_count() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                stub.call_count(),
+                1,
+                "the spilled-gate import is resolved from the settled record \
+                 and driven off the loop (the fat-only read no longer goes blind)"
             );
         })
         .await;

@@ -2358,6 +2358,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.pre_run_hook_abort.as_deref()
     }
 
+    /// The run-level `pre_staged_mode` fact this primary stamps into every
+    /// `InitialAssignment` it serves — `config.source_pre_staged_root.is_some()`,
+    /// the EXACT predicate `assignment::send_initial_assignment_to` uses. A
+    /// promotion recipe reads it back to confirm a promoted primary inherited
+    /// the run's `--source-already-staged` mode (the fact a compute secondary's
+    /// flag-less boot `task_args` does NOT carry — it rides the delivered
+    /// `forwarded_argv`); without it a mid-run joiner is served
+    /// `pre_staged_mode=false` and hash-verifies bind-mounted files it should
+    /// accept by existence.
+    pub fn stamps_pre_staged_mode(&self) -> bool {
+        self.config.source_pre_staged_root.is_some()
+    }
+
     /// Install the consumer custom-message hook (F5) BEFORE `run` (the
     /// same pre-run-setter contract as the other `register_*` / `set_*`
     /// installers). The pyo3 layer builds the closure off the duck-typed

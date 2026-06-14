@@ -182,6 +182,8 @@ fn roundtrip_all_message_types() {
                 respawn_events_hash: 0xBB,
                 phases_ended_count: 1,
                 phases_ended_hash: 0xCC,
+                wind_down_requested_count: 1,
+                wind_down_requested_hash: 0xC7,
                 custom_messages_count: 2,
                 custom_messages_hash: 0xDD,
                 custom_terminal_watermarks_count: 1,

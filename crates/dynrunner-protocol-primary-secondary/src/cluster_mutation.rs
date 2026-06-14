@@ -316,6 +316,54 @@ pub enum ClusterMutation<I> {
     /// shape. There is no un-abort: once requested, the freeze holds
     /// for the rest of the run.
     GracefulAbortRequested,
+    /// "This ONE seated secondary should drain its current work and then
+    /// gracefully depart at its next quiescence." The per-peer,
+    /// incarnation-scoped sibling of [`Self::GracefulAbortRequested`]:
+    /// where graceful-abort freezes the WHOLE fleet's dispatch, this winds
+    /// down exactly one named secondary while the rest of the run
+    /// continues untouched.
+    ///
+    /// Originated ONLY by the authoritative primary, from the frame-ingest
+    /// re-admission seam: when a falsely-removed member re-admits AND a
+    /// respawn replacement for it has already SEATED (both are live
+    /// members → double-occupancy holding two SLURM jobs against the
+    /// shared account quota), the primary marks the REPLACEMENT for
+    /// wind-down. The replacement (not the re-admitted original) is the
+    /// one that stands down: the original is the process that was wrongly
+    /// removed and never knew it; the replacement was spawned only to
+    /// cover a death that turned out false.
+    ///
+    /// `member_gen` is the replacement's CURRENT membership incarnation
+    /// (read off the ledger at origination, exactly like
+    /// [`Self::PeerRemoved`]). The receiving secondary acts on the
+    /// directive ONLY when the stamped generation matches its own live
+    /// incarnation, so a wound-down-then-respawned id at a higher
+    /// generation is never re-targeted by a stale directive.
+    ///
+    /// Set-shaped, monotone latch (no un-request): the apply rule records
+    /// the `(secondary_id, member_gen)` pair in a grow-only set and NoOps
+    /// a re-application of an already-recorded pair — exactly the
+    /// [`Self::GracefulAbortRequested`] sticky shape, generalized from one
+    /// global bit to a per-incarnation set. Replicated (live broadcast +
+    /// snapshot + AE digest) so it survives a primary failover and reaches
+    /// the replacement no matter which mesh hop carries it.
+    ///
+    /// The directed secondary, once its in-flight work has drained
+    /// (`active_tasks.is_empty()` — the same quiescence predicate the
+    /// graceful-abort drain uses), self-authors a `PeerRemoved {
+    /// SelfDeparture }` (the existing graceful-leave path) and exits,
+    /// releasing its SLURM job. That SelfDeparture must NOT spawn a
+    /// replacement — the respawn-admission gate suppresses every
+    /// deliberate self-departure, closing the wind-down→respawn loop.
+    WindDownRequested {
+        secondary_id: String,
+        /// The replacement's membership incarnation at origination time;
+        /// the directive applies only to that exact incarnation (see the
+        /// variant doc). `#[serde(default)]` decodes a pre-field sender's
+        /// frame to generation 0.
+        #[serde(default)]
+        member_gen: u64,
+    },
     /// "This run still OWES discovery." Sets the replicated
     /// `discovery_debt` lattice to `Owed`.
     ///

@@ -92,6 +92,8 @@ fn roundtrip_state_digest_payload() {
         respawn_events_hash: 0xDEAD_C0DE,
         phases_ended_count: 2,
         phases_ended_hash: 0xFEED_FACE,
+        wind_down_requested_count: 1,
+        wind_down_requested_hash: 0x0467_0467,
         custom_messages_count: 3,
         custom_messages_hash: 0xC0FF_EE00,
         custom_terminal_watermarks_count: 1,

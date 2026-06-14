@@ -397,6 +397,27 @@ impl<I: Identifier> ClusterState<I> {
                 self.graceful_abort_requested = true;
                 ApplyOutcome::Applied
             }
+            ClusterMutation::WindDownRequested {
+                secondary_id,
+                member_gen,
+            } => {
+                // Grow-only set-insert of the `(secondary_id, member_gen)`
+                // wind-down directive — the per-incarnation sibling of the
+                // global `GracefulAbortRequested` latch. A re-applied /
+                // duplicate directive (at-least-once delivery, snapshot
+                // re-broadcast, AE catch-up) is a NoOp once the pair is
+                // recorded; a directive for a DIFFERENT incarnation of the
+                // same id (higher `member_gen`) is its own distinct pair, so
+                // a stale lower-generation directive can never re-target a
+                // re-seated id. The carried generation IS the arbiter (no
+                // version stamp), mirroring the `PeerRemoved` per-incarnation
+                // rule.
+                if self.wind_down_requested.insert((secondary_id, member_gen)) {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
+                }
+            }
             ClusterMutation::DiscoveryDebtDeclared => {
                 // Declare the per-run discovery debt: `Undeclared → Owed`.
                 // Sticky-monotone: the declare is Applied ONLY from the
