@@ -505,6 +505,28 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::Unfulfillable { .. }
                 | TaskState::InvalidTask { .. }
         );
+        // A NEVER-PRODUCED-OUTPUT terminal: the failure-analogue of
+        // `newly_completed`. A `Failed { NonRecoverable }` or `InvalidTask`
+        // prereq can never yield its output, so a dependent gated on it can
+        // never run — its `Blocked` entry must cascade-fail (the
+        // `cascade_fail_blocked_dependents` walk below). DELIBERATELY tighter
+        // than `failure_won`: `Unfulfillable` is the operator-REINJECTABLE
+        // class (its dependents stay `Blocked`, awaiting the reinject+complete
+        // path — the `apply_fail_permanent` cascade-PAUSE contract), and a
+        // recoverable / OOM / resource `Failed` is retry-ELIGIBLE (its
+        // dependents stay `Blocked` until the retry buckets succeed or
+        // exhaust — only then does `finalize_phase_soft_failures` cascade).
+        // This is the SAME predicate the spawn-time classifier
+        // (`apply_tasks_spawned`) cascades on: `Failed { NonRecoverable }` and
+        // `InvalidTask` → cascade-fail; `Unfulfillable` / other `Failed` →
+        // `Blocked`.
+        let post_is_cascade_terminal = matches!(
+            incoming,
+            TaskState::Failed {
+                kind: dynrunner_core::ErrorType::NonRecoverable,
+                ..
+            } | TaskState::InvalidTask { .. }
+        );
         // Build the event from the POST-merge state BEFORE the move so the
         // projection reads the winning state's fields.
         let newly_completed = post_is_completed && !was_completed;
@@ -590,10 +612,120 @@ impl<I: Identifier> ClusterState<I> {
         if newly_completed {
             self.record_task_outputs_value(hash, incoming_outputs);
         }
+        // Newly-terminally-failed cross-task CASCADE-FAIL — the failure twin of
+        // the `newly_completed → resume_blocked_on` unblock above. A
+        // never-produced-output terminal (NonRecoverable / InvalidTask) means
+        // every `Blocked { on == hash }` dependent can never run, so they
+        // cascade-fail to the same `Failed { NonRecoverable, "upstream-failed" }`
+        // shape (transitively, over the `on`-chain). Run AFTER the winning write
+        // so the prereq's terminal is the in-slot state when the walk recurses.
+        // The cascaded dependents' terminal-completion events are emitted INSIDE
+        // the walk (it routes each through THIS join, whose built event the walk
+        // emits) — the walk runs after this prereq's OWN event is already in the
+        // returned `MergeOutcome`, so the caller emits the prereq's event and the
+        // walk has emitted every dependent's, with no double-handling.
+        if post_is_cascade_terminal {
+            self.cascade_fail_blocked_dependents(hash, resumed);
+        }
         MergeOutcome::Applied {
             newly_completed,
             failure_won,
             event,
+        }
+    }
+
+    /// Cascade-fail every `Blocked { on == failed_prereq_hash }` dependent
+    /// to the canonical upstream-failed terminal — the failure-analogue of
+    /// [`Self::resume_blocked_on`] (which UNBLOCKS dependents on a prereq's
+    /// COMPLETION). A `Failed { NonRecoverable }` / `InvalidTask` prereq will
+    /// NEVER produce its output, so a dependent gated on it can never satisfy
+    /// that dep and must terminally resolve rather than sit `Blocked` forever
+    /// (the strand the per-phase drain-guard otherwise authors `RunShouldFail`
+    /// from — a phase whose blocked dependents never reach a terminal drains
+    /// with no terminal outcome and false-fails the run).
+    ///
+    /// ## Terminal state (reuse, not a new variant)
+    /// Each dependent becomes `Failed { kind: NonRecoverable, last_error:
+    /// "upstream-failed", .. }` — the SAME shape the THREE existing cascade
+    /// sites mint (the spawn-time classifier `apply_tasks_spawned`, the
+    /// drain-edge `finalize_phase_soft_failures`, and the operator
+    /// `apply_fail_permanent`), so the accounting (`outcome_counts → fail_final`)
+    /// and the terminal-event projection are byte-identical regardless of which
+    /// path resolved the dependent. NOT `Unfulfillable`: that is the
+    /// operator-reinjectable class, semantically wrong for a dependent whose
+    /// prereq is non-recoverably dead.
+    ///
+    /// ## Transitive (a → b → c) via the single join
+    /// The walk routes each dependent's transition through
+    /// [`Self::merge_task_state`] itself — whose own
+    /// `post_is_cascade_terminal` re-invokes THIS walk on the just-failed
+    /// dependent's hash. So `a` failing cascades `b`, whose cascade-fail
+    /// (a `NonRecoverable` terminal) re-enters here and cascades `c`: the
+    /// recursion through the one join IS the flood-fill over the reverse
+    /// `on`-edges. No hand-rolled frontier queue, no parallel edge walker.
+    ///
+    /// ## Termination + cycle / re-process guard
+    /// The dep graph is acyclic (`PendingPool::new` cycle-rejects it). Each
+    /// dependent transitions OUT of `Blocked` into `Failed`, so it is no
+    /// longer matched by any subsequent `on ==` scan (a diamond `c` on
+    /// `{a, b}`: when `a` fails, `c` cascade-fails; when `b` later fails, `c`
+    /// is already `Failed`, not `Blocked`, so it is not re-collected — and the
+    /// `merge_task_state` join NoOps an idempotent re-failure anyway). One
+    /// failed dep suffices to cascade a dependent: an all-deps-required task
+    /// with ANY never-produced prereq is itself unfulfillable.
+    ///
+    /// ## A dependent ALREADY terminal is skipped
+    /// The collect scans ONLY `Blocked` entries, so a dependent that already
+    /// reached a real terminal (completed before the prereq's late failure,
+    /// or invalid in its own right) is not re-collected; the join would NoOp
+    /// it regardless.
+    ///
+    /// Collects the matching hashes first (an immutable scan), then routes
+    /// each through the join, to avoid mutating `self.tasks` while iterating.
+    /// `resumed` is threaded through purely to satisfy the join's signature
+    /// — a cascade-fail produces no `Blocked → Pending` resumes, so nothing is
+    /// appended on this path.
+    fn cascade_fail_blocked_dependents(
+        &mut self,
+        failed_prereq_hash: &str,
+        resumed: &mut Vec<dynrunner_core::TaskInfo<I>>,
+    ) {
+        // Every DIRECT dependent: a `Blocked { on }` entry whose `on` names
+        // the just-failed prereq. The transitive reach is handled by the
+        // per-dependent `merge_task_state` recursion, not a wider scan here.
+        let dependents: Vec<(String, TaskState<I>)> = self
+            .tasks
+            .iter()
+            .filter_map(|(h, s)| match s {
+                TaskState::Blocked { on, task, attempt } if on == failed_prereq_hash => Some((
+                    h.clone(),
+                    TaskState::Failed {
+                        task: task.clone(),
+                        kind: dynrunner_core::ErrorType::NonRecoverable,
+                        last_error: "upstream-failed".to_string(),
+                        version: TaskVersion::default(),
+                        attempt: *attempt,
+                    },
+                )),
+                _ => None,
+            })
+            .collect();
+        for (dep_hash, cascade_terminal) in dependents {
+            // Route through the ONE join: it runs the dominance compare (an
+            // idempotent re-cascade NoOps), bumps the per-phase Failed EVENT
+            // tally (#358), writes through `set_task_state` (#524 + #520
+            // narration), recurses into THIS walk for `dep_hash`'s own
+            // dependents (the transitive flood), and BUILDS the dependent's
+            // terminal-completion event. The build is the join's concern; the
+            // EMIT is the caller's (apply's `apply_merge` does it for the
+            // top-level mutation) — so emit it here for the cascaded dependent.
+            // A cascade-fail caches no outputs (`None`).
+            if let MergeOutcome::Applied {
+                event: Some(ev), ..
+            } = self.merge_task_state(&dep_hash, cascade_terminal, None, resumed)
+            {
+                self.emit_task_completed_event(ev);
+            }
         }
     }
 }

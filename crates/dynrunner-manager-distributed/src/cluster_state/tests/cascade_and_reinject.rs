@@ -650,3 +650,372 @@ fn invalid_task_terminal_lockout_blocks_late_failed_and_completed() {
         other => panic!("expected InvalidTask preserved, got {other:?}"),
     }
 }
+
+// ── Runtime cascade-FAIL of blocked dependents (#527) ──
+//
+// The failure-analogue of the `TaskCompleted` auto-resume above: a task
+// that transitions to a NEVER-PRODUCED-OUTPUT terminal at RUNTIME
+// (NonRecoverable / InvalidTask) must cascade-fail every dependent sitting
+// `Blocked { on: <its hash> }`, transitively, rather than strand them
+// `Blocked` forever (the consumer's 1,314-task drain-guard fire).
+
+/// A task in a chosen phase (the cross-phase drain scenario needs the
+/// dependent in a later phase than its prereq). `mk_task` hardwires "p0".
+fn mk_task_in(name: &str, phase: &str) -> TaskInfo<RunnerIdentifier> {
+    let mut t = mk_task(name);
+    t.phase_id = PhaseId::from(phase);
+    t
+}
+
+/// HEADLINE + revert-confirm: `b` Blocked-on-`a`; `a` fails NonRecoverable
+/// at runtime → `b` is terminally resolved to `Failed { NonRecoverable,
+/// "upstream-failed" }`, leaves the `Blocked` count, and is ACCOUNTED in
+/// `outcome_counts().fail_final`.
+///
+/// REVERT-CONFIRM: without the `cascade_fail_blocked_dependents` call in
+/// `merge_task_state`, `b` stays `Blocked` (the strand) — `counts().blocked`
+/// stays 1 and `fail_final` counts only `a` — so the assertions below FAIL,
+/// reproducing the production strand.
+#[test]
+fn cascade_fail_resolves_direct_blocked_dependent() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "a".into(),
+        task: mk_task("a"),
+    });
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "b".into(),
+        task: mk_task("b"),
+    });
+    s.apply(ClusterMutation::TaskBlocked {
+        hash: "b".into(),
+        on: "a".into(),
+    });
+    assert_eq!(s.counts().blocked, 1, "precondition: b is Blocked-on-a");
+
+    // a fails terminally (never-produced output).
+    assert_eq!(
+        s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
+            hash: "a".into(),
+            kind: ErrorType::NonRecoverable,
+            error: "boom".into(),
+            version: Default::default(),
+        }),
+        ApplyOutcome::Applied
+    );
+
+    // b cascade-failed to the canonical upstream-failed shape.
+    match s.task_state("b") {
+        Some(TaskState::Failed {
+            kind, last_error, ..
+        }) => {
+            assert_eq!(*kind, ErrorType::NonRecoverable);
+            assert_eq!(last_error, "upstream-failed");
+        }
+        other => panic!("expected b cascade-failed, got {other:?}"),
+    }
+    // b left the Blocked set; both a and b are accounted as terminal failures.
+    assert_eq!(s.counts().blocked, 0, "b is no longer stranded Blocked");
+    assert_eq!(
+        s.outcome_counts().fail_final,
+        2,
+        "both a and the cascaded b are accounted as fail_final"
+    );
+}
+
+/// TRANSITIVE a → b → c: a fails → b cascade-fails → c (Blocked-on-b)
+/// ALSO cascade-fails. The transitive flood rides the per-dependent
+/// `merge_task_state` recursion.
+#[test]
+fn cascade_fail_is_transitive() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    for h in ["a", "b", "c"] {
+        s.apply(ClusterMutation::TaskAdded {
+            hash: h.into(),
+            task: mk_task(h),
+        });
+    }
+    s.apply(ClusterMutation::TaskBlocked {
+        hash: "b".into(),
+        on: "a".into(),
+    });
+    s.apply(ClusterMutation::TaskBlocked {
+        hash: "c".into(),
+        on: "b".into(),
+    });
+
+    s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
+        hash: "a".into(),
+        kind: ErrorType::NonRecoverable,
+        error: "boom".into(),
+        version: Default::default(),
+    });
+
+    for h in ["b", "c"] {
+        match s.task_state(h) {
+            Some(TaskState::Failed {
+                kind, last_error, ..
+            }) => {
+                assert_eq!(*kind, ErrorType::NonRecoverable);
+                assert_eq!(last_error, "upstream-failed");
+            }
+            other => panic!("expected {h} cascade-failed, got {other:?}"),
+        }
+    }
+    assert_eq!(s.counts().blocked, 0);
+    assert_eq!(s.outcome_counts().fail_final, 3, "a, b, c all fail_final");
+}
+
+/// DIAMOND: `c` depends on `{a, b}` (Blocked-on-a; b still Pending). `a`
+/// fails → `c` cascade-fails even though `b` is fine — ONE failed dep
+/// suffices (an all-deps task with any never-produced prereq is itself
+/// unfulfillable). `b` is untouched.
+///
+/// `c` is Blocked on the FIRST-unresolved dep (`a`) per the
+/// `apply_tasks_spawned` classifier's `on` rule; this models that shape.
+#[test]
+fn cascade_fail_one_failed_dep_suffices_diamond() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    for h in ["a", "b", "c"] {
+        s.apply(ClusterMutation::TaskAdded {
+            hash: h.into(),
+            task: mk_task(h),
+        });
+    }
+    // c is blocked on a (the first unresolved dep); b stays Pending.
+    s.apply(ClusterMutation::TaskBlocked {
+        hash: "c".into(),
+        on: "a".into(),
+    });
+
+    s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
+        hash: "a".into(),
+        kind: ErrorType::NonRecoverable,
+        error: "boom".into(),
+        version: Default::default(),
+    });
+
+    assert!(
+        matches!(
+            s.task_state("c"),
+            Some(TaskState::Failed {
+                kind: ErrorType::NonRecoverable,
+                ..
+            })
+        ),
+        "c cascade-fails on its single failed dep a, despite b being live"
+    );
+    // b — a healthy sibling, never a dependent of a — is untouched.
+    assert!(
+        matches!(s.task_state("b"), Some(TaskState::Pending { .. })),
+        "b is unrelated to a's failure and stays Pending"
+    );
+}
+
+/// InvalidTask is a never-produced-output terminal too → it cascades a
+/// Blocked dependent (matching the spawn-time classifier's InvalidTask arm).
+#[test]
+fn cascade_fail_fires_on_invalid_task_prereq() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "a".into(),
+        task: mk_task("a"),
+    });
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "b".into(),
+        task: mk_task("b"),
+    });
+    s.apply(ClusterMutation::TaskBlocked {
+        hash: "b".into(),
+        on: "a".into(),
+    });
+    s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
+        hash: "a".into(),
+        kind: ErrorType::InvalidTask {
+            reason: "structurally invalid".to_string().into(),
+        },
+        error: "invalid".into(),
+        version: Default::default(),
+    });
+    assert!(
+        matches!(
+            s.task_state("b"),
+            Some(TaskState::Failed {
+                kind: ErrorType::NonRecoverable,
+                ..
+            })
+        ),
+        "an InvalidTask prereq cascade-fails its blocked dependent"
+    );
+}
+
+/// RECOVERABLE failure (retry-eligible) does NOT cascade: the dependent
+/// stays Blocked, correctly, because the prereq's retry pass may yet
+/// succeed and produce the output. (The drain-edge `finalize_soft_failures`
+/// owns the cascade IF the retry buckets later decline.)
+#[test]
+fn recoverable_fail_does_not_cascade() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "a".into(),
+        task: mk_task("a"),
+    });
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "b".into(),
+        task: mk_task("b"),
+    });
+    s.apply(ClusterMutation::TaskBlocked {
+        hash: "b".into(),
+        on: "a".into(),
+    });
+    s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
+        hash: "a".into(),
+        kind: ErrorType::Recoverable,
+        error: "transient".into(),
+        version: Default::default(),
+    });
+    assert!(
+        matches!(s.task_state("b"), Some(TaskState::Blocked { .. })),
+        "a recoverable (retry-eligible) failure must NOT cascade — b stays Blocked"
+    );
+}
+
+/// UNFULFILLABLE (operator-reinjectable) does NOT cascade: the dependent
+/// stays Blocked, awaiting the reinject + complete path — the deliberate
+/// cascade-PAUSE contract (`apply_fail_permanent`'s Unfulfillable split).
+/// Pins that the tighter `post_is_cascade_terminal` predicate excludes
+/// `Unfulfillable` even though it is a `failure_won` terminal.
+#[test]
+fn unfulfillable_fail_does_not_cascade() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "a".into(),
+        task: mk_task("a"),
+    });
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "b".into(),
+        task: mk_task("b"),
+    });
+    s.apply(ClusterMutation::TaskBlocked {
+        hash: "b".into(),
+        on: "a".into(),
+    });
+    s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
+        hash: "a".into(),
+        kind: ErrorType::Unfulfillable {
+            reason: "missing".to_string().into(),
+        },
+        error: "missing".into(),
+        version: Default::default(),
+    });
+    assert!(
+        matches!(s.task_state("b"), Some(TaskState::Blocked { .. })),
+        "an Unfulfillable (reinjectable) prereq must NOT cascade — b stays Blocked"
+    );
+}
+
+/// THE DRAIN SCENARIO (reproduces the consumer's 1,314-stranded drain-guard
+/// fire): the prereq `a` lives in phase `p0`; its dependent `b` lives in a
+/// LATER phase `p1`, Blocked-on-`a`. When `a` fails NonRecoverable, `b`
+/// cascade-fails — so phase `p1`'s rollup reports `has_live == false` (every
+/// task terminal) and the phase drains CLEANLY, no stranded live `Blocked`
+/// dependent to trip the per-phase drain-guard into a spurious RunShouldFail.
+///
+/// REVERT-CONFIRM: without the cascade, `b` stays `Blocked` (non-terminal →
+/// `has_live == true`), so `p1` never reaches a terminal outcome and the
+/// drain-guard authors the false run failure — the assertion below FAILS.
+#[test]
+fn cascade_fail_drains_dependent_phase_cleanly() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    // a in p0; b in p1 depends on a (cross-phase, the production shape).
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "a".into(),
+        task: mk_task_in("a", "p0"),
+    });
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "b".into(),
+        task: mk_task_in("b", "p1"),
+    });
+    s.apply(ClusterMutation::TaskBlocked {
+        hash: "b".into(),
+        on: "a".into(),
+    });
+
+    // Before the failure: p1 holds a live (Blocked) dependent.
+    {
+        let rollups = s.phase_rollups();
+        let p1 = PhaseId::from("p1");
+        let r = rollups.get(&p1).expect("p1 present");
+        assert!(r.has_any && r.has_live, "p1 is live before a's failure");
+    }
+
+    s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
+        hash: "a".into(),
+        kind: ErrorType::NonRecoverable,
+        error: "boom".into(),
+        version: Default::default(),
+    });
+
+    // After the cascade: p1 drains cleanly — no live work remains.
+    let rollups = s.phase_rollups();
+    let p1 = PhaseId::from("p1");
+    let r = rollups.get(&p1).expect("p1 present");
+    assert!(
+        r.has_any && !r.has_live,
+        "p1 drains cleanly after the cascade — b is terminal, not stranded Blocked"
+    );
+    // And both phases' failures are accounted (no vanished dependent).
+    assert_eq!(s.outcome_counts().fail_final, 2);
+}
+
+/// The cascaded dependent surfaces a terminal-completion EVENT (so consumer
+/// dedup buckets + the demoted-primary narration see the failure), built
+/// from the canonical upstream-failed shape via the shared
+/// `to_completed_event` projection.
+#[test]
+fn cascade_fail_emits_dependent_completion_event() {
+    use crate::task_completed::TaskCompletedEvent;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<TaskCompletedEvent>();
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.install_task_completed_sender(tx);
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "a".into(),
+        task: mk_task("a"),
+    });
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "b".into(),
+        task: mk_task("b"),
+    });
+    s.apply(ClusterMutation::TaskBlocked {
+        hash: "b".into(),
+        on: "a".into(),
+    });
+    s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
+        hash: "a".into(),
+        kind: ErrorType::NonRecoverable,
+        error: "boom".into(),
+        version: Default::default(),
+    });
+
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    // Both the prereq AND the cascaded dependent emit a failure event.
+    assert!(
+        events.iter().any(|e| e.task_id == "a" && !e.success),
+        "prereq a emits a failure event: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e.task_id == "b" && !e.success),
+        "cascaded dependent b emits a failure event: {events:?}"
+    );
+}
