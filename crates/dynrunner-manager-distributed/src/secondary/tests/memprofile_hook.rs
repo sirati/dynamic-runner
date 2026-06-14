@@ -183,6 +183,7 @@ async fn memprofile_hook_writes_profile_with_fake_subcgroup() {
                     kind: Default::default(),
                     setup_affinity: None,
                     upload_file: None,
+                    required_files: None,
                     resolved_path: None,
                 };
             secondary.notify_sampler_assigned(0, &binary);

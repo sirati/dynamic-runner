@@ -61,6 +61,7 @@ fn make_task(name: &str, phase: &str, type_id: &str) -> TaskInfo<TestId> {
         kind: Default::default(),
         setup_affinity: None,
         upload_file: None,
+        required_files: None,
         resolved_path: None,
     }
 }

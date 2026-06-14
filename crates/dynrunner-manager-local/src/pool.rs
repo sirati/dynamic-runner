@@ -1123,6 +1123,7 @@ mod orphan_poll_task_tests {
             kind: Default::default(),
             setup_affinity: None,
             upload_file: None,
+            required_files: None,
             resolved_path: None,
         }
     }

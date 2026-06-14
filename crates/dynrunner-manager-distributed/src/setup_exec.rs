@@ -192,6 +192,7 @@ mod tests {
             kind: TaskKind::Setup,
             setup_affinity: affinity.map(str::to_string),
             upload_file: None,
+            required_files: None,
             resolved_path: None,
         }
     }

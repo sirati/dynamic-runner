@@ -9,7 +9,7 @@ use pyo3::types::PyList;
 
 use dynrunner_core::{
     AffinityId, Identifier, PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskDep, TaskInfo,
-    TypeId,
+    TypeId, UploadFileRef,
 };
 
 use super::identifier::{PyBinaryIdentifier, identifier_from_pyobj};
@@ -61,6 +61,19 @@ pub(crate) fn task_to_pytask<I: Identifier>(task: &TaskInfo<I>) -> PyTaskInfo {
         is_setup: task.kind.is_setup(),
         // `setup_affinity` IS on `TaskInfo<I>`, so the projection reflects it.
         setup_affinity: task.setup_affinity.clone(),
+        // `required_files` IS on `TaskInfo<I>` (#336 P2), so the projection
+        // reflects it — each core `UploadFileRef` renders back to its
+        // `(source, optional dest)` pair.
+        required_files: task
+            .required_files()
+            .iter()
+            .map(|f| {
+                (
+                    f.source.to_string_lossy().into_owned(),
+                    f.dest.as_ref().map(|d| d.to_string_lossy().into_owned()),
+                )
+            })
+            .collect(),
     }
 }
 
@@ -145,6 +158,58 @@ fn extract_task_depends_on(
     let mut out = Vec::new();
     for item in iter {
         out.push(extract_task_dep(&item?, enclosing_phase)?);
+    }
+    Ok(out)
+}
+
+/// Extract one ``files`` entry into a Rust-side [`UploadFileRef`] (#336 P2).
+///
+/// Single concern: bridge the two legal Python shapes a consumer writes in
+/// ``TaskInfo.files`` — a bare ``str``/``Path`` source (the common case;
+/// destination is derived), or a ``(source, dest)`` 2-tuple/sequence (explicit
+/// placement for a shared resource that does not live under ``--source``).
+/// Order of attempts:
+///
+/// 1. Try ``extract::<String>``. Succeeds for a bare ``str`` source and (via
+///    ``PathBuf``'s string coercion) a ``Path``; becomes
+///    ``UploadFileRef { source, dest: None }``.
+/// 2. Fall back to a 2-element ``(source, dest)`` sequence. ``dest`` may be
+///    ``None`` (same as the bare case) or an explicit ``str``/``Path``.
+///
+/// A shape that is neither raises a ``ValueError`` naming the offending entry
+/// — the same loud-at-the-boundary contract the surrounding extractors use.
+fn extract_one_required_file(obj: &Bound<'_, PyAny>) -> PyResult<UploadFileRef> {
+    // A bare source (str / Path coerced to str) — destination derived.
+    if let Ok(source) = obj.extract::<String>() {
+        return Ok(UploadFileRef {
+            source: PathBuf::from(source),
+            dest: None,
+        });
+    }
+    // A `(source, dest)` pair. Extract as a 2-tuple of (String, Option<String>).
+    if let Ok((source, dest)) = obj.extract::<(String, Option<String>)>() {
+        return Ok(UploadFileRef {
+            source: PathBuf::from(source),
+            dest: dest.map(PathBuf::from),
+        });
+    }
+    Err(PyValueError::new_err(
+        "TaskInfo.files entry must be a source path (str/Path) or a \
+         (source, dest) pair; got an unsupported shape. \
+         See `dynamic_runner._shared.task_info.TaskInfo.files`.",
+    ))
+}
+
+/// Walk a Python iterable of ``files`` entries and produce the Rust-side
+/// ``Vec<UploadFileRef>`` (#336 P2). Each entry is bridged by
+/// :func:`extract_one_required_file`; the first per-entry error propagates and
+/// aborts the walk. ``None`` is handled by the caller (collapses to empty); a
+/// non-iterable value raises at ``try_iter``.
+fn extract_required_files(value: &Bound<'_, PyAny>) -> PyResult<Vec<UploadFileRef>> {
+    let iter = value.try_iter()?;
+    let mut out = Vec::new();
+    for item in iter {
+        out.push(extract_one_required_file(&item?)?);
     }
     Ok(out)
 }
@@ -319,6 +384,18 @@ pub(crate) fn extract_binaries(
                 .flatten()
                 .filter(|s| !s.is_empty());
 
+            // Optional `files` — the consumer-declared required files this WORK
+            // task needs uploaded before it runs (#336 P2). Each entry is a
+            // bare `str`/`Path` source, or a `(source, dest)` pair. Missing /
+            // None collapses to empty (the common case — every pre-#336 task).
+            // The framework's files-attach transform DEDUPS these across the
+            // batch into upload setup tasks + deps; this boundary only carries
+            // the declaration through onto `required_files`.
+            let required_files: Vec<UploadFileRef> = match item.getattr("files") {
+                Ok(v) if !v.is_none() => extract_required_files(&v)?,
+                _ => Vec::new(),
+            };
+
             Ok((
                 TaskInfo {
                     path: PathBuf::from(path),
@@ -335,6 +412,9 @@ pub(crate) fn extract_binaries(
                     kind,
                     setup_affinity,
                     upload_file: None,
+                    // Normalize to the storage shape (empty ⇒ `None`, so the
+                    // common no-files task never bloats the wire / the enum).
+                    required_files: dynrunner_core::required_files_storage(required_files),
                     resolved_path: None,
                 },
                 skipped_already_done,
@@ -547,6 +627,169 @@ mod tests {
                 "an item that OMITS the attribute must extract as unmarked \
                  (the optional / back-compat default)"
             );
+        });
+    }
+
+    // ── #336 P2: the `files=` consumer surface ──────────────────────────────
+
+    /// Build a TaskInfo-shaped item carrying a `files` attribute (#336 P2).
+    /// `files` is set verbatim to the supplied Python value (a list of bare
+    /// sources and/or `(source, dest)` tuples).
+    fn make_task_item_with_files<'py>(
+        py: Python<'py>,
+        task_id: &str,
+        files: Bound<'py, PyAny>,
+    ) -> Bound<'py, PyAny> {
+        let item = make_task_item(py, task_id, None);
+        item.setattr("files", files).expect("set files");
+        item
+    }
+
+    #[test]
+    fn extract_one_required_file_accepts_bare_source_and_pair() {
+        Python::attach(|py| {
+            // Bare str source -> derived destination.
+            let bare = pyo3::types::PyString::new(py, "/src/a").into_any();
+            let f = extract_one_required_file(&bare).expect("bare source");
+            assert_eq!(f.source, PathBuf::from("/src/a"));
+            assert_eq!(f.dest, None);
+
+            // (source, dest) pair -> explicit placement.
+            let pair = pyo3::types::PyTuple::new(
+                py,
+                [
+                    pyo3::types::PyString::new(py, "/src/b").into_any(),
+                    pyo3::types::PyString::new(py, "/dst/b").into_any(),
+                ],
+            )
+            .expect("pair");
+            let f = extract_one_required_file(pair.as_any()).expect("pair");
+            assert_eq!(f.source, PathBuf::from("/src/b"));
+            assert_eq!(f.dest, Some(PathBuf::from("/dst/b")));
+
+            // (source, None) pair -> derived destination.
+            let pair_none = pyo3::types::PyTuple::new(
+                py,
+                [
+                    pyo3::types::PyString::new(py, "/src/c").into_any(),
+                    py.None().into_bound(py),
+                ],
+            )
+            .expect("pair none");
+            let f = extract_one_required_file(pair_none.as_any()).expect("pair none");
+            assert_eq!(f.source, PathBuf::from("/src/c"));
+            assert_eq!(f.dest, None);
+        });
+    }
+
+    #[test]
+    fn extract_binaries_threads_files_onto_required_files() {
+        // The `files=` consumer surface crosses the extract boundary onto the
+        // core `required_files`. A missing `files` attribute (the back-compat
+        // default) yields empty.
+        Python::attach(|py| {
+            let files = PyList::new(
+                py,
+                [
+                    pyo3::types::PyString::new(py, "/src/a").into_any(),
+                    pyo3::types::PyTuple::new(
+                        py,
+                        [
+                            pyo3::types::PyString::new(py, "/src/b").into_any(),
+                            pyo3::types::PyString::new(py, "/dst/b").into_any(),
+                        ],
+                    )
+                    .expect("pair")
+                    .into_any(),
+                ],
+            )
+            .expect("files list");
+            let with_files = make_task_item_with_files(py, "build", files.into_any());
+            let without = make_task_item(py, "plain", None);
+            let list = PyList::new(py, [with_files, without]).expect("list");
+
+            let out = extract_binaries(&list).expect("extract");
+            assert_eq!(out.len(), 2);
+            // The `files=`-carrying task gets two required files.
+            let build = &out[0].0;
+            assert_eq!(build.task_id, "build");
+            assert_eq!(build.required_files().len(), 2);
+            assert_eq!(build.required_files()[0].source, PathBuf::from("/src/a"));
+            assert_eq!(build.required_files()[0].dest, None);
+            assert_eq!(build.required_files()[1].source, PathBuf::from("/src/b"));
+            assert_eq!(build.required_files()[1].dest, Some(PathBuf::from("/dst/b")));
+            // The plain task (no `files` attribute) has none.
+            assert!(out[1].0.required_files().is_empty(), "no files -> empty");
+        });
+    }
+
+    #[test]
+    fn files_extract_then_augment_dedups_to_one_upload_per_unique_file() {
+        // END-TO-END plumbing (#336 P2): the Python `files=` surface ->
+        // `extract_binaries` -> `required_files` -> the framework's
+        // files-attach augment DEDUPS shared files into ONE upload setup task
+        // per unique file. Three builds share /tc/common; b1 also lists
+        // /tc/delta. Asserts the dedup at the augment layer the primary runs.
+        Python::attach(|py| {
+            let mk = |task_id: &str, srcs: &[&str]| {
+                let entries: Vec<_> = srcs
+                    .iter()
+                    .map(|s| pyo3::types::PyString::new(py, s).into_any())
+                    .collect();
+                let files = PyList::new(py, entries).expect("files");
+                make_task_item_with_files(py, task_id, files.into_any())
+            };
+            let list = PyList::new(
+                py,
+                [
+                    mk("b1", &["/tc/common", "/tc/delta"]),
+                    mk("b2", &["/tc/common"]),
+                    mk("b3", &["/tc/common"]),
+                ],
+            )
+            .expect("list");
+
+            let extracted = extract_binaries(&list).expect("extract");
+            // Run the SAME augment transform the primary's originator runs.
+            let aug = dynrunner_manager_distributed::augment_batch_for_staging(
+                extracted,
+                dynrunner_manager_distributed::StagingStrategy::Disabled,
+            );
+
+            // EXACTLY two upload setup tasks (common, delta) — one per UNIQUE
+            // file, NOT four (one per (task, file) pair).
+            let uploads: Vec<_> = aug
+                .batch
+                .iter()
+                .filter(|(t, _)| t.kind.is_setup() && t.upload_file.is_some())
+                .collect();
+            assert_eq!(
+                uploads.len(),
+                2,
+                "deduped: one upload per unique file (common, delta)"
+            );
+
+            // The single /tc/common upload id, shared by all three builds.
+            let common_id = uploads
+                .iter()
+                .find(|(t, _)| {
+                    t.upload_file.as_ref().unwrap().source.as_path()
+                        == std::path::Path::new("/tc/common")
+                })
+                .map(|(t, _)| t.task_id.clone())
+                .expect("a common upload");
+            for name in ["b1", "b2", "b3"] {
+                let work = aug
+                    .batch
+                    .iter()
+                    .find(|(t, _)| t.task_id == name)
+                    .map(|(t, _)| t)
+                    .expect("work task");
+                assert!(
+                    work.task_depends_on.iter().any(|d| d.task_id == common_id),
+                    "{name} gates on the single shared /tc/common upload"
+                );
+            }
         });
     }
 }
