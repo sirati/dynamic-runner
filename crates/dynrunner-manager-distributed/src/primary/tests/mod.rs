@@ -35,6 +35,7 @@ mod deposed_standdown;
 mod dispatch_decoupling;
 mod dispatch_differential;
 mod e2e;
+mod estimate_escalation;
 mod graceful_abort;
 mod hydrate;
 mod incremental_setup;

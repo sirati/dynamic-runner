@@ -252,6 +252,15 @@ impl<I: Identifier> RemoteWorkerState<I> {
         }
     }
 
+    /// This worker's reserved memory budget (the `max / num_workers`
+    /// parallel-scheduling fraction the scheduler gates `assign_normal`
+    /// against). The read seam the estimate-escalation stall check (#499)
+    /// uses to ask "does any queued task fit any per-worker budget".
+    pub(super) fn reserved_budget_mem(&self) -> u64 {
+        self.resource_budgets
+            .get(&dynrunner_core::ResourceKind::memory())
+    }
+
     pub(super) fn budget_info(&self) -> WorkerBudgetInfo<I> {
         WorkerBudgetInfo {
             worker_id: self.worker_id,
@@ -2613,6 +2622,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // across re-runs.
         entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         entries.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// The full advertised resource capacity of `secondary` — its
+    /// replicated `SecondaryCapacity` record projected into a
+    /// [`ResourceMap`]. Read from the CRDT capacity ledger (the SAME
+    /// authoritative source `reconstruct_workers_from_cluster_state` builds
+    /// the roster from), NOT the transport-handle `self.secondaries` map —
+    /// so it agrees with the per-worker budgets the roster carries and is
+    /// populated on every path that grows the roster (welcome handshake AND
+    /// a bare `SecondaryCapacity` apply). Empty for a secondary with no
+    /// capacity record (treated as zero by every `ResourceMap::get`). The
+    /// single read seam for "how big is this node", consumed by the
+    /// estimate-escalation best-effort cap (#499).
+    pub(super) fn secondary_advertised_resources(&self, secondary: &str) -> ResourceMap {
+        match self.cluster_state.secondary_capacity(secondary) {
+            Some(record) => record
+                .resources
+                .iter()
+                .map(|r| (r.kind.clone(), r.amount))
+                .collect(),
+            None => ResourceMap::new(),
+        }
     }
 
     /// Borrow the pending pool. Panics if called before `run()` has
