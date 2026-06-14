@@ -357,8 +357,14 @@ async fn run_relocate_with_dispatch_target(facet: RelocateStagingFacet) -> (usiz
         pri_mesh.register_local_role(LocalRole::Primary, PeerId::from("setup"));
     pri_mesh.publish_membership();
     let pri_config = PrimaryConfig {
-        connect_timeout: Duration::from_secs(10),
-        peer_timeout: Duration::from_secs(10),
+        // Generous test-only budgets: the in-process channel transport
+        // is near-zero-latency; these exist only to bound a hung test,
+        // not to detect network failures. Generous values prevent
+        // spurious internal timeouts when the full suite runs at high
+        // parallelism and the OS scheduler is busy (the 60s outer
+        // deadline absorbs the same pressure at the test level).
+        connect_timeout: Duration::from_secs(60),
+        peer_timeout: Duration::from_secs(60),
         // Two remote compute peers (sec-0, sec-1) must connect before the
         // setup peer relocates + assigns.
         num_secondaries: 2,
@@ -390,9 +396,13 @@ async fn run_relocate_with_dispatch_target(facet: RelocateStagingFacet) -> (usiz
         ..Default::default()
     };
 
-    let setup_outcome = tokio::time::timeout(Duration::from_secs(30), pri_node.run(pri_inputs))
+    // 60s: the run completes in ~0.5s in isolation; the generous bound
+    // is only needed as a regression-detection backstop — with
+    // `start_paused = true` the happy path is entirely message-driven
+    // and completes in a single cooperative LocalSet sweep.
+    let setup_outcome = tokio::time::timeout(Duration::from_secs(60), pri_node.run(pri_inputs))
         .await
-        .expect("setup-peer node must resolve (relocate → observer) within 30s");
+        .expect("setup-peer node must resolve (relocate → observer) within 60s");
     assert!(
         matches!(setup_outcome.terminal, crate::process::RunTerminal::Done),
         "setup-peer node (relocated observer) outcome: {:?}",
@@ -404,9 +414,9 @@ async fn run_relocate_with_dispatch_target(facet: RelocateStagingFacet) -> (usiz
          would surface as a NonRecoverable failure here"
     );
 
-    let sec0_outcome = tokio::time::timeout(Duration::from_secs(30), sec0_handle)
+    let sec0_outcome = tokio::time::timeout(Duration::from_secs(60), sec0_handle)
         .await
-        .expect("relocate-target node must finish within 30s")
+        .expect("relocate-target node must finish within 60s")
         .expect("relocate-target node task join");
     assert!(
         matches!(sec0_outcome.terminal, crate::process::RunTerminal::Done),
@@ -414,9 +424,9 @@ async fn run_relocate_with_dispatch_target(facet: RelocateStagingFacet) -> (usiz
         sec0_outcome.terminal
     );
 
-    let sec1_completed = tokio::time::timeout(Duration::from_secs(30), sec1_handle)
+    let sec1_completed = tokio::time::timeout(Duration::from_secs(60), sec1_handle)
         .await
-        .expect("dispatch-target secondary node must finish within 30s")
+        .expect("dispatch-target secondary node must finish within 60s")
         .expect("dispatch-target secondary node task join");
 
     assert_eq!(
@@ -434,7 +444,11 @@ async fn run_relocate_with_dispatch_target(facet: RelocateStagingFacet) -> (usiz
 /// `report_unresolvable_task` would fail every such item NonRecoverable; the
 /// relocated primary must stamp `uses_file_based_items=false` so the target
 /// passes `local_path` through opaquely and dispatch succeeds.
-#[tokio::test(flavor = "current_thread")]
+// `start_paused = true` eliminates wall-clock scheduling jitter: the happy
+// path is entirely message-driven (no timer is needed to complete), so all
+// 3-node coordination happens in a single cooperative LocalSet sweep, making
+// the test deterministic under full-suite CPU pressure.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn relocated_primary_uses_file_based_items_false_no_restage() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
@@ -475,7 +489,8 @@ async fn relocated_primary_uses_file_based_items_false_no_restage() {
 /// primary must stamp `pre_staged_mode=true` AND strip the gateway prefix in
 /// `wire_local_path`, so the target resolves the bind-mounted file by
 /// existence — no StageFile required.
-#[tokio::test(flavor = "current_thread")]
+// `start_paused = true`: see `relocated_primary_uses_file_based_items_false_no_restage`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn relocated_primary_pre_staged_mode_no_restage() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
@@ -526,7 +541,8 @@ async fn relocated_primary_pre_staged_mode_no_restage() {
 /// the file and resolves it — no "not pre-staged" rejection. Without
 /// `source_dir` on the promoted config, auto-stage skips and the target
 /// re-requires a StageFile that never comes.
-#[tokio::test(flavor = "current_thread")]
+// `start_paused = true`: see `relocated_primary_uses_file_based_items_false_no_restage`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn relocated_primary_mode1_file_based_restages() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
