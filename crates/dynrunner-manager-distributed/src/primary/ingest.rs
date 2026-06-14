@@ -386,8 +386,35 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // applied frames for the post-connection broadcast. The resumed /
         // re-inject surfaces are empty for a fresh seed (no `Blocked`
         // dependents exist before the first dispatch), so we discard them.
-        let batch = apply_locally_for_broadcast(&mut self.cluster_state, seed);
-        self.pending_cold_seed_broadcast = batch.applied;
+        let mut staged = apply_locally_for_broadcast(&mut self.cluster_state, seed).applied;
+
+        // SecondaryAffine ready-resolution over the SEED surface (#502). The
+        // `TaskAdded` fan-out above seeds each gate `Pending` WITHOUT riding
+        // the apply-pass delta surface the live AffineReady originator fires
+        // on (`TaskAdded`'s apply arm deliberately does not feed
+        // `newly_pending_from_spawn`), so a no-dep gate — or one whose deps
+        // are pre-succeeded staging setup tasks, already terminal in the same
+        // seed — is born `Pending`-all-resolved yet never transitions to the
+        // terminal `AffineReady`. Resolve them off the just-applied ledger
+        // and APPLY+STAGE the `AffineReady` frames alongside the seed: the
+        // LOCAL apply makes the pre-connection `hydrate_from_cluster_state`
+        // (run before `wait_for_connections`) seed each resolved gate terminal
+        // and OUT of the pool (its `task_id` resolving dependents in
+        // `extend()`), and the staged frames ride the same post-connection
+        // `broadcast_cold_seed` drain so every secondary — and the relocate
+        // target's promotion snapshot — mirrors the resolved gate. The
+        // gate-resolution rides the SAME `apply_locally_for_broadcast`
+        // stamp+apply+filter the seed used, so a no-op when the corpus
+        // carries no resolvable gate (an empty `affine_ready` set short-
+        // circuits the apply to an empty `applied`).
+        let affine_ready = self.cluster_state.affine_ready_mutations_for_ledger();
+        if !affine_ready.is_empty() {
+            let mut applied =
+                apply_locally_for_broadcast(&mut self.cluster_state, affine_ready).applied;
+            staged.append(&mut applied);
+        }
+
+        self.pending_cold_seed_broadcast = staged;
         Ok(())
     }
 

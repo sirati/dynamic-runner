@@ -143,6 +143,61 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.broadcast_applied_mutations(applied).await;
     }
 
+    /// Drive the AffineReady originator over the SEED-convergence surface:
+    /// scan the seeded ledger for `Pending` SecondaryAffine gates that are
+    /// already dependency-resolved and originate one
+    /// [`ClusterMutation::AffineReady`] per gate.
+    ///
+    /// The SEED twin of the delta driver in
+    /// [`Self::apply_and_broadcast_cluster_mutations`] (which fires on the
+    /// `became_pending` resume + `TasksSpawned` spawn surfaces). A gate
+    /// seeded directly into the ledger via `TaskAdded` — the cold-seed,
+    /// discover-on-promotion, and promotion-snapshot originators all seed
+    /// tasks that way — never rides an apply-pass delta surface, so a no-dep
+    /// (or all-deps-already-terminal) gate would otherwise stay `Pending`
+    /// forever and wedge its dependents Blocked (the #502 deadlock root:
+    /// the build-phase initial-assignment then finds zero worker-assignable
+    /// tasks). Both drivers consult the SAME detection rule
+    /// (`is_pending_resolved_affine_gate`, owned by `cluster_state`) — one
+    /// detection owner, two structurally-distinct firing surfaces (live
+    /// delta vs seed convergence), exactly as the delta driver already
+    /// invokes it from BOTH the resume and the spawn surfaces.
+    ///
+    /// Routed through the canonical
+    /// [`Self::apply_and_broadcast_cluster_mutations`] path, so it inherits
+    /// the identical apply+filter+broadcast semantics AND the recursive
+    /// chain convergence: applying a gate's `AffineReady` auto-resumes a
+    /// dependent SecondaryAffine gate `Blocked → Pending`, which rides the
+    /// recursive call's own `became_pending` and originates in turn.
+    ///
+    /// ORDERING (load-bearing): the seed originator must drive this BEFORE
+    /// `hydrate_from_cluster_state` builds the pool. The live runtime-spawn
+    /// path keeps a resolved gate OUT of the pool by firing the originator
+    /// DURING the spawn apply (so the gate is already `AffineReady` — never
+    /// `Pending` — when `apply_spawn_tasks`'s post-apply pool walk runs). The
+    /// seed path must mirror that: a `Pending` gate hydrated into the pool is
+    /// never worker-dispatched (`is_worker_assignable()` is false for a gate,
+    /// like a `Setup` task) yet still counts as QUEUED, wedging its phase
+    /// from draining. Resolving the gate to `AffineReady` before hydrate lets
+    /// hydrate's `AffineReady` arm seed it terminal (its `task_id` resolves
+    /// dependents in `extend()`, the gate is NOT pushed into the pool) — so
+    /// the dependents enter the pool dispatchable and no inert gate item is
+    /// ever queued. The `discover_on_promotion` originator drives this AFTER
+    /// its `TaskAdded` seed broadcast and BEFORE its own hydrate; the
+    /// cold-seed originator stages the AffineReady frames alongside its seed
+    /// (applied locally before the pre-connection hydrate, broadcast
+    /// post-connect); the promotion-snapshot path inherits the already-
+    /// resolved gates via the snapshot.
+    ///
+    /// Idempotent: an already-`AffineReady` gate is not `Pending`, so a
+    /// re-run emits nothing.
+    pub(crate) async fn originate_affine_ready_for_seeded_gates(&mut self) {
+        let mutations = self.cluster_state.affine_ready_mutations_for_ledger();
+        if !mutations.is_empty() {
+            self.apply_and_broadcast_cluster_mutations(mutations).await;
+        }
+    }
+
     /// Arm the mutation-capture sink: until [`Self::take_mutation_capture`],
     /// every `apply_and_broadcast_cluster_mutations` call applies locally
     /// as usual but appends its NoOp-filtered batch to the capture buffer

@@ -67,6 +67,45 @@ impl<I: Identifier> ClusterState<I> {
             .collect()
     }
 
+    /// Scan the WHOLE logical ledger and produce one
+    /// [`ClusterMutation::AffineReady`] per `Pending` SecondaryAffine gate
+    /// that is already dependency-resolved — the SEED-surface twin of
+    /// [`Self::affine_ready_mutations_for`].
+    ///
+    /// The delta surface (`affine_ready_mutations_for` fed `became_pending`)
+    /// fires the originator on the gates that JUST became Pending in an
+    /// apply pass (the resume + `TasksSpawned` spawn surfaces). But a gate
+    /// seeded directly into the ledger via `TaskAdded` — the cold-seed,
+    /// discover-on-promotion, and promotion-snapshot originators — enters
+    /// `Pending` WITHOUT riding any apply-pass delta surface (`TaskAdded`'s
+    /// apply arm deliberately does NOT feed the pool-growth
+    /// `newly_pending_from_spawn` channel — the receive side rebuilds the
+    /// whole pool for a `TaskAdded` batch instead — so its freshly-Pending
+    /// gates never reach `became_pending`). A no-dep gate (or one whose
+    /// deps are already terminal at seed time, e.g. a pre-succeeded staging
+    /// setup task) is therefore born `Pending`-all-resolved yet never
+    /// transitions to `AffineReady`, leaving its dependents Blocked forever.
+    ///
+    /// This scan closes that gap by reading the post-seed/post-hydrate
+    /// ledger directly: the SAME [`Self::is_pending_resolved_affine_gate`]
+    /// detection rule the delta surface uses (one detection owner), applied
+    /// over every fat entry. A `Pending` gate is never settled (only
+    /// terminals settle), so iterating the fat map is complete. Idempotent:
+    /// a gate already `AffineReady` is not `Pending`, so it is skipped; the
+    /// scan can run on every seed-convergence pass without re-emitting.
+    pub(crate) fn affine_ready_mutations_for_ledger(&self) -> Vec<ClusterMutation<I>> {
+        let candidates: Vec<String> = self
+            .tasks_iter()
+            .filter_map(|(hash, state)| match state {
+                TaskState::Pending { task, .. } if task.kind.is_secondary_affine() => {
+                    Some(hash.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        self.affine_ready_mutations_for(candidates)
+    }
+
     /// Whether `hash`'s ledger entry is a `Pending` SecondaryAffine gate
     /// with every dep terminal — the exact READY-not-EXECUTED firing
     /// condition. A settled entry can never be `Pending` (only terminals
