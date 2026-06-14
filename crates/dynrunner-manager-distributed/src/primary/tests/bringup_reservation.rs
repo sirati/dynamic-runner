@@ -665,6 +665,80 @@ async fn failover_started_ledger_does_not_open_reservation() {
         .await;
 }
 
+/// TEST B'' — the graceful-abort relocation exclusion (the `run_is_unstarted`
+/// AND-branch in isolation). A graceful abort relocates the primary MID-RUN
+/// via the SAME `PrimaryChangeReason::Transferred` a bootstrap relocation uses
+/// (`graceful_abort` -> `relocate_primary_to`), so its target hydrates as
+/// `kind = BootstrapRelocation` — but its inherited ledger is STARTED. The
+/// gate `kind == BootstrapRelocation && run_is_unstarted()` must NOT open: the
+/// kind branch passes (Relocation), only the `run_is_unstarted()` branch
+/// declines (started), preventing the inherited-pool wedge. This ISOLATES the
+/// `run_is_unstarted` guard — a kind-only gate would wrongly open and wedge a
+/// graceful-abort relocation, which TEST B (Failover, where the kind branch
+/// already declines) cannot catch.
+#[tokio::test(flavor = "current_thread")]
+async fn relocation_started_ledger_does_not_open_reservation() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let n_members = 3usize;
+            let (transport, _ends) = setup_test(n_members as u32);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Seed a STARTED ledger (as a mid-run graceful-abort relocate
+            // inherits): two Pending tasks plus one the prior primary already
+            // dispatched (InFlight — the post-dispatch / started proof).
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(PhaseId::from("p"), vec![])]),
+                });
+                for name in ["t0", "t1", "inflight"] {
+                    let task = one_task(name);
+                    cs.apply(ClusterMutation::TaskAdded {
+                        hash: crate::primary::wire::compute_task_hash(&task),
+                        task,
+                    });
+                }
+                let inflight = one_task("inflight");
+                cs.apply(ClusterMutation::TaskAssigned {
+                    hash: crate::primary::wire::compute_task_hash(&inflight),
+                    secondary: "sec-0".into(),
+                    worker: 0,
+                    version: Default::default(),
+                    attempt: 0,
+                });
+            }
+            primary
+                .hydrate_from_cluster_state()
+                .expect("test fixture: composed task graph is valid");
+            register_operational_roster(&mut primary, n_members, 2);
+
+            assert!(
+                !primary.cluster_state_mut_for_test().run_is_unstarted(),
+                "a started ledger (InFlight) must read NOT-unstarted"
+            );
+
+            // kind = BootstrapRelocation (the Transferred graceful-abort path),
+            // but the inherited ledger is STARTED: only the run_is_unstarted
+            // AND-branch keeps the reservation closed here.
+            primary.seed_bringup_reservation(crate::process::BootstrapKind::BootstrapRelocation);
+            assert!(
+                !primary.pool().reservation_active(),
+                "a graceful-abort relocation (kind=BootstrapRelocation but a \
+                 STARTED inherited ledger) must NOT open the reservation — only \
+                 the run_is_unstarted AND-guard prevents the inherited-pool \
+                 wedge here; a kind-only gate would wrongly open"
+            );
+        })
+        .await;
+}
+
 /// TEST B' — THE CRUX (the all-Pending early-failover edge). A FAILOVER
 /// whose inherited pool is ENTIRELY Pending (the prior primary dispatched
 /// the initial batch, died, and the survivor re-queued every InFlight→
