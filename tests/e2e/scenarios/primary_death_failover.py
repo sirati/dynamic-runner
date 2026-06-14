@@ -195,6 +195,44 @@ dominant cost is R1's threshold delay + the remaining work. For a large
 #504 delta-pull ledger the budget scales with the ledger (see
 ``_post_kill_deadline_s``)."""
 
+def _teardown_grace_s() -> float:
+    """Post-RunComplete teardown grace for the PROMOTED-primary path.
+
+    The driver's baseline teardown grace (``run_e2e._TEARDOWN_GRACE_S``)
+    is sized for a CLEAN run: the single primary originates ``RunComplete``
+    the instant its ledger drains, and a fixed handful of wrappers tear
+    down. This scenario's terminal is heavier on two axes that both grow
+    with the ledger:
+
+      - Ledger finalization before RunComplete: the promoted secondary
+        must first inherit and finalize the whole ledger
+        (``populate_primary_from_cluster_state`` + the #504 delta-pull /
+        anti-entropy convergence) before it is even in a position to
+        originate ``RunComplete``. A clean primary never pays this — it
+        held the authoritative ledger all along.
+      - Wrapper-drain fan-out: more tasks ⇒ more secondary wrappers that
+        each run the ``podman unshare rm -rf $RNDTMP`` teardown after the
+        terminal reaches them, and the terminal reaches a fleet that just
+        re-formed its mesh around a new primary.
+
+    So the teardown grace scales with the ledger the same way the
+    convergence budget (:func:`_post_kill_deadline_s`) does: the baseline
+    covers the original 12-task shape; +0.5s per task beyond 12 covers
+    the heavier drain of a large #504/#497 ledger. Returning the baseline
+    (90s) for the historical 12-task shape leaves every existing run
+    unchanged; the driver clamps this up to its own baseline regardless,
+    so this can only widen the gate."""
+    base = 90.0
+    extra_tasks = max(0, _NUM_TASKS_PER_PHASE - 12)
+    return base + 0.5 * extra_tasks
+
+
+_TEARDOWN_GRACE_S = _teardown_grace_s()
+"""How long the driver's post-scenario teardown gate waits for the
+promoted primary's RunComplete to propagate and every surviving
+secondary's wrapper to drain. Ledger-scaled — see
+:func:`_teardown_grace_s`."""
+
 _POLL_INTERVAL_S = 2.0
 
 
@@ -265,6 +303,22 @@ class PrimaryDeathFailoverScenario(Scenario):
         "cluster completes all outputs out-of-band."
     )
     requires = ()
+
+    def teardown_grace_s(self, env: DispatchEnv) -> float | None:
+        """Widen the driver's teardown gate for the promoted-primary drain.
+
+        After a failover the new primary must finalize the inherited
+        ledger before it can originate ``RunComplete``, then fan the
+        terminal out to the re-formed surviving fleet — a drain that lands
+        later than a clean primary's, and that grows with the ledger size.
+        The baseline gate is sized for the clean case; here we return a
+        ledger-scaled grace (see :func:`_teardown_grace_s`) so a healthy
+        but slow post-failover teardown isn't flagged as a leftover-job
+        regression. The driver clamps this up to its own baseline, so the
+        historical 12-task shape (which returns the 90s baseline) is
+        unchanged."""
+        del env
+        return _TEARDOWN_GRACE_S
 
     def prepare(
         self, env: DispatchEnv, tmp_root: Path

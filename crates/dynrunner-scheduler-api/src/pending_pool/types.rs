@@ -33,6 +33,50 @@ pub(super) fn affinity_key<I>(item: &TaskInfo<I>) -> AffinityId {
 /// Composite bucket key.
 pub type BucketKey = (PhaseId, TypeId, AffinityId);
 
+/// The would-be dispatch standing of the work task(s) a setup (upload)
+/// task gates — the ordering key the primary uses to route the upload
+/// whose dependents we most want to start next FIRST (instead of FIFO).
+///
+/// Lower sorts BETTER (sooner). The three components are compared
+/// lexicographically by the derived `Ord`, so the ranking is exactly:
+/// dispatchable-now dependents beat will-activate-later ones; within a
+/// tier a typed (pinned) dependent beats a free-pool one; and a tie is
+/// broken toward the upload with MORE dependents (a `group_common` file
+/// shared by many builds beats an equal-tier single-dependent `delta`).
+///
+/// The field semantics MIRROR the dispatch view (`view_for_worker`) so a
+/// setup task derives its priority from the SAME phase-state + affinity
+/// classification real worker dispatch uses — no soft-pin logic is
+/// duplicated here; this is purely an `Ord` projection of those reads.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct DispatchRank {
+    /// 0 = a dependent's phase is `Active` (dispatchable right now),
+    /// 1 = `Draining`, 2 = any non-dispatchable state the dependent will
+    /// still reach dispatch from (`Blocked` will-activate). Mirrors the
+    /// `Active`/`Draining` gate the dispatch view applies for its classes.
+    pub phase_tier: u8,
+    /// 0 = a typed (non-free-pool) dependent, 1 = a free-pool dependent —
+    /// mirrors `view_for_worker`'s class ordering (typed class < free-pool
+    /// class) via the `no_affinity` sentinel.
+    pub class_tier: u8,
+    /// Negated dependent count so that, with all else equal, MORE
+    /// dependents sorts BETTER under the plain `Ord` (a shared upload
+    /// pulls ahead of a single-dependent one).
+    pub neg_dependent_count: i32,
+}
+
+impl DispatchRank {
+    /// All-max sentinel: sorts LAST. Used for a setup task with no known
+    /// dependent yet (its work task has not spawned) so a discovered-
+    /// dependent upload always routes ahead of it — it is never starved,
+    /// only deferred until a dependent appears.
+    pub const WORST: DispatchRank = DispatchRank {
+        phase_tier: u8::MAX,
+        class_tier: u8::MAX,
+        neg_dependent_count: i32::MAX,
+    };
+}
+
 /// Caller-supplied preference predicate for [`super::PendingPool::view_for_worker`].
 ///
 /// The view's emission order is fixed at four priority classes (pin,

@@ -242,6 +242,17 @@ impl PyDistributedManager {
         // promote recipes — `None` when the consumer exposes no hook.
         let mut sec_custom_message_handler_defs: Vec<Option<Py<PyAny>>> =
             Vec::with_capacity(num_secondaries as usize);
+        // Per-secondary submitter-namespace ref-bumps for the promote recipe's
+        // `run_config`. In-process every node shares the submitter's EAGERLY-
+        // parsed `task_args` (which carries `--source-already-staged` — the
+        // setup peer IS the submitter), so the recipe derives the run-level
+        // `pre_staged_mode` from a `pre_resolved` `SharedRunConfig` over this
+        // namespace — the SAME single source of truth the SLURM path uses
+        // (uniform derivation; no boot-vs-delivered split). Captured on EVERY
+        // path (cold included): a cold namespace has no `source_already_staged`,
+        // so the recipe correctly derives not-pre-staged.
+        let mut sec_run_config_namespaces: Vec<Py<PyAny>> =
+            Vec::with_capacity(num_secondaries as usize);
         for _ in 0..num_secondaries {
             let on_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
                 crate::managers::lifecycle::make_on_phase_start(self.task_definition.clone_ref(py)),
@@ -279,6 +290,10 @@ impl PyDistributedManager {
                     root,
                 )
             }));
+            // The recipe's `run_config` namespace — captured on every path so
+            // the promoted primary derives `pre_staged_mode` from the run's
+            // complete namespace uniformly with the SLURM path.
+            sec_run_config_namespaces.push(self.task_args.clone_ref(py));
         }
 
         // Take the Python peer-lifecycle listener (if any) out of
@@ -440,17 +455,21 @@ impl PyDistributedManager {
                 for (
                     (
                         (
-                            (secondary_id, sec_log),
-                            (sec_on_phase_start, sec_on_phase_end, sec_phase_hook_raise_latch),
+                            (
+                                (secondary_id, sec_log),
+                                (sec_on_phase_start, sec_on_phase_end, sec_phase_hook_raise_latch),
+                            ),
+                            sec_discovery_handle,
                         ),
-                        sec_discovery_handle,
+                        sec_custom_message_handler_def,
                     ),
-                    sec_custom_message_handler_def,
+                    sec_recipe_namespace,
                 ) in sec_log_dirs
                     .into_iter()
                     .zip(sec_phase_lifecycle_callbacks)
                     .zip(sec_discovery_handles)
                     .zip(sec_custom_message_handler_defs)
+                    .zip(sec_run_config_namespaces)
                 {
                     // This secondary's pre-wired all-to-all mesh transport (its
                     // `outgoing` table already reaches the setup peer + every
@@ -505,17 +524,16 @@ impl PyDistributedManager {
                     // `move` task owns its own copy.
                     let promote_pre_staged_root = source_pre_staged_root.clone();
                     let promote_source_dir = Some(source_dir.clone());
-                    // The two staging-dispatch flags the PROMOTE recipe stamps,
-                    // sourced from the LOCAL PRODUCER (NOT the
-                    // `InitialAssignment`-fed cell — a relocate-target's cell is
-                    // at `Default` at promotion). Both are already extracted on
-                    // this in-process manager: `uses_file_based_items` off the
-                    // `task_definition`, `source_pre_staged` =
-                    // `source_pre_staged_root.is_some()` (mirroring the
-                    // submitter's discriminant). `Copy` bools, captured by the
-                    // per-secondary `move` task below.
+                    // `uses_file_based_items` the PROMOTE recipe stamps, sourced
+                    // from the LOCAL PRODUCER's `task_definition` (a run-uniform
+                    // class fact — NOT the `InitialAssignment`-fed cell, which a
+                    // relocate-target holds at `Default` at promotion). `Copy`
+                    // bool, captured by the per-secondary `move` task below. The
+                    // run-level `pre_staged_mode` is NOT captured as a bool: the
+                    // recipe derives it from the `run_config` namespace
+                    // (`sec_recipe_namespace`) — uniform with the SLURM path's
+                    // single-source-of-truth derivation.
                     let promote_uses_file_based_items = uses_file_based_items;
-                    let promote_pre_staged_mode = source_pre_staged;
 
                     let handle = tokio::task::spawn_local(async move {
                         // This secondary's all-to-all mpsc mesh transport
@@ -817,7 +835,17 @@ impl PyDistributedManager {
                             on_run_start: None,
                             forwarded_argv: promote_run_config_handle,
                             uses_file_based_items: promote_uses_file_based_items,
-                            pre_staged_mode: promote_pre_staged_mode,
+                            // In-process every node shares the submitter's
+                            // EAGERLY-parsed namespace (which carries
+                            // `--source-already-staged`), so the recipe derives
+                            // `pre_staged_mode` from a `pre_resolved`
+                            // `SharedRunConfig` over it — the SAME single source
+                            // of truth the SLURM path resolves from the delivered
+                            // argv.
+                            run_config:
+                                crate::managers::run_config::SharedRunConfig::pre_resolved(
+                                    sec_recipe_namespace,
+                                ),
                             source_pre_staged_root: promote_pre_staged_root,
                             source_dir: promote_source_dir,
                             // Framework file-staging selector (#489 P3/P4): the
