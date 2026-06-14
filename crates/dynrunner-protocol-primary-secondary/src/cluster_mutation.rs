@@ -262,15 +262,22 @@ pub enum ClusterMutation<I> {
     /// "The run was ABORTED — every secondary and observer should exit
     /// non-zero." The failure twin of [`Self::RunComplete`].
     ///
-    /// Emitted exactly once by the primary when an unrecoverable
-    /// cluster-wide fault is detected BEFORE any phase has started —
-    /// today the only originator is the pre-phase duplicate-task-id
-    /// case (#3a): a `(phase_id, task_id)` collision in the INITIAL
-    /// batch is a producer-side bug that would silently mask one of the
-    /// colliding tasks, so the whole run is torn down rather than
-    /// proceeding on an ambiguous task set. (A duplicate detected AFTER
-    /// a phase started — #3b — does NOT abort: it invalidates the
-    /// not-yet-terminal tasks run-wide and the cluster CONTINUES.)
+    /// Emitted by the primary when an unrecoverable cluster-wide fault is
+    /// detected. CANONICAL originator set (two distinct sites):
+    ///
+    /// 1. PRE-PHASE duplicate-task-id (#3a): a `(phase_id, task_id)`
+    ///    collision in the INITIAL batch, BEFORE any phase has started, is a
+    ///    producer-side bug that would silently mask one of the colliding
+    ///    tasks, so the whole run is torn down rather than proceeding on an
+    ///    ambiguous task set. (A duplicate detected AFTER a phase started —
+    ///    #3b — does NOT abort: it invalidates the not-yet-terminal tasks
+    ///    run-wide and the cluster CONTINUES.)
+    /// 2. POST-PHASE cluster-routing collapse: the per-phase finalize tail
+    ///    finds `stranded > 0` (tasks left non-terminal after routing fell
+    ///    apart). The honest terminal broadcast is `RunAborted` carrying the
+    ///    `RunError::ClusterCollapsed` Display render as `reason`, so the
+    ///    strand reaches the observer's important channel instead of
+    ///    narrating a false `RunComplete` over a collapsed cluster.
     ///
     /// Receivers set a sticky `run_aborted: Option<String>` ledger
     /// field (mirroring `run_complete`). The secondary's

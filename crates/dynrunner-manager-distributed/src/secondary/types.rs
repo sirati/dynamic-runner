@@ -114,7 +114,9 @@ pub enum RunOutcome {
 ///   `exit(0)` / `Ok`.
 /// - `Aborted`: the replicated ledger recorded `ClusterMutation::RunAborted`
 ///   (the failure twin of RunComplete; the cluster-wide non-zero cue for a
-///   pre-phase duplicate-task-id #3a). `process_tasks` checks
+///   pre-phase #3a duplicate OR a post-phase routing collapse — see
+///   `ClusterMutation::RunAborted` for the full originator set).
+///   `process_tasks` checks
 ///   `cluster_state.run_aborted()` BEFORE the `run_complete()` break.
 ///   `reason` is carried for the boundary log; the PyO3 wrapper calls
 ///   `std::process::exit(1)`.
