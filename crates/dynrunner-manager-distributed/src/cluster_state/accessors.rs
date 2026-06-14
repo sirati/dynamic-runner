@@ -15,8 +15,8 @@ use dynrunner_protocol_primary_secondary::{DiscoveryDebt, RoleTable, SecondaryCa
 
 use super::settled::{SettledClass, SettledEntry};
 use super::{
-    ClusterState, OutcomeSummary, PeerReadmission, PhaseRollup, PhaseTaskPartition, StateCounts,
-    TaskState,
+    ClusterState, OutcomeSummary, PeerReadmission, PhaseRollup, PhaseTaskPartition, SetupProgress,
+    StateCounts, TaskState,
 };
 
 /// One LOGICAL ledger entry, wherever its body lives: a fat in-memory
@@ -811,6 +811,56 @@ impl<I: Identifier> ClusterState<I> {
             }
         }
         p
+    }
+
+    /// Setup-task lifecycle progress over the replicated ledger (#508) —
+    /// the value shape of [`SetupProgress`]: `(complete, total)` over every
+    /// SETUP-kind task (`TaskKind::is_setup`) the run planned.
+    ///
+    /// The SINGLE owner of the "how far has the setup phase got" projection
+    /// the operator run-narrator's setup milestones read. Derived from the
+    /// SAME `tasks` ledger the primary's `setup_dispatch` already drives the
+    /// setup lifecycle through (`Pending → InFlight → SetupCompleted`, or a
+    /// terminal failure via `apply_fail_permanent`) — never a separate
+    /// replicated tally, so it stays failover-consistent (every replica
+    /// converges to the same answer after the same mutation set lands).
+    ///
+    /// `total` counts setup-kind entries regardless of state; `complete`
+    /// counts the terminal ones — a setup SUCCESS (`SetupCompleted`) or a
+    /// setup terminal FAILURE (`Failed` / `Unfulfillable` / `InvalidTask`),
+    /// i.e. [`TaskState::is_terminal`] true. "Complete" is "no longer
+    /// pending" (the operator's setup-progress concern); the success/failure
+    /// split is the run summary's, not this view's.
+    ///
+    /// Fat (in-memory) entries are classified by `task.kind.is_setup()`. A
+    /// settled (spilled) entry carries no `kind`; only the
+    /// `SettledClass::SetupCompleted` class is setup-distinguishable, so a
+    /// settled setup SUCCESS is counted (`complete` and `total`) while a
+    /// settled setup FAILURE is indistinguishable from a worker failure and
+    /// is not — acceptable because setup tasks are few and execute at run
+    /// start (long before the terminal-ledger spill), so they live in the
+    /// fat map for the whole window the narrator emits over.
+    pub fn setup_progress(&self) -> SetupProgress {
+        let mut s = SetupProgress::default();
+        for state in self.tasks.values() {
+            if !state.task().kind.is_setup() {
+                continue;
+            }
+            s.total += 1;
+            if state.is_terminal() {
+                s.complete += 1;
+            }
+        }
+        // Settled setup successes: the only setup-distinguishable settled
+        // class. A settled entry is terminal by construction, so it counts
+        // toward both `complete` and `total`.
+        for (_, entry) in self.settled_entries() {
+            if matches!(entry.class, SettledClass::SetupCompleted) {
+                s.total += 1;
+                s.complete += 1;
+            }
+        }
+        s
     }
 
     /// Whether the run has been declared finished by the primary.

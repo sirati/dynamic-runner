@@ -90,6 +90,27 @@ pub struct RunNarrator {
     /// promoted node only one, deriving DIFFERENT narration from the one
     /// converged CRDT.
     retry_passes_emitted: HashSet<(PhaseId, BucketKind)>,
+    /// Whether the one-shot "setup phase started" line has fired (#508) —
+    /// the once-only edge the moment the converged ledger first shows ≥1
+    /// setup-kind task. Mirrors the `started`/`done` phase edge-sets: a pure
+    /// PRESENCE latch over [`ClusterState::setup_progress`]'s `total`, so it
+    /// derives identically whether a node watched the setup tasks land live
+    /// or was fed the already-converged ledger after a relocation.
+    setup_started_emitted: bool,
+    /// Whether the one-shot "setup complete" line has fired (#508) — the
+    /// once-only edge the moment every planned setup task is terminal
+    /// (`complete == total`, `total > 0`). The setup block runs BEFORE the
+    /// phase block in [`Self::observe`], so this all-done line precedes the
+    /// dependent phases' "starting job phase" narration.
+    setup_done_emitted: bool,
+    /// The last setup `complete` count the aggregate progress line emitted
+    /// (#508). The aggregate "setup: N/M complete" line fires once per
+    /// observe sweep ONLY when `complete` advanced past this value — the
+    /// anti-spam cadence (#393): the operator gets progress without one line
+    /// per setup task (staged uploads can be many). `None` until the first
+    /// aggregate emit. NOT a CRDT mirror — purely the local
+    /// already-narrated watermark, the exact role `started`/`done` play.
+    setup_progress_emitted: Option<usize>,
     /// Whether the one-shot run-complete / run-aborted summary has fired.
     /// The terminal outcomes are mutually exclusive and share this single
     /// latch so at most one terminal line is ever emitted.
@@ -154,6 +175,9 @@ impl RunNarrator {
             started_phases,
             done_phases: HashSet::new(),
             retry_passes_emitted: HashSet::new(),
+            setup_started_emitted: false,
+            setup_done_emitted: false,
+            setup_progress_emitted: None,
             completion_emitted: false,
             graceful_abort_announced: false,
             failover_seeded: false,
@@ -188,6 +212,13 @@ impl RunNarrator {
     /// free of any wake-policy knowledge.
     pub(crate) fn observe<I: Identifier>(&mut self, state: &ClusterState<I>) -> bool {
         let mut emitted = false;
+        // Setup-task phase milestones FIRST (#508): the setup phase is the
+        // dependency root — its tasks gate the dependent work phases — so its
+        // started / progress / all-done lines must narrate BEFORE the phase
+        // block below emits the dependents' "starting job phase". The
+        // all-done edge in particular has to precede the first dependent
+        // phase the setup unblocks.
+        emitted |= self.narrate_setup(state);
         // Phase transitions, read off the single owning phase-state
         // accessor. A phase counts as STARTED once it is dispatchable
         // (every dep-phase has fully terminated) and owns ≥1 task; it
@@ -422,6 +453,91 @@ impl RunNarrator {
         emitted
     }
 
+    /// Narrate the setup-task phase lifecycle derived from the replicated
+    /// setup-task states (#508). Single concern: turn
+    /// [`ClusterState::setup_progress`] — the `(complete, total)` projection
+    /// over the SETUP-kind tasks the primary's setup-dispatch already drives
+    /// through the SAME ledger — into the operator's wake-worthy
+    /// setup-progress narrative, idempotently. Narrated HERE, in the
+    /// observer's process, so a relocated setup phase reaches the operator's
+    /// `--important-stdio-only` stdout regardless of which node now hosts the
+    /// primary (the same process-independence rationale as the phase/failover
+    /// blocks).
+    ///
+    /// Three milestones, all on the [`IMPORTANT_TARGET`] channel:
+    ///
+    ///   - STARTED (one line, once): the first observe whose ledger shows ≥1
+    ///     setup task. A run with NO setup tasks (`total == 0`) narrates
+    ///     nothing — the whole block is inert.
+    ///   - AGGREGATE progress (one line per observe SWEEP, anti-spam #393):
+    ///     "setup: N/M tasks complete", emitted only when `complete` ADVANCED
+    ///     since the last aggregate emit — never one line per setup task
+    ///     (staged uploads can be many).
+    ///   - ALL-DONE (one line, once): `complete == total` with `total > 0`.
+    ///     Runs before the phase block emits the dependent phases' starts.
+    ///
+    /// Every line is a PRESENCE / watermark edge over the ledger projection
+    /// (the `setup_*_emitted` latches), mirroring the started/done/retry
+    /// edge-sets exactly: no narrator-local ledger re-walk, no replicated
+    /// milestone fact, failover-consistent by construction.
+    ///
+    /// Returns whether ≥1 line was emitted (folded into [`Self::observe`]'s
+    /// emitted-anything contract).
+    fn narrate_setup<I: Identifier>(&mut self, state: &ClusterState<I>) -> bool {
+        let progress = state.setup_progress();
+        // A run with no setup tasks: the whole block is inert.
+        if progress.total == 0 {
+            return false;
+        }
+        let mut emitted = false;
+
+        // STARTED: the first observe that sees any setup task.
+        if !self.setup_started_emitted {
+            self.setup_started_emitted = true;
+            tracing::info!(
+                target: IMPORTANT_TARGET,
+                setup_total = progress.total,
+                "starting setup phase — {} setup tasks to stage",
+                progress.total,
+            );
+            emitted = true;
+        }
+
+        // AGGREGATE progress: one line per sweep, only when `complete`
+        // advanced past the last emitted watermark (anti-spam). The
+        // ALL-DONE line below carries the terminal count, so the aggregate
+        // is suppressed once everything is complete (it would otherwise
+        // double-narrate the same N/M as the all-done edge).
+        if progress.complete < progress.total
+            && self.setup_progress_emitted != Some(progress.complete)
+        {
+            self.setup_progress_emitted = Some(progress.complete);
+            tracing::info!(
+                target: IMPORTANT_TARGET,
+                setup_complete = progress.complete,
+                setup_total = progress.total,
+                "setup: {}/{} tasks complete",
+                progress.complete,
+                progress.total,
+            );
+            emitted = true;
+        }
+
+        // ALL-DONE: every planned setup task is terminal. Emitted before the
+        // phase block narrates the dependents the setup unblocks.
+        if !self.setup_done_emitted && progress.complete == progress.total {
+            self.setup_done_emitted = true;
+            tracing::info!(
+                target: IMPORTANT_TARGET,
+                setup_total = progress.total,
+                "setup complete — {} setup tasks done",
+                progress.total,
+            );
+            emitted = true;
+        }
+        emitted
+    }
+
     /// Narrate the failover / degradation transitions derived from the
     /// replicated membership + primary CRDT facts. Single concern: turn the
     /// "who is primary" and "which remote worker-secondaries are live"
@@ -646,6 +762,25 @@ mod tests {
         });
     }
 
+    /// A SETUP-kind task in `phase` with id `id` — the `kind` flip the only
+    /// difference from `task` (the discriminant is what `setup_progress`
+    /// keys on). The caller adds it with `add`.
+    fn setup_task(phase: &str, id: &str) -> TaskInfo<RunnerIdentifier> {
+        let mut t = task(phase, id, &[]);
+        t.kind = dynrunner_core::TaskKind::Setup;
+        t
+    }
+
+    /// Drive an added setup task to its SUCCESS terminal — the
+    /// authoritative `SetupCompleted` the primary's setup-dispatch
+    /// originates (`Pending → SetupCompleted`). The caller adds the task
+    /// with `add` first.
+    fn setup_complete(state: &mut ClusterState<RunnerIdentifier>, hash: &str) {
+        state.apply(ClusterMutation::SetupCompleted {
+            hash: hash.to_string(),
+        });
+    }
+
     /// Bump the replicated retry-pass USED count for `(phase, bucket)` to at
     /// least `used` — the same grow-only-MAX originator the live retry-bucket
     /// caller drives after a reinjecting pass. Modelling the pass-start this
@@ -818,6 +953,139 @@ mod tests {
         assert_eq!(
             done[0].fields.get("phase").map(String::as_str),
             Some("compile")
+        );
+    }
+
+    /// #508: the setup-task phase narrates its lifecycle in the
+    /// important-stdio stream — STARTED once, an AGGREGATE "N/M complete"
+    /// line per sweep that advances the count (never one per task), and
+    /// ALL-DONE once — and the all-done line precedes the dependent phase's
+    /// "starting job phase". Mirrors the milestones+aggregate cadence the
+    /// owner confirmed.
+    #[test]
+    fn setup_phase_narrates_started_progress_and_all_done_before_dependents() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            // A dependent "build" phase gated on the "setup" phase, so the
+            // dependents' "starting job phase" can only fire after setup
+            // fully terminates — the ordering this test pins.
+            state.apply(ClusterMutation::PhaseDepsSet {
+                deps: std::collections::HashMap::from([(
+                    PhaseId::from("build"),
+                    vec![PhaseId::from("setup")],
+                )]),
+            });
+            // Three setup tasks (e.g. staged uploads) + one dependent build
+            // task.
+            for id in ["s1", "s2", "s3"] {
+                add(&mut state, &setup_task("setup", id));
+            }
+            add(&mut state, &task("build", "b1", &[]));
+
+            let mut narrator = RunNarrator::new();
+            // Sweep 1: setup phase appears (0/3). STARTED + first aggregate.
+            narrator.observe(&state);
+            // Sweep 2: two setup tasks complete in one batch → ONE aggregate
+            // line (2/3), not two — the anti-spam cadence.
+            setup_complete(&mut state, "s1");
+            setup_complete(&mut state, "s2");
+            narrator.observe(&state);
+            // Sweep 3: no advance → no new aggregate line (idempotent sweep).
+            narrator.observe(&state);
+            // Sweep 4: the last setup task completes → ALL-DONE, and "build"
+            // becomes dispatchable so its "starting job phase" fires in the
+            // SAME sweep — after the setup all-done line.
+            setup_complete(&mut state, "s3");
+            narrator.observe(&state);
+            // Sweep 5: stable → fully idempotent.
+            narrator.observe(&state);
+        });
+
+        let started: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("starting setup phase"))
+            .collect();
+        assert_eq!(
+            started.len(),
+            1,
+            "exactly one setup-started line: {events:?}"
+        );
+        assert_eq!(
+            started[0].fields.get("setup_total").map(String::as_str),
+            Some("3")
+        );
+
+        // Aggregate progress: 0/3 (sweep 1) + 2/3 (sweep 2) = exactly two
+        // lines. The two-in-one-batch sweep emits ONE line (anti-spam), the
+        // no-advance sweep emits none, and the all-done sweep uses the
+        // distinct all-done line (not a 3/3 aggregate).
+        let progress: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.starts_with("setup: ") && e.message.contains("complete"))
+            .collect();
+        assert_eq!(
+            progress.len(),
+            2,
+            "one aggregate line per advancing sweep, never per task, no 3/3: {events:?}"
+        );
+        assert!(
+            progress[0].message.contains("0/3"),
+            "first aggregate at the start edge: {:?}",
+            progress[0].message
+        );
+        assert!(
+            progress[1].message.contains("2/3"),
+            "a two-task batch advances the count once to 2/3: {:?}",
+            progress[1].message
+        );
+
+        let all_done: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("setup complete"))
+            .collect();
+        assert_eq!(
+            all_done.len(),
+            1,
+            "exactly one setup all-done line: {events:?}"
+        );
+        assert_eq!(
+            all_done[0].fields.get("setup_total").map(String::as_str),
+            Some("3")
+        );
+
+        // ORDERING: every setup line precedes the dependent "build" phase's
+        // "starting job phase". The all-done line in particular must come
+        // before the build start it unblocks.
+        let setup_done_idx = events
+            .iter()
+            .position(|e| e.message.contains("setup complete"))
+            .expect("setup all-done emitted");
+        let build_start_idx = events
+            .iter()
+            .position(|e| {
+                e.message.contains("starting job phase")
+                    && e.fields.get("phase").map(String::as_str) == Some("build")
+            })
+            .expect("dependent build phase narrates started");
+        assert!(
+            setup_done_idx < build_start_idx,
+            "setup all-done must precede the dependent phase start: {events:?}"
+        );
+    }
+
+    /// #508: a run with NO setup tasks narrates nothing setup-related — the
+    /// whole block is inert.
+    #[test]
+    fn no_setup_tasks_narrates_no_setup_lines() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            add(&mut state, &task("compile", "a", &[]));
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state);
+        });
+        assert!(
+            events.iter().all(|e| !e.message.contains("setup")),
+            "a setup-free run emits no setup narration: {events:?}"
         );
     }
 

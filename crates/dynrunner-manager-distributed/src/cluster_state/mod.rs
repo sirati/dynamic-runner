@@ -83,7 +83,7 @@ pub use stream::{SnapshotStreamPlan, StreamPackage, decode_stream_payload, encod
 pub use types::{
     ApplyOutcome, CapabilityEntry, CustomMsgState, OutcomeSummary, PeerMembership,
     PeerReadmission, PhaseRollup, PhaseTally, PhaseTaskPartition, ReplicatedRespawnPolicy,
-    RespawnEventRecord, RoleChangeHook, StateCounts, TaskState,
+    RespawnEventRecord, RoleChangeHook, SetupProgress, StateCounts, TaskState,
 };
 // `DiscoveryDebt` is the wire-format value type for the discovery-debt
 // field; it lives in the protocol crate (it crosses the wire inside
