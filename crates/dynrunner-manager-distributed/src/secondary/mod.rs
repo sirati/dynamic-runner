@@ -140,16 +140,12 @@ pub(super) struct PendingAffineDependent<I: Identifier> {
     pub(super) work_hash: String,
     pub(super) worker_id: dynrunner_core::WorkerId,
     // The resolved binary + scheduler estimate + predecessor outputs are
-    // forwarded VERBATIM to the router's `assign_task` on release in Phase 5
-    // (#497 P5 consumes them when the import completes — same "carries
-    // everything assign_task needs" contract as `PendingFirstBind`). Phase 4
-    // populates + queues them; the release path that READS them is wired in
-    // Phase 5.
-    #[allow(dead_code)]
+    // forwarded VERBATIM to the release dispatch
+    // (`dispatch_released_affine_dependent` → `assign_resolved_task`) when the
+    // import completes (#497 P5 — same "carries everything assign needs"
+    // contract as `PendingFirstBind`).
     pub(super) binary: TaskInfo<I>,
-    #[allow(dead_code)]
     pub(super) estimated: dynrunner_core::ResourceMap,
-    #[allow(dead_code)]
     pub(super) predecessor_outputs: std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>,
 }
 
@@ -540,6 +536,28 @@ where
     /// discipline as `fatal_exit_signal_rx`).
     pub(super) secondary_control_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<control::SecondaryControlCommand>>,
+
+    /// Off-loop SecondaryAffine-import completion SENDER (#497 P5). Cloned
+    /// into each detached `spawn_local` import task by
+    /// [`Self::drive_affine_import`]; the task computes the classified
+    /// outcome and posts one
+    /// [`affine_exec::AffineImportComplete`](crate::secondary::affine_exec)
+    /// per import. Mirrors the worker-completion mechanism (the pool's
+    /// `event_tx` cloned into each worker monitor task): the import runs OFF
+    /// the coordinator loop so a multi-GB `nix-store --import` never blocks it,
+    /// and the completion lands back on the loop's `select!` arm via this
+    /// channel. Unbounded for the same reason as the other dispatcher channels
+    /// — the producing import task must never block; the volume is bounded by
+    /// the number of distinct per-secondary imports (one send per import).
+    pub(super) affine_import_tx:
+        tokio::sync::mpsc::UnboundedSender<affine_exec::AffineImportComplete>,
+
+    /// Off-loop SecondaryAffine-import completion receiver. Taken into a
+    /// loop-local at `process_tasks` entry (the same take-once discipline as
+    /// `secondary_control_rx`); the operational `select!` arm drains it and
+    /// runs the on-loop release ([`Self::complete_affine_import`]).
+    pub(super) affine_import_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<affine_exec::AffineImportComplete>>,
 
     /// Announcer-outbox sender. Cloned out via
     /// [`Self::attach_observer_announcer`] into the

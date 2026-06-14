@@ -52,6 +52,34 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use super::wire::timestamp_now;
 use super::{AffineGateOutcome, PendingAffineDependent, SecondaryCoordinator};
 use crate::affine_action::{IMPORT_OUTER_RETRIES, ImportActionHandle, ImportError};
+use crate::cluster_state::TaskState;
+
+/// Completion event delivered back to the secondary's operational `select!`
+/// loop when an OFF-LOOP affine import finishes (#497 P5).
+///
+/// The import itself (`nix-store --import` of GBs) is driven on a detached
+/// `spawn_local` task off a [`AffineGateOutcome::StartedRun`], NOT inline on
+/// the coordinator loop — running it inline would hold the loop across the
+/// whole multi-GB import await and starve every sibling arm (the starvation
+/// class #476-#478). The spawned task computes the classified
+/// [`AffineOutcome`] and sends it back through the coordinator-held
+/// `affine_import_tx` channel; the loop's [`Self::complete_affine_import`]
+/// handler then runs the on-loop release (drain the queued dependents, set
+/// `affine_done`, dispatch each released `B` onto its worker). This MIRRORS
+/// the worker-completion mechanism: each worker monitor task pushes a
+/// `WorkerEvent` through the pool's `event_tx` and the pool arm receives it —
+/// the import drive is the same off-loop-compute / on-loop-apply split.
+#[derive(Debug)]
+pub(crate) struct AffineImportComplete {
+    /// The SecondaryAffine task hash whose single per-secondary import just
+    /// finished — the key into `affine_running` the on-loop handler drains.
+    pub(in crate::secondary) affine_hash: String,
+    /// The classified import result. `Success` releases every queued
+    /// dependent (`LocalDependencyReleased` + on-worker dispatch) and marks
+    /// the hash `affine_done`; `Failure` fails each dependent with the #495
+    /// class and leaves the done set untouched (no poison).
+    pub(in crate::secondary) outcome: AffineOutcome,
+}
 
 /// The classified result of running a SecondaryAffine import in-process, after
 /// the bounded transient retry. Mirrors
@@ -171,9 +199,11 @@ where
     /// The PRESENCE of the hash key in `affine_running` is the run-once latch:
     /// only the first call (which finds neither set populated) returns
     /// [`AffineGateOutcome::StartedRun`], TELLING the caller it is the one
-    /// that must now drive [`Self::run_affine_import_once`]; every concurrent
-    /// / later dependent on the SAME hash finds the key present and only
-    /// queues ([`AffineGateOutcome::QueuedBehindRun`]).
+    /// that must now drive the single import ([`Self::drive_affine_import`] in
+    /// production, off the loop; [`Self::run_affine_import_once`] inline in the
+    /// executor-level tests); every concurrent / later dependent on the SAME
+    /// hash finds the key present and only queues
+    /// ([`AffineGateOutcome::QueuedBehindRun`]).
     ///
     /// ## Why the gate is SYNCHRONOUS (does not await the import)
     /// This method performs ONLY the synchronous run-once decision (check the
@@ -182,13 +212,14 @@ where
     /// `&mut self` across the (blocking) import await, so the 2nd..Nth
     /// dependent assignments could not be processed and queued WHILE the
     /// single import is in flight — exactly the run-once-under-concurrency
-    /// invariant. The caller drives the import via `run_affine_import_once`
-    /// on a `StartedRun`, decoupled from the queue-and-report gate, so ALL N
-    /// dependents enter `QueuedAfterLocalDependency` behind the ONE run.
-    // Reached via the dispatch router's TaskAssignment arm in Phase 5 (#497
-    // P5 wires the `unmet_local_affine_dep` intercept); Phase 4 builds + tests
-    // this executor at the executor level with a stub ImportAction.
-    #[allow(dead_code)]
+    /// invariant. The caller drives the import off a `StartedRun` (in
+    /// production, OFF the coordinator loop via [`Self::drive_affine_import`]),
+    /// decoupled from the queue-and-report gate, so ALL N dependents enter
+    /// `QueuedAfterLocalDependency` behind the ONE run.
+    // Reached via the dispatch router's TaskAssignment arm
+    // ([`Self::try_gate_on_affine_import`], #497 P5) for a work task whose
+    // SecondaryAffine dependency is locally unmet; also driven directly by the
+    // executor-level Phase-4 tests with a stub ImportAction.
     pub(in crate::secondary) async fn ensure_affine_import(
         &mut self,
         affine_hash: String,
@@ -239,12 +270,24 @@ where
     /// `TaskFailed{class}` per dependent (re-routable per #495) and do NOT set
     /// `affine_done` — a later assignment / another secondary retries its OWN
     /// import (the done set is never poisoned).
-    // Driven by the dispatch router on a `StartedRun` in Phase 5 (#497 P5);
-    // Phase 4 drives it directly from the executor-level tests.
-    #[allow(dead_code)]
+    ///
+    /// ## Inline vs off-loop (the #497 P5 split)
+    /// This method drives the import INLINE (`.await` on the caller's task)
+    /// and is the EXECUTOR-LEVEL test driver (Phase-4 tests, with an in-process
+    /// stub importer). The PRODUCTION dispatch path does NOT call it: the
+    /// router's gate ([`Self::try_gate_on_affine_import`]) spawns the import
+    /// OFF the coordinator loop ([`Self::drive_affine_import`]) so the multi-GB
+    /// import never blocks the loop, and the completion arm calls
+    /// [`Self::complete_affine_import`] — the SAME release body this method
+    /// delegates to. Keeping the resolve-then-import-then-release shape in one
+    /// place lets the inline-test and off-loop-production paths share the exact
+    /// release logic (no divergence). Test-only because production never
+    /// imports inline.
+    #[cfg(test)]
     pub(in crate::secondary) async fn run_affine_import_once(
         &mut self,
         affine_hash: String,
+        factory: &mut impl dynrunner_manager_local::WorkerFactory<M>,
     ) -> Result<(), String> {
         // Resolve `I`'s TaskInfo from this node's replicated CRDT mirror (a
         // prior `TaskAdded` broadcast seeded it; the Phase-2 originator put it
@@ -259,16 +302,53 @@ where
 
         let outcome = match task {
             Some(task) => execute_affine_with_action(&task, &self.import_action).await,
-            None => AffineOutcome::Failure {
-                error_type: dynrunner_core::ErrorType::NonRecoverable,
-                reason: format!(
-                    "SecondaryAffine gate '{affine_hash}' absent from the local \
-                     ledger (assignment outran TaskAdded, or a concurrent \
-                     removal) — failing its queued dependents non-recoverably",
-                ),
-            },
+            None => Self::affine_gate_absent_failure(&affine_hash),
         };
 
+        self.complete_affine_import(affine_hash, outcome, factory)
+            .await
+    }
+
+    /// The structural-wiring failure used when a SecondaryAffine gate is
+    /// absent from this node's local ledger at import time (assignment outran
+    /// the gate's `TaskAdded` broadcast, or a concurrent removal): every
+    /// queued dependent is failed NON-recoverably rather than left stranded.
+    /// Shared by the inline ([`Self::run_affine_import_once`]) and off-loop
+    /// ([`Self::drive_affine_import`]) drives so the absent-gate verdict has
+    /// one definition.
+    pub(in crate::secondary) fn affine_gate_absent_failure(affine_hash: &str) -> AffineOutcome {
+        AffineOutcome::Failure {
+            error_type: dynrunner_core::ErrorType::NonRecoverable,
+            reason: format!(
+                "SecondaryAffine gate '{affine_hash}' absent from the local \
+                 ledger (assignment outran TaskAdded, or a concurrent \
+                 removal) — failing its queued dependents non-recoverably",
+            ),
+        }
+    }
+
+    /// Drain every dependent queued behind `affine_hash`'s single import and
+    /// apply the classified `outcome` (#497 P4 release body / P5 completion
+    /// handler). Runs ON the coordinator loop — both the inline
+    /// [`Self::run_affine_import_once`] and the off-loop completion arm reach
+    /// the run-once release through here, so the two drives share one body.
+    ///
+    /// On `Success`: mark the hash locally-done (so any FUTURE dependent
+    /// releases immediately), then per dependent BOTH (a) report
+    /// `LocalDependencyReleased` (→ the primary originates the EXISTING
+    /// `TaskAssigned` → `B` `InFlight`, pinning the same `(secondary,
+    /// worker)`) AND (b) dispatch `B` onto its worker NOW
+    /// ([`Self::dispatch_released_affine_dependent`]) — the deferred
+    /// assignment the gate withheld. On `Failure`: fail each dependent with
+    /// the import's #495 class (re-routable per #495) and leave `affine_done`
+    /// untouched (no poison) so a fresh `ensure_affine_import` starts a new
+    /// single run.
+    pub(in crate::secondary) async fn complete_affine_import(
+        &mut self,
+        affine_hash: String,
+        outcome: AffineOutcome,
+        factory: &mut impl dynrunner_manager_local::WorkerFactory<M>,
+    ) -> Result<(), String> {
         // Drain the queued dependents for THIS hash, clearing the run-once
         // latch. On success the hash also enters `affine_done` so any FUTURE
         // dependent releases immediately; on failure the done set is left
@@ -288,12 +368,19 @@ where
                 AffineOutcome::Success => {
                     // Release `B`: the primary originates the EXISTING
                     // `TaskAssigned` (→ `B` `InFlight`) off this frame — NOT a
-                    // second InFlight originator.
+                    // second InFlight originator — pinning the same
+                    // `(secondary, worker)` pair this node chose.
                     self.report_local_dependency_released(
-                        dependent.work_hash,
+                        dependent.work_hash.clone(),
                         dependent.worker_id,
                     )
                     .await?;
+                    // Actually dispatch `B` onto its worker now: the gate
+                    // withheld the assignment when `B` queued; the import is
+                    // done, so the deferred dispatch runs here (mirrors the
+                    // `pending_first_bind` post-Ready dispatch).
+                    self.dispatch_released_affine_dependent(dependent, factory)
+                        .await?;
                 }
                 AffineOutcome::Failure { error_type, reason } => {
                     // Fail `B` with the import's #495 class, reusing the
@@ -350,5 +437,210 @@ where
             worker_id,
         };
         self.send_to_primary(report).await
+    }
+
+    /// The hash of the FIRST of `binary`'s dependencies whose ledger entry is
+    /// a SecondaryAffine gate that has RESOLVED (`AffineReady`) but whose
+    /// per-secondary import this node has NOT yet run (`∉ affine_done`) — the
+    /// locally-unmet affine dependency that gates `B`'s assignment (#497 P5).
+    /// `None` ⇒ `B` has no unmet local affine dep, so the normal worker-
+    /// dispatch path runs unchanged.
+    ///
+    /// Resolution mirrors the primary-side gate detector
+    /// ([`crate::cluster_state::ClusterState::task_hash_for_dep`] →
+    /// `task_state`): each `TaskDep` `(phase_id, task_id)` resolves to the
+    /// dep's content hash, then the dep's LIVE `TaskState` must be
+    /// `AffineReady` (the resolved gate) whose underlying task is
+    /// `kind.is_secondary_affine()`. A dep that is not a SecondaryAffine gate,
+    /// not yet `AffineReady`, or already locally imported is skipped. Keyed on
+    /// the NODE-LOCAL `affine_done` set, so EVERY worker on this node gates on
+    /// the SAME single import (the run-once latch lives in `affine_running`).
+    ///
+    /// Read-only over the replicated `cluster_state` + the node-local
+    /// `affine_done`; returns an OWNED hash so the `cluster_state` borrow ends
+    /// at the call site.
+    pub(in crate::secondary) fn unmet_local_affine_dep(
+        &self,
+        binary: &TaskInfo<I>,
+    ) -> Option<String> {
+        binary.task_depends_on.iter().find_map(|dep| {
+            let dep_hash = self
+                .cluster_state
+                .task_hash_for_dep(&dep.phase_id, dep.task_id.as_str())?;
+            // The LIVE state must be the resolved gate `AffineReady` AND its
+            // task a SecondaryAffine gate. A SecondaryAffine task only ever
+            // sits Blocked / Pending (not yet ready — `B` would not have been
+            // dispatched) or AffineReady (ready), so this isolates exactly the
+            // ready-but-not-locally-imported gate.
+            let is_ready_affine_gate = matches!(
+                self.cluster_state.task_state(dep_hash),
+                Some(TaskState::AffineReady { task, .. }) if task.kind.is_secondary_affine()
+            );
+            // `affine_done` lives on `OperationalState`; this read is only
+            // reached on the operational dispatch path, so a `None` here (not
+            // yet Operational) correctly reads as "not locally imported".
+            let locally_done = self
+                .lifecycle
+                .operational_ref()
+                .is_some_and(|op| op.affine_done.contains(dep_hash));
+            (is_ready_affine_gate && !locally_done).then(|| dep_hash.to_string())
+        })
+    }
+
+    /// The dispatch-router intercept (#497 P5): gate a work task `B`'s
+    /// assignment on its locally-unmet SecondaryAffine import. Returns `true`
+    /// when `B` was GATED (queued behind the import — the caller must NOT
+    /// proceed to worker dispatch) and `false` when `B` has no unmet local
+    /// affine dep (the caller runs the UNCHANGED dispatch path).
+    ///
+    /// On a locally-unmet dep, builds the [`PendingAffineDependent`] (carrying
+    /// everything the release dispatch needs) and runs the SYNCHRONOUS run-once
+    /// claim-or-queue ([`Self::ensure_affine_import`]):
+    ///   * `AlreadyDone` → the import already ran on this node; `B` is NOT
+    ///     gated (returns `false`) so the caller dispatches it immediately.
+    ///   * `QueuedBehindRun` → `B` queued behind the in-flight import; no
+    ///     second import. Returns `true` (gated).
+    ///   * `StartedRun` → `B` is the first dependent; drive the SINGLE import
+    ///     OFF the coordinator loop ([`Self::drive_affine_import`]) and return
+    ///     `true` (gated). The import never blocks the loop.
+    ///
+    /// The router never learns the run-once latch, the queue, or the import —
+    /// this is the one seam it crosses.
+    pub(in crate::secondary) async fn try_gate_on_affine_import(
+        &mut self,
+        worker_id: dynrunner_core::WorkerId,
+        binary: &TaskInfo<I>,
+        estimated: &dynrunner_core::ResourceMap,
+        predecessor_outputs: &std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>,
+        work_hash: &str,
+    ) -> Result<bool, String> {
+        let Some(affine_hash) = self.unmet_local_affine_dep(binary) else {
+            return Ok(false);
+        };
+        let dependent = PendingAffineDependent {
+            work_hash: work_hash.to_string(),
+            worker_id,
+            binary: binary.clone(),
+            estimated: estimated.clone(),
+            predecessor_outputs: predecessor_outputs.clone(),
+        };
+        match self.ensure_affine_import(affine_hash.clone(), dependent).await? {
+            // The import already ran on this node — `B` is not gated; the
+            // caller dispatches it on the normal path immediately.
+            AffineGateOutcome::AlreadyDone => Ok(false),
+            // `B` queued behind the single in-flight import — no second run.
+            AffineGateOutcome::QueuedBehindRun => Ok(true),
+            // `B` is the FIRST dependent: drive the ONE import off the loop.
+            AffineGateOutcome::StartedRun => {
+                self.drive_affine_import(affine_hash);
+                Ok(true)
+            }
+        }
+    }
+
+    /// Drive the SINGLE per-secondary import for `affine_hash` OFF the
+    /// coordinator loop (#497 P5 — the load-bearing decoupling). The import
+    /// (`nix-store --import` of GBs) is run on a detached [`spawn_local`] task
+    /// so it never blocks the operational `select!` loop — running it inline
+    /// would hold the loop across the whole multi-GB await and starve every
+    /// sibling arm (the starvation class #476-#478 fixed). The spawned task
+    /// computes the classified [`AffineOutcome`] and sends an
+    /// [`AffineImportComplete`] back through `affine_import_tx`; the loop's
+    /// completion arm ([`Self::complete_affine_import`]) then runs the on-loop
+    /// release. This MIRRORS the worker-completion mechanism (a monitor task
+    /// pushes a `WorkerEvent` through the pool's `event_tx`; the pool arm
+    /// receives it).
+    ///
+    /// Task resolution happens HERE (on the loop, reading `cluster_state`) so
+    /// the cloned `TaskInfo` + the cloned `Arc<dyn ImportAction>` (both
+    /// moveable) cross into the spawned task without holding any borrow. An
+    /// absent gate is the structural-wiring fault delivered as a NonRecoverable
+    /// completion (no spawn — there is nothing to import), so its queued
+    /// dependents are failed by the SAME release body.
+    ///
+    /// [`spawn_local`]: tokio::task::spawn_local
+    pub(in crate::secondary) fn drive_affine_import(&mut self, affine_hash: String) {
+        let task = self
+            .cluster_state
+            .task_state(&affine_hash)
+            .map(|state| state.task().clone());
+        let tx = self.affine_import_tx.clone();
+
+        match task {
+            Some(task) => {
+                // The action handle is `Option<Arc<dyn ImportAction>>` — the
+                // `Arc` is Send+Sync (moveable); the import FUTURE is `?Send`,
+                // so the detached task is `spawn_local` (the secondary runs
+                // LocalSet-bound, like every other secondary off-loop task).
+                let action = self.import_action.clone();
+                tokio::task::spawn_local(async move {
+                    let outcome = execute_affine_with_action(&task, &action).await;
+                    // The receiver lives on the coordinator for the whole
+                    // operational span; a send error only after teardown.
+                    let _ = tx.send(AffineImportComplete {
+                        affine_hash,
+                        outcome,
+                    });
+                });
+            }
+            None => {
+                // No body to import — deliver the absent-gate failure straight
+                // to the completion arm (which fails the queued dependents).
+                let _ = tx.send(AffineImportComplete {
+                    outcome: Self::affine_gate_absent_failure(&affine_hash),
+                    affine_hash,
+                });
+            }
+        }
+    }
+
+    /// Dispatch a released SecondaryAffine dependent `B` onto its worker now
+    /// that the per-secondary import has finished (#497 P5). The gate withheld
+    /// `B`'s worker binding when it queued (the intercept runs BEFORE worker
+    /// selection); on the import's success the release re-enters the SAME
+    /// selection + per-type-ensure + assign path every normal assignment uses
+    /// ([`Self::assign_resolved_task`]) — no duplicated worker-binding logic.
+    ///
+    /// Re-checks the run-aborted gate first (mirroring the `pending_first_bind`
+    /// post-Ready dispatch): once the replicated `RunAborted` verdict is
+    /// latched, this continuation must NOT bind the deferred task — the stash
+    /// is dropped (the authority exits on the same verdict; there is no run
+    /// left to requeue into) and this loop's own tail exits on the same latch.
+    ///
+    /// `factory` is threaded from the operational loop (which owns it) so the
+    /// per-type subprocess (re)spawn `assign_resolved_task` drives reaches the
+    /// real factory.
+    pub(in crate::secondary) async fn dispatch_released_affine_dependent(
+        &mut self,
+        dependent: PendingAffineDependent<I>,
+        factory: &mut impl dynrunner_manager_local::WorkerFactory<M>,
+    ) -> Result<(), String> {
+        if let Some(reason) = self.cluster_state.run_aborted() {
+            tracing::info!(
+                worker_id = dependent.worker_id,
+                task_hash = %dependent.work_hash,
+                reason = %reason,
+                "released affine dependent NOT dispatched: the replicated \
+                 run-terminal verdict is latched; dropping the deferred task \
+                 (this node exits on the same latch)"
+            );
+            return Ok(());
+        }
+        let PendingAffineDependent {
+            work_hash,
+            worker_id,
+            binary,
+            estimated,
+            predecessor_outputs,
+        } = dependent;
+        self.assign_resolved_task(
+            worker_id,
+            binary,
+            estimated,
+            predecessor_outputs,
+            work_hash,
+            factory,
+        )
+        .await
     }
 }

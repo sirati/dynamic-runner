@@ -29,9 +29,9 @@ use dynrunner_core::{ErrorType, ResourceMap, TaskInfo, TaskKind, WorkerId};
 use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
 use tokio::sync::Notify;
 
-use super::super::test_helpers::{TestId, make_secondary_recording};
-use super::super::{AffineGateOutcome, PendingAffineDependent};
-use super::firstbind_orphan::one_worker_config;
+use super::super::test_helpers::{FakeWorkerFactory, TestId, make_secondary_recording};
+use super::super::{AffineGateOutcome, PendingAffineDependent, SecondaryConfig};
+use super::firstbind_orphan::{one_worker_config, task_assignment, test_oom_watcher};
 use super::processing::make_binary;
 use crate::affine_action::{IMPORT_OUTER_RETRIES, ImportAction, ImportError};
 
@@ -262,7 +262,10 @@ async fn eight_concurrent_dependents_trigger_exactly_one_import() {
             // and the LocalSet keeps everything on one thread.
             let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
             let import_task = tokio::task::spawn_local(async move {
-                let r = sec.run_affine_import_once(affine_hash.to_string()).await;
+                let mut factory = FakeWorkerFactory;
+                let r = sec
+                    .run_affine_import_once(affine_hash.to_string(), &mut factory)
+                    .await;
                 let _ = done_tx.send(());
                 (sec, r)
             });
@@ -347,7 +350,7 @@ async fn second_assignment_after_done_releases_immediately() {
                 .await
                 .unwrap();
             assert_eq!(first, AffineGateOutcome::StartedRun);
-            sec.run_affine_import_once(affine_hash.to_string())
+            sec.run_affine_import_once(affine_hash.to_string(), &mut FakeWorkerFactory)
                 .await
                 .unwrap();
             assert!(sec.op_mut().affine_done.contains(affine_hash));
@@ -422,7 +425,7 @@ async fn import_failure_recoverable_fails_each_queued_dependent_rerouteable() {
 
             // The single import FAILS recoverably. Each queued dependent is
             // failed re-routeably; the done set is NOT poisoned.
-            sec.run_affine_import_once(affine_hash.to_string())
+            sec.run_affine_import_once(affine_hash.to_string(), &mut FakeWorkerFactory)
                 .await
                 .unwrap();
 
@@ -487,7 +490,7 @@ async fn import_failure_does_not_poison_done_set() {
                 .await
                 .unwrap();
             assert_eq!(first, AffineGateOutcome::StartedRun);
-            sec.run_affine_import_once(affine_hash.to_string())
+            sec.run_affine_import_once(affine_hash.to_string(), &mut FakeWorkerFactory)
                 .await
                 .unwrap();
             assert!(
@@ -512,7 +515,7 @@ async fn import_failure_does_not_poison_done_set() {
                 AffineGateOutcome::StartedRun,
                 "after a failed import, a fresh dependent starts a NEW single run"
             );
-            sec.run_affine_import_once(affine_hash.to_string())
+            sec.run_affine_import_once(affine_hash.to_string(), &mut FakeWorkerFactory)
                 .await
                 .unwrap();
             assert_eq!(
@@ -555,7 +558,7 @@ async fn transient_import_failures_retry_then_succeed_and_release() {
             sec.ensure_affine_import(affine_hash.to_string(), make_dependent("B0", 0))
                 .await
                 .unwrap();
-            sec.run_affine_import_once(affine_hash.to_string())
+            sec.run_affine_import_once(affine_hash.to_string(), &mut FakeWorkerFactory)
                 .await
                 .unwrap();
 
@@ -603,7 +606,7 @@ async fn transient_import_failures_exhaust_to_recoverable_failure() {
             sec.ensure_affine_import(affine_hash.to_string(), make_dependent("B0", 0))
                 .await
                 .unwrap();
-            sec.run_affine_import_once(affine_hash.to_string())
+            sec.run_affine_import_once(affine_hash.to_string(), &mut FakeWorkerFactory)
                 .await
                 .unwrap();
 
@@ -651,7 +654,7 @@ async fn unregistered_import_action_is_a_nonrecoverable_wiring_failure() {
             sec.ensure_affine_import(affine_hash.to_string(), make_dependent("B0", 0))
                 .await
                 .unwrap();
-            sec.run_affine_import_once(affine_hash.to_string())
+            sec.run_affine_import_once(affine_hash.to_string(), &mut FakeWorkerFactory)
                 .await
                 .unwrap();
 
@@ -670,6 +673,399 @@ async fn unregistered_import_action_is_a_nonrecoverable_wiring_failure() {
                  NonRecoverably (loud wiring error); got {:?}",
                 log.borrow()
             );
+        })
+        .await;
+}
+
+// ─────────────────── Phase 5: the dispatch-router intercept ───────────────────
+//
+// These tests drive the WHOLE secondary dispatch path (`handle_inbound` →
+// `dispatch_message` → the TaskAssignment arm) for a work task `B`, exercising
+// the `unmet_local_affine_dep` gate, the off-loop import drive, and the
+// completion → release dispatch — the seams Phase 5 wires.
+
+/// An `n`-worker variant of [`one_worker_config`] (the multi-slot fixture the
+/// "all 8 workers gate on one import" test needs).
+fn n_worker_config(secondary_id: &str, n: u32) -> SecondaryConfig {
+    SecondaryConfig {
+        num_workers: n,
+        ..one_worker_config(secondary_id)
+    }
+}
+
+/// Seed a SecondaryAffine gate `I` into the secondary's ledger and drive it to
+/// `AffineReady` via the public apply path (`TaskAdded` → Pending → the
+/// Phase-2 `AffineReady` mutation), then assert it is `AffineReady`. The gate's
+/// `task_id` is what a dependent work task points its `task_depends_on` edge
+/// at. Keyed by `gate_hash` in the ledger (the kind is excluded from the
+/// content hash, so a literal hash is a clean fixture).
+fn seed_affine_ready_gate(
+    sec: &mut crate::secondary::test_helpers::SecondaryHarness<
+        crate::secondary::test_helpers::RecordingPeer<TestId>,
+    >,
+    gate_hash: &str,
+    gate_task_id: &str,
+) {
+    let mut gate = make_binary(gate_task_id, 0);
+    gate.kind = TaskKind::SecondaryAffine;
+    sec.cluster_state.apply(ClusterMutation::TaskAdded {
+        hash: gate_hash.to_string(),
+        task: gate,
+    });
+    sec.cluster_state.apply(ClusterMutation::AffineReady {
+        hash: gate_hash.to_string(),
+    });
+    assert!(
+        matches!(
+            sec.cluster_state.task_state(gate_hash),
+            Some(crate::cluster_state::TaskState::AffineReady { .. })
+        ),
+        "fixture precondition: the gate is AffineReady"
+    );
+}
+
+/// A work task `B` (`work_id`) with a single dependency on the gate task
+/// `gate_task_id` (same `default` phase `make_binary` uses) — the dependent
+/// the router gates.
+fn make_work_with_affine_dep(work_id: &str, gate_task_id: &str) -> TaskInfo<TestId> {
+    let mut b = make_binary(work_id, 50);
+    b.task_depends_on.push(dynrunner_core::TaskDep {
+        task_id: gate_task_id.into(),
+        phase_id: dynrunner_core::PhaseId::from("default"),
+        inherit_outputs: false,
+    });
+    b
+}
+
+/// Pump every pending pool event so each freshly-assigned worker's deferred
+/// first-bind binds into `active_tasks`. A fresh `FakeWorkerFactory` slot takes
+/// its FIRST task of a type via `EnsureWorkerOutcome::RespawnInProgress` — the
+/// resolved binary is stashed in `pending_first_bind` and the `WorkerEvent::Ready`
+/// arm binds it once the new subprocess reports Ready. This drives that Ready
+/// fan-in for every worker that has a stashed binary (bounded by `max` polls).
+async fn pump_ready_bindings<P: dynrunner_protocol_primary_secondary::PeerTransport<TestId>>(
+    sec: &mut crate::secondary::test_helpers::SecondaryHarness<P>,
+    oom: &dynrunner_manager_local::oom::OomWatcher,
+    max: usize,
+) {
+    for _ in 0..max {
+        if sec.op_mut().pending_first_bind.is_empty() {
+            break;
+        }
+        let Some(event) = sec.op_mut().pool.recv_event().await else {
+            break;
+        };
+        sec.handle_worker_event(event, oom).await.unwrap();
+    }
+}
+
+/// A `B` whose SecondaryAffine dep is `AffineReady` but NOT locally imported →
+/// `B` does NOT reach a worker; it is reported `QueuedAfterLocalDependency` and
+/// the single per-secondary import is driven.
+#[tokio::test(flavor = "current_thread")]
+async fn assignment_with_unmet_affine_dep_queues_b_not_worker() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            let mut factory = FakeWorkerFactory;
+            let pool = sec.initialize_workers(&mut factory).await.unwrap();
+            sec.enter_operational_for_test();
+            *sec.pool_mut() = pool;
+
+            let gate_hash = "import-monolith";
+            seed_affine_ready_gate(&mut sec, gate_hash, "import");
+            // A BLOCKING importer so the driven import stays in flight (we
+            // assert it was started, not that it completed).
+            let (stub, _gate) = StubImporter::blocking(Ok(()));
+            sec.set_import_action(stub.clone());
+
+            let b = make_work_with_affine_dep("B", "import");
+            let b_hash = "work-b-hash";
+            sec.handle_inbound(
+                task_assignment("setup", "sec-2", 0, &b, b_hash),
+                &mut FakeWorkerFactory,
+            )
+            .await;
+            sec.drain_egress().await;
+
+            // B did NOT reach a worker: nothing in active_tasks, the slot is
+            // still idle.
+            assert!(
+                !sec.op_mut().active_tasks.contains_key(b_hash),
+                "a work task gated on an unmet affine import must NOT be \
+                 assigned to a worker"
+            );
+            assert!(
+                sec.op_mut().pool.workers[0].is_idle_state(),
+                "the worker must stay idle behind the gate"
+            );
+            // B was reported QueuedAfterLocalDependency.
+            assert_eq!(
+                queued_work_hashes(&log, gate_hash),
+                vec![b_hash.to_string()],
+                "B must be reported QueuedAfterLocalDependency"
+            );
+            // The single import was driven (queued + in flight on this node).
+            assert_eq!(
+                sec.op_mut().affine_running.get(gate_hash).map(Vec::len),
+                Some(1),
+                "the single per-secondary import is driven (B queued behind it)"
+            );
+            // Let the spawned import task reach the (blocked) stub.
+            for _ in 0..100 {
+                if stub.call_count() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                stub.call_count(),
+                1,
+                "the import was driven OFF the loop (the spawned task reached \
+                 the blocking stub)"
+            );
+        })
+        .await;
+}
+
+/// A `B` whose SecondaryAffine dep is ALREADY in this node's `affine_done` →
+/// the gate is a no-op: `B` is assigned straight to its worker, no
+/// `QueuedAfterLocalDependency` report, no import.
+#[tokio::test(flavor = "current_thread")]
+async fn assignment_with_locally_done_affine_dep_goes_straight_to_worker() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            let mut factory = FakeWorkerFactory;
+            let pool = sec.initialize_workers(&mut factory).await.unwrap();
+            sec.enter_operational_for_test();
+            *sec.pool_mut() = pool;
+
+            let gate_hash = "import-monolith";
+            seed_affine_ready_gate(&mut sec, gate_hash, "import");
+            // The import already ran on this node.
+            sec.op_mut().affine_done.insert(gate_hash.to_string());
+            // A stub that would FAIL the test if called — the locally-done
+            // path must never run an import.
+            let stub = StubImporter::immediate(Err(ImportError::NonRecoverable(
+                "must not be called".into(),
+            )));
+            sec.set_import_action(stub.clone());
+
+            let b = make_work_with_affine_dep("B", "import");
+            let b_hash = "work-b-hash";
+            sec.handle_inbound(
+                task_assignment("setup", "sec-2", 0, &b, b_hash),
+                &mut FakeWorkerFactory,
+            )
+            .await;
+            sec.drain_egress().await;
+
+            // B was assigned straight to its worker (first-bind binds on Ready).
+            let oom = test_oom_watcher();
+            pump_ready_bindings(&mut sec, &oom, 4).await;
+            assert_eq!(
+                sec.op_mut().active_tasks.get(b_hash),
+                Some(&0u32),
+                "a locally-done affine dep must let B assign straight to its worker"
+            );
+            // No queued report, no import.
+            assert!(
+                queued_work_hashes(&log, gate_hash).is_empty(),
+                "a locally-done affine dep must NOT report QueuedAfterLocalDependency"
+            );
+            assert_eq!(
+                stub.call_count(),
+                0,
+                "a locally-done affine dep must NOT run a second import"
+            );
+            assert!(
+                !sec.op_mut().affine_running.contains_key(gate_hash),
+                "no import is driven for a locally-done affine dep"
+            );
+        })
+        .await;
+}
+
+/// A plain `Work` task with NO SecondaryAffine dependency takes the EXISTING
+/// dispatch path unchanged (the regression guard): assigned to its worker, no
+/// queued report, no import driven.
+#[tokio::test(flavor = "current_thread")]
+async fn assignment_with_no_affine_dep_unchanged() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            let mut factory = FakeWorkerFactory;
+            let pool = sec.initialize_workers(&mut factory).await.unwrap();
+            sec.enter_operational_for_test();
+            *sec.pool_mut() = pool;
+
+            // No import action registered, no affine gate seeded — a plain
+            // work task must never touch the affine path.
+            let b = make_binary("B", 50);
+            let b_hash = "work-b-hash";
+            sec.handle_inbound(
+                task_assignment("setup", "sec-2", 0, &b, b_hash),
+                &mut FakeWorkerFactory,
+            )
+            .await;
+            sec.drain_egress().await;
+
+            // Assigned to its worker via the unchanged path (first-bind binds
+            // on Ready).
+            let oom = test_oom_watcher();
+            pump_ready_bindings(&mut sec, &oom, 4).await;
+            assert_eq!(
+                sec.op_mut().active_tasks.get(b_hash),
+                Some(&0u32),
+                "a plain work task takes the existing dispatch path (assigned)"
+            );
+            // Nothing affine happened.
+            assert!(
+                sec.op_mut().affine_running.is_empty(),
+                "no import is driven for a non-affine task"
+            );
+            assert!(
+                log.borrow().iter().all(|m| !matches!(
+                    m,
+                    DistributedMessage::TaskQueuedAfterLocalDependency { .. }
+                )),
+                "a non-affine task must NEVER report QueuedAfterLocalDependency"
+            );
+        })
+        .await;
+}
+
+/// 8 assignments for 8 DIFFERENT workers, all depending on the SAME gate `I`:
+/// exactly ONE import is driven, all 8 are queued
+/// (`QueuedAfterLocalDependency`), and on the import's completion all 8 are
+/// released (`LocalDependencyReleased`) AND dispatched onto their workers.
+#[tokio::test(flavor = "current_thread")]
+async fn all_workers_on_node_gate_on_one_import() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, log) = make_secondary_recording(n_worker_config("sec-2", 8), 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            let mut factory = FakeWorkerFactory;
+            let pool = sec.initialize_workers(&mut factory).await.unwrap();
+            sec.enter_operational_for_test();
+            *sec.pool_mut() = pool;
+
+            let gate_hash = "import-monolith";
+            seed_affine_ready_gate(&mut sec, gate_hash, "import");
+            let (stub, gate) = StubImporter::blocking(Ok(()));
+            sec.set_import_action(stub.clone());
+
+            // 8 assignments, one per worker, each a distinct B depending on I.
+            for w in 0..8u32 {
+                let b = make_work_with_affine_dep(&format!("B{w}"), "import");
+                let b_hash = format!("work-b{w}-hash");
+                sec.handle_inbound(
+                    task_assignment("setup", "sec-2", w, &b, &b_hash),
+                    &mut FakeWorkerFactory,
+                )
+                .await;
+            }
+            sec.drain_egress().await;
+
+            // EXACTLY ONE import driven; all 8 queued behind it.
+            assert_eq!(
+                sec.op_mut().affine_running.get(gate_hash).map(Vec::len),
+                Some(8),
+                "all 8 dependents queue behind the ONE import"
+            );
+            let mut queued = queued_work_hashes(&log, gate_hash);
+            queued.sort();
+            assert_eq!(
+                queued,
+                (0..8).map(|w| format!("work-b{w}-hash")).collect::<Vec<_>>(),
+                "every one of the 8 dependents reports QueuedAfterLocalDependency"
+            );
+            // None of the 8 reached a worker yet (all gated).
+            for w in 0..8u32 {
+                assert!(
+                    !sec.op_mut()
+                        .active_tasks
+                        .contains_key(&format!("work-b{w}-hash")),
+                    "B{w} must be gated (not yet on a worker)"
+                );
+            }
+            // Let the single spawned import reach the blocking stub, then
+            // assert EXACTLY one import ran for the 8 dependents.
+            for _ in 0..100 {
+                if stub.call_count() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                stub.call_count(),
+                1,
+                "EXACTLY ONE import runs for the 8 dependents on the same hash"
+            );
+
+            // Release the import; receive the off-loop completion and run the
+            // on-loop release exactly as the `process_tasks` select! arm does.
+            gate.notify_one();
+            let completion = {
+                let rx = sec.affine_import_rx.as_mut().expect("rx present");
+                let mut got = None;
+                for _ in 0..100 {
+                    if let Ok(c) = rx.try_recv() {
+                        got = Some(c);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                got.expect("the spawned import must post AffineImportComplete")
+            };
+            sec.complete_affine_import(
+                completion.affine_hash,
+                completion.outcome,
+                &mut FakeWorkerFactory,
+            )
+            .await
+            .unwrap();
+            sec.drain_egress().await;
+
+            // The hash is locally done; the run-once queue is drained.
+            assert!(
+                sec.op_mut().affine_done.contains(gate_hash),
+                "the successful import marks the hash locally-done"
+            );
+            assert!(
+                !sec.op_mut().affine_running.contains_key(gate_hash),
+                "the drained run clears the affine_running key"
+            );
+            // All 8 released.
+            let mut released = released_hashes(&log);
+            released.sort();
+            assert_eq!(
+                released,
+                (0..8).map(|w| format!("work-b{w}-hash")).collect::<Vec<_>>(),
+                "the single import releases EXACTLY the 8 queued dependents"
+            );
+            // All 8 dispatched onto their workers (first-bind binds on Ready).
+            let oom = test_oom_watcher();
+            pump_ready_bindings(&mut sec, &oom, 64).await;
+            for w in 0..8u32 {
+                assert_eq!(
+                    sec.op_mut().active_tasks.get(&format!("work-b{w}-hash")),
+                    Some(&w),
+                    "released B{w} must be dispatched onto its worker {w}"
+                );
+            }
         })
         .await;
 }

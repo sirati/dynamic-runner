@@ -14,7 +14,9 @@
 //! through a method signature for no behavioural gain. Documented in
 //! `secondary/dispatch/mod.rs`.
 
-use dynrunner_core::{ErrorType, Identifier};
+use std::collections::BTreeMap;
+
+use dynrunner_core::{ErrorType, Identifier, ResourceMap, TaskInfo, TaskOutputs, WorkerId};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
@@ -220,285 +222,40 @@ where
                 }
                 let estimated = self.estimator.estimate(&binary);
 
-                // Select the dispatch target worker SAFELY. Prefer the
-                // primary's requested slot IF it is a valid, idle worker;
-                // otherwise fall back to any idle worker. Both `.get()` and
-                // `position()` return `None` for an empty pool, so a
-                // 0-worker `Operational` node (late-joiner / observer /
-                // phase-end observer — a VALID state on this path) is just
-                // the degenerate case of "no idle worker": no out-of-range
-                // `len() - 1` arithmetic, no unconditional index into the
-                // pool. An out-of-range `worker_id` likewise resolves to
-                // `None` on the preference and falls back to an idle worker
-                // — never silently clamped onto the wrong (last) slot.
-                let pool = &self.op_mut().pool;
-                let target_wid: Option<u32> = pool
-                    .workers
-                    .get(worker_id as usize)
-                    .filter(|w| w.is_idle_state())
-                    .map(|_| worker_id)
-                    .or_else(|| {
-                        pool.workers
-                            .iter()
-                            .position(|w| w.is_idle_state())
-                            .map(|i| i as u32)
-                    });
-
-                if let Some(target_wid) = target_wid {
-                    let estimated_mb =
-                        estimated.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
-                    let log_task_hash = file_hash.clone();
-                    // Per-type subprocess dispatch via the async-event
-                    // flow for both first-bind (`loaded_type_id == None`)
-                    // AND true type-shift (`Some(T1) → Some(T2)`). The
-                    // same-type fast path short-circuits inside the
-                    // pool with `EnsureWorkerOutcome::AlreadyLoaded`;
-                    // the respawn path returns `RespawnInProgress`
-                    // and the dispatch arm stashes the binary in
-                    // `pending_first_bind` for the
-                    // `WorkerEvent::Ready` handler to pick up.
-                    //
-                    // Pre-fix the first-bind path called the
-                    // synchronous `ensure_worker_for_type`, which
-                    // drives `poll_ready` inline. Inside this
-                    // `select!` arm body the inline wait blocked
-                    // every other arm — peer-bus relays, keepalive,
-                    // worker events, OOM ticks — for the entire
-                    // duration the freshly-spawned worker subprocess
-                    // took to send `Response::Ready`. The bug
-                    // manifested in production as a 300+s tokio-
-                    // runtime silence on the asm-tokenizer LMU
-                    // dispatch when one of the Python workers took
-                    // longer than `keepalive_timeout` to import its
-                    // task module.
-                    //
-                    // The earlier type-shift fix (commit 7862339)
-                    // closed the wedge for `Some(T1) → Some(T2)` by
-                    // routing the task through the same wire-bounce
-                    // contract the live primary's
-                    // `handle_primary_peer_rejection` recognises.
-                    // That works architecturally but biases
-                    // distribution on small workloads (peer
-                    // secondaries pay one wire round-trip per
-                    // type-bind, the promoted-primary's self-
-                    // assigns reach the same-type fast path within
-                    // sub-millisecond of Ready). Storing the binary
-                    // in `pending_first_bind` keeps it pinned to the
-                    // worker the primary picked: no wire round-trip,
-                    // no fairness regression, and the loss path
-                    // (`WorkerEvent::Disconnected`) still recovers
-                    // via the backpressure marker if the worker
-                    // never reaches Ready.
-                    let ensure_result: Result<(), String> = match self
-                        .op_mut()
-                        .pool
-                        .ensure_worker_for_type_async(target_wid, &binary.type_id, factory, false)
-                        .await
-                    {
-                        Ok(dynrunner_manager_local::EnsureWorkerOutcome::AlreadyLoaded) => Ok(()),
-                        Ok(dynrunner_manager_local::EnsureWorkerOutcome::RespawnInProgress) => {
-                            // Respawn-HOLD (#58): the per-type subprocess
-                            // for `target_wid` is mid-kill+spawn (the
-                            // pool kicked off a background `wait_ready`
-                            // task). DEFER this task rather than drop it
-                            // or busy-bounce it to the authority: stash
-                            // the resolved binary in `pending_first_bind`
-                            // keyed by the worker; the
-                            // `WorkerEvent::Ready` handler picks it up and
-                            // calls `assign_task` once the slot is
-                            // observably Idle with the new type bound. No
-                            // drop, no tight retry loop. The loss path
-                            // (`WorkerEvent::Disconnected` before Ready)
-                            // reports the deferred task back to the
-                            // authority as backpressure via
-                            // `report_deferred_task_lost`.
-                            tracing::debug!(
-                                worker_id = target_wid,
-                                type_id = %binary.type_id,
-                                file_hash = %file_hash,
-                                "type-bind respawn in progress; deferring task until \
-                                 worker Ready (respawn-HOLD)"
-                            );
-                            // The type-shift respawn just REPLACED the slot's
-                            // subprocess (a new generation). Sweep any task
-                            // still bound to this slot in `active_tasks` into
-                            // the reinject path so the replaced generation
-                            // cannot strand it (assigned-never-terminal). The
-                            // deferred task we are about to stash lives in
-                            // `pending_first_bind`, NOT `active_tasks`, so the
-                            // sweep never touches it. No-op when the slot was
-                            // idle/already-swept (the common case — the
-                            // dispatch target was selected idle). This is the
-                            // belt-and-braces companion to the generation
-                            // gate: the gate stops a stale terminal from
-                            // mis-attributing; this stops a replacement from
-                            // abandoning a still-bound task.
-                            //
-                            // ORDERING: the sweep runs after the generation
-                            // bump, in the SAME select-arm body — the event
-                            // channel cannot drain between bump and sweep
-                            // within one loop iteration. Keep them adjacent;
-                            // even if a future refactor yielded to the event
-                            // arm in between, the bumped generation makes the
-                            // gate drop a draining stale terminal first.
-                            self.sweep_replaced_worker_task(target_wid).await?;
-                            self.op_mut().pending_first_bind.insert(
-                                target_wid,
-                                super::super::PendingFirstBind {
-                                    binary,
-                                    file_hash,
-                                    estimated,
-                                    predecessor_outputs,
-                                },
-                            );
-                            return Ok(());
-                        }
-                        Err(e) => Err(e),
-                    };
-                    if let Err(e) = ensure_result {
-                        tracing::warn!(
-                            worker_id = target_wid,
-                            error = %e,
-                            type_id = %binary.type_id,
-                            "ensure_worker_for_type failed for peer-assigned task; queuing respawn"
-                        );
-                        self.schedule_worker_restart(target_wid);
-                        let task_failed = DistributedMessage::TaskFailed {
-                            target: None,
-                            sender_id: self.config.secondary_id.clone(),
-                            timestamp: timestamp_now(),
-                            secondary_id: self.config.secondary_id.clone(),
-                            worker_id: target_wid,
-                            task_hash: file_hash.clone(),
-                            error_type: ErrorType::Recoverable,
-                            error_message: format!(
-                                "No idle worker available (respawn failed): {e}"
-                            ),
-                            // Stamped at the send_to_primary chokepoint (#352).
-                            delivery_seq: None,
-                            // Stamped at the send_to_primary chokepoint (ordering gate).
-                            msgs_posted_through: None,
-                        };
-                        // Report to the primary role only; the authority
-                        // owns mesh propagation (it originates the CRDT
-                        // mutation and broadcasts it). A reporting
-                        // secondary that also broadcast would be a second
-                        // CRDT originator.
-                        self.send_to_primary(task_failed).await?;
-                        return Ok(());
-                    }
-                    // Snapshot the assigned binary for the sampler
-                    // hook before the move into `assign_task`. The
-                    // hook only reads `task_id` so cloning the
-                    // whole `TaskInfo` once is cheap relative to
-                    // the assignment-write hot path.
-                    let binary_for_hook = binary.clone();
-                    let worker = &mut self.op_mut().pool.workers[target_wid as usize];
-                    match worker
-                        .assign_task(binary, estimated, false, predecessor_outputs)
-                        .await
-                    {
-                        Ok(()) => {
-                            self.notify_sampler_assigned(target_wid, &binary_for_hook);
-                            self.op_mut().active_tasks.insert(file_hash, target_wid);
-                            self.op_mut().primary_link.reset_backoff(target_wid);
-                            tracing::info!(
-                                worker_id = target_wid,
-                                task_id = ?binary_info.task_id,
-                                phase = %binary_info.phase_id,
-                                task_type = %binary_info.type_id,
-                                task_hash = %log_task_hash,
-                                estimated_mb,
-                                "assigned task from primary"
-                            );
-                        }
-                        Err(e) => {
-                            // Worker subprocess likely died between
-                            // tasks. Reap so the log carries the
-                            // actual signal/code rather than the
-                            // pipe-level "Broken pipe" string. See
-                            // `WorkerHandle::try_reap_exit` for None
-                            // conditions.
-                            let exit_status =
-                                self.op_mut().pool.workers[target_wid as usize].try_reap_exit();
-                            tracing::warn!(
-                                worker_id = target_wid,
-                                error = %e,
-                                exit_status = exit_status.as_ref().map(|s| s.to_string()),
-                                "peer-assign failed; queuing worker respawn + requeuing task at primary"
-                            );
-                            // Bug B: queue the worker for respawn
-                            // at the next `process_tasks` tick. The
-                            // dead pipe stays dead until the manager
-                            // brings a replacement up; pre-fix the
-                            // SLURM-secondary path silently abandoned
-                            // the slot.
-                            self.schedule_worker_restart(target_wid);
-                            // Bug C: the task hasn't been attempted
-                            // — the pipe-write never landed. Send
-                            // the primary a backpressure-shaped
-                            // TaskFailed (`Recoverable` + the marker
-                            // message the primary's
-                            // `handle_primary_peer_rejection` path
-                            // recognises via `is_backpressure`) so
-                            // the primary requeues the binary into
-                            // its pool and re-dispatches once a peer
-                            // signals capacity. Pre-fix this sent
-                            // `NonRecoverable + e` which marked the
-                            // un-attempted task as terminal failed;
-                            // combined with Bug B (no respawn) this
-                            // lost every subsequent task assigned
-                            // to the dead slot.
-                            let msg = DistributedMessage::TaskFailed {
-                                target: None,
-                                sender_id: self.config.secondary_id.clone(),
-                                timestamp: timestamp_now(),
-                                secondary_id: self.config.secondary_id.clone(),
-                                worker_id: target_wid,
-                                task_hash: file_hash,
-                                error_type: ErrorType::Recoverable,
-                                error_message: "worker pipe broken; respawning".into(),
-                                // Stamped at the send_to_primary chokepoint (#352).
-                                delivery_seq: None,
-                                // Stamped at the send_to_primary chokepoint (ordering gate).
-                                msgs_posted_through: None,
-                            };
-                            self.send_to_primary(msg).await?;
-                        }
-                    }
-                } else {
-                    // No idle worker to take the task — including the
-                    // degenerate 0-worker pool (a late-joiner / phase-end
-                    // observer), which selected `None` above without any
-                    // bounds arithmetic or index. Report backpressure to
-                    // the primary keyed by the ORIGINAL wire `worker_id`
-                    // (there is no chosen slot).
-                    tracing::warn!(worker_id, "no idle worker available for task assignment");
-                    let msg = DistributedMessage::TaskFailed {
-                        target: None,
-                        sender_id: self.config.secondary_id.clone(),
-                        timestamp: timestamp_now(),
-                        secondary_id: self.config.secondary_id.clone(),
+                // SecondaryAffine gate intercept (#497 P5). If `B` gates on a
+                // SecondaryAffine import this node has NOT yet run locally, the
+                // gate queues `B` behind the single per-secondary import (and
+                // drives that import OFF the coordinator loop) instead of
+                // binding a worker now — `B` is released + dispatched when the
+                // import completes. The whole run-once decision + queue +
+                // off-loop drive is owned by `try_gate_on_affine_import`; the
+                // router never learns the latch/queue/import. A work task with
+                // NO locally-unmet affine dep returns `false` and falls through
+                // to the UNCHANGED worker-dispatch path below (the regression
+                // guard). Placed AFTER the dup-held / run-aborted gates and
+                // path resolution, BEFORE worker selection / assign_task.
+                if self
+                    .try_gate_on_affine_import(
                         worker_id,
-                        task_hash: file_hash,
-                        error_type: ErrorType::Recoverable,
-                        error_message: "No idle worker available".into(),
-                        // Stamped at the send_to_primary chokepoint (#352).
-                        delivery_seq: None,
-                        // Stamped at the send_to_primary chokepoint (ordering gate).
-                        msgs_posted_through: None,
-                    };
-                    // Report to the primary only — the authority owns
-                    // mesh propagation. Routing across a primary
-                    // changeover is opaque: `send_to_primary`
-                    // (`Destination::Primary`) resolves at the egress
-                    // edge to whichever node currently holds the role.
-                    // The promoted peer's `handle_primary_peer_rejection`
-                    // recovery is hash-keyed, so the single report
-                    // suffices.
-                    self.send_to_primary(msg).await?;
+                        &binary,
+                        &estimated,
+                        &predecessor_outputs,
+                        &file_hash,
+                    )
+                    .await?
+                {
+                    return Ok(());
                 }
-                Ok(())
+
+                self.assign_resolved_task(
+                    worker_id,
+                    binary,
+                    estimated,
+                    predecessor_outputs,
+                    file_hash,
+                    factory,
+                )
+                .await
             }
             DistributedMessage::StageFile {
                 secondary_id,
@@ -870,5 +627,312 @@ where
                 Ok(())
             }
         }
+    }
+
+    /// Bind a RESOLVED work-task binary onto an idle worker on this node:
+    /// select the dispatch target slot, ensure the per-type subprocess, and
+    /// assign the task (or report backpressure when no idle slot is free).
+    ///
+    /// Extracted verbatim from the `TaskAssignment` arm so it has EXACTLY ONE
+    /// definition: the arm calls it directly for the normal (non-affine-gated)
+    /// path, and the SecondaryAffine release
+    /// ([`Self::dispatch_released_affine_dependent`]) calls it to dispatch a
+    /// dependent `B` the gate withheld until its per-secondary import finished.
+    /// The release path reaches the SAME selection + per-type-ensure + assign
+    /// logic — no second dispatch path, no duplicated worker-binding logic.
+    ///
+    /// `worker_id` is the primary's REQUESTED slot (preferred if idle, else any
+    /// idle worker). `binary` is the wire-hydrated `TaskInfo` with its on-disk
+    /// `resolved_path` already folded in; `estimated`/`predecessor_outputs` are
+    /// forwarded verbatim. `file_hash` is the `active_tasks` key + the wire
+    /// task hash. The run-aborted gate is upstream of every caller (the
+    /// `TaskAssignment` arm and the affine release both check it before
+    /// reaching here).
+    pub(in crate::secondary) async fn assign_resolved_task(
+        &mut self,
+        worker_id: WorkerId,
+        binary: TaskInfo<I>,
+        estimated: ResourceMap,
+        predecessor_outputs: BTreeMap<String, TaskOutputs>,
+        file_hash: String,
+        factory: &mut impl WorkerFactory<M>,
+    ) -> Result<(), String> {
+        // Select the dispatch target worker SAFELY. Prefer the
+        // primary's requested slot IF it is a valid, idle worker;
+        // otherwise fall back to any idle worker. Both `.get()` and
+        // `position()` return `None` for an empty pool, so a
+        // 0-worker `Operational` node (late-joiner / observer /
+        // phase-end observer — a VALID state on this path) is just
+        // the degenerate case of "no idle worker": no out-of-range
+        // `len() - 1` arithmetic, no unconditional index into the
+        // pool. An out-of-range `worker_id` likewise resolves to
+        // `None` on the preference and falls back to an idle worker
+        // — never silently clamped onto the wrong (last) slot.
+        let pool = &self.op_mut().pool;
+        let target_wid: Option<u32> = pool
+            .workers
+            .get(worker_id as usize)
+            .filter(|w| w.is_idle_state())
+            .map(|_| worker_id)
+            .or_else(|| {
+                pool.workers
+                    .iter()
+                    .position(|w| w.is_idle_state())
+                    .map(|i| i as u32)
+            });
+
+        if let Some(target_wid) = target_wid {
+            let estimated_mb =
+                estimated.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
+            let log_task_hash = file_hash.clone();
+            // Per-type subprocess dispatch via the async-event
+            // flow for both first-bind (`loaded_type_id == None`)
+            // AND true type-shift (`Some(T1) → Some(T2)`). The
+            // same-type fast path short-circuits inside the
+            // pool with `EnsureWorkerOutcome::AlreadyLoaded`;
+            // the respawn path returns `RespawnInProgress`
+            // and the dispatch arm stashes the binary in
+            // `pending_first_bind` for the
+            // `WorkerEvent::Ready` handler to pick up.
+            //
+            // Pre-fix the first-bind path called the
+            // synchronous `ensure_worker_for_type`, which
+            // drives `poll_ready` inline. Inside this
+            // `select!` arm body the inline wait blocked
+            // every other arm — peer-bus relays, keepalive,
+            // worker events, OOM ticks — for the entire
+            // duration the freshly-spawned worker subprocess
+            // took to send `Response::Ready`. The bug
+            // manifested in production as a 300+s tokio-
+            // runtime silence on the asm-tokenizer LMU
+            // dispatch when one of the Python workers took
+            // longer than `keepalive_timeout` to import its
+            // task module.
+            //
+            // The earlier type-shift fix (commit 7862339)
+            // closed the wedge for `Some(T1) → Some(T2)` by
+            // routing the task through the same wire-bounce
+            // contract the live primary's
+            // `handle_primary_peer_rejection` recognises.
+            // That works architecturally but biases
+            // distribution on small workloads (peer
+            // secondaries pay one wire round-trip per
+            // type-bind, the promoted-primary's self-
+            // assigns reach the same-type fast path within
+            // sub-millisecond of Ready). Storing the binary
+            // in `pending_first_bind` keeps it pinned to the
+            // worker the primary picked: no wire round-trip,
+            // no fairness regression, and the loss path
+            // (`WorkerEvent::Disconnected`) still recovers
+            // via the backpressure marker if the worker
+            // never reaches Ready.
+            let ensure_result: Result<(), String> = match self
+                .op_mut()
+                .pool
+                .ensure_worker_for_type_async(target_wid, &binary.type_id, factory, false)
+                .await
+            {
+                Ok(dynrunner_manager_local::EnsureWorkerOutcome::AlreadyLoaded) => Ok(()),
+                Ok(dynrunner_manager_local::EnsureWorkerOutcome::RespawnInProgress) => {
+                    // Respawn-HOLD (#58): the per-type subprocess
+                    // for `target_wid` is mid-kill+spawn (the
+                    // pool kicked off a background `wait_ready`
+                    // task). DEFER this task rather than drop it
+                    // or busy-bounce it to the authority: stash
+                    // the resolved binary in `pending_first_bind`
+                    // keyed by the worker; the
+                    // `WorkerEvent::Ready` handler picks it up and
+                    // calls `assign_task` once the slot is
+                    // observably Idle with the new type bound. No
+                    // drop, no tight retry loop. The loss path
+                    // (`WorkerEvent::Disconnected` before Ready)
+                    // reports the deferred task back to the
+                    // authority as backpressure via
+                    // `report_deferred_task_lost`.
+                    tracing::debug!(
+                        worker_id = target_wid,
+                        type_id = %binary.type_id,
+                        file_hash = %file_hash,
+                        "type-bind respawn in progress; deferring task until \
+                         worker Ready (respawn-HOLD)"
+                    );
+                    // The type-shift respawn just REPLACED the slot's
+                    // subprocess (a new generation). Sweep any task
+                    // still bound to this slot in `active_tasks` into
+                    // the reinject path so the replaced generation
+                    // cannot strand it (assigned-never-terminal). The
+                    // deferred task we are about to stash lives in
+                    // `pending_first_bind`, NOT `active_tasks`, so the
+                    // sweep never touches it. No-op when the slot was
+                    // idle/already-swept (the common case — the
+                    // dispatch target was selected idle). This is the
+                    // belt-and-braces companion to the generation
+                    // gate: the gate stops a stale terminal from
+                    // mis-attributing; this stops a replacement from
+                    // abandoning a still-bound task.
+                    //
+                    // ORDERING: the sweep runs after the generation
+                    // bump, in the SAME select-arm body — the event
+                    // channel cannot drain between bump and sweep
+                    // within one loop iteration. Keep them adjacent;
+                    // even if a future refactor yielded to the event
+                    // arm in between, the bumped generation makes the
+                    // gate drop a draining stale terminal first.
+                    self.sweep_replaced_worker_task(target_wid).await?;
+                    self.op_mut().pending_first_bind.insert(
+                        target_wid,
+                        super::super::PendingFirstBind {
+                            binary,
+                            file_hash,
+                            estimated,
+                            predecessor_outputs,
+                        },
+                    );
+                    return Ok(());
+                }
+                Err(e) => Err(e),
+            };
+            if let Err(e) = ensure_result {
+                tracing::warn!(
+                    worker_id = target_wid,
+                    error = %e,
+                    type_id = %binary.type_id,
+                    "ensure_worker_for_type failed for peer-assigned task; queuing respawn"
+                );
+                self.schedule_worker_restart(target_wid);
+                let task_failed = DistributedMessage::TaskFailed {
+                    target: None,
+                    sender_id: self.config.secondary_id.clone(),
+                    timestamp: timestamp_now(),
+                    secondary_id: self.config.secondary_id.clone(),
+                    worker_id: target_wid,
+                    task_hash: file_hash.clone(),
+                    error_type: ErrorType::Recoverable,
+                    error_message: format!("No idle worker available (respawn failed): {e}"),
+                    // Stamped at the send_to_primary chokepoint (#352).
+                    delivery_seq: None,
+                    // Stamped at the send_to_primary chokepoint (ordering gate).
+                    msgs_posted_through: None,
+                };
+                // Report to the primary role only; the authority
+                // owns mesh propagation (it originates the CRDT
+                // mutation and broadcasts it). A reporting
+                // secondary that also broadcast would be a second
+                // CRDT originator.
+                self.send_to_primary(task_failed).await?;
+                return Ok(());
+            }
+            // Snapshot the assigned binary for the sampler
+            // hook before the move into `assign_task`. The
+            // hook only reads `task_id` so cloning the
+            // whole `TaskInfo` once is cheap relative to
+            // the assignment-write hot path.
+            let binary_for_hook = binary.clone();
+            let worker = &mut self.op_mut().pool.workers[target_wid as usize];
+            match worker
+                .assign_task(binary, estimated, false, predecessor_outputs)
+                .await
+            {
+                Ok(()) => {
+                    self.notify_sampler_assigned(target_wid, &binary_for_hook);
+                    self.op_mut().active_tasks.insert(file_hash, target_wid);
+                    self.op_mut().primary_link.reset_backoff(target_wid);
+                    tracing::info!(
+                        worker_id = target_wid,
+                        task_id = ?binary_for_hook.task_id,
+                        phase = %binary_for_hook.phase_id,
+                        task_type = %binary_for_hook.type_id,
+                        task_hash = %log_task_hash,
+                        estimated_mb,
+                        "assigned task from primary"
+                    );
+                }
+                Err(e) => {
+                    // Worker subprocess likely died between
+                    // tasks. Reap so the log carries the
+                    // actual signal/code rather than the
+                    // pipe-level "Broken pipe" string. See
+                    // `WorkerHandle::try_reap_exit` for None
+                    // conditions.
+                    let exit_status =
+                        self.op_mut().pool.workers[target_wid as usize].try_reap_exit();
+                    tracing::warn!(
+                        worker_id = target_wid,
+                        error = %e,
+                        exit_status = exit_status.as_ref().map(|s| s.to_string()),
+                        "peer-assign failed; queuing worker respawn + requeuing task at primary"
+                    );
+                    // Bug B: queue the worker for respawn
+                    // at the next `process_tasks` tick. The
+                    // dead pipe stays dead until the manager
+                    // brings a replacement up; pre-fix the
+                    // SLURM-secondary path silently abandoned
+                    // the slot.
+                    self.schedule_worker_restart(target_wid);
+                    // Bug C: the task hasn't been attempted
+                    // — the pipe-write never landed. Send
+                    // the primary a backpressure-shaped
+                    // TaskFailed (`Recoverable` + the marker
+                    // message the primary's
+                    // `handle_primary_peer_rejection` path
+                    // recognises via `is_backpressure`) so
+                    // the primary requeues the binary into
+                    // its pool and re-dispatches once a peer
+                    // signals capacity. Pre-fix this sent
+                    // `NonRecoverable + e` which marked the
+                    // un-attempted task as terminal failed;
+                    // combined with Bug B (no respawn) this
+                    // lost every subsequent task assigned
+                    // to the dead slot.
+                    let msg = DistributedMessage::TaskFailed {
+                        target: None,
+                        sender_id: self.config.secondary_id.clone(),
+                        timestamp: timestamp_now(),
+                        secondary_id: self.config.secondary_id.clone(),
+                        worker_id: target_wid,
+                        task_hash: file_hash,
+                        error_type: ErrorType::Recoverable,
+                        error_message: "worker pipe broken; respawning".into(),
+                        // Stamped at the send_to_primary chokepoint (#352).
+                        delivery_seq: None,
+                        // Stamped at the send_to_primary chokepoint (ordering gate).
+                        msgs_posted_through: None,
+                    };
+                    self.send_to_primary(msg).await?;
+                }
+            }
+        } else {
+            // No idle worker to take the task — including the
+            // degenerate 0-worker pool (a late-joiner / phase-end
+            // observer), which selected `None` above without any
+            // bounds arithmetic or index. Report backpressure to
+            // the primary keyed by the ORIGINAL wire `worker_id`
+            // (there is no chosen slot).
+            tracing::warn!(worker_id, "no idle worker available for task assignment");
+            let msg = DistributedMessage::TaskFailed {
+                target: None,
+                sender_id: self.config.secondary_id.clone(),
+                timestamp: timestamp_now(),
+                secondary_id: self.config.secondary_id.clone(),
+                worker_id,
+                task_hash: file_hash,
+                error_type: ErrorType::Recoverable,
+                error_message: "No idle worker available".into(),
+                // Stamped at the send_to_primary chokepoint (#352).
+                delivery_seq: None,
+                // Stamped at the send_to_primary chokepoint (ordering gate).
+                msgs_posted_through: None,
+            };
+            // Report to the primary only — the authority owns
+            // mesh propagation. Routing across a primary
+            // changeover is opaque: `send_to_primary`
+            // (`Destination::Primary`) resolves at the egress
+            // edge to whichever node currently holds the role.
+            // The promoted peer's `handle_primary_peer_rejection`
+            // recovery is hash-keyed, so the single report
+            // suffices.
+            self.send_to_primary(msg).await?;
+        }
+        Ok(())
     }
 }

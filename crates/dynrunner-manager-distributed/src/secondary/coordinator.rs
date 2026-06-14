@@ -71,6 +71,12 @@ where
         // must never block, and the volume is bounded by real
         // consumer replies (≤ 100 KiB each, API-capped).
         let (secondary_control_tx, secondary_control_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Off-loop SecondaryAffine-import completion channel (#497 P5). Built
+        // at construction (like the dispatcher channels) so a `StartedRun`'s
+        // detached import task always has a sender; unbounded for the same
+        // never-block-the-producer reason. The receiver is taken into a
+        // loop-local at `process_tasks` entry.
+        let (affine_import_tx, affine_import_rx) = tokio::sync::mpsc::unbounded_channel();
         // Command channel for the PyO3 `PrimaryHandle` surface.
         // Mirrors `PrimaryCoordinator::new` exactly: bounded capacity
         // sized so a noisy caller can't OOM the secondary, but with
@@ -173,6 +179,8 @@ where
             worker_message_dispatcher_handle: None,
             secondary_control_tx,
             secondary_control_rx: Some(secondary_control_rx),
+            affine_import_tx,
+            affine_import_rx: Some(affine_import_rx),
             announcer_outbox_tx: None,
             announcer_outbox_rx: None,
             panik_signal_rx: None,
