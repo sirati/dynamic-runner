@@ -70,6 +70,22 @@ pub fn build_run_argv(
     // ---- run + fixed flags — generate.rs:826-831 ----
     argv.push("run".to_string());
     argv.push("--rm".to_string());
+    // Run an init (catatonit) as the container's PID 1 instead of the
+    // framework bootstrap shim. The shim (`_secondary_bootstrap`) is a
+    // plain Python process that never `waitpid()`s strangers, so build
+    // descendants (clang/cross-gcc and their make/builder parents) that
+    // outlive their parent get REPARENTED to PID 1 and — with the shim as
+    // PID 1 — accumulate as permanent zombies, exhausting the container's
+    // `--pids-limit` (the field-observed pid-exhaustion → clone() EAGAIN →
+    // fork-storm death). With `--init`, podman bind-mounts its own init
+    // binary as PID 1; catatonit reaps ONLY those reparented orphans
+    // (`waitpid(-1)`) and forwards SIGTERM/SIGUSR1 to the shim, now its
+    // direct child. The framework's OWN worker subprocesses are unaffected:
+    // it reaps each by its specific tracked PID (`waitpid(<pid>, WNOHANG)`
+    // in `dynrunner-manager-local::worker::exit_status`), never `waitpid(-1)`,
+    // and a live worker is never reparented to PID 1 — so catatonit can
+    // never race the framework for a worker's exit status.
+    argv.push("--init".to_string());
     // Containment (design §4 a1): when the wrapper's job cgroup is
     // delegated (the caller's `cgroup_parent` probe passed), create the
     // container's cgroup BENEATH the slurmstepd job cgroup so conmon + the
@@ -347,6 +363,7 @@ mod tests {
             "--log-level=debug",
             "run",
             "--rm",
+            "--init",
             "--name",
             "asm-2f1d4e89-sec-0",
             "--pull=never",
@@ -445,11 +462,57 @@ mod tests {
         assert_eq!(argv[sm + 1], "asm_tokenizer.secondary");
     }
 
+    /// `--init` MUST be present and placed immediately after `--rm`, so the
+    /// container's PID 1 is podman's init (catatonit), not the framework
+    /// bootstrap shim. Without it, build descendants reparented to PID 1
+    /// (the shim never `waitpid()`s strangers) accumulate as zombies and
+    /// exhaust the container's `--pids-limit`. Asserted across BOTH the
+    /// delegated-cgroup (`Some(parent)`) and non-delegated (`None`) launches
+    /// so a future cgroup-flag reshuffle can't displace it.
+    #[test]
+    fn init_flag_present_after_rm_in_both_cgroup_modes() {
+        let cfg = maximal_cfg(ConnectionMode::Standard {
+            gateway_host: "gw.cluster".to_string(),
+            gateway_port: 4433,
+        });
+        for parent in [
+            None,
+            Some("/system.slice/slurmstepd.scope/job_1/step_batch"),
+        ] {
+            let argv = build_run_argv(
+                &cfg,
+                &layout(),
+                &bins(),
+                Some(8_589_934_592),
+                &both_ips(),
+                7777,
+                "tcp://gw.cluster:4433",
+                "node01.cluster",
+                parent,
+            );
+            // Exactly one `--init`, immediately after `--rm`.
+            assert_eq!(
+                argv.iter().filter(|a| *a == "--init").count(),
+                1,
+                "exactly one --init must be present (parent={parent:?})"
+            );
+            let rm_idx = argv
+                .iter()
+                .position(|a| a == "--rm")
+                .expect("--rm present");
+            assert_eq!(
+                argv[rm_idx + 1],
+                "--init",
+                "--init must immediately follow --rm (parent={parent:?})"
+            );
+        }
+    }
+
     /// (a1) With a delegated job cgroup the caller passes `Some(parent)`:
     /// `--cgroup-parent=<parent>` + `--cgroups=enabled` are inserted right
-    /// after `run --rm` (before `--name`), and NOTHING else changes vs the
-    /// `None` argv. This pins the containment-flag placement and proves
-    /// the flags are gated on the parent being present.
+    /// after `run --rm --init` (before `--name`), and NOTHING else changes
+    /// vs the `None` argv. This pins the containment-flag placement and
+    /// proves the flags are gated on the parent being present.
     #[test]
     fn cgroup_parent_inserts_containment_flags_after_run_rm() {
         let cfg = maximal_cfg(ConnectionMode::Standard {
@@ -481,25 +544,25 @@ mod tests {
         );
 
         // The two argvs differ ONLY by the two containment tokens inserted
-        // immediately after `run --rm`.
-        let rm_idx = with_parent
+        // immediately after `run --rm --init` (i.e. right after `--init`).
+        let init_idx = with_parent
             .iter()
-            .position(|a| a == "--rm")
-            .expect("--rm present");
+            .position(|a| a == "--init")
+            .expect("--init present");
         assert_eq!(
-            with_parent[rm_idx + 1],
+            with_parent[init_idx + 1],
             format!("--cgroup-parent={parent}"),
-            "--cgroup-parent must follow --rm"
+            "--cgroup-parent must follow --init"
         );
         assert_eq!(
-            with_parent[rm_idx + 2],
+            with_parent[init_idx + 2],
             "--cgroups=enabled",
             "--cgroups=enabled must follow --cgroup-parent"
         );
         // Removing the two inserted tokens reproduces the None argv exactly.
         let mut stripped = with_parent.clone();
-        stripped.remove(rm_idx + 2);
-        stripped.remove(rm_idx + 1);
+        stripped.remove(init_idx + 2);
+        stripped.remove(init_idx + 1);
         assert_eq!(
             stripped, without_parent,
             "Some(parent) must add EXACTLY the two containment tokens and nothing else"
@@ -537,6 +600,7 @@ mod tests {
             "--log-level=debug",
             "run",
             "--rm",
+            "--init",
             "--name",
             "asm-2f1d4e89-sec-0",
             "--pull=never",

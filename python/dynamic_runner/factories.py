@@ -95,6 +95,17 @@ class PodmanExecWorkerFactory:
         argv += [
             "run",
             "--rm",
+            # Run an init (catatonit) as the container's PID 1 instead of
+            # the worker python. A worker that forks build descendants
+            # (compilers and their make/builder parents) leaves orphans
+            # that reparent to PID 1; the worker python never `waitpid()`s
+            # strangers, so without an init they accumulate as zombies and
+            # exhaust the container's pid budget. `--init` makes podman
+            # bind-mount its own init as PID 1 to reap those orphans and
+            # forward signals to the worker (now its child). The framework
+            # tracks/reaps the OUTER container process by its own PID, so
+            # the in-container init never races the framework's reaping.
+            "--init",
             "-v",
             f"{self.source_dir}:/app/src:ro",
             "-v",
