@@ -26,6 +26,16 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use crate::primary::{PrimaryCoordinator, SlotProvenance};
 use crate::worker_signal::WorkerMgmtSignal;
 
+/// Minimum spacing between the rate-limited pathological-bounce WARNs the
+/// reconcile path drives through `illegal_assignment_warn`. The per-event
+/// reconcile log is DEBUG (the bounce is expected, no-loss optimistic-dispatch
+/// churn at scale — #531 RCA); this interval gates the ONE escalated WARN that
+/// surfaces a SUSTAINED bounce rate (the pathological-loop signature). Matched
+/// to the keepalive-egress throttle cadence — a minute is short enough to catch
+/// a live loop, long enough to stay off the operator's normal logs.
+pub(in crate::primary) const ILLEGAL_ASSIGNMENT_WARN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// React to a secondary's illegal-assignment bounce: reconcile this
     /// primary's `(secondary, worker_id)` occupancy model + REQUEUE the
@@ -67,7 +77,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             return;
         };
 
-        tracing::error!(
+        // The per-event reconcile log is DEBUG: a bounce is an EXPECTED,
+        // fully-reconciled, no-loss in-flight race (the primary's optimistic
+        // per-(secondary, worker_id) dispatch raced the secondary's physical
+        // respawn/requeue-rebind — #531 RCA: 414 events at 154-worker
+        // saturation, all cleanly requeued). Keep the full structured fields
+        // for forensics.
+        tracing::debug!(
             secondary = %secondary_id,
             worker_id,
             assigned_hash = %assigned.hash,
@@ -77,6 +93,30 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
              from physical reality; reconciling the slot to the incumbent and \
              requeuing the bounced task (NOT failing it)"
         );
+
+        // Rate-limited escalation: a SUSTAINED bounce rate is the
+        // pathological-loop signature (a genuine repeated same-(secondary,
+        // worker) bounce — #518 H3.3 — or a future regression), distinct from
+        // the expected steady-state churn the DEBUG line above absorbs. Emit at
+        // most one WARN per interval, naming this bounce's identity as a sample
+        // plus the count suppressed since the last emit, so the operator sees
+        // the RATE without per-event spam. The reconcile path is the single
+        // choke point every bounce passes through, so this global throttle
+        // captures the fleet-wide rate.
+        if let Some(suppressed) = self.illegal_assignment_warn.permit() {
+            tracing::warn!(
+                sample_secondary = %secondary_id,
+                sample_worker_id = worker_id,
+                sample_assigned_hash = %assigned.hash,
+                suppressed_since_last_warn = suppressed,
+                "illegal-assignment bounces are occurring (expected at scale, \
+                 handled no-loss); reporting the RATE so a PATHOLOGICAL loop \
+                 (a repeated same-(secondary,worker) bounce) is visible. A high \
+                 suppressed count between these throttled WARNs indicates a \
+                 sustained bounce loop, not steady-state optimistic-dispatch \
+                 churn"
+            );
+        }
 
         // (1) REQUEUE the bounced task. `free_slot_on_terminal` resolves the
         // holder slot from the LEDGER entry (by hash) — independent of the
@@ -113,16 +153,49 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // slot-hash invariant holds and the incumbent's terminal settles
             // it by hash — mirroring the failover-resume occupancy crossing.
             if let Some(entry) = self.in_flight.get(&inc.hash) {
-                // Already tracked in the ledger (the common case: this primary
-                // dispatched the incumbent earlier and only the SLOT belief
-                // drifted). Re-seat the slot from the ledger's task; the ledger
-                // entry stays as-is.
-                let task = entry.task.clone();
-                let estimated = self.estimator.estimate(&task);
-                // The slot is Idle (guarded just above), so the enforced
-                // idle-guard (#517) takes.
-                let _assigned =
-                    self.workers[idx].assign(inc.hash.clone(), task, estimated, SlotProvenance::Inherited);
+                // CROSS-MEMBER GUARD (#531): the ledger is hash-keyed and
+                // single-entry, so the incumbent hash may be attributed to a
+                // DIFFERENT member than the one bouncing here — precisely the
+                // #518 cross-member re-seat, which repoints the hash's ledger
+                // entry onto the authoritative holder A while a duplicate copy
+                // keeps running on this bouncing member B. Re-seating B's slot
+                // Inherited-holding-A's-hash would corrupt A: B's next
+                // TaskRequest trips `reconcile_inherited_slot`, which removes
+                // the hash's ledger entry (A's) and requeues A's still-running
+                // task. So re-seat ONLY when the ledger already attributes the
+                // hash to THIS bouncing member; otherwise leave B's slot Idle
+                // (it bounces the next assignment, handled no-loss by this same
+                // path — the cheap, self-healing outcome — while A's ledger
+                // entry and A's own terminal stay the single owner of the hash).
+                if entry.secondary_id != secondary_id {
+                    tracing::debug!(
+                        secondary = %secondary_id,
+                        worker_id,
+                        incumbent_hash = %inc.hash,
+                        ledger_holder = %entry.secondary_id,
+                        "reported incumbent is authoritatively held by a \
+                         DIFFERENT member in the ledger (a cross-member re-seat \
+                         duplicate still running here); NOT re-seating this \
+                         slot — the authoritative holder owns the hash and \
+                         re-seating here would later corrupt its ledger entry"
+                    );
+                } else {
+                    // Already tracked in the ledger AND attributed to this
+                    // member (the common case: this primary dispatched the
+                    // incumbent earlier and only the SLOT belief drifted).
+                    // Re-seat the slot from the ledger's task; the ledger entry
+                    // stays as-is.
+                    let task = entry.task.clone();
+                    let estimated = self.estimator.estimate(&task);
+                    // The slot is Idle (guarded just above), so the enforced
+                    // idle-guard (#517) takes.
+                    let _assigned = self.workers[idx].assign(
+                        inc.hash.clone(),
+                        task,
+                        estimated,
+                        SlotProvenance::Inherited,
+                    );
+                }
             } else {
                 tracing::warn!(
                     secondary = %secondary_id,

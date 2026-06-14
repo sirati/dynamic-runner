@@ -237,6 +237,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `(secondary, worker_id)` to the live Vec slot and vacate it iff it
         // still holds this hash. The ledger entry is re-seated below, NOT
         // dropped — the authoritative holder owns it now.
+        //
+        // Vacate (Idle) is the correct least-wrong state for B even when B's
+        // copy is ALREADY RUNNING (the withdraw cannot abort it mid-run): the
+        // ledger is hash-keyed/single-entry and is repointed to A below, so no
+        // terminal path can ever free a still-Assigned B slot (it would leak),
+        // and re-seating B Inherited onto A's hash would corrupt A's ledger via
+        // `reconcile_inherited_slot`. So B goes Idle; if B's still-running copy
+        // makes the next assignment bounce, the #517 reconcile handles it
+        // no-loss — and its incumbent re-seat is now cross-member-guarded
+        // (#531, see `handle_illegally_assigned`) so it never re-seats B's slot
+        // onto a hash the ledger attributes to A.
         if let Some(b_worker) = loser_worker
             && let Some(b_idx) = self.worker_idx_for(&loser, b_worker)
         {

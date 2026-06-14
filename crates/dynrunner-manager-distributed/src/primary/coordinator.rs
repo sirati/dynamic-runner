@@ -827,6 +827,19 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// debug lines stay for fine-grained tracing.
     pub(super) keepalive_egress_warn: crate::warn_throttle::WarnThrottle,
 
+    /// Rate-limited operator signal for the illegal-assignment bounce
+    /// reconcile (`handle_illegally_assigned`). The per-event reconcile log is
+    /// DEBUG — at scale the bounce is EXPECTED, no-loss optimistic-dispatch
+    /// churn (#531 RCA), so per-event ERROR/WARN spams the operator. But a
+    /// SUSTAINED high bounce rate is the pathological-loop signature (a genuine
+    /// repeated same-(secondary,worker) bounce — #518 H3.3, or a future
+    /// regression), so the reconcile path drives this throttle: one WARN per
+    /// interval naming a sample bounce identity + the count suppressed since,
+    /// surfacing the rate without per-event spam. Throttled GLOBALLY across the
+    /// fleet (not per-key) so it stays a clean single field with no unbounded
+    /// per-(secondary,worker) map to evict.
+    pub(super) illegal_assignment_warn: crate::warn_throttle::WarnThrottle,
+
     /// The set of members whose operational MAIN LOOP has provably run
     /// this incarnation: a mesh `Keepalive` with the SECONDARY emitter
     /// role was received from them (the secondary's keepalive arm spins
@@ -1620,6 +1633,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             silence_warn_stage: HashMap::new(),
             keepalive_egress_warn: crate::warn_throttle::WarnThrottle::new(
                 super::heartbeat::KEEPALIVE_EGRESS_WARN_INTERVAL,
+            ),
+            illegal_assignment_warn: crate::warn_throttle::WarnThrottle::new(
+                super::task::ILLEGAL_ASSIGNMENT_WARN_INTERVAL,
             ),
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,

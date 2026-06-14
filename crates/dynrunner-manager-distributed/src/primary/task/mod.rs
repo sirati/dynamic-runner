@@ -43,3 +43,5 @@ mod inflight_reconcile;
 mod mutation;
 pub(crate) mod predecessor_outputs;
 mod request;
+
+pub(in crate::primary) use illegal_assignment::ILLEGAL_ASSIGNMENT_WARN_INTERVAL;

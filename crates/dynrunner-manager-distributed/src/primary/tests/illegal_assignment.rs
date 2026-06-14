@@ -243,6 +243,221 @@ async fn illegal_bounce_without_incumbent_still_requeues_no_failure() {
         .await;
 }
 
+/// TEST (#531 Fix A): a handled bounce reconcile logs the per-event line at
+/// DEBUG, NOT ERROR — the bounce is expected, no-loss optimistic-dispatch
+/// churn at scale. Captured with a per-test scoped `TargetCapture` subscriber
+/// (unfiltered, `Interest::always` — safe to hold across `.await`, no
+/// #422-class warn-capture poisoning) on the reconcile module's target.
+#[tokio::test(flavor = "current_thread")]
+async fn handled_bounce_reconcile_logs_at_debug_not_error() {
+    let log = crate::test_capture::TargetCapture::for_target(
+        "dynrunner_manager_distributed::primary::task::illegal_assignment",
+    );
+    let _guard = {
+        use tracing_subscriber::layer::SubscriberExt;
+        tracing::subscriber::set_default(tracing_subscriber::Registry::default().with(log.clone()))
+    };
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let phase = PhaseId::from("work");
+            primary.pending = Some(
+                dynrunner_scheduler_api::PendingPool::<TestId>::new(
+                    [phase.clone()],
+                    HashMap::new(),
+                )
+                .expect("work-phase pool"),
+            );
+            let incumbent = work_task("incumbent");
+            let incumbent_hash = compute_task_hash(&incumbent);
+            let assigned = work_task("assigned");
+            let assigned_hash = compute_task_hash(&assigned);
+            for t in [&incumbent, &assigned] {
+                primary.cluster_state.apply(ClusterMutation::TaskAdded {
+                    hash: compute_task_hash(t),
+                    task: t.clone(),
+                });
+            }
+            primary.cluster_state.apply(ClusterMutation::SecondaryCapacity {
+                secondary: "sec-0".into(),
+                worker_count: 1,
+                resources: mem(8 * 1024 * 1024 * 1024),
+            });
+            primary.seed_inflight(
+                incumbent_hash.clone(),
+                phase.clone(),
+                "sec-0".into(),
+                0,
+                incumbent.clone(),
+            );
+            primary.stage_in_flight_for_test("sec-0".into(), 0, assigned.clone());
+
+            primary
+                .handle_illegally_assigned(illegal_bounce(
+                    "sec-0",
+                    0,
+                    &assigned_hash,
+                    "assigned",
+                    Some((&incumbent_hash, "incumbent")),
+                ))
+                .await;
+
+            let events = log.events();
+            // The per-event reconcile line ("secondary bounced an ILLEGAL
+            // assignment ...") fired, and at DEBUG.
+            let reconcile_line = events.iter().find(|e| {
+                e.event
+                    .message
+                    .contains("secondary bounced an ILLEGAL assignment")
+            });
+            let reconcile_line =
+                reconcile_line.expect("the per-event reconcile line must be emitted");
+            assert_eq!(
+                reconcile_line.level,
+                tracing::Level::DEBUG,
+                "the handled, no-loss bounce reconcile must log at DEBUG, not \
+                 ERROR (#531: expected optimistic-dispatch churn at scale)"
+            );
+            // NOTHING on this target is ERROR (the downgrade is complete; no
+            // stray ERROR slipped through on the reconcile path).
+            assert!(
+                events.iter().all(|e| e.level != tracing::Level::ERROR),
+                "a handled bounce reconcile must emit NO ERROR on the reconcile \
+                 path; got {:?}",
+                events
+                    .iter()
+                    .map(|e| (e.level, e.event.message.clone()))
+                    .collect::<Vec<_>>()
+            );
+        })
+        .await;
+}
+
+/// TEST (#531 Fix B — the re-seat cross-member guard): when the incumbent a
+/// member bounces is authoritatively held by a DIFFERENT member in the ledger
+/// (the #518 cross-member re-seat repointed the hash onto the original holder
+/// A, while a duplicate copy keeps running on the bouncing member B), the
+/// reconcile must NOT re-seat B's slot onto that hash. Re-seating B's slot
+/// Inherited-holding-A's-hash would later corrupt A's ledger entry via
+/// `reconcile_inherited_slot` (it removes the hash's ledger entry — A's — and
+/// requeues A's still-running task). The guard leaves B's slot Idle and leaves
+/// A's ledger entry untouched.
+#[tokio::test(flavor = "current_thread")]
+async fn bounce_does_not_reseat_b_slot_onto_a_held_incumbent() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let phase = PhaseId::from("work");
+            primary.pending = Some(
+                dynrunner_scheduler_api::PendingPool::<TestId>::new(
+                    [phase.clone()],
+                    HashMap::new(),
+                )
+                .expect("work-phase pool"),
+            );
+
+            // The cross-member duplicate hash. Authoritatively held by member A
+            // (sec-a, worker 0) in the ledger — the post-#518-re-seat state.
+            let dup = work_task("dup");
+            let dup_hash = compute_task_hash(&dup);
+            // The NEW task B's slot was (illegally) assigned, which B bounces.
+            let assigned = work_task("assigned-to-b");
+            let assigned_hash = compute_task_hash(&assigned);
+            for t in [&dup, &assigned] {
+                primary.cluster_state.apply(ClusterMutation::TaskAdded {
+                    hash: compute_task_hash(t),
+                    task: t.clone(),
+                });
+            }
+            // Both members have capacity. A holds `dup` in the ledger; B is the
+            // bouncing member whose slot the new task was committed onto.
+            for sec in ["sec-a", "sec-b"] {
+                primary.cluster_state.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: sec.into(),
+                    worker_count: 1,
+                    resources: mem(8 * 1024 * 1024 * 1024),
+                });
+            }
+            // A is the authoritative holder of `dup` in the ledger (the #518
+            // re-seat repointed the entry onto A). Register A's slot idle and
+            // seed the ledger entry under sec-a.
+            primary.register_idle_worker_for_test(
+                "sec-a".into(),
+                0,
+                ResourceMap::from([(ResourceKind::memory(), 8 * 1024 * 1024 * 1024u64)]),
+            );
+            primary.seed_inflight(
+                dup_hash.clone(),
+                phase.clone(),
+                "sec-a".into(),
+                0,
+                dup.clone(),
+            );
+            // B's slot holds the (illegally) assigned new task — the diverged
+            // belief the bounce will requeue.
+            primary.stage_in_flight_for_test("sec-b".into(), 0, assigned.clone());
+
+            // B bounces: its worker 0 is physically running `dup` (the
+            // not-withdrawn duplicate), so the bounce names `dup` as incumbent.
+            primary
+                .handle_illegally_assigned(illegal_bounce(
+                    "sec-b",
+                    0,
+                    &assigned_hash,
+                    "assigned-to-b",
+                    Some((&dup_hash, "dup")),
+                ))
+                .await;
+
+            // GUARD: B's slot must NOT be re-seated onto `dup` (the requeue of
+            // the bounced task freed it; the cross-member guard leaves it Idle
+            // rather than seeding it Inherited-holding-A's-hash).
+            assert!(
+                primary.slot_is_idle_for_test("sec-b", 0),
+                "B's slot must stay Idle: re-seating it onto a hash the ledger \
+                 attributes to A would later corrupt A's ledger entry"
+            );
+            assert!(
+                !primary.slot_holds_hash_for_test("sec-b", 0, &dup_hash),
+                "B's slot must NOT hold the A-attributed incumbent hash"
+            );
+            // A's ledger entry is untouched: still present and still attributed
+            // to sec-a (the authoritative holder owns the hash).
+            let dup_entry = primary
+                .in_flight
+                .get(&dup_hash)
+                .expect("A's ledger entry for the duplicate must survive");
+            assert_eq!(
+                dup_entry.secondary_id, "sec-a",
+                "the duplicate hash must stay attributed to the authoritative \
+                 holder A; the bounce must not repoint or drop it"
+            );
+            // The bounced new task is still requeued (the requeue half is
+            // unaffected by the re-seat guard).
+            assert_eq!(
+                queued(&primary),
+                1,
+                "the bounced task is requeued regardless of the re-seat guard"
+            );
+        })
+        .await;
+}
+
 /// TEST (c): the enforced assign-guard. A second commit onto a slot that
 /// already holds a task is REFUSED (returns false), the held task's slot
 /// state is PRESERVED (never silently overwritten), and the ledger/type

@@ -1035,8 +1035,18 @@ where
             }
         });
 
+        // The bounce is an EXPECTED, no-loss in-flight reconciliation, not a
+        // fault: at scale the primary's optimistic per-(secondary, worker_id)
+        // dispatch races the secondary's physical respawn/requeue-rebind, so a
+        // handful of these per second is steady-state churn (#531 RCA: 414
+        // events at 154-worker saturation, all cleanly requeued). DEBUG keeps
+        // normal logs clean while retaining the full structured forensics. The
+        // PATHOLOGICAL-loop signal (a genuine repeated same-(secondary,worker)
+        // bounce — #518 H3.3) is surfaced by the primary's rate-limited WARN on
+        // the reconcile path (`handle_illegally_assigned`), the single choke
+        // point every bounce passes through.
         match &incumbent {
-            Some(inc) => tracing::error!(
+            Some(inc) => tracing::debug!(
                 secondary_id = %self.config.secondary_id,
                 worker_id,
                 assigned_hash = %assigned.hash,
@@ -1045,7 +1055,7 @@ where
                  running another task; bouncing for re-dispatch (NOT failing) \
                  — the secondary never re-picks another worker"
             ),
-            None => tracing::error!(
+            None => tracing::debug!(
                 secondary_id = %self.config.secondary_id,
                 worker_id,
                 assigned_hash = %assigned.hash,
