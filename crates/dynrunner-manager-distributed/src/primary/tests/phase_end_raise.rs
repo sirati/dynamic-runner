@@ -282,7 +282,7 @@ async fn on_phase_end_raise_synchronously_freezes_dispatch() {
     local
         .run_until(async {
             let (mut primary, _mesh) = drive_phase_end_with_two_phase_ledger(true).await;
-            let view = primary.dispatch_view_for_worker(0);
+            let view = primary.dispatch_view_for_worker(0, false);
             assert!(
                 view.is_empty(),
                 "the on_phase_end raise must SYNCHRONOUSLY empty the \
@@ -311,7 +311,7 @@ async fn non_raising_phase_end_leaves_dispatch_live() {
     local
         .run_until(async {
             let (primary, _mesh) = drive_phase_end_with_two_phase_ledger(false).await;
-            let view = primary.dispatch_view_for_worker(0);
+            let view = primary.dispatch_view_for_worker(0, false);
             assert!(
                 !view.is_empty(),
                 "without a raise the dependent phase's task must be \

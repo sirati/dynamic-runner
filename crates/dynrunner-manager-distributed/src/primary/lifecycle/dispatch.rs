@@ -59,12 +59,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             if self.should_skip_worker_for_dispatch(worker_idx, bypass_backpressure, false) {
                 continue;
             }
+            // #519 per-decision bias: only a worker that reaches
+            // view-construction makes a real dispatch DECISION, so this runs
+            // AFTER the skip gate (a backpressured / OOM-masked worker is not
+            // a decision and must not advance the counter or consume a toggle
+            // flip — that would desync the deterministic alternation). The
+            // call folds the decision-count bump, the every-W gate re-eval,
+            // and the toggle flip; it returns `false` whenever the cached
+            // gate verdict is disarmed (pre-#519 view).
+            let prefer_dependency = self.prefer_dependency_for_decision();
             // Dispatch-shape view pipeline: pool view → soft
             // preferred-secondaries tie-break → strict
             // preferred-secondaries gate (OOM bucket only) → cap
             // filter. The full pipeline lives behind a single
             // accessor so OOM-bucket policy never leaks here.
-            let view = self.dispatch_view_for_worker(worker_idx);
+            let view = self.dispatch_view_for_worker(worker_idx, prefer_dependency);
             if view.is_empty() {
                 continue;
             }
@@ -97,13 +106,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // + ledger insert, committed together so the three
                 // pieces of in-flight bookkeeping can never diverge. The
                 // slot is idle by construction here (`dispatch_order`
-                // filters to idle workers).
-                self.commit_assignment(
+                // filters to idle workers), so the enforced idle-guard
+                // (#517) refuses only if a bug ever broke that invariant:
+                // requeue the taken binary + refresh the snapshot + skip
+                // the send rather than dispatch a task the model can't
+                // track (the silent-overwrite backstop).
+                if !self.commit_assignment(
                     worker_idx,
                     binary.clone(),
                     task_hash.clone(),
                     estimated_usage.clone(),
-                );
+                ) {
+                    self.pool_mut().requeue(binary);
+                    all_infos[worker_idx] = self.workers[worker_idx].budget_info();
+                    continue;
+                }
                 // Keep the hoisted budget snapshot coherent: the commit
                 // just made this slot busy, and later workers' scheduler
                 // calls must see it that way (idle-rank shifts under a

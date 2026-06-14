@@ -18,6 +18,7 @@ mod dispatch_rank;
 mod partition;
 mod phase_graph;
 mod phase_lifecycle;
+mod prefer_dependency;
 mod query_predicates;
 mod reservation;
 mod setup_kind;

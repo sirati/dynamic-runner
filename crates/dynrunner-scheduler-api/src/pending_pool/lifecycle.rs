@@ -726,9 +726,14 @@ impl<I: Identifier> PendingPool<I> {
     /// caller only evaluates it on the candidate-wedge shape
     /// (`queued == 0 && in_flight == 0 && blocked > 0`).
     fn live_blocked_count(&self, phase_id: &PhaseId) -> usize {
+        // Permanent failure (`failed_tasks`, any phase) is the canonical
+        // [`Self::is_dead_ended`] leaf (one owner of "never runnable
+        // again"); ADD the drain-edge-local clause — a `soft_failed`
+        // prereq IN `phase_id` ITSELF, dead for THIS gate because this
+        // phase's drain edge is its retry-decision point. A `soft_failed`
+        // in ANOTHER phase is NOT dead here (its own drain edge decides).
         let is_dead = |id: &str| {
-            self.failed_tasks.contains(id)
-                || self.soft_failed.get(id).is_some_and(|p| p == phase_id)
+            self.is_dead_ended(id) || self.soft_failed.get(id).is_some_and(|p| p == phase_id)
         };
         let mut doomed: HashSet<&str> = HashSet::new();
         loop {

@@ -597,3 +597,70 @@ fn local_dependency_released_mirrors_literal_sender_bytes() {
     }
     assert_eq!(serde_json::to_string(&decoded).unwrap(), literal);
 }
+
+/// Wire-shape mirror for `IllegallyAssignedToNonidleWorker` (#517,
+/// secondary → primary): decode the EXACT JSON bytes the secondary's
+/// bounce egress emits — tag, field names + order, the nested
+/// `AssignedTaskRef` `{hash, task_id}` shape, and the `incumbent`
+/// optional-field encoding — then re-encode and require identical bytes
+/// back (NOT symmetric-on-the-wrong-shape). Mirrors BOTH the busy-slot
+/// bounce (incumbent present) and the out-of-range / 0-worker bounce
+/// (incumbent key absent).
+#[test]
+fn illegally_assigned_to_nonidle_worker_mirrors_literal_sender_bytes() {
+    // Busy-slot bounce: the worker is running an INCUMBENT task; the
+    // illegally-assigned task is named in `assigned`. `task_id` rides as
+    // the nested `TestId` object (the tokenizer's wire identifier shape).
+    let with_incumbent = r#"{"msg_type":"illegally_assigned_to_nonidle_worker","sender_id":"sec-0","timestamp":11.25,"secondary_id":"sec-0","worker_id":6,"assigned":{"hash":"d1bf7dd7","task_id":{"binary_name":"assigned-bin","platform":"x86_64","compiler":"gcc","version":"12.0","opt_level":"O2"}},"incumbent":{"hash":"2da16d17","task_id":{"binary_name":"incumbent-bin","platform":"x86_64","compiler":"gcc","version":"12.0","opt_level":"O2"}}}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(with_incumbent).unwrap();
+    match &decoded {
+        DistributedMessage::IllegallyAssignedToNonidleWorker {
+            target,
+            sender_id,
+            timestamp,
+            secondary_id,
+            worker_id,
+            assigned,
+            incumbent,
+        } => {
+            assert!(target.is_none());
+            assert_eq!(sender_id, "sec-0");
+            assert_eq!(*timestamp, 11.25);
+            assert_eq!(secondary_id, "sec-0");
+            assert_eq!(*worker_id, 6);
+            assert_eq!(assigned.hash, "d1bf7dd7");
+            assert_eq!(assigned.task_id, test_id("assigned-bin"));
+            let inc = incumbent.as_ref().expect("incumbent present");
+            assert_eq!(inc.hash, "2da16d17");
+            assert_eq!(inc.task_id, test_id("incumbent-bin"));
+        }
+        other => panic!(
+            "expected IllegallyAssignedToNonidleWorker, got {:?}",
+            other.msg_type()
+        ),
+    }
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), with_incumbent);
+
+    // Out-of-range / 0-worker bounce: NO incumbent — the `incumbent` key is
+    // ABSENT on the wire (skip_serializing_if), and decodes back to `None`
+    // via serde(default). The assigned task is still requeued by the primary.
+    let no_incumbent = r#"{"msg_type":"illegally_assigned_to_nonidle_worker","sender_id":"sec-3","timestamp":12.0,"secondary_id":"sec-3","worker_id":99,"assigned":{"hash":"abc999","task_id":{"binary_name":"oor-bin","platform":"x86_64","compiler":"gcc","version":"12.0","opt_level":"O2"}}}"#;
+    let decoded_none: DistributedMessage<TestId> = serde_json::from_str(no_incumbent).unwrap();
+    match &decoded_none {
+        DistributedMessage::IllegallyAssignedToNonidleWorker {
+            worker_id,
+            assigned,
+            incumbent,
+            ..
+        } => {
+            assert_eq!(*worker_id, 99);
+            assert_eq!(assigned.hash, "abc999");
+            assert!(incumbent.is_none());
+        }
+        other => panic!(
+            "expected IllegallyAssignedToNonidleWorker, got {:?}",
+            other.msg_type()
+        ),
+    }
+    assert_eq!(serde_json::to_string(&decoded_none).unwrap(), no_incumbent);
+}

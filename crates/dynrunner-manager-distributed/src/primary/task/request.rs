@@ -136,12 +136,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     self.workers[idx].resource_budgets = available_res.clone();
                 }
 
+                // #519 dispatch-bias: a single `TaskRequest` serves ONE
+                // worker = ONE dispatch decision, so the per-decision
+                // primitive runs exactly once here (it folds the decision
+                // count, the every-W gate re-eval, and the toggle flip).
+                // Returns `false` while the cached gate verdict is disarmed
+                // (pre-#519 view).
+                let prefer_dependency = self.prefer_dependency_for_decision();
+
                 // Try to assign from local pending. The dispatch-
                 // shape view pipeline lives behind a single accessor
                 // on the coordinator so this site stays agnostic to
                 // soft/strict preferred-secondaries and per-type
                 // caps. See `dispatch_view_for_worker`.
-                let view = self.dispatch_view_for_worker(idx);
+                let view = self.dispatch_view_for_worker(idx, prefer_dependency);
                 if !view.is_empty() {
                     let worker_info = self.workers[idx].budget_info();
                     let all_infos: Vec<WorkerBudgetInfo<I>> =
@@ -174,13 +182,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         // Assigned{task_hash}` + ledger insert, committed
                         // together. The slot is idle here: the outer arm
                         // gated on `is_idle()`, so assignment is reachable
-                        // only from an idle slot.
-                        self.commit_assignment(
+                        // only from an idle slot. The enforced idle-guard
+                        // (#517) refuses only if that invariant ever broke:
+                        // requeue the taken binary + return (the requester
+                        // re-polls) rather than dispatch a task the model
+                        // can't track (the silent-overwrite backstop).
+                        if !self.commit_assignment(
                             idx,
                             binary.clone(),
                             task_hash.clone(),
                             estimated_usage.clone(),
-                        );
+                        ) {
+                            self.pool_mut().requeue(binary);
+                            return Ok(());
+                        }
                         // Resolve the per-edge predecessor-output map from the
                         // replicated `cluster_state.task_outputs` cache. The
                         // helper handles both the direct-dep present-but-empty

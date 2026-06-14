@@ -195,35 +195,54 @@ impl<I: Identifier> RemoteWorkerState<I> {
         self.state.task()
     }
 
-    /// Move the slot `Idle -> Assigned` with explicit `provenance`. The
-    /// slot MUST be `Idle`; the `debug_assert` makes a reassign-before-
-    /// terminal bug a test-time panic, while production faithfully
-    /// overwrites (the caller has already gated on idleness through the
-    /// dispatch view / scheduler decision). Mirrors
-    /// `WorkerHandle::assign_task`'s `take_idle().ok_or(...)` contract on
-    /// the worker-process side.
+    /// Move the slot `Idle -> Assigned` with explicit `provenance`, IFF
+    /// the slot is currently `Idle`. Returns `true` when the assign took
+    /// effect, `false` when it was REFUSED because the slot already holds
+    /// a task.
+    ///
+    /// #517 hardened the idle precondition from advisory to ENFORCED: the
+    /// pre-#517 `assign` `debug_assert`ed idle but in release builds
+    /// "faithfully overwrote" a non-idle slot — a SILENT reassignment-
+    /// before-terminal that clobbered the held task's slot state and
+    /// desynced the primary's per-`(secondary, worker_id)` occupancy model
+    /// from physical reality. The overwrite is now refused: a commit onto a
+    /// non-idle slot leaves the slot untouched, WARNs (so an operator sees
+    /// the would-be double-dispatch), and returns `false` so the caller
+    /// skips the send rather than dispatching a task the model can't track.
+    /// Mirrors `WorkerHandle::assign_task`'s `take_idle().ok_or(...)`
+    /// contract on the worker-process side (refuse, don't overwrite).
     ///
     /// `provenance` is [`SlotProvenance::Dispatched`] at every live
     /// dispatch site (this primary sent the `TaskAssignment`) and
     /// [`SlotProvenance::Inherited`] only at the failover-resume occupancy
     /// crossing (reconstructed from replicated `InFlight`).
+    #[must_use]
     pub(super) fn assign(
         &mut self,
         task_hash: String,
         task: TaskInfo<I>,
         estimated: ResourceMap,
         provenance: SlotProvenance,
-    ) {
-        debug_assert!(
-            self.state.is_idle(),
-            "slot assigned while not Idle (reassignment-before-terminal)"
-        );
+    ) -> bool {
+        if !self.state.is_idle() {
+            tracing::warn!(
+                worker_id = self.worker_id,
+                secondary_id = %self.secondary_id,
+                refused_hash = %task_hash,
+                "REFUSED assign onto a non-idle slot (reassignment-before-\
+                 terminal): the slot already holds a task; skipping rather \
+                 than silently overwriting (the held task's slot state is \
+                 preserved and its terminal still settles it by hash)"
+            );
+            return false;
+        }
         self.state = SlotState::Assigned {
             task_hash,
             task,
             estimated,
             provenance,
         };
+        true
     }
 
     /// True iff the slot holds an `Inherited` (unconfirmed-occupancy)
@@ -691,6 +710,36 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// run_20260611_005220 post-raise 6-task leak). Node-local and
     /// never cleared: a run-fail emit is terminal for this primary.
     pub(super) run_fail_dispatch_freeze: bool,
+    /// #519 pipeline-depth dispatch bias TOGGLE. While the gate is armed
+    /// (cached in `prefer_dependency_gate_armed`, re-evaluated every W
+    /// decisions — see [`Self::prefer_dependency_for_decision`]), this bool
+    /// is consulted + FLIPPED per dispatch decision: on a `true` decision the
+    /// dispatch view prefers a ready task that is a direct prerequisite of a
+    /// live blocked task (deepening the pipeline → refilling the ready pool);
+    /// on `false` it uses normal selection. The per-decision flip (no RNG)
+    /// makes ~50% of armed dispatches deepen, the other half keep breadth, so
+    /// the critical path is neither starved nor over-serialized. Node-local
+    /// dispatch state: NOT replicated; a promoted primary starts it `false`
+    /// (self-corrects per decision, no failover plumbing). Untouched whenever
+    /// the gate is off (the view is then byte-identical to the pre-#519
+    /// soft-predicate-only path).
+    pub(super) next_prefer_dependency: bool,
+    /// #519 dispatch-DECISION counter, monotonic across rechecks. The gate
+    /// is re-evaluated once per `W` decisions (W = total fleet workers), NOT
+    /// per recheck — a recheck fires per completion and can be a single
+    /// decision, so per-recheck is too often. Amortizing the `O(4W)` gate
+    /// scan across W decisions is `O(1)` per decision. Staleness is bounded
+    /// by `W` between evals, which the gate's `4W` threshold tolerates: the
+    /// count can drift by ≤W, never enough to flip a decision that has 3W of
+    /// slack (the `4×` factor IS that slack). Read+bumped only inside
+    /// [`Self::prefer_dependency_for_decision`].
+    pub(super) prefer_dependency_decision_count: u64,
+    /// #519 CACHED gate verdict, refreshed every W decisions by
+    /// [`Self::prefer_dependency_for_decision`]. Holds the last
+    /// [`Self::prefer_dependency_gate_holds`] result so the intervening
+    /// decisions read it for free (the amortized-`O(1)` path). Starts
+    /// `false` (a cold primary re-evaluates on its first decision).
+    pub(super) prefer_dependency_gate_armed: bool,
     /// The consumer's discovery policy for a relocated (mode-2) primary or
     /// an in-process `--source-already-staged` local primary, plus the
     /// phase graph it seeds alongside the discovered tasks. `None` on every
@@ -1535,6 +1584,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             custom_backlog_monitor: Default::default(),
             gated_terminals: std::collections::VecDeque::new(),
             run_fail_dispatch_freeze: false,
+            next_prefer_dependency: false,
+            prefer_dependency_decision_count: 0,
+            prefer_dependency_gate_armed: false,
             setup_discovery: None,
             phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
@@ -2686,6 +2738,98 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .and_then(|p| p.next_dispatch_backoff_expiry())
     }
 
+    /// #519 ready-pool-depth multiplier: the per-recheck dispatch bias is
+    /// armed only while the count of READY (deps-met, dispatchable) tasks is
+    /// strictly below `PREFER_DEPENDENCY_READY_MULTIPLIER × |total fleet
+    /// workers|`. Below that the ready pool is shallow enough that deepening
+    /// the pipeline (completing a prerequisite of a blocked task) is worth
+    /// biasing toward; at or above it the breadth pool is deep, so normal
+    /// selection runs unbiased. Owner-specified factor (4×).
+    const PREFER_DEPENDENCY_READY_MULTIPLIER: usize = 4;
+
+    /// Evaluate the #519 dispatch-bias GATE — the pure read both clauses
+    /// must satisfy. NOT called per decision: the caller
+    /// ([`Self::prefer_dependency_for_decision`]) refreshes a CACHED verdict
+    /// from this only once per `W` decisions, so its cost amortizes to
+    /// `O(1)` per decision. Both clauses:
+    ///
+    ///   1. The ready (deps-met, worker-dispatchable) pool is SHALLOW:
+    ///      strictly below `PREFER_DEPENDENCY_READY_MULTIPLIER × |total
+    ///      fleet workers|`. Evaluated by the SHORT-CIRCUITING
+    ///      [`PendingPool::ready_dispatchable_below`] — `O(threshold)`
+    ///      worst case (it stops the moment it has counted `threshold`
+    ///      eligible items), NEVER `O(queued)` (the #504-class sweep a 66k
+    ///      pool must not pay). `self.workers.len()` is the TOTAL fleet
+    ///      worker count (the flattened per-secondary roster). The ready
+    ///      scan sees ONLY dep-met items by CONSTRUCTION: the pool routes an
+    ///      unmet-dep task straight to its `blocked` map at ingest
+    ///      (`commit_item`) and only moves it into a bucket when its final
+    ///      dep resolves (`resolve_completed_dependents`), so a queued item
+    ///      is always dep-met — there is no per-scan queued→blocked
+    ///      housekeeping to fold in, and the ready set never re-examines a
+    ///      blocked task.
+    ///   2. There EXISTS a LIVE blocked task — one whose unmet deps are not
+    ///      dead-ended ([`PendingPool::has_live_blocked`], short-circuiting
+    ///      at the first live hit). Evaluated ONLY when clause 1 holds, so
+    ///      the combined gate stays cheap: `O(threshold)` +
+    ///      `O(until-first-live-blocked)`.
+    ///
+    /// A `0`-worker fleet (no members yet) makes the threshold `0`, so
+    /// clause 1 (`ready_dispatchable_below(0)`) is vacuously false and the
+    /// gate is off — correct, since with no workers there is nothing to
+    /// dispatch and no starvation to prevent. Pure read.
+    pub(super) fn prefer_dependency_gate_holds(&self) -> bool {
+        let threshold = Self::PREFER_DEPENDENCY_READY_MULTIPLIER * self.workers.len();
+        let pool = self.pool();
+        pool.ready_dispatchable_below(threshold) && pool.has_live_blocked()
+    }
+
+    /// The #519 per-dispatch-DECISION primitive: returns whether THIS
+    /// decision should prefer dependency-deepening, folding three concerns
+    /// into ONE call so each dispatch site is a single line:
+    ///
+    ///   1. DECISION COUNTING — bump `prefer_dependency_decision_count`.
+    ///   2. EVERY-W GATE RE-EVAL — refresh the cached
+    ///      `prefer_dependency_gate_armed` verdict from
+    ///      [`Self::prefer_dependency_gate_holds`] once per `W` decisions
+    ///      (W = total fleet workers), reading the cache the other `W-1`
+    ///      decisions. The `O(4W)` gate scan paid every W decisions is
+    ///      `O(1)` amortized per decision. Staleness is bounded by `W`,
+    ///      which the `4W` threshold's `3W` slack absorbs: the count can
+    ///      drift by ≤W between evals, never enough to wrongly flip a
+    ///      verdict with 3W of margin (the `4×` factor IS that slack). A
+    ///      benign W-step lag in either direction at worst prefers-dependency
+    ///      W steps too long / too late — harmless for a soft heuristic.
+    ///   3. PER-DECISION TOGGLE — while armed, FLIP `next_prefer_dependency`
+    ///      and return its prior value, so consecutive armed decisions
+    ///      alternate `true,false,…` (no RNG, the deterministic ~50% split).
+    ///      While disarmed, leave the toggle untouched and return `false`.
+    ///
+    /// A `0`-worker fleet never arms (clause 1 is vacuously false), and the
+    /// `W == 0` modulo guard below cannot divide by zero. Called exactly
+    /// once per real dispatch decision (per worker-idx that reaches
+    /// view-construction; once per single-worker `TaskRequest`).
+    pub(super) fn prefer_dependency_for_decision(&mut self) -> bool {
+        let w = self.workers.len() as u64;
+        // Refresh the cached verdict on the FIRST decision of each window of
+        // W (count % W == 0 BEFORE the bump → re-eval on counts 0, W, 2W…).
+        // `w == 0` is the no-fleet case: never arm, never modulo.
+        if w == 0 {
+            self.prefer_dependency_gate_armed = false;
+        } else if self.prefer_dependency_decision_count.is_multiple_of(w) {
+            self.prefer_dependency_gate_armed = self.prefer_dependency_gate_holds();
+        }
+        self.prefer_dependency_decision_count =
+            self.prefer_dependency_decision_count.wrapping_add(1);
+
+        if !self.prefer_dependency_gate_armed {
+            return false;
+        }
+        let current = self.next_prefer_dependency;
+        self.next_prefer_dependency = !current;
+        current
+    }
+
     /// Build the dispatch-shape worker view for the worker at
     /// `worker_idx`. The pipeline is:
     ///
@@ -2693,9 +2837,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///      `graceful_abort_requested` freeze the view is EMPTIED, so no
     ///      scheduler ever sees a candidate and no work leaves the ready
     ///      pool toward any worker.
-    ///   1. `pool.view_for_worker(global_wid, Some(&soft_pred))` —
-    ///      priority-ordered eligible items with soft
-    ///      `preferred_secondaries` tie-break.
+    ///   1. `pool.view_for_worker(global_wid, Some(&pred))` —
+    ///      priority-ordered eligible items. The within-class preference
+    ///      predicate is the soft `preferred_secondaries` tie-break, OPTIONALLY
+    ///      composed (when `prefer_dependency` is `true`, the #519 toggle's
+    ///      live decision) UNDER a primary `next_prefer_dependency` bias key
+    ///      that floats a ready DIRECT prerequisite of a live blocked task to
+    ///      the front of its soft-pin class. The class boundaries stay
+    ///      invariant either way (the predicate only reorders within a class);
+    ///      the dep bias is the primary key, preferred_secondaries the
+    ///      secondary tie-break (lexicographic).
     ///   2. Strict `preferred_secondaries` filter — ACTIVE iff
     ///      `single_worker_mode()` is true. Drops items whose
     ///      non-empty `preferred_secondaries` list omits this
@@ -2713,16 +2864,48 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// freeze needs no per-call-site checks. In-flight bookkeeping
     /// (completions, retries entering the pool, phase cascades) is
     /// untouched — only DISPATCH is frozen.
+    ///
+    /// `prefer_dependency` is the #519 toggle's PER-DECISION value, decided by
+    /// the caller via [`Self::prefer_dependency_for_decision`] (which folds the
+    /// every-W gate re-eval + the per-decision toggle flip); gate-off / disarmed
+    /// decisions pass `false`, giving a view byte-identical to the pre-#519
+    /// path. Kept `&self` (the flip lives in that caller, which takes
+    /// `&mut self`) so this method's borrow shape is unchanged.
     pub(super) fn dispatch_view_for_worker(
         &self,
         worker_idx: usize,
+        prefer_dependency: bool,
     ) -> dynrunner_scheduler_api::WorkerView<'_, I> {
         let global_wid = self.workers[worker_idx].worker_id;
         let secondary_id = self.workers[worker_idx].secondary_id.as_str();
         let soft_predicate =
             preferred_secondaries::apply_preferred_secondaries_predicate::<I>(secondary_id);
         let pool = self.pool();
-        let view = pool.view_for_worker(global_wid, Some(&soft_predicate));
+        // #519: when this decision prefers dependency-deepening, the within-
+        // class key becomes (dep-prerequisite-bias, preferred_secondaries) —
+        // a ready DIRECT prerequisite of a live blocked task sorts first
+        // (`Ordering::Less`), then the soft preferred_secondaries tie-break
+        // (`Ordering::then`, lexicographic). No `Greater` branch (FIFO
+        // preserved for equals, matching the soft predicate). The
+        // per-candidate `is_ready_prerequisite_of_live_blocked` is
+        // `O(direct dependents)`, bounded by the view size. When
+        // `prefer_dependency` is false the soft predicate is passed alone, so
+        // the produced view is byte-identical to the pre-#519 behaviour. The
+        // combined closure borrows `soft_predicate` + `pool` (both shared),
+        // so the `else` branch can still use `soft_predicate` unmoved.
+        let dep_then_soft = |task: &dynrunner_core::TaskInfo<I>| {
+            let dep_bias = if pool.is_ready_prerequisite_of_live_blocked(&task.task_id) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            };
+            dep_bias.then_with(|| soft_predicate(task))
+        };
+        let view = if prefer_dependency {
+            pool.view_for_worker(global_wid, Some(&dep_then_soft))
+        } else {
+            pool.view_for_worker(global_wid, Some(&soft_predicate))
+        };
         // Bring-up reservation scope (#494/#507): while the formation
         // window is open, a member's view is capped so it can never drain
         // ANOTHER member's reserved share — the late confirmers' slices the
@@ -2792,33 +2975,47 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// all. The `take_selected` that removes the binary from the pool
     /// precedes this call (it yields the owned `task`).
     ///
-    /// Reachable only from an `Idle` slot (enforced by
-    /// `RemoteWorkerState::assign`'s `debug_assert`); the caller has
-    /// already established idleness via the dispatch view / scheduler
-    /// decision.
+    /// Reachable only from an `Idle` slot (the caller has established
+    /// idleness via the dispatch view / scheduler decision). #517 made the
+    /// idle precondition ENFORCED, not advisory: returns `true` when the
+    /// commit took effect and `false` when `RemoteWorkerState::assign`
+    /// REFUSED a non-idle slot (it WARNs and leaves the slot untouched).
+    /// On refusal the type-slot reservation and the ledger insert are
+    /// SKIPPED too — the triple stays atomic (all three or none) — so the
+    /// caller MUST skip the `TaskAssignment` send (a commit that didn't
+    /// take must not put a task on the wire the model can't track). This is
+    /// the belt-and-braces backstop to the secondary's honor-or-bounce: the
+    /// honor-or-bounce removes the drift that produces a non-idle commit;
+    /// this refuses to silently overwrite if one ever arrives.
+    #[must_use]
     pub(super) fn commit_assignment(
         &mut self,
         worker_idx: usize,
         task: TaskInfo<I>,
         task_hash: String,
         estimated: ResourceMap,
-    ) {
+    ) -> bool {
         let secondary_id = self.workers[worker_idx].secondary_id.clone();
         // Record the STABLE secondary-local id (retain-immune), NOT the
         // positional Vec index — the terminal path re-resolves it via
         // `worker_idx_for` against the live Vec.
         let local_worker_id = self.local_worker_id_in_secondary(worker_idx);
         let phase = task.phase_id.clone();
-        self.reserve_type_slot(&task.type_id);
         // Live dispatch: THIS primary just sent the `TaskAssignment`, so
         // the occupancy is known-live — `Dispatched` provenance. The
-        // failover-resume reconciliation never touches such a slot.
-        self.workers[worker_idx].assign(
+        // failover-resume reconciliation never touches such a slot. Assign
+        // FIRST: if the slot is not idle the assign refuses (WARN) and we
+        // commit NOTHING — no type-slot reserve, no ledger insert — keeping
+        // the triple atomic.
+        if !self.workers[worker_idx].assign(
             task_hash.clone(),
             task.clone(),
             estimated,
             crate::primary::SlotProvenance::Dispatched,
-        );
+        ) {
+            return false;
+        }
+        self.reserve_type_slot(&task.type_id);
         self.in_flight.insert(
             task_hash,
             InFlightEntry {
@@ -2828,6 +3025,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 task,
             },
         );
+        true
     }
 
     /// Undo a `commit_assignment` whose `TaskAssignment` send failed:
@@ -3663,7 +3861,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         });
         let idx = self.workers.len() - 1;
         let task_hash = crate::primary::wire::compute_task_hash(&task);
-        self.commit_assignment(idx, task, task_hash.clone(), ResourceMap::new());
+        // The slot was just pushed Idle, so the commit always takes.
+        assert!(
+            self.commit_assignment(idx, task, task_hash.clone(), ResourceMap::new()),
+            "stage_in_flight_for_test must commit onto the freshly-idle slot"
+        );
         task_hash
     }
 

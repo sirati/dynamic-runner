@@ -122,6 +122,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             if !batch_eligible.contains(&self.workers[worker_idx].secondary_id) {
                 continue;
             }
+            // #519 per-decision bias: runs only for a worker that reaches
+            // view-construction (a real dispatch decision), after the
+            // payload-eligibility skip — a skipped worker must not advance
+            // the counter or consume a toggle flip. The call folds the
+            // decision-count bump + every-W gate re-eval + toggle flip;
+            // returns `false` while disarmed (pre-#519 view).
+            let prefer_dependency = self.prefer_dependency_for_decision();
             let worker_info = self.workers[worker_idx].budget_info();
             let max_res = self.workers[worker_idx].resource_budgets.clone();
             // The ONE dispatch-shape view pipeline (soft preferred-
@@ -138,7 +145,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // other dispatch path (load-bearing on the promoted-primary
             // path: a freeze inherited via the promotion snapshot must
             // also stop the post-promotion initial assignment).
-            let view = self.dispatch_view_for_worker(worker_idx);
+            let view = self.dispatch_view_for_worker(worker_idx, prefer_dependency);
             if view.is_empty() {
                 continue;
             }
@@ -171,14 +178,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // initial dispatch. The wire `InitialAssignment` is
                 // built+sent below in the per-secondary fan-out loop; the
                 // ledger/slot must already reflect the assignment so a
-                // completion that races back is attributed by hash.
+                // completion that races back is attributed by hash. Workers
+                // are all-idle by construction here (cold roster), so the
+                // enforced idle-guard (#517) refuses only on a broken
+                // invariant: requeue + un-count + skip rather than dispatch
+                // a task the model can't track (the silent-overwrite
+                // backstop).
                 let task_hash = compute_task_hash(&binary);
-                self.commit_assignment(
+                if !self.commit_assignment(
                     worker_idx,
                     binary.clone(),
                     task_hash,
                     estimated_usage.clone(),
-                );
+                ) {
+                    self.pool_mut().requeue(binary);
+                    total_assigned_resources.sub(&estimated_usage);
+                    continue;
+                }
 
                 assignments_per_secondary
                     .entry(secondary_id)
