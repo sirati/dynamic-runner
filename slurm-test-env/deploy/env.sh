@@ -57,8 +57,14 @@ WORKER_HOSTNAME_PREFIX="slurm-worker"
 # instances do not collide on the host's podman engine.
 GATEWAY_NAME="${GATEWAY_HOSTNAME}-${INSTANCE_ID}"
 NETWORK="slurm-test-net-${INSTANCE_ID}"
-GATEWAY_IMAGE_TAG="slurm-test-env-${INSTANCE_ID}-gateway:latest"
-WORKER_IMAGE_TAG="slurm-test-env-${INSTANCE_ID}-worker:latest"
+# Locally-built images carry a `localhost/` prefix so podman treats them
+# as fully-qualified local names. Without it, podman 5.8+ refuses to
+# resolve the bare short name on hosts that lack a registries.conf
+# (no unqualified-search registry to expand it against). The prefix flows
+# from here to import (up.sh), run (lib.sh), exists-checks (reboot-node.sh)
+# and cleanup (down.sh) — this is the single source of truth.
+GATEWAY_IMAGE_TAG="localhost/slurm-test-env-${INSTANCE_ID}-gateway:latest"
+WORKER_IMAGE_TAG="localhost/slurm-test-env-${INSTANCE_ID}-worker:latest"
 
 # Naming helpers consumed by up/down/provision scripts. Defined here so
 # the naming scheme has exactly one source of truth — adding e.g. a port
