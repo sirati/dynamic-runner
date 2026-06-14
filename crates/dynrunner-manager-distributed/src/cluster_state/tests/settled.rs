@@ -433,6 +433,12 @@ fn concurrent_reader_never_sees_torn_record() {
         .expect("write fd");
     let read_fd = std::fs::File::open(&path).expect("read fd");
     let committed = Arc::new(AtomicU64::new(0));
+    // Highest committed offset the reader has fully consumed (its decode
+    // cursor at the end of its latest pass). The writer waits on this to
+    // know the reader has caught up to the final committed offset before
+    // it stops — making the "reader observed records" liveness a
+    // synchronisation handshake rather than a CPU-scheduling race.
+    let read_progress = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
 
     // Reader thread: repeatedly walk every committed record from offset 0
@@ -443,6 +449,7 @@ fn concurrent_reader_never_sees_torn_record() {
     let reader = {
         let read_fd = read_fd;
         let committed = Arc::clone(&committed);
+        let read_progress = Arc::clone(&read_progress);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             let mut reads = 0u64;
@@ -469,6 +476,10 @@ fn concurrent_reader_never_sees_torn_record() {
                     off = rec_end;
                     reads += 1;
                 }
+                // Publish how far this pass consumed so the writer can
+                // observe the reader catching up. (Release pairs with the
+                // writer's Acquire load below.)
+                read_progress.store(off, Ordering::Release);
             }
             reads
         })
@@ -496,6 +507,34 @@ fn concurrent_reader_never_sees_torn_record() {
         committed.store(offset, Ordering::Release);
         // Yield so the reader interleaves mid-stream.
         std::thread::yield_now();
+    }
+    // Wait for the reader to consume up to the final committed offset
+    // before stopping it. This guarantees the reader walked the whole
+    // committed stream concurrently with the writes (so the torn-read
+    // invariants were exercised), and removes the prior CPU-scheduling
+    // race where a starved reader could observe nothing before stop.
+    //
+    // The wait is BOUNDED on a no-progress deadline: a starved reader
+    // (busy host) keeps making progress and just takes longer, so the
+    // deadline resets on every advance. Only a reader that is genuinely
+    // STUCK — e.g. a real regression panics/stalls the reader thread
+    // before it reaches the final offset — fails to advance, and then
+    // this fails FAST with a clear message rather than hanging the suite.
+    let no_progress_bound = std::time::Duration::from_secs(30);
+    let mut last_progress = read_progress.load(Ordering::Acquire);
+    let mut deadline = std::time::Instant::now() + no_progress_bound;
+    while last_progress < offset {
+        std::thread::yield_now();
+        let now = read_progress.load(Ordering::Acquire);
+        if now > last_progress {
+            last_progress = now;
+            deadline = std::time::Instant::now() + no_progress_bound;
+        } else if std::time::Instant::now() >= deadline {
+            panic!(
+                "reader stalled at offset {last_progress} (final committed {offset}) for \
+                 {no_progress_bound:?} — reader thread is stuck (regression?), not just slow"
+            );
+        }
     }
     stop.store(true, Ordering::Release);
     let reads = reader.join().expect("reader thread");
