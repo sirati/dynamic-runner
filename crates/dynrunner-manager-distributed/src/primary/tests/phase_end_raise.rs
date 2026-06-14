@@ -89,7 +89,7 @@ async fn on_phase_end_raise_surfaces_fatal_policy_exit() {
             // never reaching the on_phase_end raise this test asserts).
             seed_operational_ledger(&mut primary, binaries, HashMap::new());
             let result = primary
-                .run(SeedSource::PromotionSnapshot, on_start, on_end)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end)
                 .await;
 
             // #313 — the terminal RUN VERDICT. The worker-mgmt-fail
@@ -381,7 +381,7 @@ async fn non_raising_on_phase_end_completes_cleanly() {
             // run as `PromotionSnapshot` (a `ColdStart` would relocate away).
             seed_operational_ledger(&mut primary, binaries, HashMap::new());
             let result = primary
-                .run(SeedSource::PromotionSnapshot, on_start, on_end)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end)
                 .await;
 
             let completed = primary.completed_count();

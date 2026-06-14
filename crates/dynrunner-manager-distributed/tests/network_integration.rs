@@ -232,7 +232,7 @@ where
 
     {
         let run = primary.run(
-            SeedSource::PromotionSnapshot,
+            SeedSource::PromotionSnapshot { kind: dynrunner_manager_distributed::process::BootstrapKind::Failover },
             Box::new(|_| {}),
             Box::new(|_, _, _, _| {}),
         );

@@ -422,7 +422,7 @@ async fn run_producer_zero_dispatch_scenario(
     // producer-path dispatch this test asserts).
     seed_operational_ledger(&mut primary, binaries, phase_deps);
     let result = primary
-        .run(SeedSource::PromotionSnapshot, on_start, on_end)
+        .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end)
         .await;
 
     drop(primary);
@@ -585,7 +585,7 @@ async fn mode2_zero_to_run_phase1_with_lazy_spawn_phase2_does_not_prematurely_co
             // which runs `discover_on_promotion` because debt is `Owed`).
             let exit = tokio::time::timeout(
                 Duration::from_secs(15),
-                primary.run(SeedSource::PromotionSnapshot, on_start, on_end),
+                primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end),
             )
             .await
             .expect(
@@ -773,7 +773,7 @@ async fn mode2_all_skipped_phase1_fires_on_phase_end_once_and_lazy_spawn_lands()
 
             let exit = tokio::time::timeout(
                 Duration::from_secs(15),
-                primary.run(SeedSource::PromotionSnapshot, on_start, on_end),
+                primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end),
             )
             .await
             .expect("the all-skipped mode-2 run must complete promptly, not hang");
@@ -970,7 +970,7 @@ async fn run_phase_ordering_scenario(
     // `PromotionSnapshot` (a `ColdStart` would relocate away).
     seed_operational_ledger(&mut primary, binaries, phase_deps);
     primary
-        .run(SeedSource::PromotionSnapshot, on_start, on_end)
+        .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end)
         .await
         .unwrap();
 
@@ -1227,7 +1227,7 @@ async fn connected_event_precedes_first_phase_start_with_empty_phase_and_lazy_sp
                     phases: vec![PhaseId::from("pre")],
                 });
             primary
-                .run(SeedSource::PromotionSnapshot, on_start, on_end)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end)
                 .await
                 .unwrap();
 

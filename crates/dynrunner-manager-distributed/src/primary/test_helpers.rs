@@ -1478,7 +1478,7 @@ pub(super) fn build_test_promote_recipe_with_config_and_hooks(
     // invocation.
     let mut config = Some(config);
     let mut hooks = Some(hooks);
-    Box::new(move |client, inbox, demote_rx, snapshot, settled_base| {
+    Box::new(move |client, inbox, demote_rx, snapshot, settled_base, bootstrap_kind| {
         let config = config
             .take()
             .expect("promote recipe invoked more than once");
@@ -1502,7 +1502,9 @@ pub(super) fn build_test_promote_recipe_with_config_and_hooks(
         crate::process::PromotedPrimary {
             coordinator: primary,
             run_args: crate::process::PrimaryRunArgs {
-                seed: crate::process::SeedSource::PromotionSnapshot,
+                seed: crate::process::SeedSource::PromotionSnapshot {
+                    kind: bootstrap_kind,
+                },
                 on_phase_start,
                 on_phase_end,
             },
@@ -1560,7 +1562,7 @@ pub(super) fn build_test_promote_recipe_from_producer(
         source_dir,
     } = flags;
     let mut setup_discovery = setup_discovery;
-    Box::new(move |client, inbox, demote_rx, snapshot, settled_base| {
+    Box::new(move |client, inbox, demote_rx, snapshot, settled_base, bootstrap_kind| {
         // The cell is captured (on the live promotion path) but deliberately
         // NOT read for the stamped flags — assert it is still at `Default` to
         // pin that a relocate-target gets no `InitialAssignment` pre-promotion.
@@ -1605,7 +1607,9 @@ pub(super) fn build_test_promote_recipe_from_producer(
         crate::process::PromotedPrimary {
             coordinator: primary,
             run_args: crate::process::PrimaryRunArgs {
-                seed: crate::process::SeedSource::PromotionSnapshot,
+                seed: crate::process::SeedSource::PromotionSnapshot {
+                    kind: bootstrap_kind,
+                },
                 on_phase_start: Box::new(|_| {}),
                 on_phase_end: Box::new(|_, _, _, _| {}),
             },

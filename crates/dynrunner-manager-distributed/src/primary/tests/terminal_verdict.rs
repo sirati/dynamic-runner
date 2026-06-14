@@ -263,7 +263,7 @@ async fn wholesale_spawn_rejection_broadcasts_run_aborted_not_run_complete() {
             // never reaching the finalize behaviour this test asserts).
             seed_operational_ledger(&mut primary, binaries, HashMap::new());
             let result = primary
-                .run(SeedSource::PromotionSnapshot, on_start, on_end)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end)
                 .await;
 
             // Local return: the structured loud-fail backstop, naming the

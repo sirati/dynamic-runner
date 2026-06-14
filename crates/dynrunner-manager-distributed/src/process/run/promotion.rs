@@ -54,19 +54,28 @@ where
     // relocates on it). Minted here so the hook and the receiver pair.
     let (demote_tx, demote_rx) = mpsc::unbounded_channel();
 
+    // Which promotion path this is, derived from the signal's
+    // `PrimaryChangeReason` (Transferred relocate vs Election failover) —
+    // captured before `signal.snapshot` is moved. The builder stamps it onto
+    // `SeedSource::PromotionSnapshot { kind }` so the bring-up reservation
+    // opens ONLY on a `BootstrapRelocation`.
+    let bootstrap_kind = super::super::BootstrapKind::from(signal.reason);
+
     // The caller's recipe builds + snapshot-seeds the primary from the
     // converged `cluster_state` the secondary captured ON the signal at the
     // promotion-fire instant. The node only threads the snapshot (fat
     // entries) AND the settled-CRDT base (join-fixed-point slice, inherited
-    // from the promoting host's spill index without replay) through — the
-    // builder owns `adopt_settled_base` + `seed_from_promotion_snapshot` +
-    // coordinator construction (scheduler/estimator are the caller's concern).
+    // from the promoting host's spill index without replay) AND the bootstrap
+    // kind through — the builder owns `adopt_settled_base` +
+    // `seed_from_promotion_snapshot` + coordinator construction
+    // (scheduler/estimator are the caller's concern).
     let mut built = builder(
         client,
         inbox,
         demote_rx,
         signal.snapshot,
         signal.settled_base,
+        bootstrap_kind,
     );
     built.coordinator.register_demote_on_displaced(demote_tx);
 

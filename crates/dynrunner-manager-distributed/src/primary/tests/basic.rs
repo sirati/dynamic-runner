@@ -41,7 +41,7 @@ async fn single_secondary_processes_all_tasks() {
                 // asserts.
                 seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(SeedSource::PromotionSnapshot, ops, ope)
+                    .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                     .await
                     .unwrap()
             };
@@ -85,7 +85,7 @@ async fn two_secondaries_distribute_work() {
                 let (deps, ops, ope) = noop_phase_args();
                 seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(SeedSource::PromotionSnapshot, ops, ope)
+                    .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                     .await
                     .unwrap()
             };
@@ -176,7 +176,7 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
             let (deps, ops, ope) = noop_phase_args();
             seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(SeedSource::PromotionSnapshot, ops, ope)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                 .await
                 .unwrap();
 
@@ -248,7 +248,7 @@ async fn live_distribution_continues_past_initial_batch() {
                 let (deps, ops, ope) = noop_phase_args();
                 seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(SeedSource::PromotionSnapshot, ops, ope)
+                    .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                     .await
                     .unwrap()
             };

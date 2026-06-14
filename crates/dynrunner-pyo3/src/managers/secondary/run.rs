@@ -1435,7 +1435,7 @@ pub(crate) fn build_promoted_primary_recipe(
     // this node's OWN local producer on the GIL thread and captured by value;
     // they are NOT read off the `InitialAssignment`-fed cell (a relocate-target
     // has no `InitialAssignment` before promotion — its cell is at `Default`).
-    Box::new(move |client, inbox, demote_rx, snapshot, settled_base| {
+    Box::new(move |client, inbox, demote_rx, snapshot, settled_base, bootstrap_kind| {
         let config = PrimaryConfig {
             node_id: secondary_id.clone(),
             keepalive_interval,
@@ -1657,7 +1657,12 @@ pub(crate) fn build_promoted_primary_recipe(
             // the promoted primary enters `run` on the inherited CRDT: its
             // run-init originates nothing and just re-hydrates.
             run_args: PrimaryRunArgs {
-                seed: SeedSource::PromotionSnapshot,
+                // The node derived the kind (relocation vs failover) from the
+                // promotion signal's `PrimaryChangeReason` and threaded it
+                // here; it gates the bring-up reservation (#507).
+                seed: SeedSource::PromotionSnapshot {
+                    kind: bootstrap_kind,
+                },
                 on_phase_start,
                 on_phase_end,
             },

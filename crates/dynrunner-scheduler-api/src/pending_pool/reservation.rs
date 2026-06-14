@@ -31,9 +31,10 @@
 //! ## Window lifecycle (driven by the coordinator)
 //!
 //! * `open_reservation(plan)` — the coordinator, at bring-up, partitions
-//!   the initial pending pool across the FULL EXPECTED member set via its
-//!   existing projected-load interleave and hands the resulting
-//!   per-task → member assignment here. Opens the window.
+//!   the initial pending pool across the connected fleet via its existing
+//!   projected-load interleave (one task per idle worker; the surplus
+//!   stays unreserved) and hands the resulting per-task → member
+//!   assignment here. Opens the window.
 //! * `redistribute_member(member, fallbacks)` — a member was declared
 //!   DEAD (the heartbeat path's genuine member-removal — NOT the
 //!   mesh-ready proceed-deadline, which leaves a slow-to-form member's
@@ -58,27 +59,29 @@
 //!
 //! ## The view seam
 //!
-//! `reservation_admits(member, task, holder_confirmed)` is the per-item
-//! predicate the distributed coordinator layers onto its
-//! `dispatch_view_for_worker` (via the existing `WorkerView::filter`
-//! combinator). A reserved task is WITHHELD from `member` in exactly ONE
-//! case — the case the #494 pack exploited:
-//!   * the task is reserved to a DIFFERENT, still-UNCONFIRMED holder.
-//!
-//! Otherwise it is admitted:
+//! `reservation_admits(member, task)` is the per-item predicate the
+//! distributed coordinator layers onto its `dispatch_view_for_worker` (via
+//! the existing `WorkerView::filter` combinator). A reserved task is
+//! WITHHELD from `member` whenever the task is reserved to a DIFFERENT
+//! holder while the window is open — the case the pack exploited. It is
+//! admitted:
 //!   * always when the window is closed (no overlay);
-//!   * always for an unreserved task (a streamed/late task — free for
-//!     anyone, the steady-state path);
-//!   * to its HOLDER (its first-dibs share);
-//!   * to ANY member once its holder has CONFIRMED — a confirmed holder
-//!     had its dibs, so its undrained overflow is free for the formed
-//!     fleet (a co-confirmed member, OR a mid-run joiner that arrived
-//!     after the partition; the reservation must never starve live idle
-//!     capacity once the share it protected is no longer forming).
+//!   * always for an UNRESERVED task — the capacity-bounded partition
+//!     reserves at most one task per idle worker, so every task beyond
+//!     total idle capacity is unreserved and free for the formed fleet
+//!     (the steady-state path);
+//!   * to its HOLDER, and ONLY its holder, while the window is open.
 //!
-//! `holder_confirmed` is the coordinator's per-holder mesh-confirmation
-//! fact — the pool does not track mesh-readiness, so the coordinator
-//! supplies it at the seam.
+//! There is NO freed-on-confirm widening (#507): a holder's share stays
+//! bound to it until it DRAINS (`note_taken`) or its DEAD holder is
+//! REDISTRIBUTED (`redistribute_member`). Widening a confirmed holder's
+//! share to the whole fleet let a co-located, high-worker node steal a
+//! just-confirmed member's share before its own workers pulled it. The
+//! capacity bound makes holder-only safe: a holder is never reserved more
+//! tasks than it has idle workers, so it always drains its own share and
+//! nothing strands by NOT widening. The pool therefore needs no
+//! mesh-confirmation fact at all — the admit decision is purely
+//! holder-identity, owned wholly by the pool.
 //!
 //! The local single-node manager NEVER opens a reservation, so its
 //! `view_for_worker` path is wholly unaffected — the overlay is inert
@@ -117,34 +120,32 @@ impl TaskReservation {
     /// True iff `member` may SEE `key` under the current overlay.
     ///
     /// The overlay's SOLE job is to protect a still-FORMING member's
-    /// share from a member that confirmed earlier — never to hoard a
-    /// confirmed member's overflow away from the rest of the formed
-    /// fleet. So a reserved task admits:
+    /// share from any OTHER member during the formation window. A reserved
+    /// task admits:
     ///   * everyone, when the window is closed;
-    ///   * everyone, when it carries no holder (an unreserved / streamed
-    ///     task);
-    ///   * its HOLDER always (its first-dibs share);
-    ///   * any member ONCE ITS HOLDER HAS CONFIRMED — a confirmed holder
-    ///     already had its dibs, so the task is overflow free for whoever
-    ///     has idle capacity (a co-confirmed member, or a mid-run
-    ///     joiner). `holder_confirmed` is the coordinator's per-holder
-    ///     confirmation fact (the pool does not track mesh-readiness).
+    ///   * everyone, when it carries no holder (an UNRESERVED task — the
+    ///     capacity-bounded partition leaves every task beyond total idle
+    ///     capacity unreserved, free for the formed fleet);
+    ///   * its HOLDER, and ONLY its holder, while the window is open.
     ///
-    /// It is WITHHELD from `member` ONLY when the task is reserved to a
-    /// DIFFERENT, still-UNCONFIRMED holder — exactly the late-confirmer's
-    /// share the #494 pack drained. That is the one case the reservation
-    /// exists to gate.
-    fn admits(
-        &self,
-        member: &str,
-        key: &ReservationKey,
-        holder_confirmed: &dyn Fn(&str) -> bool,
-    ) -> bool {
+    /// It is WITHHELD from any member that is not its holder. There is NO
+    /// freed-on-confirm widening (the #507 removal): a holder's share stays
+    /// bound to it until the holder DRAINS it (`note_taken`) or its DEAD
+    /// holder is REDISTRIBUTED (`redistribute_member`). Widening on confirm
+    /// let a co-located, high-worker node steal a just-confirmed member's
+    /// share before that member's own workers pulled it (the 14/2/0×N
+    /// pack). The capacity bound makes holder-only safe: a holder is never
+    /// reserved MORE tasks than it has idle workers, so it can always drain
+    /// its whole share itself — there is no over-subscription overflow to
+    /// strand by NOT widening. A genuinely-undrainable surplus (tasks
+    /// beyond total idle capacity) is unreserved from the start, not held
+    /// to anyone.
+    fn admits(&self, member: &str, key: &ReservationKey) -> bool {
         if !self.active {
             return true;
         }
         match self.holder.get(key) {
-            Some(h) => h == member || holder_confirmed(h),
+            Some(h) => h == member,
             None => true,
         }
     }
@@ -201,19 +202,12 @@ impl<I: Identifier> PendingPool<I> {
     /// May `member` SEE `item` under the current reservation overlay?
     /// The per-item predicate the distributed coordinator layers onto its
     /// dispatch view via `WorkerView::filter`. A reserved task is withheld
-    /// ONLY from a member that is not its holder while the holder is still
-    /// unconfirmed; `holder_confirmed` supplies the coordinator's
-    /// per-holder mesh-confirmation fact (a confirmed holder's overflow is
-    /// free for the formed fleet). See `TaskReservation::admits` and the
-    /// module docs for the full contract.
-    pub fn reservation_admits(
-        &self,
-        member: &str,
-        item: &TaskInfo<I>,
-        holder_confirmed: &dyn Fn(&str) -> bool,
-    ) -> bool {
+    /// from every member that is not its holder while the window is open
+    /// (holder-only — no freed-on-confirm widening, #507). See
+    /// `TaskReservation::admits` and the module docs for the full contract.
+    pub fn reservation_admits(&self, member: &str, item: &TaskInfo<I>) -> bool {
         self.reservation
-            .admits(member, &Self::reservation_key(item), holder_confirmed)
+            .admits(member, &Self::reservation_key(item))
     }
 
     /// REDISTRIBUTE a timed-out member's reserved share. Every task still

@@ -277,7 +277,7 @@ async fn mid_run_failover_dispatches_all_inherited_pending() {
             // reconciliation-probe denial — far beyond this deadline.
             let outcome = tokio::time::timeout(
                 Duration::from_secs(60),
-                promoted.run_consuming(SeedSource::PromotionSnapshot, ops, ope),
+                promoted.run_consuming(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope),
             )
             .await
             .expect(
@@ -428,7 +428,7 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
                 // away, never running the dispatch loop this test asserts).
                 seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(SeedSource::PromotionSnapshot, ops, ope)
+                    .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                     .await
                     .unwrap();
                 primary.completed_count()
@@ -800,7 +800,7 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
             // never running the dispatch loop this test asserts).
             seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(SeedSource::PromotionSnapshot, ops, ope)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                 .await
                 .unwrap();
 
@@ -1461,7 +1461,7 @@ async fn promoted_run_does_not_refire_on_phase_start_for_inherited_started_phase
             let ope: OnPhaseEnd = Box::new(|_, _, _, _| {});
 
             let outcome = promoted
-                .run_consuming(SeedSource::PromotionSnapshot, ops, ope)
+                .run_consuming(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                 .await
                 .expect("promoted run must not error");
             assert!(
@@ -1973,7 +1973,7 @@ async fn promoted_inherited_failed_not_double_counted_against_pending() {
 
             let (_deps, ops, ope) = noop_phase_args();
             let outcome = promoted
-                .run_consuming(SeedSource::PromotionSnapshot, ops, ope)
+                .run_consuming(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                 .await
                 .expect("promoted run must not error");
 

@@ -101,7 +101,7 @@ async fn terminally_failed_dep_cascades_dependents_and_run_exits() {
             // the timeout converts that into a loud test failure.
             tokio::time::timeout(
                 Duration::from_secs(30),
-                primary.run(SeedSource::PromotionSnapshot, ops, ope),
+                primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope),
             )
             .await
             .expect(

@@ -170,7 +170,7 @@ async fn replicated_abort_verdict_stands_primary_down_without_clean_finish() {
             let (_deps, on_start, on_end) = noop_phase_args();
             let result = tokio::time::timeout(
                 Duration::from_secs(30),
-                primary.run(SeedSource::PromotionSnapshot, on_start, on_end),
+                primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end),
             )
             .await
             .expect("the run must stand down promptly on the latched verdict");
@@ -279,7 +279,7 @@ async fn deposed_primary_authors_no_clean_verdict_at_run_end() {
 
             let result = tokio::time::timeout(
                 Duration::from_secs(30),
-                primary.run(SeedSource::PromotionSnapshot, on_start, on_end),
+                primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end),
             )
             .await
             .expect("the run must finish promptly");

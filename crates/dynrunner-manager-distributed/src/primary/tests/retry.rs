@@ -102,7 +102,7 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
             // run as `PromotionSnapshot` (a `ColdStart` would relocate away).
             seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(SeedSource::PromotionSnapshot, ops, ope)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                 .await
                 .unwrap();
 
@@ -217,7 +217,7 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
             // never running the dispatch loop this test asserts).
             seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(SeedSource::PromotionSnapshot, ops, ope)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                 .await
                 .unwrap();
 
@@ -358,7 +358,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
             // never running the dispatch loop this test asserts).
             seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(SeedSource::PromotionSnapshot, ops, ope)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                 .await
                 .unwrap();
 
@@ -480,7 +480,7 @@ async fn retry_max_passes_zero_disables_retry() {
             // never running the dispatch loop this test asserts).
             seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(SeedSource::PromotionSnapshot, ops, ope)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                 .await
                 .unwrap();
 
@@ -624,7 +624,7 @@ async fn oom_failure_with_zero_retries_still_advances_phase() {
             // Operational primary (mesh-always): seed the inherited ledger +
             // run as `PromotionSnapshot` (a `ColdStart` would relocate away).
             seed_operational_ledger(&mut primary, binaries, HashMap::new());
-            let run_fut = primary.run(SeedSource::PromotionSnapshot, on_start, on_end);
+            let run_fut = primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end);
             match tokio::time::timeout(Duration::from_secs(10), run_fut).await {
                 Ok(res) => res.unwrap(),
                 Err(_) => panic!(
@@ -730,7 +730,7 @@ async fn recoverable_bucket_runs_within_phase_drain_edge() {
             // never running the dispatch loop this test asserts).
             seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(SeedSource::PromotionSnapshot, ops, ope)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                 .await
                 .unwrap();
 
@@ -924,7 +924,7 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
             // Operational primary (mesh-always): seed the inherited ledger +
             // run as `PromotionSnapshot` (a `ColdStart` would relocate away).
             seed_operational_ledger(&mut primary, binaries, phase_deps);
-            let run_fut = primary.run(SeedSource::PromotionSnapshot, on_start, on_end);
+            let run_fut = primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end);
             match tokio::time::timeout(Duration::from_secs(10), run_fut).await {
                 Ok(res) => res.unwrap(),
                 Err(_) => panic!(

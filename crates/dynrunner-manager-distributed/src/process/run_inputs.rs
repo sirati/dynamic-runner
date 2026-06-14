@@ -80,10 +80,53 @@ pub enum SeedSource<I: Identifier> {
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     },
     /// Promotion: the coordinator was ALREADY
-    /// `seed_from_promotion_snapshot`'d before `run`. Carries nothing — the
-    /// pool / caches / `total_tasks` are derived from the inherited CRDT by
-    /// the always-run hydrate.
-    PromotionSnapshot,
+    /// `seed_from_promotion_snapshot`'d before `run`. The pool / caches /
+    /// `total_tasks` are derived from the inherited CRDT by the always-run
+    /// hydrate. `kind` de-conflates the TWO promotion paths that both reach
+    /// here — a setup-peer BOOTSTRAP-relocation handoff vs a mid-run
+    /// FAILOVER survivor-inherit — which the inherited CRDT alone cannot
+    /// distinguish (an early-failover whose in-flight tasks all re-queued to
+    /// `Pending` is ledger-identical to a never-dispatched relocation). The
+    /// `#507` bring-up reservation opens ONLY on `BootstrapRelocation`; a
+    /// `Failover` must NOT reserve (its inherited pool dispatches through the
+    /// re-announce flow — a pre-partitioned share would wedge it).
+    PromotionSnapshot { kind: BootstrapKind },
+}
+
+/// Which of the two `SeedSource::PromotionSnapshot` construction paths
+/// built this promoted primary. The CRDT cannot tell them apart (the
+/// `PrimaryChangeReason` is advisory + not persisted, the epoch floats,
+/// and an early-failover's re-queued pool is all-`Pending` like a
+/// never-dispatched relocation), so the construction site — which DOES
+/// know why it is promoting — stamps the kind here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapKind {
+    /// The run's SETUP PEER handed full primary authority to this chosen
+    /// compute peer (`PrimaryChangeReason::Transferred`). The run has never
+    /// had an operational primary — this is its FIRST one and the fleet is
+    /// forming, so the bring-up reservation opens here.
+    BootstrapRelocation,
+    /// A survivor inherited a run that DID have an operational primary
+    /// (election win / failover self-promotion,
+    /// `PrimaryChangeReason::Election`). The inherited pool is mid-run work;
+    /// the reservation must NOT open.
+    Failover,
+}
+
+impl From<dynrunner_protocol_primary_secondary::PrimaryChangeReason> for BootstrapKind {
+    /// Map the promotion trigger's `PrimaryChangeReason` (carried on the
+    /// `PromotionSignal`) to the bring-up bootstrap kind. `Transferred` is
+    /// the setup-peer relocate handoff (the run's first operational primary);
+    /// `Election` is a survivor's failover self-promotion. This is the ONE
+    /// place the advisory wire reason is turned into the durable
+    /// construction-time discriminator.
+    fn from(reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason) -> Self {
+        use dynrunner_protocol_primary_secondary::PrimaryChangeReason;
+        match reason {
+            PrimaryChangeReason::Transferred => BootstrapKind::BootstrapRelocation,
+            PrimaryChangeReason::Election => BootstrapKind::Failover,
+        }
+    }
 }
 
 /// The pipeline args a primary's `run` / `run_consuming` consumes.
@@ -148,6 +191,11 @@ pub type PromotedPrimaryBuilder<Sched, Est, I> = Box<
         // base BEFORE the fat snapshot restore, so the join-fixed-point
         // ledger slice is inherited without replaying fat bodies.
         crate::cluster_state::SettledStore,
+        // Which promotion path this is (derived from the `PromotionSignal`'s
+        // `PrimaryChangeReason`): the builder stamps it onto
+        // `SeedSource::PromotionSnapshot { kind }` so the bring-up
+        // reservation opens ONLY on a `BootstrapRelocation`.
+        BootstrapKind,
     ) -> PromotedPrimary<Sched, Est, I>,
 >;
 

@@ -280,7 +280,7 @@ async fn primary_sigusr2_initiates_graceful_abort_and_survives() {
                 let (ops, ope) = noop_phase_hooks();
                 let terminal = primary
                     .run(
-                        dynrunner_manager_distributed::process::SeedSource::PromotionSnapshot,
+                        dynrunner_manager_distributed::process::SeedSource::PromotionSnapshot { kind: dynrunner_manager_distributed::process::BootstrapKind::Failover },
                         ops,
                         ope,
                     )
@@ -371,7 +371,7 @@ async fn un_injected_primary_arm_is_inert() {
                 let (ops, ope) = noop_phase_hooks();
                 let terminal = primary
                     .run(
-                        dynrunner_manager_distributed::process::SeedSource::PromotionSnapshot,
+                        dynrunner_manager_distributed::process::SeedSource::PromotionSnapshot { kind: dynrunner_manager_distributed::process::BootstrapKind::Failover },
                         ops,
                         ope,
                     )
@@ -453,7 +453,7 @@ async fn relocation_hands_the_trigger_to_the_responding_observer() {
                 let (ops, ope) = noop_phase_hooks();
                 let outcome = primary
                     .run_consuming(
-                        dynrunner_manager_distributed::process::SeedSource::PromotionSnapshot,
+                        dynrunner_manager_distributed::process::SeedSource::PromotionSnapshot { kind: dynrunner_manager_distributed::process::BootstrapKind::Failover },
                         ops,
                         ope,
                     )

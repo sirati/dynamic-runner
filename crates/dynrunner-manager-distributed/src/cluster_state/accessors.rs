@@ -194,6 +194,35 @@ impl<I: Identifier> ClusterState<I> {
         c
     }
 
+    /// Whether the run has NOT YET DISPATCHED ANY task — no entry sits in
+    /// a POST-DISPATCH state. The four post-dispatch states are the only
+    /// ones a worker outcome (or an active assignment) can produce:
+    /// `InFlight` (assigned to a worker), `Completed`/`Failed` (a worker
+    /// reported a terminal), and `Unfulfillable` (a worker reported a
+    /// missing cluster resource). Every other state is reachable WITHOUT
+    /// dispatch — `Pending`/`Blocked`/`QueuedAfterLocalDependency` are
+    /// undispatched-pending (a `Blocked` dependent is stamped at SEED by
+    /// `apply_tasks_spawned`'s dep-classify when its prereq is still
+    /// pending, never having run), and `SkippedAlreadyDone`/`InvalidTask`/
+    /// `SetupCompleted`/`AffineReady` are spawn-time / in-process terminals
+    /// that never reach a worker.
+    ///
+    /// Single concern: classify whether THIS inherited ledger reflects a
+    /// run that has begun executing. Derived purely from the CRDT
+    /// (`counts()` — the one state-classification owner), so it is the
+    /// mesh-always "primary = pure function of CRDT" fact a freshly-built
+    /// primary reads to tell a BOOTSTRAP-relocation cold target (the setup
+    /// peer relocated BEFORE `perform_initial_assignment`, so nothing is
+    /// dispatched) from a FAILOVER survivor-inherit (the prior operational
+    /// primary MUST have dispatched the initial batch to be operational, so
+    /// ≥1 post-dispatch entry exists). A failover therefore can NEVER read
+    /// as unstarted — the property the bring-up reservation gate relies on
+    /// to preserve the failover exclusion.
+    pub fn run_is_unstarted(&self) -> bool {
+        let c = self.counts();
+        c.in_flight + c.completed + c.failed + c.unfulfillable == 0
+    }
+
     /// Per-ErrorType partition of terminal-state tasks, in the shape
     /// the operator-facing log lines consume (`succeeded` / `fail_retry`
     /// / `fail_oom` / `fail_final`). Iterates the CRDT-replicated

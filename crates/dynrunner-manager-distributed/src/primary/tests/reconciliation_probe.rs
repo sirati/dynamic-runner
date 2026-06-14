@@ -260,7 +260,7 @@ async fn lost_tasks_are_probed_denied_requeued_and_recovered_e2e() {
                 let (deps, ops, ope) = noop_phase_args();
                 seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(SeedSource::PromotionSnapshot, ops, ope)
+                    .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                     .await
                     .unwrap()
             };

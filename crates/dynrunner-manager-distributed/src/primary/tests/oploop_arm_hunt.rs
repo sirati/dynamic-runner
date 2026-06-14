@@ -291,7 +291,7 @@ async fn drive_promoted_primary_over_quic(
     {
         // Drive the REAL operational select! via `run(PromotionSnapshot)`.
         let run = primary.run(
-            crate::process::SeedSource::PromotionSnapshot,
+            crate::process::SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover },
             Box::new(|_| {}),
             Box::new(|_, _, _, _| {}),
         );
@@ -891,7 +891,7 @@ async fn probe_herd_over_large_ledger_does_not_stall_oploop() {
             let window = StdDuration::from_millis(3500);
             {
                 let (_deps, ops, ope) = noop_phase_args();
-                let run = primary.run(SeedSource::PromotionSnapshot, ops, ope);
+                let run = primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope);
                 tokio::pin!(run);
                 let _ = tokio::time::timeout(window, &mut run).await;
             }
@@ -966,7 +966,7 @@ async fn ghost_task_request_must_not_self_relay_spin() {
 
             {
                 let (_deps, ops, ope) = noop_phase_args();
-                let run = primary.run(SeedSource::PromotionSnapshot, ops, ope);
+                let run = primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope);
                 tokio::pin!(run);
                 // The ghost in-flight task never completes, so the run cannot
                 // resolve: the timeout is the observation window, after which
@@ -1042,7 +1042,7 @@ async fn completion_burst_survives_unassignable_request_storm() {
             let (_deps, ops, ope) = noop_phase_args();
             let result = tokio::time::timeout(
                 StdDuration::from_secs(20),
-                primary.run(SeedSource::PromotionSnapshot, ops, ope),
+                primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope),
             )
             .await;
 
@@ -1167,7 +1167,7 @@ async fn inbox_closed_mid_run_breaks_loop_no_zombie_no_spin() {
             let (_deps, ops, ope) = noop_phase_args();
             let result = tokio::time::timeout(
                 StdDuration::from_secs(10),
-                primary.run(SeedSource::PromotionSnapshot, ops, ope),
+                primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope),
             )
             .await;
 
@@ -1281,7 +1281,7 @@ async fn respawn_arm_parks_through_membership_join_churn() {
 
             {
                 let (_deps, ops, ope) = noop_phase_args();
-                let run = primary.run(SeedSource::PromotionSnapshot, ops, ope);
+                let run = primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope);
                 tokio::pin!(run);
                 let _ = tokio::time::timeout(StdDuration::from_secs(5), &mut run).await;
             }

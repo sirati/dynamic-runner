@@ -80,7 +80,7 @@ async fn instantly_crashing_task_is_charged_paced_and_the_run_terminates() {
             let (deps, ops, ope) = noop_phase_args();
             seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(SeedSource::PromotionSnapshot, ops, ope)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                 .await
                 .unwrap();
 

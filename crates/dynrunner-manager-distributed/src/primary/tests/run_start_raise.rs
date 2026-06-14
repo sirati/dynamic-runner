@@ -87,7 +87,7 @@ async fn on_run_start_raise_surfaces_fatal_policy_exit() {
             // `ColdStart` would relocate away before reaching the abort gate).
             seed_operational_ledger(&mut primary, binaries, HashMap::new());
             let result = primary
-                .run(SeedSource::PromotionSnapshot, on_start, on_end)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end)
                 .await;
 
             // The terminal RUN VERDICT: the pre-run hook abort must broadcast
@@ -202,7 +202,7 @@ async fn non_raising_on_run_start_completes_cleanly() {
 
             seed_operational_ledger(&mut primary, binaries, HashMap::new());
             let result = primary
-                .run(SeedSource::PromotionSnapshot, on_start, on_end)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end)
                 .await;
 
             let completed = primary.completed_count();

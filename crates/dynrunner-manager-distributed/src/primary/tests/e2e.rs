@@ -60,7 +60,7 @@ async fn e2e_primary_and_secondary_single_node() {
                 // away, never running the dispatch loop this test asserts).
                 seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(SeedSource::PromotionSnapshot, ops, ope)
+                    .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                     .await
                     .unwrap()
             };
@@ -143,7 +143,7 @@ async fn e2e_primary_and_two_secondaries() {
                 // away, never running the dispatch loop this test asserts).
                 seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(SeedSource::PromotionSnapshot, ops, ope)
+                    .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                     .await
                     .unwrap()
             };
@@ -555,7 +555,7 @@ async fn e2e_pre_staged_source_mode() {
                 // away, never running the dispatch loop this test asserts).
                 seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(SeedSource::PromotionSnapshot, ops, ope)
+                    .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                     .await
                     .unwrap()
             };
@@ -650,7 +650,7 @@ async fn e2e_uses_file_based_items_false() {
                 // away, never running the dispatch loop this test asserts).
                 seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(SeedSource::PromotionSnapshot, ops, ope)
+                    .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                     .await
                     .unwrap()
             };
@@ -747,7 +747,7 @@ async fn e2e_per_type_max_concurrent() {
                 // away, never running the dispatch loop this test asserts).
                 seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(SeedSource::PromotionSnapshot, ops, ope)
+                    .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                     .await
                     .unwrap()
             };
@@ -837,7 +837,7 @@ async fn run_without_stage_file_queue_fails_all_tasks() {
             // never running the dispatch loop this test asserts).
             seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(SeedSource::PromotionSnapshot, ops, ope)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                 .await
                 .unwrap();
 
@@ -979,7 +979,7 @@ async fn run_with_initial_staging_succeeds() {
             // never running the dispatch loop this test asserts).
             seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(SeedSource::PromotionSnapshot, ops, ope)
+                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
                 .await
                 .unwrap();
 

@@ -19,13 +19,6 @@ fn key(id: &str) -> super::super::ReservationKey {
     (phase("P"), id.into())
 }
 
-/// A `holder_confirmed` closure where NO holder has confirmed — the
-/// strict formation case where each unconfirmed member's share is
-/// protected.
-fn none_confirmed(_: &str) -> bool {
-    false
-}
-
 /// With NO window open the overlay admits everyone — the local
 /// single-node manager / steady-state path is wholly unaffected.
 #[test]
@@ -34,16 +27,16 @@ fn closed_window_admits_every_member() {
     p.extend([task("a"), task("b")]).expect("valid extend");
     assert!(!p.reservation_active());
     let a = task("a");
-    assert!(p.reservation_admits("sec-0", &a, &none_confirmed));
-    assert!(p.reservation_admits("sec-9", &a, &none_confirmed));
+    assert!(p.reservation_admits("sec-0", &a));
+    assert!(p.reservation_admits("sec-9", &a));
 }
 
-/// While the holders are UNCONFIRMED, an open window scopes a reserved
-/// task to its HOLDER only (protecting the still-forming member's share);
-/// an UNRESERVED task (omitted from the plan — a streamed/late task)
-/// admits everyone even while the window is open.
+/// An open window scopes a reserved task to its HOLDER only (protecting
+/// the still-forming member's share); an UNRESERVED task (omitted from the
+/// plan — the capacity-bounded surplus / a streamed task) admits everyone
+/// even while the window is open.
 #[test]
-fn open_window_scopes_reserved_to_unconfirmed_holder() {
+fn open_window_scopes_reserved_to_holder() {
     let mut p = pool_with(&["P"], &[]);
     p.extend([task("a"), task("b"), task("streamed")])
         .expect("valid extend");
@@ -55,25 +48,28 @@ fn open_window_scopes_reserved_to_unconfirmed_holder() {
     let b = task("b");
     let streamed = task("streamed");
 
-    // Neither holder confirmed → each share is protected from the other.
+    // Each share is protected from the other member.
     // a is sec-0's only.
-    assert!(p.reservation_admits("sec-0", &a, &none_confirmed));
-    assert!(!p.reservation_admits("sec-1", &a, &none_confirmed));
+    assert!(p.reservation_admits("sec-0", &a));
+    assert!(!p.reservation_admits("sec-1", &a));
     // b is sec-1's only.
-    assert!(p.reservation_admits("sec-1", &b, &none_confirmed));
-    assert!(!p.reservation_admits("sec-0", &b, &none_confirmed));
+    assert!(p.reservation_admits("sec-1", &b));
+    assert!(!p.reservation_admits("sec-0", &b));
     // streamed (unreserved) admits anyone.
-    assert!(p.reservation_admits("sec-0", &streamed, &none_confirmed));
-    assert!(p.reservation_admits("sec-7", &streamed, &none_confirmed));
+    assert!(p.reservation_admits("sec-0", &streamed));
+    assert!(p.reservation_admits("sec-7", &streamed));
 }
 
-/// A CONFIRMED holder's reserved overflow is FREE for the formed fleet —
-/// a confirmed holder had its dibs, so any member (a co-confirmed peer,
-/// OR a mid-run joiner) may take it. This is what keeps a single
-/// bring-up member's whole-pool reservation from starving a mid-run
-/// joiner (the `midrun_join` regression).
+/// #507: a reserved task admits ONLY its holder while the window is open —
+/// there is NO freed-on-confirm widening. Even though the overlay no
+/// longer tracks confirmation at all, this test pins the BEHAVIOUR that a
+/// member's reserved share is never visible to any other member (a
+/// co-located high-worker peer, a mid-run joiner) until the holder drains
+/// it or its dead holder is redistributed. Widening on confirm was the
+/// 14/2/0×N steal. (The capacity-bounded partition keeps this from
+/// stranding: a holder is never reserved more than it can drain itself.)
 #[test]
-fn confirmed_holders_overflow_is_free_for_the_fleet() {
+fn reserved_task_admits_only_its_holder_no_confirm_widening() {
     let mut p = pool_with(&["P"], &[]);
     p.extend([task("a"), task("b")]).expect("valid extend");
     p.open_reservation([(key("a"), "sec-0".into()), (key("b"), "sec-1".into())]);
@@ -81,15 +77,16 @@ fn confirmed_holders_overflow_is_free_for_the_fleet() {
     let a = task("a");
     let b = task("b");
 
-    // sec-0 confirmed, sec-1 still forming.
-    let confirmed_sec0 = |h: &str| h == "sec-0";
-    // a (sec-0's, holder confirmed) → free for a joiner.
-    assert!(p.reservation_admits("sec-0", &a, &confirmed_sec0));
-    assert!(p.reservation_admits("joiner", &a, &confirmed_sec0));
-    // b (sec-1's, holder UNCONFIRMED) → still protected: only sec-1 sees it.
-    assert!(p.reservation_admits("sec-1", &b, &confirmed_sec0));
-    assert!(!p.reservation_admits("sec-0", &b, &confirmed_sec0));
-    assert!(!p.reservation_admits("joiner", &b, &confirmed_sec0));
+    // a is sec-0's only — NOT visible to sec-1 nor a mid-run joiner, no
+    // matter what mesh-confirmation state any member is in (the overlay is
+    // confirmation-blind now).
+    assert!(p.reservation_admits("sec-0", &a));
+    assert!(!p.reservation_admits("sec-1", &a));
+    assert!(!p.reservation_admits("joiner", &a));
+    // b is sec-1's only.
+    assert!(p.reservation_admits("sec-1", &b));
+    assert!(!p.reservation_admits("sec-0", &b));
+    assert!(!p.reservation_admits("joiner", &b));
 }
 
 /// `open_reservation` with an EMPTY plan does not open a window (nothing
@@ -148,25 +145,25 @@ fn redistribute_folds_dead_share_onto_survivors() {
     let (a, b, c, d) = (task("a"), task("b"), task("c"), task("d"));
     // Round-robin over [sec-1, sec-2] in queued order a,b,c,d:
     // a→sec-1, b→sec-2, c→sec-1, d→sec-2. No task is still sec-0's.
-    // Holders treated as unconfirmed so the strict-holder routing shows.
+    // Holder-only admits: each task is visible to its new holder alone.
     assert!(
-        p.reservation_admits("sec-1", &a, &none_confirmed)
-            && !p.reservation_admits("sec-2", &a, &none_confirmed)
+        p.reservation_admits("sec-1", &a)
+            && !p.reservation_admits("sec-2", &a)
     );
     assert!(
-        p.reservation_admits("sec-2", &b, &none_confirmed)
-            && !p.reservation_admits("sec-1", &b, &none_confirmed)
+        p.reservation_admits("sec-2", &b)
+            && !p.reservation_admits("sec-1", &b)
     );
     assert!(
-        p.reservation_admits("sec-1", &c, &none_confirmed)
-            && !p.reservation_admits("sec-2", &c, &none_confirmed)
+        p.reservation_admits("sec-1", &c)
+            && !p.reservation_admits("sec-2", &c)
     );
     assert!(
-        p.reservation_admits("sec-2", &d, &none_confirmed)
-            && !p.reservation_admits("sec-1", &d, &none_confirmed)
+        p.reservation_admits("sec-2", &d)
+            && !p.reservation_admits("sec-1", &d)
     );
     // sec-0 (dead) sees none of them.
-    assert!(!p.reservation_admits("sec-0", &a, &none_confirmed));
+    assert!(!p.reservation_admits("sec-0", &a));
 }
 
 /// CASCADE: two members die in turn; the second death folds its
@@ -181,7 +178,7 @@ fn redistribute_is_cascade_safe() {
     p.redistribute_member("sec-0", &["sec-1".into(), "sec-2".into()]);
     let a = task("a");
     assert!(
-        p.reservation_admits("sec-1", &a, &none_confirmed),
+        p.reservation_admits("sec-1", &a),
         "a went to sec-1"
     );
 
@@ -189,13 +186,13 @@ fn redistribute_is_cascade_safe() {
     p.redistribute_member("sec-1", &["sec-2".into()]);
     let b = task("b");
     assert!(
-        p.reservation_admits("sec-2", &a, &none_confirmed)
-            && p.reservation_admits("sec-2", &b, &none_confirmed),
+        p.reservation_admits("sec-2", &a)
+            && p.reservation_admits("sec-2", &b),
         "both fold onto the lone survivor sec-2"
     );
     assert!(
-        !p.reservation_admits("sec-1", &a, &none_confirmed)
-            && !p.reservation_admits("sec-1", &b, &none_confirmed)
+        !p.reservation_admits("sec-1", &a)
+            && !p.reservation_admits("sec-1", &b)
     );
 }
 
@@ -212,7 +209,7 @@ fn redistribute_with_no_survivors_unreserves() {
     p.redistribute_member("sec-0", &[]);
     let a = task("a");
     assert!(
-        p.reservation_admits("sec-7", &a, &none_confirmed),
+        p.reservation_admits("sec-7", &a),
         "no survivor to hold it — it admits everyone, never stranded"
     );
     assert!(
@@ -240,7 +237,7 @@ fn redistribute_ignores_already_drained_tasks() {
     p.redistribute_member("sec-1", &["sec-2".into()]);
     let b = task("b");
     assert!(
-        p.reservation_admits("sec-2", &b, &none_confirmed)
-            && !p.reservation_admits("sec-1", &b, &none_confirmed)
+        p.reservation_admits("sec-2", &b)
+            && !p.reservation_admits("sec-1", &b)
     );
 }

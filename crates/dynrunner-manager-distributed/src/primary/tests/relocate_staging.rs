@@ -122,7 +122,7 @@ async fn stamped_flags_for_config(config: PrimaryConfig) -> (bool, bool) {
         let (deps, ops, ope) = noop_phase_args();
         seed_operational_ledger(&mut primary, binaries, deps);
         primary
-            .run(SeedSource::PromotionSnapshot, ops, ope)
+            .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
             .await
             .unwrap();
     }

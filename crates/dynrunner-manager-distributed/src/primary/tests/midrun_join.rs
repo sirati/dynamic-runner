@@ -451,7 +451,7 @@ async fn midrun_joiner_exits_setup_goes_meshready_and_completes_work() {
             let (deps, ops, ope) = noop_phase_args();
             seed_operational_ledger(&mut primary, binaries, deps);
             let (run_res, joiner_handle) =
-                tokio::join!(primary.run(SeedSource::PromotionSnapshot, ops, ope), driver);
+                tokio::join!(primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope), driver);
             run_res.unwrap();
 
             assert_eq!(
@@ -625,7 +625,7 @@ async fn midrun_joiner_unregistered_leg_still_receives_peerinfo_directed() {
             let (deps, ops, ope) = noop_phase_args();
             seed_operational_ledger(&mut primary, binaries, deps);
             let (run_res, joiner_handle) =
-                tokio::join!(primary.run(SeedSource::PromotionSnapshot, ops, ope), driver);
+                tokio::join!(primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope), driver);
             run_res.unwrap();
 
             assert_eq!(primary.completed_count(), 8, "all tasks must complete");
@@ -840,7 +840,7 @@ async fn midrun_joiner_inherits_pre_staged_mode_and_resolves_bind_mounted_corpus
             let (deps, ops, ope) = noop_phase_args();
             seed_operational_ledger(&mut primary, binaries, deps);
             let (run_res, joiner_handle) =
-                tokio::join!(primary.run(SeedSource::PromotionSnapshot, ops, ope), driver);
+                tokio::join!(primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope), driver);
             run_res.unwrap();
 
             // The decisive #488 assertion: zero tasks may be lost. A

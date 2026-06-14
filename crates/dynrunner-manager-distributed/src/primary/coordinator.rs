@@ -421,8 +421,10 @@ enum BootstrapRole {
     SetupPeer,
     /// The compute-peer destination the role was relocated/promoted onto:
     /// activate THIS node as the local primary and run the operational loop
-    /// in place.
-    PromotedDestination,
+    /// in place. Carries the `BootstrapKind` (relocation vs failover) the
+    /// construction site stamped, so the bring-up reservation gate
+    /// (`seed_bringup_reservation`) opens ONLY on a `BootstrapRelocation`.
+    PromotedDestination(crate::process::BootstrapKind),
 }
 
 impl BootstrapRole {
@@ -434,7 +436,9 @@ impl BootstrapRole {
         match seed {
             crate::process::SeedSource::ColdStart { .. }
             | crate::process::SeedSource::RelocatedSeed { .. } => BootstrapRole::SetupPeer,
-            crate::process::SeedSource::PromotionSnapshot => BootstrapRole::PromotedDestination,
+            crate::process::SeedSource::PromotionSnapshot { kind } => {
+                BootstrapRole::PromotedDestination(*kind)
+            }
         }
     }
 }
@@ -2675,20 +2679,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             preferred_secondaries::apply_preferred_secondaries_predicate::<I>(secondary_id);
         let pool = self.pool();
         let view = pool.view_for_worker(global_wid, Some(&soft_predicate));
-        // Bring-up reservation scope (#494): while the formation window is
-        // open, a member's view is capped so it can never drain a STILL-
-        // FORMING (unconfirmed) member's reserved share — the late
-        // confirmers' slices the 14/14/0 pack ate. A task reserved to a
-        // confirmed holder, or to THIS member, or unreserved, is still
-        // admitted (a confirmed holder's overflow is free for the formed
-        // fleet, including a mid-run joiner). The pool owns the holder
-        // map; the per-holder mesh-confirmation fact is THIS coordinator's
-        // (`member_mesh_confirmed`), supplied at the seam. Inert (admits
-        // everything) once the window closes OR on the local single-node
-        // manager (which never opens one).
-        let holder_confirmed = |holder: &str| self.member_mesh_confirmed(holder);
-        let view =
-            view.filter(|item| pool.reservation_admits(secondary_id, item, &holder_confirmed));
+        // Bring-up reservation scope (#494/#507): while the formation
+        // window is open, a member's view is capped so it can never drain
+        // ANOTHER member's reserved share — the late confirmers' slices the
+        // 14/2/0×N pack ate. A task reserved to THIS member, or unreserved
+        // (the capacity-bounded surplus), is admitted; a task reserved to a
+        // DIFFERENT holder is withheld until that holder drains it or its
+        // dead holder is redistributed. Holder-only — no freed-on-confirm
+        // widening (the #507 removal that stopped the co-located
+        // high-worker steal); the pool owns the whole admit decision on
+        // holder identity alone. Inert (admits everything) once the window
+        // closes OR on the local single-node manager (which never opens
+        // one).
+        let view = view.filter(|item| pool.reservation_admits(secondary_id, item));
         // Step 0 — the dispatch freezes. Emptying the TYPED view
         // (rather than branching at the call sites) keeps every consumer
         // shape-oblivious: the scheduler sees zero candidates and the
@@ -4047,7 +4050,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }
             // The CRDT was already restored by `seed_from_promotion_snapshot`;
             // hydrate (re-)derives the pool + caches from the inherited ledger.
-            crate::process::SeedSource::PromotionSnapshot => {}
+            // `kind` is consumed by the bootstrap-role branch (it gates the
+            // bring-up reservation), not by the seed-origination step here.
+            crate::process::SeedSource::PromotionSnapshot { .. } => {}
         }
         // The SOLE pool builder (eliminates the pre-F1 `PendingPool::new` +
         // `ingest_initial_batch` duplication against `hydrate`'s own build):
@@ -4264,7 +4269,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }
             // The compute-peer destination (PromotionSnapshot): run the FULL
             // operational pre-loop chain in place, then the operational tail.
-            BootstrapRole::PromotedDestination => {
+            // `bootstrap_kind` (relocation vs failover) gates the bring-up
+            // reservation below.
+            BootstrapRole::PromotedDestination(bootstrap_kind) => {
                 // Mode-2 discover-on-promotion (V6). Runs the consumer's
                 // discovery policy IFF the CRDT declares discovery `Owed` (a
                 // relocated compute-peer primary, or an in-process
@@ -4393,20 +4400,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // slots — FORBIDDEN.
                 self.reconstruct_workers_from_cluster_state();
 
-                // Phase 4.9: OPEN the bring-up reservation (#494). Partition
-                // the initial pending pool across the FULL EXPECTED member set
-                // via the projected-load interleave so each member gets a
-                // reserved share. MUST run AFTER the roster is reconstructed
-                // (it reads `self.workers`) and BEFORE
+                // Phase 4.9: OPEN the bring-up reservation (#494/#507).
+                // Partition the initial pending pool across the connected
+                // fleet (one task per idle worker) via the projected-load
+                // interleave so each member gets a capacity-bounded reserved
+                // share. Opens ONLY on a `BootstrapRelocation` cold target
+                // with an unstarted ledger — a `Failover` must NOT reserve
+                // (its inherited pool dispatches via the re-announce flow; a
+                // pre-partitioned share would wedge it). MUST run AFTER the
+                // roster is reconstructed (it reads `self.workers`) and BEFORE
                 // `perform_initial_assignment` — both the initial batch and the
                 // operational idle-worker recheck construct their views through
                 // `dispatch_view_for_worker`, which scopes to the member's
                 // reserved share, so a first-confirmed member drains only its
                 // slice instead of the whole pool while the fleet forms (the
-                // 14/14/0 pack). The veto in `should_skip_worker_for_dispatch`
+                // 14/2/0×N pack). The veto in `should_skip_worker_for_dispatch`
                 // still withholds any send to an unconfirmed member — the
                 // reservation only caps what a CONFIRMED member may pull.
-                self.seed_bringup_reservation();
+                self.seed_bringup_reservation(bootstrap_kind);
 
                 // Phase 5: the initial per-secondary assignment — a pure
                 // scheduler over the reconstructed `self.workers`, staged-files
