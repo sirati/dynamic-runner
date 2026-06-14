@@ -16,7 +16,8 @@ use super::resource::SoftPreferredSecondaries;
 /// The KIND of a task — the first-class behavioral classification that
 /// decides, at four seams only (scheduling, reassignment-on-death,
 /// dependency-resolution, counting), whether a task is ordinary worker
-/// WORK or a framework SETUP primitive.
+/// WORK, a framework SETUP primitive, or a per-secondary SECONDARY-AFFINE
+/// gate.
 ///
 /// A `Setup` task is NEVER worker-assignable: it is executed IN-PROCESS
 /// by its affinity member (the source-owning member) — the executor
@@ -27,17 +28,29 @@ use super::resource::SoftPreferredSecondaries;
 /// (so build tasks can gate on a setup task overlapping) and is counted
 /// in its OWN `setup_succeeded` bucket — never the `succeeded` bucket.
 ///
+/// A `SecondaryAffine` task is the per-secondary import primitive (#497):
+/// it is NEITHER worker-assignable NOR reassignable, the primary NEVER
+/// executes it, and it is NEVER counted in any success/fail bucket. It is
+/// a schedulability GATE only — its execution is once-per-secondary,
+/// tracked node-locally OFF the CRDT. The primary considers it
+/// dependency-satisfied when its OWN deps are done (a ready-not-executed
+/// transition); the once-per-secondary local run lands in later phases.
+/// Like `Setup` it is non-worker-assignable/non-reassignable, but unlike
+/// `Setup` it is NOT the common `Work` case — so it MUST be serialized on
+/// the wire (see `is_work`).
+///
 /// `Default` is `Work`, and the field is `#[serde(default)]` on
 /// `TaskInfo`, so a frame from a peer that predates this field decodes
 /// as `Work` — the wire stays backward-compatible. NOT folded into
 /// `compute_task_hash` (the recipe is `{phase_id, path, identifier}`),
-/// so marking a task `Setup` never changes its ledger key.
+/// so marking a task `Setup` (or `SecondaryAffine`) never changes its
+/// ledger key.
 ///
 /// The classification drives behavior ONLY through this enum's
 /// predicate methods at the four seams; no consumer of the field spells
 /// a bare `if kind == Setup` — they ask `is_worker_assignable()` /
-/// `is_reassignable()` / `is_setup()` so the kind→behavior mapping has a
-/// single owner (this type).
+/// `is_reassignable()` / `is_setup()` / `is_secondary_affine()` so the
+/// kind→behavior mapping has a single owner (this type).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskKind {
     /// Ordinary worker work: dispatched to a worker, reassignable on the
@@ -51,13 +64,25 @@ pub enum TaskKind {
     /// terminal unrecoverable), depend-able, and counted in the separate
     /// `setup_succeeded` bucket on success.
     Setup,
+    /// A per-secondary import primitive (#497): never worker-assigned,
+    /// non-reassignable, NEVER executed by the primary and NEVER counted
+    /// in any bucket. A schedulability GATE whose dependents unblock when
+    /// its OWN deps resolve (ready-not-executed); its actual execution is
+    /// once-per-secondary and tracked node-locally, off the CRDT. The
+    /// ready-resolution, the `QueuedAfterLocalDependency` work-task state,
+    /// and the once-per-secondary local executor land in later phases —
+    /// in this primitive the kind exists so it can be declared, routed
+    /// past the worker-dispatch view, and serialized on the wire.
+    SecondaryAffine,
 }
 
 impl TaskKind {
     /// Whether a task of this kind may be dispatched to a WORKER. Only
     /// `Work` is worker-assignable; a `Setup` task is executed in-process
-    /// by its affinity member and must never enter a worker-dispatch
-    /// view. The scheduling seam (`PendingPool`) reads this.
+    /// by its affinity member and a `SecondaryAffine` task runs
+    /// once-per-secondary node-locally — neither must ever enter a
+    /// worker-dispatch view. The scheduling seam (`PendingPool`) reads
+    /// this.
     pub fn is_worker_assignable(self) -> bool {
         matches!(self, TaskKind::Work)
     }
@@ -66,26 +91,46 @@ impl TaskKind {
     /// to `Pending`) when its holder dies. `Work` is reassignable —
     /// another worker picks it up. A `Setup` task is NOT: its executor is
     /// its source-owning member, so an executor death is unrecoverable
-    /// (the task goes terminal, dependents cascade). The death seam (the
-    /// primary's in-flight recovery) reads this.
+    /// (the task goes terminal, dependents cascade). A `SecondaryAffine`
+    /// task is likewise not worker-reassignable here — it is never a
+    /// dispatched worker task at all (its once-per-secondary execution is
+    /// tracked node-locally). The death seam (the primary's in-flight
+    /// recovery) reads this.
     pub fn is_reassignable(self) -> bool {
         matches!(self, TaskKind::Work)
     }
 
     /// Whether this is a `Setup` task. The plain discriminant query for
     /// the few call sites that classify by kind without a behavioral
-    /// predicate (e.g. the PyO3 boundary mapping an `is_setup` bool).
+    /// predicate (e.g. the PyO3 boundary mapping an `is_setup` bool). A
+    /// `SecondaryAffine` task is NOT a setup task — it has its own
+    /// [`Self::is_secondary_affine`] discriminant and a distinct
+    /// (per-secondary, off-CRDT) execution model.
     pub fn is_setup(self) -> bool {
         matches!(self, TaskKind::Setup)
     }
 
-    /// `&self` twin of [`Self::is_worker_assignable`] for the
+    /// Whether this is a `SecondaryAffine` task (#497) — the per-secondary
+    /// import gate. The plain discriminant query for the call sites that
+    /// classify by kind without a behavioral predicate (the later phases'
+    /// ready-resolution originator, the secondary's local-dep gate, and
+    /// the PyO3 boundary mapping an `is_secondary_affine` bool).
+    pub fn is_secondary_affine(self) -> bool {
+        matches!(self, TaskKind::SecondaryAffine)
+    }
+
+    /// Whether this is the common `Work` case — the predicate behind the
     /// `#[serde(skip_serializing_if = …)]` attribute on `TaskInfo.kind`
-    /// (serde hands the predicate a `&T`). Keeps the common `Work` case
-    /// off the wire so a rolling upgrade is indistinguishable for
-    /// ordinary tasks; the behavioral seams use the by-value predicate.
+    /// (serde hands it a `&T`). Keeps the default `Work` kind off the
+    /// wire so a rolling upgrade is indistinguishable for ordinary tasks.
+    ///
+    /// Deliberately `matches!(self, Work)`, NOT a delegation to
+    /// [`Self::is_worker_assignable`]: a `SecondaryAffine` task is also
+    /// non-worker-assignable, but it is NOT the common `Work` case and
+    /// MUST be serialized (a peer that drops it from the wire would lose
+    /// the gate). Only the exact `Work` discriminant may be skipped.
     fn is_work(&self) -> bool {
-        self.is_worker_assignable()
+        matches!(self, TaskKind::Work)
     }
 }
 
@@ -578,6 +623,85 @@ mod task_dep_tests {
             explicit.phase_id,
             PhaseId::from("other"),
             "new dep untouched"
+        );
+    }
+}
+
+#[cfg(test)]
+mod task_kind_tests {
+    use super::*;
+
+    /// Build a minimal `TaskInfo` with the given kind so the kind-seam
+    /// predicates and the wire shape can be exercised without dragging in
+    /// the scheduler. Mirrors the `mk` helper in `task_hash.rs` tests.
+    fn mk_task(kind: TaskKind) -> TaskInfo<String> {
+        TaskInfo {
+            path: PathBuf::from("/bin/x"),
+            size: 1,
+            identifier: "id".to_string(),
+            phase_id: PhaseId::from("phase-A"),
+            type_id: TypeId::from("t"),
+            kind,
+            setup_affinity: None,
+            upload_file: None,
+            required_files: None,
+            affinity_id: None,
+            payload: serde_json::Value::Null,
+            task_id: "task-1".to_string(),
+            task_depends_on: Vec::new(),
+            preferred_secondaries: SoftPreferredSecondaries::default(),
+            preferred_version: Default::default(),
+            resolved_path: None,
+        }
+    }
+
+    #[test]
+    fn secondary_affine_predicates() {
+        // SecondaryAffine is NEITHER worker-assignable, reassignable, nor a
+        // setup task — it is its own discriminant. The primary never
+        // dispatches it to a worker, never requeues it on death, and never
+        // routes it through the setup executor; its only seam in this phase
+        // is its own `is_secondary_affine` query.
+        let k = TaskKind::SecondaryAffine;
+        assert!(!k.is_worker_assignable(), "never worker-assignable");
+        assert!(!k.is_reassignable(), "never reassignable");
+        assert!(!k.is_setup(), "not a setup task");
+        assert!(k.is_secondary_affine(), "is its own kind");
+
+        // The other kinds answer the new discriminant false.
+        assert!(!TaskKind::Work.is_secondary_affine());
+        assert!(!TaskKind::Setup.is_secondary_affine());
+    }
+
+    #[test]
+    fn secondary_affine_round_trips_on_the_wire() {
+        // Unlike the default `Work` kind (skipped to keep a rolling
+        // upgrade quiet), a SecondaryAffine task MUST appear on the wire —
+        // dropping it would lose the gate. Assert the `kind` field is
+        // PRESENT in the JSON and decodes back to SecondaryAffine.
+        let task = mk_task(TaskKind::SecondaryAffine);
+        let value = serde_json::to_value(&task).expect("serialize");
+        assert_eq!(
+            value["kind"], "SecondaryAffine",
+            "SecondaryAffine kind must be serialized, not skipped"
+        );
+        let back: TaskInfo<String> = serde_json::from_value(value).expect("round-trip");
+        assert_eq!(back.kind, TaskKind::SecondaryAffine);
+
+        // The common `Work` case stays OFF the wire (skip_serializing_if),
+        // so a legacy frame with no `kind` field still decodes to `Work`.
+        let work = mk_task(TaskKind::Work);
+        let work_value = serde_json::to_value(&work).expect("serialize work");
+        assert!(
+            work_value.get("kind").is_none(),
+            "the default Work kind is skipped on the wire"
+        );
+        let legacy_back: TaskInfo<String> =
+            serde_json::from_value(work_value).expect("legacy round-trip");
+        assert_eq!(
+            legacy_back.kind,
+            TaskKind::Work,
+            "a frame without a kind field decodes to Work"
         );
     }
 }

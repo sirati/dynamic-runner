@@ -55,7 +55,9 @@ pub fn compute_task_hash<I: Identifier>(binary: &TaskInfo<I>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AffinityId, PhaseId, SoftPreferredSecondaries, TaskDep, TaskInfo, TypeId};
+    use crate::types::{
+        AffinityId, PhaseId, SoftPreferredSecondaries, TaskDep, TaskInfo, TaskKind, TypeId,
+    };
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -104,5 +106,22 @@ mod tests {
         // Mutating a non-recipe field does not change the hash.
         a.affinity_id = Some(AffinityId::from("aff"));
         assert_eq!(compute_task_hash(&a), compute_task_hash(&b));
+    }
+
+    #[test]
+    fn secondary_affine_kind_excluded_from_hash() {
+        // The hash recipe is `{phase_id, path, identifier}` — `kind` is not
+        // folded in, so changing the kind never changes the ledger key.
+        // Two tasks identical but for kind ∈ {Work, SecondaryAffine} must
+        // produce EQUAL hashes (same key in the cluster ledger), exactly as
+        // for `Setup`.
+        let work = mk("phase-A", "/bin/x");
+        let mut affine = mk("phase-A", "/bin/x");
+        affine.kind = TaskKind::SecondaryAffine;
+        assert_eq!(
+            compute_task_hash(&work),
+            compute_task_hash(&affine),
+            "kind is not part of the hash recipe"
+        );
     }
 }
