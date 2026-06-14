@@ -152,6 +152,26 @@ class TaskInfo:
     # ``skipped_already_done`` it is a property of the scheduling unit,
     # not a discovery-time routing signal.
     is_setup: bool = False
+    # First-class task-KIND marker for the SecondaryAffine gate (#497).
+    # ``False`` (default) ⇒ no SecondaryAffine gate. ``True`` ⇒ a framework
+    # SecondaryAffine task: a primary-side GATE that is NEVER worker-assigned,
+    # NEVER executed by the primary, and NEVER counted in success/fail — its
+    # per-secondary IMPORT runs ONCE locally on each compute secondary whose
+    # dependent WORK tasks gate on it (e.g. a ``nix-store --import`` / toolchain
+    # build / cache prime that must be present on a node before that node's
+    # builds run). A SecondaryAffine task uses ``setup_affinity=None`` and
+    # carries its ``task_depends_on``, which is EITHER empty (the archive is
+    # already staged at pre-flight → the gate is ready at spawn) OR a #336
+    # upload setup-task id (the framework uploads → the gate is ready when the
+    # upload completes). Both compose at the CRDT layer with no new dependency
+    # machinery; downstream builds just depend on this task's ``task_id``.
+    # Mutually exclusive with ``is_setup`` (a task is at most one kind);
+    # ``is_secondary_affine`` wins at the single kind-selector mapping site.
+    # The primitive is UNCONDITIONAL (no CLI flag). Carried through the PyO3
+    # boundary (``crate::pytypes::extract_binaries``) onto the core Rust
+    # ``TaskInfo.kind`` (``TaskKind::SecondaryAffine``); a property of the
+    # scheduling unit, NOT folded into the task's content hash.
+    is_secondary_affine: bool = False
     # EXECUTOR-affinity member for a setup task (``is_setup=True``): the
     # peer id of the member that runs this setup task IN-PROCESS (its
     # source-owning member). A consumer setup task names its member here
@@ -220,6 +240,7 @@ class TaskInfo:
             "payload": self.payload,
             "task_id": self.task_id,
             "is_setup": self.is_setup,
+            "is_secondary_affine": self.is_secondary_affine,
             "setup_affinity": self.setup_affinity,
             # Normalise each required-file entry to a JSON-friendly shape:
             # a bare source stays a string; a ``(source, dest)`` pair renders

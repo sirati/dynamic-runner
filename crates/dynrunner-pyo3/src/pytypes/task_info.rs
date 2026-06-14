@@ -92,6 +92,22 @@ pub(crate) struct PyTaskInfo {
     /// `From<&PyTaskInfo>` / `From<&TaskInfo>` conversions thread it.
     #[pyo3(get)]
     pub(super) is_setup: bool,
+    /// First-class task-KIND marker for the SecondaryAffine gate — the
+    /// consumer-boundary surface of [`dynrunner_core::TaskKind::SecondaryAffine`]
+    /// (#497). `False` (default) ⇒ no SecondaryAffine gate. `True` ⇒
+    /// `TaskKind::SecondaryAffine`: a primary-side GATE never worker-assigned,
+    /// never executed by the primary, never counted in success/fail — its
+    /// per-secondary IMPORT runs ONCE locally on each compute secondary whose
+    /// dependent WORK tasks gate on it. A SecondaryAffine task uses
+    /// `setup_affinity = None` and carries its `task_depends_on` (which may be
+    /// EMPTY — the no-dep case is AffineReady at spawn — or a #336 upload
+    /// setup-task id; both compose at the CRDT layer with no new dep
+    /// machinery). Mutually exclusive with `is_setup` at the SINGLE
+    /// kind-selector mapping site below: `is_secondary_affine` wins. Available
+    /// UNCONDITIONALLY (no CLI flag). Carried on the core `TaskInfo<I>` as
+    /// `kind`.
+    #[pyo3(get)]
+    pub(super) is_secondary_affine: bool,
     /// EXECUTOR-affinity member for a setup task (`is_setup = True`): the
     /// peer id of the member that runs this setup task IN-PROCESS. A
     /// consumer setup task names its source-owning member here (e.g. a
@@ -138,6 +154,7 @@ impl PyTaskInfo {
         preferred_secondaries = Vec::new(),
         skipped_already_done = false,
         is_setup = false,
+        is_secondary_affine = false,
         setup_affinity = None,
         required_files = Vec::new(),
     ))]
@@ -157,6 +174,7 @@ impl PyTaskInfo {
         preferred_secondaries: Vec<String>,
         skipped_already_done: bool,
         is_setup: bool,
+        is_secondary_affine: bool,
         setup_affinity: Option<String>,
         required_files: Vec<(String, Option<String>)>,
     ) -> PyResult<Self> {
@@ -180,6 +198,7 @@ impl PyTaskInfo {
             preferred_secondaries,
             skipped_already_done,
             is_setup,
+            is_secondary_affine,
             setup_affinity,
             required_files,
         })
@@ -251,10 +270,13 @@ impl From<&PyTaskInfo> for TaskInfo<RunnerIdentifier> {
                 .collect(),
             preferred_secondaries: SoftPreferredSecondaries::new(py.preferred_secondaries.clone()),
             preferred_version: Default::default(),
-            // The consumer-boundary `is_setup` bool maps to the first-class
-            // `TaskKind` here — the SINGLE point this pyclass surface
-            // crosses into the Rust kind.
-            kind: if py.is_setup {
+            // The consumer-boundary kind bools map to the first-class
+            // `TaskKind` here — the SINGLE point this pyclass surface crosses
+            // into the Rust kind. `is_secondary_affine` wins over `is_setup`
+            // (a task is at most one kind); both false ⇒ ordinary `Work`.
+            kind: if py.is_secondary_affine {
+                dynrunner_core::TaskKind::SecondaryAffine
+            } else if py.is_setup {
                 dynrunner_core::TaskKind::Setup
             } else {
                 dynrunner_core::TaskKind::Work
@@ -315,8 +337,10 @@ impl From<&TaskInfo<RunnerIdentifier>> for PyTaskInfo {
             // its `TaskState` variant, not in this discovery-time field.
             skipped_already_done: false,
             // `kind` IS carried on the core `TaskInfo<I>`, so the
-            // round-trip-back faithfully reflects it.
+            // round-trip-back faithfully reflects it. The two kind bools are
+            // the mutually-exclusive projection of the single `TaskKind`.
             is_setup: bi.kind.is_setup(),
+            is_secondary_affine: bi.kind.is_secondary_affine(),
             // `setup_affinity` IS carried on the core `TaskInfo<I>`, so the
             // round-trip-back faithfully reflects it.
             setup_affinity: bi.setup_affinity.clone(),
@@ -367,6 +391,7 @@ mod tests {
             preferred_secondaries: preferred,
             skipped_already_done: false,
             is_setup: false,
+            is_secondary_affine: false,
             setup_affinity: None,
             required_files: Vec::new(),
         }
@@ -476,6 +501,7 @@ mod tests {
             Vec::new(),
             false,
             false,
+            false,
             None,
             Vec::new(),
         )
@@ -506,10 +532,48 @@ mod tests {
             Vec::new(),
             false,
             false,
+            false,
             None,
             Vec::new(),
         )
         .expect("non-empty task_id must succeed");
         assert_eq!(ok.task_id, "stable-id");
+    }
+
+    #[test]
+    fn py_taskinfo_is_secondary_affine_maps_to_kind() {
+        // #497: the consumer-boundary `is_secondary_affine` bool maps to the
+        // first-class `TaskKind::SecondaryAffine` at the SINGLE kind-selector
+        // site, and the two kind bools are mutually exclusive (a task is at
+        // most one kind).
+
+        // `is_secondary_affine = True` ⇒ SecondaryAffine.
+        let mut py = sample_pytask(Vec::new());
+        py.is_secondary_affine = true;
+        let rust: TaskInfo<RunnerIdentifier> = TaskInfo::from(&py);
+        assert_eq!(rust.kind, dynrunner_core::TaskKind::SecondaryAffine);
+        // Round-trip-back faithfully reflects the kind on both bools.
+        let py_back: PyTaskInfo = PyTaskInfo::from(&rust);
+        assert!(py_back.is_secondary_affine);
+        assert!(!py_back.is_setup);
+
+        // `is_secondary_affine` wins over `is_setup` (mutually exclusive — the
+        // affine gate is selected first).
+        let mut py_both = sample_pytask(Vec::new());
+        py_both.is_secondary_affine = true;
+        py_both.is_setup = true;
+        let rust_both: TaskInfo<RunnerIdentifier> = TaskInfo::from(&py_both);
+        assert_eq!(rust_both.kind, dynrunner_core::TaskKind::SecondaryAffine);
+
+        // Only `is_setup` ⇒ Setup (unchanged).
+        let mut py_setup = sample_pytask(Vec::new());
+        py_setup.is_setup = true;
+        let rust_setup: TaskInfo<RunnerIdentifier> = TaskInfo::from(&py_setup);
+        assert_eq!(rust_setup.kind, dynrunner_core::TaskKind::Setup);
+
+        // Both false ⇒ ordinary Work.
+        let py_work = sample_pytask(Vec::new());
+        let rust_work: TaskInfo<RunnerIdentifier> = TaskInfo::from(&py_work);
+        assert_eq!(rust_work.kind, dynrunner_core::TaskKind::Work);
     }
 }

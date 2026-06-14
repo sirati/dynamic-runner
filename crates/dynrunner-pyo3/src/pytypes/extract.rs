@@ -57,8 +57,10 @@ pub(crate) fn task_to_pytask<I: Identifier>(task: &TaskInfo<I>) -> PyTaskInfo {
         // does not live on `TaskInfo<I>`, so the Rust→Python projection
         // reconstitutes the default.
         skipped_already_done: false,
-        // `kind` IS on `TaskInfo<I>`, so the projection reflects it.
+        // `kind` IS on `TaskInfo<I>`, so the projection reflects it on both
+        // mutually-exclusive kind bools.
         is_setup: task.kind.is_setup(),
+        is_secondary_affine: task.kind.is_secondary_affine(),
         // `setup_affinity` IS on `TaskInfo<I>`, so the projection reflects it.
         setup_affinity: task.setup_affinity.clone(),
         // `required_files` IS on `TaskInfo<I>` (#336 P2), so the projection
@@ -353,20 +355,26 @@ pub(crate) fn extract_binaries(
                 .and_then(|v| v.extract::<bool>().ok())
                 .unwrap_or(false);
 
-            // Optional `is_setup` marker — the consumer-boundary surface of
-            // the first-class `TaskKind`. Missing attribute or a non-bool
-            // value collapses to `false` ⇒ `TaskKind::Work` (back-compat: a
-            // producer that predates the marker yields ordinary worker
-            // tasks). `True` ⇒ `TaskKind::Setup`, declaring the task a
-            // framework setup primitive REGARDLESS of any CLI flag (the
-            // primitive is unconditional). This is the SINGLE point the
-            // Python `is_setup` bool maps to the Rust `TaskKind`.
-            let kind = if item
-                .getattr("is_setup")
-                .ok()
-                .and_then(|v| v.extract::<bool>().ok())
-                .unwrap_or(false)
-            {
+            // Optional kind markers — the consumer-boundary surface of the
+            // first-class `TaskKind`. Each missing attribute or non-bool value
+            // collapses to `false` (back-compat: a producer that predates the
+            // markers yields ordinary worker tasks). `is_secondary_affine =
+            // True` ⇒ `TaskKind::SecondaryAffine` (#497, the per-secondary
+            // import GATE); else `is_setup = True` ⇒ `TaskKind::Setup` (a
+            // framework setup primitive); else `TaskKind::Work`. Both
+            // primitives are declared REGARDLESS of any CLI flag (unconditional).
+            // This is the SINGLE point (on this boundary) the Python kind bools
+            // map to the Rust `TaskKind`; `is_secondary_affine` wins over
+            // `is_setup` (a task is at most one kind).
+            let getattr_bool = |name: &str| -> bool {
+                item.getattr(name)
+                    .ok()
+                    .and_then(|v| v.extract::<bool>().ok())
+                    .unwrap_or(false)
+            };
+            let kind = if getattr_bool("is_secondary_affine") {
+                dynrunner_core::TaskKind::SecondaryAffine
+            } else if getattr_bool("is_setup") {
                 dynrunner_core::TaskKind::Setup
             } else {
                 dynrunner_core::TaskKind::Work
