@@ -27,6 +27,7 @@ from ._base import Scenario, ScenarioPlan, ScenarioResult
 # on the order — each scenario is self-contained.
 _SCENARIO_NAMES: tuple[str, ...] = (
     "phase-deps",
+    "important-stdio",
     "task-deps-intra",
     "task-deps-cross",
     "keyed-outputs",
