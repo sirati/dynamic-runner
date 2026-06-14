@@ -1,3 +1,4 @@
+pub mod affine_action;
 pub mod anti_entropy;
 pub mod cluster_state;
 pub(crate) mod collection_stats;
@@ -74,3 +75,6 @@ pub use observer::{
 // Re-export the upload-action port (#336 P1) for the PyO3 binding + consumer
 // wire-up — same one-import-path convenience as `TunnelReconnector`.
 pub use upload_action::{UploadAction, UploadActionHandle, UploadError};
+// Re-export the import-action port (#497 P4) for the PyO3 binding + consumer
+// wire-up — the per-secondary SecondaryAffine import seam.
+pub use affine_action::{ImportAction, ImportActionHandle, ImportError};

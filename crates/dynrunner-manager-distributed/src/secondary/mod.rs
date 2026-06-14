@@ -36,6 +36,7 @@ use crate::zip_extract::ExtractionCache;
 
 use self::lifecycle::{MeshFormation, SecondaryLifecycle};
 
+mod affine_exec;
 pub mod control;
 mod coordinator;
 pub(crate) mod custom_message;
@@ -113,6 +114,66 @@ pub(super) struct PendingFirstBind<I: Identifier> {
     pub(super) file_hash: String,
     pub(super) estimated: dynrunner_core::ResourceMap,
     pub(super) predecessor_outputs: std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>,
+}
+
+/// A work task `B` QUEUED behind this secondary's local SecondaryAffine import
+/// (#497 P4).
+///
+/// When a dispatch assignment for `B` (Phase 5) finds `B` gates on a
+/// SecondaryAffine task `I` whose import is not yet locally done on this node,
+/// the dependent is parked here (in `OperationalState::affine_running[I]`)
+/// until the single per-secondary import for `I` finishes. On the import's
+/// success the executor drains the queued dependents and emits one
+/// `LocalDependencyReleased` per dependent (→ the primary originates
+/// `TaskAssigned` → `B` `InFlight`); on failure it emits one `TaskFailed` per
+/// dependent (re-routable per #495).
+///
+/// Carries EVERYTHING the assignment release (the router's `assign_task`)
+/// needs, mirroring [`PendingFirstBind`]: the resolved [`TaskInfo`] for `B`,
+/// its wire-side `work_hash` (the `active_tasks` key + the release/queue wire
+/// frames' `task_hash`), the chosen `worker_id` slot (pinned onto the
+/// originated `TaskAssigned`), the scheduler's `estimated` usage, and the
+/// `predecessor_outputs` forwarded verbatim so the dependent worker observes
+/// the same shape a non-gated assignment would have produced.
+#[derive(Debug, Clone)]
+pub(super) struct PendingAffineDependent<I: Identifier> {
+    pub(super) work_hash: String,
+    pub(super) worker_id: dynrunner_core::WorkerId,
+    // The resolved binary + scheduler estimate + predecessor outputs are
+    // forwarded VERBATIM to the router's `assign_task` on release in Phase 5
+    // (#497 P5 consumes them when the import completes — same "carries
+    // everything assign_task needs" contract as `PendingFirstBind`). Phase 4
+    // populates + queues them; the release path that READS them is wired in
+    // Phase 5.
+    #[allow(dead_code)]
+    pub(super) binary: TaskInfo<I>,
+    #[allow(dead_code)]
+    pub(super) estimated: dynrunner_core::ResourceMap,
+    #[allow(dead_code)]
+    pub(super) predecessor_outputs: std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>,
+}
+
+/// Outcome of [`SecondaryCoordinator::ensure_affine_import`] (#497 P4) — what
+/// the dispatch router (Phase 5) does with the work task `B` after gating it
+/// on its SecondaryAffine dependency `I`.
+///
+/// The three outcomes are mutually exclusive by construction (the node-local
+/// `affine_done` / `affine_running` sets partition the affine hash into
+/// done / in-flight / not-yet-seen):
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AffineGateOutcome {
+    /// `I` is already locally imported (`affine_hash ∈ affine_done`): the
+    /// caller releases `B` STRAIGHT to `InFlight` — no queue, no import, no
+    /// `QueuedAfterLocalDependency` report.
+    AlreadyDone,
+    /// `I`'s import is already in flight (`affine_hash ∈ affine_running`):
+    /// `B` was APPENDED to the existing queue and reported
+    /// `QueuedAfterLocalDependency`; NO second import was started. `B`
+    /// releases when the single in-flight import finishes.
+    QueuedBehindRun,
+    /// `B` is the FIRST dependent on `I`: it inserted the queue, reported
+    /// `QueuedAfterLocalDependency`, and EXACTLY ONE import run was spawned.
+    StartedRun,
 }
 
 /// The secondary coordinator: connects to primary, manages local workers.
@@ -415,6 +476,17 @@ where
     /// Set before `run` via [`Self::set_upload_action`]. See
     /// [`crate::upload_action`].
     pub(super) upload_action: crate::upload_action::UploadActionHandle,
+
+    /// The import-action port for SecondaryAffine per-secondary IMPORTS (#497
+    /// P4). Consulted by this secondary's run-once affine executor
+    /// ([`affine_exec`]) when an assigned work task gates on a SecondaryAffine
+    /// dependency whose import is not yet locally done on THIS node. `None` on
+    /// a secondary whose work tasks never gate on an import; a registered
+    /// importer runs the per-secondary import AT MOST ONCE per affine hash,
+    /// gating ALL that node's workers' dependent tasks behind the single run.
+    /// Set before `run` via [`Self::set_import_action`]. See
+    /// [`crate::affine_action`].
+    pub(super) import_action: crate::affine_action::ImportActionHandle<I>,
 
     /// Handle to the task-completion dispatcher task. Mirrors
     /// `lifecycle_dispatcher_handle` — same Drop-vs-explicit cleanup

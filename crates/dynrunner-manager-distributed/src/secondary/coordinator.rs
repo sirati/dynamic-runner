@@ -165,6 +165,7 @@ where
             task_completed_rx: Some(task_completed_rx),
             task_completed_listeners: Vec::new(),
             upload_action: None,
+            import_action: None,
             task_completed_dispatcher_handle: None,
             worker_message_tx,
             worker_message_rx: Some(worker_message_rx),
@@ -484,6 +485,19 @@ where
         action: std::sync::Arc<dyn crate::upload_action::UploadAction>,
     ) {
         self.upload_action = Some(action);
+    }
+
+    /// Wire the import-action port (#497 P4) this secondary's run-once affine
+    /// executor uses to perform an assigned work task's gating SecondaryAffine
+    /// import. Set before `run`. Absence leaves the executor with no importer
+    /// — a work task that gates on a SecondaryAffine import then fails as a
+    /// wiring error (a work task with no affine dependency runs unchanged).
+    /// See [`crate::affine_action`].
+    pub fn set_import_action(
+        &mut self,
+        action: std::sync::Arc<dyn crate::affine_action::ImportAction<I>>,
+    ) {
+        self.import_action = Some(action);
     }
 
     /// Register a [`crate::worker_messages::WorkerMessageListener`]

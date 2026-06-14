@@ -326,6 +326,27 @@ pub(in crate::secondary) struct OperationalState<M: ManagerEndpoint, I: Identifi
     /// Tasks deferred because the target worker's per-type subprocess is
     /// mid-respawn (respawn-HOLD, #58). Keyed by `WorkerId`.
     pub(in crate::secondary) pending_first_bind: HashMap<WorkerId, PendingFirstBind<I>>,
+
+    /// NODE-LOCAL SecondaryAffine import tracking (#497 P4) — NOT CRDT.
+    /// SecondaryAffine hashes whose per-secondary import has COMPLETED on this
+    /// node. Keyed by the affine task's content hash. A work task gating on a
+    /// hash IN this set runs straight to `InFlight` (no queue); the set is the
+    /// run-once latch that survives every later dependent on the same import.
+    /// Lives in `Operational` (where the dispatch router runs) — a fresh
+    /// `Operational` session starts empty because the in-process import is
+    /// node-LOCAL to the running process, not replicated.
+    pub(in crate::secondary) affine_done: std::collections::HashSet<String>,
+
+    /// NODE-LOCAL SecondaryAffine import tracking (#497 P4) — NOT CRDT.
+    /// SecondaryAffine hashes whose per-secondary import is IN FLIGHT, mapped
+    /// to the work-task dependents queued behind that single run. The PRESENCE
+    /// of a hash key IS the run-once notify: the first dependent inserts the
+    /// vec and spawns exactly one import; the 2nd..Nth APPEND to the vec and
+    /// start NO second import; the import's completion drains the vec (one
+    /// release / failure per queued dependent) and clears the key. Keyed by
+    /// the affine task's content hash.
+    pub(in crate::secondary) affine_running:
+        HashMap<String, Vec<super::PendingAffineDependent<I>>>,
 }
 
 /// Peer-mesh formation progress — the orthogonal sub-concern.
@@ -608,6 +629,11 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
                     pending_peer_messages,
                     pending_worker_restarts,
                     pending_first_bind,
+                    // SecondaryAffine import tracking is node-LOCAL to this
+                    // running session; a freshly Operational secondary has
+                    // imported nothing yet (#497 P4).
+                    affine_done: std::collections::HashSet::new(),
+                    affine_running: HashMap::new(),
                 }));
                 (next, latches)
             }
@@ -645,6 +671,11 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
             pending_peer_messages: Vec::new(),
             pending_worker_restarts: HashMap::new(),
             pending_first_bind: HashMap::new(),
+            // An observer runs no workers and dispatches no work tasks, so it
+            // never gates on a SecondaryAffine import — but the fields exist
+            // on every Operational state, so start them empty (#497 P4).
+            affine_done: std::collections::HashSet::new(),
+            affine_running: HashMap::new(),
         }));
         (state, latches)
     }
