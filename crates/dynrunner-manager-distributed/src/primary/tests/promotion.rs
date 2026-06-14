@@ -277,7 +277,13 @@ async fn mid_run_failover_dispatches_all_inherited_pending() {
             // reconciliation-probe denial — far beyond this deadline.
             let outcome = tokio::time::timeout(
                 Duration::from_secs(60),
-                promoted.run_consuming(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope),
+                promoted.run_consuming(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                ),
             )
             .await
             .expect(
@@ -428,7 +434,13 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
                 // away, never running the dispatch loop this test asserts).
                 seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
+                    .run(
+                        SeedSource::PromotionSnapshot {
+                            kind: crate::process::BootstrapKind::Failover,
+                        },
+                        ops,
+                        ope,
+                    )
                     .await
                     .unwrap();
                 primary.completed_count()
@@ -800,7 +812,13 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
             // never running the dispatch loop this test asserts).
             seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
+                .run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                )
                 .await
                 .unwrap();
 
@@ -1015,8 +1033,9 @@ async fn promoted_inflight_reserves_per_type_slot_for_symmetric_release() {
                 });
             }
 
-            promoted.hydrate_from_cluster_state()
-        .expect("test fixture: composed task graph is valid");
+            promoted
+                .hydrate_from_cluster_state()
+                .expect("test fixture: composed task graph is valid");
 
             // The inherited InFlight task reserved its type slot — symmetric
             // with the live `commit_assignment` path.
@@ -1113,7 +1132,8 @@ fn promoted_hydrate_rebuilds_all_binaries_candidate_source() {
         "all_binaries starts empty before hydrate"
     );
 
-    promoted.hydrate_from_cluster_state()
+    promoted
+        .hydrate_from_cluster_state()
         .expect("test fixture: composed task graph is valid");
 
     // The candidate universe spans EVERY ledger entry (4 tasks across
@@ -1166,7 +1186,8 @@ fn promoted_hydrate_advances_next_secondary_id_past_roster_max() {
         }
     }
 
-    promoted.hydrate_from_cluster_state()
+    promoted
+        .hydrate_from_cluster_state()
         .expect("test fixture: composed task graph is valid");
 
     // The next mint must exceed the highest known id (secondary-5 → 6),
@@ -1277,8 +1298,9 @@ async fn cold_seed_hydrate_leaves_phase_started_emitted_empty() {
             primary
                 .originate_cold_seed(vec![(a, false), (b, false)], HashMap::new())
                 .expect("cold seed");
-            primary.hydrate_from_cluster_state()
-        .expect("test fixture: composed task graph is valid");
+            primary
+                .hydrate_from_cluster_state()
+                .expect("test fixture: composed task graph is valid");
 
             assert!(
                 primary.phase_started_emitted.is_empty(),
@@ -1346,7 +1368,8 @@ fn hydrate_does_not_seed_blocked_only_phase_as_started() {
             task: st,
         });
     }
-    primary.hydrate_from_cluster_state()
+    primary
+        .hydrate_from_cluster_state()
         .expect("test fixture: composed task graph is valid");
 
     assert!(
@@ -1461,7 +1484,13 @@ async fn promoted_run_does_not_refire_on_phase_start_for_inherited_started_phase
             let ope: OnPhaseEnd = Box::new(|_, _, _, _| {});
 
             let outcome = promoted
-                .run_consuming(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
+                .run_consuming(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                )
                 .await
                 .expect("promoted run must not error");
             assert!(
@@ -1529,7 +1558,8 @@ fn promoted_hydrate_advances_next_secondary_id_past_ledgered_respawn() {
         );
     }
 
-    promoted.hydrate_from_cluster_state()
+    promoted
+        .hydrate_from_cluster_state()
         .expect("test fixture: composed task graph is valid");
 
     // The next mint must exceed the highest id ACROSS BOTH the capacity
@@ -1973,7 +2003,13 @@ async fn promoted_inherited_failed_not_double_counted_against_pending() {
 
             let (_deps, ops, ope) = noop_phase_args();
             let outcome = promoted
-                .run_consuming(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
+                .run_consuming(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                )
                 .await
                 .expect("promoted run must not error");
 
@@ -2047,10 +2083,12 @@ async fn promoted_mesh_ready_expected_excludes_self_and_departed_primary() {
                 FixedEstimator(100),
             );
 
-            let mem8 = || vec![dynrunner_core::ResourceAmount {
-                kind: dynrunner_core::ResourceKind::memory(),
-                amount: 8 * 1024 * 1024 * 1024,
-            }];
+            let mem8 = || {
+                vec![dynrunner_core::ResourceAmount {
+                    kind: dynrunner_core::ResourceKind::memory(),
+                    amount: 8 * 1024 * 1024 * 1024,
+                }]
+            };
             {
                 let cs = primary.cluster_state_mut_for_test();
                 // SELF (secondary-1): alive worker-secondary — must be
@@ -2099,8 +2137,7 @@ async fn promoted_mesh_ready_expected_excludes_self_and_departed_primary() {
                 });
                 cs.apply(ClusterMutation::PeerRemoved {
                     id: "secondary-0".into(),
-                    cause:
-                        dynrunner_protocol_primary_secondary::RemovalCause::KeepaliveMiss,
+                    cause: dynrunner_protocol_primary_secondary::RemovalCause::KeepaliveMiss,
                     member_gen: 0,
                 });
             }

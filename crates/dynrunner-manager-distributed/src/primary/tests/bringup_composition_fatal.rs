@@ -260,7 +260,13 @@ async fn primary_logs_error_exit_on_composition_fatal() {
             let (deps, ops, ope) = noop_phase_args();
             let _ = deps;
             let err = primary
-                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
+                .run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                )
                 .await
                 .expect_err("the inherited dup-task_id ledger must abort the run");
             assert!(
@@ -320,7 +326,13 @@ async fn primary_logs_clean_exit_on_success() {
             let (_deps, ops, ope) = noop_phase_args();
             let outcome = tokio::time::timeout(
                 Duration::from_secs(10),
-                primary.run_consuming(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope),
+                primary.run_consuming(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                ),
             )
             .await
             .expect("the empty PromotionSnapshot run must complete promptly");

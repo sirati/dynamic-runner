@@ -47,7 +47,13 @@ async fn stranded_count_is_zero_on_clean_run() {
             // never running the dispatch loop this test asserts).
             seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
+                .run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                )
                 .await
                 .unwrap();
 
@@ -350,7 +356,13 @@ async fn stranded_on_cluster_collapse_returns_err_with_counts() {
             // gap fires (see the IGNORED-doc above).
             seed_operational_ledger(&mut primary, binaries, deps);
             let outcome = primary
-                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
+                .run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                )
                 .await;
 
             // CORRECT expectation (un-ignore once the root-cause fix lands):
@@ -466,7 +478,13 @@ async fn strand_broadcasts_run_aborted_not_run_complete() {
             // never reaching the strand/complete behaviour this test asserts).
             seed_operational_ledger(&mut primary, binaries, deps);
             let outcome = primary
-                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
+                .run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                )
                 .await;
 
             // Local return is the unchanged ClusterCollapsed.
@@ -570,7 +588,13 @@ async fn stranded_at_transfer_complete_window_returns_err_with_counts() {
             // transfer-complete window → the sibling-send collapse gate fires.
             seed_operational_ledger(&mut primary, binaries, deps);
             let outcome = primary
-                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
+                .run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                )
                 .await;
 
             match outcome {
@@ -716,7 +740,15 @@ async fn stranded_after_owed_discovery_collapse_returns_err_not_run_complete() {
             // Operational primary on the Owed/discovery seed path:
             // `PromotionSnapshot` ⇒ `BootstrapRole::PromotedDestination`, which
             // runs `discover_on_promotion` then the in-place tail.
-            let outcome = primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope).await;
+            let outcome = primary
+                .run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                )
+                .await;
 
             assert_eq!(
                 fires.load(std::sync::atomic::Ordering::Relaxed),
@@ -822,7 +854,13 @@ async fn clean_run_broadcasts_run_complete_not_aborted() {
             // never reaching the strand/complete behaviour this test asserts).
             seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
+                .run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                )
                 .await
                 .expect("clean run must return Ok");
 
@@ -1097,7 +1135,13 @@ async fn clean_run_does_not_false_positive_stranded() {
             // never reaching the strand/complete behaviour this test asserts).
             seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope)
+                .run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                )
                 .await
                 .expect("clean multi-secondary run must return Ok");
 

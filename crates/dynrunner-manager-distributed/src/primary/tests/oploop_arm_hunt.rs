@@ -255,9 +255,7 @@ struct PrimaryDriveOutcome {
 async fn drive_promoted_primary_over_quic(
     primary_net: PeerNetwork<TestId>,
     config: PrimaryConfig,
-    seed: impl FnOnce(
-        &mut PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
-    ),
+    seed: impl FnOnce(&mut PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>),
     timeout: StdDuration,
 ) -> PrimaryDriveOutcome {
     let mut mesh = Mesh::new(primary_net);
@@ -291,7 +289,9 @@ async fn drive_promoted_primary_over_quic(
     {
         // Drive the REAL operational select! via `run(PromotionSnapshot)`.
         let run = primary.run(
-            crate::process::SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover },
+            crate::process::SeedSource::PromotionSnapshot {
+                kind: crate::process::BootstrapKind::Failover,
+            },
             Box::new(|_| {}),
             Box::new(|_, _, _, _| {}),
         );
@@ -355,7 +355,8 @@ async fn arm_hunt_remote_completion_burst_over_quic() {
             )
             .await;
             assert_eq!(
-                outcome.completed, ARM_HUNT_TASKS,
+                outcome.completed,
+                ARM_HUNT_TASKS,
                 "WEDGE: the real operational loop ingested only {}/{} completions \
                  (timed_out={}). Arm snapshot at the wedge: [{}] — the dominant \
                  non-inbox arm + last_arm names the hot-looping arm; since_inbox \
@@ -363,7 +364,10 @@ async fn arm_hunt_remote_completion_burst_over_quic() {
                 outcome.completed,
                 ARM_HUNT_TASKS,
                 outcome.timed_out,
-                outcome.arm_snapshot.as_deref().unwrap_or("<run resolved; no snapshot>"),
+                outcome
+                    .arm_snapshot
+                    .as_deref()
+                    .unwrap_or("<run resolved; no snapshot>"),
             );
         })
         .await;
@@ -393,13 +397,17 @@ async fn arm_hunt_payload_burst_over_quic() {
             )
             .await;
             assert_eq!(
-                outcome.completed, ARM_HUNT_PAYLOAD_TASKS,
+                outcome.completed,
+                ARM_HUNT_PAYLOAD_TASKS,
                 "WEDGE: the real operational loop ingested only {}/{} payload-bearing \
                  completions (timed_out={}). Arm snapshot at the wedge: [{}]",
                 outcome.completed,
                 ARM_HUNT_PAYLOAD_TASKS,
                 outcome.timed_out,
-                outcome.arm_snapshot.as_deref().unwrap_or("<run resolved; no snapshot>"),
+                outcome
+                    .arm_snapshot
+                    .as_deref()
+                    .unwrap_or("<run resolved; no snapshot>"),
             );
         })
         .await;
@@ -427,8 +435,7 @@ async fn arm_hunt_discovery_settle_races_burst_over_quic() {
         .run_until(async {
             let remote = ARM_HUNT_REMOTE_SECONDARIES;
             let tasks = ARM_HUNT_TASKS;
-            let (primary_net, remote_handles) =
-                stand_up_burst_fleet(remote, tasks, 0).await;
+            let (primary_net, remote_handles) = stand_up_burst_fleet(remote, tasks, 0).await;
 
             // Discovered corpus + the Owed seed: an empty ledger that owes
             // discovery, the policy yielding the `tasks` binaries on its one
@@ -456,14 +463,10 @@ async fn arm_hunt_discovery_settle_races_burst_over_quic() {
                     // exactly as the relocated/pre-staged recipe does. The
                     // operational `run` then fires `discover_on_promotion` in
                     // its pre-loop while the burst is already inbound.
-                    primary.register_setup_discovery(fixed_discovery(
-                        binaries,
-                        HashMap::new(),
-                        fc,
-                    ));
-                    primary.cluster_state_mut_for_test().apply(
-                        ClusterMutation::DiscoveryDebtDeclared,
-                    );
+                    primary.register_setup_discovery(fixed_discovery(binaries, HashMap::new(), fc));
+                    primary
+                        .cluster_state_mut_for_test()
+                        .apply(ClusterMutation::DiscoveryDebtDeclared);
                 },
                 StdDuration::from_secs(45),
             )
@@ -476,13 +479,17 @@ async fn arm_hunt_discovery_settle_races_burst_over_quic() {
                  (the discover_on_promotion pre-loop path)",
             );
             assert_eq!(
-                outcome.completed, tasks,
+                outcome.completed,
+                tasks,
                 "WEDGE (discovery-settle races burst): ingested only {}/{} \
                  completions (timed_out={}). Arm snapshot at the wedge: [{}]",
                 outcome.completed,
                 tasks,
                 outcome.timed_out,
-                outcome.arm_snapshot.as_deref().unwrap_or("<run resolved; no snapshot>"),
+                outcome
+                    .arm_snapshot
+                    .as_deref()
+                    .unwrap_or("<run resolved; no snapshot>"),
             );
 
             drain_remote_handles(remote_handles).await;
@@ -666,7 +673,10 @@ struct GhostFixture {
 /// `InFlight` on the never-connected `ghost-sec` — an inherited assignment
 /// whose terminal never arrives, so the operational loop provably stays alive
 /// for the test's whole observation window (`run_complete_check` cannot trip).
-fn ghost_fixture(binaries: Vec<TaskInfo<TestId>>, ghost_in_flight: Option<TaskInfo<TestId>>) -> GhostFixture {
+fn ghost_fixture(
+    binaries: Vec<TaskInfo<TestId>>,
+    ghost_in_flight: Option<TaskInfo<TestId>>,
+) -> GhostFixture {
     let max_res = dynrunner_core::ResourceMap::from([(
         dynrunner_core::ResourceKind::memory(),
         1024 * 1024 * 1024u64,
@@ -691,8 +701,7 @@ fn ghost_fixture(binaries: Vec<TaskInfo<TestId>>, ghost_in_flight: Option<TaskIn
         });
     }
 
-    let transport =
-        ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
+    let transport = ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
     let config = PrimaryConfig {
         connect_timeout: Duration::from_secs(10),
         peer_timeout: Duration::from_secs(10),
@@ -769,8 +778,7 @@ fn probe_burst_fixture(ledger_size: usize) -> GhostFixture {
         });
     }
 
-    let transport =
-        ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
+    let transport = ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
     let config = PrimaryConfig {
         connect_timeout: Duration::from_secs(10),
         peer_timeout: Duration::from_secs(10),
@@ -891,7 +899,13 @@ async fn probe_herd_over_large_ledger_does_not_stall_oploop() {
             let window = StdDuration::from_millis(3500);
             {
                 let (_deps, ops, ope) = noop_phase_args();
-                let run = primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope);
+                let run = primary.run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                );
                 tokio::pin!(run);
                 let _ = tokio::time::timeout(window, &mut run).await;
             }
@@ -966,7 +980,13 @@ async fn ghost_task_request_must_not_self_relay_spin() {
 
             {
                 let (_deps, ops, ope) = noop_phase_args();
-                let run = primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope);
+                let run = primary.run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                );
                 tokio::pin!(run);
                 // The ghost in-flight task never completes, so the run cannot
                 // resolve: the timeout is the observation window, after which
@@ -1042,7 +1062,13 @@ async fn completion_burst_survives_unassignable_request_storm() {
             let (_deps, ops, ope) = noop_phase_args();
             let result = tokio::time::timeout(
                 StdDuration::from_secs(20),
-                primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope),
+                primary.run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                ),
             )
             .await;
 
@@ -1167,7 +1193,13 @@ async fn inbox_closed_mid_run_breaks_loop_no_zombie_no_spin() {
             let (_deps, ops, ope) = noop_phase_args();
             let result = tokio::time::timeout(
                 StdDuration::from_secs(10),
-                primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope),
+                primary.run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                ),
             )
             .await;
 
@@ -1281,7 +1313,13 @@ async fn respawn_arm_parks_through_membership_join_churn() {
 
             {
                 let (_deps, ops, ope) = noop_phase_args();
-                let run = primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, ops, ope);
+                let run = primary.run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                );
                 tokio::pin!(run);
                 let _ = tokio::time::timeout(StdDuration::from_secs(5), &mut run).await;
             }
@@ -1297,4 +1335,3 @@ async fn respawn_arm_parks_through_membership_join_churn() {
         })
         .await;
 }
-

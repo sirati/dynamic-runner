@@ -9,8 +9,8 @@
 
 use super::*;
 
-use crate::primary::wire::compute_task_hash;
 use crate::primary::StagingStrategy;
+use crate::primary::wire::compute_task_hash;
 
 /// The synthetic stage-task id the framework staging derives for a work task
 /// — mirrors `setup_staging::STAGE_TASK_ID_PREFIX`. The hash is recomputed
@@ -117,11 +117,7 @@ fn flag_on_seeds_setup_completed_and_dependent_is_dispatchable() {
     // And it is DISPATCHABLE: the pool's queued view holds it, and nothing is
     // blocked. A setup task is never worker-dispatchable, so the pool's queued
     // view holds EXACTLY the one work task.
-    let queued: Vec<String> = primary
-        .pool()
-        .iter()
-        .map(|t| t.task_id.clone())
-        .collect();
+    let queued: Vec<String> = primary.pool().iter().map(|t| t.task_id.clone()).collect();
     assert_eq!(
         queued,
         vec!["staged-work".to_string()],
@@ -200,7 +196,11 @@ fn relocated_primary_reads_ledger_and_dep_is_satisfied() {
         vec!["relocated-work".to_string()],
         "the promoted primary's pool holds the dispatchable work task; got {queued:?}"
     );
-    assert_eq!(promoted.pool().blocked_len(), 0, "nothing blocked post-relocate");
+    assert_eq!(
+        promoted.pool().blocked_len(),
+        0,
+        "nothing blocked post-relocate"
+    );
 }
 
 /// Flag ON via the mode-2 discovery originator (`discover_on_promotion`): the
@@ -238,7 +238,11 @@ async fn flag_on_discovery_path_seeds_setup_completed_and_dependent_dispatchable
                 .discover_on_promotion()
                 .await
                 .expect("discovery seam with flagged staging");
-            assert_eq!(fire.load(std::sync::atomic::Ordering::Relaxed), 1, "discovery policy fired once");
+            assert_eq!(
+                fire.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "discovery policy fired once"
+            );
 
             let cs = primary.cluster_state_for_test();
             assert_eq!(
@@ -259,8 +263,7 @@ async fn flag_on_discovery_path_seeds_setup_completed_and_dependent_dispatchable
                 "the discovered work task is dispatchable (dep satisfied); got {:?}",
                 cs.task_state(&work_hash)
             );
-            let queued: Vec<String> =
-                primary.pool().iter().map(|t| t.task_id.clone()).collect();
+            let queued: Vec<String> = primary.pool().iter().map(|t| t.task_id.clone()).collect();
             assert_eq!(queued, vec!["discovered-work".to_string()]);
             assert_eq!(primary.pool().blocked_len(), 0);
         })
@@ -300,7 +303,8 @@ fn flag_off_old_path_is_unchanged() {
         "flag off: no setup task is injected — only the work task is seeded"
     );
     assert!(
-        cs.tasks_iter().all(|(_, s)| s.task().kind.is_worker_assignable()),
+        cs.tasks_iter()
+            .all(|(_, s)| s.task().kind.is_worker_assignable()),
         "flag off: no Setup-kind task exists in the ledger"
     );
     // No SetupCompleted state anywhere.
@@ -406,11 +410,7 @@ fn required_files_seed_uploads_pending_and_work_blocked_until_completed() {
         1,
         "the work task is BLOCKED until its uploads complete"
     );
-    let queued_before: Vec<String> = primary
-        .pool()
-        .iter()
-        .map(|t| t.task_id.clone())
-        .collect();
+    let queued_before: Vec<String> = primary.pool().iter().map(|t| t.task_id.clone()).collect();
     assert!(
         !queued_before.contains(&"build-task".to_string()),
         "the work task is NOT dispatchable before its uploads complete; got {queued_before:?}"
@@ -439,11 +439,7 @@ fn required_files_seed_uploads_pending_and_work_blocked_until_completed() {
         "after both uploads complete, the work task is Pending/dispatchable; got {:?}",
         cs.task_state(&work_hash)
     );
-    let queued_after: Vec<String> = primary
-        .pool()
-        .iter()
-        .map(|t| t.task_id.clone())
-        .collect();
+    let queued_after: Vec<String> = primary.pool().iter().map(|t| t.task_id.clone()).collect();
     assert_eq!(
         queued_after,
         vec!["build-task".to_string()],
@@ -477,10 +473,7 @@ fn required_files_dedup_one_upload_shared_by_all_sharers() {
     let b3 = work_with_required_files("b3", &["/tc/common"]);
 
     primary
-        .originate_cold_seed(
-            vec![(b1, false), (b2, false), (b3, false)],
-            HashMap::new(),
-        )
+        .originate_cold_seed(vec![(b1, false), (b2, false), (b3, false)], HashMap::new())
         .expect("P2 dedup cold seed");
     primary
         .hydrate_from_cluster_state()
@@ -506,8 +499,7 @@ fn required_files_dedup_one_upload_shared_by_all_sharers() {
     let common_upload_id = uploads
         .iter()
         .find(|t| {
-            t.upload_file.as_ref().unwrap().source.as_path()
-                == std::path::Path::new("/tc/common")
+            t.upload_file.as_ref().unwrap().source.as_path() == std::path::Path::new("/tc/common")
         })
         .expect("a /tc/common upload task")
         .task_id

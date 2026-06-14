@@ -65,7 +65,10 @@ fn assert_gate_resolved_and_build_dispatchable(
 ) {
     let cs = primary.cluster_state_for_test();
     assert!(
-        matches!(cs.task_state(gate_hash), Some(TaskState::AffineReady { .. })),
+        matches!(
+            cs.task_state(gate_hash),
+            Some(TaskState::AffineReady { .. })
+        ),
         "the seeded no-dep SecondaryAffine gate must resolve to AffineReady on \
          the primary's own originate path (pre-fix it stays Pending forever); \
          got {:?}",
@@ -227,7 +230,11 @@ async fn discover_on_promotion_originate_resolves_gate_and_build_is_dispatchable
                 .discover_on_promotion()
                 .await
                 .expect("discovery originate seam");
-            assert_eq!(fire.load(std::sync::atomic::Ordering::Relaxed), 1, "discovery policy fired once");
+            assert_eq!(
+                fire.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "discovery policy fired once"
+            );
 
             assert_gate_resolved_and_build_dispatchable(&primary, &gate_hash, &build_hash);
         })

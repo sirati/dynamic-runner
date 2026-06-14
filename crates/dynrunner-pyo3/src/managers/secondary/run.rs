@@ -290,13 +290,13 @@ impl PySecondaryCoordinator {
         // (`set_phase_hook_raise_latch` in the recipe) so the phase cascade
         // surfaces the raise as a non-zero `FatalPolicyExit` on the relocated
         // primary (mirrors the submitter `primary/run.rs`).
-        let sec_phase_hook_raise_latch =
-            dynrunner_manager_distributed::PhaseHookRaiseLatch::new();
-        let sec_on_phase_end: crate::managers::lifecycle::OnPhaseEnd =
-            Box::new(crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
+        let sec_phase_hook_raise_latch = dynrunner_manager_distributed::PhaseHookRaiseLatch::new();
+        let sec_on_phase_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
+            crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
                 self.task_definition_py.clone_ref(py),
                 sec_phase_hook_raise_latch.clone(),
-            ));
+            ),
+        );
 
         // Errors produced inside the async block — including
         // `task.discover_items` raising in setup-promote — must surface
@@ -1065,8 +1065,12 @@ impl PySecondaryCoordinator {
 /// recipe-input field stays a single named type rather than an inline nested
 /// tuple-of-channels.
 pub(crate) type PromotedCommandChannel = (
-    tokio::sync::mpsc::Sender<dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>>,
-    tokio::sync::mpsc::Receiver<dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>>,
+    tokio::sync::mpsc::Sender<
+        dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>,
+    >,
+    tokio::sync::mpsc::Receiver<
+        dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>,
+    >,
 );
 
 /// Shared take-once cell carrying the process's ONE Python `PrimaryHandle`
@@ -1263,8 +1267,7 @@ pub(crate) struct PromotedPrimaryRecipeInputs {
     /// a discovery policy (the in-process COLD path, where the corpus was
     /// cold-seeded and the marker is `Settled`); inert on a non-relocated
     /// promotion (the driver gates on `Owed`).
-    pub setup_discovery:
-        Option<dynrunner_manager_distributed::SetupDiscovery<RunnerIdentifier>>,
+    pub setup_discovery: Option<dynrunner_manager_distributed::SetupDiscovery<RunnerIdentifier>>,
     /// The liveness-beacon ping receiver, from the node-bound
     /// [`dynrunner_manager_distributed::process`]-external
     /// `LivenessListener`. Installed on the promoted primary via
@@ -1273,8 +1276,7 @@ pub(crate) struct PromotedPrimaryRecipeInputs {
     /// (an `mpsc::UnboundedReceiver` is one-owner), captured in an `Option`
     /// and taken on the fire — same single-use discipline as the command
     /// channel + phase callbacks. `None` when no listener was bound.
-    pub liveness_ping_rx:
-        Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    pub liveness_ping_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     /// The node-scoped peer→liveness-address book (a clone of the one the
     /// co-located `SecondaryCoordinator` populated from `PeerInfo`). The
     /// promoted primary reads it to resolve its secondaries' raw beacon
@@ -1284,8 +1286,7 @@ pub(crate) struct PromotedPrimaryRecipeInputs {
     /// Shared (not single-use): the recipe READS it to seed the primary's
     /// `set_peer_liveness_addrs`, leaving the secondary's copy intact.
     /// `None` for callers without a listener (no beacon emitted).
-    pub peer_liveness_addrs:
-        Option<dynrunner_manager_distributed::liveness::PeerLivenessAddrs>,
+    pub peer_liveness_addrs: Option<dynrunner_manager_distributed::liveness::PeerLivenessAddrs>,
     /// The shared arm-stats bridge to the off-runtime runtime-watchdog. The
     /// promoted primary's operational loop publishes its `select!`-arm
     /// accounting here (labelled `"primary"`) so a freeze dump names its hot
@@ -1480,267 +1481,269 @@ pub(crate) fn build_promoted_primary_recipe(
     // `InitialAssignment`-fed cell is irrelevant here (it is at `Default` at
     // promotion — the target receives no `InitialAssignment` before it
     // promotes).
-    Box::new(move |client, inbox, demote_rx, snapshot, settled_base, bootstrap_kind| {
-        // Derive the run-level `pre_staged_mode` from the resolved complete
-        // namespace at the promotion instant (the delivered `forwarded_argv`
-        // has landed — the recipe fires AFTER the post-welcome push). This is
-        // the FIRST resolve on a relocate-target/in-process path (discovery and
-        // on_run_start read the SAME cached namespace afterwards — lazy,
-        // idempotent). A resolve failure (finalize raised / mutex poisoned)
-        // collapses to not-pre-staged: the safe historical default (the
-        // promoted primary RE-STAGES via StageFile records rather than assuming
-        // a bind-mount it cannot confirm). `uses_file_based_items` reads the
-        // run-uniform `task_definition`; only the `source_already_staged` half
-        // of the resolved namespace is consulted.
-        let pre_staged_mode = Python::attach(|py| {
-            run_config
-                .resolve_under_gil(py)
-                .map(|ns| pre_staged_mode_from_namespace(ns.bind(py)))
-                .unwrap_or_else(|e| {
-                    tracing::warn!(
-                        error = %e,
-                        "promoted primary: could not resolve the run-config \
-                         namespace to derive pre_staged_mode; defaulting to \
-                         not-pre-staged (the primary will re-stage via StageFile)"
-                    );
-                    false
-                })
-        });
-        let config = PrimaryConfig {
-            node_id: secondary_id.clone(),
-            keepalive_interval,
-            peer_timeout,
-            keepalive_miss_threshold,
-            retry_max_passes,
-            oom_retry_max_passes,
-            // The DELIVERED node-local run-config, read off the shared handle
-            // at the promotion instant (post-push, so it reflects the value the
-            // primary unicast — not the empty boot seed). Threaded so the
-            // promoted primary re-serves `RequestRunConfig` with the SAME argv
-            // — byte-identical to the original submitter.
-            forwarded_argv: forwarded_argv
+    Box::new(
+        move |client, inbox, demote_rx, snapshot, settled_base, bootstrap_kind| {
+            // Derive the run-level `pre_staged_mode` from the resolved complete
+            // namespace at the promotion instant (the delivered `forwarded_argv`
+            // has landed — the recipe fires AFTER the post-welcome push). This is
+            // the FIRST resolve on a relocate-target/in-process path (discovery and
+            // on_run_start read the SAME cached namespace afterwards — lazy,
+            // idempotent). A resolve failure (finalize raised / mutex poisoned)
+            // collapses to not-pre-staged: the safe historical default (the
+            // promoted primary RE-STAGES via StageFile records rather than assuming
+            // a bind-mount it cannot confirm). `uses_file_based_items` reads the
+            // run-uniform `task_definition`; only the `source_already_staged` half
+            // of the resolved namespace is consulted.
+            let pre_staged_mode = Python::attach(|py| {
+                run_config
+                    .resolve_under_gil(py)
+                    .map(|ns| pre_staged_mode_from_namespace(ns.bind(py)))
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "promoted primary: could not resolve the run-config \
+                             namespace to derive pre_staged_mode; defaulting to \
+                             not-pre-staged (the primary will re-stage via StageFile)"
+                        );
+                        false
+                    })
+            });
+            let config = PrimaryConfig {
+                node_id: secondary_id.clone(),
+                keepalive_interval,
+                peer_timeout,
+                keepalive_miss_threshold,
+                retry_max_passes,
+                oom_retry_max_passes,
+                // The DELIVERED node-local run-config, read off the shared handle
+                // at the promotion instant (post-push, so it reflects the value the
+                // primary unicast — not the empty boot seed). Threaded so the
+                // promoted primary re-serves `RequestRunConfig` with the SAME argv
+                // — byte-identical to the original submitter.
+                forwarded_argv: forwarded_argv
+                    .lock()
+                    .expect("forwarded_argv mutex poisoned")
+                    .clone(),
+                // Carry the run's staging/discovery context so the relocated
+                // primary's dispatch matches the submitter's (the relocate-staging
+                // fix). `uses_file_based_items` and `source_pre_staged_root` feed
+                // `assignment.rs`'s `InitialAssignment` stamps + `wire_local_path`;
+                // `source_dir` feeds `maybe_auto_stage_initial`'s re-walk (the
+                // relocated primary re-stages from scratch). `uses_file_based_items`
+                // is the run-uniform `task_definition` class fact (captured on the
+                // GIL thread); `pre_staged_mode` is derived above from the resolved
+                // COMPLETE namespace (the delivered `--source-already-staged`), NOT
+                // the boot `task_args` — neither reads the `InitialAssignment`-fed
+                // cell (the relocate-target's cell is at `Default` at promotion).
+                // `source_pre_staged_root` (the secondary's OWN bind-mount root) is
+                // consulted only in pre-staged mode — mirror the submitter's
+                // `is_some()` discriminant by gating on `pre_staged_mode`.
+                uses_file_based_items,
+                source_pre_staged_root: if pre_staged_mode {
+                    source_pre_staged_root.clone()
+                } else {
+                    None
+                },
+                source_dir: source_dir.clone(),
+                // Framework file-staging selector (#489 P3/P4): the relocate-target
+                // primary uses the SAME strategy the submitter did. On
+                // `SetupTasks`, this primary's `discover_on_promotion` seeds the
+                // discovered files as per-file pre-succeeded setup tasks — the
+                // #488-free path on the relocate target.
+                staging_strategy,
+                ..PrimaryConfig::default()
+            };
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                client,
+                inbox,
+                demote_rx,
+                // A promotion-built primary: this host won the role on failover /
+                // relocation and IS a compute peer. Its seed is
+                // `SeedSource::PromotionSnapshot` (below) ⇒
+                // `BootstrapRole::PromotedDestination`, so `run_pipeline` runs the
+                // operational loop in place and never relocates again — no
+                // construction-time policy needed; the seed is the discriminator.
+                scheduler_config.build_memory_scheduler(),
+                estimator.clone(),
+            );
+            // Transfer the Python `PrimaryHandle`'s command channel so an
+            // externally-issued `spawn_tasks` / `reinject` (e.g. from a promoted
+            // node's `on_phase_end`) reaches THIS primary's command loop. The
+            // take-once cell is shared across every candidate recipe in the
+            // process; the promotion that fires first claims the pair. Empty ⇒
+            // a second promotion in the same process — keep the internal channel
+            // and say so (the Python handle died with the first promoted primary).
+            match command_channel
                 .lock()
-                .expect("forwarded_argv mutex poisoned")
-                .clone(),
-            // Carry the run's staging/discovery context so the relocated
-            // primary's dispatch matches the submitter's (the relocate-staging
-            // fix). `uses_file_based_items` and `source_pre_staged_root` feed
-            // `assignment.rs`'s `InitialAssignment` stamps + `wire_local_path`;
-            // `source_dir` feeds `maybe_auto_stage_initial`'s re-walk (the
-            // relocated primary re-stages from scratch). `uses_file_based_items`
-            // is the run-uniform `task_definition` class fact (captured on the
-            // GIL thread); `pre_staged_mode` is derived above from the resolved
-            // COMPLETE namespace (the delivered `--source-already-staged`), NOT
-            // the boot `task_args` — neither reads the `InitialAssignment`-fed
-            // cell (the relocate-target's cell is at `Default` at promotion).
-            // `source_pre_staged_root` (the secondary's OWN bind-mount root) is
-            // consulted only in pre-staged mode — mirror the submitter's
-            // `is_some()` discriminant by gating on `pre_staged_mode`.
-            uses_file_based_items,
-            source_pre_staged_root: if pre_staged_mode {
-                source_pre_staged_root.clone()
-            } else {
-                None
-            },
-            source_dir: source_dir.clone(),
-            // Framework file-staging selector (#489 P3/P4): the relocate-target
-            // primary uses the SAME strategy the submitter did. On
-            // `SetupTasks`, this primary's `discover_on_promotion` seeds the
-            // discovered files as per-file pre-succeeded setup tasks — the
-            // #488-free path on the relocate target.
-            staging_strategy,
-            ..PrimaryConfig::default()
-        };
-        let mut primary = PrimaryCoordinator::new(
-            config,
-            client,
-            inbox,
-            demote_rx,
-            // A promotion-built primary: this host won the role on failover /
-            // relocation and IS a compute peer. Its seed is
-            // `SeedSource::PromotionSnapshot` (below) ⇒
-            // `BootstrapRole::PromotedDestination`, so `run_pipeline` runs the
-            // operational loop in place and never relocates again — no
-            // construction-time policy needed; the seed is the discriminator.
-            scheduler_config.build_memory_scheduler(),
-            estimator.clone(),
-        );
-        // Transfer the Python `PrimaryHandle`'s command channel so an
-        // externally-issued `spawn_tasks` / `reinject` (e.g. from a promoted
-        // node's `on_phase_end`) reaches THIS primary's command loop. The
-        // take-once cell is shared across every candidate recipe in the
-        // process; the promotion that fires first claims the pair. Empty ⇒
-        // a second promotion in the same process — keep the internal channel
-        // and say so (the Python handle died with the first promoted primary).
-        match command_channel
-            .lock()
-            .expect("promoted command-channel cell poisoned")
-            .take()
-        {
-            Some((tx, rx)) => primary.replace_command_channel(tx, rx),
-            None => tracing::warn!(
-                "promoted primary: Python command channel already claimed by a \
+                .expect("promoted command-channel cell poisoned")
+                .take()
+            {
+                Some((tx, rx)) => primary.replace_command_channel(tx, rx),
+                None => tracing::warn!(
+                    "promoted primary: Python command channel already claimed by a \
                  prior promotion in this process; keeping the internal channel \
                  (PrimaryHandle commands will surface channel-closed)"
-            ),
-        }
-        // Hand the node-bound liveness-beacon ping receiver to THIS promoted
-        // primary so its operational loop folds beacon datagrams into the
-        // per-secondary death-clock (the union half). The listener stays
-        // bound on the node's runtime across the promotion; only the
-        // receiver moves to whichever primary is active.
-        if let Some(rx) = liveness_ping_rx.take() {
-            primary.set_liveness_ping_rx(rx);
-        }
-        // Spawn the PROMOTED primary's OWN dedicated-thread liveness beacon
-        // (the PRIMARY→secondaries direction). The promoted primary's NODE
-        // keeps its co-located worker-secondary running builds, so its
-        // single-threaded tokio runtime is CPU-starved exactly like any
-        // compute node — its OUTBOUND mesh keepalive freezes, and its
-        // secondaries would false-elect a successor against a still-alive
-        // primary. This off-runtime beacon (its own OS thread + UdpSocket)
-        // keeps asserting the primary's liveness through the starvation. The
-        // book (populated by the co-located secondary from PeerInfo) is the
-        // promoted primary's only source of its secondaries' beacon
-        // addresses; the coordinator publishes the live-secondary subset into
-        // its `beacon_target` each heartbeat tick (`publish_beacon_targets`).
-        // Best-effort: a bind failure leaves the secondaries on the
-        // mesh-frame liveness legs alone — logged, not fatal.
-        if let Some(book) = peer_liveness_addrs.take() {
-            primary.set_peer_liveness_addrs(book);
-            match dynrunner_manager_distributed::liveness::LivenessBeacon::spawn(
-                secondary_id.clone(),
-                // Per-process breadcrumb token (the listener accepts any
-                // token — the ephemeral per-run port isolates stale runs).
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0),
-                keepalive_interval,
-                primary.beacon_target(),
-            ) {
-                Ok(beacon) => {
-                    primary.set_primary_beacon(beacon);
-                    tracing::info!(
-                        "promoted primary liveness beacon active (transport-independent \
-                         primary→secondaries keepalive; survives runtime CPU-starvation)"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "promoted primary liveness beacon spawn failed; secondaries fall \
-                         back to mesh-frame liveness legs alone for this primary"
-                    );
-                }
-            }
-        }
-        // Install the consumer custom-message hook (F5) BEFORE `run`
-        // enters (pre-run setter contract). Built HERE — after
-        // `replace_command_channel` above — from the promoted
-        // coordinator's OWN live command sender, so the handler's
-        // `primary_handle.spawn_tasks(batch)` lands on THIS primary's
-        // command loop (the streamed-spawn site). A consumer without
-        // the attribute installs nothing: the dispatch decision then
-        // consumes important messages unhandled with a WARN.
-        if let Some(def) = custom_message_handler_def.take() {
-            match crate::custom_message_bridge::make_custom_message_handler(
-                def,
-                primary.command_sender(),
-            ) {
-                Ok(handler) => primary.set_custom_message_handler(handler),
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "custom_message_handler bridge build failed; the promoted \
-                     primary will consume custom messages unhandled"
                 ),
             }
-        }
-        // Install the phase-hook raise-latch BEFORE `run` enters (pre-run
-        // setter contract, mirroring the submitter `primary/run.rs:444`) so a
-        // relocated primary's `on_phase_end` raise surfaces a non-zero
-        // `FatalPolicyExit` rather than warn-and-continue. The honest
-        // `on_phase_end` (built via `make_on_phase_end_with_raise_latch`)
-        // records into THIS latch.
-        primary.set_phase_hook_raise_latch(phase_hook_raise_latch.clone());
-        // Register the consumer's discovery policy so a mode-2 SLURM-relocated
-        // primary (which inherits `DiscoveryDebt=Owed` from the submitter's
-        // relocated seed) can run `discover_on_promotion` and seed the staged
-        // corpus itself. Inert on a non-relocated promotion: the driver gates
-        // on `discovery_debt() == Owed`, and a failover-promotion snapshot is
-        // already `Settled`, so the policy is never consulted there.
-        if let Some(sd) = setup_discovery.take() {
-            primary.register_setup_discovery(sd);
-        }
-        // Wire the shared arm-stats bridge so the promoted primary's
-        // operational loop publishes its `select!`-arm accounting (labelled
-        // "primary") into the same cell the off-runtime watchdog reads — a
-        // freeze then names the primary's hot arm alongside the co-located
-        // secondary's. The cell is a cheap `Arc`-backed clone (the recipe fires
-        // once, but `clone()` keeps the `FnMut` move-free). Observation-only.
-        primary.set_op_loop_arm_stats_cell(op_loop_arm_stats_cell.clone());
-        // Install the inherited settled-CRDT base FIRST: the promoting
-        // host's slim index + read fds onto its spill file become this
-        // primary's settled base, so the join-fixed-point ledger slice is
-        // adopted without replaying fat bodies. MUST precede the snapshot
-        // restore (which merges the disjoint fat half over it).
-        primary.adopt_settled_base(settled_base);
-        // Seed from the promoting host's converged snapshot (NORMAL pre-`run`
-        // construction input — not a `run_activated` resume, which is gone):
-        // restore the ledger + rebuild the derived pool/roster caches, then
-        // the primary enters the ordinary `run` path and originates
-        // `PrimaryChanged` itself.
-        primary.seed_from_promotion_snapshot(snapshot);
+            // Hand the node-bound liveness-beacon ping receiver to THIS promoted
+            // primary so its operational loop folds beacon datagrams into the
+            // per-secondary death-clock (the union half). The listener stays
+            // bound on the node's runtime across the promotion; only the
+            // receiver moves to whichever primary is active.
+            if let Some(rx) = liveness_ping_rx.take() {
+                primary.set_liveness_ping_rx(rx);
+            }
+            // Spawn the PROMOTED primary's OWN dedicated-thread liveness beacon
+            // (the PRIMARY→secondaries direction). The promoted primary's NODE
+            // keeps its co-located worker-secondary running builds, so its
+            // single-threaded tokio runtime is CPU-starved exactly like any
+            // compute node — its OUTBOUND mesh keepalive freezes, and its
+            // secondaries would false-elect a successor against a still-alive
+            // primary. This off-runtime beacon (its own OS thread + UdpSocket)
+            // keeps asserting the primary's liveness through the starvation. The
+            // book (populated by the co-located secondary from PeerInfo) is the
+            // promoted primary's only source of its secondaries' beacon
+            // addresses; the coordinator publishes the live-secondary subset into
+            // its `beacon_target` each heartbeat tick (`publish_beacon_targets`).
+            // Best-effort: a bind failure leaves the secondaries on the
+            // mesh-frame liveness legs alone — logged, not fatal.
+            if let Some(book) = peer_liveness_addrs.take() {
+                primary.set_peer_liveness_addrs(book);
+                match dynrunner_manager_distributed::liveness::LivenessBeacon::spawn(
+                    secondary_id.clone(),
+                    // Per-process breadcrumb token (the listener accepts any
+                    // token — the ephemeral per-run port isolates stale runs).
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0),
+                    keepalive_interval,
+                    primary.beacon_target(),
+                ) {
+                    Ok(beacon) => {
+                        primary.set_primary_beacon(beacon);
+                        tracing::info!(
+                            "promoted primary liveness beacon active (transport-independent \
+                         primary→secondaries keepalive; survives runtime CPU-starvation)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "promoted primary liveness beacon spawn failed; secondaries fall \
+                             back to mesh-frame liveness legs alone for this primary"
+                        );
+                    }
+                }
+            }
+            // Install the consumer custom-message hook (F5) BEFORE `run`
+            // enters (pre-run setter contract). Built HERE — after
+            // `replace_command_channel` above — from the promoted
+            // coordinator's OWN live command sender, so the handler's
+            // `primary_handle.spawn_tasks(batch)` lands on THIS primary's
+            // command loop (the streamed-spawn site). A consumer without
+            // the attribute installs nothing: the dispatch decision then
+            // consumes important messages unhandled with a WARN.
+            if let Some(def) = custom_message_handler_def.take() {
+                match crate::custom_message_bridge::make_custom_message_handler(
+                    def,
+                    primary.command_sender(),
+                ) {
+                    Ok(handler) => primary.set_custom_message_handler(handler),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "custom_message_handler bridge build failed; the promoted \
+                         primary will consume custom messages unhandled"
+                    ),
+                }
+            }
+            // Install the phase-hook raise-latch BEFORE `run` enters (pre-run
+            // setter contract, mirroring the submitter `primary/run.rs:444`) so a
+            // relocated primary's `on_phase_end` raise surfaces a non-zero
+            // `FatalPolicyExit` rather than warn-and-continue. The honest
+            // `on_phase_end` (built via `make_on_phase_end_with_raise_latch`)
+            // records into THIS latch.
+            primary.set_phase_hook_raise_latch(phase_hook_raise_latch.clone());
+            // Register the consumer's discovery policy so a mode-2 SLURM-relocated
+            // primary (which inherits `DiscoveryDebt=Owed` from the submitter's
+            // relocated seed) can run `discover_on_promotion` and seed the staged
+            // corpus itself. Inert on a non-relocated promotion: the driver gates
+            // on `discovery_debt() == Owed`, and a failover-promotion snapshot is
+            // already `Settled`, so the policy is never consulted there.
+            if let Some(sd) = setup_discovery.take() {
+                primary.register_setup_discovery(sd);
+            }
+            // Wire the shared arm-stats bridge so the promoted primary's
+            // operational loop publishes its `select!`-arm accounting (labelled
+            // "primary") into the same cell the off-runtime watchdog reads — a
+            // freeze then names the primary's hot arm alongside the co-located
+            // secondary's. The cell is a cheap `Arc`-backed clone (the recipe fires
+            // once, but `clone()` keeps the `FnMut` move-free). Observation-only.
+            primary.set_op_loop_arm_stats_cell(op_loop_arm_stats_cell.clone());
+            // Install the inherited settled-CRDT base FIRST: the promoting
+            // host's slim index + read fds onto its spill file become this
+            // primary's settled base, so the join-fixed-point ledger slice is
+            // adopted without replaying fat bodies. MUST precede the snapshot
+            // restore (which merges the disjoint fat half over it).
+            primary.adopt_settled_base(settled_base);
+            // Seed from the promoting host's converged snapshot (NORMAL pre-`run`
+            // construction input — not a `run_activated` resume, which is gone):
+            // restore the ledger + rebuild the derived pool/roster caches, then
+            // the primary enters the ordinary `run` path and originates
+            // `PrimaryChanged` itself.
+            primary.seed_from_promotion_snapshot(snapshot);
 
-        // Fire `on_run_start` on the relocated primary (SLURM path only — the
-        // in-process submitter already fired it in-process). The consumer
-        // receives this primary's OWN live `PrimaryHandle` + the node-local
-        // `output_dir` so its lazy-injection pattern (`on_phase_end →
-        // primary_handle.spawn_tasks`) reaches THIS primary's command loop. A
-        // raise aborts the run (the consumer's setup failed) — surfaced as a
-        // `Failed` terminal at the node boundary. Runs synchronously on the
-        // node runtime thread; this is a one-time PRE-RUN hook (this primary's
-        // operational loop / keepalives have not started yet), so it does not
-        // stall an in-flight pump.
-        if let Some(ctx) = on_run_start.take()
-            && let Err(reason) = fire_on_run_start_on_promoted_primary(&ctx)
-        {
-            // The consumer's setup hook RAISED — a deliberate run-level fatal,
-            // NOT a swallow-and-continue false-green. Record the abort onto the
-            // promoted coordinator; its post-connection abort gate
-            // (`fire_pre_run_hook_abort`) broadcasts `RunAborted` to the fleet
-            // (secondaries stop) and surfaces a non-zero `FatalPolicyExit` at
-            // this node's run boundary — the promoted-path twin of the
-            // cold-start path's `?`-propagation of an `on_run_start` raise.
-            primary.record_pre_run_hook_abort(reason);
-        }
+            // Fire `on_run_start` on the relocated primary (SLURM path only — the
+            // in-process submitter already fired it in-process). The consumer
+            // receives this primary's OWN live `PrimaryHandle` + the node-local
+            // `output_dir` so its lazy-injection pattern (`on_phase_end →
+            // primary_handle.spawn_tasks`) reaches THIS primary's command loop. A
+            // raise aborts the run (the consumer's setup failed) — surfaced as a
+            // `Failed` terminal at the node boundary. Runs synchronously on the
+            // node runtime thread; this is a one-time PRE-RUN hook (this primary's
+            // operational loop / keepalives have not started yet), so it does not
+            // stall an in-flight pump.
+            if let Some(ctx) = on_run_start.take()
+                && let Err(reason) = fire_on_run_start_on_promoted_primary(&ctx)
+            {
+                // The consumer's setup hook RAISED — a deliberate run-level fatal,
+                // NOT a swallow-and-continue false-green. Record the abort onto the
+                // promoted coordinator; its post-connection abort gate
+                // (`fire_pre_run_hook_abort`) broadcasts `RunAborted` to the fleet
+                // (secondaries stop) and surfaces a non-zero `FatalPolicyExit` at
+                // this node's run boundary — the promoted-path twin of the
+                // cold-start path's `?`-propagation of an `on_run_start` raise.
+                primary.record_pre_run_hook_abort(reason);
+            }
 
-        // Take the real phase callbacks into `PrimaryRunArgs` — the channel
-        // `run_pipeline` reads (`coordinator.rs:2640-2641`). This REPLACES the
-        // dead `register_phase_lifecycle_callbacks` path whose registration the
-        // run-args no-ops used to clobber (bug D). The promoted primary owns
-        // the phase machine; the secondary does not (R4 seam).
-        let (on_phase_start, on_phase_end) = phase_callbacks.take().expect(
-            "promoted-primary recipe fires at most once; phase callbacks must be present",
-        );
-        PromotedPrimary {
-            coordinator: primary,
-            // The snapshot already carries the tasks + phase-deps and was
-            // restored + hydrated by `seed_from_promotion_snapshot` above, so
-            // the promoted primary enters `run` on the inherited CRDT: its
-            // run-init originates nothing and just re-hydrates.
-            run_args: PrimaryRunArgs {
-                // The node derived the kind (relocation vs failover) from the
-                // promotion signal's `PrimaryChangeReason` and threaded it
-                // here; it gates the bring-up reservation (#507).
-                seed: SeedSource::PromotionSnapshot {
-                    kind: bootstrap_kind,
+            // Take the real phase callbacks into `PrimaryRunArgs` — the channel
+            // `run_pipeline` reads (`coordinator.rs:2640-2641`). This REPLACES the
+            // dead `register_phase_lifecycle_callbacks` path whose registration the
+            // run-args no-ops used to clobber (bug D). The promoted primary owns
+            // the phase machine; the secondary does not (R4 seam).
+            let (on_phase_start, on_phase_end) = phase_callbacks.take().expect(
+                "promoted-primary recipe fires at most once; phase callbacks must be present",
+            );
+            PromotedPrimary {
+                coordinator: primary,
+                // The snapshot already carries the tasks + phase-deps and was
+                // restored + hydrated by `seed_from_promotion_snapshot` above, so
+                // the promoted primary enters `run` on the inherited CRDT: its
+                // run-init originates nothing and just re-hydrates.
+                run_args: PrimaryRunArgs {
+                    // The node derived the kind (relocation vs failover) from the
+                    // promotion signal's `PrimaryChangeReason` and threaded it
+                    // here; it gates the bring-up reservation (#507).
+                    seed: SeedSource::PromotionSnapshot {
+                        kind: bootstrap_kind,
+                    },
+                    on_phase_start,
+                    on_phase_end,
                 },
-                on_phase_start,
-                on_phase_end,
-            },
-        }
-    })
+            }
+        },
+    )
 }
 
 /// Fire the consumer's `on_run_start` on the relocated primary under the GIL.
@@ -1840,11 +1843,9 @@ pub(crate) fn build_setup_discovery_fn(
         let taken = handles.take();
         let fut = async move {
             let Some((task_definition_py, run_config, setup_discover_root)) = taken else {
-                return Err(
-                    "setup-discovery policy invoked more than once — a second \
+                return Err("setup-discovery policy invoked more than once — a second \
                      invocation is a programmer error"
-                        .to_string(),
-                );
+                    .to_string());
             };
             // Capture the role span CURRENT on the runtime thread (this future
             // is awaited inside the primary coordinator's role-instrumented
@@ -2005,10 +2006,7 @@ fn build_finalize_run_config_fn(
 /// preserved from the boot registry (only the `cmd_args` depend on the
 /// run-config); the rebuild reads them off the current shared registry under
 /// the same lock it then swaps, so the swap is atomic from the factory's view.
-fn finalize_cmd_args_under_gil(
-    py: Python<'_>,
-    captures: &FinalizeCaptures,
-) -> Result<(), String> {
+fn finalize_cmd_args_under_gil(py: Python<'_>, captures: &FinalizeCaptures) -> Result<(), String> {
     // Resolve the consumer's COMPLETE argparse namespace through the SHARED
     // run-config (single source of truth — it reads the delivered argv off its
     // own `run_config_handle()` and caches the reparse). A later
@@ -2420,7 +2418,9 @@ mod staging_dispatch_flags_tests {
         let module = PyModule::from_code(
             py,
             std::ffi::CString::new(source).unwrap().as_c_str(),
-            std::ffi::CString::new("stub_staging.py").unwrap().as_c_str(),
+            std::ffi::CString::new("stub_staging.py")
+                .unwrap()
+                .as_c_str(),
             std::ffi::CString::new("stub_staging").unwrap().as_c_str(),
         )
         .expect("compile staging stub module");
@@ -2436,10 +2436,20 @@ mod staging_dispatch_flags_tests {
     #[test]
     fn uses_file_based_items_false_not_pre_staged() {
         Python::attach(|py| {
-            let (td, ta) = stubs(py, "uses_file_based_items=False", "source_already_staged=None");
+            let (td, ta) = stubs(
+                py,
+                "uses_file_based_items=False",
+                "source_already_staged=None",
+            );
             let (uses_files, pre_staged) = extract_staging_dispatch_flags(&td, &ta);
-            assert!(!uses_files, "uses_file_based_items=False must extract false");
-            assert!(!pre_staged, "source_already_staged=None must extract not-pre-staged");
+            assert!(
+                !uses_files,
+                "uses_file_based_items=False must extract false"
+            );
+            assert!(
+                !pre_staged,
+                "source_already_staged=None must extract not-pre-staged"
+            );
         });
     }
 
@@ -2455,7 +2465,10 @@ mod staging_dispatch_flags_tests {
             );
             let (uses_files, pre_staged) = extract_staging_dispatch_flags(&td, &ta);
             assert!(uses_files, "file-based stays true in pre-staged mode");
-            assert!(pre_staged, "non-None source_already_staged must extract pre-staged");
+            assert!(
+                pre_staged,
+                "non-None source_already_staged must extract pre-staged"
+            );
         });
     }
 
@@ -2469,8 +2482,14 @@ mod staging_dispatch_flags_tests {
             // SimpleNamespace with no fields at all.
             let (td, ta) = stubs(py, "", "");
             let (uses_files, pre_staged) = extract_staging_dispatch_flags(&td, &ta);
-            assert!(uses_files, "missing uses_file_based_items defaults to file-based");
-            assert!(!pre_staged, "missing source_already_staged defaults to not-pre-staged");
+            assert!(
+                uses_files,
+                "missing uses_file_based_items defaults to file-based"
+            );
+            assert!(
+                !pre_staged,
+                "missing source_already_staged defaults to not-pre-staged"
+            );
         });
     }
 }
@@ -2567,7 +2586,9 @@ task = Task()
         let module = PyModule::from_code(
             py,
             std::ffi::CString::new(source).unwrap().as_c_str(),
-            std::ffi::CString::new("relocated_stub.py").unwrap().as_c_str(),
+            std::ffi::CString::new("relocated_stub.py")
+                .unwrap()
+                .as_c_str(),
             std::ffi::CString::new("relocated_stub").unwrap().as_c_str(),
         )
         .expect("compile relocated-primary stub module");
@@ -2612,8 +2633,11 @@ task = Task()
             let platform: String = ns.getattr("platform").unwrap().extract().unwrap();
             assert_eq!(platform, "x64");
             // Non-pre-staged node-local output root = resolve(args.output).
-            let resolved: String =
-                ns.getattr("resolved_output_root").unwrap().extract().unwrap();
+            let resolved: String = ns
+                .getattr("resolved_output_root")
+                .unwrap()
+                .extract()
+                .unwrap();
             assert_eq!(resolved, "/run/out");
         });
     }
@@ -2628,7 +2652,9 @@ task = Task()
             let m = PyModule::from_code(
                 py,
                 std::ffi::CString::new(source).unwrap().as_c_str(),
-                std::ffi::CString::new("prestaged_ns.py").unwrap().as_c_str(),
+                std::ffi::CString::new("prestaged_ns.py")
+                    .unwrap()
+                    .as_c_str(),
                 std::ffi::CString::new("prestaged_ns").unwrap().as_c_str(),
             )
             .unwrap();
@@ -2684,18 +2710,19 @@ task = Task()
                 crate::managers::lifecycle::make_on_phase_start(task_def.clone_ref(py)),
             );
             let raise_latch = dynrunner_manager_distributed::PhaseHookRaiseLatch::new();
-            let on_phase_end: crate::managers::lifecycle::OnPhaseEnd =
-                Box::new(crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
+            let on_phase_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
+                crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
                     task_def.clone_ref(py),
                     raise_latch.clone(),
-                ));
+                ),
+            );
 
             let ((tx, rx), _handle, mut mesh) = recipe_inputs();
             let (slot, client, inbox) =
                 mesh.register_local_role(LocalRole::Primary, PeerId::from("primary"));
             let (_demote_tx, demote_rx) = tokio::sync::mpsc::unbounded_channel();
-            let snapshot = dynrunner_manager_distributed::ClusterState::<RunnerIdentifier>::new()
-                .snapshot();
+            let snapshot =
+                dynrunner_manager_distributed::ClusterState::<RunnerIdentifier>::new().snapshot();
             let estimator = PyMemoryEstimatorBridge::from_python(&task, &[]).unwrap();
 
             let mut recipe = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
@@ -2780,14 +2807,16 @@ task = Task()
             let task = module.getattr("task").unwrap();
             let task_def = task.clone().unbind();
 
-            let on_phase_start: crate::managers::lifecycle::OnPhaseStart =
-                Box::new(crate::managers::lifecycle::make_on_phase_start(task_def.clone_ref(py)));
+            let on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
+                crate::managers::lifecycle::make_on_phase_start(task_def.clone_ref(py)),
+            );
             let raise_latch = dynrunner_manager_distributed::PhaseHookRaiseLatch::new();
-            let on_phase_end: crate::managers::lifecycle::OnPhaseEnd =
-                Box::new(crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
+            let on_phase_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
+                crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
                     task_def.clone_ref(py),
                     raise_latch.clone(),
-                ));
+                ),
+            );
 
             // The complete namespace, resolved from the delivered argv.
             let delivered = Arc::new(Mutex::new(vec![
@@ -2803,8 +2832,8 @@ task = Task()
             let (slot, client, inbox) =
                 mesh.register_local_role(LocalRole::Primary, PeerId::from("primary"));
             let (_demote_tx, demote_rx) = tokio::sync::mpsc::unbounded_channel();
-            let snapshot = dynrunner_manager_distributed::ClusterState::<RunnerIdentifier>::new()
-                .snapshot();
+            let snapshot =
+                dynrunner_manager_distributed::ClusterState::<RunnerIdentifier>::new().snapshot();
             let estimator = PyMemoryEstimatorBridge::from_python(&task, &[]).unwrap();
 
             let mut recipe = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
@@ -2857,16 +2886,15 @@ task = Task()
                 1,
                 "the relocated primary must fire on_run_start once"
             );
-            let (source_dir, output_dir, has_handle, ns): (
-                String,
-                String,
-                bool,
-                Bound<'_, PyAny>,
-            ) = calls.get_item(0).unwrap().extract().unwrap();
+            let (source_dir, output_dir, has_handle, ns): (String, String, bool, Bound<'_, PyAny>) =
+                calls.get_item(0).unwrap().extract().unwrap();
             assert_eq!(source_dir, "/local/src");
             // The node-local output root (non-pre-staged → resolve(args.output)).
             assert_eq!(output_dir, "/run/out");
-            assert!(has_handle, "on_run_start must receive a live primary_handle");
+            assert!(
+                has_handle,
+                "on_run_start must receive a live primary_handle"
+            );
             // The args are the COMPLETE namespace (selection flag present).
             let platform: String = ns.getattr("platform").unwrap().extract().unwrap();
             assert_eq!(platform, "x64");
@@ -2891,14 +2919,16 @@ task = Task()
             task.setattr("_raise_on_run_start", true).unwrap();
             let task_def = task.clone().unbind();
 
-            let on_phase_start: crate::managers::lifecycle::OnPhaseStart =
-                Box::new(crate::managers::lifecycle::make_on_phase_start(task_def.clone_ref(py)));
+            let on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
+                crate::managers::lifecycle::make_on_phase_start(task_def.clone_ref(py)),
+            );
             let raise_latch = dynrunner_manager_distributed::PhaseHookRaiseLatch::new();
-            let on_phase_end: crate::managers::lifecycle::OnPhaseEnd =
-                Box::new(crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
+            let on_phase_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
+                crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
                     task_def.clone_ref(py),
                     raise_latch.clone(),
-                ));
+                ),
+            );
 
             // The complete namespace, resolved from the delivered argv.
             let delivered = Arc::new(Mutex::new(vec![
@@ -2914,8 +2944,8 @@ task = Task()
             let (slot, client, inbox) =
                 mesh.register_local_role(LocalRole::Primary, PeerId::from("primary"));
             let (_demote_tx, demote_rx) = tokio::sync::mpsc::unbounded_channel();
-            let snapshot = dynrunner_manager_distributed::ClusterState::<RunnerIdentifier>::new()
-                .snapshot();
+            let snapshot =
+                dynrunner_manager_distributed::ClusterState::<RunnerIdentifier>::new().snapshot();
             let estimator = PyMemoryEstimatorBridge::from_python(&task, &[]).unwrap();
 
             let mut recipe = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
@@ -2994,8 +3024,12 @@ task = Task()
             )
             .unwrap()
             .as_c_str(),
-            std::ffi::CString::new("not_prestaged_ns.py").unwrap().as_c_str(),
-            std::ffi::CString::new("not_prestaged_ns").unwrap().as_c_str(),
+            std::ffi::CString::new("not_prestaged_ns.py")
+                .unwrap()
+                .as_c_str(),
+            std::ffi::CString::new("not_prestaged_ns")
+                .unwrap()
+                .as_c_str(),
         )
         .unwrap();
         SharedRunConfig::pre_resolved(m.getattr("ns").unwrap().unbind())
@@ -3050,8 +3084,12 @@ def finalize_run_config(delivered):
             let module = PyModule::from_code(
                 py,
                 std::ffi::CString::new(source).unwrap().as_c_str(),
-                std::ffi::CString::new("prestaged_finalize.py").unwrap().as_c_str(),
-                std::ffi::CString::new("prestaged_finalize").unwrap().as_c_str(),
+                std::ffi::CString::new("prestaged_finalize.py")
+                    .unwrap()
+                    .as_c_str(),
+                std::ffi::CString::new("prestaged_finalize")
+                    .unwrap()
+                    .as_c_str(),
             )
             .unwrap();
             let task = task_module(py);
@@ -3072,21 +3110,23 @@ def finalize_run_config(delivered):
             // ONLY the delivered argv carries the flag (the real derivation).
             let run_config = SharedRunConfig::deferred(finalize, delivered);
 
-            let on_phase_start: crate::managers::lifecycle::OnPhaseStart =
-                Box::new(crate::managers::lifecycle::make_on_phase_start(task_def.clone_ref(py)));
+            let on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
+                crate::managers::lifecycle::make_on_phase_start(task_def.clone_ref(py)),
+            );
             let raise_latch = dynrunner_manager_distributed::PhaseHookRaiseLatch::new();
-            let on_phase_end: crate::managers::lifecycle::OnPhaseEnd =
-                Box::new(crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
+            let on_phase_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
+                crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
                     task_def.clone_ref(py),
                     raise_latch.clone(),
-                ));
+                ),
+            );
 
             let ((tx, rx), _handle, mut mesh) = recipe_inputs();
             let (slot, client, inbox) =
                 mesh.register_local_role(LocalRole::Primary, PeerId::from("primary"));
             let (_demote_tx, demote_rx) = tokio::sync::mpsc::unbounded_channel();
-            let snapshot = dynrunner_manager_distributed::ClusterState::<RunnerIdentifier>::new()
-                .snapshot();
+            let snapshot =
+                dynrunner_manager_distributed::ClusterState::<RunnerIdentifier>::new().snapshot();
             let estimator =
                 PyMemoryEstimatorBridge::from_python(&task.getattr("task").unwrap(), &[]).unwrap();
 

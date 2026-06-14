@@ -92,7 +92,11 @@ async fn discover_on_promotion_noop_when_undeclared() {
                 .await
                 .expect("Undeclared → no-op Ok");
 
-            assert_eq!(fires.load(std::sync::atomic::Ordering::Relaxed), 0, "the policy must NOT run when Undeclared");
+            assert_eq!(
+                fires.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "the policy must NOT run when Undeclared"
+            );
             assert_eq!(
                 primary.cluster_state_for_test().task_count(),
                 0,
@@ -140,7 +144,11 @@ async fn discover_on_promotion_noop_when_settled() {
                 .await
                 .expect("Settled → no-op Ok");
 
-            assert_eq!(fires.load(std::sync::atomic::Ordering::Relaxed), 0, "the policy must NOT run when Settled");
+            assert_eq!(
+                fires.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "the policy must NOT run when Settled"
+            );
             assert_eq!(
                 primary.cluster_state_for_test().task_count(),
                 0,
@@ -166,7 +174,9 @@ async fn discover_on_promotion_owed_nonempty_seeds_tasks_and_settles() {
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-            primary.cluster_state_mut_for_test().apply(ClusterMutation::DiscoveryDebtDeclared);
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::DiscoveryDebtDeclared);
 
             let t1 = make_binary("disc-1", 100);
             let t2 = make_binary("disc-2", 100);
@@ -184,7 +194,11 @@ async fn discover_on_promotion_owed_nonempty_seeds_tasks_and_settles() {
                 .await
                 .expect("Owed + non-empty → Ok");
 
-            assert_eq!(fires.load(std::sync::atomic::Ordering::Relaxed), 1, "the policy runs EXACTLY once");
+            assert_eq!(
+                fires.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "the policy runs EXACTLY once"
+            );
             assert_eq!(
                 primary.cluster_state_for_test().discovery_debt(),
                 DiscoveryDebt::Settled,
@@ -233,7 +247,9 @@ async fn discover_on_promotion_owed_empty_settles_and_counter_finalizes() {
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-            primary.cluster_state_mut_for_test().apply(ClusterMutation::DiscoveryDebtDeclared);
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::DiscoveryDebtDeclared);
 
             let fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             primary.register_setup_discovery(fixed_discovery(
@@ -247,7 +263,11 @@ async fn discover_on_promotion_owed_empty_settles_and_counter_finalizes() {
                 .await
                 .expect("Owed + empty → Ok");
 
-            assert_eq!(fires.load(std::sync::atomic::Ordering::Relaxed), 1, "the policy runs exactly once");
+            assert_eq!(
+                fires.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "the policy runs exactly once"
+            );
             assert_eq!(
                 primary.cluster_state_for_test().discovery_debt(),
                 DiscoveryDebt::Settled,
@@ -299,7 +319,9 @@ async fn discover_on_promotion_marked_item_lands_skipped_unmarked_lands_pending(
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-            primary.cluster_state_mut_for_test().apply(ClusterMutation::DiscoveryDebtDeclared);
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::DiscoveryDebtDeclared);
 
             let skipped = make_binary("already-done", 100);
             let to_run = make_binary("needs-run", 100);
@@ -381,7 +403,9 @@ async fn discover_on_promotion_all_skipped_settles_and_counter_finalizes() {
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-            primary.cluster_state_mut_for_test().apply(ClusterMutation::DiscoveryDebtDeclared);
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::DiscoveryDebtDeclared);
 
             let s1 = make_binary("done-1", 100);
             let s2 = make_binary("done-2", 100);
@@ -431,8 +455,7 @@ async fn discover_on_promotion_all_skipped_settles_and_counter_finalizes() {
             // completed set (the part that closes the counter gap the deleted
             // explicit RunComplete used to cover).
             assert!(
-                primary.completed_tasks.contains(&h1)
-                    && primary.completed_tasks.contains(&h2),
+                primary.completed_tasks.contains(&h1) && primary.completed_tasks.contains(&h2),
                 "hydrate must project every SkippedAlreadyDone into completed_tasks \
                  so the counter exit accounts for them; completed_tasks = {:?}",
                 primary.completed_tasks
@@ -480,7 +503,9 @@ async fn discover_on_promotion_zero_to_run_with_dependent_phase_no_run_complete(
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-            primary.cluster_state_mut_for_test().apply(ClusterMutation::DiscoveryDebtDeclared);
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::DiscoveryDebtDeclared);
 
             // The phase-chaining shape: `phase2` depends on `phase1`. Discovery
             // resolves only `phase1` (all-skipped, zero to-run); `phase2`'s real
@@ -556,7 +581,8 @@ fn cold_seed_marked_item_lands_skipped_unmarked_lands_pending() {
     primary
         .originate_cold_seed(vec![(skipped, true), (to_run, false)], HashMap::new())
         .expect("mixed marked cold seed");
-    primary.hydrate_from_cluster_state()
+    primary
+        .hydrate_from_cluster_state()
         .expect("test fixture: composed task graph is valid");
 
     assert_eq!(
@@ -605,7 +631,9 @@ async fn discover_on_promotion_owed_without_policy_is_hard_error() {
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-            primary.cluster_state_mut_for_test().apply(ClusterMutation::DiscoveryDebtDeclared);
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::DiscoveryDebtDeclared);
             // No register_setup_discovery.
 
             let r = primary.discover_on_promotion().await;
@@ -705,8 +733,9 @@ async fn discovery_owed_suppresses_phase_cascade_until_settled() {
             let mut deps = HashMap::new();
             deps.insert(dynrunner_core::PhaseId::from("build"), vec![]);
             primary.originate_relocated_seed(deps);
-            primary.hydrate_from_cluster_state()
-        .expect("test fixture: composed task graph is valid");
+            primary
+                .hydrate_from_cluster_state()
+                .expect("test fixture: composed task graph is valid");
 
             // While Owed, the cascade is a defence-in-depth no-op: NO
             // on_phase_end fires for the transiently-empty "build" phase.
@@ -910,7 +939,9 @@ async fn select_relocation_target_picks_lowest_eligible_compute_peer() {
             seed_member(&mut primary, "sec-3", 2, false, false);
 
             assert_eq!(
-                primary.select_relocation_target(crate::primary::lifecycle::RelocationPolicy::LowestId).as_deref(),
+                primary
+                    .select_relocation_target(crate::primary::lifecycle::RelocationPolicy::LowestId)
+                    .as_deref(),
                 Some("sec-1"),
                 "must pick the LOWEST-id eligible compute peer — sec-0 is an \
                  observer (excluded), sec-3 lacks can_be_primary (excluded), so \
@@ -938,7 +969,9 @@ async fn select_relocation_target_none_when_no_eligible_peer() {
             seed_member(&mut primary, "obs-0", 0, true, false);
             seed_member(&mut primary, "sec-0", 2, false, false);
             assert_eq!(
-                primary.select_relocation_target(crate::primary::lifecycle::RelocationPolicy::LowestId),
+                primary.select_relocation_target(
+                    crate::primary::lifecycle::RelocationPolicy::LowestId
+                ),
                 None,
                 "an observer + a can_be_primary=false worker leave NO promotable \
                  compute peer; selection must be None so the bootstrap errors \
@@ -971,7 +1004,9 @@ async fn select_relocation_target_excludes_self() {
             seed_member(&mut primary, &own_id, 2, false, true);
             seed_member(&mut primary, "sec-9", 2, false, true);
             assert_eq!(
-                primary.select_relocation_target(crate::primary::lifecycle::RelocationPolicy::LowestId).as_deref(),
+                primary
+                    .select_relocation_target(crate::primary::lifecycle::RelocationPolicy::LowestId)
+                    .as_deref(),
                 Some("sec-9"),
                 "selection must exclude this primary's OWN id even when it \
                  advertises an eligible-looking worker-secondary capability — \
@@ -994,8 +1029,7 @@ async fn relocate_primary_to_originates_transferred_to_chosen_not_self() {
     local
         .run_until(async {
             let (transport, secondary_ends) = setup_test(1);
-            let (_sec_id, mut to_sec_rx, _incoming_tx) =
-                secondary_ends.into_iter().next().unwrap();
+            let (_sec_id, mut to_sec_rx, _incoming_tx) = secondary_ends.into_iter().next().unwrap();
             let (mut primary, _mesh) = build_test_primary(
                 test_primary_config(),
                 transport,
@@ -1297,7 +1331,10 @@ async fn setup_peer_empty_candidate_set_is_no_relocation_target() {
             let exit = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 primary.run_consuming(
-                    SeedSource::ColdStart { binaries: vec![], phase_deps: deps },
+                    SeedSource::ColdStart {
+                        binaries: vec![],
+                        phase_deps: deps,
+                    },
                     ops,
                     ope,
                 ),
@@ -1382,7 +1419,10 @@ async fn setup_peer_relocates_without_gating_on_secondary_operational_meshready(
             let exit = tokio::time::timeout(
                 Duration::from_secs(5),
                 primary.run_consuming(
-                    SeedSource::ColdStart { binaries: vec![], phase_deps: deps },
+                    SeedSource::ColdStart {
+                        binaries: vec![],
+                        phase_deps: deps,
+                    },
                     ops,
                     ope,
                 ),
@@ -1399,7 +1439,10 @@ async fn setup_peer_relocates_without_gating_on_secondary_operational_meshready(
             // the relocate fired off TRANSPORT connectivity alone, never the
             // operational MeshReady the fake withheld.
             assert!(
-                matches!(exit, Ok(crate::primary::PrimaryRunOutcome::Relocated { .. })),
+                matches!(
+                    exit,
+                    Ok(crate::primary::PrimaryRunOutcome::Relocated { .. })
+                ),
                 "a transport-connected eligible compute peer must let the setup \
                  peer RELOCATE (PrimaryRunOutcome::Relocated) even though no \
                  MeshReady was ever sent; got {exit:?}"

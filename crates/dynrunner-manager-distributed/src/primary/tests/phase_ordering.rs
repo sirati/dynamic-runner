@@ -386,8 +386,7 @@ async fn run_producer_zero_dispatch_scenario(
     }
     drop(incoming_tx);
 
-    let transport =
-        ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
+    let transport = ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
     let config = PrimaryConfig {
         num_secondaries: 2,
         connect_timeout: Duration::from_secs(10),
@@ -422,7 +421,13 @@ async fn run_producer_zero_dispatch_scenario(
     // producer-path dispatch this test asserts).
     seed_operational_ledger(&mut primary, binaries, phase_deps);
     let result = primary
-        .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end)
+        .run(
+            SeedSource::PromotionSnapshot {
+                kind: crate::process::BootstrapKind::Failover,
+            },
+            on_start,
+            on_end,
+        )
         .await;
 
     drop(primary);
@@ -585,7 +590,13 @@ async fn mode2_zero_to_run_phase1_with_lazy_spawn_phase2_does_not_prematurely_co
             // which runs `discover_on_promotion` because debt is `Owed`).
             let exit = tokio::time::timeout(
                 Duration::from_secs(15),
-                primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end),
+                primary.run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    on_start,
+                    on_end,
+                ),
             )
             .await
             .expect(
@@ -595,7 +606,11 @@ async fn mode2_zero_to_run_phase1_with_lazy_spawn_phase2_does_not_prematurely_co
             );
             exit.expect("the mode-2 run must exit Ok, not error");
 
-            assert_eq!(fires.load(std::sync::atomic::Ordering::Relaxed), 1, "discovery runs exactly once");
+            assert_eq!(
+                fires.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "discovery runs exactly once"
+            );
             let completed = primary.completed_count();
             let failed = primary.failed_count();
             let log = events.lock().unwrap().clone();
@@ -773,7 +788,13 @@ async fn mode2_all_skipped_phase1_fires_on_phase_end_once_and_lazy_spawn_lands()
 
             let exit = tokio::time::timeout(
                 Duration::from_secs(15),
-                primary.run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end),
+                primary.run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    on_start,
+                    on_end,
+                ),
             )
             .await
             .expect("the all-skipped mode-2 run must complete promptly, not hang");
@@ -784,7 +805,11 @@ async fn mode2_all_skipped_phase1_fires_on_phase_end_once_and_lazy_spawn_lands()
                  empty-drain fail-loud",
             );
 
-            assert_eq!(fires.load(std::sync::atomic::Ordering::Relaxed), 1, "discovery runs exactly once");
+            assert_eq!(
+                fires.load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "discovery runs exactly once"
+            );
             let completed = primary.completed_count();
             let failed = primary.failed_count();
             let log = events.lock().unwrap().clone();
@@ -906,8 +931,7 @@ async fn run_phase_ordering_scenario(
     }
     drop(incoming_tx);
 
-    let transport =
-        ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
+    let transport = ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
     let config = PrimaryConfig {
         num_secondaries: 2,
         connect_timeout: Duration::from_secs(10),
@@ -970,7 +994,13 @@ async fn run_phase_ordering_scenario(
     // `PromotionSnapshot` (a `ColdStart` would relocate away).
     seed_operational_ledger(&mut primary, binaries, phase_deps);
     primary
-        .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end)
+        .run(
+            SeedSource::PromotionSnapshot {
+                kind: crate::process::BootstrapKind::Failover,
+            },
+            on_start,
+            on_end,
+        )
         .await
         .unwrap();
 
@@ -1227,7 +1257,13 @@ async fn connected_event_precedes_first_phase_start_with_empty_phase_and_lazy_sp
                     phases: vec![PhaseId::from("pre")],
                 });
             primary
-                .run(SeedSource::PromotionSnapshot { kind: crate::process::BootstrapKind::Failover }, on_start, on_end)
+                .run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    on_start,
+                    on_end,
+                )
                 .await
                 .unwrap();
 
