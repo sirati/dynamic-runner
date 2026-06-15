@@ -3,13 +3,22 @@
 //! # Single concern
 //!
 //! Turn each [`crate::task_state_change::TaskStateChangeEvent`] the CRDT
-//! merge join fires into ONE operator wake-line on the
-//! [`dynrunner_core::IMPORTANT_TARGET`] channel, at the level the spec
-//! fixes (INFO assign/complete/state-change, WARN recoverable/oom fail,
-//! ERROR terminal fail). It owns NO state beyond a single
-//! baseline-vs-live latch — every narrated field rides the event, which
-//! the merge join derived from the CRDT the primary already maintains
-//! (NO observer-only CRDT).
+//! merge join fires into ONE operator narration line at the level the
+//! spec fixes (INFO assign/complete/state-change, WARN recoverable/oom
+//! fail, ERROR terminal fail), routed to the tracing target that matches
+//! its operator-wake class:
+//!   - The per-task INFO arms (assign / complete / non-terminal state
+//!     change) emit on [`dynrunner_core::OBSERVER_TASK_TARGET`]: visible
+//!     on the default stdio stream, suppressed FROM stdio under
+//!     `--important-stdio-only` (the full log keeps them at TRACE).
+//!   - The per-task FAILURE arms (terminal ERROR, recoverable WARN, oom
+//!     WARN) and the once-per-run baseline summary emit on
+//!     [`dynrunner_core::IMPORTANT_TARGET`]: wake-worthy, reach stdio
+//!     under the flag too.
+//!
+//! The narrator owns NO state beyond a single baseline-vs-live latch —
+//! every narrated field rides the event, which the merge join derived
+//! from the CRDT the primary already maintains (NO observer-only CRDT).
 //!
 //! # Module boundary
 //!
@@ -36,7 +45,7 @@
 //! two narrators are sibling concerns over the same mirror; there is no
 //! double-emit.
 
-use dynrunner_core::IMPORTANT_TARGET;
+use dynrunner_core::{IMPORTANT_TARGET, OBSERVER_TASK_TARGET};
 
 use crate::cluster_state::StateCounts;
 use crate::task_state_change::{TaskStateChange, TaskStateChangeEvent};
@@ -111,7 +120,7 @@ impl ObserverTaskNarrator {
         match &event.change {
             TaskStateChange::Assigned => {
                 tracing::info!(
-                    target: IMPORTANT_TARGET,
+                    target: OBSERVER_TASK_TARGET,
                     task = %id,
                     holder = %holder,
                     "task {id} assigned to {holder}",
@@ -119,7 +128,7 @@ impl ObserverTaskNarrator {
             }
             TaskStateChange::Completed => {
                 tracing::info!(
-                    target: IMPORTANT_TARGET,
+                    target: OBSERVER_TASK_TARGET,
                     task = %id,
                     holder = %holder,
                     "task {id} completed on {holder}",
@@ -155,7 +164,7 @@ impl ObserverTaskNarrator {
             }
             TaskStateChange::Other { state } => {
                 tracing::info!(
-                    target: IMPORTANT_TARGET,
+                    target: OBSERVER_TASK_TARGET,
                     task = %id,
                     state = %state,
                     "task {id} changed state to {state}",
