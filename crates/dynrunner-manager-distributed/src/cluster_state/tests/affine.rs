@@ -59,26 +59,12 @@ fn affine_ready_resolves_dependents_without_execution() {
     // The gate I depends on the upload; it is Blocked on it.
     let gate = with_dep(mk_affine_task("import"), "upload");
     let gate_hash = crate::primary::wire::compute_task_hash(&gate);
-    s.tasks.insert(
-        gate_hash.clone(),
-        TaskState::Blocked {
-            task: gate,
-            on: upload_hash.clone(),
-            attempt: 0,
-        },
-    );
+    super::seed_blocked(&mut s, &gate_hash, gate, upload_hash.clone(), 0);
 
     // The build B depends on the gate; it is Blocked on it.
     let build = with_dep(mk_task("build"), "import");
     let build_hash = crate::primary::wire::compute_task_hash(&build);
-    s.tasks.insert(
-        build_hash.clone(),
-        TaskState::Blocked {
-            task: build,
-            on: gate_hash.clone(),
-            attempt: 0,
-        },
-    );
+    super::seed_blocked(&mut s, &build_hash, build, gate_hash.clone(), 0);
 
     // The upload succeeds → its SetupCompleted apply auto-resumes the gate
     // Blocked → Pending (the resume surface the originator reads).

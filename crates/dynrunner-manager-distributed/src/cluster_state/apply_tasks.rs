@@ -126,14 +126,19 @@ impl<I: Identifier> ClusterState<I> {
     }
 
     pub(super) fn resume_blocked_on(&mut self, prereq_hash: &str) -> Vec<TaskInfo<I>> {
-        let to_resume: Vec<String> = self
-            .tasks
-            .iter()
-            .filter_map(|(h, s)| match s {
-                TaskState::Blocked { on, .. } if on == prereq_hash => Some(h.clone()),
-                _ => None,
-            })
-            .collect();
+        // O(|dependents|) lookup against the `blocked_by` reverse-index
+        // (#547) — replaces the pre-fix O(|tasks|) full-HashMap scan whose
+        // cost compounded under recursive batch cascades (a large
+        // `TaskCompleted` / `SetupCompleted` / `AffineReady` batch fires one
+        // `resume_blocked_on` PER terminal, each pre-fix walking the full
+        // ledger). The index is maintained by the SOLE `set_task_state`
+        // write seam (see `range_digest.rs`) so its contents are equal to a
+        // fresh scan over `self.tasks` for `Blocked { on: prereq_hash, .. }`
+        // entries by construction. Empty/missing bucket ⇒ no dependents.
+        let to_resume: Vec<String> = match self.blocked_by.get(prereq_hash) {
+            Some(set) => set.iter().cloned().collect(),
+            None => Vec::new(),
+        };
         let mut resumed: Vec<TaskInfo<I>> = Vec::with_capacity(to_resume.len());
         for h in to_resume {
             // Read the still-present Blocked entry by reference and clone out

@@ -99,14 +99,7 @@ fn blocked_dependent_resumes_when_setup_succeeds() {
     );
     let dependent = mk_task("dependent");
     let dep_hash = crate::primary::wire::compute_task_hash(&dependent);
-    s.tasks.insert(
-        dep_hash.clone(),
-        TaskState::Blocked {
-            task: dependent,
-            on: setup_hash.clone(),
-            attempt: 0,
-        },
-    );
+    super::seed_blocked(&mut s, &dep_hash, dependent, setup_hash.clone(), 0);
 
     // The setup task succeeds (set directly), then the cascade-resume
     // runs for its hash — exactly what the executor (P2) will drive.
@@ -237,14 +230,7 @@ fn setup_completed_mutation_resumes_blocked_dependent() {
     );
     let dependent = mk_task("dependent");
     let dep_hash = crate::primary::wire::compute_task_hash(&dependent);
-    s.tasks.insert(
-        dep_hash.clone(),
-        TaskState::Blocked {
-            task: dependent,
-            on: setup_hash.clone(),
-            attempt: 0,
-        },
-    );
+    super::seed_blocked(&mut s, &dep_hash, dependent, setup_hash.clone(), 0);
 
     // Apply the success terminal through the mutation; the arm's
     // resume_blocked_on unblocks the dependent.

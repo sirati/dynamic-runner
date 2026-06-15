@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 mod affine;
 mod apply_basics;
+mod blocked_by_index;
 mod cascade_and_reinject;
 mod convergence;
 mod custom_messages;
@@ -42,6 +43,23 @@ mod snapshot;
 mod stream;
 mod task_outputs;
 mod task_state_change;
+
+/// Test-only Blocked-seed helper that routes through the canonical
+/// `set_task_state` write seam — keeps the `blocked_by` reverse-index (#547)
+/// in sync, exactly like the production apply arms do. Pre-fix tests that
+/// inserted `TaskState::Blocked` directly via `s.tasks.insert` (a path that
+/// also bypasses the range-fold memo and the #520 narration emit) silently
+/// broke the cascade tests once the index became load-bearing for
+/// `resume_blocked_on`.
+pub(super) fn seed_blocked(
+    state: &mut ClusterState<RunnerIdentifier>,
+    hash: &str,
+    task: TaskInfo<RunnerIdentifier>,
+    on: String,
+    attempt: u32,
+) {
+    state.rewrite_blocked_for_test(hash, on, task, attempt);
+}
 
 pub(super) fn mk_task(name: &str) -> TaskInfo<RunnerIdentifier> {
     TaskInfo {

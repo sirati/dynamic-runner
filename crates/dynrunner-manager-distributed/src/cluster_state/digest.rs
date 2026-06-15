@@ -221,6 +221,11 @@ impl<I: Identifier> ClusterState<I> {
             // its own (it is excluded from the digest exactly like the scalar
             // memo). Bound for the exhaustive guard.
             range_fold_memo: _range_fold_memo,
+            // node-local: the `blocked_by` reverse-index (#547) is a pure
+            // derivation of the `Blocked { on, .. }` entries in `tasks`, so
+            // it carries no INDEPENDENT convergence signal — the `tasks_hash`
+            // fold above already covers them. Bound for the exhaustive guard.
+            blocked_by: _blocked_by,
             // Settled spill store: the settled half of the tasks fold.
             // Each settled entry's XOR term was moved from the live fold
             // into `tasks_hash_acc` at spill-commit time (value-preserving

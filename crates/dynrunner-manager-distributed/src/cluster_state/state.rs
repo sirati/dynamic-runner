@@ -528,6 +528,43 @@ pub struct ClusterState<I> {
     /// its restored ledger, see `clone`), NOT snapshotted. Bound to a
     /// `_`-name in every exhaustive-destructure guard.
     pub(super) range_fold_memo: super::range_fold_memo::RangeFoldMemo,
+    /// Node-local incremental reverse-index of `Blocked` dependents (#547).
+    ///
+    /// For every `(prereq_hash, dependent_hash)` such that the LIVE in-memory
+    /// `tasks` entry under `dependent_hash` is `TaskState::Blocked { on:
+    /// prereq_hash, .. }`, this map records `prereq_hash -> { …dependent_hash
+    /// … }`. Maintained INCREMENTALLY by the SINGLE
+    /// [`Self::set_task_state`] write seam (see `range_digest.rs`): when a
+    /// state CHANGES, the OLD slot's `Blocked.on` mapping is dropped and the
+    /// NEW slot's `Blocked.on` mapping (if Blocked) is inserted, so the index
+    /// stays equal to a fresh scan over `self.tasks` by construction.
+    ///
+    /// Single concern: O(|dependents|) dependent-lookup for
+    /// [`Self::resume_blocked_on`], replacing the prior O(|tasks|) full-fat-
+    /// HashMap scan. The amplifier in #547's Mechanism 2 (recursive
+    /// `AffineReady` apply on a large spawn batch fires N_gates ×
+    /// `resume_blocked_on` synchronously inside `apply_locally_for_broadcast`)
+    /// hit O(N_gates × |tasks|) ≈ 46 M HashMap iterations per spawn batch on
+    /// the asm-dataset reproducer; this index makes each `resume_blocked_on`
+    /// cost proportional to the actual dependents to wake, not the ledger
+    /// size.
+    ///
+    /// Why the SETTLED half is irrelevant: `settle_eligible` rejects
+    /// `Blocked` (the only settle-eligible states are terminals), so a
+    /// `Blocked` entry never spills and a settled entry never re-enters
+    /// `tasks` as `Blocked` (rehydrate inserts the terminal state it was
+    /// settled at, and any subsequent merge that lands `Blocked` routes
+    /// through `set_task_state`). The index therefore only needs to track
+    /// the fat in-memory half.
+    ///
+    /// Classification: a pure DERIVATION of `self.tasks` (like
+    /// `range_fold_memo` / `digest_cache`) — NOT replicated, NOT folded into
+    /// the digest, NOT crossed over the wire. Clone copies it verbatim
+    /// (the source's `tasks` is byte-identical to the clone's, so the
+    /// derivation transfers), snapshot/restore re-build it through the
+    /// same per-entry `set_task_state` seam every merge routes through.
+    /// Bound to a `_`-name in every exhaustive-destructure guard.
+    pub(super) blocked_by: HashMap<String, HashSet<String>>,
     /// Settled-entry disk spill: the node-local STORAGE BACKEND for the
     /// join-fixed-point slice of `tasks` (see `cluster_state::settled`).
     /// A settled entry's fat body lives in the append-only spill file;
@@ -614,6 +651,11 @@ where
             // so the source's maintained fold is exactly correct for the
             // clone (and a direct copy is cheaper than re-folding the ledger).
             range_fold_memo,
+            // Node-local Blocked reverse-index (#547) — a pure derivation of
+            // the cloned `tasks` map, so it is copied through verbatim below
+            // for the same reason as `range_fold_memo`: a direct map clone is
+            // cheaper than re-walking `tasks` to rebuild the index.
+            blocked_by,
             // Settled store: carried READ-ONLY (index + shared read fds;
             // the writer affiliation is dropped — one-writer rule).
             settled,
@@ -694,6 +736,11 @@ where
             // source's maintained fold already satisfies the invariant for
             // the clone (no re-fold needed).
             range_fold_memo: range_fold_memo.clone(),
+            // Node-local Blocked reverse-index — copied verbatim (same
+            // rationale as `range_fold_memo`: the source's `tasks` is the
+            // clone's, so the source's maintained index already satisfies
+            // the invariant for the clone).
+            blocked_by: blocked_by.clone(),
             // Settled store: read-only carry — the cloned replica keeps
             // serving settled reads through the shared `Arc<File>`
             // segments but never writes the source's file.
@@ -750,6 +797,7 @@ where
             digest_cache,
             digest_fold_count,
             range_fold_memo: _range_fold_memo,
+            blocked_by,
             settled,
         } = self;
         f.debug_struct("ClusterState")
@@ -792,6 +840,7 @@ where
             .field("dead_rejoin_warn", &dead_rejoin_warn.len())
             .field("digest_cache", &digest_cache.get().is_some())
             .field("digest_fold_count", &digest_fold_count.get())
+            .field("blocked_by", &blocked_by.len())
             .field("settled", settled)
             .finish()
     }
@@ -838,6 +887,7 @@ impl<I> Default for ClusterState<I> {
             digest_cache: std::cell::Cell::new(None),
             digest_fold_count: std::cell::Cell::new(0),
             range_fold_memo: super::range_fold_memo::RangeFoldMemo::default(),
+            blocked_by: HashMap::new(),
             settled: super::settled::SettledStore::default(),
         }
     }
