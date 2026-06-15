@@ -87,6 +87,7 @@ where
                 zip_file,
                 local_path,
                 predecessor_outputs,
+                supplanted_holder,
                 ..
             } => {
                 // Run-terminal gate (asm-dataset run_20260611_112116,
@@ -161,6 +162,60 @@ where
                     self.send_to_primary(msg).await?;
                     return Ok(());
                 }
+                // Pre-start fence A (#530a): supplanted-holder gate. The
+                // dispatch carries a hint identifying the ORIGINAL holder
+                // and its `peer_member_gen` AT REMOVAL TIME, if any. When
+                // the supplanted holder is alive again at gen ≥ supplanted
+                // gen (its peer-removal was false-dead — the run_20260612
+                // #518 wasted-compute window), this node REFUSES to start a
+                // duplicate copy. The reply routes through the same
+                // already-held-style primitive so the primary's
+                // `handle_task_failed` classifier recognises the marker
+                // and reconciles + withdraws via the existing
+                // `note_task_already_held` → `reconcile_authoritative_holder`
+                // path; the LIVE original holder remains authoritative.
+                //
+                // A pre-#530 sender that omits the hint falls through (the
+                // pre-existing #518 inflight-reconcile post-start dedup
+                // contract is preserved). A hint whose holder is no longer
+                // alive (the death was genuine, no re-admission) also
+                // falls through — the dispatch is legitimate.
+                if let Some((peer, supplanted_gen)) = &supplanted_holder {
+                    let alive = self.cluster_state.is_peer_alive(peer);
+                    let live_gen = self.cluster_state.peer_member_gen(peer);
+                    if alive && live_gen >= *supplanted_gen {
+                        tracing::warn!(
+                            task_hash = %file_hash,
+                            supplanted_peer = %peer,
+                            supplanted_gen = *supplanted_gen,
+                            live_gen,
+                            "TaskAssignment supplanted-holder fence (#530a): \
+                             the original holder is alive again at gen >= the \
+                             supplanted gen; refusing to start a duplicate \
+                             copy; replying so the primary reconciles and \
+                             withdraws (the live original holder is \
+                             authoritative)"
+                        );
+                        let msg = DistributedMessage::TaskFailed {
+                            target: None,
+                            sender_id: self.config.secondary_id.clone(),
+                            timestamp: timestamp_now(),
+                            secondary_id: self.config.secondary_id.clone(),
+                            worker_id,
+                            task_hash: file_hash.clone(),
+                            error_type: ErrorType::Recoverable,
+                            error_message:
+                                super::TASK_SUPPLANTED_BY_LIVE_HOLDER_WIRE_MESSAGE.into(),
+                            // Stamped at the send_to_primary chokepoint (#352).
+                            delivery_seq: None,
+                            // Stamped at the send_to_primary chokepoint (ordering gate).
+                            msgs_posted_through: None,
+                        };
+                        self.send_to_primary(msg).await?;
+                        return Ok(());
+                    }
+                }
+
                 // Resolve binary path via the three-mode helper
                 // (uses_file_based_items / pre_staged_mode / default
                 // extraction-cache). See `resolve_for_dispatch` for

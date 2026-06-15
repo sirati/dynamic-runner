@@ -206,6 +206,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         // is identical regardless of which path fires.
                         let predecessor_outputs =
                             gather_predecessor_outputs(&self.cluster_state, &binary);
+                        // Pre-start fence A (#530a): supplanted_holder is
+                        // `Some` IFF this hash is a dead-secondary-requeue
+                        // redirect; the side-map entry is LEFT in place
+                        // across the assignment-failure rollback path below
+                        // so a re-dispatch stays fenced, and is dropped
+                        // only on terminal.
+                        let supplanted_holder = self.supplanted_holders.get(&task_hash).cloned();
                         let assignment_msg = DistributedMessage::TaskAssignment {
                             target: None,
                             sender_id: self.config.node_id.clone(),
@@ -217,6 +224,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             local_path: self.config.wire_local_path(&binary),
                             file_hash: task_hash.clone(),
                             predecessor_outputs,
+                            supplanted_holder,
                         };
 
                         // Same partial-commit-leak rollback as

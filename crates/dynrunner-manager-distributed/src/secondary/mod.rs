@@ -47,6 +47,11 @@ mod dispatch;
 // private (same pattern as `resource::NO_FAULT_PREEMPT_WIRE_MESSAGE`,
 // which rides its module's existing `pub(crate)` visibility).
 pub(crate) use dispatch::TASK_ALREADY_HELD_WIRE_MESSAGE;
+// Pre-start fence A marker (#530a) — emitter-owned (the router's
+// TaskAssignment fence arm emits it), consumed by the primary's
+// `handle_task_failed` classifier. Same visibility shape as
+// `TASK_ALREADY_HELD_WIRE_MESSAGE`.
+pub(crate) use dispatch::TASK_SUPPLANTED_BY_LIVE_HOLDER_WIRE_MESSAGE;
 mod election;
 mod lifecycle;
 // `pub(crate)` only so the `cascade_drain_done` pool-cascade primitive

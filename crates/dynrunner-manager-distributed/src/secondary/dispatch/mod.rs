@@ -55,3 +55,24 @@ mod router;
 /// the contract can never drift.
 pub(crate) const TASK_ALREADY_HELD_WIRE_MESSAGE: &str =
     "task already held by this secondary; assignment is a duplicate";
+
+/// Wire `error_message` marker for the supplanted-holder pre-start fence
+/// reply (Fence A, #530): the secondary REFUSED to start a duplicate copy
+/// of a task whose original holder (a peer previously marked dead) is
+/// alive again at a `peer_member_gen` ≥ the supplanted gen carried on
+/// `TaskAssignment.supplanted_holder`. Sent as a `TaskFailed` so the
+/// primary's `handle_task_failed` classifier routes it: this is the
+/// authoritative refuse-to-double-execute signal — the live original
+/// holder is the authoritative one. The primary reconciles + withdraws
+/// the duplicate via the existing already-held machinery
+/// (`note_task_already_held` / `reconcile_authoritative_holder`).
+///
+/// Sibling of [`TASK_ALREADY_HELD_WIRE_MESSAGE`] (the post-fact coherence
+/// report) but distinct: that marker fires when THIS secondary catches a
+/// duplicate ITSELF holds; #530a fires when this secondary catches the
+/// SUPPLANTED HOLDER alive before it starts running the duplicate. One
+/// emitter constant; both sides reference it so the contract can never
+/// drift.
+pub(crate) const TASK_SUPPLANTED_BY_LIVE_HOLDER_WIRE_MESSAGE: &str =
+    "task supplanted holder is alive again at gen >= supplanted gen; \
+     refusing to start a duplicate (#530a)";

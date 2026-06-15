@@ -135,6 +135,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // in `primary/task/request.rs` so the wire shape is
                 // identical regardless of which path fires.
                 let predecessor_outputs = gather_predecessor_outputs(&self.cluster_state, &binary);
+                // Pre-start fence A (#530a) — same contract as the sibling
+                // request-driven dispatch in `primary/task/request.rs`:
+                // supplanted_holder is `Some` IFF this hash is a
+                // dead-secondary-requeue redirect; left in place across
+                // the assignment-failure rollback so a re-dispatch stays
+                // fenced.
+                let supplanted_holder = self.supplanted_holders.get(&task_hash).cloned();
                 let assignment_msg = DistributedMessage::TaskAssignment {
                     target: None,
                     sender_id: self.config.node_id.clone(),
@@ -146,6 +153,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     local_path: self.config.wire_local_path(&binary),
                     file_hash: task_hash.clone(),
                     predecessor_outputs,
+                    supplanted_holder,
                 };
 
                 // Transport-send failure rollback: pre-fix the
