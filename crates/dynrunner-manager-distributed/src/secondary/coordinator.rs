@@ -123,6 +123,12 @@ where
         let mut cluster_state = ClusterState::new();
         let settled_spill =
             crate::settled_spill::SettledSpillDriver::start("secondary", &mut cluster_state);
+        // Snapshot the secondary's id off `config` BEFORE the struct
+        // literal moves it (matches `setup_deadline` / `own_tick_health`
+        // / `forwarded_argv`'s pre-move snapshot pattern). Owned by the
+        // #556 consensus FSM, which holds the self-id verbatim for the
+        // probe-target self-filter and the responder-id stamping.
+        let consensus_self_id = config.secondary_id.clone();
         let mut this = Self {
             config,
             client,
@@ -228,6 +234,12 @@ where
             collection_stats: crate::collection_stats::CollectionStatsEmitter::new(
                 std::time::Instant::now(),
             ),
+            // #556 mesh-consensus FSM, default-constructed at Idle. The
+            // dispatch router routes inbound consensus frames into it;
+            // the keepalive arm drives `poll(now)` ~once per second.
+            consensus_fsm:
+                crate::secondary::consensus::SecondaryConsensusFsm::new(consensus_self_id),
+            consensus_mixed_version_warned: std::collections::HashSet::new(),
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route

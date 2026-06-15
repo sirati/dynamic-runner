@@ -1006,4 +1006,26 @@ where
     /// (`observe_collection_stats`); policy + thresholds live in
     /// [`crate::collection_stats`].
     pub(in crate::secondary) collection_stats: crate::collection_stats::CollectionStatsEmitter,
+
+    /// #556 mesh-consensus FSM (secondary side). The dispatch router
+    /// routes inbound `SuspectPeers`/`RestartRequest`/`PeerProbe`/
+    /// `PeerProbeAck` frames into this FSM; the keepalive arm of
+    /// `process_tasks` drives `poll(now)` ~once per second so probe
+    /// deadlines fire on time. Frames the FSM emits flow back out
+    /// through the existing `send_to` egress (broadcast for `ResolvedPeer`
+    /// / `RestartConfirm`, role-routed for `PeerProbe`, prober-addressed
+    /// for `PeerProbeAck`). The FSM is single-owner-non-async; every
+    /// transition runs inline inside the operational loop.
+    pub(in crate::secondary) consensus_fsm:
+        crate::secondary::consensus::SecondaryConsensusFsm<I>,
+
+    /// #556 mixed-version warning gate: peer ids we have already warned
+    /// about for a missing `slurm_job_id` in their
+    /// `PeerConnectionInfo`. A peer connecting from a pre-Layer 1 build
+    /// presents no `slurm_job_id` — consensus restart for that peer will
+    /// be unable to scancel its job in Layer 5, so the operator must
+    /// scancel manually. We emit one WARN per peer at first observation
+    /// and then stay silent (a chatty per-frame WARN is operator-spam).
+    pub(in crate::secondary) consensus_mixed_version_warned:
+        std::collections::HashSet<String>,
 }

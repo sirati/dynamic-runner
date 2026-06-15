@@ -99,6 +99,7 @@
 mod abort_gates;
 mod affine_exec;
 mod anti_entropy_heal;
+mod consensus_wiring;
 mod custom_messages;
 mod dead_worker_spin;
 mod deferrer_membership_death;

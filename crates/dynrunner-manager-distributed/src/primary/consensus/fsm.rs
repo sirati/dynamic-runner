@@ -264,6 +264,58 @@ impl<I> ConsensusFsm<I> {
         &self.state
     }
 
+    /// Drop a single peer from the local `SchedulingSuspect` set if it
+    /// is present. NO-OP in every other state — an in-flight round
+    /// (`BroadcastSuspect` onward) is round-id-locked, so a peer's
+    /// fresh-frame recovery during the round flows through `ResolvedPeer`
+    /// echoes from the other secondaries instead of an inline drop here.
+    /// Idle / terminal states return without effect.
+    ///
+    /// The lazy dispatch-altitude path (`requeue_silent_held_work_locally`
+    /// seeded the suspect set) needs a per-peer recovery hook because the
+    /// next sweep's `set_scheduling_suspect` would only narrow the set
+    /// when the WHOLE silent-held condition lifts; meanwhile a single
+    /// peer that re-proves itself with a fresh keepalive must exit
+    /// dispatch's #556 skip gate immediately so its workers re-enter
+    /// the dispatch order.
+    pub fn clear_scheduling_suspect_if_present(&mut self, peer_id: &str) {
+        if let ConsensusState::SchedulingSuspect(set) = &mut self.state
+            && set.remove(peer_id)
+            && set.is_empty()
+        {
+            self.state = ConsensusState::Idle;
+        }
+    }
+
+    /// Read-only view of the ACTIVE suspect set across every state that
+    /// carries one (`SchedulingSuspect`, `BroadcastSuspect`,
+    /// `CollectingResolutions`, `BroadcastRestart`, `CollectingConfirmations`).
+    /// Terminal / `Idle` states return an empty set.
+    ///
+    /// Layer 4 reads this on every coordinator-side
+    /// [`super::MeshSnapshot`] build so the side-gate's
+    /// `live_peer_count` denominator excludes the in-flight suspects
+    /// (the candidate confirmers are the non-suspected secondaries by
+    /// definition). Production code uses this read; tests prefer
+    /// [`Self::state`] for state-shape assertions.
+    pub fn in_flight_suspects(&self) -> &BTreeSet<String> {
+        // The empty-set marker for non-suspect-carrying states. Returned
+        // by reference so callers don't allocate; lifetime is bound to
+        // `&self`, same as `state()`.
+        static EMPTY: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+        match &self.state {
+            ConsensusState::SchedulingSuspect(s)
+            | ConsensusState::BroadcastSuspect { set: s, .. }
+            | ConsensusState::CollectingResolutions { set: s, .. }
+            | ConsensusState::BroadcastRestart { set: s, .. }
+            | ConsensusState::CollectingConfirmations { set: s, .. } => s,
+            ConsensusState::Idle
+            | ConsensusState::Restart(_)
+            | ConsensusState::DropSuspicion
+            | ConsensusState::AbortRound { .. } => EMPTY.get_or_init(BTreeSet::new),
+        }
+    }
+
     /// Apply a `ResolvedPeer` echo. Stale-round / wrong-state frames
     /// are silently ignored (the wire layer drops stale-round frames
     /// upstream too, but the FSM is defensive — a delayed delivery

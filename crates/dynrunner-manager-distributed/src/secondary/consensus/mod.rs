@@ -87,6 +87,7 @@
 
 pub mod fsm;
 pub mod jitter;
+mod wiring;
 
 #[cfg(test)]
 mod tests;

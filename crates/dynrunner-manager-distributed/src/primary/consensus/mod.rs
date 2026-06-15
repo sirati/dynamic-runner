@@ -83,6 +83,7 @@
 
 pub mod fsm;
 pub mod round;
+mod wiring;
 
 #[cfg(test)]
 mod tests;
