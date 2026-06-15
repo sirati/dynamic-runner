@@ -71,7 +71,7 @@ use std::time::{Duration, Instant};
 use dynrunner_core::{BoundedString, IMPORTANT_TARGET, Identifier};
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, Destination, DistributedMessage, KeepaliveRole, RemovalCause, SendTarget,
-    StateDigest, resolve_destination,
+    StateDigest, resolve_destination, routing_target_for,
 };
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -953,28 +953,28 @@ where
         })?;
         // Two `Destination`s: the routing send-target the mesh-pump dispatches
         // by, and the C3 stamp the RECEIVER's pump demuxes against its slots.
-        // They differ ONLY for a remote `Destination::Primary`: it is id-less,
-        // so the mesh cannot route it by host — `Mesh::dispatch`'s Primary arm
-        // can only `deliver_local`, and with no local primary slot it returns
-        // the C3-seam `Err` and the frame is DROPPED. So mirror the secondary's
-        // `(Primary, Peer(id)) → Secondary(id)` collapse (`resource.rs:119`):
-        // ROUTE under the resolved host's id so the mesh delivers it over the
-        // wire, but STAMP `Destination::Primary` so the receiver's pump demuxes
-        // to its primary slot.
-        let send_target: Destination = match (&dst, &target) {
-            (Destination::Primary, SendTarget::Peer(id)) => Destination::Secondary(id.clone()),
-            (_, SendTarget::Peer(_) | SendTarget::Broadcast) => dst.clone(),
-            // The observer is never the primary, so a self-resolved
-            // Destination::Primary is a logic-impossible case; drop it
-            // best-effort rather than self-addressing.
-            (_, SendTarget::Loopback) => {
-                tracing::debug!(
-                    "observer send resolved to self (impossible for a zero-authority \
-                     observer); dropping"
-                );
-                return Ok(());
-            }
-        };
+        // They differ ONLY for a remote `Destination::Primary` (the C2
+        // egress collapse). See `routing_target_for` for the single owner
+        // of the routing-target-vs-stamp dual semantic — the same helper
+        // that the secondary's edge calls.
+        //
+        // SELF-RESOLVED PRIMARY (observer-specific): an observer is never
+        // the primary, so a `SendTarget::Loopback` for `Destination::Primary`
+        // is a logic-impossible case here; drop it best-effort rather than
+        // self-addressing the observer's own slot via the helper's
+        // Loopback-stays-bare-Primary branch. This is a coordinator-local
+        // policy on top of the shared routing-target collapse; it does NOT
+        // belong inside `routing_target_for` (the secondary genuinely
+        // loopbacks Primary on a promoted-self send and must NOT be
+        // dropped).
+        if matches!(&dst, Destination::Primary) && matches!(&target, SendTarget::Loopback) {
+            tracing::debug!(
+                "observer send resolved to self (impossible for a zero-authority \
+                 observer); dropping"
+            );
+            return Ok(());
+        }
+        let send_target: Destination = routing_target_for(&dst, &target);
         // The C3 stamp is ALWAYS the role-bearing intent `dst` — what the
         // receiver demuxes to a slot. Only the routing send-target carries the
         // resolved host (for a remote, id-less `Destination::Primary`).

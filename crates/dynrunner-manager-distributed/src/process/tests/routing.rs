@@ -1084,3 +1084,292 @@ async fn cold_holder_view_keeps_the_local_fan_default() {
         "a cold view must never relay (no guessed holder, no wire traffic)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #551 — egress-loopback retention (the at-least-once contract repair).
+// ---------------------------------------------------------------------------
+//
+// The mesh-pump silently dropped queued frames whose loopback target's
+// `Arc` raced the dispatch — the sender observed `Ok` at
+// `MeshClient::send` and nothing retransmitted. The retain-for-resolution
+// hold fixes this: a `deliver_local == false` at dispatch retains the
+// frame keyed by the target role, replayed when the matching slot
+// registers or a retag moves a live slot into the matching field. These
+// tests REPLAY THE OBSERVED SEQUENCE on `Mesh::dispatch` directly (the
+// pump and the coordinator collapse are exercised separately), so a
+// regression that re-introduces the silent drop trips them.
+
+/// `Mesh::dispatch(Destination::Primary, ...)` with NO local Primary
+/// slot RETAINS the frame (the historical Err+silent-drop site) instead
+/// of returning Err. A subsequent `register_local_role(Primary, ...)`
+/// REPLAYS the held frame into the just-registered slot's inbox. The
+/// trunk regression test: on the pre-#551 code this returns Err and the
+/// frame is gone.
+#[tokio::test]
+async fn dispatch_loopback_primary_with_no_slot_retains_and_replays() {
+    let (transport, _r) = transport_with_remotes("host-a", &[]);
+    let mut mesh = Mesh::<TestId, _>::new(transport);
+    // No Primary slot registered: the dispatch's `deliver_local` returns
+    // false. Pre-#551 this surfaced an Err and the pump dropped the
+    // frame. Post-#551 it retains and returns Ok.
+    mesh.dispatch(
+        LocalRole::Secondary,
+        Destination::Primary,
+        frame("primary-bound-no-slot"),
+    )
+    .await
+    .expect("retain-for-resolution returns Ok; never drop silently");
+
+    // Now register the Primary. The replay drain inside
+    // `register_local_role` should land the held frame in the fresh
+    // inbox.
+    let (_p_slot, _p_client, mut primary_inbox) =
+        mesh.register_local_role(LocalRole::Primary, PeerId::from("host-a"));
+    let recv = primary_inbox
+        .try_recv()
+        .expect("retained frame replayed on register");
+    assert_eq!(sender_of(&recv), "primary-bound-no-slot");
+}
+
+/// A retag MOVES a live slot from `old` to `new` — `retag_local_role`
+/// re-drains the egress hold keyed to `new`. The shape the
+/// submitter-primary→observer relocation exercises: a Primary-bound
+/// frame queued while the Primary field is empty (the slot has just
+/// retagged AWAY from Primary into Observer) is retained, then a fresh
+/// `register_local_role(Primary, ...)` (the promotion) replays it. This
+/// test exercises the inverse case: a Secondary-bound frame queued while
+/// the Secondary field is empty is replayed when an existing slot
+/// RETAGS into the Secondary field.
+#[tokio::test]
+async fn dispatch_loopback_secondary_replayed_on_retag_into_field() {
+    let (transport, _r) = transport_with_remotes("host-a", &[]);
+    let mut mesh = Mesh::<TestId, _>::new(transport);
+    // Register the Primary first; no Secondary slot yet.
+    let (_p_slot, _p_client, _p_inbox) =
+        mesh.register_local_role(LocalRole::Primary, PeerId::from("host-a"));
+
+    // Dispatch a frame targeted at the local Secondary by id: dispatch's
+    // `is_local_host(id)` is true (the Primary slot's host matches) and
+    // `deliver_local(Secondary, ...)` returns false (no Secondary slot
+    // yet) — pre-#551 this fell through to `transport.send_to_peer`
+    // against THIS host's own id (a self-id send: nominally fails, and
+    // even if it didn't, it would never reach the future Secondary
+    // slot). Post-#551 it retains.
+    mesh.dispatch(
+        LocalRole::Primary,
+        Destination::Secondary(PeerId::from("host-a")),
+        frame("secondary-bound-no-slot"),
+    )
+    .await
+    .expect("retain-for-resolution returns Ok");
+
+    // Retag Primary → Secondary: the existing slot's Weak moves into the
+    // Secondary field. The retag drains the egress-hold keyed to
+    // Secondary. The (just-retagged) slot's inbound is the SAME channel
+    // as before — its inbox receives the replayed frame.
+    let mut shared_inbox = _p_inbox;
+    mesh.retag_local_role(LocalRole::Primary, LocalRole::Secondary);
+    let recv = shared_inbox
+        .try_recv()
+        .expect("retained frame replayed on retag-into-field");
+    assert_eq!(sender_of(&recv), "secondary-bound-no-slot");
+}
+
+/// Held entries are role-keyed: a `register_local_role(Primary, ...)`
+/// drains held PRIMARY-targeted frames but PRESERVES held
+/// SECONDARY-targeted ones (waiting for the Secondary's register).
+///
+/// Set-up: an Observer slot is registered first so the mesh knows the
+/// local host id (`is_local_host("host-a")` returns true for the
+/// Secondary-bound dispatch below, exercising the
+/// `is_local_host && deliver_local==false` retention branch rather than
+/// the wire path).
+#[tokio::test]
+async fn drain_egress_loopback_hold_is_role_keyed() {
+    let (transport, _r) = transport_with_remotes("host-a", &[]);
+    let mut mesh = Mesh::<TestId, _>::new(transport);
+    // Seed `local_peer_id` via an Observer registration: that role is
+    // independent of the Primary/Secondary slots the test queues frames
+    // for, so it doesn't interfere with the role-keyed drain assertions.
+    let (_o_slot, _o_client, _o_inbox) =
+        mesh.register_local_role(LocalRole::Observer, PeerId::from("host-a"));
+
+    // Queue two frames into the hold: one Primary-bound (Primary slot
+    // absent), one Secondary-bound at the local host (Secondary slot
+    // absent — is_local_host is true via the Observer registration above).
+    mesh.dispatch(LocalRole::Observer, Destination::Primary, frame("p-1"))
+        .await
+        .expect("retain Ok");
+    mesh.dispatch(
+        LocalRole::Observer,
+        Destination::Secondary(PeerId::from("host-a")),
+        frame("s-1"),
+    )
+    .await
+    .expect("retain Ok");
+
+    // Register the Primary first: only the Primary-bound frame should
+    // drain; the Secondary-bound one stays held.
+    let (_p_slot, _p_client, mut primary_inbox) =
+        mesh.register_local_role(LocalRole::Primary, PeerId::from("host-a"));
+    let p_recv = primary_inbox
+        .try_recv()
+        .expect("Primary-bound replayed on Primary register");
+    assert_eq!(sender_of(&p_recv), "p-1");
+    assert!(
+        primary_inbox.try_recv().is_none(),
+        "no Secondary-bound frame ever lands in the Primary inbox"
+    );
+
+    // Now register the Secondary: the second held frame should replay.
+    let (_s_slot, _s_client, mut secondary_inbox) =
+        mesh.register_local_role(LocalRole::Secondary, PeerId::from("host-a"));
+    let s_recv = secondary_inbox
+        .try_recv()
+        .expect("Secondary-bound replayed on Secondary register");
+    assert_eq!(sender_of(&s_recv), "s-1");
+}
+
+/// Eviction is loud and bounded: enqueue more held frames than
+/// [`super::super::mesh::EGRESS_LOOPBACK_HOLD_CAPACITY`] and the OLDEST
+/// is evicted (with a WARN — verified by side-effect: the freshest
+/// `CAPACITY` frames remain and replay). Test asserts the bound holds
+/// AND the surviving frames replay in arrival order on register.
+#[tokio::test]
+async fn egress_loopback_hold_overflows_loudly_and_keeps_newest() {
+    use super::super::mesh::EGRESS_LOOPBACK_HOLD_CAPACITY;
+
+    let (transport, _r) = transport_with_remotes("host-a", &[]);
+    let mut mesh = Mesh::<TestId, _>::new(transport);
+
+    // Push CAPACITY + 3 Primary-bound frames into the hold (no Primary
+    // slot exists, so each dispatch retains).
+    let total = EGRESS_LOOPBACK_HOLD_CAPACITY + 3;
+    for i in 0..total {
+        mesh.dispatch(
+            LocalRole::Secondary,
+            Destination::Primary,
+            frame(&format!("p-{i}")),
+        )
+        .await
+        .expect("retain Ok under overflow");
+    }
+
+    // Register Primary: the surviving frames replay in arrival order. The
+    // oldest 3 must have been evicted (loud, never silent — verified by
+    // counting survivors).
+    let (_p_slot, _p_client, mut primary_inbox) =
+        mesh.register_local_role(LocalRole::Primary, PeerId::from("host-a"));
+    let mut got: Vec<String> = Vec::new();
+    while let Some(msg) = primary_inbox.try_recv() {
+        got.push(sender_of(&msg).to_string());
+    }
+    assert_eq!(
+        got.len(),
+        EGRESS_LOOPBACK_HOLD_CAPACITY,
+        "hold caps at EGRESS_LOOPBACK_HOLD_CAPACITY survivors"
+    );
+    // First survivor is `p-3` (oldest 3 evicted); last is `p-{total-1}`.
+    assert_eq!(got.first().map(|s| s.as_str()), Some("p-3"));
+    assert_eq!(
+        got.last().map(|s| s.as_str()),
+        Some(format!("p-{}", total - 1)).as_deref()
+    );
+}
+
+/// The pre-#551 silent-drop site — the `Mesh::dispatch`'s
+/// `Destination::Primary` arm returning Err on a missing local Primary
+/// — is replaced by retain+Ok. This test replays the BUG SEQUENCE: pre-
+/// fix it asserted the dispatch returned Err with the C3-seam message;
+/// post-fix it asserts dispatch returns Ok AND the frame is recoverable
+/// from the hold via a subsequent register replay. Combined with
+/// [`dispatch_loopback_primary_with_no_slot_retains_and_replays`] this
+/// is the "production trunk regression" guard required by the
+/// fix-must-replay-the-observed-sequence rule.
+#[tokio::test]
+async fn dispatch_primary_missing_slot_never_drops_silently() {
+    let (transport, _r) = transport_with_remotes("host-a", &[]);
+    let mut mesh = Mesh::<TestId, _>::new(transport);
+
+    // No Primary slot. Pre-#551 this dispatch returned
+    // Err("Mesh::dispatch: remote Destination::Primary requires the
+    // resolved host id (C3 frame target)") and the pump's WARN-then-drop
+    // path fired.
+    let outcome = mesh
+        .dispatch(
+            LocalRole::Secondary,
+            Destination::Primary,
+            frame("trunk-regression"),
+        )
+        .await;
+    assert!(
+        outcome.is_ok(),
+        "no-Primary-slot dispatch must NOT return Err: the strengthened \
+         MeshClient::send contract forbids silent drops (#551). got: {outcome:?}"
+    );
+
+    // Recovery: registering Primary replays the held frame. (Without the
+    // hold the frame would be unrecoverable — the trunk regression
+    // shape.)
+    let (_p_slot, _p_client, mut primary_inbox) =
+        mesh.register_local_role(LocalRole::Primary, PeerId::from("host-a"));
+    assert_eq!(
+        sender_of(
+            &primary_inbox
+                .try_recv()
+                .expect("frame recoverable from the egress-loopback hold")
+        ),
+        "trunk-regression"
+    );
+}
+
+/// Wind-down semantics: `take_egress_loopback_hold` returns every still-
+/// held entry in arrival order, leaving the buffer empty. This is the
+/// data side of the pump's `WindDown` drain — the pump iterates the
+/// returned vector and WARNs each entry's kind/target/origin, then the
+/// abort proceeds. The "data-side correctness" guard: if a frame was
+/// retained pre-WindDown, the WindDown drain MUST surface it (the
+/// alternative — silent drop on shutdown — is the bug #551 closes).
+#[tokio::test]
+async fn take_egress_loopback_hold_returns_arrival_order_and_empties() {
+    let (transport, _r) = transport_with_remotes("host-a", &[]);
+    let mut mesh = Mesh::<TestId, _>::new(transport);
+
+    // Queue three Primary-bound frames into the hold (no Primary slot).
+    for name in ["wd-1", "wd-2", "wd-3"] {
+        mesh.dispatch(LocalRole::Secondary, Destination::Primary, frame(name))
+            .await
+            .expect("retain Ok");
+    }
+
+    // The WindDown drain pulls every held entry.
+    let drained = mesh.take_egress_loopback_hold();
+    let kinds: Vec<&str> = drained
+        .iter()
+        .map(|h| match &h.frame {
+            dynrunner_protocol_primary_secondary::DistributedMessage::Keepalive {
+                sender_id, ..
+            } => sender_id.as_str(),
+            other => panic!("unexpected frame: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["wd-1", "wd-2", "wd-3"],
+        "WindDown surfaces held frames in arrival order"
+    );
+    // Roles + targets are preserved on each entry.
+    for held in &drained {
+        assert_eq!(held.target_role, LocalRole::Primary);
+        assert_eq!(held.routing_target, Destination::Primary);
+        assert_eq!(held.origin, LocalRole::Secondary);
+    }
+    // Buffer is empty after the drain — a subsequent register has nothing
+    // to replay.
+    let (_p_slot, _p_client, mut primary_inbox) =
+        mesh.register_local_role(LocalRole::Primary, PeerId::from("host-a"));
+    assert!(
+        primary_inbox.try_recv().is_none(),
+        "WindDown drained the buffer; no late replay"
+    );
+}

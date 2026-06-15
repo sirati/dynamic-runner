@@ -4,7 +4,7 @@ use dynrunner_manager_local::oom::OomWatcher;
 use dynrunner_manager_local::pool::ResourcePressureResult;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    Destination, DistributedMessage, SendTarget, resolve_destination,
+    Destination, DistributedMessage, SendTarget, resolve_destination, routing_target_for,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -306,10 +306,10 @@ where
         // the receiver demuxes to a slot. The routing send-target carries the
         // resolved host ONLY for a remote `Destination::Primary` (id-less, so
         // the mesh can't route it by host without the resolution done here).
-        let send_target = match (&dst, &target) {
-            (Destination::Primary, SendTarget::Peer(id)) => Destination::Secondary(id.clone()),
-            _ => dst.clone(),
-        };
+        // The collapse pattern is shared with the observer's edge — see
+        // `routing_target_for` for the single owner of the
+        // routing-target-vs-stamp dual semantic.
+        let send_target = routing_target_for(&dst, &target);
         // Queue it. `MeshClient::send` is QUEUED (M4): the pump drains it and
         // routes loopback-or-remote against the live slots by `send_target`,
         // and the receiving pump demuxes by the stamped `dst`.

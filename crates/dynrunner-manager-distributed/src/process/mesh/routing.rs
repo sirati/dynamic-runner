@@ -20,7 +20,7 @@ use dynrunner_protocol_primary_secondary::address::Destination;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 
 use super::super::role::LocalRole;
-use super::Mesh;
+use super::{EgressHeld, Mesh};
 
 impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
     /// Deliver a frame to ONE local role slot (loopback).
@@ -69,27 +69,64 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
             }
             Destination::Primary => {
                 // Primary is id-less on the wire: a local primary is the
-                // loopback target. A REMOTE primary needs the resolved host
-                // id carried on the frame — a C3 seam (no `target` field
-                // yet); until then C2's egress collapse resolves
-                // `Destination::Primary` to a concrete id BEFORE dispatch,
-                // so this arm is unreachable in the wired system. Surface
-                // it loudly rather than silently drop.
-                if self.deliver_local(LocalRole::Primary, frame) {
+                // loopback target. The receiver-demuxes-by-stamp /
+                // sender-dispatches-by-routing-target asymmetry means a
+                // REMOTE primary's send rides the Secondary/Observer arm
+                // (its routing-target carries the resolved host id; the
+                // C3 stamp on the frame stays `Destination::Primary` so
+                // the receiver's `route_incoming` still picks the Primary
+                // slot). This arm therefore runs for the LOCAL loopback
+                // case only — and the `deliver_local` success path is the
+                // happy path on every primary-bound send from a same-host
+                // sibling.
+                //
+                // A `deliver_local == false` here means the slot's `Arc`
+                // raced the dispatch: graceful teardown (the Arc dropped
+                // between enqueue and apply), or a retag moved Primary
+                // out of its field before the next register filled it.
+                // The historical behaviour was to return Err — the pump
+                // logged a WARN and DROPPED the frame silently, violating
+                // the at-least-once contract `MeshClient::send` documents
+                // (#551). Instead retain the frame in the egress-loopback
+                // hold so a subsequent `register_local_role(Primary)` or
+                // `retag_local_role(_, Primary)` replays it through this
+                // dispatch, exactly as the ingress slotless hold replays
+                // through `route_incoming`.
+                if self.deliver_local(LocalRole::Primary, frame.clone()) {
                     return Ok(());
                 }
-                Err(
-                    "Mesh::dispatch: remote Destination::Primary requires the resolved \
-                     host id (C3 frame target)"
-                        .to_string(),
-                )
+                self.hold_egress_loopback(EgressHeld {
+                    target_role: LocalRole::Primary,
+                    origin,
+                    routing_target: target,
+                    frame,
+                });
+                Ok(())
             }
             Destination::Secondary(id) | Destination::Observer(id) => {
                 let role = LocalRole::from_destination(&target)
                     .expect("Secondary/Observer always carry a role");
-                if self.is_local_host(id) && self.deliver_local(role, frame.clone()) {
+                // Loopback-by-id: the routing-target names THIS host. The
+                // routing decision IS local delivery — failing it must
+                // retain (the same #551 contract as the Primary arm),
+                // NEVER bounce to the wire (the transport has no
+                // self-connection, so `send_to_peer(self_id, _)` would
+                // fail — and even if it didn't, sending to the wire just
+                // to land back here would skip the retain-for-resolution
+                // semantics on a slot that is about to register).
+                if self.is_local_host(id) {
+                    if self.deliver_local(role, frame.clone()) {
+                        return Ok(());
+                    }
+                    self.hold_egress_loopback(EgressHeld {
+                        target_role: role,
+                        origin,
+                        routing_target: target,
+                        frame,
+                    });
                     return Ok(());
                 }
+                // Remote target: the wire path.
                 self.transport.send_to_peer(id.as_str(), frame).await
             }
         }
@@ -549,6 +586,116 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
             arc.set_role(new);
         }
         self.set_slot(new, weak);
+        // Egress retain-for-resolution replay: a queued frame whose
+        // dispatch failed because the `new`-role slot was momentarily
+        // absent (the most common shape: a submitter-primary→observer
+        // swap that drained the Primary field, then a future register
+        // refilled it — but a `Destination::Primary` send queued in the
+        // gap landed here at dispatch with no live Primary, retained
+        // into the egress hold). A retag from `old` INTO `new` makes
+        // that slot live again under the `new` role. Replay any held
+        // frames keyed to `new` now; the `old` key is untouched (a
+        // retag never makes the old role live — the slot moved out of
+        // it). Sync because the replay only re-attempts LOCAL delivery
+        // through `deliver_local`; the wire path is unchanged by a
+        // retag, so a held remote-target frame stays held (its slot
+        // never lived locally anyway).
+        self.drain_egress_loopback_hold(new);
+    }
+
+    /// Buffer one queued egress frame whose dispatch resolved to a LOCAL
+    /// slot but found that slot momentarily absent (the Arc raced the
+    /// pump's apply — graceful teardown / retag). Replayed by
+    /// [`Self::drain_egress_loopback_hold`] when the matching slot
+    /// registers ([`super::Mesh::register_local_role`]) or a retag moves a
+    /// slot INTO the matching role's field ([`Self::retag_local_role`]) —
+    /// the strengthened `MeshClient::send` at-least-once contract (#551).
+    ///
+    /// Bounded ([`super::EGRESS_LOOPBACK_HOLD_CAPACITY`]): on overflow the
+    /// OLDEST held frame is evicted with a throttled WARN naming its
+    /// kind/target — never a silent drop. The hold itself also WARNs
+    /// (throttled) so the operator sees the loopback-race window without
+    /// one WARN per frame at wire rate during a long swap. The replay
+    /// re-enters this same dispatch loop (it does NOT skip the locality
+    /// check), so a target whose role later resolves to a remote (e.g.
+    /// because the role moved to another peer in the meantime) still
+    /// rides the wire path next time around — there is no "held-once-
+    /// always-loopback" trap.
+    pub(super) fn hold_egress_loopback(&mut self, held: EgressHeld<I>) {
+        if self.egress_loopback_hold.len() == super::EGRESS_LOOPBACK_HOLD_CAPACITY
+            && let Some(evicted) = self.egress_loopback_hold.pop_front()
+        {
+            tracing::warn!(
+                kind = ?evicted.frame.msg_type(),
+                target = ?evicted.routing_target,
+                target_role = ?evicted.target_role,
+                capacity = super::EGRESS_LOOPBACK_HOLD_CAPACITY,
+                "mesh egress: loopback-hold buffer full — dropping the OLDEST \
+                 held frame to admit a newer one (the slot-race window outran \
+                 the buffer bound)"
+            );
+        }
+        let kind = held.frame.msg_type();
+        let routing_target = held.routing_target.clone();
+        let target_role = held.target_role;
+        self.egress_loopback_hold.push_back(held);
+        if let Some(suppressed) = self.egress_loopback_hold_warn.permit() {
+            tracing::warn!(
+                kind = ?kind,
+                target = ?routing_target,
+                target_role = ?target_role,
+                held = self.egress_loopback_hold.len(),
+                suppressed_since_last_warn = suppressed,
+                "mesh egress: queued frame's loopback target has NO live local slot \
+                 (transient teardown / role-swap window between enqueue and apply); \
+                 HOLDING it for replay when the matching slot registers, rather than \
+                 dropping it (#551)"
+            );
+        }
+    }
+
+    /// Replay every held egress frame whose `target_role` matches `role`
+    /// through [`Self::deliver_local`], in arrival order. Called the
+    /// instant a slot for `role` becomes live, by both
+    /// [`super::Mesh::register_local_role`] (a fresh slot) and
+    /// [`Self::retag_local_role`] (an existing slot moved into the
+    /// `role` field).
+    ///
+    /// Sync because the replay attempts only LOCAL delivery: the only
+    /// state that changed between the original `deliver_local == false`
+    /// and now is the slot's presence, never the wire. A held frame
+    /// whose `target_role` does NOT match `role` is left in the buffer
+    /// (it is waiting on a different role's registration). A replayed
+    /// frame whose `deliver_local` STILL fails (the just-installed Arc
+    /// already died — a pathological race) is re-held under the same key
+    /// for the next register/retag of this role; the drain takes a
+    /// snapshot first, so this is a single bounded pass, never an
+    /// unbounded loop.
+    pub(super) fn drain_egress_loopback_hold(&mut self, role: LocalRole) {
+        if self.egress_loopback_hold.is_empty() {
+            return;
+        }
+        // Partition the held queue: matching entries are replayed now,
+        // non-matching entries are preserved in arrival order. The
+        // snapshot-then-replay shape mirrors `drain_slotless_hold` so
+        // re-holds during the same drain land at the back of the buffer
+        // and never see this pass again.
+        let snapshot: Vec<EgressHeld<I>> = self.egress_loopback_hold.drain(..).collect();
+        for held in snapshot {
+            if held.target_role != role {
+                // Preserve the other role's held entries (in arrival
+                // order, since we iterate the snapshot in order and
+                // push back).
+                self.egress_loopback_hold.push_back(held);
+                continue;
+            }
+            // The local-only retry: the matching slot just became live.
+            // A re-failure re-holds (e.g. the Arc died in the
+            // microseconds since register).
+            if !self.deliver_local(held.target_role, held.frame.clone()) {
+                self.hold_egress_loopback(held);
+            }
+        }
     }
 }
 

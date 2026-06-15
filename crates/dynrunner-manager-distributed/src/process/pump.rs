@@ -253,6 +253,26 @@ pub async fn run_pump<I, Tr>(
                                 tracing::debug!(%reason, "mesh-pump: wind-down egress apply returned an error");
                             }
                         }
+                        // Egress-loopback hold flush (#551): any frame still
+                        // retained for a never-arrived register/retag is
+                        // reported here with a WARN naming kind/target — the
+                        // genuine "process exited with undelivered frames"
+                        // case. This is the ONLY remaining drop site under
+                        // the strengthened `MeshClient::send` contract; the
+                        // alternative (silent drop) was the bug #551 fixed.
+                        for evicted in mesh.take_egress_loopback_hold() {
+                            tracing::warn!(
+                                kind = ?evicted.frame.msg_type(),
+                                target = ?evicted.routing_target,
+                                target_role = ?evicted.target_role,
+                                origin = ?evicted.origin,
+                                "mesh-pump: wind-down found a held egress frame \
+                                 whose loopback target never re-registered; \
+                                 reporting it as undelivered before the pump \
+                                 aborts (process is exiting with this frame still \
+                                 pending — operator-actionable, never silent)"
+                            );
+                        }
                         // Ack so the node's `wind_down().await` returns only
                         // after the drain — the drain provably precedes the
                         // abort. A dropped receiver (node already gone) is
@@ -279,15 +299,20 @@ pub async fn run_pump<I, Tr>(
                             );
                         }
                         // Capture the envelope identity BEFORE the apply
-                        // consumes the item: a failed apply is this frame's
-                        // TERMINAL drop (the coordinator's `MeshClient::send`
-                        // already returned Ok at enqueue time, so no caller
-                        // ever observes the wire failure — nothing
-                        // retransmits). WARN, never DEBUG: a snapshot reply
-                        // to a bootstrapping joiner that dies here is
-                        // otherwise invisible at production log levels (the
-                        // joiner just times out against a responder that
-                        // believes it answered).
+                        // consumes the item: a failed apply on the WIRE
+                        // path (the remote arm — `transport.send_to_peer`
+                        // returned an error, e.g. NoRoute) is this
+                        // frame's terminal drop. The LOOPBACK-race
+                        // failure path no longer reaches this Err — it
+                        // retains the frame in the mesh's egress-loopback
+                        // hold so a subsequent `register_local_role` /
+                        // `retag_local_role` replays it through dispatch
+                        // (the strengthened `MeshClient::send`
+                        // at-least-once contract — #551). WARN, never
+                        // DEBUG: a snapshot reply that dies on the wire
+                        // is otherwise invisible at production log levels
+                        // (the joiner just times out against a responder
+                        // that believes it answered).
                         let kind = item.frame.msg_type();
                         let target = item.target.clone();
                         if let Err(reason) = mesh.apply_local_dispatch(item).await {
@@ -295,9 +320,10 @@ pub async fn run_pump<I, Tr>(
                                 %reason,
                                 kind = ?kind,
                                 target = ?target,
-                                "mesh-pump: egress apply failed — the queued \
-                                 frame is DROPPED (the sender observed Ok at \
-                                 enqueue; nothing retransmits it)"
+                                "mesh-pump: egress apply failed on the wire path — \
+                                 the queued frame is DROPPED (the loopback-race \
+                                 path retains; only a transport-level send error \
+                                 reaches here)"
                             );
                         }
                     }
