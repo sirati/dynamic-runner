@@ -103,6 +103,7 @@ async fn drive_pre_ready_death(with_pid: bool) -> (String, ErrorType, String) {
                 binary: None,
             },
             &oom,
+            &mut FakeWorkerFactory,
         )
         .await
         .unwrap();
@@ -214,7 +215,7 @@ async fn mid_task_self_exit_reports_a_counted_task_failure() {
                 .recv_event()
                 .await
                 .expect("fresh subprocess must emit a Ready event");
-            secondary.handle_worker_event(ready, &oom).await.unwrap();
+            secondary.handle_worker_event(ready, &oom, &mut FakeWorkerFactory).await.unwrap();
             assert!(
                 secondary.op_mut().active_tasks.contains_key(&file_hash),
                 "Ready arm must bind the deferred task into active_tasks"
@@ -238,6 +239,7 @@ async fn mid_task_self_exit_reports_a_counted_task_failure() {
                         binary: Some(binary.clone()),
                     },
                     &oom,
+                    &mut FakeWorkerFactory,
                 )
                 .await
                 .unwrap();

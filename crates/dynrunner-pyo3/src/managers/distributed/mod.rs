@@ -136,18 +136,11 @@ pub(crate) struct PyDistributedManager {
     /// would deliver N+1 copies of each terminal task transition.
     pub(super) task_completed_listener: Option<Py<PyAny>>,
 
-    /// Optional Python SecondaryAffine import callable supplied at
-    /// `__init__` (#497 / #501). UNLIKE the two listeners above (a
-    /// single primary-side concern), the import action is a
-    /// per-secondary affine-executor concern: it is installed on EVERY
-    /// in-process secondary the manager spawns (via the inner
-    /// coordinator's `set_import_action`), bridged through
-    /// `crate::affine_action_bridge::PyImportAction`. Each spawned
-    /// secondary's run-once affine executor consults it when a work
-    /// task gates on a not-yet-locally-imported dependency. Absence
-    /// leaves each executor with no importer (a work task with no
-    /// affine dependency runs unchanged).
-    pub(super) import_action: Option<Py<PyAny>>,
+    /// (#577) The `import_action` field is GONE — SecondaryAffine gate
+    /// bodies now run in worker subprocesses dispatched via the normal
+    /// task-dispatch path; the consumer registers a `TaskTypeSpec` whose
+    /// `worker_module` holds the `@task_function` handler that executes
+    /// the gate body.
 
     /// Optional Python per-(gate,node) satisfied probe callable supplied at
     /// `__init__` (#537). UNLIKE the two listeners above (a single

@@ -97,7 +97,7 @@
 #![cfg(test)]
 
 mod abort_gates;
-mod affine_exec;
+mod affine_exec_on_worker;
 mod anti_entropy_heal;
 mod consensus_wiring;
 mod custom_messages;

@@ -94,7 +94,10 @@ async fn pending_first_bind_not_assigned_after_run_aborted() {
                 matches!(ready, WorkerEvent::Ready { worker_id: 0, .. }),
                 "expected Ready for worker 0; got {ready:?}"
             );
-            secondary.handle_worker_event(ready, &oom).await.unwrap();
+            secondary
+                .handle_worker_event(ready, &oom, &mut FakeWorkerFactory)
+                .await
+                .unwrap();
 
             assert!(
                 !secondary.op_mut().active_tasks.contains_key(&file_hash),

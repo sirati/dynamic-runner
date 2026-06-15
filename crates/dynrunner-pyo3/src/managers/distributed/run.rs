@@ -321,26 +321,19 @@ impl PyDistributedManager {
             .take()
             .map(crate::task_completed_bridge::PyTaskCompletedListener::new);
 
-        // Take the Python SecondaryAffine import callable (if any) out of
-        // `self` and wrap it as an `Arc<dyn ImportAction<RunnerIdentifier>>` at
-        // the bridge boundary, once under the GIL before `py.detach`. UNLIKE the
-        // two listeners above (installed on the in-process PRIMARY), the import
-        // action is a per-secondary affine-executor concern: the cloneable
-        // `Arc` is captured into the detached runtime and cloned per spawned
-        // secondary below, then installed via `set_import_action`. `Send + Sync`
-        // (the bridge's trait-object contract) lets the `Arc` cross `py.detach`.
-        let import_action = self
-            .import_action
-            .take()
-            .map(crate::affine_action_bridge::PyImportAction::new);
+        // (#577) `import_action` is GONE — SecondaryAffine gate bodies run
+        // in worker subprocesses dispatched via the normal task-dispatch
+        // path. The consumer registers a per-gate-type `TaskTypeSpec` whose
+        // `worker_module` holds the `@task_function` handler that executes
+        // the gate body.
 
-        // Same shape for the per-(gate,node) satisfied probe (#537): take the
-        // Python callable out of `self` and wrap it as an
+        // Per-(gate,node) satisfied probe (#537): take the Python callable
+        // out of `self` and wrap it as an
         // `Arc<dyn AffineSatisfiedProbe<RunnerIdentifier>>` at the bridge
-        // boundary, once under the GIL before `py.detach`. The cloneable `Arc`
-        // is captured into the detached runtime and cloned per spawned
-        // secondary below; each install runs via `set_affine_satisfied_probe`
-        // alongside `set_import_action`. `Send + Sync` (the trait-object
+        // boundary, once under the GIL before `py.detach`. The cloneable
+        // `Arc` is captured into the detached runtime and cloned per spawned
+        // secondary below; each install runs via
+        // `set_affine_satisfied_probe`. `Send + Sync` (the trait-object
         // contract) lets the `Arc` cross `py.detach`.
         let affine_satisfied_probe = self
             .affine_satisfied_probe
@@ -349,9 +342,9 @@ impl PyDistributedManager {
 
         // Take the Python upload callable (#336 P1 / #493 option-A) out of
         // `self` and wrap it as an `Arc<dyn UploadAction>` at the bridge
-        // boundary, once under the GIL before `py.detach`. UNLIKE the
-        // per-secondary `import_action`, the upload action is a PRIMARY-side
-        // executor concern (the source-owning member): it is installed ONCE
+        // boundary, once under the GIL before `py.detach`. The upload
+        // action is a PRIMARY-side executor concern (the source-owning
+        // member): it is installed ONCE
         // on the in-process primary via `set_upload_action`, mirroring
         // `PyPrimaryCoordinator::run`. The setup executor consults it when
         // an upload setup task (derived by the #336 P2 attach from any
@@ -525,16 +518,13 @@ impl PyDistributedManager {
                     let sec_scheduler_config = scheduler_config.clone();
                     let sec_panik_paths = panik_watcher_paths.clone();
                     let sec_panik_poll = panik_watcher_poll_interval;
-                    // Per-secondary clone of the affine import action (a cheap
-                    // `Arc` refcount bump). Each spawned secondary installs its
-                    // own clone via `set_import_action` below; the underlying
-                    // Python callable is shared (one consumer `import_task`).
-                    let sec_import_action = import_action.clone();
-                    // Per-secondary clone of the satisfied probe (#537) — same
-                    // cheap `Arc` refcount bump as the import action above. Each
-                    // spawned secondary installs its own clone via
-                    // `set_affine_satisfied_probe`; the underlying Python
-                    // callable is shared (one consumer
+                    // (#577) No `sec_import_action` — gate bodies run in
+                    // worker subprocesses; no per-secondary inline-Python
+                    // callable to thread through.
+                    // Per-secondary clone of the satisfied probe (#537) — a
+                    // cheap `Arc` refcount bump. Each spawned secondary
+                    // installs its own clone via `set_affine_satisfied_probe`;
+                    // the underlying Python callable is shared (one consumer
                     // `affine_instance_satisfied`).
                     let sec_affine_satisfied_probe = affine_satisfied_probe.clone();
                     let sec_memprofile_output_dir = memprofile_output_dir.clone();
@@ -731,24 +721,14 @@ impl PyDistributedManager {
                                 sec_scheduler_config.build_memory_scheduler(),
                                 estimator,
                             );
-                        // Install the Python import action (#497 / #501) BEFORE
-                        // `run` enters — same pre-run contract as the
-                        // out-of-process secondary (`managers/secondary/run.rs`).
-                        // The run-once affine executor reads it when a work task
-                        // gates on a not-yet-locally-imported SecondaryAffine
-                        // dependency; absence leaves the executor with no
-                        // importer (a work task with no affine dependency runs
-                        // unchanged). Each in-process secondary gets its own
-                        // `Arc` clone sharing the one consumer callable.
-                        if let Some(action) = sec_import_action {
-                            secondary.set_import_action(action);
-                        }
+                        // (#577) `set_import_action` is GONE — gate bodies
+                        // run in worker subprocesses dispatched via the normal
+                        // task-dispatch path; no inline-Python install needed.
                         // Install the per-(gate,node) satisfied probe (#537)
-                        // BEFORE `run()`. Same per-secondary pre-`run` contract
-                        // + `Arc`-clone share as the import action above; each
-                        // in-process secondary gets its own clone sharing the
-                        // one consumer callable. Absence leaves the executor
-                        // with today's behaviour bit-for-bit.
+                        // BEFORE `run()`. Each in-process secondary gets its
+                        // own `Arc` clone sharing the one consumer callable.
+                        // Absence leaves the executor with today's behaviour
+                        // bit-for-bit.
                         if let Some(probe) = sec_affine_satisfied_probe {
                             secondary.set_affine_satisfied_probe(probe);
                         }

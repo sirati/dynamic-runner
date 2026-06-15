@@ -65,6 +65,7 @@ async fn customs_dispatch_in_order_and_stale_generation_drops() {
                             data: vec![i; 3],
                         },
                         &oom,
+                        &mut FakeWorkerFactory,
                     )
                     .await
                     .unwrap();
@@ -86,6 +87,7 @@ async fn customs_dispatch_in_order_and_stale_generation_drops() {
                         data: b"dead".to_vec(),
                     },
                     &oom,
+                    &mut FakeWorkerFactory,
                 )
                 .await
                 .unwrap();

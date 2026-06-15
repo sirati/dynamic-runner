@@ -247,18 +247,11 @@ impl PySecondaryCoordinator {
             .take()
             .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
 
-        // Same shape for the import-action kwarg (#497 P6): take the Python
-        // import callable out of `self` and wrap it as an
-        // `Arc<dyn ImportAction<RunnerIdentifier>>` at the bridge boundary.
-        // Installed on the inner coordinator BEFORE `run()` enters — the
-        // run-once affine executor consults it when a work task gates on a
-        // not-yet-locally-imported SecondaryAffine dependency.
-        let import_action = self
-            .import_action
-            .take()
-            .map(crate::affine_action_bridge::PyImportAction::new);
+        // (#577) `import_action` is GONE — SecondaryAffine gate bodies run
+        // in worker subprocesses. The consumer registers a `TaskTypeSpec`
+        // whose `worker_module` holds the `@task_function` handler.
 
-        // Same shape for the per-(gate,node) satisfied probe kwarg (#537):
+        // Per-(gate,node) satisfied probe kwarg (#537):
         // take the Python probe callable out of `self` and wrap it as an
         // `Arc<dyn AffineSatisfiedProbe<RunnerIdentifier>>` at the bridge
         // boundary. Installed on the inner coordinator BEFORE `run()`
@@ -606,16 +599,9 @@ impl PySecondaryCoordinator {
                     secondary.register_lifecycle_listener(listener);
                 }
 
-                // Install the Python import action (#497 P6) BEFORE `run`
-                // enters — the run-once affine executor reads it when a work
-                // task gates on a not-yet-locally-imported SecondaryAffine
-                // dependency. Absence leaves the executor with no importer (a
-                // work task with no affine dependency runs unchanged; a work
-                // task that DOES gate fails as a wiring error). Same pre-run
-                // contract + `?Send`/relocation rationale as the upload action.
-                if let Some(action) = import_action {
-                    secondary.set_import_action(action);
-                }
+                // (#577) `set_import_action` is GONE — gate bodies run in
+                // worker subprocesses; the consumer's `TaskTypeSpec` for the
+                // affine type carries the `@task_function` handler.
 
                 // Install the Python per-(gate,node) satisfied probe (#537)
                 // BEFORE `run` enters — the run-once affine executor reads

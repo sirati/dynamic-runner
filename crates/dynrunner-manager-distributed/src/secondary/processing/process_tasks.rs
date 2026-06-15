@@ -54,8 +54,11 @@ const ARM_WORKER_RESTART: usize = 10;
 const ARM_SNAPSHOT_STREAM: usize = 11;
 const ARM_SETTLED_SPILL: usize = 12;
 const ARM_PULL: usize = 13;
-const ARM_AFFINE_IMPORT: usize = 14;
-const ARM_RESOURCE_STATS_EMIT: usize = 15;
+// (#577) the old ARM_AFFINE_IMPORT slot (id 14) is gone — affine gate-body
+// terminals come through the pool-event arm like every other worker
+// terminal. Resource-stats emit shifts up one to preserve a contiguous id
+// space.
+const ARM_RESOURCE_STATS_EMIT: usize = 14;
 
 /// Per-iteration inbox batch-drain bound (#491). After the awaited
 /// `inbox.recv()` arm yields ONE frame, the arm body synchronously sweeps
@@ -94,7 +97,6 @@ const PROCESS_TASKS_ARM_NAMES: &[&str] = &[
     "snapshot_stream",
     "settled_spill",
     "pull",
-    "affine_import",
     "resource_stats_emit",
 ];
 
@@ -203,11 +205,9 @@ where
         // entry already took it (the loop runs once per operational
         // span) — the arm then parks on `pending()`.
         let mut secondary_control_rx = self.secondary_control_rx.take();
-        // Off-loop SecondaryAffine-import completion receiver into a loop-local
-        // for the same partial-borrow reason as `secondary_control_rx` (#497
-        // P5). `None` only if a previous `process_tasks` entry already took it;
-        // the arm then parks on `pending()`.
-        let mut affine_import_rx = self.affine_import_rx.take();
+        // (#577) The off-loop SecondaryAffine-import completion receiver is
+        // GONE — gate bodies now run in worker subprocesses and their
+        // terminals arrive through the existing pool-event arm.
 
         let mut keepalive_interval = tokio::time::interval(self.config.keepalive_interval);
         // Skip (not Burst) missed ticks: after a host suspend/resume the
@@ -563,6 +563,7 @@ where
                             event,
                             &oom_watcher,
                             &mut secondary_control_rx,
+                            factory,
                         )
                         .await?;
                     }
@@ -750,53 +751,18 @@ where
                         }
                     }
                 }
-                // Off-loop SecondaryAffine-import completion arm (#497 P5).
-                // A detached `spawn_local` import task (driven off a
-                // `StartedRun` by `drive_affine_import`, so a multi-GB
-                // `nix-store --import` never blocks this loop) posts its
-                // classified completion here; the arm body runs the ON-loop
-                // release: drain the dependents queued behind the import, mark
-                // the hash locally-done on success, send one
-                // `LocalDependencyReleased` per dependent, and DISPATCH each
-                // released `B` onto its worker (the assignment the gate
-                // withheld). This MIRRORS the worker-completion mechanism (the
-                // pool arm receiving a `WorkerEvent` a worker monitor task
-                // posted through `event_tx`).
-                //
-                // Cancel-safety: `mpsc::UnboundedReceiver::recv` is documented
-                // cancel-safe; parking on `pending()` when the receiver was
-                // already taken mirrors the announcer / fatal-exit / secondary-
-                // control arms. The coordinator's own `affine_import_tx` clone
-                // keeps the channel alive, so a `None` here never fires inside
-                // `process_tasks`.
-                completion = async {
-                    match affine_import_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    arm_stats.record(ARM_AFFINE_IMPORT);
-                    if let Some(crate::secondary::affine_exec::AffineImportComplete {
-                        affine_hash,
-                        outcome,
-                    }) = completion
-                    {
-                        // The on-loop release is owned by the executor seam —
-                        // one body shared with the inline `run_affine_import_once`
-                        // (the run-once latch / queue stays inside the executor;
-                        // this arm only delivers the off-loop outcome + the
-                        // factory the deferred dispatch needs).
-                        if let Err(e) = self
-                            .complete_affine_import(affine_hash, outcome, factory)
-                            .await
-                        {
-                            tracing::warn!(
-                                error = %e,
-                                "affine-import completion release failed"
-                            );
-                        }
-                    }
-                }
+                // #577 — the pre-existing SecondaryAffine off-loop
+                // completion arm is GONE. Affine gate bodies now run in
+                // worker subprocesses dispatched via the normal
+                // worker-dispatch path (`assign_resolved_task`); their
+                // terminal `WorkerEvent::TaskCompleted` / `TaskFailed`
+                // arrives through the existing pool-event arm above and is
+                // recognized by `binary.kind.is_secondary_affine()` in
+                // `handle_worker_event`, which routes the outcome through
+                // `on_affine_gate_worker_terminal` → the same
+                // `complete_affine_import` release body. One event channel
+                // for ALL worker terminals — no separate affine seam.
+
                 // #575 aggregated-resource-sample emit arm: every 5
                 // minutes, build the wire-shape aggregate over the
                 // current 10-min rolling buffer (~12_000 samples at
@@ -1388,12 +1354,13 @@ where
         control_rx: &mut Option<
             tokio::sync::mpsc::UnboundedReceiver<super::super::control::SecondaryControlCommand>,
         >,
+        factory: &mut impl WorkerFactory<M>,
     ) -> Result<(), String> {
         if event.is_task_terminal() {
             self.flush_worker_message_pipeline().await;
         }
         self.drain_pending_control_commands(control_rx).await;
-        let restart = self.handle_worker_event(event, oom_watcher).await?;
+        let restart = self.handle_worker_event(event, oom_watcher, factory).await?;
         if let Some(wid) = restart {
             // SCHEDULE, never execute inline: the due
             // instant comes from the pool's startup-crash

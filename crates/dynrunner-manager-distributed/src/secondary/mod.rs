@@ -482,17 +482,6 @@ where
     /// [`crate::upload_action`].
     pub(super) upload_action: crate::upload_action::UploadActionHandle,
 
-    /// The import-action port for SecondaryAffine per-secondary IMPORTS (#497
-    /// P4). Consulted by this secondary's run-once affine executor
-    /// ([`affine_exec`]) when an assigned work task gates on a SecondaryAffine
-    /// dependency whose import is not yet locally done on THIS node. `None` on
-    /// a secondary whose work tasks never gate on an import; a registered
-    /// importer runs the per-secondary import AT MOST ONCE per affine hash,
-    /// gating ALL that node's workers' dependent tasks behind the single run.
-    /// Set before `run` via [`Self::set_import_action`]. See
-    /// [`crate::affine_action`].
-    pub(super) import_action: crate::affine_action::ImportActionHandle<I>,
-
     /// The OPTIONAL per-(gate,node) satisfied probe (#537). Consulted by
     /// this secondary's run-once affine executor ([`affine_exec`]) BEFORE
     /// the run-once latch — when the probe returns `true`, the gate's hash
@@ -559,27 +548,12 @@ where
     pub(super) secondary_control_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<control::SecondaryControlCommand>>,
 
-    /// Off-loop SecondaryAffine-import completion SENDER (#497 P5). Cloned
-    /// into each detached `spawn_local` import task by
-    /// [`Self::drive_affine_import`]; the task computes the classified
-    /// outcome and posts one
-    /// [`affine_exec::AffineImportComplete`](crate::secondary::affine_exec)
-    /// per import. Mirrors the worker-completion mechanism (the pool's
-    /// `event_tx` cloned into each worker monitor task): the import runs OFF
-    /// the coordinator loop so a multi-GB `nix-store --import` never blocks it,
-    /// and the completion lands back on the loop's `select!` arm via this
-    /// channel. Unbounded for the same reason as the other dispatcher channels
-    /// — the producing import task must never block; the volume is bounded by
-    /// the number of distinct per-secondary imports (one send per import).
-    pub(super) affine_import_tx:
-        tokio::sync::mpsc::UnboundedSender<affine_exec::AffineImportComplete>,
-
-    /// Off-loop SecondaryAffine-import completion receiver. Taken into a
-    /// loop-local at `process_tasks` entry (the same take-once discipline as
-    /// `secondary_control_rx`); the operational `select!` arm drains it and
-    /// runs the on-loop release ([`Self::complete_affine_import`]).
-    pub(super) affine_import_rx:
-        Option<tokio::sync::mpsc::UnboundedReceiver<affine_exec::AffineImportComplete>>,
+    /// (#577) The dedicated off-loop affine-import completion channel is
+    /// GONE — gate bodies now run in worker subprocesses dispatched via
+    /// `assign_resolved_task`, and their terminal `WorkerEvent::TaskCompleted`
+    /// / `TaskFailed` arrives through the existing pool-event arm. The
+    /// release body (`complete_affine_import`) is reached via
+    /// `on_affine_gate_worker_terminal` from `handle_worker_event`.
 
     /// Announcer-outbox sender. Cloned out via
     /// [`Self::attach_observer_announcer`] into the

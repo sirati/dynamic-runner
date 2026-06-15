@@ -28,7 +28,6 @@ use super::module;
     panik_watcher_paths = None,
     panik_watcher_poll_interval_secs = 10.0,
     finalize_run_config = None,
-    import_action = None,
     affine_instance_satisfied = None,
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -48,7 +47,6 @@ pub(crate) fn run_secondary<'py>(
     panik_watcher_paths: Option<Vec<std::path::PathBuf>>,
     panik_watcher_poll_interval_secs: f64,
     finalize_run_config: Option<Py<PyAny>>,
-    import_action: Option<Py<PyAny>>,
     affine_instance_satisfied: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     // Legacy positional `ram_bytes` retained for back-compat; the typed
@@ -131,18 +129,10 @@ pub(crate) fn run_secondary<'py>(
     if let Some(finalize) = finalize_run_config {
         kwargs.set_item("finalize_run_config", finalize)?;
     }
-    // The consumer's SecondaryAffine import callable (#497 / #501). Forwarded
-    // into the `RustSecondaryCoordinator` constructor's `import_action` kwarg,
-    // which stores it and installs it on the inner `SecondaryCoordinator` via
-    // `set_import_action` at `run()` start — the affine gate's import action.
-    // Absent (an out-of-tree caller / a task with no affine deps) omits the
-    // kwarg so the constructor's None default applies, matching every other
-    // optional secondary-side opt-in. WITHOUT this the distributed/SLURM
-    // secondary (the path `_dispatch_secondary` drives) silently dropped the
-    // action and every affine gate deadlocked "upstream unfulfillable".
-    if let Some(action) = import_action {
-        kwargs.set_item("import_action", action)?;
-    }
+    // (#577) The consumer's `import_action` kwarg is GONE — gate bodies run
+    // in worker subprocesses dispatched via the normal task-dispatch path.
+    // The consumer registers a `TaskTypeSpec` whose `worker_module` holds
+    // the `@task_function` handler.
     // The consumer's OPTIONAL per-(gate,node) satisfied probe (#537). Forwarded
     // into the `RustSecondaryCoordinator` constructor's
     // `affine_satisfied_probe` kwarg, which stores it and installs it on the

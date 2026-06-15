@@ -105,6 +105,7 @@ async fn predrain_orders_queued_customs_before_terminal_and_stamps_watermark() {
                     },
                     &oom,
                     &mut control_rx,
+                    &mut FakeWorkerFactory,
                 )
                 .await
                 .unwrap();
@@ -195,6 +196,7 @@ async fn terminal_with_no_prior_customs_stamps_zero() {
                         estimated_resources: ResourceMap::new(),
                     },
                     &oom,
+                    &mut FakeWorkerFactory,
                 )
                 .await
                 .unwrap();
@@ -315,6 +317,7 @@ async fn trace_426_completion_covers_customs_still_in_dispatcher_pipeline() {
                         },
                         &oom,
                         &mut control_rx,
+                        &mut FakeWorkerFactory,
                     )
                     .await
                     .unwrap();
@@ -331,6 +334,7 @@ async fn trace_426_completion_covers_customs_still_in_dispatcher_pipeline() {
                     },
                     &oom,
                     &mut control_rx,
+                    &mut FakeWorkerFactory,
                 )
                 .await
                 .unwrap();
@@ -419,6 +423,7 @@ async fn trace_426_completion_with_empty_pipeline_processes_immediately() {
                     },
                     &oom,
                     &mut control_rx,
+                    &mut FakeWorkerFactory,
                 ),
             )
             .await
@@ -490,6 +495,7 @@ async fn retained_terminal_replays_with_original_watermark() {
                         estimated_resources: ResourceMap::new(),
                     },
                     &oom,
+                    &mut FakeWorkerFactory,
                 )
                 .await
                 .unwrap();

@@ -14,6 +14,7 @@
 use std::time::Duration;
 
 use dynrunner_core::{ErrorType, Identifier, WorkerId};
+use dynrunner_manager_local::WorkerFactory;
 use dynrunner_manager_local::oom::{DisconnectFault, OomWatcher, classify_disconnect_fault};
 use dynrunner_manager_local::worker::WorkerEvent;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
@@ -48,6 +49,7 @@ where
         &mut self,
         event: WorkerEvent<I>,
         oom_watcher: &OomWatcher,
+        factory: &mut impl WorkerFactory<M>,
     ) -> Result<Option<WorkerId>, String> {
         // Generation gate (root fix for the type-shift-respawn wedge).
         //
@@ -142,6 +144,70 @@ where
                     // secondary just clears its OWN `active_tasks` slot
                     // (above) and reports its own worker's outcome to
                     // the primary role (below).
+
+                    // #577 — SecondaryAffine gate-body intercept. A
+                    // SecondaryAffine task's terminal NEVER becomes a
+                    // primary-bound `TaskComplete` / `TaskFailed` (the
+                    // primary's authoritative `AffineReady` origination
+                    // fires off the per-dependent `LocalDependencyReleased`
+                    // frames the release body emits, exactly as in the
+                    // pre-#577 inline-Python path). Instead, fold the
+                    // worker's outcome into an `AffineOutcome` and route
+                    // through `on_affine_gate_worker_terminal` → the same
+                    // `complete_affine_import` release body that drains the
+                    // queued dependents, marks `affine_done` on success,
+                    // and fails the dependents (re-routable per #495) on
+                    // failure. Worker-slot bookkeeping (clear_task,
+                    // reclaim_protocol, memuse, request_task_for_worker)
+                    // already ran above on the unchanged path.
+                    let is_affine_gate = binary
+                        .as_ref()
+                        .map(|b| b.kind.is_secondary_affine())
+                        .unwrap_or(false);
+                    if is_affine_gate {
+                        let outcome = if result.success {
+                            crate::secondary::affine_exec::AffineOutcome::Success
+                        } else {
+                            let error_type = result
+                                .error_type
+                                .clone()
+                                .unwrap_or(ErrorType::NonRecoverable);
+                            crate::secondary::affine_exec::AffineOutcome::Failure {
+                                error_type,
+                                reason: result
+                                    .error_message
+                                    .clone()
+                                    .unwrap_or_else(|| "Unknown error".into()),
+                            }
+                        };
+                        if let Err(e) = self
+                            .on_affine_gate_worker_terminal(hash.clone(), outcome, factory)
+                            .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                affine_hash = %hash,
+                                "affine gate-body completion release failed"
+                            );
+                        }
+                        // Request a next task for the worker that just
+                        // finished the gate body — the queued dependent the
+                        // release dispatched onto THIS slot already entered
+                        // assignment via `dispatch_released_affine_dependent`
+                        // → `assign_resolved_task`, which itself handles the
+                        // per-type respawn/binding; this request_task is the
+                        // belt-and-braces twin of the normal path's request
+                        // (no-ops if a dependent was just dispatched onto
+                        // the slot).
+                        self.request_task_for_worker(worker_id).await?;
+                        tracing::info!(
+                            worker_id,
+                            task_hash = ?log_task_hash,
+                            success = result.success,
+                            "affine gate body done"
+                        );
+                        return Ok(None);
+                    }
 
                     if result.success {
                         // Report completion to the current primary
@@ -360,6 +426,53 @@ where
 
                 if let Some(hash) = file_hash {
                     self.op_mut().active_tasks.remove(&hash);
+
+                    // #577 — SecondaryAffine gate-body disconnect intercept.
+                    // A worker that died mid-gate-body never reported a
+                    // wire terminal: synthesize the fault verdict's class
+                    // onto an `AffineOutcome::Failure` and route through
+                    // the SAME `on_affine_gate_worker_terminal` seam the
+                    // clean-terminal path uses. The release body fails the
+                    // queued dependents (re-routable per #495 on the
+                    // InfraLoss-equivalent Recoverable verdict so another
+                    // node retries its own dispatch; NonRecoverable on a
+                    // TaskFault that resolves NonRecoverable so the
+                    // cascade fires) and leaves `affine_done` untouched
+                    // (no poison).
+                    let is_affine_gate = binary
+                        .as_ref()
+                        .map(|b| b.kind.is_secondary_affine())
+                        .unwrap_or(false);
+                    if is_affine_gate {
+                        let (error_type, reason) = match &fault {
+                            DisconnectFault::InfraLoss => (
+                                ErrorType::Recoverable,
+                                "worker subprocess disconnected mid-affine-gate-body"
+                                    .to_string(),
+                            ),
+                            DisconnectFault::TaskFault(et) => (
+                                et.clone(),
+                                result
+                                    .error_message
+                                    .clone()
+                                    .unwrap_or_else(|| "affine gate-body worker disconnected".into()),
+                            ),
+                        };
+                        let outcome = crate::secondary::affine_exec::AffineOutcome::Failure {
+                            error_type,
+                            reason,
+                        };
+                        if let Err(e) = self
+                            .on_affine_gate_worker_terminal(hash, outcome, factory)
+                            .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                "affine gate-body disconnect release failed"
+                            );
+                        }
+                        return Ok(Some(worker_id));
+                    }
 
                     // Discriminate two Disconnected-event shapes on
                     // the SAME fault verdict computed above:
