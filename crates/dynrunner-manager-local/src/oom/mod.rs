@@ -90,6 +90,13 @@ pub struct ChargeSweepInputs {
 }
 
 impl ChargeSweepInputs {
+    /// Number of workers this sweep will read charges for. Read off
+    /// the inputs BEFORE moving them into the blocking pool — the
+    /// caller uses it for per-sweep telemetry (#586).
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
     /// Perform every blocking file read for this sweep: the host /
     /// cgroup reading once, plus each worker's memory charge. Pure
     /// blocking IO — intended to run inside `spawn_blocking`. A

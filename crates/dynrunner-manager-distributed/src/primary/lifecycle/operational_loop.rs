@@ -582,7 +582,167 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // request / completion / ClusterMutation through
             // `dispatch_message` — the same dispatcher the deleted arm
             // used, idempotent on every wire shape.
+            // ── Arm-priority discipline (#586) ─────────────────────────
+            // `biased;` polls arms top-to-bottom in source order; the
+            // FIRST READY arm wins each iteration. The order below is
+            // the explicit priority: (1) terminal emergency signals
+            // (panik / graceful_abort — rare oneshots that must always
+            // win when they fire), (2) ARM_INBOX (data path: starvation
+            // here = drain-strand and dep_graph-burst silence per
+            // #545/#566 RCA), (3) ARM_COMMAND (external control: same
+            // priority as inbox under the local manager's existing
+            // pattern), (4) operational arms in source order. There is
+            // no ARM_OOM_SWEEP on the primary (the OOM watcher runs
+            // only inside `process_tasks` on the secondary side),
+            // but the same arm-priority discipline applies: data-path
+            // arms must never lose tiebreaks to forensic / periodic
+            // work.
             tokio::select! {
+                biased;
+                // Panik (operator-initiated emergency stop) arm. The
+                // watcher's `oneshot::Receiver<PanikSignal>` resolves
+                // exactly once: with `Ok(signal)` on first-matching
+                // panik file, or with `Err(_)` if the watcher's
+                // sender was dropped (empty paths config or task
+                // abort on coordinator drop). On `Ok` we announce a
+                // self-authored `ClusterMutation::PeerRemoved
+                // { SelfDeparture }` (observability only) and stash the
+                // (matched_path, reason) on `self.panik_outcome` so
+                // the outer `run_pipeline` can translate it into
+                // `RunError::PanikShutdown`. Breaking out of the
+                // loop here mirrors the `transport_closed` exit shape:
+                // the operational loop's `Result<(), String>` signature
+                // does not need to change.
+                //
+                // `Err(_)` is treated as a no-op (watcher disabled or
+                // gracefully stopped); the loop continues. Setting
+                // the local to None on either branch prevents the
+                // resolved-already future from hot-looping the
+                // select.
+                panik = async {
+                    match panik_signal_rx.as_mut() {
+                        Some(rx) => rx.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    arm_stats.record(ARM_PANIK);
+                    panik_signal_rx = None;
+                    if let Ok(signal) = panik {
+                        let outcome = self
+                            .handle_panik_signal(signal.matched_path)
+                            .await;
+                        self.panik_outcome = Some(outcome);
+                        // Break the operational loop. The outer
+                        // `run_pipeline` consumes `panik_outcome`
+                        // after the loop returns Ok and surfaces
+                        // `RunError::PanikShutdown` to the caller.
+                        tracing::error!(
+                            "primary operational loop exiting via panik path"
+                        );
+                        break;
+                    }
+                }
+                // Operator graceful-abort trigger (SIGUSR2). A PRIMARY that
+                // receives the operator's SIGUSR2 IS the abort authority — it
+                // does NOT send a `GracefulAbortRequest` to itself (the
+                // observer's arm does that); it short-circuits straight into
+                // the SAME `initiate_graceful_abort` latch the wire handler
+                // drives. Idempotent: a re-sent signal against an
+                // already-latched freeze is a NoOp.
+                //
+                // The trigger is consumed through a DISJOINT-FIELD borrow of
+                // `self.graceful_abort_trigger` (the `self.inbox.recv()`
+                // pattern), NOT taken out into a loop local: a graceful-abort
+                // relocation (`graceful_abort_tick` → `relocate_primary_to`)
+                // cancels this loop mid-flight, and a taken-out trigger would
+                // be dropped on that cancellation; left on `self`, it rides
+                // `into_observer_handoff` onto the standalone observer so the
+                // relocated node keeps responding to operator SIGUSR2.
+                // `recv() == None` (stream closed) or `None` trigger
+                // (un-injected) both PARK inside the trigger — never a
+                // hot-loop. Cancel-safety: `GracefulAbortTrigger::recv` is
+                // cancel-safe (see its doc); a sibling arm winning drops and
+                // rebuilds the recv future without losing a queued signal.
+                sig = async {
+                    match self.graceful_abort_trigger.as_mut() {
+                        Some(trigger) => trigger.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    arm_stats.record(ARM_GRACEFUL_ABORT);
+                    if sig.is_some() {
+                        let own_id = self.config.node_id.clone();
+                        self.initiate_graceful_abort(&own_id).await;
+                    }
+                }
+                // Single mesh inbound arm. Priority (#586): placed FIRST
+                // among data arms under `biased;` — when the inbox is
+                // ready, no lower-priority arm (matcher, worker_mgmt,
+                // snapshot_stream, heartbeat, etc.) ever beats it to the
+                // iteration. The pre-#586 unbiased select! placed this
+                // arm after COMMAND/MATCHER/WORKER_MGMT/SNAPSHOT_STREAM
+                // in source order, which under steady-state load gave
+                // the periodic arms a structural tiebreak edge over the
+                // data path — same shape as the secondary's
+                // OOM_SWEEP-vs-INBOX starvation, now uniformly fixed
+                // across both loops.
+                //
+                // Reframes the #545/#566 dep_graph-burst 6min silence:
+                // under high spawn-batch arrival rate, the unbiased
+                // select! let MATCHER / WORKER_MGMT win racing ties
+                // over the inbox, the same arm-priority disease as
+                // #586's OOM_SWEEP-vs-INBOX. The biased order below
+                // resolves both.
+                msg = self.inbox.recv(), if !transport_closed => {
+                    arm_stats.record(ARM_INBOX);
+                    match msg {
+                        Some(m) => {
+                            // THE single inbound arm. Every wire shape —
+                            // welcome / cert / TaskRequest / TaskComplete
+                            // / TaskFailed / Keepalive / ClusterMutation
+                            // (incl. a promoted peer's broadcasts post-
+                            // demotion) — arrives here and threads through
+                            // `dispatch_message`, the one source of truth
+                            // for wire-shape handling.
+                            //
+                            // Idempotency: `cluster_state.apply` is
+                            // CRDT-idempotent, the `completed_tasks` /
+                            // `failed_tasks` HashSet inserts are
+                            // idempotent, and `handle_task_complete`
+                            // short-circuits on
+                            // `completed_tasks.contains(hash)` — so a
+                            // mutation that reaches the primary via more
+                            // than one peer-forward path is absorbed.
+                            self.dispatch_message(m, &mut command_rx).await?;
+                        }
+                        None => {
+                            // The operational inbox closed: every sender —
+                            // i.e. the role slot the mesh-pump delivers
+                            // through — is gone. On a PRIMARY this is
+                            // fatal-worthy, never routine: the mesh pump is
+                            // the ONLY router into this inbox, so no task
+                            // terminal, request, or mutation can ever
+                            // arrive again. Gate the arm so subsequent
+                            // select! iterations don't hot-poll a
+                            // permanently-resolved future (the closed-mpsc
+                            // hazard); the top-of-loop `transport_closed`
+                            // guard then BREAKS the loop into the run's
+                            // final accounting, where unresolved work is
+                            // classified stranded and surfaces as
+                            // `RunError::ClusterCollapsed` (non-zero exit)
+                            // — loud and terminal, never a silently
+                            // disabled arm that zombies the run.
+                            transport_closed = true;
+                            tracing::error!(
+                                "operational inbox closed — the mesh pump is \
+                                 gone; the primary cannot ingest any further \
+                                 frames. Exiting the operational loop into \
+                                 final accounting (outstanding work will be \
+                                 classified stranded)"
+                            );
+                        }
+                    }
+                }
                 cmd = async {
                     match command_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -709,56 +869,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                                 "worker-management signal channel closed; disabling \
                                  the worker-management arm for the remainder of \
                                  the loop"
-                            );
-                        }
-                    }
-                }
-                msg = self.inbox.recv(), if !transport_closed => {
-                    arm_stats.record(ARM_INBOX);
-                    match msg {
-                        Some(m) => {
-                            // THE single inbound arm. Every wire shape —
-                            // welcome / cert / TaskRequest / TaskComplete
-                            // / TaskFailed / Keepalive / ClusterMutation
-                            // (incl. a promoted peer's broadcasts post-
-                            // demotion) — arrives here and threads through
-                            // `dispatch_message`, the one source of truth
-                            // for wire-shape handling.
-                            //
-                            // Idempotency: `cluster_state.apply` is
-                            // CRDT-idempotent, the `completed_tasks` /
-                            // `failed_tasks` HashSet inserts are
-                            // idempotent, and `handle_task_complete`
-                            // short-circuits on
-                            // `completed_tasks.contains(hash)` — so a
-                            // mutation that reaches the primary via more
-                            // than one peer-forward path is absorbed.
-                            self.dispatch_message(m, &mut command_rx).await?;
-                        }
-                        None => {
-                            // The operational inbox closed: every sender —
-                            // i.e. the role slot the mesh-pump delivers
-                            // through — is gone. On a PRIMARY this is
-                            // fatal-worthy, never routine: the mesh pump is
-                            // the ONLY router into this inbox, so no task
-                            // terminal, request, or mutation can ever
-                            // arrive again. Gate the arm so subsequent
-                            // select! iterations don't hot-poll a
-                            // permanently-resolved future (the closed-mpsc
-                            // hazard); the top-of-loop `transport_closed`
-                            // guard then BREAKS the loop into the run's
-                            // final accounting, where unresolved work is
-                            // classified stranded and surfaces as
-                            // `RunError::ClusterCollapsed` (non-zero exit)
-                            // — loud and terminal, never a silently
-                            // disabled arm that zombies the run.
-                            transport_closed = true;
-                            tracing::error!(
-                                "operational inbox closed — the mesh pump is \
-                                 gone; the primary cannot ingest any further \
-                                 frames. Exiting the operational loop into \
-                                 final accounting (outstanding work will be \
-                                 classified stranded)"
                             );
                         }
                     }
@@ -1023,82 +1133,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 } => {
                     arm_stats.record(ARM_RESPAWN_JOIN);
                     self.handle_respawn_join(outcome);
-                }
-                // Panik (operator-initiated emergency stop) arm. The
-                // watcher's `oneshot::Receiver<PanikSignal>` resolves
-                // exactly once: with `Ok(signal)` on first-matching
-                // panik file, or with `Err(_)` if the watcher's
-                // sender was dropped (empty paths config or task
-                // abort on coordinator drop). On `Ok` we announce a
-                // self-authored `ClusterMutation::PeerRemoved
-                // { SelfDeparture }` (observability only) and stash the
-                // (matched_path, reason) on `self.panik_outcome` so
-                // the outer `run_pipeline` can translate it into
-                // `RunError::PanikShutdown`. Breaking out of the
-                // loop here mirrors the `transport_closed` exit shape:
-                // the operational loop's `Result<(), String>` signature
-                // does not need to change.
-                //
-                // `Err(_)` is treated as a no-op (watcher disabled or
-                // gracefully stopped); the loop continues. Setting
-                // the local to None on either branch prevents the
-                // resolved-already future from hot-looping the
-                // select.
-                panik = async {
-                    match panik_signal_rx.as_mut() {
-                        Some(rx) => rx.await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    arm_stats.record(ARM_PANIK);
-                    panik_signal_rx = None;
-                    if let Ok(signal) = panik {
-                        let outcome = self
-                            .handle_panik_signal(signal.matched_path)
-                            .await;
-                        self.panik_outcome = Some(outcome);
-                        // Break the operational loop. The outer
-                        // `run_pipeline` consumes `panik_outcome`
-                        // after the loop returns Ok and surfaces
-                        // `RunError::PanikShutdown` to the caller.
-                        tracing::error!(
-                            "primary operational loop exiting via panik path"
-                        );
-                        break;
-                    }
-                }
-                // Operator graceful-abort trigger (SIGUSR2). A PRIMARY that
-                // receives the operator's SIGUSR2 IS the abort authority — it
-                // does NOT send a `GracefulAbortRequest` to itself (the
-                // observer's arm does that); it short-circuits straight into
-                // the SAME `initiate_graceful_abort` latch the wire handler
-                // drives. Idempotent: a re-sent signal against an
-                // already-latched freeze is a NoOp.
-                //
-                // The trigger is consumed through a DISJOINT-FIELD borrow of
-                // `self.graceful_abort_trigger` (the `self.inbox.recv()`
-                // pattern), NOT taken out into a loop local: a graceful-abort
-                // relocation (`graceful_abort_tick` → `relocate_primary_to`)
-                // cancels this loop mid-flight, and a taken-out trigger would
-                // be dropped on that cancellation; left on `self`, it rides
-                // `into_observer_handoff` onto the standalone observer so the
-                // relocated node keeps responding to operator SIGUSR2.
-                // `recv() == None` (stream closed) or `None` trigger
-                // (un-injected) both PARK inside the trigger — never a
-                // hot-loop. Cancel-safety: `GracefulAbortTrigger::recv` is
-                // cancel-safe (see its doc); a sibling arm winning drops and
-                // rebuilds the recv future without losing a queued signal.
-                sig = async {
-                    match self.graceful_abort_trigger.as_mut() {
-                        Some(trigger) => trigger.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    arm_stats.record(ARM_GRACEFUL_ABORT);
-                    if sig.is_some() {
-                        let own_id = self.config.node_id.clone();
-                        self.initiate_graceful_abort(&own_id).await;
-                    }
                 }
                 // Per-task re-dispatch backoff wake. `task_backoff_due`
                 // (computed at the top of this iteration) is the pool's

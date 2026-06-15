@@ -151,17 +151,32 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 // per sweep, vs the former per-fire sample + decision
                 // ticks (the 58%-of-wakeups blocking-IO hot path).
                 //
+                // Priority: this arm is LAST in source order. Under the
+                // outer `biased;` the command + pool-event arms beat
+                // the 20Hz forensic timer when they have ready work
+                // (the same arm-priority discipline the secondary
+                // process_tasks loop applies — #586).
+                //
                 // Cancel-safety: `sleep_until` consumes nothing and the
                 // deadline is PERSISTENT local state, so a sibling arm
                 // winning the race merely re-creates the future against
                 // the SAME instant next iteration — the sweep cannot be
                 // starved into never firing by a busy loop.
                 _ = tokio::time::sleep_until(next_sweep_due) => {
+                    // Per-sweep cost telemetry (#586): TRACE level so
+                    // the 20Hz cadence emits land in file logs only
+                    // (per #585) without flooding stdout. The cost
+                    // window covers the full on-loop arm body so
+                    // operators can see whether the sweep is the cause
+                    // of any inbox-equivalent (pool_event / command)
+                    // wait-time.
+                    let sweep_started_at = tokio::time::Instant::now();
                     // Collect the CURRENT worker set's read inputs
                     // (respawns / type-shifts picked up each sweep),
                     // then read off the runtime — no pool borrow held
                     // across the blocking call.
                     let inputs = oom_watcher.collect_sweep_inputs(&self.pool);
+                    let scanned_workers = inputs.worker_count();
                     let sweep = tokio::task::spawn_blocking(move || inputs.read())
                         .await
                         .expect("oom charge sweep read panicked");
@@ -171,6 +186,13 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     }
                     self.check_timeouts(active_workers, on_failure_increment_failed, factory).await;
                     self.report_stuck_workers();
+                    let cost_ms = sweep_started_at.elapsed().as_millis() as u64;
+                    tracing::trace!(
+                        target: "oom_sweep",
+                        scanned = scanned_workers,
+                        cost_ms,
+                        "oom_sweep fired"
+                    );
                     // Await-before-resleep: arm the next sweep a full
                     // interval after THIS one completed.
                     next_sweep_due = tokio::time::Instant::now() + sweep_interval;
