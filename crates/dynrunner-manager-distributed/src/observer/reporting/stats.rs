@@ -141,6 +141,74 @@ impl StatsSnapshot {
     /// and pushes the result into the reporter's snapshot source via
     /// `SharedSnapshotSource::publish` (the reporter's own test suite also
     /// exercises it directly).
+    /// Skip-predicate for the 10-min periodic report: returns `true` iff
+    /// every field that DIFFERS between `self` and `prev` is in the
+    /// skip-eligible counter set
+    /// `{succeeded, fail_retry, fail_oom, fail_final}` — i.e. the only
+    /// movement since the last announcement is routine throughput. A
+    /// `true` return tells the driver to elide this 10-minute emission
+    /// (the 1-hour safety net will print the accumulated delta later);
+    /// a `false` return means at least one non-throughput field moved
+    /// and the report must run on the normal cadence.
+    ///
+    /// Subset semantics (not strict equality): an all-equal snapshot
+    /// (diff = ∅) trivially satisfies "all changes are in the eligible
+    /// set" and returns `true` — the spec elides such ticks too (an
+    /// empty report has nothing wake-worthy; the operator uses SIGUSR1
+    /// to force a heartbeat read).
+    ///
+    /// Scope rationale (owner-decision 2026-06-15): `unfulfillable`,
+    /// `invalid_task`, and `setup_succeeded` are EXCLUDED — they are
+    /// exceptional-flow categories (structural failures, capability-loss
+    /// cascades, setup-task outcomes), not routine throughput, and the
+    /// operator wants those changes promptly. The maps
+    /// (`per_secondary_in_flight`, `per_secondary_queued_after_local_dep`)
+    /// and the roster (`alive_secondaries`) are also excluded so a peer
+    /// joining/leaving or a task moving between secondaries is never
+    /// skipped.
+    pub fn diff_subset_of_skip_eligible(&self, prev: &Self) -> bool {
+        // Destructure once so a future field addition forces a compile
+        // error here — every snapshot field must be classified
+        // "skip-eligible counter" or "must-print-on-change".
+        let Self {
+            succeeded: _cur_succeeded,
+            setup_succeeded,
+            fail_retry: _cur_fail_retry,
+            fail_oom: _cur_fail_oom,
+            fail_final: _cur_fail_final,
+            unfulfillable,
+            invalid_task,
+            in_flight,
+            queued_after_local_dependency,
+            per_secondary_queued_after_local_dep,
+            waiting_on_deps,
+            blocked,
+            ready_in_queue,
+            per_secondary_in_flight,
+            alive_secondaries,
+            busy_secondaries,
+            total_secondaries,
+            busy_workers,
+            total_workers,
+        } = self;
+        setup_succeeded == &prev.setup_succeeded
+            && unfulfillable == &prev.unfulfillable
+            && invalid_task == &prev.invalid_task
+            && in_flight == &prev.in_flight
+            && queued_after_local_dependency == &prev.queued_after_local_dependency
+            && per_secondary_queued_after_local_dep
+                == &prev.per_secondary_queued_after_local_dep
+            && waiting_on_deps == &prev.waiting_on_deps
+            && blocked == &prev.blocked
+            && ready_in_queue == &prev.ready_in_queue
+            && per_secondary_in_flight == &prev.per_secondary_in_flight
+            && alive_secondaries == &prev.alive_secondaries
+            && busy_secondaries == &prev.busy_secondaries
+            && total_secondaries == &prev.total_secondaries
+            && busy_workers == &prev.busy_workers
+            && total_workers == &prev.total_workers
+    }
+
     pub fn from_cluster_state<I: Identifier>(state: &ClusterState<I>) -> Self {
         let outcome = state.outcome_counts();
         let counts = state.counts();

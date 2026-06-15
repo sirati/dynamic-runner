@@ -117,6 +117,45 @@ fn delta(cur: usize, prev: usize) -> usize {
     cur.saturating_sub(prev)
 }
 
+/// Build the FULL periodic-report body for a force-print: every metric
+/// line is emitted, including those that are zero or unchanged. There is
+/// no inclusion gate and no footer — the report is a verbatim status
+/// dump for an operator who explicitly asked for it (SIGUSR1 against an
+/// observer). Always returns a non-empty `String`.
+///
+/// Why a separate entry point (not `render_report` with a flag): the
+/// inclusion rule is the SINGLE concern of `render_report`; a `force`
+/// branch would mean two reporting modes living in one function and a
+/// `prev`-snapshot argument that is irrelevant to the full path. Keeping
+/// the two as independent entry points lets each stay single-concern.
+pub fn render_report_full(cur: &StatsSnapshot) -> String {
+    // Plain enumeration of every snapshot field the periodic report
+    // covers — exactly the lines `render_report` would emit if every
+    // metric were both present and changed. Counters render bare totals
+    // (no `+Δ` parenthetical: a force-print is not a delta announcement
+    // and `+0` would be noise); gauges and ratios render exactly as the
+    // delta path would.
+    let lines = [
+        format!("succeeded: {}", cur.succeeded),
+        format!("setup: {}", cur.setup_succeeded),
+        format!("failed (retry): {}", cur.fail_retry),
+        format!("failed (oom): {}", cur.fail_oom),
+        format!("failed (final): {}", cur.fail_final),
+        format!("unfulfillable: {}", cur.unfulfillable),
+        format!("invalid_task: {}", cur.invalid_task),
+        format!("in-flight: {}", cur.in_flight),
+        format!("waiting on deps: {}", cur.waiting_on_deps),
+        format!("blocked (upstream unfulfillable): {}", cur.blocked),
+        format!("ready in queue: {}", cur.ready_in_queue),
+        format!(
+            "busy secondaries: {}/{}",
+            cur.busy_secondaries, cur.total_secondaries
+        ),
+        format!("busy workers: {}/{}", cur.busy_workers, cur.total_workers),
+    ];
+    lines.join("\n")
+}
+
 /// Build the periodic-report body, or `None` if there is nothing
 /// worth waking an LLM for (every metric omitted as zero AND nothing
 /// was omitted-because-unchanged). A `Some` body is the multi-line

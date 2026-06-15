@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use pyo3::prelude::*;
 
+use dynrunner_manager_distributed::ForcePrintTrigger;
 use dynrunner_manager_distributed::GracefulAbortTrigger;
 use dynrunner_manager_distributed::cluster_state::{ClusterState, ClusterStateSnapshot};
 use dynrunner_manager_distributed::observer::{ObserverConfig, build_cold_join_observer};
@@ -129,6 +130,20 @@ impl PyObserverLateJoiner {
                     // resolves once the bootstrap snapshot has warmed the
                     // role cache — there is nothing to send on before then.
                     let mut abort_trigger = Some(GracefulAbortTrigger::arm());
+                    // Arm the operator's SIGUSR1 force-print trigger
+                    // (observer-only repurposing) at the SAME early
+                    // point: a SIGUSR1 received during the gateway /
+                    // join window is latched instead of killing the
+                    // process via the kernel's default disposition.
+                    // The Python observer dispatch already skipped the
+                    // `faulthandler.register(SIGUSR1, …)` line for this
+                    // route (see `run.py::dispatch`'s
+                    // `register_sigusr1` arg), so SIGUSR1 is free for
+                    // this tokio `user_defined1()` stream. The trigger
+                    // is handed to the coordinator at step 6b below;
+                    // a bootstrap-failure path drops it with the
+                    // process. See `force_print_trigger`.
+                    let mut force_print_trigger = Some(ForcePrintTrigger::arm());
 
                     // 0. Acquire the seed. LOCAL mode resolved it
                     //    pre-detach; GATEWAY mode connects the gateway,
@@ -391,6 +406,20 @@ impl PyObserverLateJoiner {
                         //     primary on the first poll.
                         observer.set_graceful_abort_trigger(
                             abort_trigger
+                                .take()
+                                .expect("armed once at entry; taken once here"),
+                        );
+                        // 6c. Hand the entry-armed SIGUSR1 force-print
+                        //     trigger to the coordinator (taken exactly
+                        //     once; a bootstrap failure before this
+                        //     point drops it with the process). The
+                        //     reporter task's force-print arm consumes
+                        //     it; a SIGUSR1 latched during the join
+                        //     surfaces on the first poll exactly like
+                        //     a post-seat one. See
+                        //     `force_print_trigger`.
+                        observer.set_force_print_trigger(
+                            force_print_trigger
                                 .take()
                                 .expect("armed once at entry; taken once here"),
                         );
