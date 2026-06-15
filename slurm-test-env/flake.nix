@@ -57,6 +57,20 @@
           install -m 0755 ${./deploy/reboot-node.sh}     $out/bin/slurm-test-env-reboot-node
           install -m 0755 ${./scripts/provision-user.sh} $out/bin/slurm-test-env-provision-user
           install -m 0755 ${./scripts/smoke-test.sh}     $out/bin/slurm-test-env-smoke-test
+          install -m 0755 ${./scripts/test-547-chunking.sh} $out/bin/slurm-test-env-test-547-chunking
+
+          # Ship the #547 chunking-test workload package alongside the
+          # assertion script. The script wires the driver via
+          # DYNRUNNER_CMD which the operator points at the package
+          # location at execution time (the dynamic_runner wheel is
+          # deployed into the cluster out-of-band).
+          mkdir -p $out/share/slurm-test-env/test_547_workload
+          install -m 0644 ${./scripts/test_547_workload/__init__.py} \
+            $out/share/slurm-test-env/test_547_workload/__init__.py
+          install -m 0644 ${./scripts/test_547_workload/driver.py} \
+            $out/share/slurm-test-env/test_547_workload/driver.py
+          install -m 0644 ${./scripts/test_547_workload/worker.py} \
+            $out/share/slurm-test-env/test_547_workload/worker.py
 
           # PATH wrapping: include the system deps each script needs, plus
           # $out/bin itself so e.g. smoke-test can call the wrapped
@@ -119,6 +133,10 @@
           smoke-test = {
             type = "app";
             program = "${deploy}/bin/slurm-test-env-smoke-test";
+          };
+          test-547-chunking = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-test-547-chunking";
           };
         };
       }
