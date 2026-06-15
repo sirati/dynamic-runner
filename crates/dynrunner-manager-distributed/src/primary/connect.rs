@@ -66,12 +66,27 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // primary's silent 600s straggler window, the quorum-proceed at
         // 11:16:10 relocating into a fleet dead for 20s) cannot recur. It
         // ALSO doubles as the standard anti-entropy EMIT half, healing
-        // mid-setup divergence exactly as the sibling waits do. `Skip` +
-        // dropped-first-tick mirrors the operational arm.
-        let mut assembly_beacon =
-            tokio::time::interval(crate::anti_entropy::tick_period(&self.config.node_id));
+        // mid-setup divergence exactly as the sibling waits do.
+        //
+        // `interval_at(now + period, period)` schedules the FIRST tick at
+        // `t + period` (not t=0), so the select loop starts immediately
+        // without blocking outside the loop. Using `interval(period)` with
+        // a pre-loop `tick().await` to discard the t=0 tick was correct
+        // semantically but created a real-time race: the `tick().await`
+        // held execution outside the select for up to `period` (15–25 s),
+        // during which `connect_timeout` could expire even though secondaries
+        // had already sent their welcome messages into the buffered channel —
+        // on re-entry both the inbox arm and the (already-expired) deadline
+        // arm were simultaneously ready, and tokio's pseudo-random select
+        // arbitration could pick the timeout arm first, producing a spurious
+        // "0/N sent SecondaryWelcome" BringUpFailed under parallel test load.
+        // `interval_at` keeps the same 15–25 s cadence with no pre-loop block.
+        let period = crate::anti_entropy::tick_period(&self.config.node_id);
+        let mut assembly_beacon = tokio::time::interval_at(
+            tokio::time::Instant::now() + period,
+            period,
+        );
         assembly_beacon.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        assembly_beacon.tick().await;
 
         loop {
             // Check if all secondaries have completed cert exchange
