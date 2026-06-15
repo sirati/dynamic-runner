@@ -584,6 +584,27 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// run-level loud-fail backstop for the case where the consumer logs
     /// those per-task errors and proceeds, masking a zero-dispatch phase.
     pub(super) spawn_rejected_task_ids: Vec<String>,
+    /// FIFO queue of in-flight chunked `SpawnTasks` continuations (#547).
+    ///
+    /// A large `SpawnTasks` (input > [`Self::APPLY_SPAWN_CHUNK_SIZE`]) is
+    /// processed across MULTIPLE `select!` iterations: each iteration drains
+    /// one chunk from the FRONT continuation and re-queues a
+    /// `PrimaryCommand::PumpSpawnContinuation` so the COMMAND arm RETURNS
+    /// (letting sibling arms — `heartbeat_tick`, `inbox.recv()`,
+    /// `worker_mgmt_rx`, the matcher — re-fire). The `Option`→`VecDeque`
+    /// shape is FIFO because a second external `SpawnTasks` can arrive while
+    /// the first is still draining (the COMMAND arm yields between chunks),
+    /// and we must NEVER interleave the two — chunk-N of input-1 finishes
+    /// before chunk-0 of input-2 starts, exactly as the pre-#547 unchunked
+    /// FIFO contract guaranteed.
+    ///
+    /// Empty between runs and between large batches; the fast-path single-
+    /// chunk SpawnTasks NEVER touches it (no continuation installed, no kick
+    /// emitted — the pre-#547 behaviour is preserved byte-identically for
+    /// small batches). See `command_channel::handler::apply_spawn_tasks`.
+    pub(super) spawn_continuation_queue: std::collections::VecDeque<
+        crate::primary::command_channel::SpawnContinuation<I>,
+    >,
     pub(super) all_binaries: Vec<TaskInfo<I>>,
     /// Phase-aware pending pool. Lazily initialised at `run()` start so
     /// the constructor doesn't need the phase set / dependency graph;
@@ -1520,6 +1541,35 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// can't wedge the runtime.
     const DRAIN_YIELD_BUDGET: u32 = 1024;
 
+    /// Per-chunk task count for the chunked `SpawnTasks` continuation (#547).
+    ///
+    /// A `SpawnTasks` whose input exceeds this size is processed across
+    /// multiple `select!` iterations, one chunk per iteration; chunks of
+    /// `<=` this size run inline as a single-shot fast path. The constant
+    /// tunes the per-chunk wall-clock CPU burden against the per-batch wire
+    /// frame count:
+    ///   * Per-task cost on the primary's `current_thread` coordinator
+    ///     runtime is dominated by `compute_task_hash` (BLAKE3 over the
+    ///     serialized `TaskInfo<I>`), the dep-resolution probes inside
+    ///     `apply_tasks_spawned`, and the `set_task_state` write + #520
+    ///     narration. The empirical measurement on the asm-dataset
+    ///     reproducer is roughly tens of microseconds per task, so a 256-
+    ///     task chunk holds the COMMAND arm for under ~15 ms — comfortably
+    ///     below the 5 s keepalive interval that gates the heartbeat tick,
+    ///     so each chunk lets at least one heartbeat tick fire between
+    ///     iterations.
+    ///   * The wire cost is one extra `ClusterMutation::TasksSpawned` frame
+    ///     per chunk (so a 46 k-task batch becomes ~180 frames of ~1 KB
+    ///     each instead of one ~46 KB frame). The mesh transport is on a
+    ///     dedicated thread; per-frame serialize overhead is negligible
+    ///     and the receivers apply each batch idempotently.
+    ///
+    /// Lowering this WIDENS the live-arm-re-entry guarantee (more chunks
+    /// ⇒ smaller per-arm CPU windows) at the cost of more wire frames;
+    /// raising it shrinks the wire surface at the cost of longer per-arm
+    /// stalls. The owner-approved default is the conservative midpoint.
+    pub(super) const APPLY_SPAWN_CHUNK_SIZE: usize = 256;
+
     pub fn new(
         config: PrimaryConfig,
         client: crate::process::MeshClient<I>,
@@ -1623,6 +1673,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             mesh_pump_gone: false,
             run_start_batch_fired: false,
             spawn_rejected_task_ids: Vec::new(),
+            spawn_continuation_queue: std::collections::VecDeque::new(),
             all_binaries: Vec::new(),
             pending: None,
             phase_deps: HashMap::new(),
@@ -4319,6 +4370,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `spawn_tasks` task; a coordinator re-used across runs must not
         // inherit a stale rejection.
         self.spawn_rejected_task_ids.clear();
+        // Same per-run reset for the chunked-spawn continuation queue
+        // (#547): only populated by `apply_spawn_tasks`'s chunking path
+        // while a run is live. A coordinator re-used across runs must not
+        // inherit a half-drained continuation pointing at a previous
+        // run's (now-dropped) reply oneshot.
+        self.spawn_continuation_queue.clear();
         // Same per-run reset for the worker-management run-should-fail
         // outcome: only written when the worker-management arm drains a
         // `RunShouldFail`; a coordinator re-used across runs must not

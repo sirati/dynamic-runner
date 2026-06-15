@@ -366,6 +366,34 @@ pub enum PrimaryCommand<I: Identifier> {
         tasks: Vec<TaskInfo<I>>,
         reply: oneshot::Sender<Result<Vec<(usize, SpawnError)>, String>>,
     },
+
+    /// INTERNAL pump signal for the distributed primary's chunked
+    /// `apply_spawn_tasks` continuation (#547). NEVER originated by
+    /// consumers — emitted only by the distributed primary's own
+    /// `apply_spawn_tasks` handler when a large input batch was split
+    /// across multiple chunks, so the COMMAND select! arm RETURNS between
+    /// chunks (letting sibling arms — `heartbeat_tick`, `inbox.recv()`,
+    /// `worker_mgmt_rx`, the matcher — re-fire on the next select!
+    /// iteration). The carried payload is empty because the per-chunk
+    /// state (remaining tasks, accumulated errors, the original reply
+    /// oneshot) lives on the `PrimaryCoordinator` itself; this variant
+    /// is the no-payload "kick myself to drain the next chunk" signal.
+    ///
+    /// Why a dedicated variant instead of an empty `SpawnTasks { tasks:
+    /// vec![] }`: type-system clarity. An empty SpawnTasks is
+    /// semantically meaningless from a future reader's standpoint
+    /// ("why is an empty batch being dispatched?"), and the kick is a
+    /// LOAD-BEARING correctness mechanism — without it the operational
+    /// `select!` cannot re-enter between chunks and the heartbeat /
+    /// inbox arms stay starved (the 150 s wedge #547 fixes). A named
+    /// variant documents the intent and future-proofs the pattern for
+    /// other large-batch mutations that may need the same chunking.
+    ///
+    /// Other backends (LocalManager, promoted-secondary) do not chunk
+    /// their `apply_spawn_tasks` this way today, so they ignore this
+    /// variant (no-op arm in their command processors). See #547 for
+    /// the select!-arm-re-entry RCA that motivates the variant.
+    PumpSpawnContinuation,
 }
 
 impl<I: Identifier> PrimaryCommand<I> {
@@ -397,6 +425,15 @@ impl<I: Identifier> PrimaryCommand<I> {
             }
             PrimaryCommand::SpawnTasks { reply, .. } => {
                 let _ = reply.send(Err(reason.to_string()));
+            }
+            PrimaryCommand::PumpSpawnContinuation => {
+                // No reply channel and no externally-visible effect to
+                // reject: the kick is consumed by the same coordinator that
+                // emitted it, draining a continuation that lives on the
+                // coordinator. Discard semantics (F5 raise-drop): the
+                // coordinator-local `spawn_continuation` field is dropped on
+                // run teardown, which the caller already drives — there is
+                // no reply receiver to inform.
             }
         }
     }

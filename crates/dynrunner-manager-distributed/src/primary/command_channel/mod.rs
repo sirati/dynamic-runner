@@ -67,4 +67,5 @@ mod types;
 mod tests;
 
 pub use handler::handle_primary_command;
+pub(crate) use handler::SpawnContinuation;
 pub use types::{COMMAND_CHANNEL_CAPACITY, PrimaryCommand, SpawnError, validate_spawn_tasks};

@@ -7,13 +7,32 @@
 use dynrunner_core::{ErrorType, Identifier, TaskInfo};
 use dynrunner_protocol_primary_secondary::ClusterMutation;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::cluster_state::TaskState;
 use crate::primary::PrimaryCoordinator;
 use crate::worker_signal::WorkerMgmtSignal;
 
 use super::types::{PrimaryCommand, SpawnError, validate_spawn_tasks};
+
+/// One in-flight chunked `SpawnTasks` apply (#547) — the per-batch state the
+/// coordinator's `spawn_continuation_queue` holds between
+/// `PumpSpawnContinuation` ticks.
+///
+/// `remaining` is the un-applied tail of the original input (drained from the
+/// front each chunk). `next_base_index` is the absolute index of
+/// `remaining[0]` in the original input, used to translate the per-chunk
+/// validator errors into absolute-input-index `SpawnError` entries the
+/// caller's reply oneshot carries (so the chunked path is byte-identical to
+/// the pre-#547 single-shot path from the caller's standpoint).
+/// `accumulated_errors` is the running batch result; `reply` is the
+/// original caller's oneshot the final chunk fires.
+pub(crate) struct SpawnContinuation<I: Identifier> {
+    pub(crate) remaining: Vec<TaskInfo<I>>,
+    pub(crate) next_base_index: usize,
+    pub(crate) accumulated_errors: Vec<(usize, SpawnError)>,
+    pub(crate) reply: oneshot::Sender<Result<Vec<(usize, SpawnError)>, String>>,
+}
 
 /// Dispatch one received command to its handler. Single line at the
 /// `select!` call site keeps the operational-loop's match arm
@@ -73,8 +92,21 @@ pub async fn handle_primary_command<S, E, I>(
             let _ = reply.send(result);
         }
         PrimaryCommand::SpawnTasks { tasks, reply } => {
-            let result = coordinator.apply_spawn_tasks(tasks).await;
-            let _ = reply.send(result);
+            // Chunked-continuation orchestrator (#547). The dispatch arm
+            // RETURNS as soon as one chunk completes; subsequent chunks
+            // ride later select! iterations driven by
+            // `PumpSpawnContinuation` so sibling arms (heartbeat,
+            // inbox, worker-mgmt, matcher) re-fire between chunks.
+            coordinator.apply_spawn_tasks(tasks, reply).await;
+        }
+        PrimaryCommand::PumpSpawnContinuation => {
+            // One-chunk drain of the FRONT continuation in
+            // `spawn_continuation_queue`. The handler re-kicks itself
+            // (sends another `PumpSpawnContinuation` onto `command_tx`)
+            // whenever the queue still has work after the chunk
+            // completes — this re-entry is what releases the COMMAND
+            // arm's body so select!'s sibling arms can re-fire.
+            coordinator.pump_spawn_continuation().await;
         }
     }
 }
@@ -432,10 +464,199 @@ where
     /// spawn lacks the cold-seed's identifier-cloning anchor and the
     /// dedup is per-batch rather than ledger-global), kept deliberately
     /// out of scope for #493.
+    /// Chunked-continuation orchestrator for `PrimaryCommand::SpawnTasks`
+    /// (#547). One large `tasks` Vec splits into chunks of
+    /// [`Self::APPLY_SPAWN_CHUNK_SIZE`] each; chunks ride MULTIPLE select!
+    /// iterations driven by `PumpSpawnContinuation` so sibling arms
+    /// (`heartbeat_tick`, `inbox.recv()`, `worker_mgmt_rx`, matcher) re-fire
+    /// between chunks — the pre-fix 150 s wedge starved them all for the
+    /// whole batch duration. A small batch (size `<=`
+    /// `APPLY_SPAWN_CHUNK_SIZE` AND the queue is currently empty) takes the
+    /// single-shot fast path, byte-identical to the pre-#547 behaviour.
+    ///
+    /// Pre-check the WITHIN-BATCH `(phase_id, task_id)` duplicate class once
+    /// against the full input — its semantics demand the WHOLE batch be
+    /// rejected if any pair is found (#3b: the run is run-aborted), so
+    /// detecting it per-chunk would require either re-finding cross-chunk
+    /// pairs after the fact or aborting mid-stream (both ugly). The owner-
+    /// approved shape is one upfront `(phase_id, task_id)` HashSet build
+    /// here; chunks then never encounter the class. The
+    /// `DuplicateTaskHash` (already-in-ledger, idempotent re-spawn) class
+    /// stays per-chunk — the validator drops those entries and surfaces
+    /// per-index errors, and the prior ledger entry is the authoritative
+    /// copy (the failover-replay shape the pre-#547 path handles).
     pub(super) async fn apply_spawn_tasks(
         &mut self,
         tasks: Vec<TaskInfo<I>>,
-    ) -> Result<Vec<(usize, SpawnError)>, String> {
+        reply: oneshot::Sender<Result<Vec<(usize, SpawnError)>, String>>,
+    ) {
+        // Empty input ⇒ no work, no continuation. Reply Ok(empty errors).
+        if tasks.is_empty() {
+            let _ = reply.send(Ok(Vec::new()));
+            return;
+        }
+
+        // Pre-check WITHIN-BATCH `(phase_id, task_id)` duplicates ONCE on
+        // the full input. The hashset build is O(N), cheap relative to the
+        // per-task BLAKE3 + dep-probe + insert work the chunked apply will
+        // do. Reaching the chunked apply with a within-batch dupe is a
+        // contract violation by this pre-check, so the per-chunk validator
+        // does not need to invoke `invalidate_all_pending` mid-stream.
+        let in_batch_dupes = detect_in_batch_dupes::<I>(&tasks);
+        if !in_batch_dupes.is_empty() {
+            // Build the per-index error result + run-wide invalidate.
+            // `apply_spawn_tasks` IS the runtime-spawn path by construction
+            // (the initial batch goes through `ingest_initial_batch`), so
+            // reaching this handler is unconditionally 3b.
+            let reason = format!(
+                "{} duplicate task identity/identities within a single runtime \
+                 spawn batch: {}",
+                in_batch_dupes.len(),
+                in_batch_dupes
+                    .iter()
+                    .map(|(_, h)| format!("duplicate task hash {h}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+            self.invalidate_all_pending(reason).await;
+            let errors: Vec<(usize, SpawnError)> = in_batch_dupes
+                .into_iter()
+                .map(|(idx, hash)| (idx, SpawnError::DuplicateInBatch(hash)))
+                .collect();
+            let _ = reply.send(Ok(errors));
+            return;
+        }
+
+        // Single-shot fast path: tiny input AND no queued continuation
+        // (so we won't reorder against an in-flight batch). Reproduces the
+        // pre-#547 byte-identical behaviour for the common consumer case.
+        if tasks.len() <= Self::APPLY_SPAWN_CHUNK_SIZE
+            && self.spawn_continuation_queue.is_empty()
+        {
+            let errors = self.apply_spawn_tasks_chunk(tasks, 0).await;
+            let _ = reply.send(Ok(errors));
+            return;
+        }
+
+        // Chunked path. Install the continuation at the BACK of the queue —
+        // FIFO across concurrent external batches (the COMMAND arm yields
+        // between chunks, so a second SpawnTasks can land mid-drain; we
+        // must finish the first batch's chunks before starting the second).
+        let was_empty = self.spawn_continuation_queue.is_empty();
+        self.spawn_continuation_queue.push_back(SpawnContinuation {
+            remaining: tasks,
+            next_base_index: 0,
+            accumulated_errors: Vec::new(),
+            reply,
+        });
+        // If the queue was empty, the drain loop is dormant — kick it. If
+        // it wasn't empty, an earlier kick is already in flight (the
+        // current pump-handler will re-kick when it advances), so we do
+        // NOT enqueue a duplicate (which would double-drain a single chunk
+        // and is harmless but wastes one extra select! iteration).
+        if was_empty {
+            self.kick_spawn_continuation();
+        }
+    }
+
+    /// Drain one chunk from the FRONT continuation in
+    /// `spawn_continuation_queue`. Idempotent against an empty queue (a
+    /// stray `PumpSpawnContinuation` arrival — e.g. a kick that races a
+    /// run-reset clear — is benign).
+    pub(super) async fn pump_spawn_continuation(&mut self) {
+        // Peek+take rather than `front_mut` to avoid borrowing the queue
+        // across the long-running `apply_spawn_tasks_chunk` await — the
+        // chunk apply mutates `self.cluster_state` etc., so a `&mut self`
+        // overlap with the queue borrow would be a compile error.
+        let Some(mut cont) = self.spawn_continuation_queue.pop_front() else {
+            // No work: a stray kick. Either the queue was drained between
+            // the sender and this handler, or a run-reset emptied it.
+            return;
+        };
+
+        // Drain ONE chunk. `min(CHUNK, remaining)` keeps the final tail
+        // chunk's size honest.
+        let chunk_size = std::cmp::min(Self::APPLY_SPAWN_CHUNK_SIZE, cont.remaining.len());
+        // Split off the front `chunk_size` entries. `drain(..n).collect()`
+        // is the canonical pop-front-N for `Vec`.
+        let chunk: Vec<TaskInfo<I>> = cont.remaining.drain(..chunk_size).collect();
+        let base_index = cont.next_base_index;
+        cont.next_base_index += chunk_size;
+        let chunk_errors = self.apply_spawn_tasks_chunk(chunk, base_index).await;
+        cont.accumulated_errors.extend(chunk_errors);
+
+        if cont.remaining.is_empty() {
+            // Final chunk: fire the original reply with the accumulated
+            // errors. A dropped receiver is non-fatal (the contract is
+            // shared with every other reply-bearing command).
+            let _ = cont.reply.send(Ok(cont.accumulated_errors));
+            // Did NOT push back. Kick the next continuation (if any).
+            if !self.spawn_continuation_queue.is_empty() {
+                self.kick_spawn_continuation();
+            }
+            return;
+        }
+
+        // More chunks to do: push back at the FRONT (preserving FIFO with
+        // any siblings that joined behind us), kick another tick.
+        self.spawn_continuation_queue.push_front(cont);
+        self.kick_spawn_continuation();
+    }
+
+    /// Send one `PumpSpawnContinuation` onto `command_tx` so the operational
+    /// `select!` re-enters the COMMAND arm with a continuation tick the next
+    /// iteration. `try_send` (not `send().await`) because we are inside the
+    /// COMMAND arm already and must NOT block on backpressure on the very
+    /// channel we're draining — a `Full` here means the command channel is
+    /// saturated, which is itself a degenerate state (the bounded channel
+    /// is sized for normal command-rate, not 256-K-task storms; a full
+    /// channel means many continuations queued). In that pathological case
+    /// we fall back to `tokio::spawn_local`ing the send so it parks until
+    /// the channel drains rather than dropping the continuation.
+    fn kick_spawn_continuation(&self) {
+        let tx = self.command_tx.clone();
+        if let Err(err) = tx.try_send(PrimaryCommand::PumpSpawnContinuation) {
+            match err {
+                tokio_mpsc::error::TrySendError::Full(cmd) => {
+                    // Park the send on the LocalSet — preserves the kick
+                    // exactly, avoids dropping the continuation.
+                    tokio::task::spawn_local(async move {
+                        // A closed channel here is the same teardown signal
+                        // every other command sender sees; swallow it
+                        // (the coordinator is winding down — no continuation
+                        // can fire anyway).
+                        let _ = tx.send(cmd).await;
+                    });
+                }
+                tokio_mpsc::error::TrySendError::Closed(_) => {
+                    // Coordinator is winding down — drop the kick (the
+                    // queue's continuations have already-dropped reply
+                    // oneshots and never fire from a closed-channel state).
+                }
+            }
+        }
+    }
+
+    /// Apply one chunk of a (possibly chunked) `SpawnTasks` input. Returns
+    /// per-index `SpawnError` entries with their indices TRANSLATED into the
+    /// caller's ABSOLUTE input index (`chunk[i]` becomes index
+    /// `base_index + i`) so the caller's reply oneshot is consistent across
+    /// chunked and non-chunked apply paths.
+    ///
+    /// The orchestrator pre-checks within-batch hash uniqueness on the
+    /// FULL input before chunking, so this helper never sees
+    /// `SpawnError::DuplicateInBatch` from its own input — any in-batch
+    /// dupe would have aborted the run BEFORE reaching here. The
+    /// `DuplicateTaskHash` (already-in-ledger) class IS valid per-chunk
+    /// (a chunked input can re-introduce an identity prior chunks already
+    /// added) — the validator's `task_present` closure consults
+    /// `cluster_state.contains_task`, which sees the prior chunks'
+    /// applied entries, exactly as a single-shot run-all-N would.
+    async fn apply_spawn_tasks_chunk(
+        &mut self,
+        tasks: Vec<TaskInfo<I>>,
+        base_index: usize,
+    ) -> Vec<(usize, SpawnError)> {
         // Snapshot the per-index `task_id`s BEFORE the validator moves
         // `tasks`, so the run-level loud-fail backstop below can name the
         // rejected identities. The validator's `errors` carry the index
@@ -540,51 +761,28 @@ where
             tasks,
         );
 
-        // #3b: a WITHIN-BATCH `(phase_id, task_id)` duplicate in a RUNTIME
-        // spawn (any spawn reaching this handler is post-phase-start — the
-        // 3a/3b discriminator `phase_started_emitted.is_empty()` is
-        // structurally false here) is a TERMINAL run abort: the
-        // `RunAborted` verdict is latched + broadcast FIRST (carrying the
-        // duplicate-identity reason) and EVERY not-yet-terminal task is
-        // then invalidated run-wide — see `invalidate_all_pending` for the
-        // verdict-before-wipe ordering. The signal is
-        // `validate_spawn_tasks`'s `DuplicateInBatch`: the SAME
-        // `(phase_id, task_id)` appeared twice in ONE fresh spawn-set (no
-        // authoritative prior copy), so the run's task set is genuinely
-        // ambiguous and adding the would-be survivors only to immediately
-        // invalidate them is pointless.
-        //
-        // An ALREADY-IN-LEDGER duplicate (`DuplicateTaskHash`) is a DIFFERENT
-        // class and is NOT escalated: it is an idempotent re-spawn (the
-        // canonical case is a FAILOVER replay — a promoted primary's consumer
-        // `on_phase_end` hook re-fires and re-spawns the same deterministic
-        // identities it spawned pre-failover). The validator already dropped
-        // those entries from `valid_tasks` (so the apply NoOps nothing) and
-        // surfaced them as per-index errors; the prior ledger entry is the
-        // authoritative copy. Nuking the run there is the exact LMU-gating bug
-        // this path is being fixed for. The fresh survivors in the SAME batch
-        // still dispatch below.
-        let in_batch_dupes: Vec<String> = errors
-            .iter()
-            .filter_map(|(_, e)| match e {
-                SpawnError::DuplicateInBatch(hash) => Some(format!("duplicate task hash {hash}")),
-                _ => None,
-            })
+        // #3b WITHIN-BATCH dupe class is detected ONCE by the orchestrator
+        // before chunking via `detect_in_batch_dupes`, so the per-chunk
+        // validator never returns `SpawnError::DuplicateInBatch` here. The
+        // assertion documents the invariant; in release builds it is a
+        // silent NoOp.
+        debug_assert!(
+            !errors
+                .iter()
+                .any(|(_, e)| matches!(e, SpawnError::DuplicateInBatch(_))),
+            "apply_spawn_tasks_chunk must never see a DuplicateInBatch — \
+             apply_spawn_tasks pre-checks the full input before chunking"
+        );
+
+        // Translate per-chunk error indices INTO ABSOLUTE input-index
+        // entries (chunk[i] is the caller's input[base_index + i]) so the
+        // reply oneshot is consistent across the single-shot and chunked
+        // paths. A non-chunked call passes `base_index = 0`, byte-identical
+        // to the pre-#547 result.
+        let errors: Vec<(usize, SpawnError)> = errors
+            .into_iter()
+            .map(|(idx, err)| (idx + base_index, err))
             .collect();
-        if !in_batch_dupes.is_empty() {
-            // `apply_spawn_tasks` IS the runtime-spawn path by
-            // construction — the initial batch goes through
-            // `ingest_initial_batch` (the 3a side). The path is the
-            // discriminator, so no `phase_started_emitted` read is
-            // needed here; reaching this handler is unconditionally 3b.
-            let reason = format!(
-                "{} duplicate task identity/identities within a single runtime spawn batch: {}",
-                in_batch_dupes.len(),
-                in_batch_dupes.join("; ")
-            );
-            self.invalidate_all_pending(reason).await;
-            return Ok(errors);
-        }
 
         if valid_tasks.is_empty() {
             // No mutation to broadcast; the per-index errors are the
@@ -622,10 +820,18 @@ where
                 .filter(|(_, e)| !matches!(e, SpawnError::DuplicateTaskHash(_)))
                 .collect();
             if !lost.is_empty() {
-                self.spawn_rejected_task_ids
-                    .extend(lost.iter().map(|(idx, _)| task_ids_by_index[*idx].clone()));
+                // `errors` carries ABSOLUTE input indices (translated by
+                // `+ base_index` above); `task_ids_by_index` is CHUNK-LOCAL
+                // (built before the validator moved `tasks` — i.e. the
+                // chunk's `Vec`, not the caller's original input). Subtract
+                // `base_index` to land back in the chunk's local index
+                // space the per-chunk `task_ids_by_index` is keyed by.
+                self.spawn_rejected_task_ids.extend(
+                    lost.iter()
+                        .map(|(idx, _)| task_ids_by_index[*idx - base_index].clone()),
+                );
             }
-            return Ok(errors);
+            return errors;
         }
 
         // Compute hashes of the valid subset so we can post-apply
@@ -711,6 +917,39 @@ where
                 .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
         }
 
-        Ok(errors)
+        errors
     }
+}
+
+/// Detect within-batch `(phase_id, task_id)` duplicates ONCE on the full
+/// `apply_spawn_tasks` input — the pre-chunk gate that lets the per-chunk
+/// validator never see `SpawnError::DuplicateInBatch`. The classification
+/// rules (the "first occurrence is the winner, second is the loser") match
+/// `validate_spawn_tasks`'s within-batch arm exactly so chunked vs
+/// non-chunked dispatch produces byte-identical per-index errors. Returns
+/// the per-loser entries with their absolute input indices + the duplicated
+/// hash, for the caller to thread into both `invalidate_all_pending`'s
+/// reason string and the per-index reply.
+fn detect_in_batch_dupes<I: Identifier>(tasks: &[TaskInfo<I>]) -> Vec<(usize, String)> {
+    let mut seen: std::collections::HashMap<(dynrunner_core::PhaseId, String), String> =
+        std::collections::HashMap::with_capacity(tasks.len());
+    let mut out: Vec<(usize, String)> = Vec::new();
+    for (idx, task) in tasks.iter().enumerate() {
+        let identity = (task.phase_id.clone(), task.task_id.clone());
+        // The hash identifies the TASK (full content hash); the
+        // within-batch dupe is a same-`(phase_id, task_id)`-pair, second
+        // arrival. The FIRST insertion records the hash for the loser
+        // entry; the second `entry` lookup returns Occupied and the loser
+        // is recorded against its (chunk-local) absolute input index.
+        let hash = crate::primary::wire::compute_task_hash(task);
+        match seen.entry(identity) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(hash);
+            }
+            std::collections::hash_map::Entry::Occupied(o) => {
+                out.push((idx, o.get().clone()));
+            }
+        }
+    }
+    out
 }
