@@ -2,12 +2,12 @@
 //!
 //! # Single concern
 //!
-//! Carry one respawn EXECUTION (spawn / revoke) across the mesh to the
-//! process that physically hosts the provider, and bring its outcome
-//! back. The respawn DECISION (budget admission, id mint, replicated
-//! ledger spend, pending-replacement reconciliation) stays entirely in
-//! `dispatch_respawn_request` / `reconcile_replacements_on_join` and is
-//! untouched: this module is the SECOND backend behind the SAME
+//! Carry one respawn EXECUTION (spawn) across the mesh to the process
+//! that physically hosts the provider, and bring its outcome back. The
+//! respawn DECISION (budget admission, id mint, replicated ledger spend,
+//! slurm-authoritative quantity gate) stays entirely in
+//! `dispatch_respawn_request` and is untouched: this module is the SECOND
+//! backend behind the SAME
 //! [`SecondarySpawner`] trait the local providers implement, so the
 //! handler never knows local from remote.
 //!
@@ -97,8 +97,7 @@ struct PendingMaps {
 /// completes it when the observer's result frame lands.
 ///
 /// `std::sync::Mutex` — every critical section is a synchronous map
-/// probe, never held across an await (the same discipline as the SLURM
-/// provider's `replacement_jobs`). Growth is bounded by the respawn
+/// probe, never held across an await. Growth is bounded by the respawn
 /// budget (`max_total` concurrent ids at the theoretical worst).
 #[derive(Clone, Default)]
 pub struct RemoteRespawnPending {
