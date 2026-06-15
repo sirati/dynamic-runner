@@ -58,7 +58,7 @@
           install -m 0755 ${./scripts/provision-user.sh} $out/bin/slurm-test-env-provision-user
           install -m 0755 ${./scripts/smoke-test.sh}     $out/bin/slurm-test-env-smoke-test
           install -m 0755 ${./scripts/test-543-no-scancel.sh} $out/bin/slurm-test-env-test-543-no-scancel
-
+          install -m 0755 ${./scripts/test-571-tunnel-deadline.sh} $out/bin/slurm-test-env-test-571-tunnel-deadline
           install -m 0755 ${./scripts/test-574-stats-skip.sh} $out/bin/slurm-test-env-test-574-stats-skip
           install -m 0755 ${./scripts/test-575-resource-stats.sh} $out/bin/slurm-test-env-test-575-resource-stats
 
@@ -129,7 +129,10 @@
             type = "app";
             program = "${deploy}/bin/slurm-test-env-test-543-no-scancel";
           };
-
+          test-571-tunnel-deadline = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-test-571-tunnel-deadline";
+          };
           test-574-stats-skip = {
             type = "app";
             program = "${deploy}/bin/slurm-test-env-test-574-stats-skip";
