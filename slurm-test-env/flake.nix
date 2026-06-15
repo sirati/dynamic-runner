@@ -59,6 +59,7 @@
           install -m 0755 ${./scripts/smoke-test.sh}     $out/bin/slurm-test-env-smoke-test
           install -m 0755 ${./scripts/test-543-no-scancel.sh} $out/bin/slurm-test-env-test-543-no-scancel
           install -m 0755 ${./scripts/test-547-chunking.sh} $out/bin/slurm-test-env-test-547-chunking
+          install -m 0755 ${./scripts/test-563-fatal-abort.sh} $out/bin/slurm-test-env-test-563-fatal-abort
           install -m 0755 ${./scripts/test-565-572-pending-resources.sh} \
             $out/bin/slurm-test-env-test-565-572-pending-resources
           install -m 0755 ${./scripts/test-571-tunnel-deadline.sh} $out/bin/slurm-test-env-test-571-tunnel-deadline
@@ -148,6 +149,10 @@
           test-547-chunking = {
             type = "app";
             program = "${deploy}/bin/slurm-test-env-test-547-chunking";
+          };
+          test-563-fatal-abort = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-test-563-fatal-abort";
           };
           test-565-572-pending-resources = {
             type = "app";
