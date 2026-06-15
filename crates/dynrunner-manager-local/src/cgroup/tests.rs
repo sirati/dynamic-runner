@@ -657,8 +657,10 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SwapCapLogCapture 
 /// deliberately ignores the errno family) must NOT degrade the
 /// nested setup. The orchestration succeeds, `memory.max` is still
 /// tightened, the per-worker leaf is still created, and the failure
-/// logs once at info (process-global, Once-gated) plus
-/// per-occurrence at debug.
+/// logs once at warn (operator-visible: workers can swap on this
+/// host, and a swapping worker thrashes instead of OOM-killing —
+/// the userland swap-driven kill in `dynrunner-scheduler` is the
+/// backstop) plus per-occurrence at debug.
 ///
 /// Deliberately ONE test: these are the only call sites in the
 /// binary that drive `cap_swap_best_effort` down its failure branch,
@@ -702,12 +704,16 @@ fn swap_cap_write_failure_is_non_fatal_and_logged_once() {
         std::mem::forget(sub);
     });
 
-    // Exactly one operator-visible info line (Once-gated across the
+    // Exactly one operator-visible warn line (Once-gated across the
     // three failures above) and one debug trace per occurrence.
+    // The level was raised from info to warn so the failure pages
+    // operator dashboards: a workers tree where the swap cap fails
+    // can be made to swap, and the framework's userland kill is the
+    // only backstop.
     assert_eq!(
-        capture.count_at(tracing::Level::INFO),
+        capture.count_at(tracing::Level::WARN),
         1,
-        "the operator-visible info line is Once-gated"
+        "the operator-visible warn line is Once-gated"
     );
     assert_eq!(
         capture.count_at(tracing::Level::DEBUG),

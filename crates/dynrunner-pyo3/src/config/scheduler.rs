@@ -19,6 +19,13 @@ use dynrunner_scheduler::ResourceStealingScheduler;
 ///   shift down so the smallest-active kill lands BEFORE the kernel
 ///   SIGKILLs the cgroup. Surfaced to operators via
 ///   `--oom-cgroup-safety-margin`.
+/// - `swap_pressure_threshold`: 64 MiB — aggregate per-worker swap
+///   above which the main multi-worker phase fires the heaviest-
+///   swapper kill. The contract is "a worker's swap counts as RAM
+///   demand; kill workers to free RAM so no swap is used"; this knob
+///   is the small hysteresis band that ignores cold-page eviction
+///   while still tripping on genuine working-set spill. Suppressed
+///   when only one worker is active (the OOM-retry phase exception).
 /// - `temp_factors`: `[1.5, 2.0, 3.0, 4.0]` (slowest opportunistic worker
 ///   gets `available / 1.5`, the next one `/ 2.0`, etc.; later workers reuse
 ///   the final value).
@@ -29,6 +36,7 @@ pub(crate) struct SchedulerConfig {
     base_overhead: u64,
     pressure_threshold: u64,
     cgroup_safety_margin: u64,
+    swap_pressure_threshold: u64,
     temp_factors: Vec<f64>,
 }
 
@@ -39,6 +47,7 @@ impl Default for SchedulerConfig {
             base_overhead: 150 * 1024 * 1024,
             pressure_threshold: 500 * 1024 * 1024,
             cgroup_safety_margin: 1024 * 1024 * 1024,
+            swap_pressure_threshold: 64 * 1024 * 1024,
             temp_factors: vec![1.5, 2.0, 3.0, 4.0],
         }
     }
@@ -52,6 +61,7 @@ impl SchedulerConfig {
         base_overhead = None,
         pressure_threshold = None,
         cgroup_safety_margin = None,
+        swap_pressure_threshold = None,
         temp_factors = None,
     ))]
     fn new(
@@ -59,6 +69,7 @@ impl SchedulerConfig {
         base_overhead: Option<u64>,
         pressure_threshold: Option<u64>,
         cgroup_safety_margin: Option<u64>,
+        swap_pressure_threshold: Option<u64>,
         temp_factors: Option<Vec<f64>>,
     ) -> Self {
         let d = SchedulerConfig::default();
@@ -67,6 +78,8 @@ impl SchedulerConfig {
             base_overhead: base_overhead.unwrap_or(d.base_overhead),
             pressure_threshold: pressure_threshold.unwrap_or(d.pressure_threshold),
             cgroup_safety_margin: cgroup_safety_margin.unwrap_or(d.cgroup_safety_margin),
+            swap_pressure_threshold: swap_pressure_threshold
+                .unwrap_or(d.swap_pressure_threshold),
             temp_factors: temp_factors.unwrap_or(d.temp_factors),
         }
     }
@@ -85,6 +98,7 @@ impl SchedulerConfig {
             base_overhead: self.base_overhead,
             pressure_threshold: self.pressure_threshold,
             cgroup_safety_margin: self.cgroup_safety_margin,
+            swap_pressure_threshold: self.swap_pressure_threshold,
             temp_factors: self.temp_factors.clone(),
         }
     }

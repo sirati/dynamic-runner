@@ -285,6 +285,16 @@ impl<I: Identifier> RemoteWorkerState<I> {
             worker_id: self.worker_id,
             reserved_budgets: self.resource_budgets.clone(),
             actual_usage: ResourceMap::new(),
+            // The primary builds these snapshots for the assignment
+            // path (`assign_normal`); the swap-driven kill branch is
+            // only reachable through `check_resource_pressure` from
+            // the local/secondary pool's per-tick decision. The
+            // primary has no per-worker `actual_usage` view either
+            // (the field above is also `ResourceMap::new()`), so the
+            // swap component is `0` by the same construction —
+            // mirroring the empty-`actual_usage` contract, not a
+            // value the primary could supply if it wanted to.
+            actual_swap_bytes: 0,
             is_idle: self.state.is_idle(),
             is_opportunistic: false,
             has_initial_assignment: !self.state.is_idle(),

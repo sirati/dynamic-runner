@@ -229,9 +229,11 @@ pub(super) fn write_worker_subgroup(
 /// accounting never creates the file), and none of that is worth
 /// degrading the nested layout over — the cap only ADDS protection
 /// on hosts that permit it. Failure is reported once per process at
-/// info (operator-visible) and per-occurrence at debug; it is never
-/// an error, mirroring the wider setup module's infallibility
-/// contract.
+/// warn (operator-visible: workers may swap on this host, and a
+/// swapping worker thrashes instead of OOM-killing cleanly — the
+/// userland swap-driven kill in `dynrunner-scheduler` is the
+/// backstop) and per-occurrence at debug; it is never an error,
+/// mirroring the wider setup module's infallibility contract.
 fn cap_swap_best_effort(cgroup_dir: &Path) {
     let path = cgroup_dir.join("memory.swap.max");
     match std::fs::write(&path, "0") {
@@ -239,14 +241,16 @@ fn cap_swap_best_effort(cgroup_dir: &Path) {
         Err(e) => {
             static SWAP_CAP_FAILED_ONCE: std::sync::Once = std::sync::Once::new();
             SWAP_CAP_FAILED_ONCE.call_once(|| {
-                tracing::info!(
+                tracing::warn!(
                     target: "cgroup_swap_cap",
                     path = %path.display(),
                     error = %e,
                     "memory.swap.max=0 write failed (non-fatal); workers on this \
                      host may be able to swap. Operator hint: a swapping worker \
                      thrashes instead of OOM-killing cleanly — prefer a host/scope \
-                     where the swap controller is delegated."
+                     where the swap controller is delegated. The scheduler's \
+                     main-phase swap-driven kill is the userland backstop when \
+                     this cap does not take."
                 );
             });
             tracing::debug!(

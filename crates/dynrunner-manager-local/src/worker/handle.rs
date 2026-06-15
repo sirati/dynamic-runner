@@ -559,6 +559,12 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
             worker_id: self.worker_id,
             reserved_budgets: self.reserved_budgets.clone(),
             actual_usage: self.actual_usage.clone(),
+            // Swap component of the swap-inclusive `actual_usage`
+            // charge — already-tracked by `set_memory_charge` from
+            // the per-sweep `MemoryCharge::swap_bytes`. Carries it
+            // across the scheduler API so the main-phase swap-
+            // driven kill branch can see it.
+            actual_swap_bytes: self.actual_swap_bytes,
             is_idle: self.idle && self.current_binary.is_none(),
             is_opportunistic: self.opportunistic,
             has_initial_assignment: self.has_initial_assignment,
