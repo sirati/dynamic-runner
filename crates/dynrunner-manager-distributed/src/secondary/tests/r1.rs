@@ -744,6 +744,7 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
                 file_hash: file_hash.clone(),
                 predecessor_outputs: std::collections::BTreeMap::new(),
                 supplanted_holder: None,
+                secondary_id_member_gen: None,
             };
 
             // The critical call: route via the single inbound handler.

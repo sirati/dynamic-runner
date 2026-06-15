@@ -135,13 +135,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // in `primary/task/request.rs` so the wire shape is
                 // identical regardless of which path fires.
                 let predecessor_outputs = gather_predecessor_outputs(&self.cluster_state, &binary);
-                // Pre-start fence A (#530a) — same contract as the sibling
+                // Pre-start fences (#530) — same contract as the sibling
                 // request-driven dispatch in `primary/task/request.rs`:
-                // supplanted_holder is `Some` IFF this hash is a
-                // dead-secondary-requeue redirect; left in place across
-                // the assignment-failure rollback so a re-dispatch stays
-                // fenced.
+                //   A) supplanted_holder — Some IFF this hash is a
+                //      dead-secondary-requeue redirect; left in place
+                //      across the assignment-failure rollback so a
+                //      re-dispatch stays fenced.
+                //   B) secondary_id_member_gen — always Some, the
+                //      addressee's current `peer_member_gen` per this
+                //      coordinator's CRDT view.
                 let supplanted_holder = self.supplanted_holders.get(&task_hash).cloned();
+                let secondary_id_member_gen = Some(self.cluster_state.peer_member_gen(&sec_id));
                 let assignment_msg = DistributedMessage::TaskAssignment {
                     target: None,
                     sender_id: self.config.node_id.clone(),
@@ -154,6 +158,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     file_hash: task_hash.clone(),
                     predecessor_outputs,
                     supplanted_holder,
+                    secondary_id_member_gen,
                 };
 
                 // Transport-send failure rollback: pre-fix the

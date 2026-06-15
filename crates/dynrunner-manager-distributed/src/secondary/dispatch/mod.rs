@@ -76,3 +76,20 @@ pub(crate) const TASK_ALREADY_HELD_WIRE_MESSAGE: &str =
 pub(crate) const TASK_SUPPLANTED_BY_LIVE_HOLDER_WIRE_MESSAGE: &str =
     "task supplanted holder is alive again at gen >= supplanted gen; \
      refusing to start a duplicate (#530a)";
+
+/// Wire `error_message` marker for the addressee-incarnation pre-start
+/// fence reply (Fence B, #530b): the receiving secondary's current
+/// `peer_member_gen` no longer matches the `secondary_id_member_gen`
+/// stamped on the `TaskAssignment`. The lease names a STALE incarnation
+/// of this secondary (a re-removal-and-re-admission crossed the dispatch
+/// in flight); the work is owed to the previous incarnation and the
+/// frame is wholly invalid for the live one. Sent as a `TaskFailed`
+/// (`Recoverable`) so the primary requeues under the live incarnation
+/// instead of double-executing on a respawned peer.
+///
+/// Symmetric to the secondary→primary `InFlightRoster` gen-staleness
+/// gate (the primary→secondary direction) — sibling of the already-held
+/// and supplanted markers.
+pub(crate) const TASK_STALE_ADDRESSEE_GEN_WIRE_MESSAGE: &str =
+    "task assignment names a stale incarnation of this secondary; \
+     rejecting (#530b)";

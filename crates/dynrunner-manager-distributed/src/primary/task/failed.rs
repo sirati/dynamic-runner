@@ -27,6 +27,11 @@ use crate::worker_signal::WorkerMgmtSignal;
 ///     — the reconciliation probe's holder positively denied holding
 ///     the task (#308): its terminal will never come, but it did not
 ///     FAIL anywhere, so it requeues without burning retry budget.
+///   * [`crate::secondary::TASK_STALE_ADDRESSEE_GEN_WIRE_MESSAGE`] —
+///     the pre-start fence B (#530b) refused a dispatch naming a stale
+///     incarnation of the addressee secondary. The lease was wholly
+///     invalid; the task never ran, so it requeues for re-dispatch
+///     under the live incarnation without burning retry budget.
 ///
 /// Deliberately NOT in this set:
 /// [`crate::secondary::TASK_ALREADY_HELD_WIRE_MESSAGE`] — the
@@ -42,6 +47,7 @@ fn is_backpressure_shaped(error_message: &str) -> bool {
         || error_message == "worker pipe broken; respawning"
         || error_message == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE
         || error_message == crate::primary::reconciliation_probe::RECONCILIATION_LOST_WIRE_MESSAGE
+        || error_message == crate::secondary::TASK_STALE_ADDRESSEE_GEN_WIRE_MESSAGE
 }
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {

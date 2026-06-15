@@ -337,6 +337,7 @@ async fn task_assignment_to_zero_worker_operational_node_reports_backpressure_no
                 file_hash: file_hash.clone(),
                 predecessor_outputs: std::collections::BTreeMap::new(),
                 supplanted_holder: None,
+                secondary_id_member_gen: None,
             };
 
             // The critical call: pre-fix this panicked (debug) / indexed
@@ -468,6 +469,7 @@ async fn out_of_range_worker_id_bounces_never_repicks_or_clamps() {
                 file_hash: file_hash.clone(),
                 predecessor_outputs: std::collections::BTreeMap::new(),
                 supplanted_holder: None,
+                secondary_id_member_gen: None,
             };
 
             let result = sec.dispatch_message(assignment, &mut factory).await;
@@ -600,6 +602,7 @@ async fn unresolvable_task_to_zero_worker_node_reports_failure_not_underflow() {
                 file_hash: file_hash.clone(),
                 predecessor_outputs: std::collections::BTreeMap::new(),
                 supplanted_holder: None,
+                secondary_id_member_gen: None,
             };
 
             let mut factory = super::super::test_helpers::FakeWorkerFactory;
@@ -812,6 +815,7 @@ async fn unresolvable_task_in_staging_mode_is_recoverable_not_lost() {
                 file_hash: file_hash.clone(),
                 predecessor_outputs: std::collections::BTreeMap::new(),
                 supplanted_holder: None,
+                secondary_id_member_gen: None,
             };
 
             let mut factory = super::super::test_helpers::FakeWorkerFactory;

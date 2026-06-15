@@ -206,13 +206,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         // is identical regardless of which path fires.
                         let predecessor_outputs =
                             gather_predecessor_outputs(&self.cluster_state, &binary);
-                        // Pre-start fence A (#530a): supplanted_holder is
-                        // `Some` IFF this hash is a dead-secondary-requeue
-                        // redirect; the side-map entry is LEFT in place
-                        // across the assignment-failure rollback path below
-                        // so a re-dispatch stays fenced, and is dropped
-                        // only on terminal.
+                        // Pre-start fences (#530):
+                        //   A) supplanted_holder — Some IFF this hash is a
+                        //      dead-secondary-requeue redirect; the entry is
+                        //      LEFT in place across the assignment-failure
+                        //      rollback path below so a re-dispatch stays
+                        //      fenced, and is dropped only on terminal.
+                        //   B) secondary_id_member_gen — always Some, the
+                        //      addressee's current `peer_member_gen` per this
+                        //      coordinator's CRDT view (the receiver compares
+                        //      it against its own to catch a stale-incarnation
+                        //      lease that crossed a re-removal-and-re-admission
+                        //      in flight). Symmetric to the secondary→primary
+                        //      InFlightRoster gen-staleness gate (#518).
                         let supplanted_holder = self.supplanted_holders.get(&task_hash).cloned();
+                        let secondary_id_member_gen =
+                            Some(self.cluster_state.peer_member_gen(&sec_id));
                         let assignment_msg = DistributedMessage::TaskAssignment {
                             target: None,
                             sender_id: self.config.node_id.clone(),
@@ -225,6 +234,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             file_hash: task_hash.clone(),
                             predecessor_outputs,
                             supplanted_holder,
+                            secondary_id_member_gen,
                         };
 
                         // Same partial-commit-leak rollback as

@@ -421,6 +421,7 @@ fn roundtrip_task_assignment() {
         file_hash: "abc123".into(),
         predecessor_outputs: std::collections::BTreeMap::new(),
         supplanted_holder: None,
+        secondary_id_member_gen: None,
     };
 
     let bytes = serialize_message(&msg).unwrap();
@@ -565,6 +566,7 @@ fn roundtrip_task_assignment_predecessor_outputs_populated() {
         file_hash: "h".into(),
         predecessor_outputs: preds.clone(),
         supplanted_holder: None,
+        secondary_id_member_gen: None,
     };
 
     let bytes = serialize_message(&msg).unwrap();
@@ -655,6 +657,7 @@ fn roundtrip_task_assignment_with_supplanted_holder_fence_a() {
         file_hash: "h".into(),
         predecessor_outputs: std::collections::BTreeMap::new(),
         supplanted_holder: Some(("sec-a".into(), 1)),
+        secondary_id_member_gen: None,
     };
 
     let bytes = serialize_message(&msg).unwrap();
@@ -711,12 +714,104 @@ fn legacy_task_assignment_without_supplanted_holder_decodes_as_none() {
     }
 }
 
+/// Pre-start fence B wire field (#530b): a `TaskAssignment` carrying a
+/// `Some(secondary_id_member_gen)` stamp round-trips verbatim through
+/// the codec — the gen scalar is preserved, no field is silently
+/// dropped. Twin of `roundtrip_task_assignment_with_supplanted_holder_fence_a`
+/// for the orthogonal stale-incarnation fence.
+#[test]
+fn roundtrip_task_assignment_with_addressee_gen_fence_b() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::TaskAssignment {
+        target: None,
+        sender_id: "primary".into(),
+        timestamp: 0.0,
+        secondary_id: "sec-b".into(),
+        worker_id: 7,
+        zip_file: None,
+        binary_info: DistributedBinaryInfo {
+            path: "/tmp/x".into(),
+            size: 1,
+            identifier: test_id("gen_fenced"),
+            phase_id: "default".into(),
+            type_id: "default".into(),
+            affinity_id: None,
+            payload_json: "null".into(),
+            task_id: "gen-fenced-task".into(),
+            task_depends_on: vec![],
+            preferred_secondaries: Default::default(),
+        },
+        local_path: "x".into(),
+        file_hash: "h".into(),
+        predecessor_outputs: std::collections::BTreeMap::new(),
+        supplanted_holder: None,
+        secondary_id_member_gen: Some(2),
+    };
+
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, _) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    match decoded {
+        DistributedMessage::TaskAssignment {
+            secondary_id_member_gen,
+            ..
+        } => {
+            assert_eq!(secondary_id_member_gen, Some(2));
+        }
+        _ => panic!("expected TaskAssignment"),
+    }
+}
+
+/// Backcompat (#530b): a pre-fence sender emits a `TaskAssignment` JSON
+/// payload without the `secondary_id_member_gen` field. The same legacy
+/// JSON the fence-A backcompat test consumes is reused here — the same
+/// `#[serde(default)]` machinery decodes BOTH new fields as `None` from
+/// a pre-#530 frame, so a rolling upgrade introduces no asymmetry. This
+/// pins the legacy-decode contract specifically for the fence-B field.
+#[test]
+fn legacy_task_assignment_without_addressee_gen_decodes_as_none() {
+    let legacy = serde_json::json!({
+        "msg_type": "task_assignment",
+        "sender_id": "primary",
+        "timestamp": 0.0,
+        "secondary_id": "sec-0",
+        "worker_id": 0,
+        "zip_file": null,
+        "binary_info": {
+            "path": "/tmp/x",
+            "size": 1,
+            "identifier": {
+                "binary_name": "legacy",
+                "platform": "x86_64",
+                "compiler": "gcc",
+                "version": "12.0",
+                "opt_level": "O2"
+            },
+            "task_id": "legacy-task"
+        },
+        "local_path": "x",
+        "file_hash": "h"
+    });
+    let json = serde_json::to_vec(&legacy).unwrap();
+    let decoded: DistributedMessage<TestId> = serde_json::from_slice(&json).unwrap();
+    match decoded {
+        DistributedMessage::TaskAssignment {
+            secondary_id_member_gen,
+            ..
+        } => {
+            assert_eq!(secondary_id_member_gen, None);
+        }
+        _ => panic!("expected TaskAssignment"),
+    }
+}
+
 /// Wire-bytes elision (#530a): when `supplanted_holder` is `None`, the
 /// JSON output must NOT contain the field name — matches the
 /// `predecessor_outputs` / `preferred_secondaries` "elide when default"
 /// idiom so the byte representation of the common (no-fence) case is
 /// byte-identical to the pre-#530 sender's frame, and a rolling
-/// upgrade introduces zero wire bloat on the steady-state path.
+/// upgrade introduces zero wire bloat on the steady-state path. Both
+/// fence fields (#530a + #530b) are asserted to elide together so a
+/// rolling upgrade is byte-identical on the steady-state path for both
+/// fences.
 #[test]
 fn no_supplanted_holder_elided_on_wire() {
     let msg: DistributedMessage<TestId> = DistributedMessage::TaskAssignment {
@@ -742,11 +837,16 @@ fn no_supplanted_holder_elided_on_wire() {
         file_hash: "h".into(),
         predecessor_outputs: std::collections::BTreeMap::new(),
         supplanted_holder: None,
+        secondary_id_member_gen: None,
     };
     let json = serde_json::to_string(&msg).unwrap();
     assert!(
         !json.contains("supplanted_holder"),
         "None supplanted_holder must elide via skip_serializing_if, got: {json}"
+    );
+    assert!(
+        !json.contains("secondary_id_member_gen"),
+        "None secondary_id_member_gen must elide via skip_serializing_if, got: {json}"
     );
 }
 
@@ -780,6 +880,7 @@ fn empty_predecessor_outputs_elided_on_wire() {
         file_hash: "h".into(),
         predecessor_outputs: std::collections::BTreeMap::new(),
         supplanted_holder: None,
+        secondary_id_member_gen: None,
     };
 
     let json = serde_json::to_string(&msg).unwrap();
