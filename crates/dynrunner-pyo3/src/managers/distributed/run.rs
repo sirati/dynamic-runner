@@ -891,6 +891,13 @@ impl PyDistributedManager {
                             // follow-up (loopback beacon between in-process
                             // threads). No regression: `None` = no beacon rx.
                             liveness_ping_rx: None,
+                            // #542 cause-B: the in-process
+                            // `--multi-computer local` path uses an mpsc
+                            // mesh, not QUIC — no dial-failure signal is
+                            // produced, so no rx is wired. The
+                            // observer-prune arm parks on `pending()`
+                            // when this field is `None`.
+                            persistent_dial_failure_rx: None,
                             // No node beacon on the in-process path (same
                             // follow-up): `None` = no primary→secondaries beacon.
                             peer_liveness_addrs: None,

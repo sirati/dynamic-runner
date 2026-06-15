@@ -1665,8 +1665,9 @@ where
 
     /// Top-of-loop OBSERVED-terminal block (the single exit decision
     /// point). The observer terminates ONLY on a terminal it OBSERVED — the
-    /// primary's `RunAborted` / `RunComplete` verdict, or the
-    /// closed-transport-with-peers clean tail. It carries ZERO authority
+    /// primary's `RunAborted` / `RunComplete` verdict (arms 1-2), OR the
+    /// closed-transport-with-peers clean tail GATED on an observed terminal
+    /// (arm 3 — see the inline #542 GATE note). It carries ZERO authority
     /// over the run, so it NEVER returns an `Err`: a loss of the observer's
     /// own transport visibility is handled separately by the
     /// [`LostVisibilityReporter`] (report-and-retry, NEVER an exit — BUG-B).
@@ -1707,16 +1708,35 @@ where
             }
             return Some(ObserverTerminal::Done);
         }
-        // 3. Closed transport with peers present → clean exit 0. Read off
-        //    the mesh client's pump-published `MembershipView` (≤1-cycle
-        //    stale, monotone-toward-truth — it republishes the whole live set
+        // 3. Closed transport with peers present + observed terminal →
+        //    clean exit 0. Read the mesh peer count off the mesh client's
+        //    pump-published `MembershipView` (≤1-cycle stale,
+        //    monotone-toward-truth — it republishes the whole live set
         //    each pump cycle, so it can never MISS a remove). This is the
         //    role's teardown tail: the inbound closed but the wire still has
         //    peers (a clean shutdown), so the observer rides out cleanly. A
         //    stale-HIGH count only delays this by one cycle; a closed
         //    transport with ZERO peers is NOT an exit — it falls through to
         //    the lost-visibility reporter (report-and-retry), never a strand.
-        if transport_closed && self.client.peer_count() > 0 {
+        //
+        //    #542 GATE: PRE-terminal a transient inbound close (mesh blip,
+        //    socket reset, the relocated submitter's brief retag window) is
+        //    NOT an observed terminal — it's local state — and exiting here
+        //    used to violate the doc-comment invariant above ("ONLY on a
+        //    terminal it OBSERVED"). A pre-terminal close is exactly what
+        //    the [`LostVisibilityReporter`] handles (report-and-retry; see
+        //    [`Self::current_visibility`] just below). Requiring an observed
+        //    terminal here closes the cause-A leak: the relocated primary
+        //    no longer ends up with a stale `role_table.observers` entry
+        //    (the observer-side process exiting pre-RunComplete + the
+        //    primary's broadcast PeerInfo still naming it ⇒ recurring
+        //    unreachable-dial WARN every 60s at
+        //    `dynrunner-transport-quic::peer::mod::1086`). `run_aborted` is
+        //    a CRDT-replicated terminal too (the primary's deliberate fatal
+        //    verdict), so EITHER terminal releases arm 3.
+        let observed_terminal =
+            self.cluster_state.run_complete() || self.cluster_state.run_aborted().is_some();
+        if transport_closed && self.client.peer_count() > 0 && observed_terminal {
             return Some(ObserverTerminal::Done);
         }
         None

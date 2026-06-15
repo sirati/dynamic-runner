@@ -959,4 +959,64 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             );
         }
     }
+
+    /// Handle one persistent-dial-failure signal from the QUIC transport
+    /// (#542 cause-B). The transport calls into this path only at the
+    /// `DIAL_SUMMARY_THRESHOLD` boundary (3 consecutive failed dial
+    /// sweeps without a connect — the same boundary that throttles the
+    /// operator "peer unreachable" WARN), so the give-up is already
+    /// gated.
+    ///
+    /// OBSERVER-ONLY: if `peer_id` is in `role_table.observers`,
+    /// originate a `ClusterMutation::PeerRemoved { cause:
+    /// PersistentDialFailure }` so the role_table prunes, the next
+    /// PeerInfo broadcast drops the id, and `connect_to_peers` calls
+    /// `forget_departed` — the dial loop stops, and the recurring 60s
+    /// unreachable WARN that #542 was about ends. Secondaries are
+    /// SKIPPED: they already have an authoritative heartbeat-miss
+    /// dead-declaration path (`requeue_dead_secondary`); adding a
+    /// second source from the dial-failure signal would race that path
+    /// and risk a double-removal interleaving on a slow / partitioned
+    /// secondary that's still reachable on the keepalive path.
+    /// Unknown ids (not in any role set — the dial info was stale) are
+    /// dropped at debug level.
+    ///
+    /// FALSE-POSITIVE RECOVERY: a recoverable but flaky observer
+    /// removed here recovers via the existing
+    /// `PeerJoined`/`CapabilityAdvertised` re-admission path on the
+    /// next successful connect — `apply_peer_removed` merges a
+    /// `Departed` tombstone at the current generation, and a
+    /// higher-generation `Advertised` supersedes it. No new
+    /// recovery machinery is needed.
+    pub(crate) async fn handle_persistent_dial_failure(&mut self, peer_id: String) {
+        let role_table = self.cluster_state.role_table();
+        if !role_table.observers.contains(peer_id.as_str()) {
+            tracing::debug!(
+                peer = %peer_id,
+                "persistent-dial-failure signal for a non-observer peer; \
+                 secondaries are removed via the heartbeat-miss path and \
+                 unknown ids are stale dial info — taking no action"
+            );
+            return;
+        }
+        // Stamp the CURRENT membership incarnation: a removal at the
+        // peer's `member_gen` kills exactly this incarnation, leaving a
+        // higher-generation re-admission free to win at every receiver.
+        let member_gen = self.cluster_state.peer_member_gen(&peer_id);
+        tracing::warn!(
+            observer = %peer_id,
+            member_gen = member_gen,
+            "originating PeerRemoved for an observer the QUIC transport \
+             has given up dialing (DIAL_SUMMARY_THRESHOLD reached); \
+             pruning role_table.observers so the dial loop stops \
+             (#542 cause-B)"
+        );
+        let mutation = ClusterMutation::PeerRemoved {
+            id: peer_id,
+            cause: RemovalCause::PersistentDialFailure,
+            member_gen,
+        };
+        self.apply_and_broadcast_cluster_mutations(vec![mutation])
+            .await;
+    }
 }

@@ -3418,3 +3418,84 @@ async fn observer_twin_executes_upload_and_reports_success() {
         })
         .await;
 }
+
+/// #542 cause-A: `evaluate_exit` arm 3 — the closed-transport-with-peers
+/// clean tail — must REQUIRE an observed terminal (run_complete or
+/// run_aborted). PRE-terminal a closed inbound is transient (mesh blip,
+/// socket reset, the relocated submitter's retag window) and is exactly
+/// what the lost-visibility reporter handles. Without this gate the
+/// observer exits Done pre-RunComplete, the relocated primary's
+/// `role_table.observers` keeps the dead entry, and the QUIC dial loop
+/// fires a recurring 60s unreachable WARN forever after.
+///
+/// Pins arm-by-arm with `evaluate_exit` called directly (private fn, child
+/// module access):
+///   - (no terminal, transport_closed=true, peer_count>0) ⇒ None — KEEP OBSERVING.
+///   - (run_complete, transport_closed=true, peer_count>0) ⇒ Done.
+///   - (run_aborted, transport_closed=true, peer_count>0) ⇒ Aborted.
+/// A revert that removes the gate re-fails the first assertion.
+#[tokio::test(flavor = "current_thread")]
+async fn evaluate_exit_closed_tail_requires_observed_terminal() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _inbound, _peers) = transport_with_peers("obs", 1);
+            let cs = ClusterState::<TestId>::new();
+            let (client, inbox, pump) = observer_mesh(transport, "obs");
+            // Drive the pump so the membership view is published (so
+            // `client.peer_count() > 0` at the call site).
+            let pump_handle = tokio::task::spawn_local(pump);
+            // One pump tick is enough to publish the live peer count.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
+            assert!(
+                observer.client.peer_count() > 0,
+                "test setup: pump must have published a non-zero peer count"
+            );
+
+            // PRE-TERMINAL: closed inbound + peers + no observed terminal ⇒
+            // None. The lost-visibility reporter handles a pre-terminal
+            // close; arm 3 must NOT fire.
+            assert!(
+                observer.evaluate_exit(true).is_none(),
+                "#542 gate: arm 3 must require an observed terminal — got an early Done",
+            );
+
+            // POST run_complete: arm 3 fires Done.
+            let mut cs_complete = ClusterState::<TestId>::new();
+            cs_complete.apply(ClusterMutation::RunComplete { counts: Default::default() });
+            let (transport2, _inb2, _peers2) = transport_with_peers("obs2", 1);
+            let (client2, inbox2, pump2) = observer_mesh(transport2, "obs2");
+            let pump2_handle = tokio::task::spawn_local(pump2);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let observer_complete =
+                ObserverCoordinator::new(client2, inbox2, cs_complete, observer_config("obs2"));
+            assert!(matches!(
+                observer_complete.evaluate_exit(true),
+                Some(ObserverTerminal::Done)
+            ),);
+
+            // POST run_aborted: arm 3 (via arm 1) fires Aborted. (Arm 1
+            // wins on RunAborted; this pins the bracketing case.)
+            let mut cs_aborted = ClusterState::<TestId>::new();
+            cs_aborted.apply(ClusterMutation::RunAborted {
+                reason: "test".to_string(),
+                counts: Default::default(),
+            });
+            let (transport3, _inb3, _peers3) = transport_with_peers("obs3", 1);
+            let (client3, inbox3, pump3) = observer_mesh(transport3, "obs3");
+            let pump3_handle = tokio::task::spawn_local(pump3);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let observer_aborted =
+                ObserverCoordinator::new(client3, inbox3, cs_aborted, observer_config("obs3"));
+            assert!(matches!(
+                observer_aborted.evaluate_exit(true),
+                Some(ObserverTerminal::Aborted { .. })
+            ),);
+
+            pump_handle.abort();
+            pump2_handle.abort();
+            pump3_handle.abort();
+        })
+        .await;
+}
