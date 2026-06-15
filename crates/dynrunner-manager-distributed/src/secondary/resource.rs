@@ -880,6 +880,30 @@ where
             .min()
     }
 
+    /// The longest age (in seconds, saturating to `u32::MAX`) of any
+    /// retained confirmable report on the buffered-report-replay queue
+    /// at `now`. `0` when the queue is empty (no unACKed reports — the
+    /// steady-state). Consumed by the #589 loop-health emit arm to
+    /// stamp the [`dynrunner_protocol_primary_secondary::SecondaryResourceSampleRecord::max_unacked_for_secs`]
+    /// wire field — the fleet-wide max the observer computes surfaces
+    /// a blackholed-but-live leg (#352) class even when each
+    /// secondary's host CPU/mem/swap look healthy.
+    ///
+    /// Instantaneous-at-call: the queue retains every still-pending
+    /// entry's `first_retained_at`, so the longest age currently
+    /// present IS the window-max of currently-pending entries. An
+    /// entry that drained earlier in the window is by definition no
+    /// longer stuck — its omission is the operator-meaningful
+    /// "stuck-RIGHT-NOW" semantic the loop-health digest wants.
+    pub(in crate::secondary) fn max_unacked_for_secs(&self, now: std::time::Instant) -> u32 {
+        self.pending_report_replays
+            .iter()
+            .map(|entry| now.saturating_duration_since(entry.first_retained_at))
+            .max()
+            .map(|d| d.as_secs().min(u32::MAX as u64) as u32)
+            .unwrap_or(0)
+    }
+
     async fn drain_report_replays_inner(&mut self, force_due: bool) -> usize {
         if self.pending_report_replays.is_empty() {
             return 0;

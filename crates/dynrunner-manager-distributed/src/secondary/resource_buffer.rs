@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 
 use dynrunner_protocol_primary_secondary::SecondaryResourceSampleRecord;
 
+use super::loop_health::LoopHealthFields;
+
 /// Rolling-buffer retention window: every sample older than this on
 /// the most recent `push` is dropped. 10 minutes matches the owner's
 /// #575 spec ("at most two 5-minute emits worth of samples").
@@ -129,10 +131,23 @@ impl ResourceSampleBuffer {
     /// operational arm reads the membership generation off the CRDT
     /// and emit-time off the wall clock at broadcast time). The
     /// buffer never reads either — single concern.
+    ///
+    /// `loop_health` carries the at-emit-time #589 loop-health axes
+    /// (iter-rate, dominant arm, oldest-unACKed report age) the
+    /// caller already computed from the operational loop's existing
+    /// `arm_stats` counter + the report-replay queue. The buffer
+    /// FORWARDS them onto the wire record verbatim — it does not own
+    /// the loop-health concern, but it IS the single assembler of the
+    /// wire shape (one place that knows the field list), so layering
+    /// loop-health here keeps the wire-shape construction in one
+    /// function. `Default::default()` is the cold-start / no-signal
+    /// sentinel (the wire-elision contract — every field is
+    /// `skip_serializing_if=is_zero/is_empty`).
     pub fn aggregate(
         &self,
         member_gen: u64,
         emitted_at_ms: u64,
+        loop_health: LoopHealthFields,
     ) -> Option<SecondaryResourceSampleRecord> {
         if self.samples.is_empty() {
             return None;
@@ -168,7 +183,7 @@ impl ResourceSampleBuffer {
                 .map(|(_, s)| s.cpu_busy_milli),
         );
 
-        Some(SecondaryResourceSampleRecord {
+        let mut record = SecondaryResourceSampleRecord {
             member_gen,
             emitted_at_ms,
             mem_p10_bytes: mem_p10,
@@ -181,7 +196,16 @@ impl ResourceSampleBuffer {
             total_swap_used_bytes,
             total_free_swap_bytes,
             cpu_utilization_milli,
-        })
+            // #589 loop-health stamped below — `stamp_onto` writes the
+            // 4 wire fields. Default zeros pre-stamp keep the partial
+            // record well-formed if a future refactor reorders.
+            oploop_iters_per_sec_milli: 0,
+            dominant_arm_name: String::new(),
+            dominant_arm_pct_milli: 0,
+            max_unacked_for_secs: 0,
+        };
+        loop_health.stamp_onto(&mut record);
+        Some(record)
     }
 
     /// Sample count currently in the buffer — observability only.
@@ -281,7 +305,7 @@ mod tests {
     #[test]
     fn empty_buffer_aggregates_to_none() {
         let buf = ResourceSampleBuffer::new();
-        assert!(buf.aggregate(0, 0).is_none());
+        assert!(buf.aggregate(0, 0, LoopHealthFields::default()).is_none());
     }
 
     #[test]
@@ -289,7 +313,7 @@ mod tests {
         let mut buf = ResourceSampleBuffer::new();
         let now = Instant::now();
         buf.push(now, raw(1_000_000_000, Some(2_000_000_000)));
-        let agg = buf.aggregate(7, 1_700_000_000_000).unwrap();
+        let agg = buf.aggregate(7, 1_700_000_000_000, LoopHealthFields::default()).unwrap();
         assert_eq!(agg.member_gen, 7);
         assert_eq!(agg.emitted_at_ms, 1_700_000_000_000);
         // Single-sample percentiles collapse to that one value.
@@ -309,7 +333,7 @@ mod tests {
         for i in 1..=100 {
             buf.push(now, raw(i * 100, None));
         }
-        let agg = buf.aggregate(0, 0).unwrap();
+        let agg = buf.aggregate(0, 0, LoopHealthFields::default()).unwrap();
         // Linear interpolation: rank = 0.1 * 99 = 9.9, value =
         // sorted[9] + 0.9*(sorted[10] - sorted[9]) = 1000 + 0.9*100 =
         // 1090. (sorted is 1-based here: sorted[9] is sample index 9
@@ -348,7 +372,7 @@ mod tests {
         // one) get evicted. The eviction is "strictly older than
         // threshold" — t0+1s itself is retained.
         assert_eq!(buf.len(), 11);
-        let agg = buf.aggregate(0, 0).unwrap();
+        let agg = buf.aggregate(0, 0, LoopHealthFields::default()).unwrap();
         // The first sample (workers_charged = 0) is evicted; the
         // surviving min is 100. Linear-interp p10 over [100..1100]
         // step 100 lands around 200.
@@ -362,7 +386,7 @@ mod tests {
         for i in 0..10 {
             buf.push(now, raw(i * 100, None));
         }
-        let agg = buf.aggregate(0, 0).unwrap();
+        let agg = buf.aggregate(0, 0, LoopHealthFields::default()).unwrap();
         // Every sample had `host_free_memory_bytes: None`; the mean
         // falls back to 0 (the documented "no signal" sentinel).
         assert_eq!(agg.total_free_memory_bytes, 0);
@@ -379,7 +403,7 @@ mod tests {
         for _ in 0..5 {
             buf.push(now, raw(1, None));
         }
-        let agg = buf.aggregate(0, 0).unwrap();
+        let agg = buf.aggregate(0, 0, LoopHealthFields::default()).unwrap();
         // Mean over the 5 Some values is exactly 1000; the 5 Nones
         // are skipped (NOT counted as zeros that would halve the
         // mean to 500).
@@ -402,7 +426,7 @@ mod tests {
                 },
             );
         }
-        let agg = buf.aggregate(0, 0).unwrap();
+        let agg = buf.aggregate(0, 0, LoopHealthFields::default()).unwrap();
         assert_eq!(agg.cpu_utilization_milli, 80_000);
     }
 }

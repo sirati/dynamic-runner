@@ -57,6 +57,7 @@ pub(crate) use dispatch::{
 pub mod consensus;
 pub(crate) mod election;
 mod lifecycle;
+pub(crate) mod loop_health;
 // `pub(crate)` only so the `cascade_drain_done` pool-cascade primitive
 // (the module's single `pub(crate)` item) is reachable by the
 // symmetric `crate::primary::hydrate` path. Every other item in the

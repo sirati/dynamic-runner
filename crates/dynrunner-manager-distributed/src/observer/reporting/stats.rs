@@ -152,6 +152,52 @@ pub struct StatsSnapshot {
     pub avg_total_swap_used_bytes: Option<u64>,
     pub avg_total_free_swap_bytes: Option<u64>,
     pub avg_cpu_utilization_milli: Option<u32>,
+    /// #589 loop-health: arithmetic mean of every alive compute
+    /// secondary's `oploop_iters_per_sec_milli` over secondaries whose
+    /// LATEST sample carries a NON-ZERO value (a zero is the cold-
+    /// start / no-signal sentinel — pre-#589 secondaries decode to
+    /// zero via serde-default, and a freshly-spawned loop's first emit
+    /// is zero by the tracker's seed-then-return-Default contract).
+    /// `None` when NO live secondary has a non-zero reading. Excluding
+    /// zeros from the denominator keeps the fleet average from being
+    /// dragged toward the cold-start sentinel by a single just-
+    /// respawned secondary. Necessary-but-not-sufficient is the host
+    /// CPU% line ALONE; pairing the host axis with this loop-rate axis
+    /// catches the #586 oom_sweep class (low host CPU + low iter-rate).
+    pub avg_oploop_iters_per_sec_milli: Option<u64>,
+    /// #589 loop-health: the SINGLE alive compute secondary with the
+    /// HIGHEST `dominant_arm_pct_milli` across the fleet — paired with
+    /// its arm name. `None` when no live secondary has a non-empty
+    /// dominant-arm name (every alive secondary is either pre-#589
+    /// (serde-default empty string) or cold-start (the tracker's seed
+    /// emit). Max-by-pct because the operator's signal is "is ANY
+    /// secondary's loop monopolised by a non-inbox arm" — the fleet
+    /// average would average a hot secondary down to noise.
+    pub dominant_arm: Option<DominantArm>,
+    /// #589 loop-health: the fleet maximum of every alive compute
+    /// secondary's `max_unacked_for_secs` — the longest unACKed
+    /// confirmable report age ANYWHERE in the fleet at the latest emit
+    /// each secondary broadcast. `None` when no live secondary has a
+    /// non-zero reading (steady-state, no buffered replays). Max
+    /// because the blackholed-but-live leg (#352) class is a per-
+    /// secondary problem — the fleet average dilutes it to invisibility.
+    pub max_unacked_for_secs: Option<u32>,
+}
+
+/// #589 loop-health: the fleet's single hottest arm, by share of the
+/// originating secondary's emit-window iteration deltas. The (name,
+/// pct) pair the format layer renders as "dominant arm:
+/// `oom_sweep`:55.0%". Lives on the snapshot (not as two separate
+/// `Option<String>` / `Option<u32>` fields) so the format layer
+/// renders ONE atomic line — a non-empty name without a pct, or vice
+/// versa, would be a structural lie the type system rules out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DominantArm {
+    /// The arm name from the winning secondary (e.g. `"oom_sweep"`).
+    pub arm_name: String,
+    /// That arm's share of the secondary's emit-window iteration
+    /// deltas, in milli-percent (`55_000` = 55.0%).
+    pub pct_milli: u32,
 }
 
 impl StatsSnapshot {
@@ -191,6 +237,11 @@ impl StatsSnapshot {
     ///     1-hour safety net fires, OR a force-print was signalled),
     ///     `format.rs::render_report` then runs the 25% gate on each
     ///     resource line to decide actual line inclusion.
+    ///   * #589 loop-health: `avg_oploop_iters_per_sec_milli`,
+    ///     `dominant_arm`, `max_unacked_for_secs` — same rationale.
+    ///     The 25%-threshold-against-last-printed gate in `format.rs`
+    ///     decides whether each loop-health line is actually included
+    ///     when an outside-the-skip-set field forces the print.
     ///
     /// Subset semantics (not strict equality): an all-equal snapshot
     /// (diff = ∅) trivially satisfies "all changes are in the eligible
@@ -247,6 +298,18 @@ impl StatsSnapshot {
             avg_total_swap_used_bytes: _,
             avg_total_free_swap_bytes: _,
             avg_cpu_utilization_milli: _,
+            // #589 loop-health fields are SKIP-ELIGIBLE for the same
+            // reason as the #575 resource averages: continuous
+            // measurements with a per-field 25% inclusion gate in
+            // `format.rs`. A loop-health-only change must NOT force a
+            // 10-min print; the operator gets the change on the next
+            // outside-the-skip-set movement OR on the 1-hour safety
+            // net. Bound with `_` prefix so the destructure stays
+            // exhaustive (a future loop-health field is a compile
+            // error here until classified).
+            avg_oploop_iters_per_sec_milli: _,
+            dominant_arm: _,
+            max_unacked_for_secs: _,
         } = self;
         setup_succeeded == &prev.setup_succeeded
             && unfulfillable == &prev.unfulfillable
@@ -362,30 +425,69 @@ impl StatsSnapshot {
         // secondary that has not yet emitted is excluded from the
         // denominator for ALL fields (per-secondary atomicity — a
         // present record contributes to every field).
-        let (resource_sum, resource_n) = state.live_compute_resource_samples().fold(
-            (ResourceFieldSums::default(), 0u64),
-            |(mut acc, n), (_id, record)| {
-                acc.mem_p10 = acc.mem_p10.saturating_add(record.mem_p10_bytes as u128);
-                acc.mem_p30 = acc.mem_p30.saturating_add(record.mem_p30_bytes as u128);
-                acc.mem_p50 = acc.mem_p50.saturating_add(record.mem_p50_bytes as u128);
-                acc.mem_p70 = acc.mem_p70.saturating_add(record.mem_p70_bytes as u128);
-                acc.mem_p90 = acc.mem_p90.saturating_add(record.mem_p90_bytes as u128);
-                acc.mem_avg = acc.mem_avg.saturating_add(record.mem_avg_bytes as u128);
-                acc.total_free_memory = acc
-                    .total_free_memory
-                    .saturating_add(record.total_free_memory_bytes as u128);
-                acc.total_swap_used = acc
-                    .total_swap_used
-                    .saturating_add(record.total_swap_used_bytes as u128);
-                acc.total_free_swap = acc
-                    .total_free_swap
-                    .saturating_add(record.total_free_swap_bytes as u128);
-                acc.cpu_utilization_milli = acc
-                    .cpu_utilization_milli
-                    .saturating_add(record.cpu_utilization_milli as u128);
-                (acc, n + 1)
-            },
-        );
+        //
+        // #589 loop-health is folded in the same pass with PER-FIELD
+        // denominators (zero values are the cold-start / wire-elided
+        // sentinel): a freshly-respawned secondary or a pre-#589
+        // peer contributes the present #575 fields but is excluded
+        // from the loop-health denominators until it has a non-zero
+        // reading. Dominant arm is max-by-pct (not averaged) — a hot
+        // secondary's signal would average down to noise across an
+        // otherwise-quiet fleet.
+        let (resource_sum, resource_n, loop_health_sum) = state
+            .live_compute_resource_samples()
+            .fold(
+                (
+                    ResourceFieldSums::default(),
+                    0u64,
+                    LoopHealthFieldSums::default(),
+                ),
+                |(mut acc, n, mut lh), (_id, record)| {
+                    acc.mem_p10 = acc.mem_p10.saturating_add(record.mem_p10_bytes as u128);
+                    acc.mem_p30 = acc.mem_p30.saturating_add(record.mem_p30_bytes as u128);
+                    acc.mem_p50 = acc.mem_p50.saturating_add(record.mem_p50_bytes as u128);
+                    acc.mem_p70 = acc.mem_p70.saturating_add(record.mem_p70_bytes as u128);
+                    acc.mem_p90 = acc.mem_p90.saturating_add(record.mem_p90_bytes as u128);
+                    acc.mem_avg = acc.mem_avg.saturating_add(record.mem_avg_bytes as u128);
+                    acc.total_free_memory = acc
+                        .total_free_memory
+                        .saturating_add(record.total_free_memory_bytes as u128);
+                    acc.total_swap_used = acc
+                        .total_swap_used
+                        .saturating_add(record.total_swap_used_bytes as u128);
+                    acc.total_free_swap = acc
+                        .total_free_swap
+                        .saturating_add(record.total_free_swap_bytes as u128);
+                    acc.cpu_utilization_milli = acc
+                        .cpu_utilization_milli
+                        .saturating_add(record.cpu_utilization_milli as u128);
+                    // #589 loop-health fold-in:
+                    //   - iter-rate: arithmetic mean over secondaries
+                    //     with a NON-ZERO reading (zero = cold-start /
+                    //     pre-#589 / wire-elided sentinel).
+                    //   - dominant arm: max-by-pct over secondaries
+                    //     with a NON-EMPTY name.
+                    //   - max-unacked: fleet max over secondaries with
+                    //     a NON-ZERO reading.
+                    if record.oploop_iters_per_sec_milli > 0 {
+                        lh.iters_sum = lh
+                            .iters_sum
+                            .saturating_add(record.oploop_iters_per_sec_milli as u128);
+                        lh.iters_n += 1;
+                    }
+                    if !record.dominant_arm_name.is_empty()
+                        && record.dominant_arm_pct_milli > lh.dominant_pct_max
+                    {
+                        lh.dominant_pct_max = record.dominant_arm_pct_milli;
+                        lh.dominant_name = Some(record.dominant_arm_name.clone());
+                    }
+                    if record.max_unacked_for_secs > lh.unacked_max {
+                        lh.unacked_max = record.max_unacked_for_secs;
+                        lh.unacked_seen = true;
+                    }
+                    (acc, n + 1, lh)
+                },
+            );
         let avg_mem_p10_bytes = avg_u64_from_sum(resource_sum.mem_p10, resource_n);
         let avg_mem_p30_bytes = avg_u64_from_sum(resource_sum.mem_p30, resource_n);
         let avg_mem_p50_bytes = avg_u64_from_sum(resource_sum.mem_p50, resource_n);
@@ -400,6 +502,21 @@ impl StatsSnapshot {
             avg_u64_from_sum(resource_sum.total_free_swap, resource_n);
         let avg_cpu_utilization_milli =
             avg_u32_from_sum(resource_sum.cpu_utilization_milli, resource_n);
+        // #589 loop-health aggregates from the per-field denominators.
+        let avg_oploop_iters_per_sec_milli =
+            avg_u64_from_sum(loop_health_sum.iters_sum, loop_health_sum.iters_n);
+        let dominant_arm =
+            loop_health_sum
+                .dominant_name
+                .map(|arm_name| DominantArm {
+                    arm_name,
+                    pct_milli: loop_health_sum.dominant_pct_max,
+                });
+        let max_unacked_for_secs = if loop_health_sum.unacked_seen {
+            Some(loop_health_sum.unacked_max)
+        } else {
+            None
+        };
 
         StatsSnapshot {
             succeeded: outcome.succeeded,
@@ -451,8 +568,39 @@ impl StatsSnapshot {
             avg_total_swap_used_bytes,
             avg_total_free_swap_bytes,
             avg_cpu_utilization_milli,
+            avg_oploop_iters_per_sec_milli,
+            dominant_arm,
+            max_unacked_for_secs,
         }
     }
+}
+
+/// Per-field running aggregates of the #589 loop-health digest values,
+/// folded across `live_compute_resource_samples()`. Lives here (not on
+/// the public `StatsSnapshot`) — a fold-local intermediate, never
+/// reported. Mirrors [`ResourceFieldSums`] for the loop-health axis;
+/// the field shapes differ because loop-health uses MAX (dominant arm,
+/// unacked) and a separately-denominated MEAN (iter-rate excludes
+/// zero/cold-start emitters from the denominator) — neither matches
+/// the #575 "average over a fixed denominator" rule.
+#[derive(Debug, Default, Clone)]
+struct LoopHealthFieldSums {
+    iters_sum: u128,
+    /// Iter-rate is averaged ONLY across secondaries with a non-zero
+    /// reading (zero = cold-start / pre-#589 / wire-elided sentinel).
+    /// Folding cold-starts into the denominator would drag the fleet
+    /// avg toward zero after every respawn — useless to the operator.
+    iters_n: u64,
+    dominant_pct_max: u32,
+    dominant_name: Option<String>,
+    unacked_max: u32,
+    /// `true` once any secondary's `max_unacked_for_secs` exceeded the
+    /// running max (i.e. was non-zero) — the "saw a real reading"
+    /// witness for the `Option<u32>` denominator. A non-zero
+    /// `unacked_max` alone would conflate "every secondary at zero"
+    /// (steady-state, no signal) with "no secondary emitted at all";
+    /// this flag disambiguates.
+    unacked_seen: bool,
 }
 
 /// Per-field running u128 sums of the #575 resource-stat averages,

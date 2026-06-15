@@ -273,6 +273,13 @@ impl Reporter {
             total_swap_used_bytes: snapshot.avg_total_swap_used_bytes,
             total_free_swap_bytes: snapshot.avg_total_free_swap_bytes,
             cpu_utilization_milli: snapshot.avg_cpu_utilization_milli,
+            // #589 loop-health baseline advance — same rule as the
+            // #575 resource fields: every Some line printed by the
+            // force-path advances its slot; the dominant-arm baseline
+            // is the SHARE (the gate axis), not the name.
+            oploop_iters_per_sec_milli: snapshot.avg_oploop_iters_per_sec_milli,
+            dominant_arm_pct_milli: snapshot.dominant_arm.as_ref().map(|v| v.pct_milli),
+            max_unacked_for_secs: snapshot.max_unacked_for_secs,
         };
         self.ticks_since_print = 0;
         true
