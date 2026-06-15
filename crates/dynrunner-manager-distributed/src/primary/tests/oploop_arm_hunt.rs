@@ -1216,22 +1216,21 @@ async fn inbox_closed_mid_run_breaks_loop_no_zombie_no_spin() {
 
 // ─── the RESPAWN-ARM membership-join busy-wake (run_20260612_035105) ───
 //
-// Production signature on a promoted (remote-respawn) primary: the
-// `respawn_request` arm-stat climbed ~50/min (7398→7797 in 8.4 min) with
+// Historical production signature on a promoted (remote-respawn) primary:
+// the `respawn_request` arm-stat climbed ~50/min (7398→7797 in 8.4 min) with
 // ZERO spawns, ZERO dead members, the fleet fully healthy. Mechanism: the
 // respawn lifecycle listener forwarded EVERY `PeerLifecycleEvent::Added`
 // (membership joins / re-admission echoes the busy mesh emits continuously)
-// onto the respawn channel. With no replacement pending, each `Added` woke
-// the respawn arm to a guaranteed-no-op `reconcile_replacements_on_join`,
-// incrementing `respawn_request` per join while doing no respawn work — the
-// third always-ready-arm instance (membership joins are real events, but
-// not respawn-relevant while idle).
+// onto the respawn channel, where each Added woke the respawn arm to a
+// guaranteed-no-op reconcile path.
 //
-// Fix: the listener drops `Added` events while no replacement is pending
-// (the `pending_replacements` "awaiting a join" gate), so the arm parks
-// instead of busy-waking. `Removed` events are always forwarded (a death is
-// a spawn trigger), and when a replacement IS pending the gate opens so the
-// reconcile path still observes the join in apply order.
+// Fix (#543/#544/#546): the respawn pipeline no longer cares about `Added`
+// events at all — the dispatcher (`dispatch_respawn_lifecycle`) routes only
+// `Removed`, and the listener filters accordingly. A replacement that joins
+// is just a normal member; there is nothing to reconcile (the prior
+// pending-replacement / revoke pathway was deleted along with the respawn-
+// flow scancel reachability). `Removed` events still fire the arm; `Added`
+// never reaches it.
 
 /// Read `arm_name`'s win count off a retained promoted primary's live
 /// arm-stats snapshot. Panics if the loop already unpublished (resolved).

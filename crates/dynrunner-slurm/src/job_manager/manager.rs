@@ -47,6 +47,29 @@ impl<G: Gateway> SlurmJobManager<G> {
         &mut self.gateway
     }
 
+    /// The recorded sbatch job id for `secondary_id`, if any. Used by
+    /// the off-loop slurm-authoritative probe
+    /// (`crate::authority::SlurmJobManagerProbe`) to resolve a member id
+    /// to the job id it queries squeue/sacct against. `None` when the
+    /// manager never drove `submit_job` for that secondary id (e.g. a
+    /// member from a non-SLURM submission path, or before the initial
+    /// cohort's first sbatch).
+    pub fn secondary_jobs_get(&self, secondary_id: &str) -> Option<&String> {
+        self.secondary_jobs.get(secondary_id)
+    }
+
+    /// Owned `(secondary_id, job_id)` snapshot of every recorded
+    /// submission this manager drove. Used by the off-loop probe's
+    /// `probe_all` to walk the fleet without holding the manager mutex
+    /// across the per-job gateway round-trip — each probe entry is then
+    /// resolved through `secondary_jobs_get` + the per-id consult.
+    pub fn secondary_jobs_snapshot(&self) -> Vec<(String, String)> {
+        self.secondary_jobs
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
     /// Gateway-side path of the uploaded `dynrunner-slurm-shutdown`
     /// binary, set by
     /// [`SlurmJobManager::upload_shutdown_manager_binary_from`].

@@ -90,6 +90,12 @@ use std::sync::atomic::Ordering;
 /// Build a coordinator wired with 1 reserved initial-cohort id so
 /// the first minted respawn lands on `secondary-1`. The minted-id
 /// monotonic test pins this contract directly.
+///
+/// The slurm-authoritative quantity gate (#543) is wired with a
+/// `StaticSnapshot` reporting `current=0 < initial=1` so dispatched
+/// respawns are not refused by the gate — the tests in this file are
+/// about the budget/cooldown/spec semantics, not the slurm tiebreak
+/// (which is exercised in the dedicated tests below).
 fn make_coordinator() -> (
     PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
     PrimaryMeshKeepalive,
@@ -106,12 +112,19 @@ fn make_coordinator() -> (
         mesh_ready_timeout: Duration::from_secs(1),
         ..PrimaryConfig::default()
     };
-    build_test_primary(
+    let (mut coordinator, mesh) = build_test_primary(
         config,
         transport,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
-    )
+    );
+    coordinator.set_authority_snapshot(Arc::new(
+        crate::authority_snapshot::test_helpers::StaticSnapshot {
+            map: std::collections::HashMap::new(),
+            count: Some(0),
+        },
+    ));
+    (coordinator, mesh)
 }
 
 /// Loose budget — every per-knob cap large enough to never
@@ -291,10 +304,10 @@ async fn respawn_dispatcher_skips_when_policy_disabled() {
             // throwaway channel just to verify the closure shape; the
             // coordinator's wiring itself is the contract under test.
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PeerLifecycleEvent>();
-            // A closed gate (no replacement pending) — a `Removed` is
-            // always relevant, so it must still forward.
-            let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let listener = respawn_dispatcher_listener(tx, gate);
+            // The listener forwards `Removed` unconditionally now (#543
+            // retired the per-replacement revoke surface; only deaths
+            // are respawn-relevant).
+            let listener = respawn_dispatcher_listener(tx);
             let removed = PeerLifecycleEvent::Removed {
                 id: "secondary-0".into(),
                 cause: RemovalCause::KeepaliveMiss,
@@ -714,236 +727,12 @@ async fn unbounded_respawn_request_channel_accepts_burst() {
         .await;
 }
 
-/// Production replay of the already-submitted-replacement edge
-/// (original-re-admitted-FIRST interleaving): a member is removed, its
-/// replacement is dispatched (sbatch submitted — here the mock spawner
-/// stands in for the SLURM provider), and THEN the member's
-/// authenticated frames re-admit it (the membership-generation bump
-/// the frame-ingest seam originates). The still-pending replacement is
-/// a resource squatter: the pipeline must revoke it through the
-/// spawner port (`scancel` in the SLURM provider) and clear its
-/// pending-replacement bookkeeping.
-///
-/// The event path is the production one: the lifecycle listener
-/// `enable_respawn` registered forwards both the `Removed` and the
-/// `Added` events onto the respawn lifecycle channel; the test drains
-/// that channel into `dispatch_respawn_lifecycle` exactly as the
-/// operational-loop arm does.
-#[tokio::test(flavor = "current_thread")]
-async fn replacement_revoked_when_original_readmitted_before_replacement_joins() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            use dynrunner_protocol_primary_secondary::ClusterMutation;
-
-            let (mut coordinator, _mesh) = make_coordinator();
-            let spawner = Arc::new(MockSpawner::new());
-            let revoked = Arc::clone(&spawner.revoked_ids);
-            coordinator.enable_respawn(
-                spawner.clone(),
-                permissive_budget(),
-                "tcp://127.0.0.1:5555".into(),
-                "-----BEGIN PUBLIC KEY-----\nFAKE\n".into(),
-            );
-
-            // Membership ground truth: the member joins, then is
-            // (falsely) removed — `is_peer_alive` must be false at
-            // dispatch time or the queued-stage cancellation gate
-            // (the prior fix) would absorb the request before the
-            // launched-stage edge under test is ever reached.
-            coordinator
-                .cluster_state
-                .apply(ClusterMutation::PeerJoined {
-                    peer_id: "sec-x".into(),
-                    is_observer: false,
-                    can_be_primary: true,
-                    cap_version: Default::default(),
-                    member_gen: 0,
-                });
-            coordinator
-                .cluster_state
-                .apply(ClusterMutation::PeerRemoved {
-                    id: "sec-x".into(),
-                    cause: RemovalCause::KeepaliveMiss,
-                    member_gen: 0,
-                });
-
-            // The death reaches the pipeline through the REGISTERED
-            // listener (the same one the peer-lifecycle dispatcher
-            // fires in production), then the channel drain mirrors
-            // the operational-loop arm.
-            let removed = PeerLifecycleEvent::Removed {
-                id: "sec-x".into(),
-                cause: RemovalCause::KeepaliveMiss,
-            };
-            for listener in &coordinator.peer_lifecycle_listeners {
-                listener.on_event(&removed);
-            }
-            let mut rx = coordinator
-                .respawn_lifecycle_rx
-                .take()
-                .expect("enable_respawn must install the receiver");
-            let event = rx.try_recv().expect("listener must forward the removal");
-            coordinator.dispatch_respawn_lifecycle(event);
-            let outcome = coordinator
-                .respawn_tasks
-                .join_next()
-                .await
-                .expect("the death must spawn a replacement")
-                .expect("no panic");
-            assert!(outcome.result.is_ok());
-            assert_eq!(outcome.new_id, "secondary-1");
-            // The replacement is now pending-until-join, keyed by its
-            // minted id.
-            assert_eq!(
-                coordinator.pending_replacements.get("secondary-1"),
-                Some(&"sec-x".to_string()),
-                "an accepted dispatch must track the replacement as pending",
-            );
-
-            // RE-ADMISSION: the frame-ingest seam originates the
-            // generation-advancing PeerJoined; its apply emits the
-            // `Added` lifecycle event the listener forwards.
-            coordinator
-                .cluster_state
-                .apply(ClusterMutation::PeerJoined {
-                    peer_id: "sec-x".into(),
-                    is_observer: false,
-                    can_be_primary: true,
-                    cap_version: Default::default(),
-                    member_gen: 1,
-                });
-            let readmitted = PeerLifecycleEvent::Added {
-                id: "sec-x".into(),
-                is_observer: false,
-            };
-            for listener in &coordinator.peer_lifecycle_listeners {
-                listener.on_event(&readmitted);
-            }
-            let event = rx
-                .try_recv()
-                .expect("listener must forward the re-admission join");
-            coordinator.dispatch_respawn_lifecycle(event);
-
-            // The revoke runs detached on the LocalSet (the loop arm
-            // must not await a gateway round-trip); yield until it
-            // lands.
-            for _ in 0..16 {
-                tokio::task::yield_now().await;
-            }
-            assert_eq!(
-                revoked.lock().unwrap().clone(),
-                vec!["secondary-1".to_string()],
-                "the still-pending replacement must be revoked when its \
-                 original re-admits",
-            );
-            assert!(
-                coordinator.pending_replacements.is_empty(),
-                "revocation must clear the pending-replacement bookkeeping",
-            );
-            coordinator.respawn_lifecycle_rx = Some(rx);
-        })
-        .await;
-}
-
-/// The replacement-welcomed-FIRST interleaving: the replacement joins
-/// the membership (its `PeerJoined` applies before any re-admission of
-/// the original). It is then the legitimate occupant — bookkeeping is
-/// cleared WITHOUT a revoke, and a LATER re-admission of the original
-/// must not revoke it either (a welcomed member is ordinary fleet
-/// capacity; both run side by side under distinct `secondary-N` ids).
-#[tokio::test(flavor = "current_thread")]
-async fn replacement_join_clears_bookkeeping_and_later_readmission_revokes_nothing() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            use dynrunner_protocol_primary_secondary::ClusterMutation;
-
-            let (mut coordinator, _mesh) = make_coordinator();
-            let spawner = Arc::new(MockSpawner::new());
-            let revoked = Arc::clone(&spawner.revoked_ids);
-            coordinator.enable_respawn(
-                spawner.clone(),
-                permissive_budget(),
-                "tcp://127.0.0.1:5555".into(),
-                "-----BEGIN PUBLIC KEY-----\nFAKE\n".into(),
-            );
-
-            coordinator
-                .cluster_state
-                .apply(ClusterMutation::PeerJoined {
-                    peer_id: "sec-x".into(),
-                    is_observer: false,
-                    can_be_primary: true,
-                    cap_version: Default::default(),
-                    member_gen: 0,
-                });
-            coordinator
-                .cluster_state
-                .apply(ClusterMutation::PeerRemoved {
-                    id: "sec-x".into(),
-                    cause: RemovalCause::KeepaliveMiss,
-                    member_gen: 0,
-                });
-            coordinator.dispatch_respawn_lifecycle(PeerLifecycleEvent::Removed {
-                id: "sec-x".into(),
-                cause: RemovalCause::KeepaliveMiss,
-            });
-            let outcome = coordinator
-                .respawn_tasks
-                .join_next()
-                .await
-                .expect("the death must spawn a replacement")
-                .expect("no panic");
-            assert_eq!(outcome.new_id, "secondary-1");
-            assert!(coordinator.pending_replacements.contains_key("secondary-1"));
-
-            // The replacement WELCOMES first: its PeerJoined applies
-            // and the forwarded `Added` clears the bookkeeping.
-            coordinator
-                .cluster_state
-                .apply(ClusterMutation::PeerJoined {
-                    peer_id: "secondary-1".into(),
-                    is_observer: false,
-                    can_be_primary: true,
-                    cap_version: Default::default(),
-                    member_gen: 0,
-                });
-            coordinator.dispatch_respawn_lifecycle(PeerLifecycleEvent::Added {
-                id: "secondary-1".into(),
-                is_observer: false,
-            });
-            assert!(
-                coordinator.pending_replacements.is_empty(),
-                "the joined replacement must leave the pending bookkeeping",
-            );
-
-            // The original re-admits LATER: nothing is pending for it
-            // any more, so nothing may be revoked.
-            coordinator
-                .cluster_state
-                .apply(ClusterMutation::PeerJoined {
-                    peer_id: "sec-x".into(),
-                    is_observer: false,
-                    can_be_primary: true,
-                    cap_version: Default::default(),
-                    member_gen: 1,
-                });
-            coordinator.dispatch_respawn_lifecycle(PeerLifecycleEvent::Added {
-                id: "sec-x".into(),
-                is_observer: false,
-            });
-            for _ in 0..16 {
-                tokio::task::yield_now().await;
-            }
-            assert!(
-                revoked.lock().unwrap().is_empty(),
-                "a welcomed replacement is the legitimate occupant; a later \
-                 re-admission of its original must not revoke it",
-            );
-        })
-        .await;
-}
+// The two production-replay revoke tests
+// (`replacement_revoked_when_original_readmitted_before_replacement_joins`
+// and `replacement_join_clears_bookkeeping_and_later_readmission_revokes_nothing`)
+// were removed alongside the per-replacement revoke surface (#543): the
+// slurm-authoritative quantity gate prevents the redundant-replacement
+// scenario at dispatch time, so the revoke contract has no role to test.
 
 /// #467: a removed member's respawn replacement has already SEATED
 /// (operational, a live member) by the time the original re-admits, so
@@ -1021,14 +810,10 @@ async fn seated_replacement_winds_down_on_readmission_and_its_departure_does_not
                 cap_version: Default::default(),
                 member_gen: 0,
             });
-            coordinator.dispatch_respawn_lifecycle(PeerLifecycleEvent::Added {
-                id: replacement.clone(),
-                is_observer: false,
-            });
-            assert!(
-                coordinator.pending_replacements.is_empty(),
-                "the seated replacement is no longer tracked as pending",
-            );
+            // After the revoke surface was retired, the respawn listener
+            // drops `Added` events; the operational arm's
+            // `dispatch_respawn_lifecycle(Added)` is a no-op (#543). The
+            // seat itself is observed through the CRDT.
             assert!(
                 coordinator.cluster_state.is_peer_alive(&replacement),
                 "the replacement is a live (seated) member",
@@ -1198,12 +983,23 @@ async fn build_remote_rig() -> RemoteRig {
         mesh_ready_timeout: Duration::from_secs(1),
         ..PrimaryConfig::default()
     };
-    let (coordinator, pri_keepalive) = build_test_primary(
+    let (mut coordinator, pri_keepalive) = build_test_primary(
         config,
         pri_transport,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
+    // Quantity gate (#543): the build-from-promotion rigs need a snapshot
+    // that confirms the fleet is below initial count, otherwise the
+    // quantity gate refuses every dispatched respawn. `count=0` says
+    // "slurm reports zero active jobs", which is below the test rig's
+    // `num_secondaries=1`.
+    coordinator.set_authority_snapshot(Arc::new(
+        crate::authority_snapshot::test_helpers::StaticSnapshot {
+            map: StdHashMap::new(),
+            count: Some(0),
+        },
+    ));
 
     // Observer process (the provider host). Mirrors `from_handoff`:
     // the provider rides the handoff across the submitter's demotion.
@@ -1466,95 +1262,9 @@ async fn duplicate_spawn_request_replays_cached_outcome_without_resubmitting() {
         .await;
 }
 
-/// Remote revocation parity: a member re-admitted while its
-/// replacement is still pending revokes the squatter THROUGH THE MESH —
-/// the same `SecondarySpawner::revoke` contract the local provider
-/// honours, executed by the observer-hosted provider.
-#[tokio::test(flavor = "current_thread")]
-async fn readmission_revokes_pending_replacement_through_observer_provider() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let mut rig = build_remote_rig().await;
-            rig.coordinator.enable_respawn_remote(permissive_budget());
-
-            // Member joins, dies, replacement dispatched + completed.
-            rig.coordinator
-                .cluster_state
-                .apply(ClusterMutation::PeerJoined {
-                    peer_id: "sec-x".into(),
-                    is_observer: false,
-                    can_be_primary: true,
-                    cap_version: Default::default(),
-                    member_gen: 0,
-                });
-            rig.coordinator
-                .cluster_state
-                .apply(ClusterMutation::PeerRemoved {
-                    id: "sec-x".into(),
-                    cause: RemovalCause::KeepaliveMiss,
-                    member_gen: 0,
-                });
-            rig.coordinator.dispatch_respawn_request(RespawnRequest {
-                original_id: "sec-x".into(),
-                cause: RemovalCause::KeepaliveMiss,
-            });
-            let (outcome, _) =
-                pump_until_respawn_outcome(&mut rig.coordinator, Duration::from_secs(10)).await;
-            let outcome = outcome.expect("spawn round trip");
-            assert!(outcome.result.is_ok());
-            assert!(
-                rig.coordinator
-                    .pending_replacements
-                    .contains_key("secondary-1"),
-                "the replacement must be pending-until-join",
-            );
-
-            // RE-ADMISSION: the original returns alive at the next
-            // generation; the reconciliation revokes the squatter via
-            // the REMOTE provider.
-            rig.coordinator
-                .cluster_state
-                .apply(ClusterMutation::PeerJoined {
-                    peer_id: "sec-x".into(),
-                    is_observer: false,
-                    can_be_primary: true,
-                    cap_version: Default::default(),
-                    member_gen: 1,
-                });
-            rig.coordinator
-                .dispatch_respawn_lifecycle(PeerLifecycleEvent::Added {
-                    id: "sec-x".into(),
-                    is_observer: false,
-                });
-
-            // The revoke runs detached; pump the primary's inbox (the
-            // revoke RESULT must complete the stub's waiter) until the
-            // observer-side provider records the revocation.
-            let started = tokio::time::Instant::now();
-            while started.elapsed() < Duration::from_secs(10)
-                && rig.provider.revoked_ids.lock().unwrap().is_empty()
-            {
-                while let Some(msg) = rig.coordinator.inbox.try_recv() {
-                    rig.coordinator
-                        .dispatch_message(msg, &mut None)
-                        .await
-                        .expect("dispatch ok");
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            assert_eq!(
-                rig.provider.revoked_ids.lock().unwrap().clone(),
-                vec!["secondary-1".to_string()],
-                "the pending replacement must be revoked on the provider host",
-            );
-            assert!(
-                rig.coordinator.pending_replacements.is_empty(),
-                "revocation must clear the pending bookkeeping",
-            );
-        })
-        .await;
-}
+// The remote-revocation parity test
+// (`readmission_revokes_pending_replacement_through_observer_provider`)
+// was removed alongside the per-replacement revoke surface (#543).
 
 /// The seed originators replicate the enabled policy caps (the
 /// promoted primary's re-arm source). A coordinator WITHOUT the policy
@@ -1590,6 +1300,127 @@ async fn seed_origination_replicates_enabled_policy_caps() {
             let (mut disabled, _mesh2) = make_coordinator();
             disabled.originate_relocated_seed(std::collections::HashMap::new());
             assert_eq!(disabled.cluster_state.respawn_policy(), None);
+        })
+        .await;
+}
+
+// ── Slurm-authoritative quantity gate (#543) ─────────────────────────
+//
+// The quantity gate refuses respawn whenever slurm-authoritative
+// evidence shows the fleet at-or-above initial count. The lag is a
+// FEATURE: when N secondaries appear silent simultaneously, the
+// snapshot still shows their jobs Alive until the next probe; the gate
+// refuses every dispatched respawn until slurm itself confirms Gone.
+
+fn install_count_snapshot(
+    coordinator: &mut PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
+    count: Option<usize>,
+) {
+    use crate::authority_snapshot::test_helpers::StaticSnapshot;
+    coordinator.set_authority_snapshot(Arc::new(StaticSnapshot {
+        map: std::collections::HashMap::new(),
+        count,
+    }));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn respawn_quantity_gate_refuses_when_count_at_initial() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+            // make_coordinator wires `num_secondaries=1`; install a
+            // snapshot saying slurm currently sees 1 alive (== initial).
+            install_count_snapshot(&mut coordinator, Some(1));
+            let spawner = Arc::new(MockSpawner::new());
+            let calls = Arc::clone(&spawner.calls);
+            coordinator.enable_respawn(
+                spawner.clone(),
+                permissive_budget(),
+                "tcp://127.0.0.1:5555".into(),
+                "-----BEGIN PUBLIC KEY-----\nFAKE\n".into(),
+            );
+            coordinator.dispatch_respawn_request(RespawnRequest {
+                original_id: "secondary-0".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            });
+            assert!(
+                coordinator.respawn_tasks.is_empty(),
+                "the quantity gate must refuse to dispatch a respawn task",
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "the spawner must NOT be called when slurm reports count >= initial",
+            );
+            assert_eq!(
+                coordinator.cluster_state.respawn_events().len(),
+                0,
+                "a gated request must not consume the replicated ledger",
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn respawn_quantity_gate_refuses_when_count_unknown() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+            // Unknown / stale snapshot.
+            install_count_snapshot(&mut coordinator, None);
+            let spawner = Arc::new(MockSpawner::new());
+            let calls = Arc::clone(&spawner.calls);
+            coordinator.enable_respawn(
+                spawner.clone(),
+                permissive_budget(),
+                "tcp://127.0.0.1:5555".into(),
+                "-----BEGIN PUBLIC KEY-----\nFAKE\n".into(),
+            );
+            coordinator.dispatch_respawn_request(RespawnRequest {
+                original_id: "secondary-0".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            });
+            assert!(coordinator.respawn_tasks.is_empty());
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "fail-closed: no authoritative evidence → no respawn",
+            );
+            assert_eq!(coordinator.cluster_state.respawn_events().len(), 0);
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn respawn_quantity_gate_fires_when_count_below_initial() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+            // num_secondaries=1, slurm reports 0 alive → gate passes.
+            install_count_snapshot(&mut coordinator, Some(0));
+            let spawner = Arc::new(MockSpawner::new());
+            let calls = Arc::clone(&spawner.calls);
+            coordinator.enable_respawn(
+                spawner.clone(),
+                permissive_budget(),
+                "tcp://127.0.0.1:5555".into(),
+                "-----BEGIN PUBLIC KEY-----\nFAKE\n".into(),
+            );
+            coordinator.dispatch_respawn_request(RespawnRequest {
+                original_id: "secondary-0".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            });
+            let outcome = coordinator
+                .respawn_tasks
+                .join_next()
+                .await
+                .expect("the gate must let this respawn through")
+                .expect("respawn task must not panic");
+            assert!(outcome.result.is_ok());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
         })
         .await;
 }

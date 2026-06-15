@@ -1,6 +1,7 @@
 pub mod affine_action;
 pub mod affine_satisfied;
 pub mod anti_entropy;
+pub mod authority_snapshot;
 pub mod cluster_state;
 pub(crate) mod collection_stats;
 pub mod pull_coordinator;

@@ -1219,21 +1219,25 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     pub(super) respawn_lifecycle_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<crate::peer_lifecycle::PeerLifecycleEvent>>,
 
-    /// Pending replacements awaiting their join: minted replacement id
-    /// → the removed member it replaces. Node-local operational state
-    /// of the respawn pipeline (NOT replicated — the submitting node
-    /// is the only one able to revoke what it submitted; a failed-over
-    /// primary's replacements are reclaimed by the old node's
-    /// run-teardown sweep, the same story as its `job_ids`). Inserted
-    /// on every ACCEPTED dispatch; an entry leaves when its
-    /// replacement joins the membership (the legitimate-occupant case
-    /// — no revocation) or when its original is re-admitted first (the
-    /// squatter case — `SecondarySpawner::revoke` is issued).
-    /// Size is bounded by `RespawnBudget::max_total`. Wraps the map with
-    /// the derived "awaiting a join" gate the respawn listener consults to
-    /// drop `Added` events while no replacement is pending (so the respawn
-    /// arm parks instead of busy-waking on membership joins).
-    pub(super) pending_replacements: super::respawn::PendingReplacements,
+    /// Slurm-authoritative life-state snapshot consulted by the respawn
+    /// quantity gate (#543), the collective-silence escalation tiebreak
+    /// (#544), and the sticky-removal reversibility tiebreak (#546). The
+    /// snapshot lives off-loop (see
+    /// [`crate::authority_snapshot::OffLoopAuthoritySnapshot`]); the
+    /// off-loop probe republishes the map at the slurm probe cadence so
+    /// consumers read a synchronous view from any context — never
+    /// inline-async on the coordinator loop, which can wedge in any arm
+    /// (the #547 face).
+    ///
+    /// On non-SLURM deployments the deployment layer wires
+    /// [`crate::authority_snapshot::NoSlurmAuthoritySnapshot`], which
+    /// always reads `Unknown` / `None` — every safety-net consumer
+    /// fail-closes under those values (the quantity gate refuses
+    /// respawn, the tiebreaks become no-ops, the collective-silence
+    /// gate keeps deferring within its escalation window). That is the
+    /// correct default for backends with no slurm to consult.
+    pub(super) authority_snapshot:
+        std::sync::Arc<dyn crate::authority_snapshot::SlurmAuthoritativeSnapshot>,
 
     /// Receiver side of the liveness-beacon listener → operational-loop
     /// channel. The [`crate::liveness::LivenessListener`] (bound on this
@@ -1694,7 +1698,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             upload_action: None,
             respawn_lifecycle_tx: None,
             respawn_lifecycle_rx: None,
-            pending_replacements: super::respawn::PendingReplacements::default(),
+            authority_snapshot: std::sync::Arc::new(
+                crate::authority_snapshot::NoSlurmAuthoritySnapshot,
+            ),
             liveness_ping_rx: None,
             beacon_target: crate::liveness::BeaconTarget::new(),
             peer_liveness_addrs: crate::liveness::PeerLivenessAddrs::new(),
@@ -2263,6 +2269,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.slurm_job_manager.as_ref()
     }
 
+    /// Install the slurm-authoritative life-state snapshot the safety-net
+    /// consumers read (#543/#544/#546). Wired BEFORE `run()` enters
+    /// (same pre-run contract as the other registration setters). The
+    /// default at construction is
+    /// [`crate::authority_snapshot::NoSlurmAuthoritySnapshot`] (every read
+    /// is `Unknown`/`None`, the conservative direction for non-SLURM
+    /// backends); SLURM deployments replace it via this setter with the
+    /// [`crate::authority_snapshot::OffLoopAuthoritySnapshot`] whose
+    /// off-loop updater republishes at the slurm probe cadence.
+    ///
+    /// Also propagated into `cluster_state` so the sticky-removal
+    /// reversibility tiebreak (#546) reads the same snapshot from the
+    /// apply-path (the apply path has no direct handle on the
+    /// coordinator, so it consults its own copy).
+    pub fn set_authority_snapshot(
+        &mut self,
+        snapshot: std::sync::Arc<dyn crate::authority_snapshot::SlurmAuthoritativeSnapshot>,
+    ) {
+        self.cluster_state
+            .set_authority_snapshot(std::sync::Arc::clone(&snapshot));
+        self.authority_snapshot = snapshot;
+    }
+
     /// Enable the secondary respawn pipeline. `spawner` is the
     /// per-provider [`SecondarySpawner`] (multi-process or SLURM);
     /// `budget` is the per-coordinator caps; `primary_endpoint` and
@@ -2300,12 +2329,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `run()` start, so the registration MUST land before the
         // run is entered. Same contract as
         // `register_lifecycle_listener` (which this call delegates
-        // to under the hood). The listener carries the
-        // pending-replacement "awaiting a join" gate so it drops `Added`
-        // events while no replacement is pending (the membership-join
-        // busy-arm fix).
-        let awaiting_join = self.pending_replacements.awaiting_join_gate();
-        self.register_lifecycle_listener(respawn_dispatcher_listener(tx, awaiting_join));
+        // to under the hood). The listener drops `Added` events
+        // unconditionally — after the per-replacement revoke surface
+        // was retired in favour of the slurm-authoritative quantity
+        // gate, there is no join-reconciliation work for the respawn
+        // arm to do (#543).
+        self.register_lifecycle_listener(respawn_dispatcher_listener(tx));
     }
 
     /// Enable the respawn pipeline with the REMOTE execution backend —

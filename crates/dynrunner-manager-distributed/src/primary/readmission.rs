@@ -124,11 +124,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // (4) #467 double-occupancy heal: if a respawn replacement for this
         // original has ALREADY SEATED (it is a live member), the original's
         // re-admission means BOTH now hold a SLURM job to run-end (the
-        // shared-account quota waste). #399 only cancels a QUEUED or
-        // not-yet-joined replacement (the `is_peer_alive` dispatch gate +
-        // the `reconcile_replacements_on_join` squatter revoke); a SEATED
-        // replacement is no longer in `pending_replacements`, so close the
-        // gap here by winding it down at its next quiescence.
+        // shared-account quota waste). The `is_peer_alive` dispatch gate
+        // skips a still-queued respawn for an already-alive original (#399),
+        // and the slurm-authoritative quantity gate refuses any further
+        // respawn while the fleet is at or above initial count (#543); a
+        // SEATED replacement that pre-dates the re-admission falls outside
+        // both, so close the gap here by winding it down at its next
+        // quiescence.
         self.schedule_seated_replacement_winddown(&sender).await;
         // (5) #518 cross-member double-exec heal: the falsely-removed member
         // kept running its in-flight tasks while the primary requeued them
@@ -145,13 +147,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// replacement of `original` (the just-re-admitted member).
     ///
     /// The durable lookup is the REPLICATED respawn ledger
-    /// (`cluster_state.respawn_events()`, `new_id → {original_id, …}`),
-    /// NOT the node-local `pending_replacements` table — the latter is
-    /// CLEARED the moment a replacement seats (see
-    /// `reconcile_replacements_on_join` Case 1), so by the time the
-    /// original re-admits it holds nothing for a seated replacement. The
-    /// ledger entry persists for the run and survives failover, so it is
-    /// the correct "who replaced whom" source even after the seat.
+    /// (`cluster_state.respawn_events()`, `new_id → {original_id, …}`).
+    /// The ledger entry persists for the run and survives failover, so it
+    /// is the correct "who replaced whom" source even after the seat.
     ///
     /// A replacement qualifies only when it is BOTH recorded as replacing
     /// `original` AND currently a live member (`is_peer_alive`) — the

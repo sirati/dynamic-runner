@@ -1703,7 +1703,6 @@ pub(super) struct MockSpawner {
     /// pin that the coordinator named the dead member on the spec (and
     /// left it `None` when there was none to key on).
     pub(super) captured_dead_members: CapturedDeadMembers,
-    pub(super) revoked_ids: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl MockSpawner {
@@ -1712,7 +1711,6 @@ impl MockSpawner {
             calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             captured_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
             captured_dead_members: Arc::new(std::sync::Mutex::new(Vec::new())),
-            revoked_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -1754,17 +1752,6 @@ impl crate::primary::respawn::SecondarySpawner for MockSpawner {
             .lock()
             .unwrap()
             .push(spec.new_secondary_id);
-        Ok(())
-    }
-
-    async fn revoke(
-        &self,
-        new_secondary_id: &str,
-    ) -> Result<(), crate::primary::respawn::SpawnError> {
-        self.revoked_ids
-            .lock()
-            .unwrap()
-            .push(new_secondary_id.to_owned());
         Ok(())
     }
 }

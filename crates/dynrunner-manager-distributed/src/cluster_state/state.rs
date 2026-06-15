@@ -544,6 +544,24 @@ pub struct ClusterState<I> {
     /// converges through the `merge_task_state` settled consult; the
     /// digest folds the accumulator (`tasks_hash_acc`).
     pub(super) settled: super::settled::SettledStore,
+    /// Slurm-authoritative life-state snapshot consulted by the apply-path
+    /// sticky-removal reversibility tiebreak (#546): an apply of
+    /// `PeerJoined` for a peer this node already marked `Dead` at a
+    /// non-advancing membership generation reverses the dead-mark when
+    /// slurm itself reports the job still `Alive` — the local
+    /// declaration was a false-positive from local deafness, not a real
+    /// death. Without positive authoritative evidence the original
+    /// sticky-removal stands.
+    ///
+    /// `None` until the deployment layer wires
+    /// [`Self::set_authority_snapshot`] (the construction default — every
+    /// test fixture and non-SLURM run reads `None`, so the tiebreak is
+    /// a no-op and the original behavior is preserved). NOT replicated /
+    /// cloned / snapshotted / digest-folded: a pure node-local runtime
+    /// handle the apply path consults synchronously, classified
+    /// node-local in every exhaustive-destructure guard.
+    pub(super) authority_snapshot:
+        Option<Arc<dyn crate::authority_snapshot::SlurmAuthoritativeSnapshot>>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -617,6 +635,12 @@ where
             // Settled store: carried READ-ONLY (index + shared read fds;
             // the writer affiliation is dropped — one-writer rule).
             settled,
+            // Node-local runtime handle (slurm-authoritative life-state
+            // snapshot for #546) — NOT cloned. A cloned replica is bound
+            // to the same snapshot later via `set_authority_snapshot` if
+            // its deployment wires one; otherwise the tiebreak stays
+            // a no-op.
+            authority_snapshot: _authority_snapshot,
         } = self;
         Self {
             tasks: tasks.clone(),
@@ -698,6 +722,8 @@ where
             // serving settled reads through the shared `Arc<File>`
             // segments but never writes the source's file.
             settled: settled.clone_read_only(),
+            // Node-local runtime handle — see field doc.
+            authority_snapshot: None,
         }
     }
 }
@@ -751,6 +777,7 @@ where
             digest_fold_count,
             range_fold_memo: _range_fold_memo,
             settled,
+            authority_snapshot,
         } = self;
         f.debug_struct("ClusterState")
             .field("tasks", tasks)
@@ -793,6 +820,7 @@ where
             .field("digest_cache", &digest_cache.get().is_some())
             .field("digest_fold_count", &digest_fold_count.get())
             .field("settled", settled)
+            .field("authority_snapshot", &authority_snapshot.is_some())
             .finish()
     }
 }
@@ -839,7 +867,22 @@ impl<I> Default for ClusterState<I> {
             digest_fold_count: std::cell::Cell::new(0),
             range_fold_memo: super::range_fold_memo::RangeFoldMemo::default(),
             settled: super::settled::SettledStore::default(),
+            authority_snapshot: None,
         }
+    }
+}
+
+impl<I: Identifier> ClusterState<I> {
+    /// Install the slurm-authoritative life-state snapshot the apply-path
+    /// sticky-removal reversibility tiebreak (#546) consults. Called by
+    /// [`crate::primary::PrimaryCoordinator::set_authority_snapshot`] so
+    /// the apply path and the operational-loop consumers see the SAME
+    /// snapshot.
+    pub fn set_authority_snapshot(
+        &mut self,
+        snapshot: Arc<dyn crate::authority_snapshot::SlurmAuthoritativeSnapshot>,
+    ) {
+        self.authority_snapshot = Some(snapshot);
     }
 }
 

@@ -61,9 +61,15 @@ const MIN_REMOTE_MEMBERS: usize = 2;
 
 /// One member's classification from the sweep, as the gate consumes it:
 /// where the member's frames come from (remote wire vs in-process
-/// loopback) and how silent the sweep judged it. The gate never sees
-/// ids or clocks — the sweep owns the silence arithmetic.
+/// loopback), how silent the sweep judged it, and which id it has (for
+/// the slurm-authoritative tiebreak in [`CollectiveSilenceGate::observe`]).
+/// The gate never sees clocks — the sweep owns the silence arithmetic.
 pub(in crate::primary) struct SilenceObservation {
+    /// The member's secondary id (`secondary-N`). The gate uses it to
+    /// consult the slurm-authoritative snapshot on escalation
+    /// (#544 tiebreak): a silent remote member whose slurm job is still
+    /// `Alive` is local-deafness evidence, not a real death.
+    pub(in crate::primary) secondary_id: String,
     /// `true` for a member whose frames traverse the wire (its id is
     /// not this node's own); the co-located same-peer member's loopback
     /// frames prove nothing about the wire, so it is excluded from the
@@ -92,11 +98,17 @@ pub(in crate::primary) struct CollectiveSilenceGate {
     /// otherwise-due death has been actively deferred, not how long the
     /// members have merely been WARN-stage silent.
     hard_suppressed_since: Option<Instant>,
-    /// Latched once the suppression has outlived the escalation window:
-    /// declarations resume for the remainder of the episode (a
-    /// genuinely all-dead fleet is then removed and the fleet-dead arm
-    /// can arm). Reset with the episode.
+    /// Latched once the suppression has outlived the escalation window
+    /// AND the slurm-authoritative tiebreak agrees the fleet is gone:
+    /// declarations resume for the remainder of the episode. Reset
+    /// with the episode.
     escalated: bool,
+    /// Latched once we have logged the "deferring past the escalation
+    /// window because authority says ≥1 silent peer is still Alive"
+    /// (or "no authoritative evidence either way") WARN for this
+    /// episode, so the operator sees a single line per episode rather
+    /// than one per sweep. Reset with the episode.
+    warned_authoritative_defer: bool,
     /// The current verdict: `Some(episode age)` while the gate defers
     /// staleness-based removals, `None` while healthy or escalated.
     /// Refreshed by [`Self::observe`]; at most one sweep stale for the
@@ -112,6 +124,7 @@ impl CollectiveSilenceGate {
             episode_since: None,
             hard_suppressed_since: None,
             escalated: false,
+            warned_authoritative_defer: false,
             deferral: None,
             warn: WarnThrottle::new(DEFER_WARN_INTERVAL),
         }
@@ -131,6 +144,9 @@ impl CollectiveSilenceGate {
         members: &[SilenceObservation],
         now: Instant,
         escalation_window: Duration,
+        authority: &dyn crate::authority_snapshot::SlurmAuthoritativeSnapshot,
+        co_located_secondary_id: Option<&str>,
+        co_located_last_frame_age: Option<Duration>,
     ) -> Option<Duration> {
         let remote_total = members.iter().filter(|m| m.remote).count();
         let remote_silent = members.iter().filter(|m| m.remote && m.silent).count();
@@ -142,6 +158,8 @@ impl CollectiveSilenceGate {
                     episode_s = now.saturating_duration_since(since).as_secs_f64(),
                     remote_members = remote_total,
                     remote_silent,
+                    co_located_secondary = co_located_secondary_id,
+                    co_located_last_frame_age_s = co_located_last_frame_age.map(|d| d.as_secs_f64()),
                     "collective-silence episode over (a remote member is \
                      live again, or the judged set changed); staleness-based \
                      dead-peer declarations resume on the normal schedule"
@@ -149,6 +167,7 @@ impl CollectiveSilenceGate {
             }
             self.hard_suppressed_since = None;
             self.escalated = false;
+            self.warned_authoritative_defer = false;
             self.deferral = None;
             return None;
         }
@@ -161,22 +180,72 @@ impl CollectiveSilenceGate {
         if let Some(first) = self.hard_suppressed_since
             && now.saturating_duration_since(first) > escalation_window
         {
-            if !self.escalated {
-                // Escalation onset — once per episode, NOT throttled:
-                // the operator must see exactly when the self-suspect
-                // deferral gave way to declarations again.
-                tracing::warn!(
-                    suppressed_for_s = now.saturating_duration_since(first).as_secs_f64(),
-                    escalation_window_s = escalation_window.as_secs_f64(),
-                    remote_members = remote_total,
-                    "collective silence has outlived a full escalation \
-                     window with no remote evidence either way — the fleet \
-                     may genuinely be dead, and deferring forever would \
-                     leave it un-declared (no requeue, no respawn, no \
-                     fleet-dead exit); resuming dead-peer declarations"
-                );
+            // SLURM-AUTHORITATIVE TIEBREAK (#544): the wall-clock window
+            // outlived. Wall-clock-alone escalation was the
+            // run_20260615_112332 face — the primary's apply_spawn_tasks
+            // wedge made every remote member's keepalive look silent for
+            // ~6 min, the wall-clock then escalated and declared all 10
+            // dead while their SLURM jobs were still RUNNING. The
+            // off-loop probe is the second opinion: only escalate when
+            // SLURM itself agrees every silent peer's job is GONE.
+            use crate::authority_snapshot::PeerLifeState;
+            let lives: Vec<PeerLifeState> = members
+                .iter()
+                .filter(|m| m.remote && m.silent)
+                .map(|m| authority.peer_life(&m.secondary_id))
+                .collect();
+            let any_alive = lives.iter().any(|s| matches!(s, PeerLifeState::Alive));
+            let all_gone = !lives.is_empty()
+                && lives.iter().all(|s| matches!(s, PeerLifeState::Gone));
+            if any_alive {
+                if !self.warned_authoritative_defer {
+                    tracing::warn!(
+                        suppressed_for_s = now.saturating_duration_since(first).as_secs_f64(),
+                        escalation_window_s = escalation_window.as_secs_f64(),
+                        remote_members = remote_total,
+                        alive_count = lives.iter().filter(|s| matches!(s, PeerLifeState::Alive)).count(),
+                        co_located_secondary = co_located_secondary_id,
+                        co_located_last_frame_age_s = co_located_last_frame_age.map(|d| d.as_secs_f64()),
+                        "collective silence outlived escalation window but slurm-authoritative \
+                         evidence shows ≥1 silent peer is still RUNNING — the silence is \
+                         LOCAL (this node's ingest/wire failed, fleet is alive); CONTINUING \
+                         to defer staleness-based declarations until either a remote frame \
+                         proves the wire or slurm-authoritative evidence shows the fleet gone",
+                    );
+                    self.warned_authoritative_defer = true;
+                }
+                // Continue deferring — DO NOT set self.escalated.
+            } else if all_gone {
+                if !self.escalated {
+                    tracing::warn!(
+                        suppressed_for_s = now.saturating_duration_since(first).as_secs_f64(),
+                        escalation_window_s = escalation_window.as_secs_f64(),
+                        remote_members = remote_total,
+                        co_located_secondary = co_located_secondary_id,
+                        co_located_last_frame_age_s = co_located_last_frame_age.map(|d| d.as_secs_f64()),
+                        "collective silence outlived escalation window AND slurm-authoritative \
+                         evidence confirms every silent peer's job is GONE — the fleet is \
+                         genuinely dead; resuming dead-peer declarations",
+                    );
+                }
+                self.escalated = true;
+            } else {
+                // No Alive seen but at least one Unknown → fail-closed.
+                if !self.warned_authoritative_defer {
+                    tracing::warn!(
+                        suppressed_for_s = now.saturating_duration_since(first).as_secs_f64(),
+                        escalation_window_s = escalation_window.as_secs_f64(),
+                        remote_members = remote_total,
+                        unknown_count = lives.iter().filter(|s| matches!(s, PeerLifeState::Unknown)).count(),
+                        co_located_secondary = co_located_secondary_id,
+                        co_located_last_frame_age_s = co_located_last_frame_age.map(|d| d.as_secs_f64()),
+                        "collective silence outlived escalation window with no slurm-authoritative \
+                         evidence either way (probe stale or unable to read) — fail-closed: \
+                         CONTINUING to defer until evidence lands",
+                    );
+                    self.warned_authoritative_defer = true;
+                }
             }
-            self.escalated = true;
         }
         if self.escalated {
             self.deferral = None;
@@ -190,6 +259,8 @@ impl CollectiveSilenceGate {
                 episode_s = age.as_secs_f64(),
                 hard_declaration_due = any_hard_due,
                 suppressed_since_last_warn = suppressed,
+                co_located_secondary = co_located_secondary_id,
+                co_located_last_frame_age_s = co_located_last_frame_age.map(|d| d.as_secs_f64()),
                 "EVERY remote member is silent simultaneously — N \
                  independent deaths are less likely than ONE local \
                  ingest/wire failure, so this node suspects its own \
@@ -215,15 +286,46 @@ impl CollectiveSilenceGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authority_snapshot::test_helpers::StaticSnapshot;
+    use crate::authority_snapshot::{PeerLifeState, SlurmAuthoritativeSnapshot};
+    use std::collections::HashMap;
 
     const WINDOW: Duration = Duration::from_millis(200);
 
-    fn obs(remote: bool, silent: bool, hard: bool) -> SilenceObservation {
+    fn obs(id: &str, remote: bool, silent: bool, hard: bool) -> SilenceObservation {
         SilenceObservation {
+            secondary_id: id.into(),
             remote,
             silent,
             hard,
         }
+    }
+
+    /// Empty static snapshot: every id reads `Unknown`. The escalation
+    /// path fail-closes on this — the gate keeps deferring past the
+    /// window UNLESS authoritative evidence confirms the fleet is gone.
+    fn unknown_snapshot() -> StaticSnapshot {
+        StaticSnapshot {
+            map: HashMap::new(),
+            count: None,
+        }
+    }
+
+    /// Static snapshot with `state` for every id in `ids`. The
+    /// authority tiebreak escalates only when all silent peers report
+    /// `Gone`; one `Alive` peer pins the gate in defer.
+    fn snapshot_with(ids: &[&str], state: PeerLifeState) -> StaticSnapshot {
+        let map = ids.iter().map(|i| ((*i).into(), state)).collect();
+        StaticSnapshot { map, count: None }
+    }
+
+    fn observe(
+        gate: &mut CollectiveSilenceGate,
+        members: &[SilenceObservation],
+        now: Instant,
+        snap: &dyn SlurmAuthoritativeSnapshot,
+    ) -> Option<Duration> {
+        gate.observe(members, now, WINDOW, snap, None, None)
     }
 
     /// ALL remotes silent (≥2) defers; one live remote — proof the
@@ -233,17 +335,17 @@ mod tests {
     fn defers_only_when_every_remote_is_silent() {
         let mut gate = CollectiveSilenceGate::new();
         let t0 = Instant::now();
+        let snap = unknown_snapshot();
 
         // One live remote among silent ones: the wire is proven, the
         // schedule declares as today.
-        let mixed = [obs(true, true, true), obs(true, false, false)];
-        assert_eq!(gate.observe(&mixed, t0, WINDOW), None);
+        let mixed = [obs("a", true, true, true), obs("b", true, false, false)];
+        assert_eq!(observe(&mut gate, &mixed, t0, &snap), None);
         assert_eq!(gate.deferring(), None);
 
         // Every remote silent: self-suspect, defer.
-        let all = [obs(true, true, false), obs(true, true, true)];
-        let age = gate
-            .observe(&all, t0 + Duration::from_millis(10), WINDOW)
+        let all = [obs("a", true, true, false), obs("b", true, true, true)];
+        let age = observe(&mut gate, &all, t0 + Duration::from_millis(10), &snap)
             .expect("collective silence defers");
         assert_eq!(age, Duration::ZERO, "episode starts at this sweep");
         assert!(gate.deferring().is_some(), "verdict visible between sweeps");
@@ -258,62 +360,130 @@ mod tests {
     fn local_member_is_excluded_and_single_remote_never_engages() {
         let mut gate = CollectiveSilenceGate::new();
         let t0 = Instant::now();
+        let snap = unknown_snapshot();
 
         // Fresh co-located member + two silent remotes: defer.
         let colocated = [
-            obs(false, false, false),
-            obs(true, true, true),
-            obs(true, true, false),
+            obs("local", false, false, false),
+            obs("a", true, true, true),
+            obs("b", true, true, false),
         ];
-        assert!(gate.observe(&colocated, t0, WINDOW).is_some());
+        assert!(observe(&mut gate, &colocated, t0, &snap).is_some());
 
         // Single remote silent past hard (plus the local member):
         // below MIN_REMOTE_MEMBERS — gate stays out of the way.
-        let single = [obs(false, false, false), obs(true, true, true)];
+        let single = [
+            obs("local", false, false, false),
+            obs("a", true, true, true),
+        ];
         assert_eq!(
-            gate.observe(&single, t0 + Duration::from_millis(10), WINDOW),
+            observe(&mut gate, &single, t0 + Duration::from_millis(10), &snap),
             None
         );
         assert_eq!(gate.deferring(), None);
     }
 
-    /// BOUNDED: once a due HARD declaration has been suppressed past
-    /// the escalation window, the gate escalates (declarations resume)
-    /// for the remainder of the episode — a genuinely all-dead fleet is
-    /// still removed and the fleet-dead arm can arm.
+    /// SLURM-AUTHORITATIVE ESCALATION: once a due HARD declaration has
+    /// been suppressed past the escalation window AND slurm reports
+    /// every silent peer's job GONE, the gate escalates (declarations
+    /// resume) for the remainder of the episode.
     #[test]
-    fn suppressed_hard_declaration_escalates_after_the_window() {
+    fn collective_silence_escalates_when_authoritative_says_all_gone() {
         let mut gate = CollectiveSilenceGate::new();
         let t0 = Instant::now();
-        let all_warn = [obs(true, true, false), obs(true, true, false)];
-        let all_hard = [obs(true, true, true), obs(true, true, true)];
+        let all_warn = [obs("a", true, true, false), obs("b", true, true, false)];
+        let all_hard = [obs("a", true, true, true), obs("b", true, true, true)];
+        let gone = snapshot_with(&["a", "b"], PeerLifeState::Gone);
 
         // WARN-stage collective silence: deferring, but the escalation
         // clock has not started (no hard declaration is due yet).
-        assert!(gate.observe(&all_warn, t0, WINDOW).is_some());
+        assert!(observe(&mut gate, &all_warn, t0, &gone).is_some());
         // Hard becomes due: still deferred, escalation clock starts NOW.
         assert!(
-            gate.observe(&all_hard, t0 + Duration::from_millis(300), WINDOW)
-                .is_some(),
+            observe(&mut gate, &all_hard, t0 + Duration::from_millis(300), &gone).is_some(),
             "the WARN-stage episode age must not pre-burn the escalation \
              window: the clock runs from the first SUPPRESSED hard"
         );
         // Inside the window: still deferred.
         assert!(
-            gate.observe(&all_hard, t0 + Duration::from_millis(450), WINDOW)
-                .is_some()
+            observe(&mut gate, &all_hard, t0 + Duration::from_millis(450), &gone).is_some()
         );
-        // Past the window: escalated — declarations resume.
+        // Past the window AND authority says all Gone: escalated.
         assert_eq!(
-            gate.observe(&all_hard, t0 + Duration::from_millis(550), WINDOW),
+            observe(&mut gate, &all_hard, t0 + Duration::from_millis(550), &gone),
             None,
-            "deferral must be bounded; a genuinely all-dead fleet is declared"
+            "deferral must be bounded; a genuinely all-dead fleet (per slurm) is declared"
         );
         assert_eq!(gate.deferring(), None);
         // Escalation latches for the episode.
         assert_eq!(
-            gate.observe(&all_hard, t0 + Duration::from_millis(600), WINDOW),
+            observe(&mut gate, &all_hard, t0 + Duration::from_millis(600), &gone),
             None
+        );
+    }
+
+    /// Past the window, if slurm-authoritative evidence shows ≥1 silent
+    /// peer is still `Alive`, the gate KEEPS DEFERRING (the silence is
+    /// local-deafness, not a real death — the run_20260615_112332
+    /// face). This is the #544 tiebreak that prevents the wall-clock
+    /// false-positive escalation.
+    #[test]
+    fn collective_silence_defers_when_authoritative_says_all_alive() {
+        let mut gate = CollectiveSilenceGate::new();
+        let t0 = Instant::now();
+        let all_hard = [obs("a", true, true, true), obs("b", true, true, true)];
+        let alive = snapshot_with(&["a", "b"], PeerLifeState::Alive);
+
+        assert!(observe(&mut gate, &all_hard, t0, &alive).is_some());
+        // Past the window: WOULD escalate on wall-clock alone, but
+        // authority says Alive → continue deferring.
+        assert!(
+            observe(&mut gate, &all_hard, t0 + Duration::from_millis(300), &alive).is_some(),
+            "authority says Alive → gate must continue deferring past the window"
+        );
+        assert!(gate.deferring().is_some());
+    }
+
+    /// Past the window with NO authoritative evidence either way
+    /// (snapshot stale / probe failure / no probe wired), the gate
+    /// fail-closes: continue deferring until evidence lands.
+    #[test]
+    fn collective_silence_defers_on_unknown_authority() {
+        let mut gate = CollectiveSilenceGate::new();
+        let t0 = Instant::now();
+        let all_hard = [obs("a", true, true, true), obs("b", true, true, true)];
+        let snap = unknown_snapshot();
+
+        assert!(observe(&mut gate, &all_hard, t0, &snap).is_some());
+        // Past the window with no positive evidence: fail-closed →
+        // continue deferring.
+        assert!(
+            observe(&mut gate, &all_hard, t0 + Duration::from_millis(300), &snap).is_some(),
+            "no authoritative evidence either way → fail-closed defer"
+        );
+        assert!(gate.deferring().is_some());
+    }
+
+    /// One Alive among Unknowns is still "any_alive" — the gate keeps
+    /// deferring (the fleet is not provably all-gone).
+    #[test]
+    fn collective_silence_defers_when_any_alive_among_unknowns() {
+        let mut gate = CollectiveSilenceGate::new();
+        let t0 = Instant::now();
+        let three_hard = [
+            obs("a", true, true, true),
+            obs("b", true, true, true),
+            obs("c", true, true, true),
+        ];
+        // a is Alive, b/c are Unknown (no map entries).
+        let mut map = HashMap::new();
+        map.insert("a".into(), PeerLifeState::Alive);
+        let mixed = StaticSnapshot { map, count: None };
+
+        assert!(observe(&mut gate, &three_hard, t0, &mixed).is_some());
+        assert!(
+            observe(&mut gate, &three_hard, t0 + Duration::from_millis(300), &mixed).is_some(),
+            "one Alive (rest Unknown) → defer past window"
         );
     }
 
@@ -324,26 +494,26 @@ mod tests {
     fn remote_evidence_resets_episode_and_escalation() {
         let mut gate = CollectiveSilenceGate::new();
         let t0 = Instant::now();
-        let all_hard = [obs(true, true, true), obs(true, true, true)];
-        let one_live = [obs(true, true, true), obs(true, false, false)];
+        let all_hard = [obs("a", true, true, true), obs("b", true, true, true)];
+        let one_live = [obs("a", true, true, true), obs("b", true, false, false)];
+        let gone = snapshot_with(&["a", "b"], PeerLifeState::Gone);
 
-        // Drive into escalation.
-        assert!(gate.observe(&all_hard, t0, WINDOW).is_some());
+        // Drive into escalation (authority confirms Gone past window).
+        assert!(observe(&mut gate, &all_hard, t0, &gone).is_some());
         assert_eq!(
-            gate.observe(&all_hard, t0 + Duration::from_millis(300), WINDOW),
+            observe(&mut gate, &all_hard, t0 + Duration::from_millis(300), &gone),
             None
         );
 
         // A remote frame proves the wire: episode over.
         assert_eq!(
-            gate.observe(&one_live, t0 + Duration::from_millis(350), WINDOW),
+            observe(&mut gate, &one_live, t0 + Duration::from_millis(350), &gone),
             None
         );
 
         // A NEW collective episode defers again from scratch.
         assert!(
-            gate.observe(&all_hard, t0 + Duration::from_millis(400), WINDOW)
-                .is_some(),
+            observe(&mut gate, &all_hard, t0 + Duration::from_millis(400), &gone).is_some(),
             "a fresh episode must re-arm the deferral (no leftover \
              escalation latch from the previous one)"
         );

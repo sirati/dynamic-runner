@@ -7,6 +7,11 @@
 //! step is mocked via a `RecordingTunnelEstablisher` that counts
 //! calls and records the id it was invoked with — no real ssh /
 //! sbatch / podman is touched.
+//!
+//! Respawn is FIRE-AND-FORGET: there is no revoke surface, and the
+//! happy path NEVER issues `scancel`. The tests below pin both
+//! invariants — over-allocation is structurally tolerated, never
+//! cancelled (rule 1, #543: respawning must NEVER cancel a job).
 use super::{SlurmSecondarySpawner, TunnelEstablisher, WrapperScriptGenerator};
 use crate::config::SlurmConfig;
 use crate::job_manager::SlurmJobManager;
@@ -32,14 +37,6 @@ use tokio::sync::Mutex;
 struct RecordingGateway {
     commands: StdMutex<Vec<String>>,
     sbatch_fails: bool,
-    /// scancel runs but reports an error (rc=1) — the "job already
-    /// gone / unknown to the controller" shape `cancel_job` maps to
-    /// `CancelOutcome::AlreadyGone`.
-    scancel_reports_error: bool,
-    /// scancel never runs — the gateway transport itself fails
-    /// (`Err(GatewayError)`), the shape `revoke` must surface as
-    /// `SpawnError`.
-    scancel_transport_fails: bool,
     /// Node name a `squeue -j … -o '%N'` probe answers with (the
     /// SLURM-vocabulary node the respawn resolves for `--exclude`).
     /// Empty → squeue reports no node (the resolution falls through to
@@ -65,22 +62,7 @@ impl Gateway for RecordingGateway {
         cmd: &str,
         _cwd: Option<&str>,
     ) -> Result<CommandResult, GatewayError> {
-        // Transport failure for scancel is checked BEFORE recording:
-        // a transport-dead gateway never delivers the command, so the
-        // command log must not show it either.
-        if cmd.starts_with("scancel ") && self.scancel_transport_fails {
-            return Err(GatewayError::CommandFailed(
-                "ssh: connect to host gateway.test.invalid: Connection refused".into(),
-            ));
-        }
         self.commands.lock().unwrap().push(cmd.to_string());
-        if cmd.starts_with("scancel ") && self.scancel_reports_error {
-            return Ok(CommandResult {
-                return_code: 1,
-                stdout: String::new(),
-                stderr: "scancel: error: Invalid job id specified".into(),
-            });
-        }
         // Respawn node-resolution probes. `node_from_squeue` issues
         // `squeue -j … -h -o '%N'` (distinct from cancel-verify's
         // `-o '%T|%N|%r'`); `node_from_sacct` issues `sacct … NodeList`.
@@ -233,18 +215,16 @@ fn make_spec_with_dead_member(id: &str, dead_member_id: &str) -> SecondarySpawnS
 
 /// `spawn()` must thread `spec.new_secondary_id` into both the
 /// wrapper-script generator (so the script's secondary id matches)
-/// AND the `--job-name=` argument of the sbatch invocation (so
-/// operators eyeballing `squeue` see the same id as the
-/// respawn-event ring). This locks down both propagation paths in
-/// a single test rather than splitting them — the same id must
-/// reach both places or the respawn is broken.
-/// All `spawn()` tests run under a `LocalSet`: the production
-/// implementation uses `tokio::task::spawn_local` to detach the
-/// (sbatch + job_ids.push + tunnel) inner task from the
+/// AND the `--job-name=` argument of the sbatch invocation when
+/// no consumer prefix is set. This locks down both propagation paths
+/// in a single test — the same id must reach both places or the
+/// respawn is broken. All `spawn()` tests run under a `LocalSet`:
+/// the production implementation uses `tokio::task::spawn_local` to
+/// detach the (sbatch + job_ids.push + tunnel) inner task from the
 /// coordinator's `respawn_tasks` JoinSet so a JoinSet-level abort
-/// can't orphan a submitted job. `spawn_local` requires a
-/// `LocalSet` context — providing it in the test scaffold matches
-/// the production caller (the operational loop's `run_until`).
+/// can't orphan a submitted job. `spawn_local` requires a `LocalSet`
+/// context — providing it in the test scaffold matches the
+/// production caller (the operational loop's `run_until`).
 #[tokio::test]
 async fn slurm_spawner_submit_job_called_with_new_id() {
     tokio::task::LocalSet::new()
@@ -272,6 +252,7 @@ async fn slurm_spawner_submit_job_called_with_new_id() {
                 Arc::clone(&tunnel),
                 wrap_gen,
                 "/srv/slurm-test/log/run-1".into(),
+                None,
             );
 
             spawner
@@ -285,7 +266,7 @@ async fn slurm_spawner_submit_job_called_with_new_id() {
                 Some("sec-replacement-7"),
             );
 
-            // (b) sbatch was invoked with --job-name=<new_id>.
+            // (b) sbatch was invoked with --job-name=<new_id> (no prefix).
             let mgr_locked = mgr.lock().await;
             let cmds = mgr_locked.gateway().commands();
             let sbatch = cmds
@@ -294,7 +275,8 @@ async fn slurm_spawner_submit_job_called_with_new_id() {
                 .expect("sbatch command must have been issued");
             assert!(
                 sbatch.contains("--job-name=sec-replacement-7"),
-                "new id must propagate into sbatch --job-name; got: {sbatch}",
+                "new id must propagate into sbatch --job-name when no \
+                 prefix is set; got: {sbatch}",
             );
 
             // (c) `--nodes=1` per spec (1-node allocation for one
@@ -368,6 +350,7 @@ async fn slurm_spawner_resolves_and_passes_exclude_node_to_sbatch() {
                 Arc::clone(&tunnel),
                 wrap_gen,
                 "/srv/slurm-test/log/run-1".into(),
+                None,
             );
 
             spawner
@@ -419,6 +402,7 @@ async fn slurm_spawner_omits_exclude_when_dead_member_unresolvable() {
                 Arc::clone(&tunnel),
                 wrap_gen,
                 "/srv/slurm-test/log/run-1".into(),
+                None,
             );
 
             // Name a dead member the manager never submitted a job for.
@@ -476,6 +460,7 @@ async fn slurm_spawner_returns_spawn_error_on_sbatch_failure() {
                 Arc::clone(&tunnel),
                 wrap_gen,
                 "/srv/slurm-test/log/run-1".into(),
+                None,
             );
 
             let err = spawner
@@ -504,6 +489,14 @@ async fn slurm_spawner_returns_spawn_error_on_sbatch_failure() {
                 0,
                 "tunnel establishment must not run when sbatch failed",
             );
+
+            // Rule 1 (#543): respawning must NEVER cancel a job — not on
+            // the happy path AND not when sbatch fails.
+            let cmds = mgr.lock().await.gateway().commands();
+            assert!(
+                cmds.iter().all(|c| !c.starts_with("scancel ")),
+                "respawn must NEVER scancel a job (rule 1); got: {cmds:?}",
+            );
         })
         .await;
 }
@@ -518,12 +511,6 @@ async fn slurm_spawner_returns_spawn_error_on_sbatch_failure() {
 ///       from a prior call); and
 ///   (c) the sbatch command was in the gateway's command log
 ///       (cross-check that submission did happen).
-///
-/// Ordering between (a) and (c) is implicit: `spawn()`'s code
-/// path runs them sequentially under a single `await` chain, so
-/// "both happened" is equivalent to "submit_job ran first" given
-/// the sbatch-failure test above pinned the failure-short-circuit
-/// branch.
 #[tokio::test]
 async fn slurm_spawner_invokes_establish_one_tunnel_after_submit() {
     tokio::task::LocalSet::new()
@@ -544,6 +531,7 @@ async fn slurm_spawner_invokes_establish_one_tunnel_after_submit() {
                 Arc::clone(&tunnel),
                 wrap_gen,
                 "/srv/slurm-test/log/run-1".into(),
+                None,
             );
 
             spawner
@@ -572,6 +560,60 @@ async fn slurm_spawner_invokes_establish_one_tunnel_after_submit() {
                 cmds.iter().any(|c| c.contains("| sbatch ")),
                 "submit_job must have issued an sbatch command",
             );
+
+            // Rule 1 (#543): happy-path respawn issues ZERO scancel
+            // commands. The over-allocation case is structurally
+            // tolerated (see [[feedback_at_least_once_execution_deliberate]]),
+            // never resolved by killing a job.
+            assert!(
+                cmds.iter().all(|c| !c.starts_with("scancel ")),
+                "respawn happy path must NEVER scancel a job (rule 1); got: {cmds:?}",
+            );
+        })
+        .await;
+}
+
+/// Rule 3 (#543): a respawned secondary's `--job-name` is composed from
+/// the consumer-set prefix captured at startup plus the new secondary
+/// id. Operators eyeballing `squeue` see consistent naming across
+/// initial and respawned cohorts.
+#[tokio::test]
+async fn slurm_spawner_uses_consumer_job_name_prefix_when_set() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let gw = RecordingGateway::default();
+            let cfg = SlurmConfig {
+                root_folder: "/srv/slurm-test".into(),
+                ..SlurmConfig::default()
+            };
+            let mgr = Arc::new(Mutex::new(SlurmJobManager::new(cfg, gw)));
+            let tunnel = Arc::new(RecordingTunnelEstablisher::ok());
+            let wrap_gen: WrapperScriptGenerator =
+                Arc::new(|_spec: &SecondarySpawnSpec| Ok("#!/bin/sh\necho hi\n".to_string()));
+
+            let spawner = SlurmSecondarySpawner::new(
+                Arc::clone(&mgr),
+                Arc::clone(&tunnel),
+                wrap_gen,
+                "/srv/slurm-test/log/run-1".into(),
+                Some("asm-2026".into()),
+            );
+
+            spawner
+                .spawn(make_spec("sec-replacement-7"))
+                .await
+                .expect("spawn must succeed");
+
+            let mgr_locked = mgr.lock().await;
+            let cmds = mgr_locked.gateway().commands();
+            let sbatch = cmds
+                .iter()
+                .find(|c| c.contains("| sbatch "))
+                .expect("sbatch command must have been issued");
+            assert!(
+                sbatch.contains("--job-name=asm-2026-sec-replacement-7"),
+                "consumer prefix must compose with the new id; got: {sbatch}",
+            );
         })
         .await;
 }
@@ -581,19 +623,6 @@ async fn slurm_spawner_invokes_establish_one_tunnel_after_submit() {
 /// dropping the outer future mid-tunnel-setup must NOT lose the
 /// job_id from the manager — the coordinator's later `cleanup()`
 /// scancels the orphan exactly because the id is recorded there.
-///
-/// Repro pattern:
-/// 1. Tunnel-establisher is gated on a oneshot the test holds.
-/// 2. We `spawn()` into the surrounding LocalSet via
-///    `tokio::task::spawn_local` and yield until sbatch has run
-///    (visible on the gateway's command log).
-/// 3. At that point, we drop the outer JoinHandle (mirroring the
-///    JoinSet::shutdown abort path) WITHOUT releasing the gate.
-/// 4. We then release the gate (so the inner task can finish its
-///    tunnel step) and yield until the inner task drains.
-/// 5. Assert `mgr.job_ids` contains exactly one entry —
-///    `"67890"` (the canned sbatch stdout) — proving the post-
-///    abort sequence preserved the orphan-cleanup invariant.
 #[tokio::test]
 async fn slurm_spawner_orphan_sbatch_recorded_in_job_ids_after_shutdown_abort() {
     tokio::task::LocalSet::new()
@@ -619,6 +648,7 @@ async fn slurm_spawner_orphan_sbatch_recorded_in_job_ids_after_shutdown_abort() 
                 Arc::clone(&tunnel),
                 wrap_gen,
                 "/srv/slurm-test/log/run-1".into(),
+                None,
             ));
 
             // Mirror the operational-loop shape: the outer `spawn()`
@@ -631,13 +661,7 @@ async fn slurm_spawner_orphan_sbatch_recorded_in_job_ids_after_shutdown_abort() 
                 spawner_for_task.spawn(make_spec("sec-orphan-test")).await
             });
 
-            // Yield until sbatch has run. `submit_job` pipes the wrapper
-            // body to sbatch over STDIN in a SINGLE command
-            // (`printf '%s' '<body>' | sbatch --parsable …`) — there is
-            // no separate script-write command, so the recorded command
-            // CONTAINS `| sbatch ` rather than starting with `sbatch `.
-            // We poll for that line rather than sleeping a fixed
-            // duration so the test stays deterministic on slow CI.
+            // Yield until sbatch has run.
             let sbatch_seen = async {
                 loop {
                     {
@@ -671,25 +695,13 @@ async fn slurm_spawner_orphan_sbatch_recorded_in_job_ids_after_shutdown_abort() 
             }
 
             // Abort the outer future (mirrors `JoinSet::shutdown`).
-            // The inner spawn_local task is parented to the
-            // surrounding LocalSet, NOT to this handle, so it keeps
-            // running.
             outer_handle.abort();
-            // Yield so the abort actually takes effect; the inner
-            // task is still pending on the gate.
             tokio::task::yield_now().await;
 
-            // Release the gate so the inner task can finish its
-            // tunnel step. With the production implementation, the
-            // tunnel succeeds, the inner task tries to send on the
-            // oneshot (the rx is gone — the outer future was
-            // aborted), and the `let _ =` swallows the error.
+            // Release the gate so the inner task can finish its tunnel step.
             let _ = gate_tx.send(());
 
-            // Yield a few times so the inner task drains. We can't
-            // join on it directly (it's a detached spawn_local), but
-            // a handful of yields are enough for the recorder's
-            // `calls` counter to settle.
+            // Yield a few times so the inner task drains.
             for _ in 0..16 {
                 tokio::task::yield_now().await;
             }
@@ -710,208 +722,6 @@ async fn slurm_spawner_orphan_sbatch_recorded_in_job_ids_after_shutdown_abort() 
                 1,
                 "the inner task must keep running after outer abort \
              (proves the spawn_local detach)",
-            );
-        })
-        .await;
-}
-
-// ── Revocation (task: cancel the already-submitted replacement when
-//    the original member re-admits before the replacement joins) ──
-
-/// Shared scaffold for the revoke tests: a spawner over the supplied
-/// recording gateway with an always-ok tunnel and a constant wrapper
-/// body. Returns the manager handle (for command-log assertions),
-/// the tunnel recorder, and the spawner.
-#[allow(clippy::type_complexity)]
-fn make_revoke_fixture(
-    gw: RecordingGateway,
-) -> (
-    Arc<Mutex<SlurmJobManager<RecordingGateway>>>,
-    Arc<RecordingTunnelEstablisher>,
-    SlurmSecondarySpawner<RecordingGateway, RecordingTunnelEstablisher>,
-) {
-    let cfg = SlurmConfig {
-        root_folder: "/srv/slurm-test".into(),
-        ..SlurmConfig::default()
-    };
-    let mgr = Arc::new(Mutex::new(SlurmJobManager::new(cfg, gw)));
-    let tunnel = Arc::new(RecordingTunnelEstablisher::ok());
-    let wrap_gen: WrapperScriptGenerator =
-        Arc::new(|_spec: &SecondarySpawnSpec| Ok("#!/bin/sh\necho hi\n".to_string()));
-    let spawner = SlurmSecondarySpawner::new(
-        Arc::clone(&mgr),
-        Arc::clone(&tunnel),
-        wrap_gen,
-        "/srv/slurm-test/log/run-1".into(),
-    );
-    (mgr, tunnel, spawner)
-}
-
-/// Count the `scancel <id>` invocations in the gateway's command log.
-async fn scancel_count(mgr: &Arc<Mutex<SlurmJobManager<RecordingGateway>>>, job_id: &str) -> usize {
-    let expected = format!("scancel {job_id}");
-    mgr.lock()
-        .await
-        .gateway()
-        .commands()
-        .iter()
-        .filter(|c| c.as_str() == expected)
-        .count()
-}
-
-/// Production replay (original-re-admitted-first interleaving): the
-/// replacement's sbatch is submitted and its job id recorded, then the
-/// original member re-admits → `revoke(new_id)` must `scancel` exactly
-/// the recorded job id. A second revoke for the same id is an
-/// idempotent no-op (no double scancel).
-#[tokio::test]
-async fn slurm_spawner_revoke_after_submit_issues_scancel_for_recorded_job_id() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let (mgr, _tunnel, spawner) = make_revoke_fixture(RecordingGateway::default());
-
-            spawner
-                .spawn(make_spec("sec-replacement-10"))
-                .await
-                .expect("spawn must succeed");
-
-            spawner
-                .revoke("sec-replacement-10")
-                .await
-                .expect("revoke of a submitted job must succeed");
-            assert_eq!(
-                scancel_count(&mgr, "67890").await,
-                1,
-                "revoke must scancel exactly the job id recorded at submit time",
-            );
-
-            // Idempotency: the entry was consumed; a duplicate revoke
-            // (e.g. a re-delivered Added event) must not scancel again.
-            spawner
-                .revoke("sec-replacement-10")
-                .await
-                .expect("duplicate revoke must be a quiet no-op");
-            assert_eq!(
-                scancel_count(&mgr, "67890").await,
-                1,
-                "a duplicate revoke must not issue a second scancel",
-            );
-        })
-        .await;
-}
-
-/// Revoke-before-submit race: the re-admission can land while (or even
-/// before) the spawner's inner task is still driving sbatch. The
-/// revoke parks a tombstone; the submitting task must then scancel its
-/// own freshly-minted job, skip the tunnel step (nothing will ever
-/// connect to a cancelled job), and surface `SpawnError::Revoked`.
-#[tokio::test]
-async fn slurm_spawner_revoke_before_submit_cancels_job_and_skips_tunnel() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let (mgr, tunnel, spawner) = make_revoke_fixture(RecordingGateway::default());
-
-            spawner
-                .revoke("sec-replacement-11")
-                .await
-                .expect("pre-submit revoke must tombstone quietly");
-
-            let err = spawner
-                .spawn(make_spec("sec-replacement-11"))
-                .await
-                .expect_err("a revoked-in-flight spawn must not report success");
-            assert!(
-                matches!(err, SpawnError::Revoked),
-                "expected SpawnError::Revoked, got {err:?}",
-            );
-
-            // sbatch ran (the tombstone is only honoured after
-            // submission — sbatch was already in flight), and its job
-            // was immediately scancel'd by its own submitter.
-            let cmds = mgr.lock().await.gateway().commands();
-            assert!(
-                cmds.iter().any(|c| c.contains("| sbatch ")),
-                "sbatch must have been issued before the tombstone was seen",
-            );
-            assert_eq!(
-                scancel_count(&mgr, "67890").await,
-                1,
-                "the submitting task must scancel its own job on a tombstone",
-            );
-            assert_eq!(
-                tunnel.calls(),
-                0,
-                "no tunnel may be established for a revoked job",
-            );
-        })
-        .await;
-}
-
-/// A revoked job that is already gone from the controller (scancel
-/// runs but reports an error) is a QUIET no-op: `revoke` returns Ok.
-#[tokio::test]
-async fn slurm_spawner_revoke_of_gone_job_is_quiet_noop() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let gw = RecordingGateway {
-                scancel_reports_error: true,
-                ..RecordingGateway::default()
-            };
-            let (mgr, _tunnel, spawner) = make_revoke_fixture(gw);
-
-            spawner
-                .spawn(make_spec("sec-replacement-12"))
-                .await
-                .expect("spawn must succeed");
-
-            spawner
-                .revoke("sec-replacement-12")
-                .await
-                .expect("a gone job must be a quiet no-op, not an error");
-            assert_eq!(
-                scancel_count(&mgr, "67890").await,
-                1,
-                "scancel must still have been attempted once",
-            );
-        })
-        .await;
-}
-
-/// A gateway transport failure (scancel never ran) must surface as
-/// `Err` so the caller can log loudly — the job id stays on
-/// `job_manager.job_ids`, so the run-teardown `cleanup()` sweep still
-/// scancels it.
-#[tokio::test]
-async fn slurm_spawner_revoke_transport_failure_surfaces_err() {
-    tokio::task::LocalSet::new()
-        .run_until(async {
-            let gw = RecordingGateway {
-                scancel_transport_fails: true,
-                ..RecordingGateway::default()
-            };
-            let (mgr, _tunnel, spawner) = make_revoke_fixture(gw);
-
-            spawner
-                .spawn(make_spec("sec-replacement-13"))
-                .await
-                .expect("spawn must succeed");
-
-            let err = spawner
-                .revoke("sec-replacement-13")
-                .await
-                .expect_err("a transport failure must surface");
-            assert!(
-                matches!(&err, SpawnError::Other(msg) if msg.contains("scancel")),
-                "transport failure must be tagged as a scancel failure; got {err:?}",
-            );
-
-            // The orphan-safety net: the job id is still on `job_ids`
-            // so the coordinator's `cleanup()` scancels it at teardown.
-            assert_eq!(
-                mgr.lock().await.job_ids(),
-                &["67890".to_string()],
-                "a revoke transport failure must leave the job id on \
-                 job_ids for the teardown sweep",
             );
         })
         .await;

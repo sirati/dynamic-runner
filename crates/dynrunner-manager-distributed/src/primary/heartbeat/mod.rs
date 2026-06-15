@@ -808,6 +808,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             };
             let stage = silence_stage(silence, interval, &warn_multiples, hard_multiple);
             observations.push(SilenceObservation {
+                // Carried for the slurm-authoritative tiebreak (#544):
+                // the gate consults the off-loop snapshot per silent id
+                // on escalation, so it can tell local-deafness from a
+                // real all-dead fleet (see CollectiveSilenceGate::observe).
+                secondary_id: s.secondary_id.clone(),
                 // The co-located same-peer member's frames ride the
                 // in-process loopback — they prove nothing about the
                 // wire, so it never counts toward (or against) the
@@ -837,9 +842,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // the same bound the chronic tick-lag escalation uses, derived
         // from the one cadence authority rather than a new config knob.
         let escalation_window = interval.saturating_mul(hard_multiple);
+        // Clone the Arc so the borrow-checker is happy holding
+        // `&mut self.collective_silence_gate` alongside the snapshot
+        // read; the gate consults the snapshot per silent id on
+        // escalation (#544). `co_located_*` are observability-only
+        // (#549) and may be populated by a future patch — `None`
+        // preserves correctness today.
+        let authority = std::sync::Arc::clone(&self.authority_snapshot);
         if self
             .collective_silence_gate
-            .observe(&observations, Instant::now(), escalation_window)
+            .observe(
+                &observations,
+                Instant::now(),
+                escalation_window,
+                authority.as_ref(),
+                None,
+                None,
+            )
             .is_some()
         {
             return Ok(());

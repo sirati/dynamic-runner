@@ -2,12 +2,12 @@
 //!
 //! # Single concern
 //!
-//! Carry one respawn EXECUTION (spawn / revoke) across the mesh to the
-//! process that physically hosts the provider, and bring its outcome
-//! back. The respawn DECISION (budget admission, id mint, replicated
-//! ledger spend, pending-replacement reconciliation) stays entirely in
-//! `dispatch_respawn_request` / `reconcile_replacements_on_join` and is
-//! untouched: this module is the SECOND backend behind the SAME
+//! Carry one respawn EXECUTION (spawn) across the mesh to the process
+//! that physically hosts the provider, and bring its outcome back. The
+//! respawn DECISION (budget admission, id mint, replicated ledger spend,
+//! slurm-authoritative quantity gate) stays entirely in
+//! `dispatch_respawn_request` and is untouched: this module is the SECOND
+//! backend behind the SAME
 //! [`SecondarySpawner`] trait the local providers implement, so the
 //! handler never knows local from remote.
 //!
@@ -70,17 +70,14 @@ const SPAWN_RESEND_INITIAL: Duration = Duration::from_secs(10);
 /// id already minted; only delivery is pending). Run teardown aborts
 /// the retry future via the `respawn_tasks` drain.
 const SPAWN_RESEND_CAP: Duration = Duration::from_secs(60);
-/// Revoke re-send cadence + bounded attempt count. Revocation is
-/// best-effort by the trait contract: after the attempts exhaust the
-/// caller gets the same `Err` a local provider returns on an
-/// unreachable backend (logged loudly; the provider-side run-teardown
-/// sweep remains the reclamation backstop).
-const REVOKE_RESEND_INTERVAL: Duration = Duration::from_secs(10);
-const REVOKE_MAX_ATTEMPTS: u32 = 6;
-
 /// Which pending table a request correlates through. Spawn and revoke
 /// results for the SAME `new_secondary_id` must never cross-complete
 /// (a revoke can race its spawn), so the two are distinct keyspaces.
+/// `Revoke` is retained for the observer-side wire protocol (the
+/// observer's handler keeps replying), but no primary-side caller emits
+/// revoke requests after the slurm-authoritative quantity gate replaced
+/// the per-replacement revoke surface (#543); the table entries for
+/// `Revoke` are dead-on-arrival.
 #[derive(Clone, Copy, Debug)]
 enum ExecKind {
     Spawn,
@@ -100,8 +97,7 @@ struct PendingMaps {
 /// completes it when the observer's result frame lands.
 ///
 /// `std::sync::Mutex` — every critical section is a synchronous map
-/// probe, never held across an await (the same discipline as the SLURM
-/// provider's `replacement_jobs`). Growth is bounded by the respawn
+/// probe, never held across an await. Growth is bounded by the respawn
 /// budget (`max_total` concurrent ids at the theoretical worst).
 #[derive(Clone, Default)]
 pub struct RemoteRespawnPending {
@@ -299,53 +295,6 @@ impl<I: Identifier> SecondarySpawner for RemoteSecondarySpawner<I> {
         }
     }
 
-    /// Send the revoke request and await the observer's result, with
-    /// bounded re-sends. Exhaustion returns the same
-    /// `ProviderUnavailable` a local provider returns on an unreachable
-    /// backend: the caller logs loudly, and the provider-side
-    /// run-teardown sweep (the job id is on the PROVIDER host's
-    /// `job_ids` ledger — submission happened there) reclaims the job.
-    async fn revoke(&self, new_secondary_id: &str) -> Result<(), SpawnError> {
-        let mut waiter = self.pending.register(ExecKind::Revoke, new_secondary_id);
-        for attempt in 1..=REVOKE_MAX_ATTEMPTS {
-            let frame = DistributedMessage::RespawnRevokeRequest {
-                target: None,
-                sender_id: self.local_id.clone(),
-                timestamp: crate::primary::wire::timestamp_now(),
-                new_secondary_id: new_secondary_id.to_owned(),
-            };
-            if let Err(e) = self.send_request(frame) {
-                return Err(SpawnError::ProviderUnavailable(format!(
-                    "local mesh egress closed: {e}"
-                )));
-            }
-            match tokio::time::timeout(REVOKE_RESEND_INTERVAL, &mut waiter.rx).await {
-                Ok(Ok(Ok(()))) => return Ok(()),
-                Ok(Ok(Err(provider_err))) => return Err(SpawnError::Other(provider_err)),
-                Ok(Err(_recv_gone)) => {
-                    return Err(SpawnError::Other(
-                        "remote revoke waiter displaced before a result arrived".to_string(),
-                    ));
-                }
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        target: "dynrunner_respawn",
-                        new_secondary_id,
-                        provider_host = %self.provider_host,
-                        attempt,
-                        max_attempts = REVOKE_MAX_ATTEMPTS,
-                        event = "respawn_remote_revoke_resend",
-                        "no revoke result from the provider host yet; re-sending \
-                         (idempotent at the provider)",
-                    );
-                }
-            }
-        }
-        Err(SpawnError::ProviderUnavailable(format!(
-            "no revoke result from provider host {} after {} attempts",
-            self.provider_host, REVOKE_MAX_ATTEMPTS
-        )))
-    }
 }
 
 // ── Coordinator-side result ingest ─────────────────────────────────

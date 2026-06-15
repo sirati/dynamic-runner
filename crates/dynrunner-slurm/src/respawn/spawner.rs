@@ -9,8 +9,7 @@
 //! by its original's re-admission). See the module-level docs in
 //! [`super`] for the design rationale.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use dynrunner_gateway::traits::Gateway;
@@ -19,26 +18,9 @@ use dynrunner_manager_distributed::primary::respawn::{
 };
 use tokio::sync::Mutex;
 
-use crate::job_manager::{CancelOutcome, SlurmJobManager};
+use crate::job_manager::SlurmJobManager;
 
 use super::tunnel::TunnelEstablisher;
-
-/// Per-replacement bookkeeping entry in
-/// [`SlurmSecondarySpawner::replacement_jobs`]. The two states close
-/// the revoke-vs-submit race without the revoker ever waiting on the
-/// submitting task:
-///
-/// - `Submitted(job_id)`: sbatch returned this id; a `revoke` for the
-///   secondary id takes the entry and scancels it.
-/// - `Revoked`: a `revoke` arrived BEFORE sbatch completed (or even
-///   before `spawn` ran). The submitting task observes the tombstone
-///   right after `submit_job` returns and scancels its own freshly-
-///   minted job immediately, skipping the tunnel step.
-#[derive(Debug)]
-enum ReplacementJob {
-    Submitted(String),
-    Revoked,
-}
 
 /// Closure that synthesises a SLURM wrapper-script body for a given
 /// respawn spec. Returns the script content (not a path); the
@@ -75,16 +57,14 @@ pub struct SlurmSecondarySpawner<G: Gateway, T: TunnelEstablisher> {
     /// uses; captured here so the per-respawn call site doesn't have
     /// to re-derive it.
     run_log_dir: String,
-    /// Node-local secondary-id → replacement-job bookkeeping backing
-    /// [`SecondarySpawner::revoke`]. Shared (`Arc`) with the detached
-    /// inner submit task, which records the sbatch job id here (or
-    /// honours a `Revoked` tombstone — see [`ReplacementJob`]).
-    /// `std::sync::Mutex` — every critical section is a synchronous
-    /// map probe, never held across an await. Entries whose
-    /// replacement joins the run and is never revoked stay until drop;
-    /// growth is bounded by the respawn budget, the same story as
-    /// `SlurmJobManager::job_ids`.
-    replacement_jobs: Arc<StdMutex<HashMap<String, ReplacementJob>>>,
+    /// Consumer-set prefix captured at startup from the first initial
+    /// secondary's `--job-name` (everything before `-secondary-N`). On
+    /// respawn the job name is reconstructed as
+    /// `<prefix>-<new_secondary_id>` so operators eyeballing `squeue`
+    /// see consistent naming across initial and respawned secondaries
+    /// (rule 3: respawned secondaries preserve the original's name
+    /// prefix). `None` falls back to the bare framework peer-id.
+    consumer_job_name_prefix: Option<String>,
 }
 
 impl<G: Gateway, T: TunnelEstablisher> SlurmSecondarySpawner<G, T> {
@@ -99,13 +79,14 @@ impl<G: Gateway, T: TunnelEstablisher> SlurmSecondarySpawner<G, T> {
         tunnel_establisher: Arc<T>,
         wrapper_script_generator: WrapperScriptGenerator,
         run_log_dir: String,
+        consumer_job_name_prefix: Option<String>,
     ) -> Self {
         Self {
             job_manager,
             tunnel_establisher,
             wrapper_script_generator,
             run_log_dir,
-            replacement_jobs: Arc::new(StdMutex::new(HashMap::new())),
+            consumer_job_name_prefix,
         }
     }
 }
@@ -153,6 +134,17 @@ where
         let tunnel_establisher = Arc::clone(&self.tunnel_establisher);
         let run_log_dir = self.run_log_dir.clone();
         let secondary_id = spec.new_secondary_id.clone();
+        // Compose the SLURM `--job-name` for the replacement. Rule 3
+        // (#543): a respawned secondary preserves the original cohort's
+        // name prefix instead of falling through to the bare framework
+        // id. The prefix is captured ONCE at startup from the first
+        // initial secondary's job name (everything before
+        // `-secondary-N`); `None` falls back to the framework id so
+        // legacy non-SLURM tests stay green.
+        let job_name = match self.consumer_job_name_prefix.as_deref() {
+            Some(prefix) => format!("{prefix}-{secondary_id}"),
+            None => secondary_id.clone(),
+        };
         // The DEAD member's id, carried on the spec. The SLURM node to
         // exclude is resolved from it inside the inner task (job id →
         // squeue/sacct, SLURM's own vocabulary) while the manager lock is
@@ -160,7 +152,6 @@ where
         // `None` means there is no dead member to key on; the replacement
         // then places without constraint.
         let dead_member_id = spec.dead_member_id.clone();
-        let replacement_jobs = Arc::clone(&self.replacement_jobs);
 
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), SpawnError>>();
 
@@ -194,7 +185,7 @@ where
                 match mgr
                     .submit_job(
                         &wrapper_script,
-                        &secondary_id,
+                        &job_name,
                         &secondary_id,
                         1,
                         &run_log_dir,
@@ -205,74 +196,18 @@ where
                     Ok(id) => id,
                     Err(e) => {
                         // sbatch failed → no job_id was minted, no
-                        // push happened, no orphan exists. Clear any
-                        // `Revoked` tombstone a concurrent revoke may
-                        // have parked for us (there is no job for it
-                        // to apply to), surface the error, and stop.
-                        replacement_jobs
-                            .lock()
-                            .expect("replacement_jobs mutex poisoned")
-                            .remove(&secondary_id);
+                        // push happened, no orphan exists. Surface the
+                        // error and stop.
                         let _ = tx.send(Err(SpawnError::Other(format!("sbatch: {e}"))));
                         return;
                     }
                 }
             };
 
-            // Record the freshly-minted job id under this replacement's
-            // secondary id — the bookkeeping `revoke` consults — unless
-            // a revoke already tombstoned the entry (the replacement
-            // became redundant while sbatch was in flight). In the
-            // tombstoned case the job is scancel'd right here by its
-            // own submitter and the tunnel step is skipped: nothing
-            // will ever connect to a cancelled job.
-            let already_revoked = {
-                let mut jobs = replacement_jobs
-                    .lock()
-                    .expect("replacement_jobs mutex poisoned");
-                match jobs.get(&secondary_id) {
-                    Some(ReplacementJob::Revoked) => {
-                        jobs.remove(&secondary_id);
-                        true
-                    }
-                    _ => {
-                        jobs.insert(
-                            secondary_id.clone(),
-                            ReplacementJob::Submitted(job_id.clone()),
-                        );
-                        false
-                    }
-                }
-            };
-            if already_revoked {
-                tracing::info!(
-                    new_secondary_id = %secondary_id,
-                    job_id = %job_id,
-                    "respawn revoked while sbatch was in flight; \
-                     cancelling the freshly-submitted job",
-                );
-                // Best-effort: on a transport failure the job_id is
-                // already on `job_manager.job_ids` (submit_job pushed
-                // it), so the coordinator's `cleanup()` scancels it at
-                // run teardown — the same orphan safety net the abort
-                // path relies on.
-                let mgr = job_manager.lock().await;
-                if let Err(e) = mgr.cancel_job(&job_id).await {
-                    tracing::warn!(
-                        new_secondary_id = %secondary_id,
-                        job_id = %job_id,
-                        error = %e,
-                        "could not scancel the revoked-in-flight respawn job; \
-                         it remains on job_ids for the run-teardown sweep",
-                    );
-                }
-                let _ = tx.send(Err(SpawnError::Revoked));
-                return;
-            }
-
             tracing::info!(
                 new_secondary_id = %secondary_id,
                 job_id = %job_id,
+                job_name = %job_name,
                 "respawn sbatch submitted; awaiting tunnel",
             );
 
@@ -310,72 +245,6 @@ where
             Err(_recv_err) => Err(SpawnError::Other(
                 "spawn inner task dropped its sender before completion".to_string(),
             )),
-        }
-    }
-
-    /// Best-effort scancel of the replacement job submitted for
-    /// `new_secondary_id` (the member it replaces was re-admitted
-    /// before the replacement joined — the queued/running job is a
-    /// redundant allocation squatter).
-    ///
-    /// Race tolerance per the trait contract:
-    /// - job already submitted → take the recorded id and `scancel`
-    ///   it. A job the controller no longer knows (finished/purged) is
-    ///   a quiet no-op (`CancelOutcome::AlreadyGone`, debug log).
-    /// - submission still in flight (or `spawn` not yet polled) → park
-    ///   a `Revoked` tombstone; the submitting task scancels its own
-    ///   job the moment sbatch returns (see `spawn`).
-    /// - `Err` ONLY on a gateway transport failure: scancel never ran.
-    ///   The job id is still on `job_manager.job_ids` (submit_job
-    ///   pushed it), so the run-teardown `cleanup()` sweep scancels it
-    ///   regardless — the caller logs loudly, nothing is leaked past
-    ///   the run.
-    async fn revoke(&self, new_secondary_id: &str) -> Result<(), SpawnError> {
-        let submitted_job_id = {
-            let mut jobs = self
-                .replacement_jobs
-                .lock()
-                .expect("replacement_jobs mutex poisoned");
-            match jobs.remove(new_secondary_id) {
-                Some(ReplacementJob::Submitted(job_id)) => Some(job_id),
-                // Already tombstoned by an earlier revoke (put it
-                // back — idempotent) or not submitted yet: park the
-                // tombstone for the submitting task.
-                Some(ReplacementJob::Revoked) | None => {
-                    jobs.insert(new_secondary_id.to_owned(), ReplacementJob::Revoked);
-                    tracing::debug!(
-                        new_secondary_id,
-                        "revoke arrived before sbatch completed; tombstoned — \
-                         the submitting task will scancel its own job",
-                    );
-                    None
-                }
-            }
-        };
-        let Some(job_id) = submitted_job_id else {
-            return Ok(());
-        };
-        let mgr = self.job_manager.lock().await;
-        match mgr.cancel_job(&job_id).await {
-            Ok(CancelOutcome::Cancelled) => {
-                tracing::info!(
-                    new_secondary_id,
-                    job_id = %job_id,
-                    "revoked redundant respawn job (scancel issued)",
-                );
-                Ok(())
-            }
-            Ok(CancelOutcome::AlreadyGone) => {
-                tracing::debug!(
-                    new_secondary_id,
-                    job_id = %job_id,
-                    "revoked respawn job was already gone; nothing to cancel",
-                );
-                Ok(())
-            }
-            Err(e) => Err(SpawnError::Other(format!(
-                "scancel for revoked respawn job {job_id}: {e}"
-            ))),
         }
     }
 }

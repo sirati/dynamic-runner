@@ -50,6 +50,11 @@ serde_json = { workspace = true }
 # cost), then base64-wrapped to ride the JSON wire envelope.
 ciborium = { workspace = true }
 base64 = { workspace = true }
+# Lock-free atomic Arc swap backing the synchronously-readable
+# off-loop slurm-authoritative life-state snapshot. See
+# `authority_snapshot::OffLoopAuthoritySnapshot` for the safety-net
+# tiebreak that consumes it.
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 dynrunner-transport-tunnel = { workspace = true }

@@ -166,12 +166,23 @@ pub(super) fn build_slurm_respawn_kwargs<'py>(
     );
 
     // --- Build the PySlurmSpawner pyclass. ---
+    //
+    // Rule 3 (#543): a respawned secondary's `--job-name` preserves the
+    // initial-cohort consumer prefix (`outcome.name_prefix`) — operators
+    // eyeballing `squeue` see consistent naming across initial and
+    // respawned jobs, instead of the bare framework id-only fallback.
+    let consumer_job_name_prefix = if outcome.name_prefix.is_empty() {
+        None
+    } else {
+        Some(outcome.name_prefix.clone())
+    };
     let spawner = crate::slurm::respawn_bridge::PySlurmSpawner::new(
         job_manager_arc,
         preparation_arc,
         info_reader,
         wrapper_gen,
         outcome.run_log_dir.clone(),
+        consumer_job_name_prefix,
     );
     let spawner_py = Py::new(py, spawner)?;
 

@@ -2291,39 +2291,22 @@ where
         });
     }
 
-    /// Execute one revoke request against the hosted provider. No dedup
-    /// map: `SecondarySpawner::revoke` is idempotent and race-tolerant
-    /// by contract (Submitted → scancel; in-flight/not-yet-submitted →
-    /// tombstone), so every (re-)send just drives the provider again
-    /// and replies with its outcome.
+    /// Handle one revoke request from a primary. The per-replacement
+    /// revoke surface was retired in favour of the slurm-authoritative
+    /// quantity gate (#543); no current primary emits this frame. A frame
+    /// that lands here is a partial-upgrade leftover — reply Ok so the
+    /// sender's retry stops, and proceed without driving the provider.
+    /// The provider's run-teardown sweep remains the reclamation backstop
+    /// for any over-allocation.
     async fn on_respawn_revoke_request(&mut self, new_secondary_id: String) {
-        let Some(provider) = self.respawn_provider.clone() else {
-            tracing::warn!(
-                target: "dynrunner_respawn",
-                new_secondary_id = %new_secondary_id,
-                "revoke request received but this observer hosts no respawn \
-                 provider; replying with an error",
-            );
-            self.send_respawn_result(
-                RespawnExecKind::Revoke,
-                &new_secondary_id,
-                &Err("this observer hosts no respawn provider".to_string()),
-            )
+        tracing::debug!(
+            target: "dynrunner_respawn",
+            new_secondary_id = %new_secondary_id,
+            "revoke request received but the revoke surface was retired; \
+             replying Ok without driving the provider",
+        );
+        self.send_respawn_result(RespawnExecKind::Revoke, &new_secondary_id, &Ok(()))
             .await;
-            return;
-        };
-        let tx = self.respawn_exec_tx.clone();
-        tokio::task::spawn_local(async move {
-            let result = provider
-                .revoke(&new_secondary_id)
-                .await
-                .map_err(|e| e.to_string());
-            let _ = tx.send(RespawnExecOutcome {
-                kind: RespawnExecKind::Revoke,
-                new_secondary_id,
-                result,
-            });
-        });
     }
 
     /// Record a finished provider call and reply its outcome to the

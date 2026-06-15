@@ -32,8 +32,6 @@ pub enum SpawnError {
     ProviderUnavailable(String),
     #[error("spawn timed out")]
     Timeout,
-    #[error("spawn revoked: replacement no longer needed")]
-    Revoked,
     #[error("spawn failed: {0}")]
     Other(String),
 }
@@ -54,34 +52,19 @@ pub enum SpawnError {
 /// `Arc<dyn SecondarySpawner>` is moveable across `select!` arms.
 #[async_trait::async_trait(?Send)]
 pub trait SecondarySpawner: Send + Sync {
+    /// Fire-and-forget submission of a replacement secondary. The
+    /// provider is responsible for owning the new job to completion or
+    /// for surfacing the failure via `SpawnError`. There is NO revoke
+    /// surface — over-allocation (an "original" peer re-admitting after
+    /// its replacement was dispatched) is structurally tolerated, the
+    /// same precedent as at-least-once execution
+    /// (`feedback_at_least_once_execution_deliberate`). The
+    /// slurm-authoritative quantity gate in `handler::dispatch_respawn_request`
+    /// is what prevents an unbounded cascade; one stray
+    /// over-allocation is treated as ordinary fleet capacity and ages
+    /// out at run teardown. See the module-level docs on
+    /// `respawn::spawner` for the SLURM-side rationale.
     async fn spawn(&self, spec: SecondarySpawnSpec) -> Result<(), SpawnError>;
-
-    /// Best-effort revocation of a replacement previously requested via
-    /// [`Self::spawn`] for `new_secondary_id`, issued when the
-    /// replacement became redundant BEFORE it joined the membership
-    /// (the member it replaces was re-admitted — provably alive, so
-    /// the still-pending replacement is a resource squatter).
-    ///
-    /// Contract: idempotent and race-tolerant. The provider may be
-    /// called before, during, or after its own submission completes,
-    /// and the underlying allocation may already be gone — all of
-    /// those are quiet successes. `Err` is reserved for the provider
-    /// being UNABLE TO REACH its backend (e.g. gateway/ssh transport
-    /// failure), so the caller can log loudly; the spawned resource is
-    /// still reclaimed by the provider's run-teardown sweep (the SLURM
-    /// provider's `cleanup()` scancels every id on `job_ids`).
-    ///
-    /// Default: no-op. Providers whose replacements are reclaimed by
-    /// run teardown alone (e.g. the multi-process provider's
-    /// `tracked_children` Drop sweep) need no eager revocation.
-    async fn revoke(&self, new_secondary_id: &str) -> Result<(), SpawnError> {
-        tracing::debug!(
-            new_secondary_id,
-            "spawner provider has no eager revocation; the replacement \
-             is reclaimed at run teardown only",
-        );
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug)]
