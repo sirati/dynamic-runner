@@ -811,6 +811,28 @@ impl<I: Identifier> PendingPool<I> {
         }
     }
 
+    /// Predicate twin of `cluster_state.phase_boundary_open` (#584) on
+    /// the pool's `PhaseState::Done` set: returns `true` iff every
+    /// `phase_deps[phase]` entry has reached `Done`, or `phase` has no
+    /// recorded deps. The pool's `Done` set is the per-phase
+    /// counterpart of `cluster_state.phases_ended` — both are flipped
+    /// at the same site (`mark_phase_done` runs immediately after the
+    /// manager originates the `PhaseEnded` mutation, see
+    /// `process_phase_lifecycle`), so this predicate observes the same
+    /// edge the manager's gate consults. Used by `maybe_transition_drain`
+    /// to block the spurious `(0,0,0) → Drained` transition on a
+    /// barrier=False phase whose predecessor hasn't finished injecting
+    /// (#588). A phase with no recorded deps is unconditionally open
+    /// (matches `phase_boundary_open` and `activate_phases_with_all_deps_done`).
+    fn predecessors_done(&self, phase_id: &PhaseId) -> bool {
+        match self.phase_deps.get(phase_id) {
+            None => true,
+            Some(deps) => deps
+                .iter()
+                .all(|d| self.phase_state.get(d) == Some(&PhaseState::Done)),
+        }
+    }
+
     /// Inspect a phase to decide if it should transition between
     /// `Active`, `Draining`, and `Drained`. Idempotent — safe to call
     /// from anywhere a relevant counter changed.
@@ -821,6 +843,38 @@ impl<I: Identifier> PendingPool<I> {
     /// unresolved task-level prereqs (typically in another phase) and
     /// must not be considered done. `Draining` covers the case where
     /// the queue is empty but in-flight or blocked items remain.
+    ///
+    /// # Phase-boundary gate (#588)
+    ///
+    /// A phase whose predecessor phases have not yet reached `Done`
+    /// MUST NOT transition `Active → Drained` even when its counters
+    /// read `(0,0,0)`. The barrier=False pattern (`set_no_barrier_phases`)
+    /// flips dependent phases `Blocked → Active` BEFORE their
+    /// predecessors complete so streamed-injected tasks can begin
+    /// dispatching ahead of the predecessor's `PhaseEnded` — the pool
+    /// is legitimately empty BY DESIGN while the predecessor is still
+    /// producing work for it (the dep_graph + `on_phase_end` streaming
+    /// pattern). Transitioning that phase `Drained` here lets the
+    /// manager's drain-edge handler observe a `(0 completed, 0 failed)`
+    /// phase, fire `on_phase_end` against an empty ledger, and emit
+    /// `RunShouldFail` ("phase reached drain with no terminal outcome")
+    /// — the consumer's BUILD phase aborting at init within ~5s before
+    /// dep_graph injected anything. This is the structural twin of the
+    /// `phase_boundary_open` gate at the manager's `phase_can_proceed`
+    /// (#584): the manager's gate stops `PhaseEnded` origination on the
+    /// LIVE / drain path, this gate stops the spurious `Drained`
+    /// transition that would feed that path with a zero-tally phase
+    /// before its predecessor finished injecting.
+    ///
+    /// The gate is keyed on the pool's `PhaseState::Done` — the
+    /// per-phase counterpart of `cluster_state.phases_ended` set by
+    /// `mark_phase_done` AT the manager's `PhaseEnded` origination
+    /// site, so the two views are paired. Once the predecessor reaches
+    /// `Done`, the outer cascade in `process_phase_lifecycle` re-runs
+    /// `drain_empty_active_phases`, which re-invokes this and lets the
+    /// held-back phase transition `Drained` legitimately (empty-and-
+    /// deps-done is the genuine `may_be_empty` / structural-leaf case
+    /// the manager surfaces).
     pub(super) fn maybe_transition_drain(&mut self, phase_id: &PhaseId) {
         let current = match self.phase_state.get(phase_id).copied() {
             Some(s) => s,
@@ -834,8 +888,24 @@ impl<I: Identifier> PendingPool<I> {
         let in_flight = self.in_flight(phase_id);
         let blocked = self.blocked_per_phase.get(phase_id).copied().unwrap_or(0);
 
+        // #588 — phase-boundary gate. Compute the predecessor-done
+        // predicate ONCE here and consult it on every arm that would
+        // flip `Drained`: an empty phase whose predecessor hasn't
+        // reached `Done` is empty-by-design-pending-injection, NOT
+        // genuinely drained. Holding it at its current state (Active or
+        // Draining) is safe — the manager's lifecycle cascade re-runs
+        // `drain_empty_active_phases` after every `mark_phase_done`, so
+        // the held-back phase re-evaluates as soon as the predecessor
+        // edge closes. The `Active` and `Draining` arms are unaffected
+        // because they carry live work (queued / in_flight / live
+        // blocked); the gate only suppresses the spurious `Drained`
+        // edge that feeds the manager's drain-guard with a zero-tally
+        // phase before its predecessor finished injecting.
+        let predecessors_done = self.predecessors_done(phase_id);
+
         let next = match (queued, in_flight, blocked) {
-            (0, 0, 0) => PhaseState::Drained,
+            (0, 0, 0) if predecessors_done => PhaseState::Drained,
+            (0, 0, 0) => current,
             // Blocked items remain, but every one of them is DOOMED by a
             // dead prereq (final-failed anywhere, or soft-failed in THIS
             // phase — see `live_blocked_count`): they are not live work,
