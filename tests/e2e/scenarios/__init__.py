@@ -47,6 +47,9 @@ _SCENARIO_NAMES: tuple[str, ...] = (
     "stage-via-setup-tasks",
     "secondary-affine",
     "secondary-affine-withdep",
+    "narration-discovery-debt",
+    "narration-custom-message-handled",
+    "narration-custom-message-failed",
 )
 
 

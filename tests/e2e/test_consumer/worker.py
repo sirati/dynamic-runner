@@ -44,6 +44,8 @@ from dynamic_runner.worker.publish import (
 
 from .task import (
     AFFINE_BUILD_MARKER,
+    NARRATION_CUSTOM_MESSAGE_PAYLOAD,
+    NARRATION_CUSTOM_MESSAGE_TOPIC,
     build_output_filename,
     setup_output_filename,
 )
@@ -167,6 +169,28 @@ def _produce(task: Task, source_dir: Path) -> WorkerOutput:
     # so existing scenarios that use this consumer stay unchanged.
     if payload.get("keyed_outputs"):
         task.publish_string("nonce", _expected_nonce(idx))
+    # Narration-arms opt-in (#568 / #570 e2e): when the dispatch was run
+    # with ``DYNRUNNER_E2E_CUSTOM_MESSAGE_MODE`` set, discovery stamped
+    # ``narration_custom_message`` on every produce payload. Sending the
+    # probe message HERE (one per produce task) drives the primary's
+    # CustomMessagePosted narration (#568) and the
+    # CustomMessageOutcomeEvent Handled/Failed narration (#570) — the
+    # mode value on the dispatcher's task definition decides whether the
+    # handler returns cleanly (``ok``) or raises (``fail``), so the
+    # WORKER stays mode-agnostic and emits the same message either way.
+    narration_mode = payload.get("narration_custom_message", "none")
+    if narration_mode in ("ok", "fail"):
+        _logger.info(
+            "produce-%d: sending narration probe custom message "
+            "(topic=%s, mode=%s)",
+            idx,
+            NARRATION_CUSTOM_MESSAGE_TOPIC,
+            narration_mode,
+        )
+        task.send_message(
+            NARRATION_CUSTOM_MESSAGE_TOPIC,
+            NARRATION_CUSTOM_MESSAGE_PAYLOAD,
+        )
     return WorkerOutput()
 
 
