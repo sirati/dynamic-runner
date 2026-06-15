@@ -31,11 +31,31 @@ NODE_COMMON_FLAGS=(
   -v "${HOME_SHARE}:/home:rw"
 )
 
-# Remove a container if present. Silent — names are internal.
+# Remove a container if present, in a netavark-safe order. Silent —
+# names are internal.
+#
+# Sequence is stop → network disconnect → rm -f. The ordering matters
+# because `podman rm -f` on a still-attached container makes netavark
+# tear down the bridge attachment as part of removal, and if the
+# container's network namespace is in a bad state (e.g. cpuset-wedged
+# processes inside it — see #560 / #561) that teardown trips
+# setns(2)=EIO and globally wedges aardvark-dns on the host. Doing
+# the disconnect first runs the netavark teardown while podman's
+# bookkeeping is still consistent and aardvark records are cleanly
+# released; the subsequent `rm -f` then has no network teardown left
+# to do. The `stop` is a defensive front-end: it lets PID 1 reap its
+# children and exit cleanly on the common path, reducing how often
+# the bad-ns code path is reached at all.
+#
+# Every step is `|| true`-guarded so set -euo pipefail doesn't trip
+# on an already-stopped container, an already-disconnected network,
+# or a container that races to exit between `exists` and `rm`.
 remove_node_container() {
   local name="$1"
   if podman container exists "$name"; then
-    podman rm -f "$name" >/dev/null
+    podman stop -t 10 "$name" >/dev/null 2>&1 || true
+    podman network disconnect "$NETWORK" "$name" >/dev/null 2>&1 || true
+    podman rm -f "$name" >/dev/null 2>&1 || true
   fi
 }
 
