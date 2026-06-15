@@ -291,8 +291,22 @@ def dispatch(
     inherits it; ``args._boot_argv`` resolves the ``--full-log-dir`` dump
     target exactly as the secondary's bootstrap argv does (else ``stderr``).
     Best-effort by the ``_fault_dumps`` contract — it can never break dispatch.
+
+    Asymmetry for the late-joiner observer: that route repurposes SIGUSR1
+    as the Rust ``ForcePrintTrigger`` (force-print of the current cluster
+    stats on the importance channel). The fatal-signal handlers still
+    install; only the on-demand ``faulthandler.register(SIGUSR1, …)`` line
+    is skipped for the observer so its tokio
+    ``SignalKind::user_defined1()`` stream owns SIGUSR1. Frame-dump UX is
+    preserved on primary / secondary (the runtime-starvation watchdog
+    only runs there), and the operator gains ``kill -USR1`` against the
+    observer as the force-print channel.
     """
-    enable_fault_dumps(list(getattr(args, "_boot_argv", [])))
+    register_sigusr1 = not getattr(args, "observer_join_from_peer_info_dir", None)
+    enable_fault_dumps(
+        list(getattr(args, "_boot_argv", [])),
+        register_sigusr1=register_sigusr1,
+    )
     with surface_fatal_errors():
         _dispatch_route(task, args, deployment)
 

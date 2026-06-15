@@ -23,13 +23,19 @@ use std::time::{Duration, Instant};
 
 use dynrunner_core::IMPORTANT_TARGET;
 
-use super::format::render_report;
+use super::format::{render_report, render_report_full};
 use super::idle::IdleDetector;
 use super::stats::StatsSnapshot;
 use crate::observer::lost_visibility::{EndedOutage, WakeNoteSlot};
 
 /// The 10-minute periodic-stats cadence.
 pub const STATS_INTERVAL: Duration = Duration::from_secs(600);
+/// The 1-hour safety-net cadence in units of [`STATS_INTERVAL`]: every
+/// 6th 10-minute grid tick since the last emission bypasses the
+/// skip-eligible predicate (so a routine-throughput-only run is still
+/// reported at least once an hour, with the accumulated delta against
+/// the LAST-PRINTED snapshot — the safety net's whole point).
+pub const SAFETY_NET_TICKS: u8 = 6;
 /// The idle-secondary poll cadence and the idle threshold are both one
 /// minute: a secondary idle across a full poll interval (with ready
 /// work) has been idle for ≥ the threshold.
@@ -119,11 +125,23 @@ impl Clock for TokioClock {
 }
 
 /// Reporter state across ticks: the last ANNOUNCED snapshot (the delta
-/// baseline, advanced only when a report actually emits) and the idle
-/// detector. Construct once before driving the cadences.
+/// baseline, advanced only when a report actually emits), the idle
+/// detector, and the 1-hour safety-net counter. Construct once before
+/// driving the cadences.
 pub struct Reporter {
     last_announced: StatsSnapshot,
     idle: IdleDetector,
+    /// Grid ticks consumed since the last actual emission. Increments on
+    /// every grid tick the reporter processes (whether it emits or
+    /// skips); resets to 0 on any emission. When `>= SAFETY_NET_TICKS - 1`
+    /// at the START of a tick, this tick is the 1-hour safety net and
+    /// bypasses the skip-eligible predicate so the accumulated delta of
+    /// any skipped throughput ticks is reported. The 1-hour grid is
+    /// measured from the LAST-PRINTED announcement (invariant 3): the
+    /// safety net fires "at least once per 6 ticks of silence", not on a
+    /// wall clock — so it tracks exactly the operator-visible quiet
+    /// window.
+    ticks_since_print: u8,
 }
 
 impl Default for Reporter {
@@ -137,7 +155,51 @@ impl Reporter {
         Self {
             last_announced: StatsSnapshot::default(),
             idle: IdleDetector::new(IDLE_THRESHOLD),
+            ticks_since_print: 0,
         }
+    }
+
+    /// Process one STATS tick with the 10-min skip predicate + the
+    /// 1-hour safety net (the production cadence arm). On a tick whose
+    /// diff against the last announcement is a subset of the
+    /// skip-eligible counter set AND the safety net is not due, this
+    /// returns `false` WITHOUT emitting and WITHOUT advancing the
+    /// last-announced baseline — so the next 10-min tick still diffs
+    /// against the same baseline and the skipped delta accumulates
+    /// (invariant 1: skipped ticks never advance last_printed;
+    /// invariant 3: the eventual 1-hour print's delta is against the
+    /// last actually-printed snapshot).
+    ///
+    /// When the safety net IS due (`ticks_since_print + 1 >=
+    /// SAFETY_NET_TICKS`) the predicate is bypassed and this delegates
+    /// to [`on_stats_tick`] regardless of which fields moved. A safety
+    /// net tick with diff = ∅ still elides (owner-approved: the
+    /// emission is silent when there is literally nothing wake-worthy
+    /// to say; the operator can use SIGUSR1 for a heartbeat read).
+    ///
+    /// Returns whether a report was emitted — same contract as the
+    /// unskipping `on_stats_tick`.
+    pub fn on_stats_tick_skippable(&mut self, snapshot: &StatsSnapshot) -> bool {
+        let safety_net_due = self.ticks_since_print + 1 >= SAFETY_NET_TICKS;
+        if !safety_net_due && snapshot.diff_subset_of_skip_eligible(&self.last_announced) {
+            // Routine throughput-only change AND the 1-hour boundary is
+            // not yet due: elide. The counter advances because the grid
+            // tick was still consumed; the next tick is one step closer
+            // to the safety net.
+            self.ticks_since_print = self.ticks_since_print.saturating_add(1);
+            return false;
+        }
+        // Either the diff includes a non-throughput field, or the
+        // safety-net boundary is due: run the normal delta-emit path.
+        // `on_stats_tick` resets `ticks_since_print` on a genuine
+        // emission; an all-omitted hour boundary advances the counter
+        // like any other skip (so subsequent ticks keep treating the
+        // run as "overdue for a print" until something emits).
+        let emitted = self.on_stats_tick(snapshot);
+        if !emitted {
+            self.ticks_since_print = self.ticks_since_print.saturating_add(1);
+        }
+        emitted
     }
 
     /// Process one STATS tick: render against the last-announced
@@ -154,10 +216,32 @@ impl Reporter {
             // `--important-stdio-only` (C1's filter keys on the target).
             tracing::info!(target: IMPORTANT_TARGET, "periodic cluster stats (10m):\n{report}");
             self.last_announced = snapshot.clone();
+            self.ticks_since_print = 0;
             true
         } else {
             false
         }
+    }
+
+    /// Process an operator-driven FORCE-PRINT (SIGUSR1 against the
+    /// observer). Always emits the full snapshot (every field, including
+    /// unchanged and zero values — invariant 4) on the importance
+    /// channel, advances the last-announced baseline, and resets the
+    /// 1-hour safety-net counter. After this the next 10-min tick diffs
+    /// against the post-signal snapshot (invariant 5).
+    ///
+    /// Returns `true` unconditionally — the force-print is the
+    /// operator's explicit "show me everything", so the caller flushes
+    /// the wake-note slot exactly as it would for a periodic emission.
+    pub fn on_force_print(&mut self, snapshot: &StatsSnapshot) -> bool {
+        let report = render_report_full(snapshot);
+        tracing::info!(
+            target: IMPORTANT_TARGET,
+            "cluster stats (force-print):\n{report}"
+        );
+        self.last_announced = snapshot.clone();
+        self.ticks_since_print = 0;
+        true
     }
 
     /// Process one IDLE tick: fold the snapshot into the gates and emit
@@ -284,6 +368,7 @@ pub async fn run_reporter<S, C, F>(
     source: S,
     clock: C,
     outage_rx: tokio::sync::mpsc::UnboundedReceiver<EndedOutage>,
+    force_print_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     note: WakeNoteSlot,
     cancel: F,
 ) where
@@ -304,17 +389,23 @@ pub async fn run_reporter<S, C, F>(
     let _ = stats_interval.tick().await; // consume the immediate tick
     let _ = idle_interval.tick().await; // consume the immediate tick
 
-    // Once the sender side drops (the run loop is tearing down; cancel is
-    // imminent) the arm parks instead of hot-looping on `None`.
+    // Once a sender side drops (the run loop is tearing down; cancel is
+    // imminent) the arm parks instead of hot-looping on `None`. The
+    // force-print receiver follows the same idiom as the outage
+    // receiver — closed channel ⇒ parked arm.
     let mut outage_rx = Some(outage_rx);
+    let mut force_print_rx = Some(force_print_rx);
 
     tokio::pin!(cancel);
     loop {
         tokio::select! {
             _ = stats_interval.tick() => {
                 if grid_gate.grid_tick(clock.now()) {
+                    // Routine periodic arm: the skippable path applies
+                    // the 10-min skip-eligible predicate AND the 1-hour
+                    // safety net (see `Reporter::on_stats_tick_skippable`).
                     let snapshot = source.snapshot();
-                    if reporter.on_stats_tick(&snapshot) {
+                    if reporter.on_stats_tick_skippable(&snapshot) {
                         note.flush_after_host();
                     }
                 }
@@ -328,14 +419,31 @@ pub async fn run_reporter<S, C, F>(
             ended = recv_outage(&mut outage_rx) => {
                 if grid_gate.late_run_due(ended.down_since) {
                     // Rule 3: ≥1 grid occurrence elapsed while down — run
-                    // ONE stats log immediately. It follows the normal
-                    // delta rule; on a genuine emission it hosts the
-                    // reconnection note and arms the skip-one check.
+                    // ONE stats log immediately. The late-emit follows
+                    // the un-skippable delta rule: an outage just ended
+                    // and the operator must see the state, even when
+                    // the only changes are routine throughput (the
+                    // skip-eligible predicate is for ROUTINE 10-min
+                    // ticks, not for one-off recovery emissions).
                     let snapshot = source.snapshot();
                     if reporter.on_stats_tick(&snapshot) {
                         note.flush_after_host();
                         grid_gate.record_late_emit(clock.now());
                     }
+                }
+            }
+            forced = recv_force_print(&mut force_print_rx) => {
+                let () = forced;
+                // SIGUSR1 force-print: the operator explicitly asked
+                // for a current status, so render the FULL snapshot
+                // (every field, including unchanged + zero — see
+                // `render_report_full`), advance the last-announced
+                // baseline, and reset the 1-hour safety counter
+                // (handled inside `on_force_print`). The wake-note
+                // rides this emission like any other periodic event.
+                let snapshot = source.snapshot();
+                if reporter.on_force_print(&snapshot) {
+                    note.flush_after_host();
                 }
             }
             _ = &mut cancel => {
@@ -358,6 +466,25 @@ async fn recv_outage(
     match rx {
         Some(r) => match r.recv().await {
             Some(ended) => ended,
+            None => {
+                rx.take();
+                std::future::pending().await
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Await the next SIGUSR1 force-print delivery from the optional
+/// receiver; mirrors [`recv_outage`]'s closed-channel-parks idiom so the
+/// select arm never hot-loops on `None`. Cancel-safe
+/// (`UnboundedReceiver::recv` is).
+async fn recv_force_print(
+    rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+) -> () {
+    match rx {
+        Some(r) => match r.recv().await {
+            Some(()) => (),
             None => {
                 rx.take();
                 std::future::pending().await

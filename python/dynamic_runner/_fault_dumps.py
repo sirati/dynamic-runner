@@ -142,6 +142,7 @@ def enable_fault_dumps(
     argv: list[str] | None = None,
     *,
     dump_path: str | Path | None = None,
+    register_sigusr1: bool = True,
 ) -> None:
     """Install ``faulthandler`` for this process. Call once, at bootstrap.
 
@@ -166,6 +167,19 @@ def enable_fault_dumps(
     if ``faulthandler`` cannot be wired (e.g. a redirected ``sys.stderr``
     with no real fd, or the platform lacks ``SIGUSR1``), the exception is
     swallowed so cold start is never blocked.
+
+    ``register_sigusr1`` (keyword-only, default ``True``) gates ONLY the
+    ``faulthandler.register(SIGUSR1, …)`` line. The late-joiner observer
+    dispatch route passes ``False`` so SIGUSR1 stays free for the Rust
+    ``ForcePrintTrigger`` (which arms a tokio
+    ``SignalKind::user_defined1()`` stream for the operator's
+    "force-print the current cluster stats" channel — see
+    ``dynrunner_manager_distributed::force_print_trigger``). The fatal
+    signal handlers are installed unconditionally — only the on-demand
+    SIGUSR1 registration is asymmetric. The runtime-starvation watchdog
+    that raises SIGUSR1 from inside the framework runs only on
+    primary/secondary processes, so an observer with SIGUSR1
+    repurposed never receives an internal frame-dump signal.
     """
     raw = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -178,9 +192,12 @@ def enable_fault_dumps(
         # On-demand all-thread dump. ``SIGUSR1`` is not used by CPython
         # internally; the wrapper/operator and the runtime watchdog both
         # deliver it. Guard on platform support (Windows lacks SIGUSR1).
-        sigusr1 = getattr(signal, "SIGUSR1", None)
-        if sigusr1 is not None:
-            faulthandler.register(sigusr1, file=target, all_threads=True, chain=False)
+        # Skipped when ``register_sigusr1=False`` (observer mode: the
+        # Rust force-print trigger owns SIGUSR1 there).
+        if register_sigusr1:
+            sigusr1 = getattr(signal, "SIGUSR1", None)
+            if sigusr1 is not None:
+                faulthandler.register(sigusr1, file=target, all_threads=True, chain=False)
     except (OSError, RuntimeError, ValueError):
         # Diagnostics wiring must never break the secondary's cold start.
         pass
