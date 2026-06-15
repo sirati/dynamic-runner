@@ -763,6 +763,21 @@ where
             .collect();
         let mesh_degraded = self.mesh.degraded;
         let secondary_id = self.config.secondary_id.clone();
+        // Replicated run-terminal verdict snapshot (#563). When the cluster's
+        // CRDT already names the run terminal — `RunAborted` (the failure
+        // twin, broadcast by every `broadcast_terminal_verdict` originator) or
+        // `RunComplete` (the clean-end latch) — there is no run left to elect
+        // a primary for. The election was the mid-run failover mechanism: a
+        // primary that DELIBERATELY ends the run authored the verdict before
+        // tearing down its mesh, and a stale election fired off the link drop
+        // is at best wasted work (a promoted successor would re-decide the
+        // same verdict at finalize) and at worst the cascade observed in
+        // #563: a new primary's `bootstrap_tail_dispatch` racing the latch
+        // adoption and re-dispatching already-aborted work. Snapshotted here
+        // as a `&self` read alongside `mesh_degraded` / `current_primary_id`,
+        // before the `&mut op` borrow below.
+        let run_terminal_latched =
+            self.cluster_state.run_aborted().is_some() || self.cluster_state.run_complete();
 
         // Honest liveness — by SOURCE, not by a bare receive-staleness
         // clock. The decision to suspect the primary and start a failover
@@ -888,7 +903,32 @@ where
         // the spurious failover; a genuine death (beacon also silent) arms it.
         let mesh_says_dead =
             link_dead || primary_silence_exceeded || primary_left_membership_after_seen;
-        let need_election = mesh_says_dead && !primary_beacon_fresh;
+        // Run-terminal latch suppresses election arming (#563 Seam 1): the
+        // cluster's replicated verdict — `RunAborted` (the deliberate failure
+        // twin every `broadcast_terminal_verdict` originator latches before
+        // tearing down) or `RunComplete` (the clean-end latch) — is the
+        // authority's own "the run is over" signal. A mesh-death observed
+        // AFTER the latch is the dying primary's tear-down, not a primary the
+        // cluster needs replaced; the existing `process_tasks` loop-tail
+        // `cluster_state.run_aborted()` exit (process_tasks.rs:978) tears this
+        // secondary down on the same tick, and the terminal counts ride the
+        // verdict for finalize. Without this gate the election fires on the
+        // primary's exit-window link drop and a peer's
+        // `bootstrap_tail_dispatch` re-dispatches already-finalized work
+        // (#563 Bug B2 covers the post-promotion catch via the bootstrap-
+        // tail gate; this gate is the pre-election prevention).
+        if mesh_says_dead && run_terminal_latched {
+            tracing::debug!(
+                secondary = %secondary_id,
+                link_dead,
+                primary_silence_exceeded,
+                primary_left_membership = primary_left_membership_after_seen,
+                "election arming suppressed: replicated run-terminal verdict \
+                 latched (RunAborted or RunComplete); the run is over and the \
+                 mesh-death is the dying primary's tear-down"
+            );
+        }
+        let need_election = mesh_says_dead && !primary_beacon_fresh && !run_terminal_latched;
 
         // Bind the mutable election state with a PARTIAL borrow — only
         // `self.lifecycle` (operational regime) OR `self.setup_election` (the

@@ -651,6 +651,26 @@ impl RunNarrator {
         // iteration. While not operational, formation churn is absorbed into
         // the tracked baseline below but never emitted.
         let operational = !self.started_phases.is_empty();
+        // Run-terminal latch suppresses failover / membership narration
+        // (#563 Seam 3). The replicated terminal verdict — `RunAborted` (the
+        // deliberate failure twin every `broadcast_terminal_verdict`
+        // originator latches) or `RunComplete` (the clean-end latch) — means
+        // the run is over from the cluster's authoritative POV: a
+        // primary-changed line, a primary-lost line, or a peer-left line
+        // observed alongside (or after) the terminal latch is teardown
+        // churn, not a wake-worthy mid-run transition. The completion block
+        // in `observe` (the one-shot run-aborted / run-complete summary)
+        // owns the operator's terminal-state line; suppressing the
+        // failover-shaped lines here keeps that authoritative narration
+        // from being upstaged by a misleading "primary failed over to X"
+        // alarm. The baselines (`live_remote_secondaries`, `last_primary`)
+        // continue to advance UNCONDITIONALLY below so a fresh narrator
+        // started against a future un-aborted run still emits correctly;
+        // suppression is per-call on the emit predicates only, never
+        // retroactive. An UNRESOLVED in-flight failover (latch not yet
+        // observed) still narrates normally — this gate is reached only
+        // once the latch has converged on THIS observer.
+        let terminal = state.run_aborted().is_some() || state.run_complete();
 
         // PEER-LOST: a remote secondary that was live and is now absent from
         // the live set departed. A secondary that became the primary is NOT a
@@ -660,7 +680,10 @@ impl RunNarrator {
         // flicker.
         let live_count = live_remote.len();
         for departed in self.live_remote_secondaries.difference(&live_remote) {
-            if operational && Some(departed.as_str()) != current_primary.as_deref() {
+            if operational
+                && !terminal
+                && Some(departed.as_str()) != current_primary.as_deref()
+            {
                 tracing::warn!(
                     target: IMPORTANT_TARGET,
                     secondary = %departed,
@@ -674,7 +697,7 @@ impl RunNarrator {
         // joined AFTER the run was operational (a never-before-seen id — the
         // sticky-Dead ledger means a departed id cannot reappear).
         for joined in live_remote.difference(&self.live_remote_secondaries) {
-            if operational {
+            if operational && !terminal {
                 tracing::info!(
                     target: IMPORTANT_TARGET,
                     secondary = %joined,
@@ -695,6 +718,7 @@ impl RunNarrator {
         // edge-set advances only on a real emit, so a loss that began while
         // gated still narrates once work starts if still unresolved.
         if operational
+            && !terminal
             && let Some(primary) = current_primary.as_deref()
             && !state.is_peer_alive(primary)
             && self.primary_lost_emitted.insert(primary.to_owned())
@@ -716,7 +740,7 @@ impl RunNarrator {
         // same id (different epoch) still narrates.
         let current = current_primary.map(|id| (id, state.primary_epoch()));
         if current.is_some() && current != self.last_primary {
-            if operational && let Some((id, epoch)) = current.as_ref() {
+            if operational && !terminal && let Some((id, epoch)) = current.as_ref() {
                 tracing::warn!(
                     target: IMPORTANT_TARGET,
                     primary = %id,
@@ -2353,6 +2377,245 @@ mod tests {
         assert!(
             start_idx < notes[0] && notes[0] < done_idx,
             "the note rides together with the hosting iteration: {events:?}"
+        );
+    }
+
+    // ── #563 Seam 3 — failover-narration suppression under the run-terminal latch ──
+    //
+    // Production trace (asm-tokenizer 2026-06-15): the observer saw a
+    // "primary failed over to secondary-1 (epoch 2)" WARN line and NO "run
+    // aborted — shutting down" ERROR line, because the dying primary's
+    // RunAborted broadcast was lost on the observer's leg (the existing
+    // `await_terminal_observer_delivery` 60s re-broadcast hold is observer-
+    // leg-only and cannot retroactively cover a never-formed leg). When the
+    // verdict DID converge — via snapshot pull / anti-entropy — the
+    // narrator's emit ordering puts `narrate_failover` BEFORE the
+    // run_aborted completion block, so the operator's eye lands on the
+    // failover narrative even when the run-aborted line ALSO fires the
+    // same iteration. Seam 3 gates the FAILOVER / MEMBERSHIP narration on
+    // `run_aborted().is_some() || run_complete()`: under a terminal latch
+    // all churn is teardown noise; the completion block is the single
+    // owner of the operator's terminal-state line.
+
+    /// SEAM 3 — when a `PrimaryChanged` and a `RunAborted` are both
+    /// observed in the same window (the asm-tokenizer 2026-06-15 race), the
+    /// "primary failed over" WARN is SUPPRESSED and the "run aborted —
+    /// shutting down" ERROR fires with the verbatim reason. Pinned here so
+    /// the operator's authoritative terminal-state line is not upstaged by
+    /// the now-noise failover label.
+    #[test]
+    fn primary_failed_over_suppressed_under_run_aborted_latch() {
+        const ABORT_REASON: &str = "runtime spawn_tasks rejected 46497 task(s): \
+                                    [duplicate task identity dependency_graph, ...]";
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            set_primary(&mut state, "p1", 1);
+            join_secondary(&mut state, "p1");
+            join_secondary(&mut state, "p2");
+
+            let mut narrator = RunNarrator::new();
+            // Seed at p1 silently.
+            narrator.observe(&state);
+            // The failover + the terminal verdict converge in the same observe
+            // window — the production race the user's transcript captured.
+            remove_peer(&mut state, "p1");
+            set_primary(&mut state, "p2", 2);
+            state.apply(ClusterMutation::RunAborted {
+                reason: ABORT_REASON.into(),
+                counts: Default::default(),
+            });
+            narrator.observe(&state);
+            // Subsequent observes must stay quiet on the failover seam (the
+            // baseline advanced; the gate stays terminal-suppressed).
+            narrator.observe(&state);
+        });
+
+        assert!(
+            events.iter().all(|e| !e.message.contains("failed over to")),
+            "the failover narration must be SUPPRESSED under a latched RunAborted; \
+             got events: {events:?}",
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| !e.message.contains("failover in progress")),
+            "the primary-lost narration must also be SUPPRESSED under the latch; \
+             got events: {events:?}",
+        );
+        let aborted: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("run aborted"))
+            .collect();
+        assert_eq!(
+            aborted.len(),
+            1,
+            "exactly one 'run aborted — shutting down' line carries the operator's \
+             terminal state: {events:?}",
+        );
+        assert_eq!(
+            aborted[0].fields.get("reason").map(String::as_str),
+            Some(ABORT_REASON),
+            "the run-aborted line must carry the dying primary's VERBATIM reason \
+             (the rejection-id list the user expects to see)",
+        );
+    }
+
+    /// SEAM 3 — symmetric clean-finish: a `RunComplete` latch ALSO
+    /// suppresses the failover narration. The previously-flagged BUG-B
+    /// shape (a clean-end leg drop racing the completion broadcast) must
+    /// not narrate as a benign-looking failover.
+    #[test]
+    fn primary_failed_over_suppressed_under_run_complete_latch() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            set_primary(&mut state, "p1", 1);
+            join_secondary(&mut state, "p1");
+            join_secondary(&mut state, "p2");
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state);
+            remove_peer(&mut state, "p1");
+            set_primary(&mut state, "p2", 2);
+            state.apply(ClusterMutation::RunComplete {
+                counts: Default::default(),
+            });
+            narrator.observe(&state);
+        });
+
+        assert!(
+            events.iter().all(|e| !e.message.contains("failed over to")),
+            "the failover narration must be SUPPRESSED under a latched RunComplete; \
+             got events: {events:?}",
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.message.contains("run complete"))
+                .count(),
+            1,
+            "exactly one 'run complete' line is the operator's terminal-state line: \
+             {events:?}",
+        );
+    }
+
+    /// SEAM 3 — secondary-membership churn (peer-left / peer-rejoined)
+    /// is ALSO suppressed under the terminal latch. A teardown phase's
+    /// membership flicker (peers dropping out as the cluster winds down)
+    /// is not a wake-worthy operator event under an authored terminal.
+    #[test]
+    fn membership_churn_suppressed_under_run_terminal_latch() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            set_primary(&mut state, "p1", 1);
+            join_secondary(&mut state, "p1");
+            join_secondary(&mut state, "p2");
+            join_secondary(&mut state, "p3");
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state); // seed
+            // Terminal latch lands first.
+            state.apply(ClusterMutation::RunAborted {
+                reason: "deliberate".into(),
+                counts: Default::default(),
+            });
+            // Now a peer departs as part of teardown — should NOT narrate.
+            remove_peer(&mut state, "p2");
+            narrator.observe(&state);
+        });
+
+        assert!(
+            events
+                .iter()
+                .all(|e| !e.message.contains("secondary left the cluster")),
+            "peer-departure narration is teardown noise under the latch: {events:?}",
+        );
+    }
+
+    /// SEAM 3 NEGATIVE REGRESSION — a mid-run failover with NO terminal
+    /// latch still narrates exactly as before. Pinned here so a future
+    /// refactor that misplaced the `terminal` factor (e.g. inverted, or
+    /// applied unconditionally) is caught locally to the narrator file.
+    /// Mirrors the existing `primary_changed_on_failover_once` test —
+    /// kept here so the suppression's negative twin is grouped with its
+    /// positive cases.
+    #[test]
+    fn no_latch_still_narrates_failover_regression() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            set_primary(&mut state, "p1", 1);
+            join_secondary(&mut state, "p1");
+            join_secondary(&mut state, "p2");
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state); // seed at p1 silently
+            remove_peer(&mut state, "p1");
+            set_primary(&mut state, "p2", 2);
+            // NO RunAborted / RunComplete applied — pure mid-run failover.
+            narrator.observe(&state);
+        });
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.message.contains("failed over to"))
+                .count(),
+            1,
+            "without a terminal latch, mid-run failover must still narrate (no \
+             regression on the BUG-H shape): {events:?}",
+        );
+    }
+
+    /// SEAM 3 — UNRESOLVED failover (latch not yet observed) still
+    /// narrates the primary-lost line; the terminal-suppression is
+    /// strictly per-call. This is the "primary left the mesh — failover
+    /// in progress" path: observed BEFORE the verdict converges, narrated
+    /// as normal; once the verdict converges, subsequent observes do not
+    /// re-emit (the once-per-id edge-set advances on the real emit). No
+    /// prior emit is rewound — the gate is per-call only.
+    #[test]
+    fn unresolved_failover_pre_latch_still_narrates_then_suppresses() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            set_primary(&mut state, "p1", 1);
+            join_secondary(&mut state, "p1");
+            join_secondary(&mut state, "p2");
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state); // seed at p1
+            // p1 leaves; NO terminal latch yet — primary-lost must narrate.
+            remove_peer(&mut state, "p1");
+            narrator.observe(&state);
+            // Verdict converges later; the membership-departure has ALREADY
+            // narrated. The terminal-suppression gate does NOT rewind it.
+            state.apply(ClusterMutation::RunAborted {
+                reason: "late convergence".into(),
+                counts: Default::default(),
+            });
+            narrator.observe(&state);
+        });
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.message.contains("failover in progress"))
+                .count(),
+            1,
+            "the in-flight failover narrated before the verdict converged (per-call \
+             suppression, not retroactive): {events:?}",
+        );
+        // The completion block also fires once.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.message.contains("run aborted"))
+                .count(),
+            1,
+            "the terminal verdict narrates once when it lands: {events:?}",
         );
     }
 }
