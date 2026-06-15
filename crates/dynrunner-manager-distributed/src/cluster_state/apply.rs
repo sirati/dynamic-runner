@@ -979,9 +979,11 @@ impl<I: Identifier> ClusterState<I> {
             ClusterMutation::CustomMessageHandled { origin, seq } => {
                 self.apply_custom_message_handled(origin, seq)
             }
-            ClusterMutation::CustomMessageFailed { origin, seq } => {
-                self.apply_custom_message_failed(origin, seq)
-            }
+            ClusterMutation::CustomMessageFailed {
+                origin,
+                seq,
+                reason,
+            } => self.apply_custom_message_failed(origin, seq, reason),
         }
     }
 

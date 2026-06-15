@@ -922,20 +922,64 @@ fn roundtrip_custom_message_handled() {
     }
 }
 
-/// F5 `CustomMessageFailed` round-trips with its `(origin, seq)` key
-/// (the terminal twin of `CustomMessageHandled` — a handler raise).
+/// F5 `CustomMessageFailed` round-trips with its `(origin, seq, reason)`
+/// triple (the terminal twin of `CustomMessageHandled` — a handler raise).
+/// The `reason` field (#570 — narration-only plumbing for the
+/// CustomMessageOutcomeEvent, never CRDT state) survives the wire
+/// verbatim when non-empty.
 #[test]
 fn roundtrip_custom_message_failed() {
     let mutation: ClusterMutation<TestId> = ClusterMutation::CustomMessageFailed {
         origin: "sec-1".into(),
         seq: 11,
+        reason: "handler raised: bad config".into(),
     };
     let json = serde_json::to_string(&mutation).unwrap();
     let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
     match decoded {
-        ClusterMutation::CustomMessageFailed { origin, seq } => {
+        ClusterMutation::CustomMessageFailed {
+            origin,
+            seq,
+            reason,
+        } => {
             assert_eq!(origin, "sec-1");
             assert_eq!(seq, 11);
+            assert_eq!(reason, "handler raised: bad config");
+        }
+        _ => panic!("expected CustomMessageFailed"),
+    }
+}
+
+/// F5 `CustomMessageFailed` with an empty `reason` is wire-LEGACY-shaped
+/// — `#[serde(default, skip_serializing_if = "String::is_empty")]` drops
+/// the field on encode and defaults it on decode — so a legacy sender's
+/// reason-less frame still decodes (back-compat), and a current sender
+/// with no reason emits the same legacy bytes (forward-compat).
+#[test]
+fn roundtrip_custom_message_failed_empty_reason_is_legacy_shape() {
+    // Current sender's empty-reason encoding drops the field.
+    let mutation: ClusterMutation<TestId> = ClusterMutation::CustomMessageFailed {
+        origin: "sec-1".into(),
+        seq: 11,
+        reason: String::new(),
+    };
+    let json = serde_json::to_string(&mutation).unwrap();
+    assert_eq!(
+        json, r#"{"CustomMessageFailed":{"origin":"sec-1","seq":11}}"#,
+        "an empty reason is dropped on encode (skip_serializing_if)"
+    );
+    // Legacy sender's reason-less frame decodes to empty reason
+    // (#[serde(default)]).
+    let legacy = r#"{"CustomMessageFailed":{"origin":"sec-1","seq":11}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(legacy).unwrap();
+    match decoded {
+        ClusterMutation::CustomMessageFailed {
+            origin,
+            seq,
+            reason,
+        } => {
+            assert_eq!((origin.as_str(), seq), ("sec-1", 11));
+            assert_eq!(reason, "", "legacy reason-less frame decodes to empty");
         }
         _ => panic!("expected CustomMessageFailed"),
     }
@@ -969,11 +1013,33 @@ fn custom_message_mutations_decode_literal_sender_bytes() {
         }
         _ => panic!("expected CustomMessageHandled"),
     }
+    // Legacy reason-less bytes (the pre-#570 wire shape) still decode —
+    // the `#[serde(default)]` defaults the reason to empty.
     let failed = r#"{"CustomMessageFailed":{"origin":"sec-1","seq":3}}"#;
     let decoded: ClusterMutation<TestId> = serde_json::from_str(failed).unwrap();
     match decoded {
-        ClusterMutation::CustomMessageFailed { origin, seq } => {
+        ClusterMutation::CustomMessageFailed {
+            origin,
+            seq,
+            reason,
+        } => {
             assert_eq!((origin.as_str(), seq), ("sec-1", 3));
+            assert_eq!(reason, "", "legacy reason-less frame decodes to empty");
+        }
+        _ => panic!("expected CustomMessageFailed"),
+    }
+    // Current-shape bytes with a populated reason decode verbatim — the
+    // narration-only plumbing surface for the #570 event channel.
+    let failed_with_reason =
+        r#"{"CustomMessageFailed":{"origin":"sec-1","seq":4,"reason":"boom"}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(failed_with_reason).unwrap();
+    match decoded {
+        ClusterMutation::CustomMessageFailed {
+            origin,
+            seq,
+            reason,
+        } => {
+            assert_eq!((origin.as_str(), seq, reason.as_str()), ("sec-1", 4, "boom"));
         }
         _ => panic!("expected CustomMessageFailed"),
     }
