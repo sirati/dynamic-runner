@@ -348,10 +348,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     // terminal-without-effect direction of the
                     // atomicity contract is satisfied by construction
                     // (there IS no effect).
+                    //
+                    // The handler's raise `reason` rides the mutation
+                    // verbatim (the same string this site already
+                    // structured-logs above) — narration-only plumbing
+                    // for the #570 `CustomMessageOutcomeEvent` the
+                    // apply rule emits; never enters the CRDT lattice.
                     self.apply_and_broadcast_cluster_mutations(vec![
                         ClusterMutation::CustomMessageFailed {
                             origin: origin.clone(),
                             seq,
+                            reason,
                         },
                     ])
                     .await;

@@ -27,6 +27,7 @@ pub mod secondary;
 pub mod setup_exec;
 pub mod state;
 pub mod upload_action;
+pub mod custom_message_outcome;
 pub mod task_completed;
 pub mod task_state_change;
 pub mod worker_messages;

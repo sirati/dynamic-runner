@@ -18,6 +18,7 @@ use super::ClusterState;
 use crate::fulfillability_matcher::MatcherTriggerEvent;
 use crate::peer_lifecycle::PeerLifecycleEvent;
 use crate::task_completed::TaskCompletedEvent;
+use crate::custom_message_outcome::CustomMessageOutcomeEvent;
 use crate::task_state_change::TaskStateChangeEvent;
 use crate::worker_signal::WorkerMgmtSignal;
 
@@ -224,5 +225,49 @@ impl<I: Identifier> ClusterState<I> {
         tx: tokio::sync::mpsc::UnboundedSender<TaskStateChangeEvent>,
     ) {
         self.task_state_change_tx = Some(tx);
+    }
+
+    /// Enqueue a [`CustomMessageOutcomeEvent`] onto the #570
+    /// custom-message outcome-narration channel.
+    ///
+    /// Same best-effort / non-blocking / non-panicking contract as
+    /// [`Self::emit_task_state_change_event`]: a missing or closed
+    /// receiver is a silent drop. ONLY the observer installs this
+    /// sender (it is the operator-facing narrator); on every other role
+    /// the emit is a silent no-op, so the F5 apply rule builds the
+    /// event unconditionally but pays nothing when nobody narrates.
+    ///
+    /// Called from
+    /// [`Self::apply_custom_message_handled`]
+    /// /
+    /// [`Self::apply_custom_message_failed`]
+    /// on `Applied` (the winning terminal latch) — BEFORE the per-origin
+    /// watermark compactor erases the Handled/Failed label
+    /// (`compact_custom_watermark` in `apply_custom.rs`), so the event
+    /// carries the label even though the post-compaction state cannot.
+    ///
+    /// CCD-9 invariant: this method must never invoke a consumer
+    /// directly. Consumption happens off the apply path on the
+    /// observer's run loop; the channel is the only synchronization
+    /// crossing.
+    pub(crate) fn emit_custom_message_outcome_event(&self, event: CustomMessageOutcomeEvent) {
+        if let Some(tx) = &self.custom_message_outcome_tx {
+            // `send` on `UnboundedSender` only fails when the receiver
+            // is dropped; silent drop matches the best-effort contract
+            // above.
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Attach the #570 outcome-narration channel's sender end so
+    /// subsequent `emit_custom_message_outcome_event` calls route events
+    /// to the observer's run-loop narrator. Only the observer calls
+    /// this. Same re-installation semantics as
+    /// [`Self::install_lifecycle_sender`].
+    pub fn install_custom_message_outcome_sender(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<CustomMessageOutcomeEvent>,
+    ) {
+        self.custom_message_outcome_tx = Some(tx);
     }
 }

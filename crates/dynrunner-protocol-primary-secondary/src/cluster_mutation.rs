@@ -1078,8 +1078,23 @@ pub enum ClusterMutation<I> {
     /// the late `Posted` NoOps. Each Applied advances the per-origin
     /// terminal watermark exactly as `Handled` does (both terminals are
     /// payload-dropping tombstones the GC compacts).
+    ///
+    /// `reason` carries the handler's raise message verbatim — the SAME
+    /// string the originating primary already structured-logs at
+    /// [`primary/custom_message.rs`]. It is NARRATION-ONLY plumbing for
+    /// the #570 `CustomMessageOutcomeEvent` (consumed at the apply site,
+    /// before the per-origin watermark compactor erases the
+    /// Handled/Failed label); it never enters the CRDT lattice (the
+    /// apply rule still only inserts a label-less `Failed` tombstone
+    /// that the compactor then sweeps, exactly as it did before this
+    /// field existed) and is dropped on every replica the instant the
+    /// event is emitted. `#[serde(default)]` so a legacy sender's
+    /// reason-less frame decodes to the empty string (the same default
+    /// the apply rule sees when this carriage is unused).
     CustomMessageFailed {
         origin: String,
         seq: u64,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
     },
 }

@@ -21,6 +21,7 @@ mod apply_basics;
 mod blocked_by_index;
 mod cascade_and_reinject;
 mod convergence;
+mod custom_message_outcome;
 mod custom_messages;
 mod digest;
 mod discovery_debt;

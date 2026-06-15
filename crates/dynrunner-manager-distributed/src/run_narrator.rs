@@ -2979,6 +2979,12 @@ mod tests {
             state.apply(ClusterMutation::CustomMessageFailed {
                 origin: "n2".to_string(),
                 seq: 1,
+                // Pre-#570 the wire mutation had no reason; today the
+                // state-derived narrator still ignores it (the silence
+                // pin is reason-independent — the watermark compactor
+                // erases the label either way), so an empty reason is
+                // the cleanest re-statement of the same pin.
+                reason: String::new(),
             });
             narrator.observe(&state);
         });

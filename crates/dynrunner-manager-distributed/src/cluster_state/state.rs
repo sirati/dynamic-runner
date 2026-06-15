@@ -17,6 +17,7 @@ use dynrunner_protocol_primary_secondary::{DiscoveryDebt, RoleTable, SecondaryCa
 use crate::fulfillability_matcher::MatcherTriggerEvent;
 use crate::peer_lifecycle::PeerLifecycleEvent;
 use crate::task_completed::TaskCompletedEvent;
+use crate::custom_message_outcome::CustomMessageOutcomeEvent;
 use crate::task_state_change::TaskStateChangeEvent;
 use crate::worker_signal::WorkerMgmtSignal;
 
@@ -271,6 +272,21 @@ pub struct ClusterState<I> {
     /// snapshot, and restore — same CCD-9 rationale as `task_completed_tx`.
     pub(super) task_state_change_tx:
         Option<tokio::sync::mpsc::UnboundedSender<TaskStateChangeEvent>>,
+    /// Sender for the #570 F5 custom-message outcome narration channel.
+    /// Installed via [`Self::install_custom_message_outcome_sender`]
+    /// when the OBSERVER wires its narrator; `None` everywhere else
+    /// (primary / secondary never narrate, so they never install it —
+    /// the emit is a silent drop for them, like every other apply-path
+    /// channel with no receiver). Carries the per-mutation outcome
+    /// (`Handled` | `Failed { reason }`) captured at the apply site
+    /// BEFORE the per-origin watermark compactor erases the
+    /// Handled/Failed label, so the observer narrates the truth even
+    /// though the post-compaction state cannot tell the two terminals
+    /// apart (the #568 / #570 boundary). Skipped from `Clone`,
+    /// snapshot, and restore — same CCD-9 rationale as
+    /// `task_completed_tx`.
+    pub(super) custom_message_outcome_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<CustomMessageOutcomeEvent>>,
     /// Per-peer set of opaque resource strings each peer announces
     /// it currently holds locally. Maintained by the
     /// `PeerResourceHoldingsUpdated` apply rule and round-tripped via
@@ -639,6 +655,8 @@ where
             task_completed_tx: _task_completed_tx,
             // Deliberately not cloned — same rationale as `lifecycle_tx`.
             task_state_change_tx: _task_state_change_tx,
+            // Deliberately not cloned — same rationale as `lifecycle_tx`.
+            custom_message_outcome_tx: _custom_message_outcome_tx,
             peer_holdings,
             task_outputs,
             secondary_capacities,
@@ -725,6 +743,8 @@ where
             task_completed_tx: None,
             // Deliberately not cloned — same rationale as `lifecycle_tx`.
             task_state_change_tx: None,
+            // Deliberately not cloned — same rationale as `lifecycle_tx`.
+            custom_message_outcome_tx: None,
             // Replicated CRDT data — clone preserves it.
             peer_holdings: peer_holdings.clone(),
             // Replicated CRDT data — clone preserves it.
@@ -807,6 +827,7 @@ where
             worker_mgmt_tx,
             task_completed_tx,
             task_state_change_tx,
+            custom_message_outcome_tx,
             peer_holdings,
             task_outputs,
             secondary_capacities,
@@ -849,6 +870,10 @@ where
             .field("worker_mgmt_tx", &worker_mgmt_tx.is_some())
             .field("task_completed_tx", &task_completed_tx.is_some())
             .field("task_state_change_tx", &task_state_change_tx.is_some())
+            .field(
+                "custom_message_outcome_tx",
+                &custom_message_outcome_tx.is_some(),
+            )
             .field("peer_holdings", peer_holdings)
             .field("task_outputs", &task_outputs.len())
             .field("secondary_capacities", secondary_capacities)
@@ -899,6 +924,7 @@ impl<I> Default for ClusterState<I> {
             worker_mgmt_tx: None,
             task_completed_tx: None,
             task_state_change_tx: None,
+            custom_message_outcome_tx: None,
             peer_holdings: HashMap::new(),
             task_outputs: HashMap::new(),
             secondary_capacities: HashMap::new(),
