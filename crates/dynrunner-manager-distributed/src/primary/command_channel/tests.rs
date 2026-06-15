@@ -843,11 +843,21 @@ fn seed_pool(
 /// Drive a `SpawnTasks` command through the dispatch path and
 /// return the per-index error list. Centralised so every test
 /// uses the same call sequence.
+///
+/// Post-#582 every `SpawnTasks` rides the continuation queue (no
+/// single-shot fast path), so the helper must mirror the operational
+/// loop's COMMAND arm: keep draining `PumpSpawnContinuation` kicks off
+/// `command_rx` until the reply oneshot fires. The reply is the
+/// final-chunk completion signal.
 async fn spawn_via_handler(
     coordinator: &mut PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
     tasks: Vec<dynrunner_core::TaskInfo<TestId>>,
 ) -> Result<Vec<(usize, super::SpawnError)>, String> {
     let (reply_tx, reply_rx) = oneshot::channel();
+    let mut command_rx = coordinator
+        .command_rx
+        .take()
+        .expect("command_rx armed on test coordinator");
     super::handle_primary_command(
         coordinator,
         PrimaryCommand::SpawnTasks {
@@ -857,7 +867,25 @@ async fn spawn_via_handler(
         &mut None,
     )
     .await;
-    reply_rx.await.expect("reply oneshot closed")
+    // Drain PumpSpawnContinuation kicks until the reply fires (mirrors
+    // the production COMMAND arm's drive). The single-chunk path now
+    // produces ONE kick (the initial SpawnTasks enqueues the
+    // continuation and kicks once); multi-chunk inputs produce one
+    // additional kick per remaining chunk.
+    let mut reply_rx = reply_rx;
+    let result = loop {
+        tokio::select! {
+            cmd = command_rx.recv() => {
+                let cmd = cmd.expect("command channel closed mid-spawn");
+                super::handle_primary_command(coordinator, cmd, &mut None).await;
+            }
+            received = &mut reply_rx => {
+                break received.expect("reply oneshot closed without firing");
+            }
+        }
+    };
+    coordinator.command_rx = Some(command_rx);
+    result
 }
 
 /// 3 fresh tasks with no deps: all 3 land in Pending in the CRDT
@@ -2201,6 +2229,218 @@ async fn spawn_tasks_chunked_absolute_index_translation() {
                 matches!(errors[0].1, super::SpawnError::UnknownDependency { .. }),
                 "the error class must be UnknownDependency, got {:?}",
                 errors[0].1,
+            );
+        })
+        .await;
+}
+
+// ── #582: every SpawnTasks rides the continuation queue (no fast path) ──
+
+/// A small SpawnTasks (≤ `APPLY_SPAWN_CHUNK_SIZE` tasks, so pre-#582 it would
+/// take the single-shot fast path) must NOT apply inline; it must enqueue a
+/// `PumpSpawnContinuation` kick onto the command channel and complete only
+/// after the COMMAND arm services that kick. The kick-then-drain shape is the
+/// single concern: it forces a `select!` re-entry between the SpawnTasks body
+/// and the chunk apply, so sibling arms (heartbeat in particular) re-fire
+/// between successive bursts under sustained submission.
+///
+/// Pre-#582 the input was applied inline within `apply_spawn_tasks` and the
+/// reply oneshot fired before `handle_primary_command` returned; the command
+/// channel was untouched. So under a sustained streaming submitter (consumer
+/// run_20260615_192743: 10 batches/sec) the COMMAND arm was perpetually
+/// ready, and #586's `biased;` then guaranteed ARM_HEARTBEAT lost every
+/// tiebreak — keepalive deafness, false-departure cascades.
+///
+/// Post-#582 the same input enqueues + kicks: this test pins exactly that.
+#[tokio::test(flavor = "current_thread")]
+async fn small_spawn_tasks_rides_continuation_queue_no_fast_path() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+            // 3 tasks — far below APPLY_SPAWN_CHUNK_SIZE (=256), so pre-#582
+            // this would take the fast path. A single chunk's worth of work,
+            // so one PumpSpawnContinuation kick is sufficient to drain it.
+            let mut tasks = Vec::with_capacity(3);
+            for i in 0..3 {
+                let mut t = make_binary(&format!("t{i}"), 100);
+                t.task_id = format!("t{i}_id");
+                tasks.push(t);
+            }
+            seed_pool(&mut coordinator, &[&tasks[0].phase_id]);
+
+            let mut command_rx = coordinator.command_rx.take().expect("command_rx armed");
+
+            // Invoke `apply_spawn_tasks` directly so the test observes its
+            // post-call channel state, NOT the operational-loop drain.
+            let (reply_tx, mut reply_rx) = oneshot::channel::<
+                Result<Vec<(usize, super::SpawnError)>, String>,
+            >();
+            coordinator.apply_spawn_tasks(tasks.clone(), reply_tx).await;
+
+            // ORACLE 1 (no fast path): the reply oneshot has NOT fired yet —
+            // `apply_spawn_tasks` enqueued the continuation and returned
+            // without applying the chunk. Pre-#582 the reply was already
+            // resolved here.
+            assert!(
+                reply_rx.try_recv().is_err(),
+                "post-#582: apply_spawn_tasks must NOT fire the reply inline; \
+                 it enqueues a continuation + kick. A resolved reply here is \
+                 the pre-#582 single-shot fast path re-introduced — the \
+                 keepalive-deafness regression the gate of last resort \
+                 (`fire_heartbeat_if_overdue`) must not have to catch."
+            );
+
+            // ORACLE 2 (kick enqueued): a `PumpSpawnContinuation` is queued on
+            // the command channel. The COMMAND arm's drain (production: the
+            // operational loop's `select!`) services it on the next iteration.
+            let kick = command_rx
+                .try_recv()
+                .expect("apply_spawn_tasks must kick PumpSpawnContinuation");
+            assert!(
+                matches!(kick, PrimaryCommand::PumpSpawnContinuation),
+                "the enqueued command must be PumpSpawnContinuation"
+            );
+            // No further kicks queued (one batch → one initial kick).
+            assert!(
+                command_rx.try_recv().is_err(),
+                "only ONE PumpSpawnContinuation kick per SpawnTasks call"
+            );
+
+            // ORACLE 3 (the kick services the batch): drive the kick through
+            // the COMMAND arm and observe the reply land + tasks in the CRDT.
+            super::handle_primary_command(&mut coordinator, kick, &mut None).await;
+            let errors = reply_rx
+                .await
+                .expect("reply oneshot fires post-PumpSpawnContinuation")
+                .expect("apply returns Ok");
+            assert!(
+                errors.is_empty(),
+                "no per-index errors expected: {errors:?}"
+            );
+            for t in &tasks {
+                let hash = compute_task_hash(t);
+                assert!(
+                    matches!(
+                        coordinator.cluster_state.task_state(&hash),
+                        Some(TaskState::Pending { .. })
+                    ),
+                    "task {:?} must land in Pending post-kick",
+                    t.task_id
+                );
+            }
+        })
+        .await;
+}
+
+// ── #582: heartbeat-deadline fairness gate (C) ──
+
+/// `fire_heartbeat_if_overdue` fires the heartbeat body and records
+/// ARM_HEARTBEAT in arm-stats when the wall-clock elapsed since the last
+/// heartbeat fire exceeds 2× `keepalive_interval`. Pre-#582 there was no
+/// gate; under any hot-arm body that did not yield to siblings, ARM_HEARTBEAT
+/// could be starved indefinitely and peers falsely depart.
+///
+/// Construct a stale `last_heartbeat_fire` (3× keepalive_interval old),
+/// invoke the gate, and assert: (1) it fires, (2) ARM_HEARTBEAT is recorded,
+/// (3) `last_heartbeat_fire` is reset to ~now. Then invoke the gate again
+/// with a fresh `last_heartbeat_fire` and assert it does NOT fire (the
+/// steady-state cost is one `Instant::elapsed()` comparison).
+#[tokio::test(flavor = "current_thread")]
+async fn fairness_gate_fires_when_heartbeat_overdue() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+            let keepalive = coordinator.config.keepalive_interval;
+            // Arm-stats instance, mirroring the operational loop's setup.
+            let arm_stats = crate::oploop_instrumentation::OpLoopArmStats::new(
+                crate::primary::lifecycle::OP_LOOP_ARM_NAMES,
+                crate::primary::lifecycle::ARM_INBOX,
+            );
+            let mut command_rx: Option<tokio::sync::mpsc::Receiver<PrimaryCommand<TestId>>> = None;
+            let mut heartbeat_tick = tokio::time::interval(keepalive);
+            // Mirror the loop's pre-arm setup (consume the immediate first
+            // tick + Skip on missed) so `reset()` below behaves identically.
+            heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            heartbeat_tick.tick().await;
+
+            // STALE last-fire: 3× keepalive_interval ago. The 2× gate
+            // threshold has been crossed, so the next invocation must fire.
+            let mut last_heartbeat_fire =
+                std::time::Instant::now() - keepalive.saturating_mul(3);
+
+            // ORACLE 1 (gate fires when overdue): ARM_HEARTBEAT was 0 before
+            // the call; the gate's record bumps it to 1.
+            assert_eq!(
+                arm_stats.snapshot().counts.iter()
+                    .find(|(n, _)| *n == "heartbeat").map(|(_, c)| *c),
+                Some(0),
+                "pre-gate: ARM_HEARTBEAT count starts at zero"
+            );
+            coordinator
+                .fire_heartbeat_if_overdue(
+                    &mut command_rx,
+                    &mut last_heartbeat_fire,
+                    &mut heartbeat_tick,
+                    &arm_stats,
+                )
+                .await
+                .expect("gate body returns Ok on a clean coordinator");
+            assert_eq!(
+                arm_stats.snapshot().counts.iter()
+                    .find(|(n, _)| *n == "heartbeat").map(|(_, c)| *c),
+                Some(1),
+                "post-gate (overdue): ARM_HEARTBEAT must be recorded — the \
+                 production observability would otherwise report a stalled \
+                 heartbeat while the gate had been firing the body all along"
+            );
+
+            // ORACLE 2 (gate stamps a fresh last-fire): a follow-up call with
+            // the just-stamped `last_heartbeat_fire` must NOT fire again
+            // (elapsed ≈ 0 ≤ 2× keepalive_interval). The arm-stats counter
+            // stays at 1, no double-fire.
+            coordinator
+                .fire_heartbeat_if_overdue(
+                    &mut command_rx,
+                    &mut last_heartbeat_fire,
+                    &mut heartbeat_tick,
+                    &arm_stats,
+                )
+                .await
+                .expect("gate no-op returns Ok");
+            assert_eq!(
+                arm_stats.snapshot().counts.iter()
+                    .find(|(n, _)| *n == "heartbeat").map(|(_, c)| *c),
+                Some(1),
+                "post-gate (in-cadence): the gate must NOT re-fire when the \
+                 last-fire stamp is fresh — a per-iteration re-fire would be \
+                 a hot-loop bug that spams peers with redundant keepalives"
+            );
+
+            // ORACLE 3 (sub-threshold elapsed): even at exactly 1×
+            // keepalive_interval since the last fire (the WARN ceiling, the
+            // schedule's "evidence freshness" boundary), the gate must NOT
+            // fire — the 2× threshold defends against the normal
+            // `heartbeat_tick.tick()` jitter racing the gate.
+            last_heartbeat_fire = std::time::Instant::now() - keepalive;
+            coordinator
+                .fire_heartbeat_if_overdue(
+                    &mut command_rx,
+                    &mut last_heartbeat_fire,
+                    &mut heartbeat_tick,
+                    &arm_stats,
+                )
+                .await
+                .expect("gate no-op returns Ok");
+            assert_eq!(
+                arm_stats.snapshot().counts.iter()
+                    .find(|(n, _)| *n == "heartbeat").map(|(_, c)| *c),
+                Some(1),
+                "post-gate at 1× keepalive_interval elapsed: the gate must \
+                 NOT fire below the 2× starvation threshold — a 1× threshold \
+                 would race the normal `heartbeat_tick.tick()` cadence under \
+                 scheduler jitter and suppress on-cadence ARM_HEARTBEAT records"
             );
         })
         .await;

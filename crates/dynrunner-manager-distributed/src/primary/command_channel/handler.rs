@@ -527,17 +527,36 @@ where
             return;
         }
 
-        // Single-shot fast path: tiny input AND no queued continuation
-        // (so we won't reorder against an in-flight batch). Reproduces the
-        // pre-#547 byte-identical behaviour for the common consumer case.
-        if tasks.len() <= Self::APPLY_SPAWN_CHUNK_SIZE
-            && self.spawn_continuation_queue.is_empty()
-        {
-            let errors = self.apply_spawn_tasks_chunk(tasks, 0).await;
-            let _ = reply.send(Ok(errors));
-            return;
-        }
-
+        // ALWAYS route through the continuation queue, even for a single-
+        // chunk input (#582). The pre-#582 single-shot fast path
+        // (`tasks.len() <= APPLY_SPAWN_CHUNK_SIZE` AND queue empty) drained
+        // the entire batch inside the COMMAND arm body with NO yield back to
+        // `select!` — so under a sustained submission cadence (consumer
+        // run_20260615_192743: ~74 tasks/batch × 10 batches/sec) the COMMAND
+        // arm was perpetually ready, and #586's `biased;` then guaranteed
+        // ARM_HEARTBEAT (id=4, below the data arms in source-order priority)
+        // could lose every tiebreak indefinitely → keepalive deafness, 75s
+        // collective-silence episode, 11 false departures. Routing through
+        // the queue makes every batch take ≥1 select! re-entry between the
+        // apply and the caller's reply, so sibling arms (heartbeat, inbox,
+        // worker_mgmt, matcher) re-fire between successive spawn batches no
+        // matter how fast the submitter streams. The extra select! iteration
+        // per batch is the single tokio task slice that keeps the data path
+        // cooperative; throughput cost is negligible at consumer rates and
+        // the chunked path's apply semantics are byte-identical to the
+        // pre-fix fast path for a same-sized single-chunk input.
+        //
+        // BIASED-PRIORITY CONTRACT (#586 + #582 amendment): `biased;` in the
+        // operational-loop select! resolves RACE-WINNER ORDERING for ties —
+        // when multiple arms become ready in the same poll, the
+        // higher-priority arm wins. It does NOT bound how long a winning
+        // arm's body runs; a body that does not yield monopolises the loop
+        // until it returns. Every higher-priority data-arm body
+        // (ARM_COMMAND, ARM_INBOX) must therefore yield to siblings between
+        // work units — either via the continuation-queue pattern below or
+        // via `yield_now().await` — so the heartbeat-deadline fairness gate
+        // (`fire_heartbeat_if_overdue` at the top of each loop iteration)
+        // is the last line of defence, not the only one.
         // Chunked path. Install the continuation at the BACK of the queue —
         // FIFO across concurrent external batches (the COMMAND arm yields
         // between chunks, so a second SpawnTasks can land mid-drain; we
@@ -549,6 +568,32 @@ where
             accumulated_errors: Vec::new(),
             reply,
         });
+        // F5 ATOMIC-BATCH SEAM (mutation_capture is armed): the surrounding
+        // `drain_callback_queued_commands_capturing` walk has armed the
+        // capture sink, so EVERY local apply this batch produces is diverted
+        // into a buffer rather than broadcast, and the whole buffer flushes
+        // as ONE wire frame after the drain returns (the F5 atomicity
+        // contract: effect + terminal land together or not at all). Inside
+        // that window there is NOTHING for sibling select! arms to do — the
+        // wire egress is held back by the capture, so the #582
+        // yield-between-chunks contract does not apply. Drain the spawn-
+        // continuation queue SYNCHRONOUSLY here so the captured batch
+        // includes every applied mutation; otherwise the capture window
+        // would close before the kick-scheduled `PumpSpawnContinuation`
+        // could run, and the spawn's mutations would land in a SEPARATE
+        // later frame — breaking the atomic effect+terminal invariant
+        // (`handler_effect_and_handled_terminal_ride_one_frame`).
+        //
+        // Outside the capture window this branch is skipped: the normal
+        // path enqueues + kicks `PumpSpawnContinuation` onto `command_tx`,
+        // and the operational-loop's ARM_COMMAND arm services one chunk
+        // per select! iteration — the #582 fairness contract.
+        if self.mutation_capture.is_some() {
+            while !self.spawn_continuation_queue.is_empty() {
+                self.pump_spawn_continuation().await;
+            }
+            return;
+        }
         // If the queue was empty, the drain loop is dormant — kick it. If
         // it wasn't empty, an earlier kick is already in flight (the
         // current pump-handler will re-kick when it advances), so we do

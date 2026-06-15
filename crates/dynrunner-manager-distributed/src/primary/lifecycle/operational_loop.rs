@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use dynrunner_core::Identifier;
+use dynrunner_core::{IMPORTANT_TARGET, Identifier};
 use dynrunner_protocol_primary_secondary::{DiscoveryDebt, MessageType};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::PrimaryCoordinator;
+use crate::primary::command_channel::PrimaryCommand;
 
 // ── Operational-loop `select!` arm ids (oploop instrumentation) ──
 //
@@ -18,7 +20,7 @@ use crate::primary::PrimaryCoordinator;
 const ARM_COMMAND: usize = 0;
 const ARM_MATCHER: usize = 1;
 const ARM_WORKER_MGMT: usize = 2;
-const ARM_INBOX: usize = 3;
+pub(crate) const ARM_INBOX: usize = 3;
 const ARM_HEARTBEAT: usize = 4;
 const ARM_ANTI_ENTROPY: usize = 5;
 const ARM_RESPAWN_REQUEST: usize = 6;
@@ -34,7 +36,7 @@ const ARM_PERSISTENT_DIAL_FAILURE: usize = 15;
 
 /// Arm names, index-aligned with the `ARM_*` ids above. The render order of
 /// the compact stats line.
-const OP_LOOP_ARM_NAMES: &[&str] = &[
+pub(crate) const OP_LOOP_ARM_NAMES: &[&str] = &[
     "command",
     "matcher",
     "worker_mgmt",
@@ -178,6 +180,142 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         false
     }
 
+    /// Run the full ARM_HEARTBEAT body — the five per-cadence calls the
+    /// `heartbeat_tick.tick()` arm makes — out-of-band of the select!.
+    /// Called from both the normal arm and the heartbeat-deadline fairness
+    /// gate ([`Self::fire_heartbeat_if_overdue`]) so the body's call order
+    /// stays in ONE place. Returns the same `Result<(), String>` shape the
+    /// arm body propagates from `process_heartbeat_tick`.
+    ///
+    /// The five calls are idempotent against being invoked at a higher
+    /// rate than the configured `keepalive_interval`:
+    ///   * `dispatch_unhandled_custom_messages` no-ops when the inbox
+    ///     holds no `Unhandled` entry (the steady-state hot path);
+    ///   * `observe_custom_backlog` is a WARN observer with its own
+    ///     rate-limit gate;
+    ///   * `broadcast_primary_keepalive` is a fan-out broadcast — peers
+    ///     bump their per-secondary keepalive timestamps and any extra
+    ///     emit just refreshes them earlier;
+    ///   * `publish_beacon_targets` republishes the same target set;
+    ///   * `process_heartbeat_tick` self-defers via `own_tick_health`
+    ///     when called too close to the prior fire (the tick-lag
+    ///     guard), so a fairness-gate double-fire is absorbed without
+    ///     spurious sweeps.
+    pub(crate) async fn service_heartbeat_tick(
+        &mut self,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) -> Result<(), String> {
+        self.dispatch_unhandled_custom_messages(command_rx).await;
+        self.observe_custom_backlog();
+        self.broadcast_primary_keepalive().await;
+        self.publish_beacon_targets();
+        self.process_heartbeat_tick().await
+    }
+
+    /// Heartbeat-deadline fairness gate (#582). Called once per
+    /// operational-loop iteration BEFORE the `select!`. If the wall-clock
+    /// elapsed since the last heartbeat fire exceeds `keepalive_interval`,
+    /// synchronously runs the ARM_HEARTBEAT body and resets the cadence
+    /// tick.
+    ///
+    /// ## Why this exists
+    ///
+    /// `tokio::select! { biased; ... }` resolves WAKE-ORDER ties — when
+    /// multiple arms are ready in the same poll, the higher-priority arm
+    /// wins. It does NOT bound how long a winning arm's body runs; a body
+    /// that does not yield monopolises the loop until it returns. Under
+    /// sustained data-arm load (#582: 10 batches/sec spawn-stream into
+    /// the COMMAND arm), ARM_HEARTBEAT (id=4 in the biased order, below
+    /// the data arms) can lose every tiebreak indefinitely → keepalive
+    /// deafness → 75 s collective-silence episode → false departures.
+    ///
+    /// The contract is: every data-arm body MUST yield to siblings
+    /// between work units (continuation queue per #547/#582, or
+    /// `yield_now().await` for arms that lack a natural queue). This gate
+    /// is the LAST-LINE defence: even if a future regression re-introduces
+    /// a non-yielding hot-arm body, the heartbeat still fires within
+    /// `keepalive_interval` of its prior fire.
+    ///
+    /// ## Cadence interaction
+    ///
+    /// After firing, `heartbeat_tick.reset()` rescheds the interval to
+    /// `now + keepalive_interval`, so the next normal-cadence fire is one
+    /// full period away — the gate does not double-count against the
+    /// schedule. `process_heartbeat_tick` internally defers via
+    /// `own_tick_health` if the call rate gets too tight, so the fairness
+    /// fire never causes a spurious dead-secondary sweep.
+    ///
+    /// ## Observability
+    ///
+    /// An overdue fire emits one `IMPORTANT_TARGET` info line naming the
+    /// elapsed silence so operators see fan-in saturation episodes in the
+    /// important-stdio sink. Steady-state (no starvation) the gate is a
+    /// single `Instant::elapsed()` comparison per iteration — no logging,
+    /// no allocations.
+    pub(crate) async fn fire_heartbeat_if_overdue(
+        &mut self,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+        last_heartbeat_fire: &mut Instant,
+        heartbeat_tick: &mut tokio::time::Interval,
+        arm_stats: &crate::oploop_instrumentation::OpLoopArmStats,
+    ) -> Result<(), String> {
+        // Threshold: fire the gate at 2× `keepalive_interval` since the last
+        // heartbeat fire. The 2× margin separates GENUINE STARVATION from
+        // normal-cadence tick jitter: the periodic `heartbeat_tick` fires
+        // every 1× interval on a healthy loop (small scheduler jitter
+        // around that deadline), so a 1× threshold would race the tick
+        // and spuriously fire the gate, suppressing the normal ARM_HEARTBEAT
+        // record via the `heartbeat_tick.reset()` below. 2× is comfortably
+        // above the worst-case jitter on a healthy loop AND comfortably
+        // BELOW the first silence-WARN multiple (`silence_warn_multiples[0]`,
+        // typically 3-4×) so peers never observe missed keepalives. Under
+        // the 5 s production cadence this is a 10 s starvation budget — the
+        // consumer's run_20260615_192743 burst monopolised the loop for
+        // ~75 s before #582 even noticed, so 10 s before the fairness gate
+        // intervenes is generous headroom for a recoverable transient
+        // (e.g. a single chunk that runs long under load) while still
+        // bounding the steady-state worst case.
+        let starvation_threshold = self
+            .config
+            .keepalive_interval
+            .saturating_mul(2);
+        let elapsed = last_heartbeat_fire.elapsed();
+        if elapsed <= starvation_threshold {
+            return Ok(());
+        }
+        tracing::info!(
+            target: IMPORTANT_TARGET,
+            elapsed_ms = elapsed.as_millis() as u64,
+            keepalive_interval_ms = self.config.keepalive_interval.as_millis() as u64,
+            "heartbeat-deadline fairness gate firing — a hot arm body \
+             (likely ARM_COMMAND or ARM_INBOX under sustained spawn-batch \
+             load) monopolised the operational loop past the keepalive \
+             cadence; firing the heartbeat body out-of-band so peers do \
+             not falsely depart"
+        );
+        // Record the gate-fire as an ARM_HEARTBEAT observation in the
+        // arm-stats counter: the body genuinely ran (every per-cadence
+        // call the on-cadence arm makes happened here), so the
+        // observability counter must reflect the fire. Without this an
+        // operator reading the stats line would see "0 heartbeat ticks
+        // across the burst" — exactly the wedge signature — while the
+        // gate had been firing the body all along, masking the real
+        // problem (the hot arm's monopolisation), since downstream
+        // assertions on the counter (e.g.
+        // `oploop_arm_hunt::probe_herd_over_large_ledger_does_not_stall_oploop`)
+        // count the body fires, not the select! arm wins.
+        arm_stats.record(ARM_HEARTBEAT);
+        self.service_heartbeat_tick(command_rx).await?;
+        *last_heartbeat_fire = Instant::now();
+        // Reset the periodic tick so the next on-cadence fire is one full
+        // `keepalive_interval` from now — without this the just-deferred
+        // tick would fire IMMEDIATELY on the next select! poll (Skip
+        // missed-tick behaviour returns instantly when the deadline has
+        // already passed), double-firing the body.
+        heartbeat_tick.reset();
+        Ok(())
+    }
+
     pub(crate) async fn operational_loop(&mut self) -> Result<(), String> {
         tracing::info!("entering operational loop");
 
@@ -214,6 +352,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // Skip the immediate first tick — secondaries might not have sent
         // their first keepalive yet at the moment we enter the loop.
         heartbeat_tick.tick().await;
+        // Wall-clock anchor for the heartbeat-deadline fairness gate
+        // (#582). Updated at every actual fire of the heartbeat-arm body
+        // (either via the on-cadence ARM_HEARTBEAT arm OR
+        // `fire_heartbeat_if_overdue`). The pre-loop init treats the
+        // dispatcher entry as the implicit fire-zero — the first
+        // operational-loop iteration only invokes the fairness gate if a
+        // hot arm body monopolised the loop for the entire first
+        // `keepalive_interval`, exactly the starvation shape the gate
+        // defends against. See `fire_heartbeat_if_overdue` for the full
+        // contract.
+        let mut last_heartbeat_fire = Instant::now();
 
         // Anti-entropy cadence. On each tick the primary broadcasts its
         // `StateDigest` so any follower behind the authoritative ledger
@@ -559,6 +708,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 break;
             }
 
+            // Heartbeat-deadline fairness gate (#582). Defends against
+            // hot-arm body monopolisation of the operational loop — a
+            // body that does not yield between work units would otherwise
+            // starve ARM_HEARTBEAT under #586's biased select! priority.
+            // See `fire_heartbeat_if_overdue` for the full rationale.
+            // Steady-state cost is one `Instant::elapsed()` comparison
+            // per iteration when the heartbeat is not overdue.
+            self.fire_heartbeat_if_overdue(
+                &mut command_rx,
+                &mut last_heartbeat_fire,
+                &mut heartbeat_tick,
+                &arm_stats,
+            )
+            .await?;
+
             // Per-task re-dispatch backoff wake deadline, recomputed
             // each iteration from the pool's PERSISTENT stored
             // eligible-at stamps (never derived relative to "now" at
@@ -597,6 +761,35 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // but the same arm-priority discipline applies: data-path
             // arms must never lose tiebreaks to forensic / periodic
             // work.
+            //
+            // ── #582 amendment: `biased;` is RACE-WINNER ordering only ──
+            // `biased;` resolves ties at the moment of the select! wake:
+            // when multiple arms are ready in the SAME poll, the
+            // higher-priority arm wins. It does NOT bound how long the
+            // winning arm's body runs; a body that does not yield to
+            // siblings monopolises the loop until it returns. Under
+            // sustained data-arm load (e.g. a streamed spawn batch into
+            // ARM_COMMAND at 10 batches/sec), a non-yielding body in a
+            // higher-priority arm starves every lower-priority arm —
+            // including ARM_HEARTBEAT (id=4), whose silence then triggers
+            // false-departure cascades (#582: 75 s collective-silence
+            // episode, 11 false departures).
+            //
+            // The CONTRACT every higher-priority data-arm body must hold:
+            // yield to siblings between work units. The two established
+            // primitives:
+            //   * the `spawn_continuation_queue` chunking pattern (#547,
+            //     extended in #582 to drop the single-shot fast path) —
+            //     for COMMAND-arm SpawnTasks, each chunk apply RETURNS to
+            //     `select!` and rides a later iteration;
+            //   * `tokio::task::yield_now().await` between bounded work
+            //     units — for arms that lack a natural queue.
+            //
+            // The `fire_heartbeat_if_overdue` gate at the top of each
+            // loop iteration is the LAST-LINE defence: even if a future
+            // regression re-introduces a non-yielding hot body, the
+            // heartbeat still fires within `keepalive_interval` of its
+            // prior fire — peers never falsely depart.
             tokio::select! {
                 biased;
                 // Panik (operator-initiated emergency stop) arm. The
@@ -945,34 +1138,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 }
                 _ = heartbeat_tick.tick() => {
                     arm_stats.record(ARM_HEARTBEAT);
-                    // F5 periodic dispatch trigger: backstop re-run of
-                    // the custom-message handler-dispatch decision (a
-                    // cheap no-op when the inbox holds no `Unhandled`
-                    // entry — the steady-state hot path) on a
-                    // PERSISTENT interval (never reset by sibling arms
-                    // — the watchdog law), plus the keep-up monitor's
-                    // observation point: WARN (rate-limited) when the
-                    // backlog grows across consecutive ticks or its
-                    // oldest entry ages past the threshold. The
-                    // unhandled set is never bounded — observability
-                    // only.
-                    self.dispatch_unhandled_custom_messages(&mut command_rx).await;
-                    self.observe_custom_backlog();
-                    self.broadcast_primary_keepalive().await;
-                    // Refresh the PRIMARY→secondaries liveness-beacon target
-                    // set on the SAME cadence as the mesh keepalive — the
-                    // transport-independent twin. Any roster change since the
-                    // last tick (welcome, hydrate, dead-secondary requeue) is
-                    // reflected here, well inside the death thresholds; the
-                    // off-runtime beacon thread re-reads the published set
-                    // each of its own ticks. A single placement (not one per
-                    // roster-mutation site) keeps the concern in one spot.
-                    self.publish_beacon_targets();
-                    // `process_heartbeat_tick` collects the per-tick
-                    // death report and hands it to the dead-secondary
-                    // declaration/requeue policy. See
-                    // `process_heartbeat_tick` for detail.
-                    self.process_heartbeat_tick().await?;
+                    // The full per-cadence heartbeat body — F5 dispatch
+                    // trigger + backlog observer + keepalive broadcast +
+                    // beacon-target refresh + dead-secondary sweep — is
+                    // owned by `service_heartbeat_tick` so the SAME call
+                    // sequence runs whether reached via this on-cadence
+                    // arm or via the heartbeat-deadline fairness gate
+                    // (`fire_heartbeat_if_overdue`, #582). The
+                    // `last_heartbeat_fire` stamp anchors that gate; updating
+                    // it here keeps the gate accurate against the actual
+                    // fires (not just the missed-cadence fires).
+                    self.service_heartbeat_tick(&mut command_rx).await?;
+                    last_heartbeat_fire = Instant::now();
                 }
                 // Anti-entropy tick: broadcast the primary's digest so any
                 // follower behind the authoritative ledger pulls + converges.
