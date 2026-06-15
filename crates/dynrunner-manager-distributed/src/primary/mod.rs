@@ -29,6 +29,7 @@ mod bringup_reservation;
 mod command_channel;
 mod config;
 mod connect;
+pub mod consensus;
 mod coordinator;
 mod custom_message;
 mod discovery;
