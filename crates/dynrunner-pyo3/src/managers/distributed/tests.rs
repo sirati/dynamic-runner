@@ -124,6 +124,7 @@ fn build_manager_with(
         /* peer_lifecycle_listener */ None,
         /* task_completed_listener */ None,
         /* import_action */ import_action,
+        /* affine_satisfied_probe */ None,
         /* upload_action */ upload_action,
         /* unfulfillable_reinject_max_per_task */ cap,
         /* log_dir */ None,

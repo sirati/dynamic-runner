@@ -347,6 +347,21 @@ pub(in crate::secondary) struct OperationalState<M: ManagerEndpoint, I: Identifi
     /// the affine task's content hash.
     pub(in crate::secondary) affine_running:
         HashMap<String, Vec<super::PendingAffineDependent<I>>>,
+
+    /// NODE-LOCAL per-(gate,node) satisfied-probe verdict cache (#537) —
+    /// NOT CRDT. Keyed by the same SecondaryAffine task content hash
+    /// `affine_done` / `affine_running` use. Holds the most recent
+    /// `ProbeOutcome` for each gate so a fixed-graph fleet of N dependents
+    /// in flight on this node consults the consumer probe only ONCE per
+    /// gate (per TTL window) — bounded probe call frequency even at
+    /// thousands of dependents per gate. A `Satisfied` verdict never
+    /// expires (locally-present-store-path invariant persists for the
+    /// run); `NotSatisfied` / `Errored` expire on the constants in
+    /// [`crate::affine_satisfied`]. Independent of `affine_done`: a
+    /// `Satisfied` verdict ALSO seeds `affine_done` so subsequent
+    /// dependents short-circuit on the existing run-once latch.
+    pub(in crate::secondary) affine_probe_cache:
+        HashMap<String, crate::affine_satisfied::ProbeOutcome>,
 }
 
 /// Peer-mesh formation progress — the orthogonal sub-concern.
@@ -634,6 +649,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
                     // imported nothing yet (#497 P4).
                     affine_done: std::collections::HashSet::new(),
                     affine_running: HashMap::new(),
+                    affine_probe_cache: HashMap::new(),
                 }));
                 (next, latches)
             }
@@ -676,6 +692,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
             // on every Operational state, so start them empty (#497 P4).
             affine_done: std::collections::HashSet::new(),
             affine_running: HashMap::new(),
+            affine_probe_cache: HashMap::new(),
         }));
         (state, latches)
     }

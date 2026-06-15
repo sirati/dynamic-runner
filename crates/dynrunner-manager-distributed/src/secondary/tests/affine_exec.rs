@@ -34,6 +34,7 @@ use super::super::{AffineGateOutcome, PendingAffineDependent, SecondaryConfig};
 use super::firstbind_orphan::{one_worker_config, task_assignment, test_oom_watcher};
 use super::processing::make_binary;
 use crate::affine_action::{IMPORT_OUTER_RETRIES, ImportAction, ImportError};
+use crate::affine_satisfied::AffineSatisfiedProbe;
 
 /// The stub the headline + failure tests share. Records every `import` call
 /// in a `Mutex<usize>` counter and either:
@@ -1462,6 +1463,428 @@ async fn unified_resolver_one_read_recognizes_and_resolves_spilled_gate() {
             assert!(
                 sec.cluster_state.affine_gate_task("never-synced").is_none(),
                 "an absent hash has no body"
+            );
+        })
+        .await;
+}
+
+// =============================================================================
+// #537 — per-(gate,node) satisfied probe tests
+// =============================================================================
+
+/// Scripted satisfied-probe stub. Records every call's `task_id`, returns a
+/// scripted boolean (or PANICS, for the Errored-cache test). `Mutex` because
+/// the trait bound is `Send + Sync` (the probe must survive a relocation
+/// handoff, same as `ImportAction`).
+struct StubProbe {
+    /// Records the `task_id` of every call so a test can assert frequency.
+    calls: Mutex<Vec<String>>,
+    /// `Ok(b)` ⇒ return `b`; `Err(())` ⇒ PANIC inside `is_satisfied` (the
+    /// executor classifies that as `Errored`, falls through to today's
+    /// path, caches briefly). Wrapped in `Mutex` so a test can swap the
+    /// script mid-run.
+    script: Mutex<Result<bool, ()>>,
+}
+
+impl StubProbe {
+    fn new(value: bool) -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::new(Vec::new()),
+            script: Mutex::new(Ok(value)),
+        })
+    }
+
+    fn panicking() -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::new(Vec::new()),
+            script: Mutex::new(Err(())),
+        })
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+}
+
+impl AffineSatisfiedProbe<TestId> for StubProbe {
+    fn is_satisfied(&self, task: &TaskInfo<TestId>) -> bool {
+        self.calls.lock().unwrap().push(task.task_id.clone());
+        match *self.script.lock().unwrap() {
+            Ok(b) => b,
+            Err(()) => panic!("scripted probe panic"),
+        }
+    }
+}
+
+/// HEADLINE: a probe returning `true` SHORT-CIRCUITS the run-once affine
+/// executor — the dependent dispatches on the `AlreadyDone` path with
+/// ZERO `import_action` calls, ZERO `QueuedAfterLocalDependency` frames,
+/// ZERO `LocalDependencyReleased` frames. The gate's hash enters
+/// `affine_done` (so every later dependent for the rest of the run
+/// short-circuits on the existing run-once latch).
+#[tokio::test(flavor = "current_thread")]
+async fn probe_true_short_circuits_executor_no_import_no_frames() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            sec.enter_operational_for_test();
+
+            let affine_hash = "import-producer-side";
+            seed_affine_task(&mut sec, affine_hash);
+
+            // A succeeding-but-MUST-NEVER-BE-CALLED importer: if the
+            // short-circuit is broken the call_count assertion below
+            // catches it loudly. The probe answers true, so this
+            // importer must not be invoked.
+            let importer = StubImporter::immediate(Ok(()));
+            sec.set_import_action(importer.clone());
+
+            let probe = StubProbe::new(true);
+            sec.set_affine_satisfied_probe(probe.clone());
+
+            let outcome = sec
+                .ensure_affine_import(affine_hash.to_string(), make_dependent("B0", 0))
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                AffineGateOutcome::AlreadyDone,
+                "a Satisfied probe verdict short-circuits to AlreadyDone — \
+                 no queue, no spawn, no frames",
+            );
+            assert_eq!(
+                importer.call_count(),
+                0,
+                "Satisfied probe must NEVER call the import action",
+            );
+            assert!(
+                sec.op_mut().affine_done.contains(affine_hash),
+                "Satisfied verdict SEEDS affine_done so later dependents \
+                 short-circuit on the existing run-once latch",
+            );
+            assert!(
+                queued_work_hashes(&log, affine_hash).is_empty(),
+                "Satisfied verdict produces NO QueuedAfterLocalDependency frame",
+            );
+            assert!(
+                released_hashes(&log).is_empty(),
+                "Satisfied verdict produces NO LocalDependencyReleased frame",
+            );
+            // SUBSEQUENT dependents on the SAME hash short-circuit through
+            // `affine_done.contains` WITHOUT re-consulting the probe —
+            // probe call frequency stays bounded across the dispatch fan-out.
+            let probe_calls_before = probe.call_count();
+            for i in 1..5 {
+                let later = sec
+                    .ensure_affine_import(
+                        affine_hash.to_string(),
+                        make_dependent(&format!("B{i}"), i as WorkerId),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    later,
+                    AffineGateOutcome::AlreadyDone,
+                    "subsequent dependent #{i} short-circuits via affine_done",
+                );
+            }
+            assert_eq!(
+                probe.call_count(),
+                probe_calls_before,
+                "the probe is NOT re-consulted once affine_done is seeded — \
+                 thousands of dependents share ONE probe call per gate",
+            );
+        })
+        .await;
+}
+
+/// A probe returning `false` falls through to today's path: the import
+/// action runs exactly as if no probe were registered. The negative
+/// verdict is cached on the (gate, this run) so a fixed-graph batch of
+/// dependents in flight at the same time consults the probe only ONCE per
+/// gate per TTL window.
+#[tokio::test(flavor = "current_thread")]
+async fn probe_false_falls_through_to_import_and_caches_verdict() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            sec.enter_operational_for_test();
+
+            let affine_hash = "import-non-producer";
+            seed_affine_task(&mut sec, affine_hash);
+
+            let importer = StubImporter::immediate(Ok(()));
+            sec.set_import_action(importer.clone());
+
+            let probe = StubProbe::new(false);
+            sec.set_affine_satisfied_probe(probe.clone());
+
+            // First dependent: probe says "no" → today's StartedRun path.
+            let outcome = sec
+                .ensure_affine_import(affine_hash.to_string(), make_dependent("B0", 0))
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                AffineGateOutcome::StartedRun,
+                "NotSatisfied verdict falls through to today's run-once path",
+            );
+            // Drive the import inline (the executor-level test driver) and
+            // drain the pending egress so the `LocalDependencyReleased`
+            // frame the release path emits lands in the recording log
+            // (the recording-peer harness queues frames; drain dispatches).
+            sec.run_affine_import_once(affine_hash.to_string(), &mut FakeWorkerFactory)
+                .await
+                .unwrap();
+            sec.drain_egress().await;
+            assert_eq!(
+                importer.call_count(),
+                1,
+                "NotSatisfied verdict ⇒ import action runs (today's behaviour)",
+            );
+            assert!(
+                !released_hashes(&log).is_empty(),
+                "NotSatisfied falls through ⇒ LocalDependencyReleased fires",
+            );
+
+            // CACHE BOUNDEDNESS: a SECOND, DIFFERENT-hash dependent on the
+            // SAME hash inside the TTL window does not re-call the probe.
+            // (`affine_done` is now populated by the successful import, so
+            // the second dependent short-circuits at the outer `affine_done`
+            // check BEFORE the probe path is reached. The probe-cache
+            // boundedness is exercised more directly by the next test where
+            // the gate stays not-locally-done.)
+            assert_eq!(probe.call_count(), 1, "probe consulted exactly once");
+        })
+        .await;
+}
+
+/// Cache boundedness across MANY dependents while the import is in flight:
+/// 8 dependents on the same not-yet-done hash trigger the probe AT MOST
+/// ONCE — the negative verdict is cached so the 2nd..8th queue without
+/// re-consulting the probe. The dependents queue into `affine_running`
+/// behind the single import, exactly as if no probe were registered.
+#[tokio::test(flavor = "current_thread")]
+async fn probe_false_consulted_at_most_once_during_inflight_window() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            sec.enter_operational_for_test();
+
+            let affine_hash = "import-many-deps";
+            seed_affine_task(&mut sec, affine_hash);
+
+            // A BLOCKING stub: keeps the import in flight while the rest of
+            // the dependents arrive (mirrors the 8-concurrent headline test
+            // for the no-probe path).
+            let (stub, gate) = StubImporter::blocking(Ok(()));
+            sec.set_import_action(stub.clone());
+
+            let probe = StubProbe::new(false);
+            sec.set_affine_satisfied_probe(probe.clone());
+
+            // First dependent → probe consult #1, StartedRun.
+            let first = sec
+                .ensure_affine_import(affine_hash.to_string(), make_dependent("B0", 0))
+                .await
+                .unwrap();
+            assert_eq!(first, AffineGateOutcome::StartedRun);
+            // 7 more dependents: each sees `affine_running` populated, so
+            // queues. The probe cache holds the NotSatisfied verdict, so
+            // these calls MUST NOT re-consult the probe.
+            for i in 1..8 {
+                let later = sec
+                    .ensure_affine_import(
+                        affine_hash.to_string(),
+                        make_dependent(&format!("B{i}"), i as WorkerId),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    later,
+                    AffineGateOutcome::QueuedBehindRun,
+                    "subsequent dependent #{i} queues behind the single run",
+                );
+            }
+            assert_eq!(
+                probe.call_count(),
+                1,
+                "8 dependents on a not-yet-done hash consult the probe \
+                 EXACTLY ONCE — cache binds the consumer-callable rate",
+            );
+            // Cleanup: release the parked import + drain.
+            gate.notify_waiters();
+            // Drain the queued frames so the recorded log stays sane for
+            // future readers (no test assertion needed past this point).
+            let _ = log;
+        })
+        .await;
+}
+
+/// No probe registered ⇒ today's path bit-for-bit. The regression guard:
+/// the new field/setter MUST default to absence on a coordinator that
+/// never opts in.
+#[tokio::test(flavor = "current_thread")]
+async fn no_probe_registered_preserves_today_behaviour_verbatim() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, _log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            sec.enter_operational_for_test();
+
+            let affine_hash = "import-no-probe";
+            seed_affine_task(&mut sec, affine_hash);
+
+            let importer = StubImporter::immediate(Ok(()));
+            sec.set_import_action(importer.clone());
+            // INTENTIONALLY no `set_affine_satisfied_probe` call — the
+            // default is `None` and the executor must take today's path.
+
+            let outcome = sec
+                .ensure_affine_import(affine_hash.to_string(), make_dependent("B0", 0))
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                AffineGateOutcome::StartedRun,
+                "no probe ⇒ today's behaviour: StartedRun + import_action runs",
+            );
+            sec.run_affine_import_once(affine_hash.to_string(), &mut FakeWorkerFactory)
+                .await
+                .unwrap();
+            assert_eq!(
+                importer.call_count(),
+                1,
+                "no probe ⇒ import_action runs exactly as before",
+            );
+        })
+        .await;
+}
+
+/// A probe that PANICS is classified as `Errored`: the dependent falls
+/// through to today's import path (NEVER poisons `affine_done`), and the
+/// verdict is CACHED briefly so a persistently-erroring probe is not
+/// called at dispatch frequency.
+#[tokio::test(flavor = "current_thread")]
+async fn probe_panic_classified_errored_falls_through_to_import() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, _log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            sec.enter_operational_for_test();
+
+            let affine_hash = "import-panicky-probe";
+            seed_affine_task(&mut sec, affine_hash);
+
+            let importer = StubImporter::immediate(Ok(()));
+            sec.set_import_action(importer.clone());
+
+            // The probe PANICS on the first call. The executor catches
+            // (catch_unwind) and classifies Errored; the dependent falls
+            // through to today's path.
+            let probe = StubProbe::panicking();
+            sec.set_affine_satisfied_probe(probe.clone());
+
+            let outcome = sec
+                .ensure_affine_import(affine_hash.to_string(), make_dependent("B0", 0))
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                AffineGateOutcome::StartedRun,
+                "panicking probe ⇒ Errored cache + today's run-once path",
+            );
+            assert!(
+                !sec.op_mut().affine_done.contains(affine_hash),
+                "an Errored probe must NEVER poison affine_done — only an \
+                 actual Satisfied verdict marks the gate locally-done",
+            );
+
+            // SECOND dependent inside the Errored cache TTL: must NOT
+            // re-consult the panicking probe (would hammer the consumer
+            // callable at dispatch frequency). Queues behind the in-flight
+            // import via the run-once latch — which is exactly today's
+            // behaviour for a 2nd..Nth dependent.
+            let later = sec
+                .ensure_affine_import(affine_hash.to_string(), make_dependent("B1", 1))
+                .await
+                .unwrap();
+            assert_eq!(
+                later,
+                AffineGateOutcome::QueuedBehindRun,
+                "second dependent during the Errored cache window queues \
+                 behind the in-flight run-once import",
+            );
+            assert_eq!(
+                probe.call_count(),
+                1,
+                "Errored verdict caches briefly — second dependent must \
+                 NOT re-call the panicking probe",
+            );
+        })
+        .await;
+}
+
+/// The #509 sync race (gate body not yet in the local ledger) MUST NOT
+/// consult the probe: probing an unresolved gate is meaningless. The
+/// executor falls through to today's path which delivers the existing
+/// Recoverable absent verdict via `drive_affine_import`.
+#[tokio::test(flavor = "current_thread")]
+async fn probe_not_consulted_when_gate_body_not_resolvable() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, _log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            sec.enter_operational_for_test();
+
+            // DELIBERATELY no `seed_affine_task` — the gate's TaskAdded
+            // has NOT yet reached this node (the #509 sync race).
+            let affine_hash = "import-not-yet-synced";
+
+            let importer = StubImporter::immediate(Ok(()));
+            sec.set_import_action(importer.clone());
+
+            // A probe that would say `true` if asked — but it must NEVER
+            // be asked when the gate body cannot be resolved.
+            let probe = StubProbe::new(true);
+            sec.set_affine_satisfied_probe(probe.clone());
+
+            let outcome = sec
+                .ensure_affine_import(affine_hash.to_string(), make_dependent("B0", 0))
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                AffineGateOutcome::StartedRun,
+                "an unresolvable gate falls through to today's path (the \
+                 absent-gate Recoverable verdict is delivered later by \
+                 drive_affine_import)",
+            );
+            assert_eq!(
+                probe.call_count(),
+                0,
+                "the probe must NEVER be consulted for an unresolved gate \
+                 — there is nothing yet to ask about",
+            );
+            assert!(
+                !sec.op_mut().affine_done.contains(affine_hash),
+                "an unresolved gate must NOT enter affine_done via the \
+                 probe path (the probe was never consulted)",
             );
         })
         .await;

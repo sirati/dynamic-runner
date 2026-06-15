@@ -259,6 +259,17 @@ impl PySecondaryCoordinator {
             .take()
             .map(crate::affine_action_bridge::PyImportAction::new);
 
+        // Same shape for the per-(gate,node) satisfied probe kwarg (#537):
+        // take the Python probe callable out of `self` and wrap it as an
+        // `Arc<dyn AffineSatisfiedProbe<RunnerIdentifier>>` at the bridge
+        // boundary. Installed on the inner coordinator BEFORE `run()`
+        // enters — the run-once affine executor consults it BEFORE the
+        // import action on each not-yet-locally-done dependent.
+        let affine_satisfied_probe = self
+            .affine_satisfied_probe
+            .take()
+            .map(crate::affine_satisfied_bridge::PyAffineSatisfiedProbe::new);
+
         // Duck-typed consumer hook (the `task_completed_listener`
         // idiom): an optional `worker_message_listener` attribute on
         // the consumer's TaskDefinition. Captured on the GIL thread
@@ -583,6 +594,15 @@ impl PySecondaryCoordinator {
                 // contract + `?Send`/relocation rationale as the upload action.
                 if let Some(action) = import_action {
                     secondary.set_import_action(action);
+                }
+
+                // Install the Python per-(gate,node) satisfied probe (#537)
+                // BEFORE `run` enters — the run-once affine executor reads
+                // it on each gate-resolution to decide whether THIS node is
+                // the producer (already holds the closure locally). Absence
+                // leaves the executor with today's behaviour bit-for-bit.
+                if let Some(probe) = affine_satisfied_probe {
+                    secondary.set_affine_satisfied_probe(probe);
                 }
 
                 // Register the consumer's `worker_message_listener`

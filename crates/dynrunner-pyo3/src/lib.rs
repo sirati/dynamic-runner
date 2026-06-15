@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod affine_action_bridge;
+mod affine_satisfied_bridge;
 mod config;
 mod custom_message_bridge;
 mod discovery;

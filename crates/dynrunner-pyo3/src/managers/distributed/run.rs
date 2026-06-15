@@ -333,6 +333,19 @@ impl PyDistributedManager {
             .take()
             .map(crate::affine_action_bridge::PyImportAction::new);
 
+        // Same shape for the per-(gate,node) satisfied probe (#537): take the
+        // Python callable out of `self` and wrap it as an
+        // `Arc<dyn AffineSatisfiedProbe<RunnerIdentifier>>` at the bridge
+        // boundary, once under the GIL before `py.detach`. The cloneable `Arc`
+        // is captured into the detached runtime and cloned per spawned
+        // secondary below; each install runs via `set_affine_satisfied_probe`
+        // alongside `set_import_action`. `Send + Sync` (the trait-object
+        // contract) lets the `Arc` cross `py.detach`.
+        let affine_satisfied_probe = self
+            .affine_satisfied_probe
+            .take()
+            .map(crate::affine_satisfied_bridge::PyAffineSatisfiedProbe::new);
+
         // Take the Python upload callable (#336 P1 / #493 option-A) out of
         // `self` and wrap it as an `Arc<dyn UploadAction>` at the bridge
         // boundary, once under the GIL before `py.detach`. UNLIKE the
@@ -516,6 +529,13 @@ impl PyDistributedManager {
                     // own clone via `set_import_action` below; the underlying
                     // Python callable is shared (one consumer `import_task`).
                     let sec_import_action = import_action.clone();
+                    // Per-secondary clone of the satisfied probe (#537) — same
+                    // cheap `Arc` refcount bump as the import action above. Each
+                    // spawned secondary installs its own clone via
+                    // `set_affine_satisfied_probe`; the underlying Python
+                    // callable is shared (one consumer
+                    // `affine_instance_satisfied`).
+                    let sec_affine_satisfied_probe = affine_satisfied_probe.clone();
                     let sec_memprofile_output_dir = memprofile_output_dir.clone();
                     let sec_memuse_log_path = memuse_log_path.clone();
                     // Per-secondary clone so the spawned `move` task owns its
@@ -721,6 +741,15 @@ impl PyDistributedManager {
                         // `Arc` clone sharing the one consumer callable.
                         if let Some(action) = sec_import_action {
                             secondary.set_import_action(action);
+                        }
+                        // Install the per-(gate,node) satisfied probe (#537)
+                        // BEFORE `run()`. Same per-secondary pre-`run` contract
+                        // + `Arc`-clone share as the import action above; each
+                        // in-process secondary gets its own clone sharing the
+                        // one consumer callable. Absence leaves the executor
+                        // with today's behaviour bit-for-bit.
+                        if let Some(probe) = sec_affine_satisfied_probe {
+                            secondary.set_affine_satisfied_probe(probe);
                         }
 
                         // The egress edge resolves `Destination::Primary` to
