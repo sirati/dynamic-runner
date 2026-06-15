@@ -180,6 +180,14 @@ impl<I: Identifier> ClusterState<I> {
             // INDEPENDENT convergence signal. A `_`-bound exclusion, same
             // rationale as `role_table` (a derived/co-converging field).
             phase_may_be_empty: _phase_may_be_empty,
+            // Replicated static phase-graph metadata, EXCLUDED for the same
+            // reason as `phase_may_be_empty`: `phase_no_barrier` is
+            // originated in the SAME seed batch as `phase_deps` (both
+            // set-once at run start, paired in every originator) and the
+            // snapshot restore heals it on the same first-bootstrap-adopt
+            // path, so it co-converges with the graph and carries no
+            // INDEPENDENT convergence signal.
+            phase_no_barrier: _phase_no_barrier,
             // Replicated run-constant respawn caps, EXCLUDED for the same
             // reason as `phase_may_be_empty`: originated in the SAME seed
             // batch as `phase_deps` and healed by the same snapshot

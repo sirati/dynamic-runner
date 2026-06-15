@@ -41,6 +41,9 @@ pub(crate) struct PyPrimaryCoordinator {
     /// Phases declared `PhaseSpec.may_be_empty` — registered on the
     /// coordinator before `run()` (the empty-drain opt-out).
     pub(super) phase_may_be_empty: Vec<PhaseId>,
+    /// Phases declared `PhaseSpec.barrier=False` — registered on the
+    /// coordinator before `run()` (the pipelined-edge opt-in).
+    pub(super) phase_no_barrier: Vec<PhaseId>,
     pub(super) spawn_secondary: Py<PyAny>,
     pub(super) distributed_config: DistributedConfig,
     /// Optional caller-supplied bind port for the network server.

@@ -571,6 +571,32 @@ impl<I: Identifier> ClusterState<I> {
         self.phase_may_be_empty.contains(phase)
     }
 
+    /// True iff `phase` was declared `barrier=False` by the consumer
+    /// (`PhaseSpec.barrier=False`, replicated via
+    /// `ClusterMutation::PhaseNoBarrierSet`). Read by:
+    ///
+    ///   * the runtime-spawn barrier-violation interlock in
+    ///     `apply_spawn_tasks` (primary + promoted-secondary): a target
+    ///     phase accepts a runtime spawn iff it has already started OR
+    ///     this returns `true` (the pipelined-edge opt-in);
+    ///   * the pool's initial-state assignment via
+    ///     [`super::super::pending_pool::PendingPool::set_no_barrier_phases`]
+    ///     so a no-barrier phase starts `Active` rather than `Blocked`.
+    ///
+    /// Empty on the common strict-barrier run (every phase barrier=True);
+    /// non-empty iff the consumer opted at least one phase in.
+    pub fn phase_no_barrier(&self, phase: &PhaseId) -> bool {
+        self.phase_no_barrier.contains(phase)
+    }
+
+    /// The full set of phases the consumer declared `barrier=False`.
+    /// Used by callers that need the SET (pool initialisation passes the
+    /// whole set in one go through `set_no_barrier_phases`); per-phase
+    /// queries should use [`Self::phase_no_barrier`] instead.
+    pub fn phase_no_barrier_set(&self) -> &std::collections::HashSet<PhaseId> {
+        &self.phase_no_barrier
+    }
+
     /// The replicated respawn-policy CAPS (`ClusterMutation::
     /// RespawnPolicySet`, set once per run by the submitter's seed when
     /// `--respawn-policy` is enabled). `None` = the run launched with

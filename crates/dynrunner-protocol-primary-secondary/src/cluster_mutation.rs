@@ -215,6 +215,30 @@ pub enum ClusterMutation<I> {
     PhaseMayBeEmptySet {
         phases: Vec<PhaseId>,
     },
+    /// Per-run static set of phases the consumer declared
+    /// `PhaseSpec.barrier=False` — the pipelined-edge opt-in that
+    /// authorizes the scheduler to dispatch tasks from these phases
+    /// without first waiting for whole-of-upstream drain. Emitted once
+    /// by the primary at run start, paired with [`Self::PhaseDepsSet`]
+    /// (same static-graph lifecycle), and stored on every receiver's
+    /// `ClusterState` so a promoted secondary's `apply_spawn_tasks`
+    /// runs the same barrier-violation interlock the live primary used
+    /// (consults the SAME set: a target phase accepts runtime spawn
+    /// when it has already started OR it is declared no-barrier here).
+    ///
+    /// A SEPARATE mutation rather than a field on `PhaseDepsSet` for the
+    /// same reasons [`Self::PhaseMayBeEmptySet`] is separate: its single
+    /// concern is one specific consumer opt-in (the explicit pipelined
+    /// edge), it is empty on the overwhelmingly-common strict-barrier
+    /// run, and a new variant is wire-safe without churning existing
+    /// `PhaseDepsSet` originators — a peer that predates this variant
+    /// simply never emits it and treats its absence as "every phase is
+    /// barrier=True". Re-application is a no-op once the local set is
+    /// seeded (static for the run), mirroring `PhaseDepsSet` /
+    /// `PhaseMayBeEmptySet`.
+    PhaseNoBarrierSet {
+        phases: Vec<PhaseId>,
+    },
     /// Per-run static respawn-policy CAPS (`--respawn-policy=
     /// on-secondary-death` + its three knobs). Emitted once by the
     /// submitter primary in the same seed batch as [`Self::PhaseDepsSet`]

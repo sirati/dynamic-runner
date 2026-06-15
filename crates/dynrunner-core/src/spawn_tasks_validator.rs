@@ -94,6 +94,29 @@ pub enum SpawnError {
         task_hash: String,
         dep_task_id: String,
     },
+    /// The task targets a phase that REJECTS runtime spawn at this
+    /// moment: the phase's upstream barrier has NOT lifted (its
+    /// `depends_on` is not yet `Done`) AND the phase's `PhaseSpec.barrier`
+    /// is `true` (the default — the consumer did NOT declare it
+    /// pipeline-eligible). The early-spawn was unauthorized: a
+    /// `task_completed_listener` (or any other `spawn_tasks` caller) cannot
+    /// inject work into a downstream phase while the upstream is still
+    /// draining UNLESS the consumer explicitly declared
+    /// `PhaseSpec(barrier=False)` on the target phase to authorize the
+    /// pipelined edge. `task_hash` is the wire-canonical hash of the
+    /// rejected task; `phase_id` is the target phase whose barrier gate
+    /// rejected the spawn.
+    ///
+    /// Symmetric with the phase-state gate at dispatch time: the
+    /// scheduler-api's `PendingPool` only dispatches from phases whose
+    /// `phase_state` is `Active`, but `apply_spawn_tasks` would otherwise
+    /// add a task to a `Blocked` phase's queue (where it would sit
+    /// invisible until the upstream drained). Rejecting it here surfaces
+    /// the contract violation LOUD instead.
+    BarrierViolation {
+        task_hash: String,
+        phase_id: crate::PhaseId,
+    },
 }
 
 /// Pre-apply validation for a `SpawnTasks` batch. Single concern: walk
@@ -124,6 +147,15 @@ pub enum SpawnError {
 ///   validate automatically — the helper unions every
 ///   `(phase_id, task_id)` from the input batch onto the known-set
 ///   before walking the dep references.)
+/// * `phase_accepts_runtime_spawn(&PhaseId) -> bool` — is the target
+///   phase eligible to receive a runtime-spawned task right now? `true`
+///   iff EITHER the phase has already started (its upstream barrier
+///   lifted: `phase_state` ∈ `{Active, Draining, Drained, Done}`) OR
+///   the phase declared `PhaseSpec.barrier=False` (the pipelined-edge
+///   opt-in — early spawn authorized). `false` for a `Blocked`
+///   barrier=True phase. A `false` return surfaces
+///   `SpawnError::BarrierViolation` per task, mirroring the per-index
+///   shape of the other rejection classes.
 ///
 /// Dep resolution is keyed on the FULL `(phase_id, task_id)` identity
 /// (the same rule the scheduler-api `PendingPool::partition_ingest`
@@ -141,15 +173,17 @@ pub enum SpawnError {
 /// `(phase_id, task_id)` the `is_known_task_id` closure accepts AND
 /// (b) every `(phase_id, task_id)` contributed by the input batch
 /// itself, so within-batch dependencies validate.
-pub fn validate_spawn_tasks<I, F, G>(
+pub fn validate_spawn_tasks<I, F, G, H>(
     is_task_present_by_hash: F,
     is_known_task_id: G,
+    phase_accepts_runtime_spawn: H,
     tasks: Vec<TaskInfo<I>>,
 ) -> (Vec<TaskInfo<I>>, Vec<(usize, SpawnError)>)
 where
     I: Identifier,
     F: Fn(&str) -> bool,
     G: Fn(&crate::PhaseId, &str) -> bool,
+    H: Fn(&crate::PhaseId) -> bool,
 {
     let mut errors: Vec<(usize, SpawnError)> = Vec::new();
     let mut valid_tasks: Vec<TaskInfo<I>> = Vec::with_capacity(tasks.len());
@@ -217,6 +251,24 @@ where
                 SpawnError::UnknownDependency {
                     task_hash: hash,
                     dep_task_id,
+                },
+            ));
+            continue;
+        }
+        // Barrier interlock: target phase must accept runtime spawn right
+        // now — either it has already started (upstream barrier lifted) or
+        // the consumer declared `PhaseSpec.barrier=False` on it. A
+        // `Blocked` barrier=True phase refuses; the listener / spawner
+        // would otherwise inject work that the dispatch gate
+        // (`phase_state == Active`) silently leaves unrunnable until the
+        // upstream drained. Surface the rejection loud so a consumer who
+        // wants early-spawn declares barrier=False explicitly.
+        if !phase_accepts_runtime_spawn(&task.phase_id) {
+            errors.push((
+                idx,
+                SpawnError::BarrierViolation {
+                    task_hash: hash,
+                    phase_id: task.phase_id.clone(),
                 },
             ));
             continue;

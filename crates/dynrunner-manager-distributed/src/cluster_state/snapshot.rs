@@ -167,6 +167,14 @@ pub struct ClusterStateSnapshot<I> {
     /// predating this field restores as "no phase opted out" — wire-safe.
     #[serde(default)]
     pub phase_may_be_empty: std::collections::HashSet<PhaseId>,
+    /// Replicated `barrier=False` phase set (same static-graph lifecycle as
+    /// `phase_deps`): carried so a late-joiner / promoted node restores the
+    /// consumer's pipelined-edge opt-in and its `apply_spawn_tasks` barrier
+    /// interlock matches the live primary's. `#[serde(default)]` so a
+    /// snapshot from a peer predating this field restores as "every phase
+    /// is barrier=True" — wire-safe.
+    #[serde(default)]
+    pub phase_no_barrier: std::collections::HashSet<PhaseId>,
     /// Replicated role-capability 2P-set (C6) — the SINGLE source of
     /// `is_observer` / `can_be_primary`, carried so a late-joiner /
     /// reconnecting node converges the full capability roster (including
@@ -451,6 +459,7 @@ impl<I> Default for ClusterStateSnapshot<I> {
             primary_epoch: 0,
             phase_deps: HashMap::new(),
             phase_may_be_empty: HashSet::new(),
+            phase_no_barrier: HashSet::new(),
             capabilities: HashMap::new(),
             peer_holdings: HashMap::new(),
             task_outputs: HashMap::new(),
@@ -531,6 +540,7 @@ impl<I: Identifier> ClusterState<I> {
             primary_epoch,
             phase_deps,
             phase_may_be_empty,
+            phase_no_barrier,
             run_complete,
             run_aborted,
             terminal_outcome,
@@ -618,6 +628,10 @@ impl<I: Identifier> ClusterState<I> {
             // promoted / late-joining node restores the consumer's
             // empty-drain opt-out (same contract as `phase_deps`).
             phase_may_be_empty: phase_may_be_empty.clone(),
+            // Replicated `barrier=False` opt-in set — carried so a
+            // promoted / late-joining node restores the consumer's
+            // pipelined-edge opt-in (same contract as `phase_may_be_empty`).
+            phase_no_barrier: phase_no_barrier.clone(),
             // Carry the replicated role-capability 2P-set (the SINGLE
             // source of `is_observer`/`can_be_primary`) through the
             // snapshot so a late-joiner / promoted primary converges the
@@ -781,6 +795,7 @@ impl<I: Identifier> ClusterState<I> {
             primary_epoch,
             phase_deps,
             phase_may_be_empty,
+            phase_no_barrier,
             capabilities,
             peer_holdings,
             task_outputs,
@@ -898,6 +913,16 @@ impl<I: Identifier> ClusterState<I> {
         // safe side if a gate's opt-out were ever dropped).
         if self.phase_may_be_empty.is_empty() {
             self.phase_may_be_empty = phase_may_be_empty;
+        }
+        // `no_barrier` set: same static-graph lifecycle as `phase_deps` —
+        // adopt on first-bootstrap (local empty). The consumer's
+        // `PhaseSpec.barrier=False` declaration is set-once at run start
+        // (the topology fact), so a non-empty local already encodes the
+        // run's pipelined-edge opt-in; a divergent incoming set keeps the
+        // local for the same conservative first-write-wins reasoning as
+        // `phase_may_be_empty`.
+        if self.phase_no_barrier.is_empty() {
+            self.phase_no_barrier = phase_no_barrier;
         }
         // Capabilities: per-id 2P-set merge (C6). Monotone — `Departed`
         // sticks, `Advertised` ratchets `is_observer` and follows the

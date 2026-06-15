@@ -317,9 +317,30 @@ class PhaseSpec:
     ``TaskDefinition.get_phases()`` is informational only.
 
     ``barrier=True`` (the default) means the framework waits for full
-    drain of dependencies before any item of this phase dispatches.
-    The ``barrier=False`` path is reserved for future pipelined work
-    and is not used today.
+    drain of dependencies before any item of this phase dispatches —
+    the strict whole-of-upstream barrier every consumer historically
+    saw. ``barrier=False`` is the explicit PIPELINED-EDGE opt-in: the
+    framework starts the phase ``Active`` from the run's beginning, and
+    items dispatch as soon as their per-task ``task_depends_on`` graph
+    resolves (a phase-N+1 task whose specific phase-N predecessor has
+    completed dispatches without waiting for the rest of phase N).
+
+    The same flag also gates the ``task_completed_listener`` /
+    ``PrimaryHandle.spawn_tasks`` runtime-spawn path: spawning into a
+    ``barrier=True`` phase whose upstream is still draining is REJECTED
+    with a ``barrier_violation`` per-task entry (mirroring the
+    duplicate-hash / unknown-dep classes); spawning into a
+    ``barrier=False`` phase is ACCEPTED. The two enforcement sites —
+    the scheduler's phase-state gate and the runtime-spawn interlock —
+    consult the same per-phase flag, so the explicit declaration
+    (``barrier=False``) and the implicit listener-early-spawn form
+    carry one source of truth.
+
+    A ``barrier=False`` phase's downstream dependents still wait for
+    IT to be ``Done`` (each phase's own drain edge is the gate; only
+    the upstream-arrival gate is relaxed). Dependent ordering between
+    phases is preserved phase-by-phase — the relaxation is one-edge,
+    not transitive.
 
     ``may_be_empty`` (default ``False``) is the empty-drain honesty
     opt-out. By default the framework FAILS THE RUN LOUD if an activated

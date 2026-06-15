@@ -192,6 +192,9 @@ fn stamp_versions<I: Identifier>(
             | ClusterMutation::PrimaryChanged { .. }
             | ClusterMutation::PhaseDepsSet { .. }
             | ClusterMutation::PhaseMayBeEmptySet { .. }
+            // `PhaseNoBarrierSet` is version-LESS: a run-constant set-once
+            // fact (first-write-wins apply), like `PhaseMayBeEmptySet`.
+            | ClusterMutation::PhaseNoBarrierSet { .. }
             // `RespawnPolicySet` is version-LESS: a run-constant set-once
             // fact (first-write-wins apply), like `PhaseMayBeEmptySet`.
             | ClusterMutation::RespawnPolicySet { .. }

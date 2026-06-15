@@ -46,6 +46,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         ClusterMutation::PhaseMayBeEmptySet { phases }
     }
 
+    /// Build the `ClusterMutation::PhaseNoBarrierSet` carrying the
+    /// consumer's registered `barrier=False` opt-in set — the pipelined-
+    /// edge declaration — for emission paired with `PhaseDepsSet` from
+    /// every seed originator (same run-constant lifecycle as
+    /// [`Self::phase_may_be_empty_mutation`]). Single place the wire
+    /// shape (sorted `Vec` for deterministic frames) is built, so the
+    /// cold-seed and relocated-seed originators don't each re-spell it.
+    /// An empty set yields an empty-`Vec` mutation the apply arm treats
+    /// as a NoOp — harmless on the common strict-barrier run.
+    pub(crate) fn phase_no_barrier_mutation(&self) -> ClusterMutation<I> {
+        let mut phases: Vec<PhaseId> = self.phase_no_barrier_decl.iter().cloned().collect();
+        phases.sort();
+        ClusterMutation::PhaseNoBarrierSet { phases }
+    }
+
     /// Build the `ClusterMutation::RespawnPolicySet` carrying this
     /// coordinator's enabled respawn caps, for emission paired with
     /// `PhaseDepsSet` from every seed originator (same run-constant
@@ -324,6 +339,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // promoted primary inherits the same opt-out. NoOp on apply when the
         // set is empty (the common no-opt-out run).
         seed.push(self.phase_may_be_empty_mutation());
+        // Pair the static phase graph with the consumer's `barrier=False`
+        // opt-in set (the pipelined-edge declaration) so a promoted primary
+        // inherits the same set and its `apply_spawn_tasks` barrier
+        // interlock runs against the same gate the live primary used. NoOp
+        // on apply when the set is empty (the common strict-barrier run).
+        seed.push(self.phase_no_barrier_mutation());
         // Pair the respawn-policy CAPS with the phase graph (same
         // run-constant lifecycle) so a promoted primary inherits the
         // respawn decision's admission gate. Absent when the policy is
@@ -467,6 +488,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // static-graph lifecycle) so the relocated/promoted primary's
             // empty-drain policy inherits it. NoOp on apply when empty.
             self.phase_may_be_empty_mutation(),
+            // Pair the `barrier=False` opt-in (the pipelined-edge
+            // declaration) with the phase graph (same static-graph
+            // lifecycle) so the relocated/promoted primary's
+            // `apply_spawn_tasks` barrier interlock runs against the same
+            // gate the live primary used. NoOp on apply when empty.
+            self.phase_no_barrier_mutation(),
             ClusterMutation::DiscoveryDebtDeclared,
         ];
         // Pair the respawn-policy CAPS with the phase graph (same

@@ -269,6 +269,45 @@ impl<I: Identifier> PendingPool<I> {
         self.dispatch_backoff.set_params(base, cap);
     }
 
+    /// Mark the listed phases as `PhaseSpec.barrier=False`: their initial
+    /// state flips from `Blocked` → `Active` regardless of `depends_on`,
+    /// authorizing the scheduler to dispatch tasks from them as soon as
+    /// each task's per-task `task_depends_on` resolves (the per-task
+    /// graph still gates individual readiness; only the EXTRA
+    /// phase-level wait is dropped). Idempotent. Unknown phase ids are
+    /// silently ignored (a barrier flag for a phase not in the pool's
+    /// tracked set is not the pool's concern).
+    ///
+    /// Single concern: an initial-state override the manager applies once
+    /// at pool-construction time, reflecting the consumer's per-phase
+    /// `PhaseSpec.barrier` declaration. The pool itself does not own the
+    /// barrier-set source of truth — the manager carries the flags from
+    /// `LoadedTopology` (the pyo3 extractor) and replicates them via
+    /// `ClusterMutation::PhaseNoBarrierSet` for failover symmetry. Phases
+    /// not flipped here keep their default initial state (`Active` iff
+    /// no deps, else `Blocked`) — the documented strict-barrier
+    /// behaviour every existing consumer relies on.
+    ///
+    /// Caller contract: call BEFORE the pool sees any items (`extend` /
+    /// `mark_in_flight` / `seed_completed_phases`). Calling later is
+    /// defensively-safe (only `Blocked` flips, no in-flight bookkeeping
+    /// disturbed) but conceptually outside the per-phase-config
+    /// initialisation window.
+    pub fn set_no_barrier_phases(&mut self, phases: impl IntoIterator<Item = PhaseId>) {
+        for phase_id in phases {
+            // Only flip phases the pool actually tracks; an unknown phase
+            // is silently ignored (matches `seed_completed_phases`'s
+            // defensive shape — barrier flags from the topology and the
+            // pool's phase set are both derived from `get_phases()` so a
+            // mismatch is a defensive guard, not an expected path).
+            if let Some(state) = self.phase_state.get_mut(&phase_id)
+                && *state == super::types::PhaseState::Blocked
+            {
+                *state = super::types::PhaseState::Active;
+            }
+        }
+    }
+
     /// Earliest FUTURE instant at which a currently-backed-off queued
     /// task becomes dispatch-eligible again, or `None` when no task is
     /// parked under an unexpired backoff stamp. Event-driven managers

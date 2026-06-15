@@ -449,6 +449,43 @@ where
         // The closure-based signature lets the shared helper live in
         // `dynrunner-core` (no `ClusterState` dependency); each backend
         // supplies two closures that probe its own ledger shape.
+        // Snapshot the pool's phase-state map BEFORE building the
+        // validator closures — the validator's third closure
+        // (`phase_accepts_runtime_spawn`) needs a `&pool` view that
+        // doesn't keep the live `&mut self` borrow alive through the
+        // validator call, since the `tasks.iter()` snapshot above and
+        // the cluster_state probes inside the closures conflict with
+        // an overlapping `self.pool()` borrow. The composed gate is:
+        //   accept ⇔ phase is no-barrier (`PhaseSpec.barrier=False`)
+        //            OR every dep of phase has finished its work
+        //              (state ∈ {`Drained`, `Done`}).
+        // The `Drained|Done` half accepts the LEGITIMATE on_phase_end
+        // -> spawn_tasks idiom (the producer / lazy-spawn pattern):
+        // the upstream fires `on_phase_end` AT the drain edge, BEFORE
+        // `mark_phase_done`, so its state is `Drained` (not yet
+        // `Done`) and the spawn into the downstream-but-still-
+        // `Blocked` phase races the about-to-fire activation. A
+        // simpler `phase_state(Y) != Blocked` test would
+        // reject these legitimate spawns; walking Y's deps and
+        // accepting when every upstream has reached its drain edge
+        // captures the right semantic — the upstream's work is
+        // genuinely done, only the lifecycle-cascade hasn't run yet.
+        // The interlock still rejects the genuine BARRIER violation
+        // (any dep still `Active`/`Draining`/`Blocked` — actual live
+        // work upstream), which barrier=False is the consumer's
+        // opt-in to authorize.
+        // The two halves are joined here in one place — single source
+        // of truth for the runtime-spawn gate, mirrored by the
+        // promoted-secondary's `apply_spawn_tasks` site below.
+        let phase_states: std::collections::HashMap<_, _> = self
+            .pool()
+            .phase_state_iter()
+            .map(|(p, s)| (p.clone(), s))
+            .collect();
+        let phase_deps_for_check: std::collections::HashMap<_, _> =
+            self.cluster_state.phase_deps().clone();
+        let phase_no_barrier: std::collections::HashSet<dynrunner_core::PhaseId> =
+            self.cluster_state.phase_no_barrier_set().clone();
         let (valid_tasks, errors) = validate_spawn_tasks(
             // Duplicate detection over the LOGICAL ledger: a SETTLED hash
             // is a present task — re-spawning it must be rejected exactly
@@ -464,6 +501,41 @@ where
                 self.cluster_state
                     .task_hash_for_dep(phase_id, task_id)
                     .is_some()
+            },
+            // Runtime-spawn barrier interlock: the target phase must
+            // either be in the declared no-barrier set (the consumer's
+            // explicit `PhaseSpec.barrier=False` opt-in) OR have every
+            // upstream dep at-or-past its drain edge
+            // (`phase_state ∈ {Drained, Done}` — the upstream's work
+            // is genuinely done, only the lifecycle-cascade may not
+            // have flipped this phase from `Blocked` to `Active` yet).
+            // The latter accepts the LEGITIMATE on_phase_end -> spawn
+            // idiom; the rejection is the genuine BARRIER violation
+            // (an upstream still in `Active`/`Draining`/`Blocked`,
+            // i.e. real live work in flight). An unknown phase id
+            // (defensive — the validator's unknown-dep / unknown-phase
+            // machinery owns that class separately) treats the gate
+            // as open here.
+            |phase_id: &dynrunner_core::PhaseId| {
+                use dynrunner_scheduler_api::pending_pool::PhaseState;
+                if phase_no_barrier.contains(phase_id) {
+                    return true;
+                }
+                // Walk this phase's deps; accept iff every dep has
+                // reached drain (state ∈ {Drained, Done}). An undeclared
+                // phase (no entry in `phase_deps_for_check` and no
+                // entry in `phase_states`) treats the gate as open —
+                // the validator's other classes own that diagnosis.
+                let deps = match phase_deps_for_check.get(phase_id) {
+                    Some(d) => d,
+                    None => return true,
+                };
+                deps.iter().all(|dep| {
+                    phase_states
+                        .get(dep)
+                        .map(|s| matches!(s, PhaseState::Drained | PhaseState::Done))
+                        .unwrap_or(true)
+                })
             },
             tasks,
         );

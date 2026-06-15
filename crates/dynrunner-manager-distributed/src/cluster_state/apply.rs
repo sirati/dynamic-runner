@@ -335,6 +335,25 @@ impl<I: Identifier> ClusterState<I> {
                 self.phase_may_be_empty = phases.into_iter().collect();
                 ApplyOutcome::Applied
             }
+            ClusterMutation::PhaseNoBarrierSet { phases } => {
+                // Static config, set-once (mirrors `PhaseMayBeEmptySet`):
+                // the no-barrier set is run-constant — the consumer's
+                // declared per-phase `PhaseSpec.barrier=False` opt-in is
+                // a topology fact that does not change mid-run. A
+                // re-application once the local set is seeded is a no-op
+                // (idempotent re-origination / at-least-once replication).
+                // An empty incoming set on the common all-barriers run is
+                // the degenerate seed — applying it is harmless (the set
+                // stays empty).
+                if !self.phase_no_barrier.is_empty() {
+                    return ApplyOutcome::NoOp;
+                }
+                if phases.is_empty() {
+                    return ApplyOutcome::NoOp;
+                }
+                self.phase_no_barrier = phases.into_iter().collect();
+                ApplyOutcome::Applied
+            }
             ClusterMutation::RespawnPolicySet {
                 max_per_secondary,
                 max_total,

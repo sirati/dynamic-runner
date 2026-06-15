@@ -62,6 +62,18 @@ pub struct ClusterState<I> {
     /// intentional pure-sequencing gate. Empty on the common no-opt-out
     /// run.
     pub(super) phase_may_be_empty: std::collections::HashSet<PhaseId>,
+    /// Per-run static set of phases the consumer declared
+    /// `PhaseSpec.barrier=False` — the explicit pipelined-edge opt-in.
+    /// Set once at run start via `ClusterMutation::PhaseNoBarrierSet`,
+    /// paired with `phase_deps` (same static-graph lifecycle, originated
+    /// by the primary, applied on every node). Read by the runtime-spawn
+    /// barrier-violation interlock in `apply_spawn_tasks` (primary +
+    /// promoted-secondary): a target phase accepts runtime spawn iff it
+    /// has already started OR it is in this set. Mirrored on the pool's
+    /// initial-state assignment (`set_no_barrier_phases`) so a no-barrier
+    /// phase starts `Active` rather than `Blocked`. Empty on the common
+    /// strict-barrier run.
+    pub(super) phase_no_barrier: std::collections::HashSet<PhaseId>,
     /// Per-run static respawn-policy CAPS. Set once at run start via
     /// `ClusterMutation::RespawnPolicySet` (originated by the submitter
     /// primary in the same seed batch as `PhaseDepsSet`, same
@@ -584,6 +596,7 @@ where
             respawn_events,
             respawn_policy,
             phase_may_be_empty,
+            phase_no_barrier,
             phases_ended,
             custom_messages,
             custom_terminal_watermarks,
@@ -615,6 +628,9 @@ where
             // Replicated static phase-graph metadata — clone preserves it
             // (same lifecycle as `phase_deps`).
             phase_may_be_empty: phase_may_be_empty.clone(),
+            // Replicated static phase-graph metadata — clone preserves it
+            // (same lifecycle as `phase_deps` / `phase_may_be_empty`).
+            phase_no_barrier: phase_no_barrier.clone(),
             run_complete: *run_complete,
             run_aborted: run_aborted.clone(),
             // Replicated set-once verdict-count payload — clone preserves it
@@ -702,6 +718,7 @@ where
             primary_epoch_mirror: _primary_epoch_mirror,
             phase_deps,
             phase_may_be_empty,
+            phase_no_barrier,
             run_complete,
             run_aborted,
             terminal_outcome,
@@ -741,6 +758,7 @@ where
             .field("primary_epoch", primary_epoch)
             .field("phase_deps", phase_deps)
             .field("phase_may_be_empty", phase_may_be_empty)
+            .field("phase_no_barrier", phase_no_barrier)
             .field("run_complete", run_complete)
             .field("run_aborted", run_aborted)
             .field("terminal_outcome", terminal_outcome)
@@ -788,6 +806,7 @@ impl<I> Default for ClusterState<I> {
             primary_epoch_mirror: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             phase_deps: HashMap::new(),
             phase_may_be_empty: std::collections::HashSet::new(),
+            phase_no_barrier: std::collections::HashSet::new(),
             run_complete: false,
             run_aborted: None,
             terminal_outcome: None,

@@ -116,6 +116,7 @@ impl PyDistributedManager {
             types: task.types,
             phase_deps: task.phase_deps,
             phase_may_be_empty: task.phase_may_be_empty,
+            phase_no_barrier: task.phase_no_barrier,
             skip_existing,
             uses_file_based_items: task.uses_file_based_items,
             max_concurrent_per_type: task.max_concurrent_per_type,

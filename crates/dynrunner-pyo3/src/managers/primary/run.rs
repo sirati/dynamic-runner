@@ -153,6 +153,7 @@ impl PyPrimaryCoordinator {
         // thread for registration on the coordinator inside the detached
         // runtime (the empty-drain proceed-or-fail discriminator).
         let phase_may_be_empty = self.phase_may_be_empty.clone();
+        let phase_no_barrier = self.phase_no_barrier.clone();
         // Capture the scheduler-tuning snapshot here on the GIL thread so
         // the detached-runtime block can build the inner
         // `ResourceStealingScheduler` with the operator-supplied
@@ -579,6 +580,12 @@ impl PyPrimaryCoordinator {
                 // it as `PhaseMayBeEmptySet` paired with the phase graph. Same
                 // pre-run-setter contract as the other registrations.
                 primary.register_phase_may_be_empty(phase_may_be_empty.iter().cloned());
+                // Register the consumer's `barrier=False` opt-in BEFORE
+                // `run()` enters, so the cold-/relocated-seed originator
+                // emits it as `PhaseNoBarrierSet` paired with the phase
+                // graph. Same pre-run-setter contract as the other
+                // registrations.
+                primary.register_phase_no_barrier(phase_no_barrier.iter().cloned());
 
                 // Relay the SLURM-pipeline-parked deployment-mode job
                 // manager onto the inner coordinator BEFORE `run()`
