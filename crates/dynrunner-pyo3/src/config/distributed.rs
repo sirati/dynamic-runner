@@ -189,24 +189,6 @@ impl DistributedConfig {
 }
 
 impl DistributedConfig {
-    /// Default for the CONCRETE [`Self::connect_timeout`] accessor when
-    /// the operator left the knob unset — the historical 600s transport
-    /// patience the secondary's bootstrap dial keeps.
-    const CONNECT_TIMEOUT_DEFAULT_SECS: f64 = 600.0;
-
-    /// The concrete connect-timeout (explicit value or the 600s
-    /// default) — the SECONDARY's bootstrap-dial budget. The PRIMARY's
-    /// quorum-proceed window must NOT read this: it goes through
-    /// [`Self::connect_timeout_override`] +
-    /// `dynrunner_manager_distributed::derive_connect_timeout` so an
-    /// unset knob derives the deadline-fraction window.
-    pub(crate) fn connect_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs_f64(
-            self.connect_timeout_secs
-                .unwrap_or(Self::CONNECT_TIMEOUT_DEFAULT_SECS),
-        )
-    }
-
     /// The operator's explicit connect-timeout, `None` when unset — the
     /// input to the primary-side quorum-proceed-window derivation.
     pub(crate) fn connect_timeout_override(&self) -> Option<std::time::Duration> {

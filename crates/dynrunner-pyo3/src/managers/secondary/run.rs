@@ -54,7 +54,6 @@ impl PySecondaryCoordinator {
         let scheduler_config = self.scheduler_config.clone();
         let dist_keepalive = self.distributed_config.keepalive_interval();
         let dist_peer_timeout = self.distributed_config.peer_timeout();
-        let dist_connect_timeout = self.distributed_config.connect_timeout();
         let dist_connect_retry_delay = self.distributed_config.connect_retry_delay();
         let dist_keepalive_miss_threshold = self.distributed_config.keepalive_miss_threshold();
         let dist_retry_max_passes = self.distributed_config.retry_max_passes();
@@ -443,7 +442,15 @@ impl PySecondaryCoordinator {
                 let mut dial_failure_rx_for_recipe = Some(dial_failure_rx);
                 let dial_params = transport_factory::SecondaryDialParams {
                     addrs,
-                    connect_timeout: dist_connect_timeout,
+                    // #571 — bind the tunnel-dial deadline to 80% of the
+                    // outer `unconfigured_deadline` so the background dial
+                    // gives up before the outer deadline fires and signals
+                    // `wait_for_setup` to exit cleanly (IMPORTANT_TARGET
+                    // log + non-zero exit). The 80% fraction mirrors the
+                    // primary's quorum-wait shape and leaves a 20% buffer
+                    // for the coordinator's own setup machinery to see the
+                    // signal before the outer fence fires.
+                    connect_timeout: dist_unconfigured_deadline.mul_f64(0.8),
                     retry_delay: dist_connect_retry_delay,
                     secondary_id: secondary_id.clone(),
                     bootstrap_primary_id: dynrunner_core::SETUP_NODE_ID.to_string(),
@@ -460,8 +467,10 @@ impl PySecondaryCoordinator {
                 // any stall of THIS coordinator runtime (the production
                 // coordinator-saturation incident). Only `Send` channel
                 // handles cross back; the construct closure never touches
-                // Python.
-                let (mesh_host, (secondary_cert_info, mesh_send_handle)) =
+                // Python. The `tunnel_gave_up_rx` is `Send` (it is a
+                // `oneshot::Receiver<()>` with `(): Send`) so it can cross
+                // the thread boundary in the output tuple.
+                let (mesh_host, (secondary_cert_info, mesh_send_handle, tunnel_gave_up_rx)) =
                     MeshHost::<RunnerIdentifier>::on_dedicated_thread(move || async move {
                         let bundle = transport_factory::dial_secondary_mesh::<RunnerIdentifier>(
                             dial_params,
@@ -470,7 +479,7 @@ impl PySecondaryCoordinator {
                         // Cloneable mesh-send capability over the secondary's
                         // peer mesh; the secondary's `can_be_primary` marker
                         // reads `is_some()`. See `MeshSendHandle`.
-                        Ok((bundle.transport, (bundle.peer_cert_info, bundle.mesh_send)))
+                        Ok((bundle.transport, (bundle.peer_cert_info, bundle.mesh_send, bundle.tunnel_gave_up_rx)))
                     })
                     .await
                     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
@@ -836,6 +845,14 @@ impl PySecondaryCoordinator {
                 if let Some(rx) = panik_watcher.take_signal_rx() {
                     secondary.register_panik_signal_rx(rx);
                 }
+
+                // #571 — register the tunnel-gave-up signal receiver so
+                // `wait_for_setup` can exit cleanly (IMPORTANT_TARGET log +
+                // non-zero) when the background bootstrap dial exhausts its
+                // deadline (80% of `unconfigured_deadline_secs`) without
+                // connecting. The receiver came out of the mesh bundle
+                // across the `MeshHost::on_dedicated_thread` boundary.
+                secondary.register_tunnel_gave_up_rx(tunnel_gave_up_rx);
 
                 // The SHARED run-config handle the coordinator's
                 // `store_pushed_run_config` writes (the delivered `forwarded_argv`,
