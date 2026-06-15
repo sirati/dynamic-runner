@@ -15,11 +15,21 @@ use dynrunner_protocol_primary_secondary::ClusterMutation;
 
 use crate::ClusterState;
 
-use super::format::render_report;
+use super::format::{ResourceBaseline, render_report as render_report_full};
 use super::idle::IdleDetector;
 use super::reporter::{IDLE_THRESHOLD, SharedSnapshotSource};
 use super::stats::StatsSnapshot;
 use super::stats::StatsSnapshot as Snap;
+
+/// Pre-#575 `Option<String>` test seam — wraps the new
+/// [`render_report_full`] entry with an all-`None` resource baseline.
+/// The legacy tests below NEVER populate the snapshot's `avg_*` fields,
+/// so every resource line trips `present() == false` and the body is
+/// IDENTICAL to the pre-#575 output. #575-specific tests call the full
+/// surface directly so they can read the per-field baseline back.
+fn render_report(cur: &StatsSnapshot, prev: &StatsSnapshot) -> Option<String> {
+    render_report_full(cur, prev, &ResourceBaseline::default()).body
+}
 
 // ── fixture helpers ──
 
@@ -1208,4 +1218,143 @@ async fn driver_skips_late_stats_when_no_periodic_elapsed_while_down() {
     tokio::time::advance(Duration::from_millis(1)).await;
     let joined = tokio::time::timeout(Duration::from_secs(1), driver).await;
     assert!(joined.is_ok(), "driver must terminate on cancel");
+}
+
+// ── #575 resource-stat inclusion tests (per-field 25% threshold + zero-baseline) ──
+
+/// A snapshot pre-populated with averaged resource numbers — the test
+/// fixture for the #575 format paths.
+fn resource_snap(p50: u64, p90: u64, free_mem: u64) -> StatsSnapshot {
+    StatsSnapshot {
+        avg_mem_p50_bytes: Some(p50),
+        avg_mem_p90_bytes: Some(p90),
+        avg_total_free_memory_bytes: Some(free_mem),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn resource_avg_first_value_always_included_against_none_baseline() {
+    let cur = resource_snap(500 * 1024 * 1024, 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024);
+    let outcome = render_report_full(&cur, &StatsSnapshot::default(), &ResourceBaseline::default());
+    let body = outcome.body.expect("first-ever resource emit reports");
+    assert!(body.contains("mem P50"), "got: {body}");
+    assert!(body.contains("mem P90"), "got: {body}");
+    assert!(body.contains("free host memory"), "got: {body}");
+    // The next baseline advances per-field for every line we included.
+    assert_eq!(
+        outcome.next_resource_baseline.mem_p50_bytes,
+        Some(500 * 1024 * 1024)
+    );
+    assert_eq!(
+        outcome.next_resource_baseline.mem_p90_bytes,
+        Some(1024 * 1024 * 1024)
+    );
+    // P10/P30/P70/avg + swap + cpu are still None on the prev_printed
+    // side; their `value` was `None` (snapshot default), so they
+    // weren't rendered and the baseline stays None for them.
+    assert_eq!(outcome.next_resource_baseline.mem_p10_bytes, None);
+}
+
+#[test]
+fn resource_avg_30pct_move_included_10pct_move_omitted_per_field() {
+    let prev_baseline = ResourceBaseline {
+        mem_p50_bytes: Some(1000),
+        mem_p90_bytes: Some(1000),
+        ..Default::default()
+    };
+    let cur = StatsSnapshot {
+        avg_mem_p50_bytes: Some(1300),
+        avg_mem_p90_bytes: Some(1100),
+        ..Default::default()
+    };
+    let outcome = render_report_full(&cur, &StatsSnapshot::default(), &prev_baseline);
+    let body = outcome.body.expect("P50 30% move must trip the gate");
+    assert!(body.contains("mem P50"), "got: {body}");
+    assert!(
+        !body.contains("mem P90"),
+        "P90 10% move is below 25%, expected omitted; got: {body}"
+    );
+    // Per-field baseline advance: P50 moved → new baseline; P90 omitted
+    // → baseline unchanged.
+    assert_eq!(outcome.next_resource_baseline.mem_p50_bytes, Some(1300));
+    assert_eq!(outcome.next_resource_baseline.mem_p90_bytes, Some(1000));
+}
+
+#[test]
+fn resource_avg_zero_baseline_includes_first_nonzero() {
+    let prev_baseline = ResourceBaseline {
+        mem_p50_bytes: Some(0),
+        ..Default::default()
+    };
+    let cur = StatsSnapshot {
+        avg_mem_p50_bytes: Some(500),
+        ..Default::default()
+    };
+    let outcome = render_report_full(&cur, &StatsSnapshot::default(), &prev_baseline);
+    let body = outcome.body.expect("zero-baseline first nonzero must include");
+    assert!(body.contains("mem P50"), "got: {body}");
+    assert_eq!(outcome.next_resource_baseline.mem_p50_bytes, Some(500));
+}
+
+#[test]
+fn resource_avg_none_value_omitted_does_not_consume_baseline() {
+    let prev_baseline = ResourceBaseline {
+        mem_p50_bytes: Some(1000),
+        ..Default::default()
+    };
+    let cur = StatsSnapshot::default();
+    let outcome = render_report_full(&cur, &StatsSnapshot::default(), &prev_baseline);
+    assert!(outcome.body.is_none(), "None value -> nothing wake-worthy");
+    // Baseline must NOT regress (no-regress contract).
+    assert_eq!(outcome.next_resource_baseline.mem_p50_bytes, Some(1000));
+}
+
+#[test]
+fn resource_avg_omitted_unchanged_does_not_trigger_footer() {
+    let prev_baseline = ResourceBaseline {
+        mem_p50_bytes: Some(1000),
+        ..Default::default()
+    };
+    let cur = StatsSnapshot {
+        succeeded: 5,
+        avg_mem_p50_bytes: Some(1050),
+        ..Default::default()
+    };
+    let prev = StatsSnapshot {
+        succeeded: 0,
+        ..Default::default()
+    };
+    let outcome = render_report_full(&cur, &prev, &prev_baseline);
+    let body = outcome.body.expect("succeeded change reports");
+    assert!(body.contains("succeeded: 5"), "got: {body}");
+    // The resource line was OMITTED but does NOT contribute to the
+    // "Omitted unchanged stats." footer (resource lines are not in the
+    // wake-worthiness contract for the existing 13 operational metrics).
+    assert!(
+        !body.contains("Omitted unchanged stats."),
+        "resource-only unchanged must not trip the footer; got: {body}"
+    );
+}
+
+#[test]
+fn resource_avg_per_field_baseline_independence() {
+    let prev_baseline = ResourceBaseline {
+        mem_p50_bytes: Some(1000),
+        mem_p90_bytes: Some(1000),
+        ..Default::default()
+    };
+    let cur = StatsSnapshot {
+        avg_mem_p50_bytes: Some(1300),
+        avg_mem_p90_bytes: Some(1050),
+        ..Default::default()
+    };
+    let outcome = render_report_full(&cur, &StatsSnapshot::default(), &prev_baseline);
+    assert!(outcome.body.is_some());
+    assert_eq!(outcome.next_resource_baseline.mem_p50_bytes, Some(1300));
+    assert_eq!(
+        outcome.next_resource_baseline.mem_p90_bytes,
+        Some(1000),
+        "P90's baseline must NOT advance just because P50 emitted"
+    );
 }

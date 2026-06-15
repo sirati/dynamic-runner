@@ -12,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dynrunner_core::{Identifier, PhaseId, TaskOutputs, TerminalOutcomeCounts};
-use dynrunner_protocol_primary_secondary::{DiscoveryDebt, RoleTable, SecondaryCapacityRecord};
+use dynrunner_protocol_primary_secondary::{
+    DiscoveryDebt, RoleTable, SecondaryCapacityRecord, SecondaryResourceSampleRecord,
+};
 
 use crate::fulfillability_matcher::MatcherTriggerEvent;
 use crate::peer_lifecycle::PeerLifecycleEvent;
@@ -339,6 +341,29 @@ pub struct ClusterState<I> {
     /// reconstructs `alive_worker_count()` / `self.workers` from this
     /// replicated source rather than starting empty.
     pub(super) secondary_capacities: HashMap<String, SecondaryCapacityRecord>,
+    /// Latest aggregated resource-sample broadcast from each compute
+    /// secondary (#575) — keyed by `secondary` id, valued by the LWW
+    /// [`SecondaryResourceSampleRecord`] the secondary's
+    /// `SecondaryResourceSample` mutation supplied.
+    ///
+    /// LWW on the per-record stamp `(member_gen, emitted_at_ms)`: a
+    /// strictly-greater stamp wins (the apply rule overwrites in place),
+    /// equal or older is a NoOp. Member-gen takes precedence so a
+    /// respawned member's first aggregate dominates whatever stale
+    /// record the dead incarnation left; emit-time breaks ties within
+    /// one membership.
+    ///
+    /// Replicated CRDT data — clone preserves it; included in
+    /// snapshot/restore so a freshly-promoted primary and late-joining
+    /// observers hold the latest resource picture per secondary. Anti-
+    /// entropy-reconciled (see `digest.rs`).
+    ///
+    /// CONSUMED BY: the observer's important-update reporter — the
+    /// projection averages each field across `alive_secondary_members()`
+    /// and applies the per-field 25% inclusion threshold (#575). The
+    /// primary NEVER reads it for a scheduling decision; resource stats
+    /// are observability-only.
+    pub(super) latest_resource_samples: HashMap<String, SecondaryResourceSampleRecord>,
     /// Node-local per-task monotone "next seq" counter — the originator's
     /// half of the `TaskVersion` stamp. The originating primary (or a
     /// promoted secondary holding a `ClusterState`) bumps this at the
@@ -660,6 +685,7 @@ where
             peer_holdings,
             task_outputs,
             secondary_capacities,
+            latest_resource_samples,
             // Node-local originator counter — reset on clone (a cloned
             // replica originates nothing inherited from the source).
             task_seq: _task_seq,
@@ -751,6 +777,8 @@ where
             task_outputs: task_outputs.clone(),
             // Replicated CRDT data — clone preserves it.
             secondary_capacities: secondary_capacities.clone(),
+            // Replicated CRDT data (#575) — clone preserves it.
+            latest_resource_samples: latest_resource_samples.clone(),
             // Node-local originator counter — reset on clone (a cloned
             // replica originates nothing inherited from the source).
             task_seq: HashMap::new(),
@@ -831,6 +859,7 @@ where
             peer_holdings,
             task_outputs,
             secondary_capacities,
+            latest_resource_samples,
             task_seq,
             phase_event_tallies,
             retry_passes_used,
@@ -877,6 +906,7 @@ where
             .field("peer_holdings", peer_holdings)
             .field("task_outputs", &task_outputs.len())
             .field("secondary_capacities", secondary_capacities)
+            .field("latest_resource_samples", &latest_resource_samples.len())
             .field("task_seq", &task_seq.len())
             .field("phase_event_tallies", &phase_event_tallies.len())
             .field("retry_passes_used", &retry_passes_used.len())
@@ -928,6 +958,7 @@ impl<I> Default for ClusterState<I> {
             peer_holdings: HashMap::new(),
             task_outputs: HashMap::new(),
             secondary_capacities: HashMap::new(),
+            latest_resource_samples: HashMap::new(),
             task_seq: HashMap::new(),
             phase_event_tallies: HashMap::new(),
             retry_passes_used: HashMap::new(),

@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use dynrunner_core::IMPORTANT_TARGET;
 
-use super::format::render_report;
+use super::format::{ResourceBaseline, render_report};
 use super::idle::IdleDetector;
 use super::stats::StatsSnapshot;
 use crate::observer::lost_visibility::{EndedOutage, WakeNoteSlot};
@@ -123,6 +123,15 @@ impl Clock for TokioClock {
 /// detector. Construct once before driving the cadences.
 pub struct Reporter {
     last_announced: StatsSnapshot,
+    /// Per-field LAST-PRINTED baseline for the #575 resource-stat
+    /// averages (held alongside `last_announced` because the
+    /// resource lines advance per-field on emission, not atomically
+    /// with the whole snapshot — see `format::render_report`'s
+    /// returned `next_resource_baseline`). A resource line that was
+    /// OMITTED leaves its baseline slot untouched, so the next emit
+    /// decides inclusion against the same prior value the operator
+    /// last saw.
+    last_printed_resource: ResourceBaseline,
     idle: IdleDetector,
 }
 
@@ -136,6 +145,7 @@ impl Reporter {
     pub fn new() -> Self {
         Self {
             last_announced: StatsSnapshot::default(),
+            last_printed_resource: ResourceBaseline::default(),
             idle: IdleDetector::new(IDLE_THRESHOLD),
         }
     }
@@ -148,12 +158,18 @@ impl Reporter {
     /// report was emitted (the caller flushes the wake-note slot after a
     /// genuine emission — the emitted report is a wake-stream host).
     pub fn on_stats_tick(&mut self, snapshot: &StatsSnapshot) -> bool {
-        if let Some(report) = render_report(snapshot, &self.last_announced) {
+        let outcome = render_report(snapshot, &self.last_announced, &self.last_printed_resource);
+        if let Some(report) = outcome.body {
             // The whole report is one importance-channel event so the
             // dual-sink routes it to stdio atomically under
             // `--important-stdio-only` (C1's filter keys on the target).
             tracing::info!(target: IMPORTANT_TARGET, "periodic cluster stats (10m):\n{report}");
+            // Advance the operational baseline atomically + the
+            // per-field resource baseline per-line (the renderer wrote
+            // each included field into `next_resource_baseline`; an
+            // omitted line preserves its slot).
             self.last_announced = snapshot.clone();
+            self.last_printed_resource = outcome.next_resource_baseline;
             true
         } else {
             false

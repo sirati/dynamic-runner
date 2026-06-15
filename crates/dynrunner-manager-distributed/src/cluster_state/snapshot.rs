@@ -10,7 +10,9 @@
 use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::{Identifier, PhaseId, TaskInfo, TaskOutputs, TerminalOutcomeCounts};
-use dynrunner_protocol_primary_secondary::{DiscoveryDebt, SecondaryCapacityRecord};
+use dynrunner_protocol_primary_secondary::{
+    DiscoveryDebt, SecondaryCapacityRecord, SecondaryResourceSampleRecord,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::primary::retry_bucket::BucketKind;
@@ -250,6 +252,23 @@ pub struct ClusterStateSnapshot<I> {
     /// pre-feature shape).
     #[serde(default)]
     pub secondary_capacities: HashMap<String, SecondaryCapacityRecord>,
+    /// Replicated per-secondary aggregated resource-sample record (#575)
+    /// — the latest [`SecondaryResourceSampleRecord`] each compute
+    /// secondary has broadcast. Carried so a freshly-promoted primary
+    /// and late-joining observers hold the latest resource picture per
+    /// secondary on snapshot-restore, before any live broadcast
+    /// reaches them.
+    ///
+    /// Merge rule on `restore`: LWW on `(member_gen, emitted_at_ms)`,
+    /// SAME tuple the live `apply_secondary_resource_sample` arm
+    /// consumes. A snapshot entry wins iff its stamp is strictly
+    /// greater than the local entry's (or the local has no entry).
+    /// Idempotent + order-insensitive across (live, snapshot) arrival.
+    ///
+    /// `#[serde(default)]` keeps wire compat with pre-#575 senders
+    /// (missing field decodes as an empty map — the pre-feature shape).
+    #[serde(default)]
+    pub latest_resource_samples: HashMap<String, SecondaryResourceSampleRecord>,
     /// Projected alive-membership set: the ids whose `peer_state` entry
     /// is `Alive`. A PROJECTION of the module-private `peer_state` map
     /// (only `HashSet<String>` crosses the wire — `PeerEntry`/`PeerState`
@@ -464,6 +483,7 @@ impl<I> Default for ClusterStateSnapshot<I> {
             peer_holdings: HashMap::new(),
             task_outputs: HashMap::new(),
             secondary_capacities: HashMap::new(),
+            latest_resource_samples: HashMap::new(),
             alive_members: HashSet::new(),
             member_generations: HashMap::new(),
             run_complete: false,
@@ -556,6 +576,9 @@ impl<I: Identifier> ClusterState<I> {
             // co-present entry) ──
             task_outputs: _task_outputs,
             secondary_capacities,
+            // Replicated LWW per-secondary aggregated resource sample (#575)
+            // — head-safe (LWW on a per-record stamp, never join-bumped).
+            latest_resource_samples,
             // ── tail partition: the join-BUMPED grow-max map (F4) must
             // arrive AFTER every task state it counts (#358 order rule
             // projected onto the stream) ──
@@ -662,6 +685,11 @@ impl<I: Identifier> ClusterState<I> {
             // promoted primary and late-joining observers reconstruct
             // the full worker roster on snapshot-restore.
             secondary_capacities: secondary_capacities.clone(),
+            // Per-secondary aggregated resource sample (#575) — carried
+            // so a freshly-promoted primary and late-joining observers
+            // hold the latest resource picture on restore. LWW-merged
+            // on the restore side; head-safe.
+            latest_resource_samples: latest_resource_samples.clone(),
             // Project the alive-membership set out of `peer_state`:
             // ONLY ids whose entry is `Alive` (Dead is sticky-local;
             // absence must not be read as Dead). `PeerEntry`/`PeerState`
@@ -812,6 +840,7 @@ impl<I: Identifier> ClusterState<I> {
             peer_holdings,
             task_outputs,
             secondary_capacities,
+            latest_resource_samples,
             alive_members,
             member_generations,
             run_complete,
@@ -991,6 +1020,29 @@ impl<I: Identifier> ClusterState<I> {
         // entry when the snapshot interleaves with live broadcasts.
         for (secondary, record) in secondary_capacities {
             self.secondary_capacities.entry(secondary).or_insert(record);
+        }
+        // Per-secondary aggregated resource sample merge (#575): LWW on
+        // `(member_gen, emitted_at_ms)`. The SAME rule the live
+        // `apply_secondary_resource_sample` arm consumes — so a
+        // snapshot interleaving with live broadcasts converges
+        // deterministically. A blanket replace would clobber a
+        // legitimately-applied newer local entry; a strict insert-when-
+        // missing would freeze a stale value. The tuple-LWW resolves
+        // both.
+        for (secondary, incoming) in latest_resource_samples {
+            match self.latest_resource_samples.entry(secondary) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(incoming);
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let local = e.get();
+                    let incoming_stamp = (incoming.member_gen, incoming.emitted_at_ms);
+                    let local_stamp = (local.member_gen, local.emitted_at_ms);
+                    if incoming_stamp > local_stamp {
+                        e.insert(incoming);
+                    }
+                }
+            }
         }
         // Alive-membership merge: Dead-wins WITHIN one membership
         // incarnation / generation-advances re-admit, mirroring the

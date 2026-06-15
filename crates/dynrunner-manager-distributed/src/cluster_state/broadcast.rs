@@ -218,6 +218,15 @@ fn stamp_versions<I: Identifier>(
             | ClusterMutation::PeerRemoved { .. }
             | ClusterMutation::PeerResourceHoldingsUpdated { .. }
             | ClusterMutation::SecondaryCapacity { .. }
+            // `SecondaryResourceSample` (#575) is version-LESS: LWW per
+            // `secondary` on the per-record `(member_gen, emitted_at_ms)`
+            // stamp carried IN the record itself — no per-key TaskVersion
+            // arbitration is needed (the originating secondary stamps its
+            // own emit time + reads the membership generation from the
+            // cluster ledger). Same shape as `PeerRemoved` /
+            // `PeerResourceHoldingsUpdated` (per-incarnation stamp, no
+            // version mint here).
+            | ClusterMutation::SecondaryResourceSample { .. }
             | ClusterMutation::TasksSpawned { .. }
             // The F5 custom-message inbox mutations are version-LESS:
             // the `(origin, seq)` key is the originating secondary's
