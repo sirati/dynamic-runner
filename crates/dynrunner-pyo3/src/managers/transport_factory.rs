@@ -136,6 +136,19 @@ pub(crate) struct SecondaryMeshBundle<I: Identifier> {
     /// Cloneable mesh-send capability over the secondary's peer mesh.
     /// The manager reads `is_some()` as the primary-capability marker.
     pub mesh_send: Option<MeshSendHandle<I>>,
+    /// Fires `Ok(())` if the background bring-up dial exhausts its
+    /// deadline without ever connecting — the tunnel never appeared.
+    ///
+    /// The receiver is registered on the
+    /// `SecondaryCoordinator` via
+    /// `register_tunnel_gave_up_rx` so `wait_for_setup` can exit early
+    /// (log to `IMPORTANT_TARGET` + return a typed error) instead of
+    /// squatting until the outer `unconfigured_deadline` fires. Fires at
+    /// most ONCE; never fires if the dial succeeds. Dropped unfired on
+    /// successful dial so the receiver side returns `Err(RecvError)` —
+    /// the `wait_for_setup` arm selects on `Option` and parks on
+    /// `pending()` once the option is taken.
+    pub tunnel_gave_up_rx: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// Inputs to [`dial_secondary_mesh`] — the secondary's mesh-dial
@@ -497,12 +510,28 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
     // so the handle reflects the live `PeerNetwork`.
     let mesh_send = Some(transport.mesh_send_handle());
 
+    // Tunnel-gave-up signal: the background dial fires this if it exhausts
+    // its deadline without connecting (the tunnel never appeared). The
+    // receiver is registered on the `SecondaryCoordinator` so
+    // `wait_for_setup` can exit early — log to `IMPORTANT_TARGET` + return
+    // a typed error — instead of squatting until the outer
+    // `unconfigured_deadline` fires. The sender is consumed inside the
+    // `spawn_local` below (dropped on success, fired on deadline
+    // exhaustion), so the receiver side never needs to distinguish
+    // success-vs-timeout: it fires `Ok(())` only on timeout, and a
+    // successful dial lets it drop, making the coordinator's arm yield
+    // `Err(RecvError)` — handled by parking on `pending()`.
+    let (tunnel_gave_up_tx, tunnel_gave_up_rx) = tokio::sync::oneshot::channel::<()>();
+
     // Dial the bootstrap primary IN THE BACKGROUND: WSS, retrying
-    // transient failures until the configured deadline (`connect_timeout`,
-    // default 600s — the same window as the submitter's secondary-welcome
-    // wait). Each attempt sweeps the candidate list in order; the FIRST
-    // address that accepts carries the run (a v6-only partial `-R` bind
-    // connects over `[::1]`).
+    // transient failures until `connect_timeout` (default 80% of
+    // `unconfigured_deadline_secs` — sized so the coordinator's
+    // `wait_for_setup` arm receives the give-up signal before the outer
+    // `unconfigured_deadline` itself fires, giving the operator a clear
+    // IMPORTANT_TARGET log and a clean non-zero exit rather than a silent
+    // squat to the full 10-minute outer horizon). Each attempt sweeps the
+    // candidate list in order; the FIRST address that accepts carries the
+    // run (a v6-only partial `-R` bind connects over `[::1]`).
     //
     // The dial no longer gates the node's existence: the coordinator
     // enters its setup-wait immediately (beaconing + healable + retrying
@@ -511,10 +540,8 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
     // channel (`bootstrap_fold_handle`), the same path a re-dialed wire
     // takes, which retains the connected address so the wire stays
     // RE-dialable after a drop ("the tunnel is just a way of joining the
-    // mesh"). On deadline exhaustion the dial gives up LOUDLY; the node's
-    // fate stays owned by the coordinator's `unconfigured_deadline` (it
-    // may still be healed through its own acceptor by a peer that knows
-    // its recorded port).
+    // mesh"). On deadline exhaustion the dial fires `tunnel_gave_up_tx`
+    // so the coordinator can exit early and release the SLURM allocation.
     let fold = transport.bootstrap_fold_handle();
     tokio::task::spawn_local(async move {
         match dial_until_deadline(&target, connect_timeout, retry_delay, || {
@@ -530,18 +557,27 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
                     "bootstrap primary dial connected; folding the wire into the mesh"
                 );
                 fold.fold(bootstrap_primary_id, connected_addr, client);
+                // `tunnel_gave_up_tx` is dropped here (success path),
+                // making the receiver's await yield `Err(RecvError)` —
+                // the coordinator's arm treats this as "no give-up signal"
+                // and parks on `pending()` for the rest of setup.
             }
             Err(error) => {
-                // Loud give-up, no process kill: the unconfigured-deadline
-                // owns the node's fate, and an inbound heal through this
-                // node's own acceptor remains possible without the
-                // bootstrap wire.
+                // The tunnel never appeared within the dial deadline. Signal
+                // the coordinator so `wait_for_setup` can exit cleanly
+                // instead of squatting until the outer `unconfigured_deadline`
+                // fires. The error detail is captured here; the coordinator
+                // owns the IMPORTANT_TARGET emit (it has the secondary-id,
+                // the configured horizon, and the context to narrate cleanly).
                 tracing::error!(
                     error = %error,
-                    "bootstrap bring-up dial gave up (deadline/hard error); \
-                     the node keeps waiting under its unconfigured deadline \
-                     and stays healable through its own mesh acceptor"
+                    "bootstrap bring-up dial deadline exhausted (tunnel never appeared); \
+                     signalling coordinator to exit setup cleanly"
                 );
+                // Best-effort: the coordinator may have already exited (e.g.
+                // it received a RunComplete/RunAborted during setup). The
+                // `Err` is intentionally discarded.
+                let _ = tunnel_gave_up_tx.send(());
             }
         }
     });
@@ -557,6 +593,7 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
         transport,
         peer_cert_info,
         mesh_send,
+        tunnel_gave_up_rx,
     })
 }
 
@@ -1146,6 +1183,115 @@ mod tests {
                     .await
                     .expect("a WSS dial to the pre-allocated port must connect");
                 drop(bundle);
+            })
+            .await;
+    }
+
+    /// #571 — `tunnel_gave_up_rx` fires when the background dial
+    /// exhausts its deadline (the tunnel never appeared). Deterministic
+    /// under `tokio::time::pause` — no real sleep.
+    ///
+    /// Shape: a port with nothing listening, `connect_timeout=100ms` → the
+    /// signal fires within the deadline; the receiver resolves `Ok(())`.
+    #[tokio::test(start_paused = true)]
+    async fn tunnel_gave_up_rx_fires_on_deadline_exhaustion() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Nothing listens on this address.
+                let bootstrap_addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+                let bundle = dial_secondary_mesh::<RunnerIdentifier>(SecondaryDialParams {
+                    addrs: vec![bootstrap_addr],
+                    connect_timeout: Duration::from_millis(100),
+                    retry_delay: Duration::from_millis(10),
+                    secondary_id: "sec-0".to_string(),
+                    bootstrap_primary_id: "primary".to_string(),
+                    ipv4_address: Some("127.0.0.1".to_string()),
+                    ipv6_address: None,
+                    quic_bind_port: None,
+                    dial_failure_tx: None,
+                })
+                .await
+                .expect("dial_secondary_mesh must return promptly (dial is background)");
+
+                // Advance time past the dial deadline — the background
+                // spawn_local fires `tunnel_gave_up_tx` after its loop exits.
+                tokio::time::advance(Duration::from_millis(500)).await;
+                // Yield to let the spawned task run.
+                tokio::task::yield_now().await;
+
+                tokio::time::timeout(
+                    Duration::from_millis(50),
+                    bundle.tunnel_gave_up_rx,
+                )
+                .await
+                .expect("tunnel_gave_up_rx must resolve within the timeout")
+                .expect("tunnel_gave_up_rx must fire Ok(()) on dial deadline exhaustion");
+            })
+            .await;
+    }
+
+    /// #571 regression: a successful dial does NOT fire `tunnel_gave_up_rx`.
+    ///
+    /// Shape: a real listener appears before `connect_timeout` → the
+    /// background dial connects, drops `tunnel_gave_up_tx`, and the
+    /// receiver yields `Err(RecvError)` (the coordinator treats this as
+    /// "no give-up signal" and parks on `pending()`).
+    #[tokio::test]
+    async fn tunnel_gave_up_rx_does_not_fire_on_successful_dial() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let listener = dynrunner_transport_quic::WssListener::bind(
+                    "127.0.0.1:0".parse().unwrap(),
+                )
+                .await
+                .expect("test listener bind");
+                let addr = listener.local_addr();
+
+                // Accept in background — just enough to not leave the
+                // dial hanging on the WS handshake.
+                tokio::task::spawn_local(async move {
+                    let _conn = listener.accept().await.expect("test accept");
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                });
+
+                let bundle = dial_secondary_mesh::<RunnerIdentifier>(SecondaryDialParams {
+                    addrs: vec![addr],
+                    connect_timeout: Duration::from_secs(30),
+                    retry_delay: Duration::from_millis(50),
+                    secondary_id: "sec-ok".to_string(),
+                    bootstrap_primary_id: "primary".to_string(),
+                    ipv4_address: Some("127.0.0.1".to_string()),
+                    ipv6_address: None,
+                    quic_bind_port: None,
+                    dial_failure_tx: None,
+                })
+                .await
+                .expect("dial_secondary_mesh");
+
+                // Wait for the background dial to land (success path).
+                // The background spawn folds the wire then drops
+                // `tunnel_gave_up_tx`.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                // The receiver must yield Err(RecvError) — NOT Ok(()).
+                let result = tokio::time::timeout(
+                    Duration::from_millis(50),
+                    bundle.tunnel_gave_up_rx,
+                )
+                .await;
+                // Either timed-out (tx not yet dropped) OR RecvError
+                // (tx dropped on success). Both are correct — we must
+                // NOT see Ok(()).
+                if let Ok(inner) = result {
+                    assert!(
+                        inner.is_err(),
+                        "successful dial must NOT fire tunnel_gave_up_rx (got Ok(()))"
+                    );
+                }
+                // Timed-out: the tx is alive (connected) but not yet
+                // dropped — also correct; the receiver is parked.
             })
             .await;
     }
