@@ -14,6 +14,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SLURM_TEST_ENV_ENV_FILE:-${SCRIPT_DIR}/env.sh}"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
+# See up.sh for the SLURM_TEST_ENV_LIB_SH rationale. lib.sh owns the
+# netavark-safe container-removal helper used here — keeping the
+# teardown sequence in one place avoids the duplication that existed
+# while down.sh carried its own local remove_container().
+LIB_SH="${SLURM_TEST_ENV_LIB_SH:-${SCRIPT_DIR}/lib.sh}"
+# shellcheck disable=SC1090
+source "$LIB_SH"
 
 for arg in "$@"; do
   case "$arg" in
@@ -38,13 +45,6 @@ done
 # Only the final summary block prints anything, and it shows just the
 # host-visible /home path (the one persistent artifact).
 
-remove_container() {
-  local name="$1"
-  if podman container exists "$name"; then
-    podman rm -f "$name" >/dev/null
-  fi
-}
-
 remove_image() {
   local tag="$1"
   if podman image exists "$tag"; then
@@ -56,9 +56,9 @@ printf 'Stopping cluster...\n'
 
 # --- Containers --------------------------------------------------------------
 
-remove_container "$GATEWAY_NAME"
+remove_node_container "$GATEWAY_NAME"
 for i in $(seq 1 "$WORKER_COUNT"); do
-  remove_container "$(worker_container_name "$i")"
+  remove_node_container "$(worker_container_name "$i")"
 done
 
 # --- Network + images --------------------------------------------------------
