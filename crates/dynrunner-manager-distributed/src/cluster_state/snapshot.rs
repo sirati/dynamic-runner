@@ -607,6 +607,12 @@ impl<I: Identifier> ClusterState<I> {
             // snapshot's content), so it carries no signal of its own and
             // never crosses the wire — a restoring replica maintains its own.
             range_fold_memo: _range_fold_memo,
+            // node-local: the Blocked reverse-index (#547) is a pure
+            // derivation of the replicated `tasks` (`Blocked { on, .. }`
+            // entries), so it carries no signal of its own and never crosses
+            // the wire — a restoring replica re-builds it through the same
+            // per-entry `set_task_state` seam every merge routes through.
+            blocked_by: _blocked_by,
             // ── task-batch partition, file-served ──: a settled entry is
             // a `tasks` ledger entry whose fat body lives in the spill
             // file; the snapshot STREAM serves it per-key from the file

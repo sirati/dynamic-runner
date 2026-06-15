@@ -312,5 +312,17 @@ pub(crate) async fn handle_local_command<M, S, E, I>(
             );
             let _ = reply.send(Ok(()));
         }
+        PrimaryCommand::PumpSpawnContinuation => {
+            // No-op on the local backend (#547). The chunked SpawnTasks
+            // continuation is a distributed-primary-only pump signal — the
+            // local manager applies its `SpawnTasks` inline in a single
+            // call (no continuation state, no chunking), so a spurious
+            // PumpSpawnContinuation that ever reaches this handler is a
+            // benign tick. No reply oneshot exists on this variant.
+            tracing::debug!(
+                "PumpSpawnContinuation observed on the local backend; ignored \
+                 (the variant is the distributed primary's chunked spawn pump)"
+            );
+        }
     }
 }

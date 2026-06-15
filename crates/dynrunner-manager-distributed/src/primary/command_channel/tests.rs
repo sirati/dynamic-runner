@@ -1996,3 +1996,213 @@ async fn drain_yields_and_drains_past_budget_in_order() {
         })
         .await;
 }
+
+// ── Chunked SpawnTasks continuation (#547) ──
+
+/// A `SpawnTasks` input larger than `APPLY_SPAWN_CHUNK_SIZE` rides the
+/// continuation path: the COMMAND arm RETURNS between chunks (so sibling
+/// `select!` arms — heartbeat_tick, inbox, worker_mgmt — can re-fire), and
+/// only the final chunk fires the original reply, with ABSOLUTE input
+/// indices on the per-index error vec.
+///
+/// The load-bearing invariant is "the COMMAND arm RETURNS between
+/// chunks". The direct evidence is the per-chunk select!-arm-invocation
+/// count: a multi-chunk apply must trigger the COMMAND arm ≥ once per
+/// chunk (the original SpawnTasks + one PumpSpawnContinuation per
+/// remaining chunk). Pre-#547 the entire batch ran in ONE COMMAND-arm
+/// body, so chunk_arms would equal 1 regardless of input size.
+///
+/// Pins:
+///   1. The COMMAND arm returns between chunks — verified by the
+///      `chunk_arms` count == number of select! invocations the COMMAND
+///      arm won.
+///   2. The reply oneshot fires EXACTLY ONCE at the end with the full
+///      accumulated error list (empty here — all-pending input).
+///   3. Every input task lands in the CRDT — the chunked apply does not
+///      drop any task.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tasks_chunked_continuation_returns_to_select_between_chunks() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+            // 5 chunks' worth so the test exercises a sustained
+            // continuation (single chunk would only prove fast-path
+            // suppression of the kick).
+            const CHUNK: usize = PrimaryCoordinator::<
+                ResourceStealingScheduler,
+                FixedEstimator,
+                TestId,
+            >::APPLY_SPAWN_CHUNK_SIZE;
+            const N: usize = 5 * CHUNK + 7;
+            let mut tasks = Vec::with_capacity(N);
+            for i in 0..N {
+                let mut t = make_binary(&format!("t{i}"), 100);
+                t.task_id = format!("t{i}_id");
+                tasks.push(t);
+            }
+            seed_pool(&mut coordinator, &[&tasks[0].phase_id]);
+
+            // We own the command channel for this test (the operational
+            // loop would in production). Submit SpawnTasks; then drive a
+            // select! that mirrors the operational loop's COMMAND arm.
+            let mut command_rx = coordinator.command_rx.take().expect("command_rx armed");
+            let command_tx = coordinator.command_sender();
+
+            let (reply_tx, reply_rx) = oneshot::channel::<
+                Result<Vec<(usize, super::SpawnError)>, String>,
+            >();
+            command_tx
+                .send(PrimaryCommand::SpawnTasks {
+                    tasks: tasks.clone(),
+                    reply: reply_tx,
+                })
+                .await
+                .expect("submit SpawnTasks");
+
+            let mut none = None;
+            let mut chunk_arms = 0usize;
+            let mut reply_rx = reply_rx;
+            let errors = loop {
+                tokio::select! {
+                    cmd = command_rx.recv() => {
+                        let cmd = cmd.expect("command channel closed mid-test");
+                        chunk_arms += 1;
+                        super::handle_primary_command(&mut coordinator, cmd, &mut none).await;
+                    }
+                    received = &mut reply_rx => {
+                        break received
+                            .expect("reply oneshot closed without firing")
+                            .expect("apply returns Ok");
+                    }
+                }
+            };
+
+            // (1) Multiple chunks ⇒ COMMAND arm returned between chunks
+            // (each PumpSpawnContinuation tick is a separate
+            // `select!` re-entry). N = 5×CHUNK + 7 means the original
+            // SpawnTasks queues the first 256 + a continuation for the
+            // remaining ~1283; with CHUNK=256, the continuation needs
+            // ceil(1283/256) = 6 more chunks ⇒ ≥ 6 PumpSpawnContinuation
+            // arms after the initial SpawnTasks (≥ 7 total). Pre-#547
+            // chunk_arms == 1 regardless of input size — the SpawnTasks
+            // arm body would have processed the full batch inline. A
+            // chunk_arms count well above 1 is the direct evidence the
+            // wedge is gone.
+            let expected_min_arms = 1 + N.div_ceil(CHUNK);
+            assert!(
+                chunk_arms >= expected_min_arms,
+                "chunked SpawnTasks must release the COMMAND arm between \
+                 chunks (got {chunk_arms} arm invocations for a {N}-task \
+                 batch with CHUNK={CHUNK}; expected ≥ {expected_min_arms})",
+            );
+
+            // (3) Reply carries no errors (input was clean) and EVERY task
+            // applied to the CRDT.
+            assert!(
+                errors.is_empty(),
+                "no per-index errors expected: {errors:?}"
+            );
+            for t in &tasks {
+                let hash = compute_task_hash(t);
+                assert!(
+                    matches!(
+                        coordinator.cluster_state.task_state(&hash),
+                        Some(TaskState::Pending { .. })
+                    ),
+                    "task {:?} must land in Pending",
+                    t.task_id
+                );
+            }
+        })
+        .await;
+}
+
+/// A chunked SpawnTasks whose per-chunk validator produces per-index
+/// `SpawnError`s must thread the ABSOLUTE input index back to the caller
+/// (not the chunk-local index) — otherwise a multi-chunk path silently
+/// remaps the caller's per-index error semantics. Inject an
+/// `UnknownDependency` error at position CHUNK+1 (i.e. in the SECOND
+/// chunk) and assert the reply carries index = CHUNK+1, NOT 1.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tasks_chunked_absolute_index_translation() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+            const CHUNK: usize = PrimaryCoordinator::<
+                ResourceStealingScheduler,
+                FixedEstimator,
+                TestId,
+            >::APPLY_SPAWN_CHUNK_SIZE;
+            // CHUNK + 5 tasks total; index `CHUNK + 1` (in the SECOND
+            // chunk) declares an UnknownDependency. The other tasks are
+            // dep-less and apply cleanly.
+            let bad_index = CHUNK + 1;
+            let mut tasks = Vec::with_capacity(CHUNK + 5);
+            for i in 0..(CHUNK + 5) {
+                let mut t = make_binary(&format!("t{i}"), 100);
+                t.task_id = format!("t{i}_id");
+                if i == bad_index {
+                    t.task_depends_on = vec![TaskDep {
+                        task_id: "does_not_exist".into(),
+                        phase_id: t.phase_id.clone(),
+                        inherit_outputs: false,
+                    }];
+                }
+                tasks.push(t);
+            }
+            seed_pool(&mut coordinator, &[&tasks[0].phase_id]);
+
+            let mut command_rx = coordinator.command_rx.take().expect("command_rx armed");
+            let command_tx = coordinator.command_sender();
+
+            let (reply_tx, reply_rx) = oneshot::channel::<
+                Result<Vec<(usize, super::SpawnError)>, String>,
+            >();
+            command_tx
+                .send(PrimaryCommand::SpawnTasks {
+                    tasks: tasks.clone(),
+                    reply: reply_tx,
+                })
+                .await
+                .expect("submit SpawnTasks");
+
+            let mut none = None;
+            let mut reply_rx = reply_rx;
+            let errors = loop {
+                tokio::select! {
+                    cmd = command_rx.recv() => {
+                        let cmd = cmd.expect("command channel closed mid-test");
+                        super::handle_primary_command(&mut coordinator, cmd, &mut none).await;
+                    }
+                    received = &mut reply_rx => {
+                        break received
+                            .expect("reply oneshot closed without firing")
+                            .expect("apply returns Ok");
+                    }
+                }
+            };
+
+            // Exactly one error, at the ABSOLUTE input index of the bad
+            // task (not the chunk-local index 1).
+            assert_eq!(
+                errors.len(),
+                1,
+                "exactly one validator-rejected task: {errors:?}"
+            );
+            assert_eq!(
+                errors[0].0, bad_index,
+                "the per-index error must carry the ABSOLUTE input index \
+                 (got {}, expected {bad_index})",
+                errors[0].0,
+            );
+            assert!(
+                matches!(errors[0].1, super::SpawnError::UnknownDependency { .. }),
+                "the error class must be UnknownDependency, got {:?}",
+                errors[0].1,
+            );
+        })
+        .await;
+}
+

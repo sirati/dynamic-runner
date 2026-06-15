@@ -235,6 +235,47 @@ impl<I: Identifier> ClusterState<I> {
         self.tasks.iter()
     }
 
+    /// Read-only handle on the `blocked_by` reverse-index (#547) for the
+    /// invariant test in `tests/blocked_by_index.rs` — comparing the
+    /// incrementally-maintained index against a fresh ledger scan. NOT a
+    /// production accessor: `resume_blocked_on` reads `self.blocked_by`
+    /// directly (its sole production consumer), and exposing it would tempt
+    /// callers to keep external references across `set_task_state` writes
+    /// (which mutate the index) — a soundness footgun for a node-local
+    /// derivation.
+    #[cfg(test)]
+    pub(crate) fn blocked_by_for_test(
+        &self,
+    ) -> &std::collections::HashMap<String, std::collections::HashSet<String>> {
+        &self.blocked_by
+    }
+
+    /// Test-only seam: route a `Blocked → Blocked-different-on` rewrite
+    /// through the universal `set_task_state` write path. Exercises the
+    /// `blocked_by` reverse-index re-bucketing branch that no production
+    /// public mutation triggers today (the closest equivalent is the
+    /// snapshot-restore convergence path through `merge_task_state`), so
+    /// `tests/blocked_by_index.rs` can assert the invariant without
+    /// re-implementing the memo-maintaining write site.
+    #[cfg(test)]
+    pub(crate) fn rewrite_blocked_for_test(
+        &mut self,
+        hash: &str,
+        new_on: String,
+        task: TaskInfo<I>,
+        attempt: u32,
+    ) {
+        self.set_task_state(
+            hash,
+            TaskState::Blocked {
+                task,
+                on: new_on,
+                attempt,
+            },
+            None,
+        );
+    }
+
     pub fn iter_pending(&self) -> impl Iterator<Item = (&String, &TaskInfo<I>)> {
         self.tasks.iter().filter_map(|(h, s)| match s {
             TaskState::Pending { task, .. } => Some((h, task)),

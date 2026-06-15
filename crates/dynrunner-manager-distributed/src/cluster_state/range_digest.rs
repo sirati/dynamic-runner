@@ -118,11 +118,54 @@ impl<I: Identifier> ClusterState<I> {
             .tasks
             .get(hash)
             .map(|old| task_digest_term(hash, old));
+        // Capture the OLD slot's `Blocked.on` (if any) so the post-insert
+        // `blocked_by` reverse-index maintenance below removes `hash` from
+        // the old prereq's dependent set. Read here under the immutable
+        // `tasks.get(hash)` borrow so the index ops do not race the insert.
+        let old_blocked_on: Option<String> = self
+            .tasks
+            .get(hash)
+            .and_then(|old| match old {
+                TaskState::Blocked { on, .. } => Some(on.clone()),
+                _ => None,
+            });
+        // Capture the NEW slot's `Blocked.on` (if any) under the move-in's
+        // borrow so the post-insert add does not need to re-read the slot.
+        let new_blocked_on: Option<String> = match &new {
+            TaskState::Blocked { on, .. } => Some(on.clone()),
+            _ => None,
+        };
         let new_term = task_digest_term(hash, &new);
         self.tasks.insert(hash.to_string(), new);
         match old_term {
             Some(old) => self.range_fold_memo.swap(hash, old, new_term),
             None => self.range_fold_memo.add(hash, new_term),
+        }
+        // `blocked_by` reverse-index maintenance (#547). REMOVE first, ADD
+        // second — both ops keyed by the prereq hash the dependent waits on,
+        // so a Blocked→Blocked rewrite onto a DIFFERENT prereq correctly
+        // re-buckets (remove from the old key, add to the new). A
+        // Blocked→non-Blocked transition removes (resume); a non-Blocked→
+        // Blocked transition adds (cascade/spawn into Blocked); a same-`on`
+        // Blocked→Blocked rewrite is a no-op (the entry already names the
+        // hash). Borrow by ref so we can consult both at the second arm.
+        let same_on = old_blocked_on.as_deref() == new_blocked_on.as_deref();
+        if let Some(old_on) = old_blocked_on.as_deref()
+            && !same_on
+            && let Some(set) = self.blocked_by.get_mut(old_on)
+        {
+            set.remove(hash);
+            if set.is_empty() {
+                self.blocked_by.remove(old_on);
+            }
+        }
+        if let Some(new_on) = new_blocked_on
+            && !same_on
+        {
+            self.blocked_by
+                .entry(new_on)
+                .or_default()
+                .insert(hash.to_string());
         }
         // #520: build + emit the narration event from the POST-write state.
         // Skip the read+build entirely when no observer is narrating (the
