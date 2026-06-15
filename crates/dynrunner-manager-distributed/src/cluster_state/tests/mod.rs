@@ -32,6 +32,7 @@ mod non_task_convergence;
 mod panik;
 mod peer_lifecycle;
 mod peer_resources;
+mod phase_boundary_open;
 mod phase_ended;
 mod range_digest;
 mod respawn_ledger;

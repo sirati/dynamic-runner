@@ -143,6 +143,7 @@ fn peer_info_for(id: &str, net: &PeerNetwork<TestId>) -> PeerConnectionInfo {
         port: net.port(),
         is_observer: false,
         liveness_port: None,
+        slurm_job_id: None,
     }
 }
 

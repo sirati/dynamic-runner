@@ -165,6 +165,7 @@ mod tests {
             port,
             is_observer: false,
             liveness_port: Some(7000),
+            slurm_job_id: None,
         }
     }
 

@@ -115,6 +115,34 @@ pub enum MessageType {
     TimeoutResponse,
     PromotionVote,
     PromotionConfirm,
+    /// Primary -> all secondaries (#556 mesh-consensus respawn): the
+    /// round-1 opening frame, broadcasting the suspect list with the
+    /// round's `consensus_id` so the cluster can resolve false-positives
+    /// before any restart vote.
+    SuspectPeers,
+    /// Secondary -> primary (#556): per-suspect false-positive
+    /// contradiction echoed back to the primary's `SuspectPeers` round —
+    /// the witnessing secondary heard from a suspected peer recently and
+    /// drops it from the round's tally.
+    ResolvedPeer,
+    /// Primary -> all secondaries (#556): the round-2 commit frame.
+    /// After narrowing the suspect list, the primary broadcasts the
+    /// remaining candidates for restart confirmation; only on quorum
+    /// `RestartConfirm` does the actual respawn / scancel proceed.
+    RestartRequest,
+    /// Secondary -> primary (#556): the commit-frame ack with the
+    /// secondary's final per-candidate vote (`still_suspicious`) AND any
+    /// last-second retractions (`resolved_since`).
+    RestartConfirm,
+    /// Secondary -> suspected secondary (#556, point-to-point active
+    /// probe): elicits a fresh keepalive from a peer the prober has
+    /// flagged silent. Reusable via Router/Relay.
+    PeerProbe,
+    /// Suspected secondary -> prober (#556, point-to-point ack): the
+    /// reachable peer's reply to a `PeerProbe`. The prober credits it as
+    /// positive liveness evidence and forwards a `ResolvedPeer` to the
+    /// primary on the current `consensus_id`.
+    PeerProbeAck,
     /// Secondary signalling an unrecoverable local fault (e.g. peer
     /// mesh fully failed to form). Sent once, immediately before the
     /// secondary process exits non-zero. Primary treats the sender as

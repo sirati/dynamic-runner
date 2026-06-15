@@ -664,6 +664,42 @@ impl<I: Identifier> ClusterState<I> {
         self.phases_ended.contains(phase)
     }
 
+    /// Phase-boundary policy: `phase`'s formal boundary (its start edge AND
+    /// its complete edge) is OPEN iff every direct phase-dep of `phase` has
+    /// formally completed (its [`Self::phase_ended`] is `true`). The single
+    /// predicate the narrator's start/complete gates and the coordinator's
+    /// `phase_can_proceed` + `fire_initial_phase_starts` all consult, so the
+    /// invariant
+    ///
+    ///   * I1. phase P cannot FORMALLY START before every phase-dep of P has
+    ///     formally completed (regardless of barrier);
+    ///   * I2. phase P cannot FORMALLY COMPLETE before every phase-dep of P
+    ///     has formally completed (regardless of barrier),
+    ///
+    /// is enforced once, at one boundary, against the same replicated
+    /// `PhaseEnded` fact. Strict — `barrier=False` is the I3 dispatch
+    /// authorization (a task of P may execute before P's predecessor's
+    /// `PhaseEnded` fires; the runtime-spawn barrier interlock in
+    /// `apply_spawn_tasks` and the pool's `set_no_barrier_phases` own that
+    /// path), not a relaxation of the formal boundary; this predicate
+    /// therefore reads no barrier set.
+    ///
+    /// Vacuously `true` for a phase whose deps slot is missing from
+    /// `phase_deps` (an undeclared / no-deps phase has no upstream to wait
+    /// on — the strict initial-active root). Reads only the per-phase dep
+    /// slot and the `phases_ended` set; no live-bit consultation,
+    /// no transitive walk — the strict "all direct deps' `PhaseEnded`
+    /// fired" semantics ride the replicated fact directly. Transitivity
+    /// is implicit: a dep's own `PhaseEnded` could only have fired
+    /// against ITS own boundary, so the predicate is closed under the
+    /// dep chain by induction.
+    pub fn phase_boundary_open(&self, phase: &PhaseId) -> bool {
+        let Some(deps) = self.phase_deps.get(phase) else {
+            return true;
+        };
+        deps.iter().all(|dep| self.phases_ended.contains(dep))
+    }
+
     /// Per-phase derived view recomputed from the CRDT: for every phase
     /// that owns at least one task, the [`PhaseRollup`] of `has_any`,
     /// `has_live`, and `dispatchable`.

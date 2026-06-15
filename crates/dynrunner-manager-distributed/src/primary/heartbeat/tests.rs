@@ -241,9 +241,14 @@ fn empty_transport() -> (
 }
 
 /// Build a primary with one registered secondary that owns one in-flight
-/// task; advance time past the death threshold; verify the heartbeat
-/// report flags the secondary as dead and `requeue_dead_secondary`
-/// requeues the task and drops the worker.
+/// task; advance time past the hard backstop; verify the heartbeat
+/// report flags the secondary silent AND the post-#556 hard-backstop
+/// sweep seeds the consensus FSM's scheduling-suspect set (and escalates
+/// it into a consensus round) rather than unilaterally requeuing. The
+/// destructive declaration (roster drop, worker eviction, in-flight
+/// requeue) is reserved for the FSM-Restart commit path now — see
+/// `consensus_commit_runs_destructive_declaration_and_respawn` for the
+/// commit-path coverage.
 #[tokio::test(flavor = "current_thread")]
 async fn dead_secondary_requeues_in_flight_task() {
     let (transport, _sec_rx, _kept_alive_for_outgoing_clone) = empty_transport();
@@ -307,20 +312,32 @@ async fn dead_secondary_requeues_in_flight_task() {
     assert_eq!(report.silences[0].secondary_id, "dead-sec");
     primary.process_heartbeat_tick().await.unwrap();
 
-    assert_eq!(primary.workers.len(), 0, "dead worker should be evicted");
-    // After requeue, the in-flight item is back in the pool (queued),
-    // not in_flight.
-    assert_eq!(primary.pool().len(), 1, "in-flight task requeued");
-    let requeued: Vec<_> = primary.pool().iter().collect();
-    assert_eq!(requeued[0].identifier.0, "victim");
-    assert!(!primary.secondaries.contains_key("dead-sec"));
-    // The infra-distinction contract: a host dying mid-task is NOT the
-    // task's fault — the requeue must not charge the task's retry
-    // budget (no failed-ledger entry, no failure-class outcome).
+    // #556 hard backstop: the sweep no longer drops the peer or evicts
+    // workers — those are reserved for the FSM-Restart commit. The peer
+    // stays in the roster, the worker stays put, the in-flight task is
+    // not touched; only the consensus scheduling-suspect set is seeded.
+    assert!(
+        primary.secondaries.contains_key("dead-sec"),
+        "#556 hard backstop must NOT drop the silent peer; declaration is FSM-gated"
+    );
+    assert_eq!(
+        primary.workers.len(),
+        1,
+        "#556 hard backstop does not evict workers; eviction is on FSM-Restart commit"
+    );
+    assert!(
+        primary
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains("dead-sec"),
+        "#556 hard backstop must seed the FSM scheduling-suspect set"
+    );
+    // Retry-budget invariant is unchanged: no failure-class outcome,
+    // because nothing was requeued.
     assert_eq!(
         primary.failed_count(),
         0,
-        "a dead-host requeue must not consume the task's retry budget"
+        "a dead-host suspicion must not consume the task's retry budget"
     );
 }
 
@@ -682,8 +699,11 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
             );
             install_default_pool(&mut primary);
 
-            // sec-a is the wedged secondary; it owns one in-flight task that
-            // must be recovered into the pool and re-dispatched to sec-b.
+            // sec-a is the wedged secondary; pre-#556 the hard-backstop
+            // sweep used to drop it inline and kickstart a dispatch to the
+            // idle survivor. Post-#556 the sweep escalates the suspicion to
+            // mesh consensus and does NOT requeue or kickstart — there is
+            // no inline destructive declaration to drive any dispatch.
             register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
 
             // sec-b is the survivor with an IDLE worker that has a non-zero
@@ -710,96 +730,77 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
                 )]),
             );
 
-            // Install the worker-management bus so the requeue path's
-            // `TasksAdded` emit lands on a receiver we drive the recheck from.
+            // Install the worker-management bus so we can assert the
+            // hard-backstop sweep does NOT emit a `TasksAdded` — under
+            // #556 the destructive requeue (and its dispatch kickstart)
+            // is deferred to the FSM-Restart commit path.
             let (wm_tx, mut wm_rx) =
                 tokio_mpsc::unbounded_channel::<crate::worker_signal::WorkerMgmtSignal>();
             primary
                 .cluster_state_mut_for_test()
                 .install_worker_mgmt_sender(wm_tx);
 
-            // Sleep past the keepalive deadline so sec-a is dead. Refresh
-            // sec-b's keepalive immediately before the tick so only sec-a
-            // ends up in the dead list — the surviving-peer shape the
-            // single-death requeue takes in production.
+            // Sleep past the keepalive deadline so sec-a is silent.
+            // Refresh sec-b so only sec-a ends up suspect.
             tokio::time::sleep(Duration::from_millis(200)).await;
             primary.record_keepalive("sec-b");
             primary.process_heartbeat_tick().await.unwrap();
 
-            // sec-a is gone, sec-b survives, the recovered task is in the
-            // pool. These three are independent of the kickstart contract —
-            // they assert the requeue itself happened, so a regression in
-            // the requeue path can't masquerade as a kickstart failure.
+            // #556 hard-backstop semantics: sec-a is NOT dropped from the
+            // roster and the survivor is untouched. The FSM scheduling-
+            // suspect set carries sec-a, the destructive declaration is
+            // reserved for the FSM-Restart commit path (which the side-
+            // gate cannot pass here: 2 secondaries → threshold 3, only
+            // sec-b live → side-gate fails on `BroadcastRestart` entry).
             assert!(
-                !primary.secondaries.contains_key("sec-a"),
-                "dead secondary must be removed"
+                primary.secondaries.contains_key("sec-a"),
+                "#556 hard backstop must NOT drop the silent peer (FSM-gated)"
             );
             assert!(
                 primary.secondaries.contains_key("sec-b"),
-                "survivor must remain"
+                "the survivor is untouched"
             );
-
-            // Deferred-recheck contract: the requeue path emitted a
-            // `TasksAdded` rather than dispatching inline. Drain the coalesced
-            // batch and run the worker-management reaction synchronously —
-            // exactly what the operational loop's worker-management arm does.
-            let batch = crate::worker_signal::recv_worker_signal_batch(&mut wm_rx)
-                .await
-                .expect("dead-secondary requeue must emit a TasksAdded batch");
             assert!(
-                batch
-                    .signals
-                    .contains(&crate::worker_signal::WorkerMgmtSignal::TasksAdded),
-                "requeue path must emit TasksAdded; got {:?}",
-                batch.signals
+                primary
+                    .consensus_fsm
+                    .in_flight_suspects()
+                    .contains("sec-a"),
+                "#556 hard backstop must seed the FSM scheduling-suspect set"
             );
-            // Keep the survivor genuinely live across the reaction: in production
-            // sec-b keeps sending keepalives, so it never looks silent. Without
-            // the refresh the test's long pre-tick sleep would leave sec-b past
-            // the first silence stage, and the dispatch-altitude lazy oracle would
-            // (correctly) treat the freshly-assigned-to survivor as a silent
-            // holder and evict it — a test artifact, not the kickstart contract.
-            primary.record_keepalive("sec-b");
-            primary.react_to_worker_signal_batch(batch, &mut None).await;
 
-            // The load-bearing assertion: sec-b's outgoing channel saw a
-            // `TaskAssignment` — i.e. the recheck re-dispatched to the
-            // surviving idle worker, the very signal the production run was
-            // missing. The assignment is a QUEUED mesh send, so settle the
-            // production pump before draining the wire.
+            // #556 the hard backstop DOES emit a `TasksAdded` even
+            // though it does not destructively kill the silent peer.
+            // The nudge replaces the pre-#556 tail-of-`requeue_dead_secondary`
+            // emit and is the wakeup that drives the lazy
+            // dispatch-altitude requeue (`maybe_requeue_silent_held_work`)
+            // on the next worker-mgmt arm iteration. Without it a
+            // small-fleet failover where the FSM aborts on the
+            // side-gate would park (no event drives the recheck) —
+            // the run_20260615 producer_backstop wedge. The dispatch
+            // itself stays gated: see the `assignment.is_none()`
+            // assertion below.
+            assert!(
+                wm_rx.try_recv().is_ok(),
+                "#556 hard backstop must emit TasksAdded so the lazy \
+                 dispatch-altitude recheck wakes up on small-fleet \
+                 failovers where the FSM aborts on the side-gate"
+            );
             crate::primary::tests::settle_pump().await;
             let assignment = first_task_assignment(&mut sec_rxs[1]);
             assert!(
-                assignment.is_some(),
-                "survivor must receive TaskAssignment after dead-secondary requeue; \
-                 without the kickstart the recovered task hangs in the pool until \
-                 the next external event (which never came in the cohort run)"
+                assignment.is_none(),
+                "#556 hard backstop must NOT dispatch to the survivor; \
+                 the recovered task is not in the pool until consensus commits"
             );
-            if let Some(DistributedMessage::TaskAssignment {
-                target: _,
-                secondary_id,
-                ..
-            }) = assignment
-            {
-                assert_eq!(secondary_id, "sec-b");
-            }
-            // Post-dispatch the survivor's worker is no longer idle and the
-            // recovered task is no longer in the queued bucket — symmetric
-            // to the dispatch-success path elsewhere. `pool().len()` counts
-            // queued + in-flight + blocked, so checking `iter()` (queued-
-            // only) is the right shape: the task moved from queued to
-            // in-flight on the kickstart's dispatch call.
+            // The roster still believes sec-a holds its worker; nothing
+            // moved between buckets because the destructive primitive
+            // never ran. The survivor's worker stays idle.
             assert!(
                 primary
                     .workers
                     .iter()
-                    .any(|w| w.secondary_id == "sec-b" && !w.is_idle()),
-                "survivor's worker must flip to busy after the kickstart"
-            );
-            assert_eq!(
-                primary.pool().iter().count(),
-                0,
-                "recovered task must leave the queued bucket via dispatch kickstart"
+                    .any(|w| w.secondary_id == "sec-b" && w.is_idle()),
+                "the survivor's worker stays idle without a kickstart dispatch"
             );
         })
         .await;
@@ -1071,19 +1072,36 @@ async fn hard_backstop_declares_dead_regardless_of_dispatch_state() {
 
     // No idle survivor exists — the only worker is the dead-sec one. The
     // lazy oracle could not act (no idle worker to starve), so only the
-    // hard backstop can recover. Cross it.
+    // hard backstop can advance the recovery. Cross it.
     tokio::time::sleep(Duration::from_millis(200)).await;
     primary.process_heartbeat_tick().await.unwrap();
 
+    // #556: the hard backstop now triggers a CONSENSUS round rather than
+    // declaring the secondary dead inline. The peer stays in the roster
+    // and the worker stays put; the FSM holds the scheduling-suspect set
+    // and the destructive declaration is reserved for the FSM-Restart
+    // commit path (gated on a successful mesh round).
     assert!(
-        !primary.secondaries.contains_key("dead-sec"),
-        "hard backstop must declare the silent secondary dead"
+        primary.secondaries.contains_key("dead-sec"),
+        "#556 hard backstop must NOT drop the peer inline; declaration is FSM-gated"
     );
-    assert_eq!(primary.workers.len(), 0, "the dead worker is evicted");
+    assert_eq!(
+        primary.workers.len(),
+        1,
+        "#556 hard backstop does not evict workers; eviction is on FSM-Restart commit"
+    );
     assert_eq!(
         primary.pool().iter().count(),
-        1,
-        "the in-flight task is requeued into the pool"
+        0,
+        "#556 hard backstop does not requeue in-flight work; requeue is FSM-gated"
+    );
+    assert!(
+        primary
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains("dead-sec"),
+        "#556 hard backstop must seed the FSM scheduling-suspect set regardless of \
+         dispatch state"
     );
 }
 
@@ -1476,9 +1494,21 @@ async fn lazy_requeue_fires_at_dispatch_altitude_when_only_silent_held_work_rema
             };
             primary.react_to_worker_signal_batch(batch, &mut None).await;
 
+            // #556: the lazy oracle now triggers a LOCAL-ONLY requeue. The
+            // silent holder STAYS in the roster (no mesh-declaration of
+            // death without consensus) — the FSM is seeded with the
+            // scheduling-suspect set instead, and the destructive
+            // declaration is reserved for the FSM-Restart commit path.
             assert!(
-                !primary.secondaries.contains_key("sec-a"),
-                "lazy oracle declared the silent holder dead"
+                primary.secondaries.contains_key("sec-a"),
+                "#556 lazy path is local-only; the silent holder stays in roster"
+            );
+            assert!(
+                primary
+                    .consensus_fsm
+                    .in_flight_suspects()
+                    .contains("sec-a"),
+                "#556 lazy path must seed the FSM scheduling-suspect set"
             );
             assert!(
                 primary.secondaries.contains_key("sec-b"),
@@ -1632,10 +1662,23 @@ async fn genuinely_dead_secondary_without_beacon_is_still_reaped() {
     );
 
     primary.process_heartbeat_tick().await.unwrap();
+    // #556: the hard backstop now escalates suspicion to consensus
+    // rather than dropping the peer inline. The genuinely-silent peer
+    // must still REACH the recovery pipeline — here, by entering the
+    // FSM scheduling-suspect set. The destructive declaration is on
+    // the FSM-Restart commit path (covered by other tests).
     assert!(
-        !primary.secondaries.contains_key("dead-sec"),
-        "a genuinely dead secondary (no beacon AND no frames) is still reaped — \
-         the beacon's union refresh must not break real failure detection"
+        primary.secondaries.contains_key("dead-sec"),
+        "#556 hard backstop must NOT drop the peer inline; declaration is FSM-gated"
+    );
+    assert!(
+        primary
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains("dead-sec"),
+        "a genuinely dead secondary (no beacon AND no frames) must still reach \
+         the consensus pipeline — the beacon's union refresh must not break real \
+         failure detection"
     );
 }
 
@@ -1710,6 +1753,7 @@ fn peer_info(id: &str, ipv4: &str, port: u16) -> dynrunner_protocol_primary_seco
         port: 0,
         is_observer: false,
         liveness_port: Some(port),
+        slurm_job_id: None,
     }
 }
 
@@ -1778,24 +1822,50 @@ async fn starved_primary_does_not_remove_peer_whose_frames_are_queued() {
          the starved node must not author its removal (the false-removal \
          face of run_20260610_221140)"
     );
+    // #556 wire-shape: the same defer must also keep the FSM clean — a
+    // starved-author suspicion is what consensus is designed to prevent.
+    assert!(
+        !primary
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains("live-sec"),
+        "#556: the queued-frame deferral must not even seed the consensus \
+         scheduling-suspect set — the starved primary has no business \
+         escalating a peer whose frames it failed to drain"
+    );
 
     // GENUINE death is intact: the peer now sends NOTHING. The next
-    // sweep after a full silence window removes it. (The first tick
-    // after the sleep is itself deferred by the local-starvation gate —
-    // the test genuinely stalled the runtime — and the follow-up
-    // on-cadence tick performs the honest removal.)
+    // sweep after a full silence window REACHES the consensus pipeline.
+    // (The first tick after the sleep is itself deferred by the local-
+    // starvation gate — the test genuinely stalled the runtime — and
+    // the follow-up on-cadence tick performs the honest hand-off.)
     tokio::time::sleep(Duration::from_millis(200)).await;
     primary.process_heartbeat_tick().await.unwrap();
     assert!(
-        primary.secondaries.contains_key("live-sec"),
+        !primary
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains("live-sec"),
         "the lagged sweep right after a local stall is deferred (its ages \
-         reflect OUR stall)"
+         reflect OUR stall) — the FSM must stay quiet"
     );
     primary.process_heartbeat_tick().await.unwrap();
+    // #556: the genuine-death backstop now feeds the consensus FSM
+    // instead of dropping the peer inline. The peer stays in the roster
+    // — only the FSM-Restart commit path drops it — but the suspect set
+    // must carry it: the hand-off into the recovery pipeline still
+    // fires on cadence.
     assert!(
-        !primary.secondaries.contains_key("live-sec"),
-        "a truly silent peer (empty inbox, stale clocks) is still removed \
-         — the genuine-death backstop is intact"
+        primary.secondaries.contains_key("live-sec"),
+        "#556 hard backstop must NOT drop the peer inline; declaration is FSM-gated"
+    );
+    assert!(
+        primary
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains("live-sec"),
+        "a truly silent peer (empty inbox, stale clocks) is still handed off \
+         to the consensus pipeline — the genuine-death backstop is intact"
     );
 }
 
@@ -1908,24 +1978,41 @@ async fn removed_but_sending_peer_is_readmitted_on_next_frame() {
     );
 
     // No permanent immunity: the re-admitted member then goes GENUINELY
-    // silent — the same schedule removes it again, at the advanced
-    // generation. (The first post-stall tick is deferred by the local-
-    // starvation gate; the follow-up tick removes.)
+    // silent — the same schedule reaches the consensus pipeline again,
+    // at the advanced generation. (The first post-stall tick is
+    // deferred by the local-starvation gate; the follow-up tick fires.)
+    //
+    // #556 hand-off shape: the destructive declaration is FSM-gated, so
+    // the re-admitted member STAYS in the roster + replicated
+    // membership; the silence sweep's job is to seed the FSM
+    // scheduling-suspect set, and the FSM-Restart commit path owns the
+    // drop. The "no permanent immunity" contract is preserved at the
+    // hand-off seam.
     tokio::time::sleep(Duration::from_millis(200)).await;
     primary.process_heartbeat_tick().await.unwrap();
     primary.process_heartbeat_tick().await.unwrap();
     assert!(
-        !primary.secondaries.contains_key("sec-x"),
-        "a genuinely-dead re-admitted member is removed again"
+        primary.secondaries.contains_key("sec-x"),
+        "#556 hard backstop must NOT drop the re-admitted peer inline; \
+         declaration is FSM-gated"
     );
     assert!(
-        !primary.cluster_state_for_test().is_peer_alive("sec-x"),
-        "the gen-1 incarnation is killed by a gen-1 removal"
+        primary
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains("sec-x"),
+        "a genuinely-dead re-admitted member is silence-judged again — it \
+         reaches the consensus scheduling-suspect set on the same schedule"
+    );
+    assert!(
+        primary.cluster_state_for_test().is_peer_alive("sec-x"),
+        "the replicated membership stays Alive until the FSM-Restart \
+         commit path runs the destructive declaration"
     );
     assert_eq!(
         primary.cluster_state_for_test().peer_member_gen("sec-x"),
         1,
-        "the second removal kills the CURRENT incarnation"
+        "the gen-1 incarnation is the one the FSM is now judging"
     );
 
     // And a SecondaryFatalError from a removed id must NOT re-admit
@@ -2130,11 +2217,23 @@ async fn transport_arrival_keeps_starved_pump_node_from_removing_live_peer() {
          a node whose pump is starved must not author its removal (the \
          run_20260611_115429 false-removal face)"
     );
+    // #556 wire-shape: the same defer keeps the FSM clean — a starved-
+    // author suspicion is exactly what mesh consensus exists to prevent.
+    assert!(
+        !primary
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains("live-sec"),
+        "#556: a transport-arrival evidence deferral must not even seed \
+         the consensus scheduling-suspect set"
+    );
 
     // GENUINE death is intact: the pump catches up (drains the queued
     // keepalive into the slot — refreshing the slot clock and advancing
     // the drained edge), then the peer sends NOTHING further. The next
-    // on-cadence sweep past the backstop removes it.
+    // on-cadence sweep past the backstop hands the peer off to the
+    // consensus pipeline (the post-#556 hand-off shape; destructive
+    // declaration is on the FSM-Restart commit path).
     assert!(
         keep._mesh
             .as_mut()
@@ -2146,9 +2245,17 @@ async fn transport_arrival_keeps_starved_pump_node_from_removing_live_peer() {
     tokio::time::sleep(Duration::from_millis(120)).await;
     primary.process_heartbeat_tick().await.unwrap();
     assert!(
-        !primary.secondaries.contains_key("live-sec"),
-        "once the evidence ends (queue drained, peer silent at EVERY \
-         edge) the genuine-death backstop still removes on cadence"
+        primary.secondaries.contains_key("live-sec"),
+        "#556 hard backstop must NOT drop the peer inline; declaration is FSM-gated"
+    );
+    assert!(
+        primary
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains("live-sec"),
+        "once the evidence ends (queue drained, peer silent at EVERY edge) \
+         the genuine-death backstop still seeds the consensus pipeline on \
+         cadence"
     );
 }
 
@@ -2209,6 +2316,14 @@ async fn ingest_backlog_defers_staleness_removals_until_drained() {
          removals: the buried peer's frames may sit unattributed in the \
          same backed-up queue"
     );
+    // #556 wire-shape: the same defer must keep the FSM clean — the
+    // gate's job is to suppress the hand-off entirely, not just the
+    // destructive primitive.
+    assert!(
+        primary.consensus_fsm.in_flight_suspects().is_empty(),
+        "#556: an ingest-backlogged decider must NOT even seed the \
+         consensus scheduling-suspect set off staleness"
+    );
     assert!(primary.secondaries.contains_key("noisy-sec"));
     assert!(
         log.events().iter().any(|e| e.level == tracing::Level::WARN),
@@ -2239,14 +2354,35 @@ async fn ingest_backlog_defers_staleness_removals_until_drained() {
     // fixture artifact, not the defer-not-amnesty contract under test.
     primary.record_keepalive("noisy-sec");
     primary.process_heartbeat_tick().await.unwrap();
+    // #556 hand-off shape: the gate now lifts onto the consensus
+    // pipeline, not the destructive primitive. The genuinely-silent
+    // buried-sec STAYS in the roster (declaration is FSM-gated) but
+    // reaches the FSM scheduling-suspect set, which is the recovery
+    // pipeline's new entry point.
     assert!(
-        !primary.secondaries.contains_key("buried-sec"),
+        primary.secondaries.contains_key("buried-sec"),
+        "#556 hard backstop must NOT drop the peer inline; declaration is FSM-gated"
+    );
+    assert!(
+        primary
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains("buried-sec"),
         "the gate DEFERS, it does not amnesty: once the ingest path is \
-         healthy again the genuinely-silent peer is removed on cadence"
+         healthy again the genuinely-silent peer is handed off to the \
+         consensus pipeline on cadence"
     );
     assert!(
         primary.secondaries.contains_key("noisy-sec"),
         "the freshly-drained keepalive is honest evidence of life"
+    );
+    assert!(
+        !primary
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains("noisy-sec"),
+        "the freshly-drained keepalive keeps noisy-sec OUT of the \
+         consensus scheduling-suspect set"
     );
 }
 
@@ -2269,10 +2405,23 @@ async fn truly_dead_peer_removed_on_cadence_when_ingest_healthy() {
     primary.process_heartbeat_tick().await.unwrap();
     tokio::time::sleep(Duration::from_millis(120)).await;
     primary.process_heartbeat_tick().await.unwrap();
+    // #556 hand-off shape: with no ingest-backlog deferral, the silence
+    // sweep seeds the FSM scheduling-suspect set on the normal cadence —
+    // the recovery pipeline's entry point. The destructive declaration
+    // is still FSM-gated, so the peer stays in the roster until the
+    // FSM-Restart commit path runs it.
     assert!(
-        !primary.secondaries.contains_key("dead-sec"),
-        "no arrivals at EITHER edge: the dead peer is removed on the \
-         normal cadence — the ingest gate never blocks a healthy decider"
+        primary.secondaries.contains_key("dead-sec"),
+        "#556 hard backstop must NOT drop the peer inline; declaration is FSM-gated"
+    );
+    assert!(
+        primary
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains("dead-sec"),
+        "no arrivals at EITHER edge: the dead peer reaches the consensus \
+         pipeline on the normal cadence — the ingest gate never blocks a \
+         healthy decider"
     );
 }
 
@@ -2283,9 +2432,9 @@ async fn truly_dead_peer_removed_on_cadence_when_ingest_healthy() {
 /// REPLAY (run_20260611_200548): a CHRONICALLY starved primary — EVERY
 /// heartbeat tick's own inter-tick gap stretched past the starvation
 /// threshold, for a streak spanning many hard silence windows — must
-/// STILL remove a member that went permanently silent, and the removal
-/// must reach the respawn pipeline (a replacement is requested under the
-/// on-secondary-death policy).
+/// STILL hand a member that went permanently silent off to the recovery
+/// pipeline (post-#556: the consensus FSM's scheduling-suspect set, the
+/// new entry point to respawn).
 ///
 /// The production sequence: six secondaries fatal-exited while the
 /// promoted primary's node was saturated by uncapped workers; the
@@ -2299,10 +2448,18 @@ async fn truly_dead_peer_removed_on_cadence_when_ingest_healthy() {
 /// The pinned contract: chronic deferral must ESCALATE. Once the starved
 /// streak has spanned the hard silence window, sweeps resume on
 /// starvation-honest accrued time (each lagged gap contributes at most
-/// the starvation threshold), so a permanently-silent member is removed
-/// within a bounded number of lagged sweeps while a member with fresh
-/// evidence each round is never falsely declared (judged silence never
-/// exceeds wall silence).
+/// the starvation threshold), so a permanently-silent member reaches the
+/// consensus pipeline within a bounded number of lagged sweeps while a
+/// member with fresh evidence each round is never falsely suspected
+/// (judged silence never exceeds wall silence).
+///
+/// #556 note: the actual destructive declaration + respawn dispatch only
+/// fires after a successful consensus round, which a 2-secondary fleet
+/// can never reach (side-gate: `failover_quorum_threshold(3) = 3`, only
+/// 1 confirmer live). The respawn-pipeline-reached contract is covered
+/// by `consensus_commit_runs_destructive_declaration_and_respawn`. This
+/// test pins the chronic-starvation HAND-OFF: the suspect set is the
+/// new "did this dead member reach the recovery pipeline?" boundary.
 #[tokio::test(flavor = "current_thread")]
 async fn chronically_starved_primary_removes_dead_member_and_requests_respawn() {
     let local = tokio::task::LocalSet::new();
@@ -2358,7 +2515,16 @@ async fn chronically_starved_primary_removes_dead_member_and_requests_respawn() 
             // `survivor` keeps delivering frames each round (its
             // keepalives land in the inbox at the slot's ingest choke
             // point), exactly like the five surviving members did.
-            let mut removed_at_tick = None;
+            //
+            // #556: the hard backstop now seeds the consensus FSM
+            // scheduling-suspect set instead of dropping the peer inline,
+            // so the per-sweep boundary is "did `doomed` reach the
+            // suspect set?" — the new hand-off into the recovery
+            // pipeline. The destructive declaration + respawn dispatch
+            // only fires on FSM-Restart commit, which a 2-secondary
+            // fleet cannot reach (side-gate fails); commit-path coverage
+            // lives in `consensus_commit_runs_destructive_declaration_and_respawn`.
+            let mut suspected_at_tick = None;
             for tick in 0..8 {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 keep._slot
@@ -2367,19 +2533,24 @@ async fn chronically_starved_primary_removes_dead_member_and_requests_respawn() 
                     .deliver(keepalive_from("survivor"))
                     .expect("inbox live");
                 primary.process_heartbeat_tick().await.unwrap();
-                if !primary.secondaries.contains_key("doomed") {
-                    removed_at_tick = Some(tick);
+                if primary
+                    .consensus_fsm
+                    .in_flight_suspects()
+                    .contains("doomed")
+                {
+                    suspected_at_tick = Some(tick);
                     break;
                 }
             }
             assert!(
-                removed_at_tick.is_some(),
-                "a permanently-silent member must be removed within a \
-                 bounded number of chronically-lagged sweeps — perpetual \
-                 whole-sweep deferral must escalate once the starved \
-                 streak spans the hard silence window (the \
-                 run_20260611_200548 face: 30 minutes of deferral, six \
-                 dead members never removed)"
+                suspected_at_tick.is_some(),
+                "a permanently-silent member must reach the consensus \
+                 scheduling-suspect set within a bounded number of \
+                 chronically-lagged sweeps — perpetual whole-sweep \
+                 deferral must escalate once the starved streak spans \
+                 the hard silence window (the run_20260611_200548 face: \
+                 30 minutes of deferral, six dead members never reaching \
+                 the recovery pipeline)"
             );
             assert!(
                 primary.secondaries.contains_key("survivor"),
@@ -2388,59 +2559,34 @@ async fn chronically_starved_primary_removes_dead_member_and_requests_respawn() 
                  silence resets on every evidence advance)"
             );
             assert!(
-                !primary.cluster_state.is_peer_alive("doomed"),
-                "the replicated membership must mark the dead member removed"
+                !primary
+                    .consensus_fsm
+                    .in_flight_suspects()
+                    .contains("survivor"),
+                "the survivor must NOT be in the consensus suspect set"
             );
-
-            // The removal must reach the respawn pipeline through the
-            // SAME listener `enable_respawn` registered — replicate the
-            // lifecycle dispatcher fan-out the run loop drives
-            // (`run_peer_lifecycle_dispatcher` + the respawn select arm).
-            let mut lifecycle_rx = primary
-                .lifecycle_rx
-                .take()
-                .expect("lifecycle dispatcher channel installed at construction");
-            while let Ok(event) = lifecycle_rx.try_recv() {
-                for listener in &primary.peer_lifecycle_listeners {
-                    listener.on_event(&event);
-                }
-            }
-            let mut respawn_rx = primary
-                .respawn_lifecycle_rx
-                .take()
-                .expect("enable_respawn installed the respawn lifecycle channel");
-            let mut removed_events = 0;
-            while let Ok(event) = respawn_rx.try_recv() {
-                if matches!(
-                    &event,
-                    crate::peer_lifecycle::PeerLifecycleEvent::Removed { id, .. } if id == "doomed"
-                ) {
-                    removed_events += 1;
-                }
-                primary.dispatch_respawn_lifecycle(event);
-            }
-            assert_eq!(
-                removed_events, 1,
-                "exactly one Removed lifecycle event for the dead member \
-                 reaches the respawn pipeline"
+            assert!(
+                primary.secondaries.contains_key("doomed"),
+                "#556: the peer stays in the roster until the FSM-Restart \
+                 commit path runs the destructive declaration; the \
+                 chronic-starvation contract is hand-off, not drop"
             );
-
-            // The request was ACCEPTED: replicated ledger entry written
-            // and spawner invoked with a fresh id.
+            // No FSM-Restart commit can fire in a 2-secondary fleet
+            // (side-gate fails), so no destructive declaration runs and
+            // no respawn lifecycle event lands — `calls` stays zero and
+            // the replicated respawn ledger is empty. Commit-path
+            // coverage is independent; see the wiring tests.
             assert_eq!(
                 primary.cluster_state.respawn_events().len(),
-                1,
-                "the accepted respawn is recorded on the replicated ledger"
+                0,
+                "#556: respawn-ledger writes are FSM-commit-gated, \
+                 unreachable in this 2-secondary fleet"
             );
-            let outcome = primary
-                .respawn_tasks
-                .join_next()
-                .await
-                .expect("respawn spawn future present after dispatch")
-                .expect("respawn task must not panic");
-            assert!(outcome.result.is_ok());
-            assert_eq!(outcome.original_id, "doomed");
-            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "#556: no respawn dispatch without an FSM-Restart commit"
+            );
         })
         .await;
 }
@@ -2526,7 +2672,17 @@ async fn rewelcomed_dead_member_is_removed_within_hard_window() {
     // kill -9: dead-sec's frames STOP (zero ingest, wire dead). The
     // survivor keeps keepaliving every round; the decider ticks on
     // cadence.
-    let mut removed_at_tick = None;
+    //
+    // #556 hand-off shape: a wire-dead member must reach the consensus
+    // scheduling-suspect set within the hard silence window — the new
+    // entry point to the recovery pipeline. The destructive declaration
+    // (PeerRemoved + in-flight requeue) is reserved for the FSM-Restart
+    // commit path (covered by the wiring tests). In a 2-secondary fleet
+    // the side-gate fails, so commit cannot reach + the peer stays in
+    // the roster + the membership stays Alive — what THIS test pins is
+    // that the hand-off still fires under a duplicate-welcome
+    // typestate regression, not the commit outcome.
+    let mut suspected_at_tick = None;
     for tick in 0..6 {
         tokio::time::sleep(Duration::from_millis(60)).await;
         primary
@@ -2534,30 +2690,39 @@ async fn rewelcomed_dead_member_is_removed_within_hard_window() {
             .await
             .unwrap();
         primary.process_heartbeat_tick().await.unwrap();
-        if !primary.secondaries.contains_key("dead-sec") {
-            removed_at_tick = Some(tick);
+        if primary
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains("dead-sec")
+        {
+            suspected_at_tick = Some(tick);
             break;
         }
     }
     assert!(
-        removed_at_tick.is_some(),
-        "a wire-dead member must be PeerRemoved within the hard silence \
-         window on an unstarved primary, REGARDLESS of a duplicate-welcome \
-         state regression (the run_20260611_214327 wedge: never removed, \
-         respawn unreachable, task stranded)"
-    );
-    assert!(
-        !primary.cluster_state.is_peer_alive("dead-sec"),
-        "the authoritative PeerRemoved must land in the replicated membership"
+        suspected_at_tick.is_some(),
+        "a wire-dead member must reach the consensus scheduling-suspect \
+         set within the hard silence window on an unstarved primary, \
+         REGARDLESS of a duplicate-welcome state regression (the \
+         run_20260611_214327 wedge: never escalated, respawn unreachable, \
+         task stranded)"
     );
     assert!(
         primary.secondaries.contains_key("survivor"),
         "the keepaliving survivor must not be swept up"
     );
+    assert!(
+        !primary
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains("survivor"),
+        "the keepaliving survivor must NOT be in the consensus suspect set"
+    );
     assert_eq!(
         primary.pool().iter().count(),
-        1,
-        "the dead member's stranded in-flight task is requeued into the pool"
+        0,
+        "#556: in-flight work stays put until the FSM-Restart commit \
+         path runs the destructive requeue"
     );
 }
 
@@ -2606,21 +2771,34 @@ async fn keepalive_proven_pre_operational_member_is_silence_judged() {
     primary.process_heartbeat_tick().await.unwrap();
 
     // Then it dies: total silence past the hard window, decider healthy.
-    let mut removed = false;
+    // #556 hand-off shape: a keepalive-proven member must reach the
+    // consensus scheduling-suspect set on genuine death — the new entry
+    // point to the recovery pipeline. The destructive declaration stays
+    // FSM-gated; the bounded-gate law lifts the silence schedule's
+    // exemption, the FSM is the recipient.
+    let mut suspected = false;
     for _ in 0..6 {
         tokio::time::sleep(Duration::from_millis(60)).await;
         primary.process_heartbeat_tick().await.unwrap();
-        if !primary.secondaries.contains_key("wedged") {
-            removed = true;
+        if primary
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains("wedged")
+        {
+            suspected = true;
             break;
         }
     }
     assert!(
-        removed,
-        "a keepalive-proven member must be silence-judged (and removed on \
-         genuine death) regardless of its pre-Operational connection state"
+        suspected,
+        "a keepalive-proven member must be silence-judged (and handed off \
+         to the consensus pipeline on genuine death) regardless of its \
+         pre-Operational connection state"
     );
-    assert!(!primary.cluster_state.is_peer_alive("wedged"));
+    assert!(
+        primary.secondaries.contains_key("wedged"),
+        "#556: the peer stays in the roster until the FSM-Restart commit"
+    );
 }
 
 /// Root-cause guard: a duplicate `SecondaryWelcome` (the setup loop's
@@ -2795,9 +2973,15 @@ async fn bursty_starved_deaf_primary_defers_mass_removal() {
 
 /// Recovery half of the replay: ONE remote frame proves the local wire
 /// works, the collective episode ends, and the schedule resumes — the
-/// still-silent remotes are then declared on the very next sweep (no
-/// permanent amnesty), while the revived member and the co-located
-/// member survive.
+/// still-silent remotes are then handed off to the consensus pipeline
+/// on the very next sweep (no permanent amnesty), while the revived
+/// member and the co-located member survive.
+///
+/// #556: post-Layer 4, "declared" means "reaches the FSM scheduling-
+/// suspect set", not "dropped from the roster". The destructive
+/// declaration is FSM-gated and unreachable here (4-member fleet,
+/// threshold 4, only 2 live confirmers after recovery) — what's tested
+/// is the hand-off into the consensus pipeline.
 #[tokio::test(flavor = "current_thread")]
 async fn remote_evidence_ends_deferral_and_remaining_silent_are_declared() {
     let local = tokio::task::LocalSet::new();
@@ -2849,15 +3033,15 @@ async fn remote_evidence_ends_deferral_and_remaining_silent_are_declared() {
             // krater13's frame lands (the wire heals / was never the
             // remotes' fault): the episode is over. The OTHER two are
             // still genuinely silent past the backstop, and with live
-            // remote evidence in hand the schedule must declare them —
-            // bounded sweeps, no permanent amnesty.
+            // remote evidence in hand the schedule must hand them off
+            // to the consensus pipeline — bounded sweeps, no permanent
+            // amnesty.
             let mut declared = false;
             for _ in 0..8 {
                 primary.record_keepalive("krater13");
                 sweep_with_fresh_local(&mut primary, Duration::from_millis(60)).await;
-                if !primary.secondaries.contains_key("krater14")
-                    && !primary.secondaries.contains_key("krater15")
-                {
+                let suspects = primary.consensus_fsm.in_flight_suspects();
+                if suspects.contains("krater14") && suspects.contains("krater15") {
                     declared = true;
                     break;
                 }
@@ -2865,7 +3049,27 @@ async fn remote_evidence_ends_deferral_and_remaining_silent_are_declared() {
             assert!(
                 declared,
                 "once a remote frame proves the wire, the still-silent \
-                 remotes must be declared dead on the normal schedule"
+                 remotes must reach the consensus scheduling-suspect set \
+                 on the normal schedule"
+            );
+            // #556 hand-off shape: declaration is FSM-gated, so the
+            // still-silent remotes STAY in the roster; the destructive
+            // drop runs only on FSM-Restart commit (unreachable here —
+            // 4-member fleet, threshold 4, only 2 live confirmers).
+            assert!(
+                primary.secondaries.contains_key("krater14"),
+                "#556: still-silent remote stays in roster pending consensus commit"
+            );
+            assert!(
+                primary.secondaries.contains_key("krater15"),
+                "#556: still-silent remote stays in roster pending consensus commit"
+            );
+            assert!(
+                !primary
+                    .consensus_fsm
+                    .in_flight_suspects()
+                    .contains("krater13"),
+                "the revived remote is NOT in the consensus suspect set"
             );
             assert!(
                 primary.secondaries.contains_key("krater13"),
@@ -2881,10 +3085,16 @@ async fn remote_evidence_ends_deferral_and_remaining_silent_are_declared() {
 
 /// BOUNDED deferral (the hard backstop stays load-bearing): a fleet
 /// whose every remote is GENUINELY dead (the cohort-3 face — tunnel
-/// blips killed all secondaries at once) is still fully declared after
-/// the gate's escalation window, so requeue/respawn/fleet-dead all
-/// remain reachable. The sweep defers first (the gate engaged), then
-/// escalates and declares.
+/// blips killed all secondaries at once) is still fully handed off to
+/// the consensus pipeline after the gate's escalation window, so the
+/// recovery pipeline stays reachable. The sweep defers first (the
+/// gate engaged), then escalates and seeds the FSM scheduling-suspect set.
+///
+/// #556: post-Layer 4, the bounded-window escalation lands ALL silent
+/// remotes in the consensus suspect set. The destructive declaration
+/// (requeue/respawn/fleet-dead) is FSM-gated and unreachable here
+/// (4-member fleet, threshold 4, only 1 live confirmer = the
+/// co-located setup peer); that path is covered by the wiring tests.
 #[tokio::test(flavor = "current_thread")]
 async fn collective_silence_escalates_and_declares_after_bounded_window() {
     let local = tokio::task::LocalSet::new();
@@ -2925,12 +3135,13 @@ async fn collective_silence_escalates_and_declares_after_bounded_window() {
             // escalate within a bounded number of sweeps and let the
             // schedule declare the whole remote fleet.
             let mut deferred_a_hard_due_sweep = false;
-            let mut all_declared_at = None;
+            let mut all_suspected_at = None;
             for tick in 0..20 {
                 sweep_with_fresh_local(&mut primary, Duration::from_millis(60)).await;
-                let remotes_present = ["krater13", "krater14", "krater15"]
+                let suspects = primary.consensus_fsm.in_flight_suspects();
+                let suspect_remotes = ["krater13", "krater14", "krater15"]
                     .iter()
-                    .filter(|id| primary.secondaries.contains_key(**id))
+                    .filter(|id| suspects.contains(**id))
                     .count();
                 let report = primary.collect_heartbeat_report();
                 let past_hard = report
@@ -2939,11 +3150,11 @@ async fn collective_silence_escalates_and_declares_after_bounded_window() {
                     .filter(|s| s.secondary_id != "setup")
                     .filter(|s| s.silence > Duration::from_millis(100))
                     .count();
-                if remotes_present == 3 && past_hard == 3 {
+                if suspect_remotes == 0 && past_hard == 3 {
                     deferred_a_hard_due_sweep = true;
                 }
-                if remotes_present == 0 {
-                    all_declared_at = Some(tick);
+                if suspect_remotes == 3 {
+                    all_suspected_at = Some(tick);
                     break;
                 }
             }
@@ -2954,26 +3165,38 @@ async fn collective_silence_escalates_and_declares_after_bounded_window() {
                  exercising the escalation at all)"
             );
             assert!(
-                all_declared_at.is_some(),
+                all_suspected_at.is_some(),
                 "a genuinely all-dead remote fleet must still be fully \
-                 declared once the bounded escalation window elapses — \
-                 the hard backstop is the load-bearing forward-progress \
-                 guarantee (fleet-dead must stay reachable)"
+                 handed off to the consensus pipeline once the bounded \
+                 escalation window elapses — the hard backstop is the \
+                 load-bearing forward-progress guarantee (the recovery \
+                 pipeline must stay reachable)"
             );
+            // #556 hand-off shape: declaration is FSM-gated. The remotes
+            // stay in the roster + the replicated membership stays Alive
+            // + their in-flight work is not yet requeued — those are all
+            // FSM-Restart commit consequences, and the commit cannot
+            // fire in this fleet (only `setup` is a live confirmer; the
+            // threshold is 4).
             for id in ["krater13", "krater14", "krater15"] {
                 assert!(
-                    !primary.cluster_state.is_peer_alive(id),
-                    "{id}'s replicated membership must be Dead after escalation"
+                    primary.secondaries.contains_key(id),
+                    "#556: {id} stays in roster pending FSM-Restart commit"
                 );
             }
             assert!(
                 primary.secondaries.contains_key("setup"),
                 "the co-located member (fresh evidence every round) survives"
             );
+            assert!(
+                !primary.consensus_fsm.in_flight_suspects().contains("setup"),
+                "the co-located member must NOT be in the consensus suspect set"
+            );
             assert_eq!(
                 primary.pool().iter().count(),
-                3,
-                "the three remote-held in-flight tasks are requeued on declaration"
+                0,
+                "#556: in-flight requeue is FSM-commit-gated; the three \
+                 remote-held tasks stay put until consensus commits"
             );
         })
         .await;
@@ -3403,6 +3626,267 @@ async fn supplanted_holder_drops_on_task_complete_terminal() {
                 primary.supplanted_holder_for_test(&redirected_hash),
                 None
             );
+        })
+        .await;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// #556 mesh-consensus wire-up tests (Layer 4)
+// ────────────────────────────────────────────────────────────────────
+
+/// Build a transport carrying `n` operational secondaries. Returns the
+/// transport, the per-secondary outgoing receivers (one per secondary,
+/// keyed by index 0..n-1 → "sec-0".."sec-{n-1}"), and the inbound sender
+/// the primary's mesh reads from. Mirrors `two_secondary_transport`
+/// generalised for #556 tests where the side-gate forces at least 4
+/// confirming secondaries (`failover_quorum_threshold(6) = 4`).
+#[allow(clippy::type_complexity)]
+fn n_secondary_transport(
+    n: usize,
+) -> (
+    ChannelPeerTransport<TestId>,
+    Vec<tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>>,
+    tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+) {
+    let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+    let mut rxs = Vec::with_capacity(n);
+    let mut outgoing = HashMap::new();
+    for i in 0..n {
+        let (tx, rx) = tokio_mpsc::unbounded_channel();
+        outgoing.insert(format!("sec-{i}"), tx);
+        rxs.push(rx);
+    }
+    (
+        ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx),
+        rxs,
+        incoming_tx,
+    )
+}
+
+/// #556 Test 2 (wiring): when the side-gate fails, the FSM aborts the
+/// round and the primary does NOT mesh-declare the suspect dead.
+///
+/// Two-secondary fleet (`failover_quorum_threshold(3) = 3`) with one
+/// suspect: `live_peer_count = 1 < 3`, so on the `BroadcastRestart`
+/// transition the FSM emits `Abort{reason: side-gate failure}`. The
+/// wiring's `commit_consensus_restart` is NEVER called; no `PeerRemoved`
+/// is broadcast; the suspect stays in `self.secondaries`.
+#[tokio::test(flavor = "current_thread")]
+async fn consensus_side_gate_failure_does_not_mesh_declare_dead() {
+    use std::time::Instant;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
+            let (mut primary, _mesh) = build_primary_pumped(
+                config(Duration::from_millis(50), 2),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+            install_default_pool(&mut primary);
+            // Two secondaries: sec-a (the suspect), sec-b (the lone non-
+            // suspected confirmer). `total_known_members = 3` (primary +
+            // 2 secondaries); `failover_quorum_threshold(3) = 3`;
+            // `live_peer_count = 1` (sec-b alone) < 3 → side-gate fails.
+            register_operational_secondary(&mut primary, "sec-a", 0, "task-a");
+            register_operational_secondary(&mut primary, "sec-b", 1, "task-b");
+
+            let t0 = Instant::now();
+            let mut suspect = std::collections::BTreeSet::new();
+            suspect.insert("sec-a".to_string());
+            primary.set_consensus_scheduling_suspect(suspect.clone());
+            // Escalate at t0: the FSM emits `SuspectPeers` and enters
+            // CollectingResolutions with `deadline = t0 + 15s`.
+            primary.consensus_escalate_at(suspect, t0).await;
+
+            // Fast-forward past the resolution deadline so the FSM
+            // attempts to enter BroadcastRestart, where the side-gate
+            // fires. No real wall-clock waiting.
+            let t_past_deadline = t0
+                + crate::primary::consensus::RESOLUTION_DEADLINE
+                + Duration::from_millis(1);
+            primary.drive_consensus_fsm_at(t_past_deadline).await;
+
+            // Settle any queued sends, then assert nothing destructive
+            // landed on the wire.
+            crate::primary::tests::settle_pump().await;
+            let mut all_removed: Vec<(String, RemovalCause)> = Vec::new();
+            for rx in &mut sec_rxs {
+                all_removed.extend(collect_peer_removed(rx));
+            }
+            assert!(
+                all_removed.is_empty(),
+                "#556 side-gate failure must NOT broadcast PeerRemoved; saw {all_removed:?}"
+            );
+            // Both secondaries STILL in the roster (no membership change).
+            assert!(
+                primary.secondaries.contains_key("sec-a"),
+                "the suspected secondary must stay in the roster on side-gate failure"
+            );
+            assert!(
+                primary.secondaries.contains_key("sec-b"),
+                "the confirming secondary must stay in the roster"
+            );
+        })
+        .await;
+}
+
+/// #556 Test 3 (wiring): the lazy dispatch-altitude path's local
+/// requeue (`requeue_silent_held_work_locally`) recovers in-flight tasks
+/// back to the pool WITHOUT mesh-declaring the silent peer dead.
+///
+/// Two secondaries with in-flight work; call the local-requeue path
+/// directly with both as suspects; assert NO `PeerRemoved` mutation
+/// fans out and both peers stay in `self.secondaries`.
+#[tokio::test(flavor = "current_thread")]
+async fn requeue_silent_held_work_locally_does_not_mesh_declare_dead() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
+            let (mut primary, _mesh) = build_primary_pumped(
+                config(Duration::from_millis(50), 2),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+            install_default_pool(&mut primary);
+            register_operational_secondary(&mut primary, "sec-a", 0, "task-a");
+            register_operational_secondary(&mut primary, "sec-b", 1, "task-b");
+
+            let mut suspects = std::collections::BTreeSet::new();
+            suspects.insert("sec-a".to_string());
+            suspects.insert("sec-b".to_string());
+            // Local-only requeue: drains in-flight back to pool, emits
+            // TaskRequeued mutations, records supplanted_holders fence —
+            // but does NOT broadcast PeerRemoved / TimeoutDetected /
+            // drop from roster.
+            primary
+                .requeue_silent_held_work_locally(&suspects)
+                .await
+                .expect("local requeue must succeed");
+
+            crate::primary::tests::settle_pump().await;
+            let mut all_removed: Vec<(String, RemovalCause)> = Vec::new();
+            for rx in &mut sec_rxs {
+                all_removed.extend(collect_peer_removed(rx));
+            }
+            assert!(
+                all_removed.is_empty(),
+                "#556 lazy local-requeue MUST NOT broadcast PeerRemoved; saw {all_removed:?}"
+            );
+            // Both peers stay in the roster (still alive for membership).
+            assert!(primary.secondaries.contains_key("sec-a"));
+            assert!(primary.secondaries.contains_key("sec-b"));
+        })
+        .await;
+}
+
+/// #556 Test 1 (wiring): a successful consensus round drives the
+/// destructive declaration AND the respawn dispatch through the FSM
+/// commit path. Uses a 5-secondary fleet so the side-gate passes
+/// (`failover_quorum_threshold(6) = 4`; suspect 1 secondary → 4 live
+/// confirmers = threshold).
+///
+/// The test side-steps the time-deadlines by:
+/// (a) calling `consensus_escalate_at(t0, ...)` so the round starts at
+///     a deterministic instant;
+/// (b) driving the FSM at `t0` so the opening `SuspectPeers` emits;
+/// (c) driving the FSM at `t0 + RESOLUTION_DEADLINE + 1ms` so the
+///     transition into `CollectingConfirmations` fires and the
+///     `RestartRequest` broadcast goes out;
+/// (d) feeding `RestartConfirm` from every non-suspected secondary so
+///     the all-responded fast-path commits `Restart{targets=[sec-0]}`
+///     and the wiring's `commit_consensus_restart` runs the destructive
+///     declaration.
+#[tokio::test(flavor = "current_thread")]
+async fn consensus_commit_runs_destructive_declaration_and_respawn() {
+    use std::time::Instant;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut sec_rxs, _incoming_tx) = n_secondary_transport(5);
+            let (mut primary, _mesh) = build_primary_pumped(
+                config(Duration::from_millis(50), 2),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+            install_default_pool(&mut primary);
+            for i in 0..5 {
+                let id = format!("sec-{i}");
+                let label = format!("task-{i}");
+                register_operational_secondary(&mut primary, &id, i as u32, &label);
+            }
+
+            // Suspect sec-0; confirmers are sec-1..sec-4.
+            let t0 = Instant::now();
+            let mut suspect = std::collections::BTreeSet::new();
+            suspect.insert("sec-0".to_string());
+            primary.set_consensus_scheduling_suspect(suspect.clone());
+            primary.consensus_escalate_at(suspect, t0).await;
+
+            // Roll past the resolution deadline to surface the
+            // BroadcastRestart → CollectingConfirmations transition.
+            let t_round2 =
+                t0 + crate::primary::consensus::RESOLUTION_DEADLINE + Duration::from_millis(1);
+            primary.drive_consensus_fsm_at(t_round2).await;
+
+            // Read the in-flight consensus_id off the FSM so the
+            // confirm replies key against the round.
+            let consensus_id = primary
+                .consensus_fsm
+                .current_consensus_id()
+                .expect("FSM must be mid-round after escalate + deadline roll");
+
+            // Feed `RestartConfirm` from every non-suspected secondary,
+            // each reporting sec-0 still-suspicious. All-responded fast
+            // path commits `Restart{targets=[sec-0]}` synchronously.
+            for i in 1..5usize {
+                let responder = format!("sec-{i}");
+                primary
+                    .apply_consensus_confirm(
+                        consensus_id,
+                        &responder,
+                        vec!["sec-0".to_string()],
+                        Vec::new(),
+                    )
+                    .await;
+            }
+
+            // The destructive declaration emits PeerRemoved on sec-0;
+            // settle the pump and inspect each survivor's outgoing
+            // channel for the broadcast.
+            crate::primary::tests::settle_pump().await;
+            let mut all_removed: Vec<(String, RemovalCause)> = Vec::new();
+            for rx in &mut sec_rxs {
+                all_removed.extend(collect_peer_removed(rx));
+            }
+            assert!(
+                !all_removed.is_empty(),
+                "#556 FSM-Restart commit must broadcast PeerRemoved; none observed"
+            );
+            assert!(
+                all_removed.iter().any(|(id, _)| id == "sec-0"),
+                "#556 PeerRemoved must name sec-0; saw {all_removed:?}"
+            );
+            // sec-0 is dropped from the roster (the destructive
+            // primitive's `secondaries.remove`).
+            assert!(
+                !primary.secondaries.contains_key("sec-0"),
+                "#556 confirmed-dead peer must be removed from roster"
+            );
+            // Surviving peers remain.
+            for i in 1..5 {
+                let id = format!("sec-{i}");
+                assert!(
+                    primary.secondaries.contains_key(&id),
+                    "#556 non-suspected peer {id} must stay in roster"
+                );
+            }
         })
         .await;
 }

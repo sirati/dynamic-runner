@@ -53,6 +53,7 @@ fn unreachable_peer_info() -> PeerConnectionInfo {
         port: UNROUTABLE_PORT,
         is_observer: false,
         liveness_port: None,
+        slurm_job_id: None,
     }
 }
 

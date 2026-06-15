@@ -558,6 +558,20 @@ async fn observer_narrates_phases_and_one_completion_summary() {
                 error: "boom".into(),
                 version: Default::default(),
             });
+            // Mirror the converged-on-RunComplete shape the primary
+            // produces: every phase that fully drained has its
+            // `PhaseEnded` fact applied (the primary's cascade
+            // originates the wire fact at the SAME decision point as
+            // `mark_phase_done`). Without these the narrator's
+            // strict boundary gate (#584) holds compile's start
+            // narration until `PhaseEnded(build)` lands, which on a
+            // genuine converged-RunComplete observer ledger always
+            // would have.
+            for ph in ["build", "compile"] {
+                cs.apply(ClusterMutation::PhaseEnded {
+                    phase: PhaseId::from(ph),
+                });
+            }
             // The verdict carries the primary's authoritative partition
             // (2 succeeded, 1 failed-final) — the narrator reports THESE.
             cs.apply(ClusterMutation::RunComplete {
@@ -584,8 +598,20 @@ async fn observer_narrates_phases_and_one_completion_summary() {
             // path under a thread-local subscriber (no await between install
             // and emit → the per-callsite Interest is evaluated under THIS
             // subscriber, immune to the cross-test global cache poisoning).
+            //
+            // Two `observe()` calls: the narrator's start edge populates
+            // `started_phases`, which the complete-edge predicate then
+            // ANDs (#584 — the complete line never narrates for a phase
+            // whose start was never observed, the I2 invariant). On a
+            // cold narrator observing a fully-terminal ledger the
+            // start lines fire on the first sweep and the complete
+            // lines fire on the second — the same TWO sweeps the
+            // production observer's reporting loop would naturally
+            // run.
             let events = crate::test_capture::capture_important(|| {
-                crate::run_narrator::RunNarrator::new().observe(observer.cluster_state());
+                let mut narrator = crate::run_narrator::RunNarrator::new();
+                narrator.observe(observer.cluster_state());
+                narrator.observe(observer.cluster_state());
             });
 
             let started: std::collections::HashSet<&str> = events

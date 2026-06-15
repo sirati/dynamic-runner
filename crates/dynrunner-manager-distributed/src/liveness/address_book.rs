@@ -97,6 +97,7 @@ mod tests {
             port: 0,
             is_observer: false,
             liveness_port: port,
+            slurm_job_id: None,
         }
     }
 
