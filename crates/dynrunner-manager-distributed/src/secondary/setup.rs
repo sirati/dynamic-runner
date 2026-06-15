@@ -564,6 +564,15 @@ where
         let mut wait_marks =
             super::wait_marks::SetupWaitMarks::new(self.setup_deadline.clone());
 
+        // #571 — setup-phase tunnel-gave-up signal. Taken off `self` once at
+        // loop entry (the same loop-local pattern as `panik_signal_rx` in
+        // `process_tasks`) so the select arm can poll it without a simultaneous
+        // `&mut self` borrow conflict with `recv_setup_frame`. `None` (not
+        // registered) parks the arm on `pending().await` — channel-only
+        // fixtures and observers are unaffected. `oneshot::Receiver` is
+        // cancel-safe: drop-and-rebuild on each sibling-arm win is safe.
+        let mut tunnel_gave_up_rx = self.tunnel_gave_up_rx.take();
+
         while !got_peer_info || !got_assignment || !got_transfer {
             // Terminal-exit backstop. A terminal CRDT flag set DURING setup
             // (RunComplete / RunAborted) means the RUN IS OVER — even though
@@ -790,6 +799,66 @@ where
                                  setup deadline"
                             );
                         }
+                    }
+                    // #571 — setup-phase tunnel-wait deadline. Fires when the
+                    // background bootstrap bring-up dial exhausts its deadline
+                    // (80% of `unconfigured_deadline_secs`) without connecting.
+                    //
+                    // The submitter's reverse tunnel never appeared: the
+                    // submitter crashed, the SSH connection dropped, or the
+                    // gateway rebooted mid-run. Emits to `IMPORTANT_TARGET` so
+                    // operators see it on `--important-stdio-only` and exits
+                    // non-zero to release the SLURM allocation immediately
+                    // rather than squatting to the full outer
+                    // `unconfigured_deadline`.
+                    //
+                    // Pattern mirrors `panik_signal_rx` in `process_tasks`:
+                    // loop-local taken off `self` before the while loop,
+                    // polled via `as_mut()` so the receiver is re-used across
+                    // sibling-arm cancellations (cancel-safe: oneshot holds a
+                    // single slot, no partial state to lose on drop/rebuild).
+                    // `Err(RecvError)` means the sender was DROPPED on the
+                    // success path (tunnel connected); the arm parks on
+                    // `pending()` thereafter (same as `None` registration).
+                    gave_up = async {
+                        match tunnel_gave_up_rx.as_mut() {
+                            Some(rx) => rx.await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        tunnel_gave_up_rx = None;
+                        if gave_up.is_ok() {
+                            // The tunnel never appeared within the dial
+                            // deadline. Log to IMPORTANT_TARGET (visible in
+                            // `--important-stdio-only` mode) so the operator
+                            // sees the reason for the non-zero exit.
+                            let deadline_secs =
+                                self.setup_deadline.horizon().as_secs_f64();
+                            tracing::error!(
+                                target: dynrunner_core::IMPORTANT_TARGET,
+                                secondary = %self.config.secondary_id,
+                                dial_deadline_secs = deadline_secs,
+                                "setup-phase tunnel-wait deadline expired: the \
+                                 submitter's reverse SSH tunnel never appeared \
+                                 within the configured dial window; the \
+                                 submitter may have crashed, the SSH connection \
+                                 dropped, or the gateway rebooted mid-run — \
+                                 exiting clean to release the SLURM allocation"
+                            );
+                            let reason = format!(
+                                "setup-phase tunnel-wait deadline expired after \
+                                 {deadline_secs:.0}s: submitter never \
+                                 appeared; exiting clean to release SLURM \
+                                 allocation"
+                            );
+                            self.shutdown_sampler_if_present().await;
+                            self.stop_all_workers().await;
+                            self.enter_terminal_bring_up_failed(reason.clone());
+                            return Err(reason);
+                        }
+                        // `Err(RecvError)`: sender dropped on success path
+                        // (tunnel connected) — park on `pending()` for the
+                        // rest of setup.
                     }
                 }
             };

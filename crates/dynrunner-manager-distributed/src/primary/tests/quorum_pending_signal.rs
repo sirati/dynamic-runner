@@ -1,150 +1,224 @@
 //! Unit tests for the setup-quorum PENDING(Resources) observability signal
-//! (#565).
+//! (#565/#572).
 //!
 //! # Single concern
-//! `wait_for_connections` emits exactly ONE important INFO line at wait-start
-//! when the SLURM-authoritative snapshot reports `k > 0`
-//! PENDING(Resources) jobs; it stays silent when `k = 0` or the snapshot
-//! is absent.
+//! `AuthorityUpdaterHandle::publish` emits exactly ONE important INFO line the
+//! FIRST time a probe result carries `pending_resources > 0`; it stays silent
+//! when `pending_resources == 0` or when no emit config is wired.
+//!
+//! # Why probe-publish, NOT wait_for_connections
+//! The original (#565) emit was gated at `wait_for_connections` start, reading
+//! `pending_resources_count()` synchronously. The first probe tick fires
+//! immediately but only STARTS the async squeue subprocess — the count stays
+//! at 0 until that subprocess returns (10ms–100ms+ in practice). The
+//! synchronous read near-always beats the probe, silently skipping the emit.
+//! #572 moves the emit to `AuthorityUpdaterHandle::publish` — the sole point
+//! where fresh probe data is installed — so the INFO line fires the moment
+//! squeue data first arrives, regardless of `wait_for_connections` timing.
 //!
 //! # Test strategy
-//! We install a `StaticSnapshot` with a controlled `pending_resources` value,
-//! then run `wait_for_connections` with a 1ms `connect_timeout` so it exits
-//! immediately via the quorum-proceed timeout arm (no real secondaries
-//! connect). The `TargetCapture` (safe to hold across `.await` on a
-//! current-thread runtime) asserts the correct event count and field values.
+//! Tests drive `AuthorityUpdaterHandle::publish` directly (no full primary
+//! needed). A `TargetCapture` layer asserts event count and field values.
+//! The `StaticSnapshot`-based helper used by the removed wait-start tests is
+//! no longer applicable to the new emit site, so the test helper is
+//! replaced with a publish-level harness.
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::HashMap;
 
 use tracing::subscriber::set_default;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::Registry;
 
-use crate::authority_snapshot::test_helpers::StaticSnapshot;
+use crate::authority_snapshot::OffLoopAuthoritySnapshot;
 use crate::test_capture::{IMPORTANT_TARGET, TargetCapture};
 
-use super::*;
-
-/// Helper: build a primary with `num_secondaries = 2`, a 1ms connect timeout
-/// (so `wait_for_connections` exits instantly), and a `StaticSnapshot` with
-/// the given `pending_resources` count.
-///
-/// Runs `wait_for_connections` and returns the events captured on the
-/// importance target.
-async fn run_quorum_wait_with_pending(
-    pending_resources: Option<usize>,
-    partition: Option<String>,
+/// Build a handle with emit config, drive `publish()` with the given
+/// `pending_resources`, and return all events captured on the importance
+/// target. A 30s probe interval is standard (staleness gating is irrelevant
+/// for publish-path tests — the latch is checked before the map is stored).
+fn run_publish_with_pending(
+    pending_resources: usize,
+    partition: Option<&str>,
+    num_secondaries: usize,
 ) -> Vec<crate::test_capture::LeveledEvent> {
-    let (transport, _ends) = setup_test(2);
-    let config = PrimaryConfig {
-        num_secondaries: 2,
-        // 1 ms: the wait exits immediately via the quorum-proceed timeout arm.
-        connect_timeout: Duration::from_millis(1),
-        slurm_partition: partition,
-        ..test_primary_config()
-    };
-    let (mut primary, _mesh) = build_test_primary(
-        config,
-        transport,
-        ResourceStealingScheduler::memory(),
-        FixedEstimator(100),
-    );
-    primary.set_authority_snapshot(Arc::new(StaticSnapshot {
-        map: Default::default(),
-        count: None,
-        pending_resources,
-    }));
+    let probe_interval = std::time::Duration::from_secs(30);
+    let snapshot = OffLoopAuthoritySnapshot::new(probe_interval);
+    let handle = snapshot
+        .updater_handle()
+        .with_emit_config(partition.map(str::to_owned), num_secondaries);
 
     let capture = TargetCapture::for_target(IMPORTANT_TARGET);
     let subscriber = Registry::default().with(capture.clone());
     let _guard = set_default(subscriber);
 
-    // Drive the wait. We pass `None` as the command_rx (no commands
-    // expected for this narrow unit).
-    let _ = primary.wait_for_connections(&mut None).await;
+    handle.publish(HashMap::new(), pending_resources);
 
     capture.events()
 }
 
-/// POSITIVE: `pending_resources = Some(2)` emits exactly one INFO event on
-/// the importance target naming the pending count, partition, deadline, and
-/// suggested job count.
-#[tokio::test(flavor = "current_thread")]
-async fn pending_resources_emits_one_important_info_at_wait_start() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let events =
-                run_quorum_wait_with_pending(Some(2), Some("gpu-partition".into())).await;
+// ── POSITIVE: first publish with k>0 emits exactly one important INFO ────────
 
-            let important: Vec<_> = events
-                .iter()
-                .filter(|e| e.level == tracing::Level::INFO)
-                .collect();
-            assert_eq!(
-                important.len(),
-                1,
-                "exactly ONE important INFO must fire when pending_resources=2; \
-                 got {} events: {events:?}",
-                important.len(),
-            );
-            let ev = &important[0].event;
+/// `pending_resources = 2` on the first publish emits exactly ONE INFO event
+/// on the importance target, naming the pending count and the partition.
+#[test]
+fn pending_resources_emits_one_important_info_on_first_publish() {
+    let events = run_publish_with_pending(2, Some("gpu-partition"), 5);
 
-            // Fields: pending_resources, partition, deadline_secs present.
-            assert_eq!(
-                ev.fields.get("pending_resources").map(String::as_str),
-                Some("2"),
-                "pending_resources field must be 2; fields: {:?}",
-                ev.fields
-            );
-            assert!(
-                ev.fields
-                    .get("partition")
-                    .is_some_and(|v| v.contains("gpu-partition")),
-                "partition field must name the configured partition; fields: {:?}",
-                ev.fields
-            );
-            assert!(
-                ev.message.contains("PENDING(Resources)"),
-                "message must mention PENDING(Resources); got {:?}",
-                ev.message
-            );
-        })
-        .await;
+    let important: Vec<_> = events
+        .iter()
+        .filter(|e| e.level == tracing::Level::INFO)
+        .collect();
+    assert_eq!(
+        important.len(),
+        1,
+        "exactly ONE important INFO must fire when pending_resources=2; \
+         got {} events: {events:?}",
+        important.len(),
+    );
+    let ev = &important[0].event;
+
+    assert_eq!(
+        ev.fields.get("pending_resources").map(String::as_str),
+        Some("2"),
+        "pending_resources field must be 2; fields: {:?}",
+        ev.fields
+    );
+    assert!(
+        ev.fields
+            .get("partition")
+            .is_some_and(|v| v.contains("gpu-partition")),
+        "partition field must name the configured partition; fields: {:?}",
+        ev.fields
+    );
+    assert!(
+        ev.message.contains("PENDING(Resources)"),
+        "message must mention PENDING(Resources); got {:?}",
+        ev.message
+    );
 }
 
-/// NEGATIVE: `pending_resources = Some(0)` — no PENDING jobs — must produce
-/// NO important events at all (only the normal wait-start non-important INFO
-/// is allowed).
-#[tokio::test(flavor = "current_thread")]
-async fn zero_pending_resources_emits_no_important_event() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let events = run_quorum_wait_with_pending(Some(0), None).await;
-            assert!(
-                events.is_empty(),
-                "zero pending_resources must NOT produce any important event; \
-                 got {events:?}",
-            );
-        })
-        .await;
+// ── NEGATIVE: zero pending_resources ─────────────────────────────────────────
+
+/// `pending_resources = 0` on every publish must NOT produce any important
+/// event — the partition has capacity for all jobs.
+#[test]
+fn zero_pending_resources_emits_no_important_event() {
+    let events = run_publish_with_pending(0, None, 4);
+    assert!(
+        events.is_empty(),
+        "zero pending_resources must NOT produce any important event; \
+         got {events:?}",
+    );
 }
 
-/// NEGATIVE: `pending_resources = None` (snapshot absent / stale) — no
-/// important event.
-#[tokio::test(flavor = "current_thread")]
-async fn absent_snapshot_emits_no_important_event() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let events = run_quorum_wait_with_pending(None, None).await;
-            assert!(
-                events.is_empty(),
-                "absent snapshot (None) must NOT produce any important event; \
-                 got {events:?}",
-            );
-        })
-        .await;
+// ── LATCH: second publish with k>0 must NOT re-emit ──────────────────────────
+
+/// A second `publish()` call with `pending_resources > 0` on the SAME handle
+/// must NOT emit a duplicate INFO line — the latch is fire-once per lineage.
+#[test]
+fn pending_resources_latch_prevents_duplicate_emit() {
+    let probe_interval = std::time::Duration::from_secs(30);
+    let snapshot = OffLoopAuthoritySnapshot::new(probe_interval);
+    let handle = snapshot
+        .updater_handle()
+        .with_emit_config(Some("gpu-partition".into()), 5);
+
+    let capture = TargetCapture::for_target(IMPORTANT_TARGET);
+    let subscriber = Registry::default().with(capture.clone());
+    let _guard = set_default(subscriber);
+
+    // First publish: k=2 → emit fires.
+    handle.publish(HashMap::new(), 2);
+    // Second publish: k=3 (still > 0) → latch held, no re-emit.
+    handle.publish(HashMap::new(), 3);
+
+    let important: Vec<_> = capture
+        .events()
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::INFO)
+        .collect();
+    assert_eq!(
+        important.len(),
+        1,
+        "latch must prevent a second emit; got {} events: {important:?}",
+        important.len(),
+    );
+}
+
+// ── LATE-ARRIVING PENDING: empty-first then k>0 ──────────────────────────────
+
+/// The race scenario that defeated #565: the first probe returns
+/// `pending_resources = 0` (jobs just submitted, squeue not yet showing them
+/// as PD(Resources)), then a later probe returns `pending_resources = 3`.
+/// The emit must fire on the SECOND publish — the first was silent.
+///
+/// This is the primary correctness check for #572: the probe-publish path
+/// handles late-arriving PENDING(Resources) counts that were 0 at
+/// wait_for_connections start.
+#[test]
+fn late_arriving_pending_resources_emits_on_first_nonzero_publish() {
+    let probe_interval = std::time::Duration::from_secs(30);
+    let snapshot = OffLoopAuthoritySnapshot::new(probe_interval);
+    let handle = snapshot
+        .updater_handle()
+        .with_emit_config(Some("gpu".into()), 4);
+
+    let capture = TargetCapture::for_target(IMPORTANT_TARGET);
+    let subscriber = Registry::default().with(capture.clone());
+    let _guard = set_default(subscriber);
+
+    // First publish: k=0 (jobs not yet showing as PD(Resources)) → silent.
+    handle.publish(HashMap::new(), 0);
+    assert!(
+        capture.events().is_empty(),
+        "first publish with k=0 must be silent; got {:?}",
+        capture.events()
+    );
+
+    // Second publish: k=3 (partition capacity exhausted) → emit fires.
+    handle.publish(HashMap::new(), 3);
+
+    let important: Vec<_> = capture
+        .events()
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::INFO)
+        .collect();
+    assert_eq!(
+        important.len(),
+        1,
+        "emit must fire on the first nonzero publish; got {} events: {important:?}",
+        important.len(),
+    );
+    assert_eq!(
+        important[0].event.fields.get("pending_resources").map(String::as_str),
+        Some("3"),
+        "pending_resources field must be 3; fields: {:?}",
+        important[0].event.fields,
+    );
+}
+
+// ── NO EMIT CONFIG: handle without context stays silent ──────────────────────
+
+/// A handle that was NOT configured with `with_emit_config` must stay silent
+/// even when `pending_resources > 0`. Non-SLURM / test-stub callers that
+/// never call `with_emit_config` must not emit spurious lines.
+#[test]
+fn no_emit_config_stays_silent() {
+    let probe_interval = std::time::Duration::from_secs(30);
+    let snapshot = OffLoopAuthoritySnapshot::new(probe_interval);
+    // Deliberately NO `with_emit_config` call.
+    let handle = snapshot.updater_handle();
+
+    let capture = TargetCapture::for_target(IMPORTANT_TARGET);
+    let subscriber = Registry::default().with(capture.clone());
+    let _guard = set_default(subscriber);
+
+    handle.publish(HashMap::new(), 5);
+
+    assert!(
+        capture.events().is_empty(),
+        "a handle without emit config must produce no important events; \
+         got {:?}",
+        capture.events()
+    );
 }
