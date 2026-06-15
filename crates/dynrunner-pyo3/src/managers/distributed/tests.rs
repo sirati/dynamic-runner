@@ -88,15 +88,18 @@ task_args = SimpleNamespace()
 /// calls can flow through the PyO3 method-dispatch surface (the
 /// production call path).
 fn build_manager(py: Python<'_>, cap: Option<u32>) -> PyResult<Py<PyDistributedManager>> {
-    build_manager_with(py, cap, None)
+    build_manager_with(py, cap, None, None)
 }
 
 /// As [`build_manager`] but also threads an optional `import_action`
-/// Python callable — the #501 affine-import forwarding surface.
+/// Python callable — the #501 affine-import forwarding surface — and
+/// an optional `upload_action` Python callable — the #336 P1 / #493
+/// option-A primary-side upload forwarding surface.
 fn build_manager_with(
     py: Python<'_>,
     cap: Option<u32>,
     import_action: Option<Py<PyAny>>,
+    upload_action: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyDistributedManager>> {
     let module = build_task_definition_module(py);
     let task = module.getattr("task")?;
@@ -121,6 +124,7 @@ fn build_manager_with(
         /* peer_lifecycle_listener */ None,
         /* task_completed_listener */ None,
         /* import_action */ import_action,
+        /* upload_action */ upload_action,
         /* unfulfillable_reinject_max_per_task */ cap,
         /* log_dir */ None,
         /* scheduler_config */ None,
@@ -233,7 +237,7 @@ fn import_action_kwarg_is_stored_on_manager() {
             .expect("compile import stub")
             .unbind();
 
-        let with_action = build_manager_with(py, None, Some(import_callable))
+        let with_action = build_manager_with(py, None, Some(import_callable), None)
             .expect("manager constructs with import_action");
         assert!(
             with_action.borrow(py).import_action.is_some(),
@@ -242,11 +246,52 @@ fn import_action_kwarg_is_stored_on_manager() {
         );
 
         // Absence stays absent — no accidental default importer.
-        let without_action =
-            build_manager_with(py, None, None).expect("manager constructs without import_action");
+        let without_action = build_manager_with(py, None, None, None)
+            .expect("manager constructs without import_action");
         assert!(
             without_action.borrow(py).import_action.is_none(),
             "no import_action kwarg must leave the field empty"
+        );
+    });
+}
+
+/// #493 regression: the `upload_action` kwarg must be STORED on the
+/// in-process distributed manager at `__init__`, so the `run()` body
+/// can install it on the in-process primary's setup executor BEFORE
+/// `run()` enters. Pre-fix `PyDistributedManager::new` had no such
+/// param, so `run_distributed(upload_action=...)` could not thread the
+/// consumer's callable through; any setup task asking for an upload
+/// (derived from a TaskInfo `files=`) then failed with a wiring-error
+/// terminal. A `None` upload_action leaves the field empty (a task with
+/// no `files=` runs unchanged).
+#[test]
+fn upload_action_kwarg_is_stored_on_manager() {
+    Python::attach(|py| {
+        // A bare callable stands in for the consumer's uploader
+        // (e.g. `gw.upload_file` or `SlurmJobManager.upload_task_file`);
+        // the manager stores the unbound handle verbatim, the bridge
+        // wraps it as `Arc<dyn UploadAction>` at `run()` entry.
+        let upload_callable = py
+            .eval(c"lambda source, dest: None", None, None)
+            .expect("compile upload stub")
+            .unbind();
+
+        let with_action = build_manager_with(py, None, None, Some(upload_callable))
+            .expect("manager constructs with upload_action");
+        assert!(
+            with_action.borrow(py).upload_action.is_some(),
+            "upload_action kwarg must be stored so run()'s primary-install \
+             step can wrap it as Arc<dyn UploadAction> and install it BEFORE \
+             primary.run() enters"
+        );
+
+        // Absence stays absent — no accidental default uploader, no
+        // wiring-error masking.
+        let without_action = build_manager_with(py, None, None, None)
+            .expect("manager constructs without upload_action");
+        assert!(
+            without_action.borrow(py).upload_action.is_none(),
+            "no upload_action kwarg must leave the field empty"
         );
     });
 }

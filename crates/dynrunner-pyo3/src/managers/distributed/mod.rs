@@ -141,6 +141,23 @@ pub(crate) struct PyDistributedManager {
     /// affine dependency runs unchanged).
     pub(super) import_action: Option<Py<PyAny>>,
 
+    /// Optional Python upload callable supplied at `__init__` (#336 P1 /
+    /// #493 option-A). `Some` iff the caller passed `upload_action=<callable>`;
+    /// the callable is bridged through
+    /// `crate::upload_action_bridge::PyUploadAction` and installed on the
+    /// in-process primary BEFORE `run()` enters, via the coordinator's
+    /// `set_upload_action`. The primary is the upload-affinity executor for
+    /// `--multi-computer local|single-process|remote-podman` runs (mirroring
+    /// `PyPrimaryCoordinator.upload_action` on the SLURM path), so a
+    /// consumer's TaskInfo declaring `files=` works mode-1 here too: the
+    /// framework's #336 P2 attach derives one deduped upload setup task per
+    /// unique (source, dest) and the executor invokes THIS callable for
+    /// each. Constructor-only — same pre-`run()` registration contract.
+    /// Signature (matches the SLURM path): `def upload(source: str,
+    /// dest: str | None) -> None` raising OSError on transient transport
+    /// faults, anything else on permanent failure.
+    pub(super) upload_action: Option<Py<PyAny>>,
+
     /// Rust-side bundle of the command channel + reinject-cap cell
     /// shared with every `PyPrimaryHandle` minted from this manager.
     /// Single concern split out into

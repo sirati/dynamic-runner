@@ -42,6 +42,7 @@ use super::module;
     peer_lifecycle_listener = None,
     task_completed_listener = None,
     import_action = None,
+    upload_action = None,
     unfulfillable_reinject_max_per_task = None,
     log_dir = None,
     scheduler_config = None,
@@ -67,6 +68,7 @@ pub(crate) fn run_distributed<'py>(
     peer_lifecycle_listener: Option<Py<PyAny>>,
     task_completed_listener: Option<Py<PyAny>>,
     import_action: Option<Py<PyAny>>,
+    upload_action: Option<Py<PyAny>>,
     unfulfillable_reinject_max_per_task: Option<u32>,
     log_dir: Option<String>,
     scheduler_config: Option<SchedulerConfig>,
@@ -128,6 +130,18 @@ pub(crate) fn run_distributed<'py>(
     // secondary, not the in-process primary.
     if let Some(action) = import_action.as_ref() {
         kwargs.set_item("import_action", action)?;
+    }
+    // The consumer's #336 P1 / #493 option-A upload callable (e.g.
+    // `SlurmJobManager.upload_task_file`). Forwarded into
+    // `RustDistributedManager`, which installs it via `set_upload_action` on
+    // the in-process primary BEFORE `run()` enters. Mirrors the SLURM-path
+    // `run_primary` plumbing; the upload-action is a PRIMARY-side concern
+    // (the source-owning member is the upload affinity), distinct from the
+    // per-secondary `import_action` above. Only set when on (the
+    // constructor defaults to `None`, leaving any setup task that asks for
+    // an upload to fail loud with a wiring error).
+    if let Some(action) = upload_action.as_ref() {
+        kwargs.set_item("upload_action", action)?;
     }
     if let Some(cap) = unfulfillable_reinject_max_per_task {
         kwargs.set_item("unfulfillable_reinject_max_per_task", cap)?;

@@ -986,6 +986,15 @@ def _dispatch_single_process(task, args, config, logger) -> None:
         # secondary it spawns (a per-secondary affine-executor concern, unlike
         # the primary-side listeners above).
         import_action=getattr(task, "import_action", None),
+        # The consumer's #336 P1 / #493 option-A upload callable. Threaded
+        # into `RustDistributedManager`, which installs it on the in-process
+        # primary (the source-owning member is the upload affinity).
+        # Consumers declare per-task `files=[...]` on TaskInfo; the
+        # framework's #336 P2 attach derives one deduped upload setup task
+        # per unique (source, dest) and the executor invokes this callable
+        # for each. Signature: `def upload(source: str, dest: str | None)
+        # -> None`, raising OSError on transient transport faults.
+        upload_action=getattr(task, "upload_action", None),
         unfulfillable_reinject_max_per_task=unfulfillable_cap,
         log_dir=getattr(args, "log_dir", None),
         scheduler_config=_build_scheduler_config(args),
@@ -1064,6 +1073,12 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
         fulfillability_matcher=getattr(task, "fulfillability_matcher", None),
         peer_lifecycle_listener=getattr(task, "peer_lifecycle_listener", None),
         task_completed_listener=getattr(task, "task_completed_listener", None),
+        # The consumer's #336 P1 / #493 option-A upload callable. Threaded
+        # into `RustPrimaryCoordinator`, which installs it via
+        # `set_upload_action` on the in-process primary BEFORE `run()`
+        # enters. See the matching kwarg on `run_distributed` above for
+        # the contract.
+        upload_action=getattr(task, "upload_action", None),
         **_panik_kwargs(args),
     )
     logger.info(f"Completed: {result['completed']}")

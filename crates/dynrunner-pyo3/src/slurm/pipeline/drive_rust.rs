@@ -168,6 +168,32 @@ pub(super) fn drive_rust_primary<'py>(
         coord_kwargs.set_item("task_completed_listener", listener)?;
     }
 
+    // Wire the #336 P1 / #493 option-A upload callable. Order of
+    // preference:
+    //   1. `task.upload_action` — the consumer's own callable (the same
+    //      protocol attribute the in-process local/single-process/remote-
+    //      podman paths consult). Lets a SLURM consumer override the
+    //      framework's default (e.g. to drive a sidecar uploader).
+    //   2. `job_manager.upload_task_file` (bound method) — the default
+    //      SLURM upload callable. The `SlurmJobManager` already owns the
+    //      gateway scp + per-blob `retry_transient` shape; binding the
+    //      method here gives the in-process primary's setup executor a
+    //      ready-to-call callable that satisfies the
+    //      `(source, dest: str | None) -> None` bridge contract.
+    // Absent → no upload action installed (any setup task that asks for
+    // an upload fails loud with a wiring error — distinct from the no-ref
+    // success that the mode-2 pre-staged gate produces).
+    let upload_action_obj: Option<Py<PyAny>> = match task.getattr("upload_action") {
+        Ok(v) if !v.is_none() => Some(v.unbind()),
+        _ => match job_manager.getattr("upload_task_file") {
+            Ok(m) if !m.is_none() => Some(m.unbind()),
+            _ => None,
+        },
+    };
+    if let Some(action) = upload_action_obj {
+        coord_kwargs.set_item("upload_action", action)?;
+    }
+
     // Forward the OOM preempt-margin knobs through to the
     // `RustPrimaryCoordinator`'s `scheduler_config` kwarg so the SLURM
     // path tunes the inner scheduler with the same operator-supplied

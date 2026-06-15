@@ -64,6 +64,7 @@ use super::module;
     fulfillability_matcher = None,
     peer_lifecycle_listener = None,
     task_completed_listener = None,
+    upload_action = None,
     scheduler_config = None,
     panik_watcher_paths = None,
     panik_watcher_poll_interval_secs = 10.0,
@@ -86,6 +87,7 @@ pub(crate) fn run_primary<'py>(
     fulfillability_matcher: Option<Py<PyAny>>,
     peer_lifecycle_listener: Option<Py<PyAny>>,
     task_completed_listener: Option<Py<PyAny>>,
+    upload_action: Option<Py<PyAny>>,
     scheduler_config: Option<SchedulerConfig>,
     panik_watcher_paths: Option<Vec<std::path::PathBuf>>,
     panik_watcher_poll_interval_secs: f64,
@@ -122,6 +124,17 @@ pub(crate) fn run_primary<'py>(
     }
     if let Some(l) = task_completed_listener.as_ref() {
         kwargs.set_item("task_completed_listener", l)?;
+    }
+    // The consumer's #336 P1 / #493 option-A upload callable (e.g.
+    // `SlurmJobManager.upload_task_file`). Forwarded into
+    // `RustPrimaryCoordinator`, which installs it via `set_upload_action`
+    // BEFORE `run()` enters. The setup executor invokes it when an upload
+    // setup task — derived by the #336 P2 attach from any TaskInfo
+    // `files=` declaration — runs in-process (source-owning affinity).
+    // Only set when on; the constructor defaults to `None`, leaving any
+    // setup task that asks for an upload to fail loud with a wiring error.
+    if let Some(action) = upload_action.as_ref() {
+        kwargs.set_item("upload_action", action)?;
     }
     if let Some(sc) = scheduler_config.as_ref() {
         kwargs.set_item("scheduler_config", sc.clone())?;
