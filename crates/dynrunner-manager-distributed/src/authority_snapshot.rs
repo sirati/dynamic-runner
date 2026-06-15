@@ -34,6 +34,7 @@
 //! DO NOT remove the lag; it is load-bearing (#543).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -149,9 +150,16 @@ impl OffLoopAuthoritySnapshot {
     /// A publisher handle for the off-loop updater. Cheap clones (one
     /// `Arc::clone`); the snapshot keeps its OWN `Arc` so the publisher
     /// can republish while the snapshot is shared with consumers.
+    ///
+    /// The returned handle has no emit config attached — call
+    /// [`AuthorityUpdaterHandle::with_emit_config`] before passing it to
+    /// `spawn_authority_updater` if PENDING(Resources) observability is
+    /// desired (#565/#572).
     pub fn updater_handle(&self) -> AuthorityUpdaterHandle {
         AuthorityUpdaterHandle {
             inner: Arc::clone(&self.inner),
+            emitted: Arc::new(AtomicBool::new(false)),
+            emit_config: None,
         }
     }
 
@@ -189,24 +197,116 @@ impl SlurmAuthoritativeSnapshot for OffLoopAuthoritySnapshot {
     }
 }
 
+/// Emit-once context attached to an [`AuthorityUpdaterHandle`] for the
+/// PENDING(Resources) setup-quorum observability signal (#565/#572).
+///
+/// # Why this lives here, not in `wait_for_connections`
+///
+/// `wait_for_connections` reads `pending_resources_count()` synchronously
+/// the instant it starts — before the first probe round-trip returns.
+/// `spawn_authority_updater` fires the initial tick immediately, but the
+/// tick only STARTS the async squeue subprocess; the count stays at 0
+/// until that subprocess returns (10ms–100ms+ depending on cluster load).
+/// The synchronous read near-always beats the probe, so the emit is
+/// silently skipped. Moving the emit to the publish path means it fires
+/// the moment squeue data first becomes available — no probe race (#572).
+///
+/// # Latch semantics
+///
+/// `emitted` is set on the first `publish()` call that observes
+/// `pending_resources > 0`. Subsequent publishes (including later ones
+/// that still show `pending_resources > 0`) do NOT re-emit — one INFO
+/// line per run is sufficient to alert the operator.
+///
+/// # Fields
+///
+/// * `partition` — the SLURM partition label, for the emit message.
+/// * `num_secondaries` — the requested fleet size, for the emit message.
+pub struct PendingResourcesEmitConfig {
+    pub partition: Option<String>,
+    pub num_secondaries: usize,
+}
+
 /// Publisher side of the snapshot. The updater task `publish()`es a
 /// fresh map every probe round; readers see it on the next load.
 #[derive(Clone)]
 pub struct AuthorityUpdaterHandle {
     inner: Arc<ArcSwap<SnapshotInner>>,
+    /// Emit-once latch: set by the first `publish()` call that observes
+    /// `pending_resources > 0`. Guards the PENDING(Resources) INFO line.
+    emitted: Arc<AtomicBool>,
+    /// Optional emit config. `None` for handles created without context
+    /// (non-SLURM callers, test stubs) — the emit is a no-op without it.
+    emit_config: Option<Arc<PendingResourcesEmitConfig>>,
 }
 
 impl AuthorityUpdaterHandle {
+    /// Attach the PENDING(Resources) emit config to this handle.
+    ///
+    /// Called in `run.rs` right before `spawn_authority_updater`, where
+    /// both `slurm_partition` and `num_secondaries` are known. The latch
+    /// is shared: all clones of this handle see the same `emitted` flag,
+    /// so a clone used in a test sees the same fire-once semantics.
+    pub fn with_emit_config(
+        mut self,
+        partition: Option<String>,
+        num_secondaries: usize,
+    ) -> Self {
+        self.emit_config = Some(Arc::new(PendingResourcesEmitConfig {
+            partition,
+            num_secondaries,
+        }));
+        self
+    }
+
     /// Atomically install a fresh probe result. `last_updated` is set to
     /// `Instant::now()` at publish time, so the snapshot's staleness gate
     /// reads from the moment THIS publish landed (not the moment the
     /// probe started its round-trip).
+    ///
+    /// If this is the first publish that observes `pending_resources > 0`
+    /// AND an emit config is wired, emits the PENDING(Resources) INFO
+    /// line on the importance target (#565/#572). The emit is fire-once
+    /// per handle lineage (the `emitted` latch is shared across clones).
     pub fn publish(&self, map: HashMap<String, PeerLifeState>, pending_resources: usize) {
         self.inner.store(Arc::new(SnapshotInner {
             map,
             pending_resources,
             last_updated: Instant::now(),
         }));
+
+        // Emit the PENDING(Resources) observability line the first time
+        // a probe result shows k > 0 unschedulable jobs. The emit is
+        // gated on the latch so it fires at most once per updater
+        // lineage regardless of how many publishes carry pending_resources
+        // > 0. `AcqRel` on the CAS is the minimal ordering that makes the
+        // store visible to any reader that observes the flag = true.
+        if pending_resources > 0
+            && !self.emitted.load(Ordering::Relaxed)
+            && !self.emitted.swap(true, Ordering::AcqRel)
+            && let Some(cfg) = &self.emit_config
+        {
+            let partition_label = cfg
+                .partition
+                .as_deref()
+                .unwrap_or("<unknown partition>");
+            let expected = cfg.num_secondaries;
+            tracing::info!(
+                target: dynrunner_core::IMPORTANT_TARGET,
+                pending_resources,
+                requested = expected,
+                partition = partition_label,
+                "setup-quorum is waiting for {expected} secondaries; \
+                 however slurm queue shows {pending_resources} job(s) in \
+                 PENDING(Resources) on partition {partition_label} — those \
+                 may NEVER schedule on this partition's capacity. \
+                 Run will proceed at {} / {expected} after the setup \
+                 deadline elapses. To avoid the wait, lower --jobs to {} \
+                 or use a partition with more capacity.",
+                expected.saturating_sub(pending_resources),
+                expected.saturating_sub(pending_resources),
+            );
+        }
     }
 }
 

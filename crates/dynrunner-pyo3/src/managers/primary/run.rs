@@ -501,8 +501,10 @@ impl PyPrimaryCoordinator {
                     // SLURM submitter path.
                     peer_credentials_path,
                     // SLURM partition label for setup-quorum observability (#565).
-                    // `None` for non-SLURM deployments.
-                    slurm_partition,
+                    // `None` for non-SLURM deployments. Cloned so the original
+                    // local is still available for the updater emit-config wiring
+                    // below (#572), where `config` has already been moved.
+                    slurm_partition: slurm_partition.clone(),
                     // Staged silence schedule: keepalive-interval-relative
                     // defaults (not surfaced on the Python config today).
                     ..PrimaryConfig::default()
@@ -629,18 +631,38 @@ impl PyPrimaryCoordinator {
                 }
 
                 // Wire the SLURM-authoritative snapshot for setup-quorum
-                // observability (#565) and respawn quantity gate (#543).
+                // observability (#565/#572) and respawn quantity gate (#543).
                 // The SLURM pipeline parks (snapshot, probe, interval) via
                 // `set_authority_snapshot_from_rust` BEFORE `run()` is
                 // called. If present, install the snapshot on the coordinator
                 // and spawn the background updater task (needs tokio runtime
-                // — we are inside the detached async block). The first tick
-                // of the interval fires immediately, so the snapshot is
-                // populated by the time `wait_for_connections` reads it.
+                // — we are inside the detached async block).
+                //
+                // PENDING(Resources) observability (#572): the emit is owned
+                // by the probe-publish path (AuthorityUpdaterHandle::publish),
+                // NOT by wait_for_connections. The updater fires its first tick
+                // immediately, but the tick only STARTS the async squeue
+                // subprocess — the count stays at 0 until that subprocess
+                // returns. A synchronous read at wait_for_connections start
+                // near-always beats the probe result, silently skipping the
+                // emit (the asm-tokenizer 2026-06-15 systematic miss).
+                // Attaching the emit config to the updater handle means the
+                // INFO line fires the moment squeue data first arrives,
+                // regardless of when wait_for_connections runs.
                 if let Some((snapshot, updater_handle, probe, probe_interval)) =
                     authority_snapshot_parts
                 {
                     primary.set_authority_snapshot(std::sync::Arc::clone(&snapshot));
+                    // Attach the emit config so the probe-publish path owns
+                    // the PENDING(Resources) INFO line (#572). `slurm_partition`
+                    // and `num_secondaries` are the same locals that were moved
+                    // into `PrimaryConfig` above — we clone/copy from the
+                    // original locals here because `config` has already been
+                    // moved into `PrimaryCoordinator::new`.
+                    let updater_handle = updater_handle.with_emit_config(
+                        slurm_partition.clone(),
+                        num_secondaries as usize,
+                    );
                     let join_handle =
                         dynrunner_manager_distributed::authority_snapshot::spawn_authority_updater(
                             probe,
