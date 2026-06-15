@@ -1393,6 +1393,98 @@ async fn respawn_quantity_gate_refuses_when_count_unknown() {
         .await;
 }
 
+// ── Authority-snapshot escape hatch in the remote resend loop (#557) ─
+//
+// When the provider host's slurm-authoritative state is `Gone` the
+// resend loop must abort with `SpawnError::ProviderUnavailable` and
+// emit a single `respawn_remote_abandoned` WARN rather than looping
+// indefinitely.
+//
+// Test strategy: build the two-process rig but do NOT let the observer
+// process answer the spawn request (the MockSpawner is never invoked).
+// Set the authority snapshot to report `peer_life("setup") = Gone`
+// BEFORE calling `enable_respawn_remote` so the spawner captures it.
+// Use `tokio::time::pause()` + `advance` to cross the first resend
+// window without real wall time. Assert the outcome is
+// `ProviderUnavailable`.
+
+/// TRACE-REPLAY: provider host reports `Gone` mid-resend; loop
+/// observes Gone on the first timeout and aborts immediately rather
+/// than looping indefinitely.
+#[tokio::test(flavor = "current_thread")]
+async fn remote_resend_loop_aborts_when_provider_host_is_gone() {
+    // `tokio::time::pause` is required to advance through
+    // `SPAWN_RESEND_INITIAL` (10 s) without real wall time.
+    tokio::time::pause();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use crate::authority_snapshot::test_helpers::StaticSnapshot;
+            use crate::authority_snapshot::PeerLifeState;
+
+            let mut rig = build_remote_rig().await;
+
+            // Install a snapshot where the provider host "setup" reads
+            // `Gone` (the observer-side process has disappeared). Count
+            // is below initial (0 < 1) so the ONLY trigger here is the
+            // Gone path — the count-at-initial path is not exercised.
+            rig.coordinator.set_authority_snapshot(Arc::new(StaticSnapshot {
+                map: std::collections::HashMap::from([(
+                    "setup".to_string(),
+                    PeerLifeState::Gone,
+                )]),
+                count: Some(0),
+            }));
+
+            // Wire the remote execution backend. It captures the
+            // snapshot set above via `Arc::clone(&self.authority_snapshot)`
+            // in `enable_respawn_remote`.
+            rig.coordinator.enable_respawn_remote(permissive_budget());
+
+            // Trigger a member removal — the handler dispatches a
+            // remote spawn task into `respawn_tasks`.
+            rig.coordinator.dispatch_respawn_request(RespawnRequest {
+                original_id: "secondary-0".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            });
+            assert!(
+                !rig.coordinator.respawn_tasks.is_empty(),
+                "respawn task must be enqueued in the JoinSet",
+            );
+
+            // The spawner sends the first request frame to the observer,
+            // then waits on `tokio::time::timeout(SPAWN_RESEND_INITIAL, ...)`.
+            // Advance past that window so the `Err(_elapsed)` arm fires
+            // and triggers the authority-snapshot check.
+            //
+            // We advance in two steps:
+            // (a) a small yield so the spawn future runs through its
+            //     first send + enters the timeout wait,
+            // (b) then past SPAWN_RESEND_INITIAL so the timeout fires.
+            tokio::task::yield_now().await;
+            tokio::time::advance(super::remote::SPAWN_RESEND_INITIAL + Duration::from_millis(1)).await;
+
+            // Drain inbox frames (the send_request enqueues one frame
+            // to the mesh pump; we don't need to deliver it) and wait
+            // for the JoinSet outcome.
+            let (outcome, _frames) = pump_until_respawn_outcome(
+                &mut rig.coordinator,
+                Duration::from_secs(2),
+            )
+            .await;
+
+            let outcome = outcome.expect(
+                "respawn task must complete (ProviderUnavailable) when provider is Gone",
+            );
+            assert!(
+                matches!(outcome.result, Err(ref s) if s.contains("provider host gone")),
+                "expected ProviderUnavailable(\"provider host gone\") but got: {:?}",
+                outcome.result,
+            );
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn respawn_quantity_gate_fires_when_count_below_initial() {
     let local = tokio::task::LocalSet::new();
