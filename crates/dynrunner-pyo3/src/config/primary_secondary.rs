@@ -73,6 +73,11 @@ impl PyPrimaryConfig {
             // reads `TaskDefinition.uses_file_based_items`).
             uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
+            // Primary-pinned types (#580) are wired through
+            // PyPrimaryCoordinator's own constructor (which reads each
+            // `TaskTypeSpec.primary_pinned`). This config shim defaults
+            // to the empty set — every type is freely relocatable.
+            primary_pinned_types: std::collections::HashSet::new(),
             retry_max_passes: self.distributed_config.retry_max_passes(),
             oom_retry_max_passes: self.distributed_config.oom_retry_max_passes(),
             fleet_dead_timeout: std::time::Duration::from_secs(30),

@@ -136,6 +136,11 @@ pub(crate) struct PyPrimaryCoordinator {
     /// type declares a cap. Forwarded to `PrimaryConfig` so the
     /// scheduler refuses to dispatch beyond the cap.
     pub(super) max_concurrent_per_type: std::collections::HashMap<dynrunner_core::TypeId, u32>,
+    /// Task types marked `TaskTypeSpec.primary_pinned=True` (#580).
+    /// Harvested from each `TaskTypeSpec` at construction. Forwarded to
+    /// `PrimaryConfig.primary_pinned_types` so the primary's dispatch
+    /// view hides them from workers on non-primary secondaries.
+    pub(super) primary_pinned_types: std::collections::HashSet<dynrunner_core::TypeId>,
     /// Held for the per-phase lifecycle hooks that re-acquire the GIL
     /// from inside `PrimaryCoordinator::run` (Phase 5B).
     pub(super) task_definition: Py<PyAny>,

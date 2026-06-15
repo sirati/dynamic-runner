@@ -122,6 +122,7 @@ impl PyDistributedManager {
             skip_existing,
             uses_file_based_items: task.uses_file_based_items,
             max_concurrent_per_type: task.max_concurrent_per_type,
+            primary_pinned_types: task.primary_pinned_types,
             estimator: task.estimator,
             completed: 0,
             failed: 0,
