@@ -16,6 +16,17 @@ These tests load `cli` + `run` directly under a package stub (mirroring
 a bare `nix develop` without a maturin build. `DistributedConfig` is a
 capture-spy on the stub package; the in-function `import dynamic_runner
 as _rs` in `run._build_distributed_config` resolves to it.
+
+The spy installation is SCOPED to each TestCase via an `autouse` pytest
+fixture (`_patch_distributed_config_spy`) that uses pytest's
+`monkeypatch` for automatic teardown. A previous incarnation installed
+the spy at MODULE import time and never restored it, which polluted
+``sys.modules["dynamic_runner"].DistributedConfig`` for every test that
+ran AFTER this file in the same pytest session — `_rs.DistributedConfig`
+in unrelated tests (e.g. ``test_lifecycle_hooks``) then resolved to the
+spy and failed PyO3's argument type-check with
+``'_DistributedConfigSpy' object is not an instance of 'DistributedConfig'``.
+Scoping the patch to a fixture's setup/teardown closes that leak.
 """
 
 from __future__ import annotations
@@ -26,6 +37,8 @@ import pathlib
 import sys
 import types
 import unittest
+
+import pytest
 
 
 _PACKAGE_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -50,18 +63,22 @@ class _DistributedConfigSpy:
         self.kwargs = kwargs
 
 
-def _setup_package_stub() -> None:
+def _ensure_package_stub() -> None:
+    """Create the `dynamic_runner` package stub if not already present.
+
+    Idempotent: existing real-package or prior-stub registrations are left
+    untouched. The spy attribute is installed PER-TEST by the autouse
+    fixture below, not here — this function only owns the package skeleton
+    needed by `_load_module_direct`.
+    """
     if "dynamic_runner" not in sys.modules:
         pkg = types.ModuleType("dynamic_runner")
         pkg.__path__ = [str(_PACKAGE_ROOT)]
         sys.modules["dynamic_runner"] = pkg
-    # Attach the spy so `import dynamic_runner as _rs; _rs.DistributedConfig(...)`
-    # inside `run._build_distributed_config` captures rather than builds.
-    sys.modules["dynamic_runner"].DistributedConfig = _DistributedConfigSpy
 
 
 def _load_module_direct(name: str, relpath: str):
-    _setup_package_stub()
+    _ensure_package_stub()
     fullname = f"dynamic_runner.{name}"
     if fullname in sys.modules:
         return sys.modules[fullname]
@@ -79,6 +96,37 @@ run = _load_module_direct("run", "run.py")
 
 def _parse(argv: list[str]) -> argparse.Namespace:
     return cli.build_arg_parser("test").parse_args(argv)
+
+
+@pytest.fixture(autouse=True)
+def _patch_distributed_config_spy(monkeypatch: pytest.MonkeyPatch):
+    """Install the spy onto the `dynamic_runner` stub package for one
+    test, then restore on teardown.
+
+    Using pytest's ``monkeypatch`` fixture (instead of a bare assignment
+    at module-import time) means:
+
+    1. Each test sees a freshly-installed spy with a cleared `_CAPTURED`
+       buffer — no leakage between sibling tests in this file.
+    2. AFTER the last test in this file, ``DistributedConfig`` is
+       restored to whatever it was before (typically the real PyO3
+       class, when other test files run later in the same session).
+
+    The fixture is module-autouse so it applies to every test function
+    in this file without needing to be referenced explicitly. The
+    `dynamic_runner` package stub itself is left in place across tests
+    (it carries the loaded `cli` / `run` submodules); only the
+    `DistributedConfig` attribute is the per-test churn.
+    """
+    _ensure_package_stub()
+    _CAPTURED.clear()
+    monkeypatch.setattr(
+        sys.modules["dynamic_runner"],
+        "DistributedConfig",
+        _DistributedConfigSpy,
+        raising=False,
+    )
+    yield
 
 
 class UnconfiguredDeadlineFlagShapeTests(unittest.TestCase):
