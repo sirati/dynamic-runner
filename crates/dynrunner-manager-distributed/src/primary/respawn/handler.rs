@@ -1,9 +1,10 @@
 //! Operational-loop arms for the respawn pipeline. The impl block here
 //! decorates `PrimaryCoordinator` with `dispatch_respawn_lifecycle`
 //! (called on the respawn lifecycle select arm; routes `Removed` into
-//! `dispatch_respawn_request` and `Added` into the pending-replacement
-//! reconciliation) and `handle_respawn_join` (called when the
-//! `JoinSet<RespawnOutcome>` yields a finished task).
+//! `dispatch_respawn_request`; `Added` events are dropped here as a
+//! no-op — see the doc on `dispatch_respawn_lifecycle` for why) and
+//! `handle_respawn_join` (called when the `JoinSet<RespawnOutcome>`
+//! yields a finished task).
 
 use std::sync::Arc;
 
@@ -33,117 +34,26 @@ where
     I: Identifier,
 {
     /// Route one [`PeerLifecycleEvent`] drained off the respawn
-    /// lifecycle channel. `Removed` is a death — translated into a
-    /// [`RespawnRequest`] and dispatched. `Added` is a join —
-    /// reconciled against the pending-replacement bookkeeping (the
-    /// joiner is either a pending replacement claiming its place, the
-    /// re-admitted original whose still-pending replacement is now a
-    /// squatter, or — the common case — neither).
+    /// lifecycle channel.
+    ///
+    /// Only `Removed` is acted on: each removal is translated into a
+    /// [`RespawnRequest`] and dispatched. The historical `Added`
+    /// reconciliation (re-admitted-original → revoke-still-pending
+    /// replacement) has been removed in favour of the slurm-authoritative
+    /// quantity gate in [`Self::dispatch_respawn_request`]: that gate
+    /// refuses respawn whenever slurm itself reports the fleet at-or-above
+    /// initial count, so the redundant-replacement scenario is unreachable
+    /// to begin with. Over-allocation that slips through (a small race
+    /// between the local death-declaration and the next probe) is
+    /// structurally tolerated — at-least-once execution is the precedent
+    /// (`feedback_at_least_once_execution_deliberate`). The listener
+    /// continues to drop `Added` events for the respawn arm; if one ever
+    /// arrives here it is a no-op.
     pub(crate) fn dispatch_respawn_lifecycle(&mut self, event: PeerLifecycleEvent) {
-        match event {
-            PeerLifecycleEvent::Removed { id, cause } => {
-                self.dispatch_respawn_request(RespawnRequest {
-                    original_id: id,
-                    cause,
-                });
-            }
-            PeerLifecycleEvent::Added { id, .. } => {
-                self.reconcile_replacements_on_join(&id);
-            }
-        }
-    }
-
-    /// Reconcile the pending-replacement bookkeeping against a peer
-    /// that just joined the replicated membership.
-    ///
-    /// Two matches are possible (both cheap map probes; the common
-    /// no-match join costs one lookup + one scan over a map bounded by
-    /// `RespawnBudget::max_total`):
-    ///
-    /// 1. `joined_id` IS a pending replacement → it welcomed and is
-    ///    the legitimate occupant (it joins under its freshly-minted
-    ///    `secondary-N` id, never the dead member's, so there is no
-    ///    identity conflict). Clear its entry. If its original is
-    ///    re-admitted LATER, nothing is revoked: a welcomed member is
-    ///    ordinary fleet capacity, and killing it would only re-enter
-    ///    the removal→respawn churn it was spawned to resolve.
-    ///
-    /// 2. `joined_id` is the ORIGINAL of one or more pending
-    ///    replacements → the re-admission edge (the frame-ingest seam
-    ///    proved the removed member alive and bumped its membership
-    ///    generation). Every still-pending replacement for it is a
-    ///    resource squatter: revoke it through the provider port
-    ///    (best-effort `scancel` for SLURM). The revoke runs detached
-    ///    on the LocalSet — same orphan-safety shape as the
-    ///    provider's own spawn internals — because the loop arm must
-    ///    not await a gateway round-trip. A revoke transport failure
-    ///    is logged loudly; the job id stays on the provider's
-    ///    `job_ids` ledger, so the run-teardown `cleanup()` sweep
-    ///    still scancels it (no re-admission retry sweep exists).
-    ///
-    /// Ordering between the two cases is the lifecycle channel's apply
-    /// order — both `PeerJoined` applies flow through the SAME
-    /// dispatcher → channel → this method, so the
-    /// replacement-welcomed-first and original-re-admitted-first
-    /// interleavings resolve deterministically.
-    fn reconcile_replacements_on_join(&mut self, joined_id: &str) {
-        // Case 1: the joiner is a pending replacement — it claimed its
-        // place; the bookkeeping entry is done.
-        if let Some(original_id) = self.pending_replacements.remove(joined_id) {
-            tracing::info!(
-                target: "dynrunner_respawn",
-                original_id = %original_id,
-                new_id = %joined_id,
-                event = "respawn_replacement_joined",
-                "replacement secondary joined the membership; it is the \
-                 legitimate occupant (no revocation possible for it from \
-                 here on)",
-            );
-            return;
-        }
-        // Case 2: the joiner is the original of pending replacement(s)
-        // — the re-admission edge. Revoke every squatter.
-        let squatters = self.pending_replacements.replacements_of(joined_id);
-        if squatters.is_empty() {
-            return;
-        }
-        // Defensive mirror of `dispatch_respawn_request`: entries only
-        // exist when `enable_respawn` installed the spawner, so this
-        // cannot fire outside a logic error.
-        let Some(spawner) = self.respawn_spawner.as_ref().map(Arc::clone) else {
-            tracing::warn!(
-                target: "dynrunner_respawn",
-                peer_id = %joined_id,
-                "pending replacements exist but the respawn policy is \
-                 disabled; cannot revoke",
-            );
-            return;
-        };
-        for new_id in squatters {
-            self.pending_replacements.remove(&new_id);
-            tracing::info!(
-                target: "dynrunner_respawn",
-                original_id = %joined_id,
-                new_id = %new_id,
-                event = "respawn_replacement_revoked",
-                "member re-admitted while its replacement was still \
-                 pending; revoking the redundant replacement",
-            );
-            let spawner = Arc::clone(&spawner);
-            tokio::task::spawn_local(async move {
-                if let Err(e) = spawner.revoke(&new_id).await {
-                    tracing::warn!(
-                        target: "dynrunner_respawn",
-                        new_id = %new_id,
-                        error = %e,
-                        event = "respawn_revoke_failed",
-                        "could not revoke the redundant replacement (provider \
-                         backend unreachable); its job id remains on the \
-                         provider's ledger, so run-teardown cleanup() will \
-                         scancel it — if the run aborts before teardown, a \
-                         manual scancel may be needed",
-                    );
-                }
+        if let PeerLifecycleEvent::Removed { id, cause } = event {
+            self.dispatch_respawn_request(RespawnRequest {
+                original_id: id,
+                cause,
             });
         }
     }
@@ -221,11 +131,10 @@ where
         // only happens on accept, below). The LAUNCHED stage has its own
         // counterpart: an accepted respawn comes up under a freshly-
         // minted `secondary-N` id (never the dead peer's), so it cannot
-        // duplicate the re-admitted identity — but until it JOINS it is
-        // a revocable resource squatter, tracked in
-        // `pending_replacements` and reconciled by
-        // `reconcile_replacements_on_join` when either party's
-        // `PeerJoined` lands.
+        // duplicate the re-admitted identity. Over-allocation that
+        // slips through (a small race between the local death-declaration
+        // and the next authoritative probe) is structurally tolerated —
+        // see `feedback_at_least_once_execution_deliberate`.
         if self.cluster_state.is_peer_alive(&request.original_id) {
             tracing::info!(
                 target: "dynrunner_respawn",
@@ -237,6 +146,58 @@ where
                  (no budget consumed)",
             );
             return;
+        }
+        // SLURM-AUTHORITATIVE QUANTITY GATE (#543, rule 2):
+        // "if we are respawning only do so if there are less slurm jobs
+        //  active/queued than when started".
+        //
+        // The local view of "X is dead" can be false-positive when the
+        // coordinator loop wedges and heartbeats appear silent. The
+        // slurm-authoritative snapshot is the tiebreak: only fire respawn
+        // when slurm itself agrees the fleet is below initial count.
+        //
+        // Fail-closed on Unknown (no probe answer / stale snapshot): refuse
+        // to fire. Without authoritative evidence, the conservative
+        // direction is don't-spawn.
+        //
+        // THE LAG IS A FEATURE: when 10 secondaries are declared dead and
+        // 10 respawn requests arrive in the same tick, the snapshot still
+        // shows their jobs Alive (probe hasn't re-run). Every dispatch
+        // sees count==initial, refuses to fire. Only after slurm confirms
+        // Gone does respawn fire. This is the structural mechanism by
+        // which local-deafness false-deaths produce no respawn cascade.
+        // DO NOT remove the lag.
+        let initial_count = self.config.num_secondaries as usize;
+        match self.authority_snapshot.secondary_active_or_queued_count() {
+            Some(current) if current >= initial_count => {
+                tracing::warn!(
+                    target: "dynrunner_respawn",
+                    peer_id = %request.original_id,
+                    cause = ?request.cause,
+                    initial_count,
+                    current,
+                    event = "respawn_suppressed_quantity_gate",
+                    "slurm-authoritative count of active/queued secondaries is \
+                     at or above initial count; not firing respawn (the \
+                     declaration was likely a false-positive from local \
+                     deafness — see #543/#544)",
+                );
+                return;
+            }
+            None => {
+                tracing::warn!(
+                    target: "dynrunner_respawn",
+                    peer_id = %request.original_id,
+                    cause = ?request.cause,
+                    initial_count,
+                    event = "respawn_suppressed_authority_unknown",
+                    "slurm-authoritative count is Unknown (stale snapshot / \
+                     probe failure); fail-closed: refusing respawn until \
+                     evidence lands",
+                );
+                return;
+            }
+            Some(_) => { /* current < initial_count: proceed */ }
         }
         let (spawner, budget) = match (self.respawn_spawner.as_ref(), self.respawn_budget.as_ref())
         {
@@ -314,14 +275,6 @@ where
                 at: now,
             },
         );
-        // Track the replacement as pending-until-join so a later
-        // re-admission of the original can revoke it (see
-        // `reconcile_replacements_on_join`). Inserted at accept time —
-        // BEFORE the spawn future runs — so a re-admission landing in
-        // the submission window is still observed; the provider's
-        // `revoke` contract absorbs the not-yet-submitted race.
-        self.pending_replacements
-            .insert(new_id.clone(), request.original_id.clone());
         tracing::info!(
             target: "dynrunner_respawn",
             original_id = %request.original_id,

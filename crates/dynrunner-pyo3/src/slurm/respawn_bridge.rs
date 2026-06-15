@@ -71,6 +71,7 @@ impl PySlurmSpawner {
         info_reader: PyGatewayReader,
         wrapper_script_generator: WrapperScriptGenerator,
         run_log_dir: String,
+        consumer_job_name_prefix: Option<String>,
     ) -> Self {
         let tunnel_establisher = Arc::new(SlurmPreparationTunnelEstablisher::new(
             preparation,
@@ -81,6 +82,7 @@ impl PySlurmSpawner {
             tunnel_establisher,
             wrapper_script_generator,
             run_log_dir,
+            consumer_job_name_prefix,
         ));
         Self { inner }
     }

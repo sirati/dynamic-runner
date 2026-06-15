@@ -1,5 +1,14 @@
 //! SLURM provider implementation of [`SecondarySpawner`].
 //!
+//! Respawn is fire-and-forget: a replacement secondary joins as a normal
+//! member with a fresh id. Over-allocation (an original re-admitting AFTER
+//! its replacement was dispatched) is TOLERATED — the slurm-authoritative
+//! quantity gate in `dispatch_respawn_request` prevents continuous growth;
+//! one stray over-allocation contributes work and ages out at run
+//! teardown. Rule 1 (NEVER cancel a job from a respawn flow) is absolute;
+//! the at-least-once-execution contract is the precedent. See
+//! [[feedback_at_least_once_execution_deliberate]].
+//!
 //! Single concern: turn a [`SecondarySpawnSpec`] from the
 //! `dynrunner-manager-distributed` operational loop into the SLURM
 //! provider's operations:
@@ -12,19 +21,12 @@
 //!      not own).
 //!
 //!   2. **sbatch submission** via [`SlurmJobManager::submit_job`] on a
-//!      1-node allocation, using `spec.new_secondary_id` as the SLURM
-//!      job name so operators eyeballing `squeue` see the same id the
-//!      framework's respawn-event ring carries.
+//!      1-node allocation, using a `--job-name` built from the consumer-
+//!      set prefix captured at startup plus the new secondary id (rule 3:
+//!      respawned secondaries preserve the original cohort's name
+//!      prefix). `None` prefix falls back to the bare framework id.
 //!
-//!   3. **Revocation** via [`SecondarySpawner::revoke`]: a
-//!      replacement whose original member is re-admitted before the
-//!      replacement joins is a redundant allocation squatter; the
-//!      spawner scancels the recorded sbatch job (or tombstones a
-//!      submission still in flight). Best-effort — a gone job is a
-//!      quiet no-op, and a transport failure still leaves the job id
-//!      on `job_ids` for the run-teardown scancel sweep.
-//!
-//!   4. **Reverse-tunnel establishment** via the
+//!   3. **Reverse-tunnel establishment** via the
 //!      [`TunnelEstablisher`](tunnel::TunnelEstablisher) port
 //!      (production-bound to
 //!      [`SlurmPreparation::establish_one_tunnel`](crate::preparation::SlurmPreparation::establish_one_tunnel)).

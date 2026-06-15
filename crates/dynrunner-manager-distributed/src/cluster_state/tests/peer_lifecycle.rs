@@ -624,3 +624,125 @@ fn peer_removed_observer_drops_from_role_table() {
         "role-change hook must fire once with the shrunk set"
     );
 }
+
+// ── Sticky-removal slurm-authoritative tiebreak (#546) ────────────────
+//
+// A `PeerJoined` for a `Dead` id at a non-advancing membership generation
+// is the SAME-INCARNATION re-join the sticky rule normally drops. After
+// #546 the apply path consults the slurm-authoritative snapshot first:
+// if slurm reports the peer's job ALIVE, the dead-mark is REVERSED and
+// the existing entry_gen is preserved (this is correction-of-our-error,
+// not a new incarnation). Without an Alive verdict — Gone, Unknown, or
+// no snapshot wired at all — the original sticky behavior holds.
+
+use crate::authority_snapshot::test_helpers::StaticSnapshot;
+use crate::authority_snapshot::PeerLifeState;
+use std::collections::HashMap;
+
+fn install_dead_at_gen(state: &mut ClusterState<RunnerIdentifier>, id: &str, member_gen: u64) {
+    state.apply(ClusterMutation::PeerJoined {
+        peer_id: id.into(),
+        is_observer: false,
+        can_be_primary: true,
+        cap_version: Default::default(),
+        member_gen,
+    });
+    state.apply(ClusterMutation::PeerRemoved {
+        id: id.into(),
+        cause: RemovalCause::KeepaliveMiss,
+        member_gen,
+    });
+}
+
+fn snapshot_alive(ids: &[&str]) -> Arc<StaticSnapshot> {
+    let map: HashMap<String, PeerLifeState> = ids
+        .iter()
+        .map(|i| ((*i).to_string(), PeerLifeState::Alive))
+        .collect();
+    Arc::new(StaticSnapshot { map, count: None })
+}
+
+#[test]
+fn apply_peer_joined_reverses_sticky_when_authority_alive() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    install_dead_at_gen(&mut s, "p1", 5);
+    s.set_authority_snapshot(snapshot_alive(&["p1"]));
+    // Non-advancing PeerJoined while authority reports Alive: the
+    // dead-mark must be REVERSED and the membership generation must
+    // stay at 5 (correction-of-our-error, not a new incarnation).
+    let outcome = s.apply(ClusterMutation::PeerJoined {
+        peer_id: "p1".into(),
+        is_observer: false,
+        can_be_primary: true,
+        cap_version: Default::default(),
+        member_gen: 5,
+    });
+    assert_eq!(outcome, ApplyOutcome::Applied);
+    assert!(s.is_peer_alive("p1"), "sticky-removal must be reversed");
+}
+
+#[test]
+fn apply_peer_joined_keeps_sticky_when_authority_gone() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    install_dead_at_gen(&mut s, "p1", 5);
+    let map: HashMap<String, PeerLifeState> =
+        std::iter::once(("p1".to_string(), PeerLifeState::Gone)).collect();
+    s.set_authority_snapshot(Arc::new(StaticSnapshot { map, count: None }));
+    let outcome = s.apply(ClusterMutation::PeerJoined {
+        peer_id: "p1".into(),
+        is_observer: false,
+        can_be_primary: true,
+        cap_version: Default::default(),
+        member_gen: 5,
+    });
+    assert_eq!(
+        outcome,
+        ApplyOutcome::NoOp,
+        "authority=Gone → original sticky removal stands"
+    );
+    assert!(!s.is_peer_alive("p1"));
+}
+
+#[test]
+fn apply_peer_joined_keeps_sticky_when_authority_unknown() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    install_dead_at_gen(&mut s, "p1", 5);
+    s.set_authority_snapshot(Arc::new(StaticSnapshot {
+        map: HashMap::new(),
+        count: None,
+    }));
+    let outcome = s.apply(ClusterMutation::PeerJoined {
+        peer_id: "p1".into(),
+        is_observer: false,
+        can_be_primary: true,
+        cap_version: Default::default(),
+        member_gen: 5,
+    });
+    assert_eq!(
+        outcome,
+        ApplyOutcome::NoOp,
+        "authority=Unknown → fail-closed: original sticky removal stands"
+    );
+    assert!(!s.is_peer_alive("p1"));
+}
+
+#[test]
+fn apply_peer_joined_keeps_sticky_when_no_authority_configured() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    install_dead_at_gen(&mut s, "p1", 5);
+    // No `set_authority_snapshot` call — preserves the original
+    // behavior for tests / deployments that never wire a snapshot.
+    let outcome = s.apply(ClusterMutation::PeerJoined {
+        peer_id: "p1".into(),
+        is_observer: false,
+        can_be_primary: true,
+        cap_version: Default::default(),
+        member_gen: 5,
+    });
+    assert_eq!(
+        outcome,
+        ApplyOutcome::NoOp,
+        "no authority snapshot → original sticky removal stands"
+    );
+    assert!(!s.is_peer_alive("p1"));
+}

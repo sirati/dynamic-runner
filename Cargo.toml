@@ -82,6 +82,12 @@ base64 = "0.22"
 ciborium = "0.2"
 url = "2"
 zstd = { version = "0.13", default-features = false }
+# Lock-free `Arc<T>` swap for the off-loop slurm-authoritative life-state
+# snapshot publisher (see `dynrunner_manager_distributed::authority_snapshot`).
+# Consumers (collective-silence gate, sticky-removal tiebreak, respawn
+# quantity gate) read the snapshot synchronously from any context; the
+# probe task republishes atomically.
+arc-swap = "1"
 
 # Internal crates
 dynrunner-core = { path = "crates/dynrunner-core" }

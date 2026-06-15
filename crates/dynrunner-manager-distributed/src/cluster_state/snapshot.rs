@@ -615,6 +615,11 @@ impl<I: Identifier> ClusterState<I> {
             // only — its production caller (the promotion signal) pairs
             // it with the settled-base handover (`settled_base_clone`).
             settled: _settled,
+            // node-local: slurm-authoritative life-state snapshot consumed
+            // by the apply-path sticky-removal reversibility tiebreak
+            // (#546) — a pure runtime handle the restoring replica re-wires
+            // on its own deployment side, never crosses the wire.
+            authority_snapshot: _authority_snapshot,
         } = self;
         ClusterStateSnapshot {
             // Task-batch partition — empty in the head; the stream's

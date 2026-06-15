@@ -2332,6 +2332,17 @@ async fn chronically_starved_primary_removes_dead_member_and_requests_respawn() 
                 "tcp://127.0.0.1:5555".into(),
                 "-----BEGIN PUBLIC KEY-----\nFAKE\n".into(),
             );
+            // The slurm-authoritative quantity gate (#543) refuses respawn
+            // unless slurm reports the fleet below initial count. Wire a
+            // static snapshot saying `current=0 < initial=2` so the
+            // gate passes and this test exercises the chronic-starvation
+            // removal → respawn dispatch path it was built for.
+            primary.set_authority_snapshot(std::sync::Arc::new(
+                crate::authority_snapshot::test_helpers::StaticSnapshot {
+                    map: std::collections::HashMap::new(),
+                    count: Some(0),
+                },
+            ));
             register_operational_secondary(&mut primary, "doomed", 0, "victim");
             register_operational_secondary(&mut primary, "survivor", 1, "victim-2");
 
@@ -2413,19 +2424,12 @@ async fn chronically_starved_primary_removes_dead_member_and_requests_respawn() 
                  reaches the respawn pipeline"
             );
 
-            // The request was ACCEPTED: replicated ledger entry written,
-            // replacement tracked pending, spawner invoked with a fresh id.
+            // The request was ACCEPTED: replicated ledger entry written
+            // and spawner invoked with a fresh id.
             assert_eq!(
                 primary.cluster_state.respawn_events().len(),
                 1,
                 "the accepted respawn is recorded on the replicated ledger"
-            );
-            assert!(
-                primary
-                    .pending_replacements
-                    .values()
-                    .any(|original| original == "doomed"),
-                "the replacement is tracked pending-until-join for the dead member"
             );
             let outcome = primary
                 .respawn_tasks
@@ -2809,6 +2813,23 @@ async fn remote_evidence_ends_deferral_and_remaining_silent_are_declared() {
             );
             install_default_pool(&mut primary);
             register_colocated_plus_three_remotes(&mut primary);
+            // After #544 the collective-silence gate escalates only when
+            // slurm-authoritative evidence agrees the silent fleet is GONE.
+            // This test's silent remotes are simulating exited processes,
+            // so install a snapshot that reports them all `Gone` —
+            // wall-clock plus authority confirmation is what the gate
+            // needs to escalate.
+            {
+                use crate::authority_snapshot::{PeerLifeState, test_helpers::StaticSnapshot};
+                let map = ["krater13", "krater14", "krater15"]
+                    .iter()
+                    .map(|id| ((*id).to_string(), PeerLifeState::Gone))
+                    .collect();
+                primary.set_authority_snapshot(std::sync::Arc::new(StaticSnapshot {
+                    map,
+                    count: None,
+                }));
+            }
 
             primary.process_heartbeat_tick().await.unwrap();
 
@@ -2877,6 +2898,21 @@ async fn collective_silence_escalates_and_declares_after_bounded_window() {
             );
             install_default_pool(&mut primary);
             register_colocated_plus_three_remotes(&mut primary);
+            // #544: install an authoritative snapshot reporting all
+            // remotes Gone so the escalation can fire — the gate now
+            // requires slurm-authoritative confirmation in addition to
+            // the wall-clock window having elapsed.
+            {
+                use crate::authority_snapshot::{PeerLifeState, test_helpers::StaticSnapshot};
+                let map = ["krater13", "krater14", "krater15"]
+                    .iter()
+                    .map(|id| ((*id).to_string(), PeerLifeState::Gone))
+                    .collect();
+                primary.set_authority_snapshot(std::sync::Arc::new(StaticSnapshot {
+                    map,
+                    count: None,
+                }));
+            }
 
             primary.process_heartbeat_tick().await.unwrap();
 

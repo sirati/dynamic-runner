@@ -20,11 +20,9 @@
 mod budget;
 mod handler;
 mod listener;
-mod pending;
 mod remote;
 mod types;
 
-pub(crate) use pending::PendingReplacements;
 pub use listener::respawn_dispatcher_listener;
 pub use remote::{RemoteRespawnPending, RemoteSecondarySpawner};
 pub use types::{

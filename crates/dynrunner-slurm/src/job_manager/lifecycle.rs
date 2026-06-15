@@ -689,6 +689,17 @@ impl<G: Gateway> SlurmJobManager<G> {
     /// not yet left the queue — maps to `None` (no terminal recorded yet),
     /// the same fail-safe "no clean-completion evidence" direction as an
     /// unreadable consult.
+    /// Public wrapper around [`Self::sacct_terminal_state`] for the
+    /// off-loop slurm-authoritative probe
+    /// (`crate::authority::SlurmJobManagerProbe`). A squeue-empty consult
+    /// falls through to sacct here; a terminal disposition (any `Some`)
+    /// proves the job has left the queue, a `None` keeps the answer
+    /// `Unknown` at the probe layer. Thin pub wrapper — the consult body
+    /// stays private so other call sites must go through this seam.
+    pub async fn sacct_terminal_state_pub(&self, job_id: &str) -> Option<JobStatus> {
+        self.sacct_terminal_state(job_id).await
+    }
+
     async fn sacct_terminal_state(&self, job_id: &str) -> Option<JobStatus> {
         let cmd = format!("sacct -j {job_id} -n -P -X -o State 2>/dev/null");
         let result = self.gateway.execute_command(&cmd, None).await.ok()?;

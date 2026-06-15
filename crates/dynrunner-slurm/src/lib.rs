@@ -8,6 +8,7 @@
 /// never a per-call-site `if`.
 pub(crate) use dynrunner_core::IMPORTANT_TARGET;
 
+pub mod authority;
 pub(crate) mod child_reaping;
 pub mod config;
 pub mod job_manager;

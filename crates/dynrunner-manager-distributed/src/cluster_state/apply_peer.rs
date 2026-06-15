@@ -156,30 +156,65 @@ impl<I: Identifier> ClusterState<I> {
     ) -> ApplyOutcome {
         match self.peer_state.get(&peer_id) {
             Some(entry) if entry.state == PeerState::Dead && member_gen <= entry.member_gen => {
-                // Per-peer throttle (#416): a removed-but-alive peer
-                // re-applies this same non-advancing join on EVERY frame
-                // until its transport leg re-admits — emit once per peer
-                // per minute, carrying the suppressed count, never one
-                // line per frame. (The WARN still names a real
-                // re-admission stall, so it stays — just quiet.)
-                let entry_gen = entry.member_gen;
-                if let Some(suppressed) = self
-                    .dead_rejoin_warn
-                    .entry(peer_id.clone())
-                    .or_insert_with(|| WarnThrottle::new(DEAD_REJOIN_WARN_INTERVAL))
-                    .permit()
-                {
+                // SLURM-AUTHORITATIVE TIEBREAK (#546): the sticky-removal
+                // may have been a false-positive (local view declared the
+                // peer dead while slurm still has the original's job
+                // running — the run_20260615_112332 face). Consult the
+                // off-loop authority snapshot; if it shows the peer
+                // ALIVE, REVERSE the dead-mark and re-admit at the
+                // EXISTING entry_gen (no generation bump — this is
+                // correction-of-our-error, not a new incarnation,
+                // matching the #540 phase-may-be-empty symmetry).
+                //
+                // Fail-closed on Unknown / stale snapshot / no snapshot
+                // wired: keep the sticky-removal. Without positive
+                // evidence of life we don't reverse the declaration.
+                use crate::authority_snapshot::PeerLifeState;
+                let alive_via_authority = self
+                    .authority_snapshot
+                    .as_ref()
+                    .is_some_and(|s| matches!(s.peer_life(&peer_id), PeerLifeState::Alive));
+
+                if alive_via_authority {
                     tracing::warn!(
                         target: "dynrunner_cluster_state",
                         peer_id = %peer_id,
-                        entry_gen = entry_gen,
+                        entry_gen = entry.member_gen,
                         join_gen = member_gen,
-                        suppressed_since_last_warn = suppressed,
-                        "PeerJoined for dead id at a non-advancing generation ignored \
-                         (sticky removal within the membership incarnation)",
+                        "PeerJoined for dead id at non-advancing gen — slurm-authoritative \
+                         evidence shows the peer's job is ALIVE; REVERSING the sticky-removal \
+                         (the prior dead-declaration was a false-positive from local \
+                         deafness — see #543/#544/#546)",
                     );
+                    // Fall through to the liveness-update path below.
+                    // The Dead-entry branch there handles the state flip
+                    // and (per the gen-unchanged branch) keeps the
+                    // existing entry_gen on a reversal.
+                } else {
+                    // Per-peer throttle (#416): a removed-but-alive peer
+                    // re-applies this same non-advancing join on EVERY
+                    // frame until its transport leg re-admits — emit once
+                    // per peer per minute, carrying the suppressed count,
+                    // never one line per frame.
+                    let entry_gen = entry.member_gen;
+                    if let Some(suppressed) = self
+                        .dead_rejoin_warn
+                        .entry(peer_id.clone())
+                        .or_insert_with(|| WarnThrottle::new(DEAD_REJOIN_WARN_INTERVAL))
+                        .permit()
+                    {
+                        tracing::warn!(
+                            target: "dynrunner_cluster_state",
+                            peer_id = %peer_id,
+                            entry_gen = entry_gen,
+                            join_gen = member_gen,
+                            suppressed_since_last_warn = suppressed,
+                            "PeerJoined for dead id at a non-advancing generation ignored \
+                             (sticky removal within the membership incarnation)",
+                        );
+                    }
+                    return ApplyOutcome::NoOp;
                 }
-                return ApplyOutcome::NoOp;
             }
             _ => {}
         }
@@ -203,18 +238,27 @@ impl<I: Identifier> ClusterState<I> {
                 true
             }
             Some(entry) if entry.state == PeerState::Dead => {
-                // member_gen > entry.member_gen here (the sticky gate
-                // above returned NoOp otherwise): the RE-ADMISSION edge.
-                tracing::warn!(
-                    target: "dynrunner_cluster_state",
-                    peer_id = %peer_id,
-                    from_gen = entry.member_gen,
-                    to_gen = member_gen,
-                    "re-admitting removed peer at an advanced membership \
-                     generation (its authenticated frames prove it alive)",
-                );
+                // Two cases reach here:
+                // (a) STANDARD RE-ADMISSION: member_gen > entry.member_gen
+                //     (the frame-ingest seam advanced the gen on this
+                //     dead-but-alive sender's frame). Adopt the new gen.
+                // (b) STICKY-REMOVAL REVERSAL via the slurm-authoritative
+                //     tiebreak (#546): member_gen <= entry.member_gen,
+                //     authority said Alive. Keep the existing entry_gen
+                //     (this is not a new incarnation — it is
+                //     correction-of-our-error).
+                if member_gen > entry.member_gen {
+                    tracing::warn!(
+                        target: "dynrunner_cluster_state",
+                        peer_id = %peer_id,
+                        from_gen = entry.member_gen,
+                        to_gen = member_gen,
+                        "re-admitting removed peer at an advanced membership \
+                         generation (its authenticated frames prove it alive)",
+                    );
+                    entry.member_gen = member_gen;
+                }
                 entry.state = PeerState::Alive;
-                entry.member_gen = member_gen;
                 true
             }
             Some(entry) => {

@@ -228,6 +228,12 @@ impl<I: Identifier> ClusterState<I> {
             // accumulator and adding the settled count keeps the digest
             // BYTE-IDENTICAL to a full fold of the logical state.
             settled,
+            // node-local: slurm-authoritative life-state snapshot consumed
+            // by the apply-path sticky-removal reversibility tiebreak
+            // (#546). A pure runtime handle (no replicated content), so it
+            // carries no convergence signal — same classification as the
+            // lifecycle dispatcher senders. Bound for the exhaustive guard.
+            authority_snapshot: _authority_snapshot,
         } = self;
 
         // `peer_holdings` is steady-state best-effort metadata
