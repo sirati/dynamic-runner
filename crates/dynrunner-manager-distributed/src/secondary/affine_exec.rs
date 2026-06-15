@@ -140,7 +140,13 @@ where
         match importer.import(task).await {
             Ok(()) => return AffineOutcome::Success,
             Err(e) if e.is_transient() => {
-                tracing::warn!(
+                // Per-attempt RETRY-LOOP decision noise (trace, not info): the
+                // standalone, operator-meaningful event is the FINAL outcome
+                // of the bounded retry (the Success arm above, or the
+                // Recoverable exhaustion fall-through below) — both lifted to
+                // info on the release seam. A mid-loop transient that the
+                // outer retry absorbs is decision-internal observability.
+                tracing::trace!(
                     target: "dynrunner_affine",
                     task_id = %task.task_id,
                     attempt,
@@ -273,6 +279,19 @@ where
             .affine_probe_cache
             .insert(affine_hash.to_string(), outcome);
         if satisfied {
+            // Standalone lifecycle event: a FRESH probe verdict identified
+            // this node as the gate's producer — `affine_done` is seeded and
+            // every subsequent dependent for the rest of the run short-circuits
+            // through the outer `affine_done.contains` check (the probe is NOT
+            // re-consulted, the cache-hit `Satisfied` path stays silent — the
+            // verdict is `Satisfied` forever). Fires at most ONCE per
+            // (node, gate) by construction.
+            tracing::info!(
+                target: "dynrunner_affine",
+                affine_hash = %affine_hash,
+                "satisfied probe identified this node as gate producer; \
+                 seeding affine_done (the import scaffolding is skipped)"
+            );
             self.op_mut().affine_done.insert(affine_hash.to_string());
         }
         satisfied
@@ -361,18 +380,30 @@ where
         // Every queued dependent (first or not) reports the CRDT-visible
         // queued state, so the primary/observer SEE `B` waiting on the local
         // import (never silently stuck mid-InFlight). The primary originates
-        // `QueuedAfterLocalDependencySet` off this frame.
-        self.report_queued_after_local_dependency(work_hash, affine_hash)
+        // `QueuedAfterLocalDependencySet` off this frame. Clone the hash so it
+        // remains available for the standalone lifecycle emit below.
+        self.report_queued_after_local_dependency(work_hash, affine_hash.clone())
             .await?;
 
         // The import itself is driven by the caller off a `StartedRun` (the
         // synchronous-gate rationale above): exactly one dependent per (node,
         // affine hash) sees the key vacant.
-        Ok(if is_first {
-            AffineGateOutcome::StartedRun
+        if is_first {
+            // Standalone lifecycle event: this node just kicked off its single
+            // per-secondary import for the gate (`StartedRun` fires exactly
+            // ONCE per (node, gate) by virtue of the `affine_running` latch).
+            // Pairs with the `complete_affine_import` "finished" emit below
+            // and the primary's `AffineReady` emission for end-to-end gate-
+            // lifecycle visibility.
+            tracing::info!(
+                target: "dynrunner_affine",
+                affine_hash = %affine_hash,
+                "secondary-affine import started (first dependent on this node)"
+            );
+            Ok(AffineGateOutcome::StartedRun)
         } else {
-            AffineGateOutcome::QueuedBehindRun
-        })
+            Ok(AffineGateOutcome::QueuedBehindRun)
+        }
     }
 
     /// Run the SINGLE per-secondary import for `affine_hash` and drain every
@@ -490,6 +521,28 @@ where
             .unwrap_or_default();
         if matches!(outcome, AffineOutcome::Success) {
             self.op_mut().affine_done.insert(affine_hash.clone());
+        }
+
+        // Standalone lifecycle event: the single per-secondary import for this
+        // gate just finished and the run-once latch is being drained — releases
+        // every queued dependent (Success) or fails them with the #495 class
+        // (Failure). Fires exactly ONCE per (node, gate, import attempt); pairs
+        // with the `ensure_affine_import` "started" emit above.
+        match &outcome {
+            AffineOutcome::Success => tracing::info!(
+                target: "dynrunner_affine",
+                affine_hash = %affine_hash,
+                queued_dependents = dependents.len(),
+                "secondary-affine import completed; releasing queued dependents"
+            ),
+            AffineOutcome::Failure { error_type, reason } => tracing::info!(
+                target: "dynrunner_affine",
+                affine_hash = %affine_hash,
+                queued_dependents = dependents.len(),
+                error_type = ?error_type,
+                reason = %reason,
+                "secondary-affine import failed; failing queued dependents (re-routable per #495 on Recoverable)"
+            ),
         }
 
         for dependent in dependents {
