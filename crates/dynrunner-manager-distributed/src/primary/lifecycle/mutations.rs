@@ -64,12 +64,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // tick picks them up.
         let batch = apply_locally_for_broadcast(&mut self.cluster_state, mutations);
         let crate::cluster_state::AppliedBatch {
-            applied,
+            mut applied,
             resumed_for_dispatch,
             became_pending,
         } = batch;
         let resumed_any = !resumed_for_dispatch.is_empty();
+        // A SecondaryAffine gate that auto-resumed Blocked → Pending in this
+        // batch must NOT enter the pool: a gate is `is_worker_assignable=false`
+        // and is never worker-dispatched, and the AffineReady resolution
+        // below transitions it to its terminal `AffineReady` state inside
+        // this same call. Reinjecting it would leave an inert non-
+        // dispatchable item in the pool with no path to remove it (the
+        // `resolve_dependency_satisfied_affine_gates` pass only detects
+        // Pending+resolved gates, not the AffineReady gate this resolution
+        // produces). Skip gates here; the AffineReady recursion below owns
+        // the gate's terminal transition AND the cascade resume of its
+        // dependents (those dependents are the real worker-assignable
+        // tasks that DO need pool re-injection — they ride the recursive
+        // call's own `resumed_for_dispatch`).
         for binary in resumed_for_dispatch {
+            if binary.kind.is_secondary_affine() {
+                continue;
+            }
             tracing::debug!(
                 phase = %binary.phase_id,
                 task_id = ?binary.task_id,
@@ -95,22 +111,80 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // without the primary ever executing it. `became_pending` carries
         // the union of the resume + spawn surfaces; the detection
         // (Pending-gate ∧ all-deps-resolved) is owned by `cluster_state`.
-        // Broadcast through THIS method recursively so the follow-up
-        // inherits the identical apply+filter+capture+settle semantics AND
-        // so a CHAIN of gates (I1 depends on I2, both SecondaryAffine)
-        // converges: applying I2's `AffineReady` resumes I1 `Blocked →
-        // Pending`, which rides the recursive call's own `became_pending`
-        // and originates I1's `AffineReady` in turn. The recursion
-        // terminates: each step strictly drains the finite set of
-        // not-yet-ready gates (a gate goes `Pending → AffineReady` exactly
-        // once, and the apply arm NoOps a re-application).
-        if !became_pending.is_empty() {
+        //
+        // BROADCAST-ORDER INVARIANT (#591): the originating frame in
+        // `applied` (TasksSpawned / TaskCompleted / SetupCompleted) must
+        // reach every secondary BEFORE the AffineReady frame this resolution
+        // produces. Otherwise the secondary's apply of the originating frame
+        // hasn't yet inserted/resumed the gate to `Pending`, so when
+        // AffineReady arrives the gate is still `Blocked` (or absent), the
+        // `Pending`-precondition arm misses, and the `_ => None` NoOp arm
+        // wins — leaving the gate forever non-`AffineReady` on the secondary.
+        // `unmet_local_affine_dep` then returns `None` for every dependent
+        // (it only fires on `AffineReady` gates), so the secondary's affine
+        // executor never dispatches the gate body, and the dependents either
+        // run without their import (with broken outputs) or fail-and-retry
+        // forever (the consumer's 272-reinject + 0-body-execution deadlock).
+        //
+        // The pre-#591 inline recursion broadcast AffineReady FIRST (during
+        // the recursive `broadcast_applied_mutations`) and the outer frame
+        // SECOND, exactly the wrong order. The cold-seed path
+        // (`originate_cold_seed`) is unaffected because it STAGES every
+        // resolved-gate AffineReady into one post-connect broadcast vec
+        // alongside the seed's TaskAdded — same in-order semantics, single
+        // frame.
+        //
+        // The fix here: DRAIN the AffineReady chain ITERATIVELY against
+        // `apply_locally_for_broadcast` (apply locally + collect cascade
+        // surfaces, NO broadcast), append every applied AffineReady mutation
+        // to the OUTER `applied` vec in topological order (parent before
+        // child), and let the OUTER's single `broadcast_applied_mutations`
+        // ship the originating frame AND the whole chain in ONE wire frame
+        // in the right order. Chain convergence: each iteration resumes the
+        // next layer's gates Blocked → Pending and their hashes ride the
+        // next iteration's `became_pending`. Terminates: a gate goes
+        // `Pending → AffineReady` exactly once and the apply arm NoOps a
+        // re-application.
+        let mut pending_to_resolve = became_pending;
+        while !pending_to_resolve.is_empty() {
             let affine_ready = self
                 .cluster_state
-                .affine_ready_mutations_for(became_pending);
-            if !affine_ready.is_empty() {
-                Box::pin(self.apply_and_broadcast_cluster_mutations(affine_ready)).await;
+                .affine_ready_mutations_for(pending_to_resolve);
+            if affine_ready.is_empty() {
+                break;
             }
+            let chain_batch =
+                apply_locally_for_broadcast(&mut self.cluster_state, affine_ready);
+            // The chain step's cascade-resumed dependents (e.g. the
+            // `build` tasks unblocked by the gate's `AffineReady`): real
+            // worker-assignable work that must enter the pool. Skip
+            // gates here too — a chained downstream gate's terminal will be
+            // applied on this same loop's next iteration. Reinject the
+            // real work tasks straight away so the post-loop
+            // `TasksAdded` emit reaches a pool that already holds them.
+            let chain_resumed_any = !chain_batch.resumed_for_dispatch.is_empty();
+            for binary in chain_batch.resumed_for_dispatch {
+                if binary.kind.is_secondary_affine() {
+                    continue;
+                }
+                tracing::debug!(
+                    phase = %binary.phase_id,
+                    task_id = ?binary.task_id,
+                    "pool: re-inject auto-resumed Blocked dependent (affine chain)"
+                );
+                self.pool_mut().reinject(binary);
+            }
+            if chain_resumed_any {
+                self.cluster_state
+                    .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
+            }
+            applied.extend(chain_batch.applied);
+            // Re-arm the next iteration over any chained gates that THIS
+            // chain step just resumed Blocked → Pending. A non-gate
+            // `became_pending` hash filters to no AffineReady mutation
+            // (see `affine_ready_mutations_for`), so the chain naturally
+            // terminates the iteration in O(distinct-gate-depth).
+            pending_to_resolve = chain_batch.became_pending;
         }
         // Worker-roster growth edge — the symmetric twin of the
         // pool-entry edge above. A `SecondaryCapacity` this batch ACTUALLY

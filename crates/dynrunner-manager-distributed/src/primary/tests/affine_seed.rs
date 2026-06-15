@@ -241,6 +241,254 @@ async fn discover_on_promotion_originate_resolves_gate_and_build_is_dispatchable
         .await;
 }
 
+// ─────────────────────── #591: with-dep gate runtime-spawn ───────────────────────
+
+/// (c) #591 — a RUNTIME-SPAWNED `TaskKind::SecondaryAffine` gate WITH a
+/// pending predecessor dep that COMPLETES after the gate (and its
+/// dependents) are runtime-spawned via the `TasksSpawned` classifier.
+///
+/// THE consumer asm-dataset-nix DEADLOCK scenario (the #591 brief): build
+/// tasks gate on a SecondaryAffine `I` which itself depends on a normal
+/// WORK task `W`. `I` + dependents land via the runtime `TasksSpawned`
+/// classifier while `W` is still InFlight, so `I` is born CRDT-`Blocked`
+/// on `W` and every dependent is born CRDT-`Blocked` on `I`. When `W`
+/// completes, the primary's `apply_and_broadcast_cluster_mutations` flow
+/// auto-resumes `I` `Blocked → Pending` (the `resume_blocked_on(W)`
+/// cascade in the `TaskCompleted` arm), the `became_pending` surface
+/// drives the `AffineReady` resolution, applying it transitions `I`
+/// `Pending → AffineReady` AND resume_blocked_on(I) cascade-resumes every
+/// dependent. Both AffineReady + dependent resumption must complete BEFORE
+/// the worker-management recheck dispatches anything — otherwise the
+/// dependents never enter the pool and no worker picks them up, so no
+/// secondary's affine executor ever triggers the gate body, and the gate
+/// stays READY-not-EXECUTED forever (the consumer 272-reinject + 0-body-
+/// execution deadlock).
+///
+/// Pre-fix (the bug the asm-dataset run pinned):
+///   (a) the gate itself rode `mutations.rs`'s `resumed_for_dispatch`
+///       reinject loop unconditionally — but a SecondaryAffine gate is
+///       `is_worker_assignable=false`, so reinjecting it leaves an inert
+///       non-dispatchable item in the pool with no removal path
+///       (resolve_dependency_satisfied_affine_gates only fires on
+///       Pending+resolved gates, NOT on the AffineReady gate this
+///       resolution produces); and
+///   (b) the AffineReady recursion's BROADCAST went out BEFORE the outer
+///       TaskCompleted broadcast, so every secondary received AffineReady
+///       while its local gate was still CRDT-`Blocked` (the TaskCompleted
+///       hadn't applied yet to resume Blocked → Pending). The
+///       `Pending`-precondition arm of the AffineReady apply then took the
+///       NoOp branch on every secondary, leaving the gate non-`AffineReady`
+///       there. `unmet_local_affine_dep` returns `None` for every dependent
+///       (it only fires on AffineReady gates), so the secondary's affine
+///       executor never dispatches the gate body and the dependents run
+///       without their import (broken outputs / retry-loop).
+///
+/// THIS test pins the PRIMARY-side invariants on the runtime-spawn HAS-DEP
+/// path: (i) the gate reaches CRDT `AffineReady`, NOT stuck `Pending`;
+/// (ii) the gate is NOT in the dispatch pool (it never was — a gate is
+/// inert, the AffineReady resolution + the cascade-resume run in the same
+/// `apply_and_broadcast` call, no inert pool residue); (iii) every
+/// dependent is CRDT-`Pending` and DISPATCHABLE in the pool (its
+/// `Blocked-on-gate` was cleared by the same `resume_blocked_on(gate)`
+/// cascade the AffineReady apply emits).
+///
+/// The broadcast-order half (the half that pins the SECONDARY-side gate-
+/// AffineReady transition) lives in `cluster_state::tests::affine`
+/// because it reads the `apply_and_broadcast`-emitted frame sequence; the
+/// frame-ordering invariant the iterative-drain fix establishes is checked
+/// by the `with_dep_runtime_spawn_chain_emits_outer_before_affine_ready`
+/// test there.
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_spawn_with_dep_gate_resolves_when_dependency_completes() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // The PRE-EXISTING normal WORK task `W` (the asm-dataset
+            // `build_common_dep`): seeded via `TaskAdded` so it is already
+            // CRDT-`Pending` (it is the gate's predecessor), then we will
+            // originate its `TaskCompleted` post-spawn to drive the
+            // resume cascade onto the runtime-spawned gate.
+            let w = make_binary("build_common_dep", 100);
+            let w_hash = compute_task_hash(&w);
+
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // SEED `W` via the production `TaskAdded` path + hydrate so the
+            // pool tracks it as queued-Pending (no dispatch yet — the test
+            // never runs a recheck pre-completion).
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: w_hash.clone(),
+                    task: w.clone(),
+                });
+            }
+            primary
+                .hydrate_from_cluster_state()
+                .expect("the W graph is valid");
+
+            // Mark `W` `InFlight` on the CRDT (the production state when its
+            // worker is mid-execution and its `TaskCompleted` is about to
+            // land), then runtime-spawn the gate + dependents. The dep
+            // resolution in `apply_tasks_spawned` sees `W` as `InFlight`
+            // (non-terminal), so the gate lands `Blocked { on: w_hash }`
+            // and the dependents land `Blocked { on: gate_hash }`.
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::TaskAssigned {
+                    hash: w_hash.clone(),
+                    secondary: "secondary-0".into(),
+                    worker: 0,
+                    version: Default::default(),
+                    attempt: Default::default(),
+                });
+            }
+
+            // RUNTIME-SPAWN the gate + two dependents through the production
+            // `TasksSpawned` apply rule (the exact path `apply_spawn_tasks`
+            // calls). They land `Blocked` per the dep classifier; the bug
+            // pre-fix surfaces on the LATER TaskCompleted-driven cascade.
+            let gate = affine_gate_depending_on("import_common_dep", "build_common_dep");
+            let build_a = build_depending_on("build-a", "import_common_dep");
+            let build_b = build_depending_on("build-b", "import_common_dep");
+            let gate_hash = compute_task_hash(&gate);
+            let build_a_hash = compute_task_hash(&build_a);
+            let build_b_hash = compute_task_hash(&build_b);
+            primary
+                .apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TasksSpawned {
+                    tasks: vec![gate.clone(), build_a.clone(), build_b.clone()],
+                }])
+                .await;
+
+            // Pre-completion invariants: `W` InFlight, gate + dependents
+            // CRDT-Blocked, NOTHING in the pool (the gate is non-
+            // dispatchable; the dependents are CRDT-Blocked; nothing has
+            // been resumed yet).
+            assert!(
+                matches!(
+                    primary.cluster_state.task_state(&gate_hash),
+                    Some(TaskState::Blocked { .. })
+                ),
+                "the runtime-spawned gate is CRDT-Blocked on its pending predecessor"
+            );
+            for (name, hash) in [("build-a", &build_a_hash), ("build-b", &build_b_hash)] {
+                assert!(
+                    matches!(
+                        primary.cluster_state.task_state(hash),
+                        Some(TaskState::Blocked { .. })
+                    ),
+                    "{name} is CRDT-Blocked on the gate (gate is itself Blocked)"
+                );
+            }
+            // The gate + dependents are CRDT-Blocked, so they are NOT in
+            // the dispatch pool. `W` (the predecessor) IS in the pool from
+            // the hydrate (Pending), but the test never runs a dispatch
+            // recheck — its assignment was originated via direct CRDT
+            // apply, so the pool entry remains queued; it is consumed only
+            // by the post-completion assertions below.
+            let queued_pre: Vec<String> =
+                primary.pool().iter().map(|t| t.task_id.clone()).collect();
+            assert!(
+                !queued_pre.contains(&"import_common_dep".to_string()),
+                "the gate is non-worker-assignable + CRDT-Blocked; it must \
+                 not enter the dispatch pool pre-completion; got {queued_pre:?}"
+            );
+            assert!(
+                !queued_pre.contains(&"build-a".to_string())
+                    && !queued_pre.contains(&"build-b".to_string()),
+                "the dependents are CRDT-Blocked behind the gate; they must \
+                 not enter the dispatch pool pre-completion; got {queued_pre:?}"
+            );
+
+            // Originate `W`'s `TaskCompleted` — the seam where the bug fires.
+            // This is the EXACT origination path `handle_task_complete` uses
+            // (the consumer's run does it the same way: secondary reports
+            // `TaskComplete` → primary's `handle_task_complete` →
+            // `apply_and_broadcast_cluster_mutations([TaskCompleted])`).
+            // The bug: pre-fix the gate's auto-resume Blocked → Pending fed
+            // `resumed_for_dispatch`, the reinject loop unconditionally
+            // dropped the gate into the pool as an inert item (gate is
+            // `is_worker_assignable=false`), THEN the AffineReady recursion
+            // applied the gate Pending → AffineReady — but its
+            // `broadcast_applied_mutations` for AffineReady WENT OUT FIRST
+            // (before the outer's TaskCompleted broadcast), so every
+            // secondary's gate stayed CRDT-Blocked when AffineReady arrived
+            // and the NoOp branch on the secondary left the gate non-
+            // AffineReady there forever. Locally on the primary the cascade
+            // also has to resume the dependents Blocked → Pending (the
+            // `resume_blocked_on(gate)` chain inside the recursion); this
+            // test pins those local invariants.
+            primary
+                .apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskCompleted {
+                    hash: w_hash.clone(),
+                    result_data: None,
+                    attempt: Default::default(),
+                }])
+                .await;
+
+            // (a) the gate is originated `AffineReady` — NOT stuck Pending,
+            // NOT stuck Blocked, NOT in any other live state.
+            assert!(
+                matches!(
+                    primary.cluster_state.task_state(&gate_hash),
+                    Some(TaskState::AffineReady { .. })
+                ),
+                "the runtime-spawned with-dep gate resolves to AffineReady once \
+                 its predecessor dep completes (pre-fix it sat Pending in the pool \
+                 because the gate was reinjected during the resume cascade); got {:?}",
+                primary.cluster_state.task_state(&gate_hash)
+            );
+
+            // (b) BOTH builds are CRDT-Pending — their Blocked-on-gate was
+            // cleared by the same `resume_blocked_on(gate)` cascade the
+            // AffineReady apply emits, and the dependents rode the
+            // recursion's `resumed_for_dispatch` into a `pool.reinject` (they
+            // ARE worker-assignable and DO belong in the pool).
+            for (name, hash) in [("build-a", &build_a_hash), ("build-b", &build_b_hash)] {
+                assert!(
+                    matches!(
+                        primary.cluster_state.task_state(hash),
+                        Some(TaskState::Pending { .. })
+                    ),
+                    "{name} must be Pending once the gate resolved (pre-fix it stayed \
+                     Blocked on the never-AffineReady gate); got {:?}",
+                    primary.cluster_state.task_state(hash)
+                );
+            }
+
+            // (c) the dependents are queued + dispatchable in the pool;
+            // the gate is NOT in the pool (a resolved gate is a terminal,
+            // it never belonged to a dispatch surface). `W` may still be
+            // queued (its TaskCompleted apply does not reach the pool
+            // through this direct test path), which is irrelevant to the
+            // bug — assert only on the gate's absence + the dependents'
+            // presence.
+            let queued: std::collections::HashSet<String> =
+                primary.pool().iter().map(|t| t.task_id.clone()).collect();
+            assert!(
+                !queued.contains("import_common_dep"),
+                "the resolved gate must NOT be in the pool (pre-fix the gate \
+                 sat in the pool as an inert non-dispatchable item, reinjected \
+                 by `mutations.rs:78` from the gate-resume cascade); got {queued:?}"
+            );
+            assert!(
+                queued.contains("build-a"),
+                "build-a must be queued + dispatchable; got {queued:?}"
+            );
+            assert!(
+                queued.contains("build-b"),
+                "build-b must be queued + dispatchable; got {queued:?}"
+            );
+        })
+        .await;
+}
+
 // ─────────────────────── #506: with-dep gate ───────────────────────
 
 /// A `TaskKind::Setup` task (the upload `U`) with the PRIMARY's own affinity
