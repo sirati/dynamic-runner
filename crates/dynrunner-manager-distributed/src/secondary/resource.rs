@@ -80,6 +80,32 @@ pub(in crate::secondary) const REPORT_REPLAY_BACKOFF_CAP: std::time::Duration =
 pub(in crate::secondary) const REPORT_REPLAY_LOG_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(30);
 
+/// THE single owner of "which `RetainedSendState` does a successful
+/// confirmable send transition into" — both the first-send chokepoint
+/// ([`SecondaryCoordinator::send_to_primary`]'s `Ok` arm) and the
+/// replay drain's re-send ([`SecondaryCoordinator::
+/// drain_report_replays_inner`]) read it, so the
+/// terminal-vs-important-custom drop-trigger split lives in one
+/// place. The classifier is the enum's
+/// [`DistributedMessage::is_important_custom_message`]; the call sites
+/// hand the boolean in (they already compute it for the matching
+/// stamp / classification decisions, so this function never inspects
+/// the frame variant — it owns ONLY the state-shape choice).
+///
+/// `now` is captured at the call site so the same instant flows into
+/// `sent_at` AND the entry's `next_due` (one ack window later) —
+/// consistent schedule under fast clock drift / debug timing.
+pub(in crate::secondary) fn retention_state_for_sent_ok(
+    is_important_custom: bool,
+    now: std::time::Instant,
+) -> RetainedSendState {
+    if is_important_custom {
+        RetainedSendState::AwaitingCrdtConvergence { sent_at: now }
+    } else {
+        RetainedSendState::AwaitingAck { sent_at: now }
+    }
+}
+
 /// The per-report replay schedule: how long after its `attempts`-th
 /// replay a still-unACKed report waits for the next one. Doubles from
 /// `ack_timeout` (`ack_timeout` → 2× → 4× …) and saturates at
@@ -138,8 +164,24 @@ pub(in crate::secondary) struct RetainedReport<I> {
 /// Why a confirmable report is retained in the replay buffer. WHEN it
 /// is re-sent is the entry's own schedule
 /// ([`RetainedReport::next_due`]); the reason only classifies the
-/// retention for logging (the AwaitingAck → past-deadline WARN is the
-/// blackholed-leg honesty signal #352 exists for).
+/// retention for logging (the AwaitingAck / AwaitingCrdtConvergence →
+/// past-deadline WARN is the blackholed-leg honesty signal #352 exists
+/// for) and selects the DROP TRIGGER:
+///   * `NoRoute` / `AwaitingAck` drop on the primary's
+///     [`DistributedMessage::TerminalAck`] (`SecondaryCoordinator::
+///     ack_delivery`);
+///   * `AwaitingCrdtConvergence` drops on observing the originator's
+///     own `CustomMessagePosted` arrive in the local CRDT mirror via a
+///     `ClusterMutation` broadcast (`dispatch::helpers::
+///     drop_retentions_for_own_customs`) — the #541 fix: a TerminalAck
+///     can race ahead of the wire fan-out (post-#539 the ack is sent
+///     after `apply_and_broadcast(CustomMessagePosted)`'s local apply
+///     but before the mesh-pump has put the broadcast bytes on the
+///     wire), so an ack-driven drop strands the entry on the dead
+///     primary's local CRDT only if it dies in that window; the CRDT-
+///     observation drop trigger forecloses the window because the
+///     originator never sees its own broadcast come back unless the
+///     fan-out actually happened.
 #[derive(Debug)]
 pub(in crate::secondary) enum RetainedSendState {
     /// The send was ABSORBED on a no-route (the pre-#352 retention
@@ -149,12 +191,41 @@ pub(in crate::secondary) enum RetainedSendState {
     NoRoute,
     /// The send returned `Ok` — queued toward a route the membership
     /// view calls live — but the primary's app-level `TerminalAck` has
-    /// not yet landed (#352). `Ok` proves nothing about DELIVERY on a
-    /// blackholed-but-live QUIC leg, so the frame stays retained; an
-    /// ack drops it, and the schedule slot (`next_due`, one ack window
-    /// after `sent_at`) makes the drain treat it as no-route-equivalent
-    /// (replay, same seq).
+    /// not yet landed (#352). Used for TERMINAL-bearing reports
+    /// (`TaskComplete` / `TaskFailed`), whose only durability proof is
+    /// the ack — they have no replicated CRDT analogue. `Ok` proves
+    /// nothing about DELIVERY on a blackholed-but-live QUIC leg, so the
+    /// frame stays retained; an ack drops it, and the schedule slot
+    /// (`next_due`, one ack window after `sent_at`) makes the drain
+    /// treat it as no-route-equivalent (replay, same seq).
     AwaitingAck { sent_at: std::time::Instant },
+    /// The send returned `Ok` for an IMPORTANT [`DistributedMessage::
+    /// CustomMessage`] (F5) — but the originator has not yet observed
+    /// its own `CustomMessagePosted` arrive in the local CRDT mirror via
+    /// a `ClusterMutation` broadcast. The #541 fix: post-#539 the
+    /// primary's `TerminalAck` for an important custom flies AFTER the
+    /// local apply of `CustomMessagePosted` but BEFORE the mesh-pump
+    /// puts the broadcast bytes on the wire (`MeshClient::send` is a
+    /// non-blocking mpsc enqueue, `mesh_host.rs` spawns the pump as a
+    /// `spawn_local` task), so an ack-driven retention drop strands the
+    /// entry on the dead primary's local CRDT only if it dies in that
+    /// window. The CRDT-observation drop trigger
+    /// (`drop_retentions_for_own_customs`) forecloses the window by
+    /// construction: the originator never sees its own broadcast come
+    /// back unless the fan-out actually happened, and the broadcast
+    /// reaching every replica is exactly the durability proof the
+    /// retention needs.
+    ///
+    /// Same schedule semantics as `AwaitingAck` (`next_due` is one
+    /// `delivery_ack_timeout` after `sent_at`, then capped exponential
+    /// backoff) — the difference is purely the DROP TRIGGER, not the
+    /// replay cadence: a fan-out that never happens replays at the same
+    /// rate as an ack that never arrives, and the primary's repeated
+    /// `apply_and_broadcast(CustomMessagePosted)` NoOps on the vacant-
+    /// insert key (idempotent under at-least-once delivery), so a
+    /// re-delivery to the same or a new primary is at-most-once-
+    /// effective.
+    AwaitingCrdtConvergence { sent_at: std::time::Instant },
 }
 
 impl RetainedSendState {
@@ -164,6 +235,14 @@ impl RetainedSendState {
     #[cfg(test)]
     pub(in crate::secondary) fn is_awaiting_ack(&self) -> bool {
         matches!(self, Self::AwaitingAck { .. })
+    }
+
+    /// Test-visible state predicate for the #541 retention reason — the
+    /// drop-on-CRDT-convergence variant the important-custom retention
+    /// uses (terminals stay on `AwaitingAck`).
+    #[cfg(test)]
+    pub(in crate::secondary) fn is_awaiting_crdt_convergence(&self) -> bool {
+        matches!(self, Self::AwaitingCrdtConvergence { .. })
     }
 }
 
@@ -366,6 +445,20 @@ where
         // knowledge beyond "must this report provably reach the
         // authority?".
         let is_confirmable = msg.requires_delivery_ack();
+        // Sub-classify the retention DROP TRIGGER: an IMPORTANT custom
+        // (F5) drops on observing its own `CustomMessagePosted` arrive
+        // in the local CRDT mirror via a `ClusterMutation` broadcast
+        // (#541 — the post-#539 hard-crash window between the primary's
+        // local apply and the mesh-pump fan-out: a TerminalAck-driven
+        // drop strands the entry on the dead primary's CRDT only), so
+        // its `Ok`-side retention enters `AwaitingCrdtConvergence`.
+        // Terminals continue to use `AwaitingAck` — they have no
+        // replicated CRDT analogue, so the ack is their only proof.
+        // The classifier is owned by the enum
+        // (`is_important_custom_message`) for the same single-owner
+        // reason `requires_delivery_ack` is — this site reads one
+        // predicate, never inspects the variant.
+        let is_important_custom = msg.is_important_custom_message();
         // App-level delivery-confirmation stamp (#352): THIS chokepoint
         // is the single owner of `delivery_seq` assignment — every
         // confirmable primary-bound report gets the next value of the
@@ -515,22 +608,31 @@ where
         // QUIC leg `send.write_all` buffers locally and returns Ok while
         // the bytes never arrive, and `has_peer` stays true until the
         // 60s idle timeout (well past the task window). So a
-        // confirmable report is RETAINED on success too, in the
-        // SAME replay buffer with the `AwaitingAck` retention reason:
-        // the primary's app-level `TerminalAck { seq }` is the ONLY
-        // event that drops it, and `sent_at` aging past the ack timeout
-        // makes the next drain treat it as no-route-equivalent (replay,
-        // same seq). NO failover-health input is touched on this path —
-        // the ack is delivery bookkeeping, not liveness.
+        // confirmable report is RETAINED on success too. The retention
+        // REASON splits by class (the single-owner predicate
+        // `is_important_custom_message` is read once above): a TERMINAL
+        // enters `AwaitingAck` (the primary's `TerminalAck { seq }` is
+        // the only event that drops it — terminals have no replicated
+        // CRDT analogue), an IMPORTANT custom enters
+        // `AwaitingCrdtConvergence` (drops on observing its own
+        // `CustomMessagePosted` arrive in the local CRDT mirror — the
+        // #541 fix forecloses the post-#539 hard-crash window). Either
+        // way `sent_at` aging past the ack timeout makes the next drain
+        // treat the send as no-route-equivalent (replay, same seq),
+        // so the schedule semantics are identical — the difference is
+        // purely the drop trigger. NO failover-health input is touched
+        // on this path — delivery bookkeeping, not liveness.
         if let Some(retained) = replay_copy {
             let now = std::time::Instant::now();
+            let state = retention_state_for_sent_ok(is_important_custom, now);
             self.pending_report_replays.push(RetainedReport {
                 frame: retained,
-                state: RetainedSendState::AwaitingAck { sent_at: now },
+                state,
                 attempts: 0,
-                // Due one ack window from the send: an ack landing
-                // inside it drops the entry; aging past it makes the
-                // drain treat the send as no-route-equivalent (#352).
+                // Due one ack window from the send: an ack / CRDT
+                // observation landing inside it drops the entry; aging
+                // past it makes the drain treat the send as no-route-
+                // equivalent (#352 / #541).
                 next_due: now + self.delivery_ack_timeout,
                 first_retained_at: now,
             });
@@ -539,8 +641,8 @@ where
                 task_hash = ?report_hash,
                 delivery_seq = ?report_seq,
                 buffered = self.pending_report_replays.len(),
-                "primary-bound CONFIRMABLE report sent; retained awaiting \
-                 the app-level TerminalAck"
+                drop_on = %if is_important_custom { "CRDT-convergence" } else { "TerminalAck" },
+                "primary-bound CONFIRMABLE report sent; retained"
             );
         }
         result
@@ -597,8 +699,34 @@ where
         // Dropping the entry also drops its replay-attempt tally and
         // its backoff schedule — both live ON the entry, so a confirmed
         // delivery leaves no side state behind.
-        self.pending_report_replays
-            .retain(|entry| entry.frame.delivery_seq() != Some(seq));
+        //
+        // ONLY drops AwaitingAck / NoRoute entries. An IMPORTANT-
+        // custom retention sits in `AwaitingCrdtConvergence` and waits
+        // for the CRDT-observation drop trigger
+        // ([`Self::drop_retentions_on_own_custom_observation`]) — the
+        // primary's post-#539 TerminalAck for an important custom is
+        // still emitted (operators reading the logs see "primary
+        // acked"), but acking on it would re-open the #541 hard-crash
+        // window between the primary's local apply and the mesh-pump
+        // fan-out. The filter is precise — the seq alone cannot
+        // distinguish a terminal seq from an important-custom seq
+        // (they share one monotonic counter), but the retention's
+        // STATE tag carries the discriminant.
+        self.pending_report_replays.retain(|entry| {
+            // Keep every entry whose seq does NOT match.
+            if entry.frame.delivery_seq() != Some(seq) {
+                return true;
+            }
+            // Seq matches: drop iff this entry is ack-droppable
+            // (terminal / no-route variants). An
+            // `AwaitingCrdtConvergence` entry (important-custom under
+            // #541) is KEPT — its drop trigger is
+            // `drop_retentions_on_own_custom_observation`, not the ack.
+            !matches!(
+                entry.state,
+                RetainedSendState::AwaitingAck { .. } | RetainedSendState::NoRoute
+            )
+        });
         if self.pending_report_replays.len() < before {
             tracing::debug!(
                 seq,
@@ -609,8 +737,69 @@ where
         } else {
             tracing::debug!(
                 seq,
-                "TerminalAck for an unknown delivery_seq (already acked / \
-                 duplicate landing); no-op"
+                "TerminalAck for an unknown delivery_seq, OR for an \
+                 important-custom seq (#541: important-custom retention \
+                 drops on CRDT-convergence observation, not on ack); no-op"
+            );
+        }
+    }
+
+    /// Drop every `AwaitingCrdtConvergence` retention whose
+    /// `delivery_seq` is named by `observed_seqs` — the #541 drop
+    /// trigger fired from the post-apply hook in
+    /// [`Self::apply_cluster_mutations`] when the local CRDT mirror
+    /// received an own-originated `CustomMessagePosted` via a
+    /// `ClusterMutation` broadcast.
+    ///
+    /// `delivery_seq` is the IMPORTANT-custom retention's primary key
+    /// (the SAME stamp that ID's the message at the primary), and the
+    /// origin-id pre-filter at the call site ensures we only consider
+    /// the SEQUENCES we ourselves stamped — so a `delivery_seq` match
+    /// against an `AwaitingCrdtConvergence` entry uniquely identifies
+    /// the retained important-custom. The state-tag gate is the same
+    /// shape `ack_delivery` uses (precision against the shared
+    /// monotonic counter): we never drop a terminal here, only the
+    /// important-custom that was actually waiting for this CRDT
+    /// observation.
+    ///
+    /// Idempotent: a duplicate broadcast carrying the same
+    /// CustomMessagePosted finds no matching entry on the second
+    /// sweep (the first already dropped it) and DEBUG-logs the
+    /// no-op.
+    pub(in crate::secondary) fn drop_retentions_on_own_custom_observation(
+        &mut self,
+        observed_seqs: &[u64],
+    ) {
+        if observed_seqs.is_empty() {
+            return;
+        }
+        let before = self.pending_report_replays.len();
+        let observed: std::collections::HashSet<u64> = observed_seqs.iter().copied().collect();
+        self.pending_report_replays.retain(|entry| {
+            if !matches!(entry.state, RetainedSendState::AwaitingCrdtConvergence { .. }) {
+                return true;
+            }
+            !entry
+                .frame
+                .delivery_seq()
+                .is_some_and(|s| observed.contains(&s))
+        });
+        let dropped = before - self.pending_report_replays.len();
+        if dropped > 0 {
+            tracing::debug!(
+                observed_seqs = ?observed_seqs,
+                dropped,
+                buffered = self.pending_report_replays.len(),
+                "important-custom CRDT-convergence observed (own \
+                 CustomMessagePosted came back via ClusterMutation \
+                 broadcast); dropped matching retentions (#541)"
+            );
+        } else {
+            tracing::debug!(
+                observed_seqs = ?observed_seqs,
+                "own-originated CustomMessagePosted observed in local \
+                 CRDT but no matching AwaitingCrdtConvergence retention \
+                 (already dropped / duplicate broadcast); no-op"
             );
         }
     }
@@ -719,22 +908,31 @@ where
                 continue;
             }
             let task_hash = entry.frame.task_hash().map(str::to_owned);
-            if let RetainedSendState::AwaitingAck { sent_at } = entry.state
+            let unacked_sent_at = match entry.state {
+                RetainedSendState::AwaitingAck { sent_at }
+                | RetainedSendState::AwaitingCrdtConvergence { sent_at } => Some(sent_at),
+                RetainedSendState::NoRoute => None,
+            };
+            if let Some(sent_at) = unacked_sent_at
                 && now.duration_since(sent_at) >= ack_timeout
             {
                 // The blackhole detection edge firing: the transport
-                // accepted the send but no ack came back within the
-                // window — surface it, this is the honesty signal #352
-                // exists for. Bounded per entry by the backoff
-                // schedule, never per drain pass.
+                // accepted the send but no proof of delivery (ack for a
+                // terminal, or own-CRDT observation for an important
+                // custom — #541) came back within the window. Surface
+                // it — the honesty signal #352 (terminals) / #541
+                // (important customs) exists for. Bounded per entry by
+                // the backoff schedule, never per drain pass.
                 tracing::warn!(
                     task_hash = ?task_hash,
                     delivery_seq = ?seq,
                     attempts = entry.attempts,
                     unacked_for_secs = now.duration_since(sent_at).as_secs_f64(),
                     ack_timeout_secs = ack_timeout.as_secs_f64(),
-                    "confirmable report sent but UNACKED past the ack timeout \
-                     (possible blackholed-but-live leg); treating as \
+                    "confirmable report sent but UNACKED (no TerminalAck / \
+                     no CRDT-convergence observation) past the ack timeout \
+                     (possible blackholed-but-live leg, or primary died \
+                     between local apply and wire fan-out); treating as \
                      no-route-equivalent and replaying with the same seq"
                 );
             }
@@ -769,12 +967,19 @@ where
             }
             // Re-send through the egress edge with the SAME stamped
             // frame (same seq — never re-stamp). `Destination::Primary`
-            // re-resolves to the CURRENT holder.
+            // re-resolves to the CURRENT holder. The Ok-side retention
+            // state is chosen by the same single-owner helper the
+            // first-send chokepoint uses, so the
+            // terminal-vs-important-custom drop-trigger split is
+            // consistent across first send AND replay (#541): a replay
+            // of an IMPORTANT custom re-enters
+            // `AwaitingCrdtConvergence`, never `AwaitingAck`.
+            let is_important_custom = entry.frame.is_important_custom_message();
             entry.state = match self
                 .send_to(Destination::Primary, entry.frame.clone())
                 .await
             {
-                Ok(()) => RetainedSendState::AwaitingAck { sent_at: now },
+                Ok(()) => retention_state_for_sent_ok(is_important_custom, now),
                 Err(e) => {
                     // Still no route: feed the failover-health probe
                     // (same as a first send) and keep the NoRoute

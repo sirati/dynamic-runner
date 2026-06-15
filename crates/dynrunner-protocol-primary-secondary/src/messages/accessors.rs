@@ -356,6 +356,40 @@ impl<I> DistributedMessage<I> {
         )
     }
 
+    /// Sub-classifier of [`Self::requires_delivery_ack`]: is this frame an
+    /// IMPORTANT [`DistributedMessage::CustomMessage`] (the F5 class)?
+    ///
+    /// The retention concern (`secondary/resource.rs`) splits its drop
+    /// trigger by this predicate: a TERMINAL drops on
+    /// [`DistributedMessage::TerminalAck`] (the only durability proof a
+    /// terminal has — it has no replicated CRDT analogue), while an
+    /// IMPORTANT custom drops on observing its own `CustomMessagePosted`
+    /// arrive in the local CRDT mirror via a `ClusterMutation` broadcast
+    /// (the durability proof that the primary not only applied but also
+    /// FANNED OUT the entry — a primary that dies between local apply and
+    /// the mesh-pump's wire fan-out under post-#539 would have already
+    /// sent the `TerminalAck` from its dispatch tail, dropping retention
+    /// with the entry stranded on its dead local CRDT only; the CRDT-
+    /// observation drop trigger forecloses that window because the
+    /// originator never sees its own broadcast come back unless the
+    /// fan-out actually happened).
+    ///
+    /// Owned by the enum for the same reason `requires_delivery_ack` is:
+    /// the secondary's retention chokepoint reads one predicate to choose
+    /// the retention reason at first send, and the receiver-side CRDT-
+    /// apply hook reads the same shape of fact (a `ClusterMutation`
+    /// carrying `CustomMessagePosted` for `self.id`) without needing to
+    /// know the frame's history.
+    pub fn is_important_custom_message(&self) -> bool {
+        matches!(
+            self,
+            Self::CustomMessage {
+                important: true,
+                ..
+            }
+        )
+    }
+
     /// The per-task hash this frame resolves, for the
     /// [`DistributedMessage::TaskComplete`] /
     /// [`DistributedMessage::TaskFailed`] terminal variants; `None` for

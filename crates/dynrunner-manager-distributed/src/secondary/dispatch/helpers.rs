@@ -68,6 +68,42 @@ where
         mutations: Vec<ClusterMutation<I>>,
     ) -> bool {
         let count = mutations.len();
+        // Pre-scan the batch for own-originated `CustomMessagePosted`
+        // entries: the appearance of `CustomMessagePosted { origin =
+        // self.id, seq }` in a ClusterMutation broadcast received by
+        // this node is the durability proof an IMPORTANT-custom
+        // retention entry waits for under the #541 drop trigger
+        // (`AwaitingCrdtConvergence`). The primary's `Destination::All`
+        // fan is origin-EXCLUDED on the PRIMARY role — secondaries are
+        // included, so an origin secondary ALWAYS receives its own
+        // CustomMessagePosted back if the mesh-pump actually fanned out
+        // (the post-#539 hard-crash window is exactly the case where
+        // the local apply ran but the fan-out did not, so this
+        // observation never happens there and the retention stays
+        // live). The scan reads `self.config.secondary_id` to compare
+        // origin, then collects the seqs into a single sweep through
+        // `pending_report_replays` — the retention bookkeeping is
+        // local to the secondary; the apply loop below is the
+        // standard CRDT mirror, unchanged.
+        //
+        // Idempotent under duplicate broadcasts (the same
+        // CustomMessagePosted arriving twice): the second sweep finds
+        // no matching seq because the first already dropped it.
+        let own_id = self.config.secondary_id.as_str();
+        let own_posted_seqs: Vec<u64> = mutations
+            .iter()
+            .filter_map(|m| match m {
+                ClusterMutation::CustomMessagePosted { origin, seq, .. }
+                    if origin == own_id =>
+                {
+                    Some(*seq)
+                }
+                _ => None,
+            })
+            .collect();
+        if !own_posted_seqs.is_empty() {
+            self.drop_retentions_on_own_custom_observation(&own_posted_seqs);
+        }
         let mut primary_changed = false;
         for m in mutations {
             match m {
