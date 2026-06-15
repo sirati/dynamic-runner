@@ -67,6 +67,12 @@ class _StubTaskInfo:
     type_id: str = ""
     affinity_id: str | None = None
     payload: dict = field(default_factory=dict)
+    # ``task_id`` became REQUIRED (non-empty) at the Python->Rust
+    # boundary in commit c0a05719 ("core(task): task_id is now
+    # required"). Stub mirrors the real ``TaskInfo`` field so the
+    # PyO3 extractor doesn't reject these synthetic items at run
+    # start. Call sites must populate it with a unique value.
+    task_id: str = ""
 
 
 class _RecordingTask:
@@ -93,6 +99,17 @@ class _RecordingTask:
                         worker_module="dynamic_runner.tests._failover_stub_worker",
                     ),
                 ),
+                # Lifecycle tests routinely drive runs with no items (the
+                # "hooks fire even on an empty run" assertions). The
+                # distributed coordinator now fails-loud at drain on a
+                # leaf phase that reached 0/0 with no terminal outcome
+                # unless the consumer declared the phase may legitimately
+                # be empty (see #540 + `phase_may_be_empty` in
+                # `crates/dynrunner-manager-distributed/src/cluster_state/state.rs`).
+                # Tests that DO pass items still pass — `may_be_empty`
+                # only relaxes the fail-loud, it does not change the
+                # populated-phase semantics.
+                may_be_empty=True,
             ),
         )
 
@@ -189,6 +206,8 @@ def test_on_phase_hooks_fire_once_per_phase(tmp_path: Path) -> None:
             identifier=_StubBinaryIdentifier(binary_name=f"item_{i}"),
             phase_id="only-phase",
             type_id="default",
+            # Non-empty + unique; required since c0a05719.
+            task_id=f"item_{i}",
         )
         for i in range(2)
     ]
@@ -310,22 +329,47 @@ def test_run_secondary_fires_on_run_start_before_connect(tmp_path: Path) -> None
         secondary_id="test-secondary-0",
         num_workers=1,
         max_resources=_rs.ResourceMap({"memory": 64 * 1024 * 1024}),
-        distributed_config=_rs.DistributedConfig(connect_timeout_secs=0.1),
+        # ``connect_timeout_secs`` governs only an individual TCP-level
+        # connect attempt, NOT the secondary's overall setup-deadline.
+        # The setup-deadline is owned by
+        # ``DistributedConfig.unconfigured_deadline_secs`` (default
+        # 600s — see ``crates/dynrunner-pyo3/src/config/distributed.rs``).
+        # Without bounding that knob this test waited ~10 minutes per
+        # run before `run_secondary` returned. Setting both lets the
+        # in-process bring-up bail in well under a second; the hook
+        # invocation we are asserting fires synchronously in
+        # ``run_secondary`` BEFORE the network stack engages, so it
+        # has already been recorded by the time the deadline elapses.
+        distributed_config=_rs.DistributedConfig(
+            connect_timeout_secs=0.1,
+            unconfigured_deadline_secs=0.5,
+        ),
     )
     args = SimpleNamespace()
 
-    _rs.run_secondary(
-        cfg,
-        # 127.0.0.1:1 resolves but nothing is listening there, so the
-        # WSS connect fails ECONNREFUSED on the first attempt and the
-        # 0.1s `connect_timeout_secs` budget bails the retry loop.
-        # `coord.run()` returns without doing anything operational.
-        "tcp://127.0.0.1:1",
-        task,
-        args,
-        str(tmp_path / "src"),
-        str(tmp_path / "out"),
-    )
+    # `run_secondary` raises `RuntimeError` once the setup deadline
+    # elapses with no primary reachable (see
+    # `crates/dynrunner-manager-distributed/src/secondary/coordinator.rs`
+    # "setup deadline elapsed with no primary and no peers"). The
+    # hook-fire assertion is independent of how the run exits: the
+    # synchronous `on_run_start` call lands BEFORE the Rust async
+    # runtime engages, and the matching `on_run_end` fires on the
+    # bring-up failure exit, so the recorded calls are populated
+    # regardless of the raise.
+    with pytest.raises(RuntimeError, match="setup deadline"):
+        _rs.run_secondary(
+            cfg,
+            # 127.0.0.1:1 resolves but nothing is listening, so the
+            # WSS connect would fail ECONNREFUSED. With
+            # `unconfigured_deadline_secs=0.5` the secondary's setup
+            # window collapses to half a second before raising — the
+            # hook fires inside that window.
+            "tcp://127.0.0.1:1",
+            task,
+            args,
+            str(tmp_path / "src"),
+            str(tmp_path / "out"),
+        )
 
     names = _ordered_calls(task)
     assert names.count("on_run_start") == 1, names
