@@ -430,6 +430,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // circuits the apply to an empty `applied`).
         let affine_ready = self.cluster_state.affine_ready_mutations_for_ledger();
         if !affine_ready.is_empty() {
+            // Bucket the per-gate "EMITTED AffineReady" INFO lines so an
+            // operator reading the log can attribute them to the cold-seed
+            // local-apply pass (this surface) rather than the live-delta
+            // surface (`apply_and_broadcast_cluster_mutations`'s
+            // `became_pending`) or the post-seed dispatch surface
+            // (`affine_dispatch::resolve_dependency_satisfied_affine_gates`).
+            // Without this bucket, the per-gate lines time-cluster with
+            // later cold-seed pipeline steps (handshake, relocation) and read
+            // as causally adjacent — the #548 false-causal report. Cheap one-
+            // line marker; the per-gate lines remain at their original site.
+            tracing::info!(
+                count = affine_ready.len(),
+                "cold-seed local apply: emitting AffineReady for no-dep / \
+                 pre-resolved SecondaryAffine gates"
+            );
             let mut applied =
                 apply_locally_for_broadcast(&mut self.cluster_state, affine_ready).applied;
             staged.append(&mut applied);
