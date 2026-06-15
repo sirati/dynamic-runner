@@ -865,6 +865,7 @@ mod tests {
             port: 1,
             is_observer: false,
             liveness_port: None,
+            slurm_job_id: None,
         }];
         let started = std::time::Instant::now();
         let result = transport

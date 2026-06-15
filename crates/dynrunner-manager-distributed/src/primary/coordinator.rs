@@ -882,6 +882,26 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// only liveness fact dispatch consumes, via the two boundary methods).
     pub(super) silence_warn_stage: HashMap<String, usize>,
 
+    /// #556 mesh-consensus FSM (primary side). Owns the WHEN-to-mesh-
+    /// declare-a-peer-dead concern: a heartbeat hard-backstop seeds the
+    /// `SchedulingSuspect` set via [`Self::set_consensus_scheduling_suspect`]
+    /// and the operational loop drives the FSM forward via
+    /// [`Self::drive_consensus_fsm`]. On [`crate::primary::consensus::ConsensusOutput::Restart`]
+    /// the coordinator runs the FULL dead-declaration (`PeerRemoved` +
+    /// `TimeoutDetected` + worker drop + roster clear + respawn dispatch);
+    /// on [`crate::primary::consensus::ConsensusOutput::DropSuspicion`] /
+    /// [`crate::primary::consensus::ConsensusOutput::Abort`] no kill fires
+    /// — the unilateral hard-backstop kill is REPLACED by this gate.
+    ///
+    /// The lazy `maybe_requeue_silent_held_work` path NEVER calls
+    /// [`Self::set_consensus_scheduling_suspect`]: it stays at the
+    /// scheduling-altitude (the peer's in-flight tasks return to the pool
+    /// so idle workers don't starve), without escalating to mesh
+    /// consensus. The FSM is consulted via `poll` on the heartbeat tick
+    /// cadence so deadlines fire without an extra ticker.
+    pub(super) consensus_fsm:
+        crate::primary::consensus::ConsensusFsm<I>,
+
     /// Throttle for the primary's OWN egress-keepalive delivery failures
     /// (`broadcast_primary_keepalive`). A primary whose keepalive sends
     /// all fail is MUTE — invisible to itself and silently feeding every
@@ -1770,6 +1790,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             ingest_gate: super::heartbeat::IngestEdgeGate::new(),
             collective_silence_gate: super::heartbeat::CollectiveSilenceGate::new(),
             silence_warn_stage: HashMap::new(),
+            // #556 mesh-consensus FSM, default-constructed at Idle. The
+            // heartbeat tick + the scheduling-suspect seed paths drive
+            // every transition; no extra ticker.
+            consensus_fsm: crate::primary::consensus::ConsensusFsm::new(),
             keepalive_egress_warn: crate::warn_throttle::WarnThrottle::new(
                 super::heartbeat::KEEPALIVE_EGRESS_WARN_INTERVAL,
             ),
@@ -2875,6 +2899,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         request_driven: bool,
     ) -> bool {
         let sec_id = self.workers[worker_idx].secondary_id.as_str();
+        // #556 LOCAL-suspect gate — the dispatch-altitude consequence of
+        // the lazy `requeue_silent_held_work_locally` path keeping the
+        // silent peer alive in the roster. Dispatching to a worker on a
+        // peer this primary already classifies as scheduling-suspect
+        // would re-strand the freshly-requeued task on the same silent
+        // holder: the local-only requeue would never reach a survivor.
+        // The FSM owns the suspect set (whether seeded by the lazy path
+        // or by an in-flight consensus round); reading it here is the
+        // single source of truth for "this peer is suspected; do not
+        // dispatch new work to it until the round resolves or the lazy
+        // suspicion lifts via a fresh keepalive". Skips REQUEST-driven
+        // dispatch too: a TaskRequest arriving from a peer we already
+        // suspect is liveness evidence (the keepalive-bump preamble in
+        // `dispatch_message` covers that), but we still must not assign
+        // it new work until the FSM clears the suspect (otherwise the
+        // task is back at risk on the same holder).
+        if self
+            .consensus_fsm
+            .in_flight_suspects()
+            .contains(sec_id)
+        {
+            return true;
+        }
         // Mesh-confirmation gate — PROACTIVE push only (a request that
         // arrived is its own proof of a working leg, so `request_driven`
         // lifts it). An unconfirmed member is unassignable to a proactive
@@ -3725,7 +3772,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///      task is held by a live secondary, the run is still advancing.
     ///
     /// The boundary the dispatch consumer sees is this predicate plus
-    /// [`Self::declare_silent_secondaries_dead`]; it never learns how
+    /// [`Self::requeue_silent_held_work_locally`]; it never learns how
     /// "silent" or "dispatchable" are computed.
     pub(super) fn only_silent_held_work_remains(&self) -> bool {
         let silent = self.silent_secondary_ids();
@@ -3747,11 +3794,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     }
 
     /// The silent secondaries currently holding the only remaining work,
-    /// packaged as [`DeadSecondary`] declarations for
-    /// [`Self::declare_silent_secondaries_dead`]. Pairs with
-    /// [`Self::only_silent_held_work_remains`]: the oracle gates whether to
-    /// declare; this enumerates WHOM, reusing the liveness silent-id set
-    /// and the recorded keepalive timestamps.
+    /// packaged as [`DeadSecondary`] declarations for the lazy
+    /// dispatch-altitude requeue. Pairs with
+    /// [`Self::only_silent_held_work_remains`]: the oracle gates whether
+    /// to requeue; this enumerates WHOM, reusing the liveness silent-id
+    /// set and the recorded keepalive timestamps. Post-#556 the suspect
+    /// set is consumed by [`Self::requeue_silent_held_work_locally`]
+    /// (local-only) and also seeded into the consensus FSM via
+    /// [`Self::set_consensus_scheduling_suspect`].
     pub(super) fn silent_held_dead_declarations(&self) -> Vec<super::heartbeat::DeadSecondary> {
         let now = Instant::now();
         self.silent_secondary_ids()

@@ -628,6 +628,13 @@ where
                     // idleness, so the periodic re-poll is the
                     // failover-safe wakeup.
                     self.repoll_idle_workers().await;
+                    // #556 — drive the secondary mesh-consensus FSM on
+                    // the keepalive cadence (~1s, same as this arm)
+                    // so per-target probe deadlines fire on time even
+                    // when no consensus frames are arriving. A no-op in
+                    // `Idle`; bounded per-target probe-fan work in the
+                    // active rounds.
+                    self.drive_consensus_fsm().await;
                     let actions = self.run_election_tick();
                     for msg in actions.broadcast {
                         let _ = self.send_to(Destination::All, msg).await;

@@ -333,6 +333,60 @@ fn roundtrip_all_message_types() {
             task_hash: "h".into(),
             worker_id: 0,
         },
+        // #556 mesh-consensus respawn (Layer 1 — wire). The six new
+        // variants ride the every-variant sweep so their `msg_type`/
+        // `sender_id` accessors are pinned alongside every other variant
+        // (the dedicated per-variant round-trips below pin the full
+        // payload).
+        DistributedMessage::SuspectPeers {
+            target: None,
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            consensus_id: 7,
+            primary_epoch: 2,
+            member_gen: 5,
+            suspected: vec!["sec-1".into(), "sec-2".into()],
+        },
+        DistributedMessage::ResolvedPeer {
+            target: None,
+            sender_id: "sec-3".into(),
+            timestamp: 0.0,
+            consensus_id: 7,
+            observer_id: "sec-3".into(),
+            resolved: "sec-1".into(),
+        },
+        DistributedMessage::RestartRequest {
+            target: None,
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            consensus_id: 7,
+            primary_epoch: 2,
+            member_gen: 5,
+            candidates: vec!["sec-2".into()],
+        },
+        DistributedMessage::RestartConfirm {
+            target: None,
+            sender_id: "sec-3".into(),
+            timestamp: 0.0,
+            consensus_id: 7,
+            responder_id: "sec-3".into(),
+            still_suspicious: vec!["sec-2".into()],
+            resolved_since: vec![],
+        },
+        DistributedMessage::PeerProbe {
+            target: None,
+            sender_id: "sec-3".into(),
+            timestamp: 0.0,
+            consensus_id: 7,
+            probed_id: "sec-1".into(),
+        },
+        DistributedMessage::PeerProbeAck {
+            target: None,
+            sender_id: "sec-1".into(),
+            timestamp: 0.0,
+            consensus_id: 7,
+            prober_id: "sec-3".into(),
+        },
     ];
 
     for msg in &messages {
@@ -342,6 +396,269 @@ fn roundtrip_all_message_types() {
         assert_eq!(decoded.msg_type(), msg.msg_type());
         assert_eq!(decoded.sender_id(), msg.sender_id());
     }
+}
+
+/// #556 Layer 1 — wire round-trips for each of the six new consensus
+/// variants. Each frame's full payload survives the wire byte-for-byte
+/// (encode → decode → assert deep-equality on every field). The accessor
+/// sweep above only checks `msg_type` / `sender_id`, so these per-variant
+/// pins are the guard that a renamed / dropped field is caught.
+#[test]
+fn roundtrip_suspect_peers() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::SuspectPeers {
+        target: None,
+        sender_id: "primary".into(),
+        timestamp: 11.0,
+        consensus_id: 42,
+        primary_epoch: 3,
+        member_gen: 9,
+        suspected: vec!["sec-1".into(), "sec-2".into(), "sec-7".into()],
+    };
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+    match decoded {
+        DistributedMessage::SuspectPeers {
+            sender_id,
+            consensus_id,
+            primary_epoch,
+            member_gen,
+            suspected,
+            ..
+        } => {
+            assert_eq!(sender_id, "primary");
+            assert_eq!(consensus_id, 42);
+            assert_eq!(primary_epoch, 3);
+            assert_eq!(member_gen, 9);
+            assert_eq!(
+                suspected,
+                vec!["sec-1".to_string(), "sec-2".into(), "sec-7".into()]
+            );
+        }
+        _ => panic!("expected SuspectPeers"),
+    }
+}
+
+#[test]
+fn roundtrip_resolved_peer() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::ResolvedPeer {
+        target: None,
+        sender_id: "sec-3".into(),
+        timestamp: 11.5,
+        consensus_id: 42,
+        observer_id: "sec-3".into(),
+        resolved: "sec-1".into(),
+    };
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+    match decoded {
+        DistributedMessage::ResolvedPeer {
+            sender_id,
+            consensus_id,
+            observer_id,
+            resolved,
+            ..
+        } => {
+            assert_eq!(sender_id, "sec-3");
+            assert_eq!(consensus_id, 42);
+            assert_eq!(observer_id, "sec-3");
+            assert_eq!(resolved, "sec-1");
+        }
+        _ => panic!("expected ResolvedPeer"),
+    }
+}
+
+#[test]
+fn roundtrip_restart_request() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::RestartRequest {
+        target: None,
+        sender_id: "primary".into(),
+        timestamp: 12.0,
+        consensus_id: 42,
+        primary_epoch: 3,
+        member_gen: 9,
+        candidates: vec!["sec-2".into(), "sec-7".into()],
+    };
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+    match decoded {
+        DistributedMessage::RestartRequest {
+            sender_id,
+            consensus_id,
+            primary_epoch,
+            member_gen,
+            candidates,
+            ..
+        } => {
+            assert_eq!(sender_id, "primary");
+            assert_eq!(consensus_id, 42);
+            assert_eq!(primary_epoch, 3);
+            assert_eq!(member_gen, 9);
+            assert_eq!(candidates, vec!["sec-2".to_string(), "sec-7".into()]);
+        }
+        _ => panic!("expected RestartRequest"),
+    }
+}
+
+#[test]
+fn roundtrip_restart_confirm() {
+    // The `resolved_since` retraction list survives on its non-empty
+    // value (the wire-shape-mirror discipline: a default empty Vec
+    // would mask a dropped field).
+    let msg: DistributedMessage<TestId> = DistributedMessage::RestartConfirm {
+        target: None,
+        sender_id: "sec-3".into(),
+        timestamp: 12.5,
+        consensus_id: 42,
+        responder_id: "sec-3".into(),
+        still_suspicious: vec!["sec-2".into()],
+        resolved_since: vec!["sec-7".into()],
+    };
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+    match decoded {
+        DistributedMessage::RestartConfirm {
+            sender_id,
+            consensus_id,
+            responder_id,
+            still_suspicious,
+            resolved_since,
+            ..
+        } => {
+            assert_eq!(sender_id, "sec-3");
+            assert_eq!(consensus_id, 42);
+            assert_eq!(responder_id, "sec-3");
+            assert_eq!(still_suspicious, vec!["sec-2".to_string()]);
+            assert_eq!(resolved_since, vec!["sec-7".to_string()]);
+        }
+        _ => panic!("expected RestartConfirm"),
+    }
+}
+
+#[test]
+fn roundtrip_peer_probe() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::PeerProbe {
+        target: None,
+        sender_id: "sec-3".into(),
+        timestamp: 13.0,
+        consensus_id: 42,
+        probed_id: "sec-1".into(),
+    };
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+    match decoded {
+        DistributedMessage::PeerProbe {
+            sender_id,
+            consensus_id,
+            probed_id,
+            ..
+        } => {
+            assert_eq!(sender_id, "sec-3");
+            assert_eq!(consensus_id, 42);
+            assert_eq!(probed_id, "sec-1");
+        }
+        _ => panic!("expected PeerProbe"),
+    }
+}
+
+#[test]
+fn roundtrip_peer_probe_ack() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::PeerProbeAck {
+        target: None,
+        sender_id: "sec-1".into(),
+        timestamp: 13.5,
+        consensus_id: 42,
+        prober_id: "sec-3".into(),
+    };
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+    match decoded {
+        DistributedMessage::PeerProbeAck {
+            sender_id,
+            consensus_id,
+            prober_id,
+            ..
+        } => {
+            assert_eq!(sender_id, "sec-1");
+            assert_eq!(consensus_id, 42);
+            assert_eq!(prober_id, "sec-3");
+        }
+        _ => panic!("expected PeerProbeAck"),
+    }
+}
+
+/// #556 Layer 1 — wire-shape mirror for `PeerConnectionInfo`'s new
+/// `slurm_job_id` field. A pre-upgrade peer's `PeerInfo` frame omits the
+/// key entirely (no `slurm_job_id` in the JSON object) and the decoder
+/// fills the field with `None`. Symmetrically, a `None` value re-encodes
+/// WITHOUT the key (the `skip_serializing_if` contract): a non-SLURM-
+/// launched peer cannot leak a stray `null` into a downstream that read
+/// it as "explicit absent" — keeping the field purely additive. Decodes
+/// the OTHER side's literal bytes, not a re-encode of our own, so a
+/// tag/field rename that still round-trips against itself is caught.
+#[test]
+fn peer_connection_info_slurm_job_id_legacy_omits_field() {
+    // Pre-upgrade `PeerInfo`: NO `slurm_job_id` key on any peer entry.
+    let bytes = r#"{"msg_type":"peer_info","sender_id":"p","timestamp":0.0,"peers":[{"secondary_id":"sec-1","cert":"c","ipv4":null,"ipv6":null,"port":5000,"is_observer":false}]}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(bytes).unwrap();
+    match decoded {
+        DistributedMessage::PeerInfo { peers, .. } => {
+            assert_eq!(peers.len(), 1);
+            assert!(
+                peers[0].slurm_job_id.is_none(),
+                "a pre-upgrade PeerConnectionInfo must decode slurm_job_id as None"
+            );
+        }
+        other => panic!("expected PeerInfo, got {:?}", other.msg_type()),
+    }
+}
+
+#[test]
+fn peer_connection_info_slurm_job_id_none_omitted_on_wire() {
+    // A `None` `slurm_job_id` value MUST NOT serialize as
+    // `"slurm_job_id":null` — the `skip_serializing_if` contract keeps
+    // the wire bytes minimal so a pre-upgrade receiver decodes
+    // unchanged.
+    let peer = PeerConnectionInfo {
+        secondary_id: "sec-1".into(),
+        cert: "c".into(),
+        ipv4: None,
+        ipv6: None,
+        port: 5000,
+        is_observer: false,
+        liveness_port: None,
+        slurm_job_id: None,
+    };
+    let json = serde_json::to_string(&peer).unwrap();
+    assert!(
+        !json.contains("slurm_job_id"),
+        "the slurm_job_id key must be omitted when None, got: {json}"
+    );
+
+    // A `Some` value, by contrast, DOES emit the key + value verbatim.
+    let with_job = PeerConnectionInfo {
+        secondary_id: "sec-2".into(),
+        cert: "c".into(),
+        ipv4: None,
+        ipv6: None,
+        port: 5000,
+        is_observer: false,
+        liveness_port: None,
+        slurm_job_id: Some("12345_3".into()),
+    };
+    let json = serde_json::to_string(&with_job).unwrap();
+    assert!(
+        json.contains("\"slurm_job_id\":\"12345_3\""),
+        "the slurm_job_id key must be present when Some, got: {json}"
+    );
+    // Decode it back — the value round-trips.
+    let decoded: PeerConnectionInfo = serde_json::from_str(&json).unwrap();
+    assert_eq!(decoded.slurm_job_id.as_deref(), Some("12345_3"));
 }
 
 /// Wire-shape mirror for `RequestSnapshotStream` (NOT

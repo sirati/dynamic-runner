@@ -96,6 +96,7 @@ fn probe_peer_main(
             port: b_port,
             is_observer: false,
             liveness_port: None,
+            slurm_job_id: None,
         }];
         // "a-probe" < "b-blocked": the lower id dials (the production
         // dial-direction tie-break), so the blocked node only ACCEPTS.

@@ -1211,6 +1211,236 @@ pub enum DistributedMessage<I> {
         new_primary_id: String,
         vote_round: u32,
     },
+    /// Primary -> all secondaries (#556, mesh-consensus respawn — round 1
+    /// opening frame). The primary has observed one or more peers fall
+    /// silent and broadcasts the suspect list, asking each secondary "do
+    /// you still hear any of these?". Receivers run the FSM's resolve
+    /// pass — a secondary that has heard from a `suspected` peer recently
+    /// echoes a [`Self::ResolvedPeer`] back so the primary can drop the
+    /// false-positive from its tally BEFORE escalating to a restart vote.
+    ///
+    /// Broadcast pattern: `target` is `None` on construction (the egress
+    /// fans the same frame to every secondary; receivers self-filter).
+    /// `consensus_id` is the primary-minted monotonic u64 keyed off the
+    /// primary's incarnation epoch — the round id ALL `ResolvedPeer` /
+    /// `RestartRequest` / `RestartConfirm` frames in this consensus round
+    /// echo verbatim. Receivers drop a frame whose `consensus_id` is
+    /// stale relative to their last-seen round, so a delayed echo from a
+    /// prior round can never poison the current tally. `primary_epoch` +
+    /// `member_gen` pin the round to the primary's incarnation /
+    /// membership view at mint time — a frame minted by a stale primary /
+    /// against a stale roster is recognisable as such and ignored.
+    /// `suspected` lists the peer ids the primary needs resolution on.
+    SuspectPeers {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant. Broadcast frame: stays `None` at originate, the
+        /// egress stamps a per-recipient `Destination` per fan-out leg.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// The consensus round id (monotonic u64, minted by the primary
+        /// for this round). Echoed verbatim by every reply / follow-up so
+        /// stale-round messages are dropped at receive.
+        consensus_id: u64,
+        /// The primary's incarnation epoch at mint time. A frame from a
+        /// stale primary (e.g. a promoted-then-demoted one) is recognisable
+        /// here and dropped without applying its tally effect.
+        primary_epoch: u64,
+        /// The primary's `peer_member_gen` at mint time — the membership
+        /// view this round speaks to. A `ResolvedPeer` / `RestartConfirm`
+        /// reply that crossed a membership change is stale against this
+        /// gen and ignored.
+        member_gen: u64,
+        /// The peer ids the primary has observed fall silent and is
+        /// asking the cluster to resolve. Each secondary independently
+        /// answers per-id with a [`Self::ResolvedPeer`] if its local
+        /// liveness records contradict the suspicion.
+        suspected: Vec<String>,
+    },
+    /// Secondary -> primary (#556). A receiver of a [`Self::SuspectPeers`]
+    /// frame answers with one of these per suspected peer it CAN
+    /// resolve — i.e. has heard from recently — so the primary drops the
+    /// false-positive from its tally before the round escalates. A
+    /// secondary that cannot help (no recent contact with any suspect)
+    /// stays silent: silence is not a vote, only positive contradiction
+    /// is.
+    ///
+    /// `consensus_id` echoes the round's id verbatim (the primary keys
+    /// its in-round tally on it; a stale echo from a prior round is
+    /// recognisable + dropped). `observer_id` is the responder's own id
+    /// (the witness offering the resolution). `resolved` is the peer-id
+    /// from the suspect list this frame de-suspects.
+    ResolvedPeer {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant. Point-to-point reply back to the primary; the
+        /// egress stamps the primary's `Destination` per the standard
+        /// role-routing path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// Echoes the round's `consensus_id` from the matching
+        /// [`Self::SuspectPeers`] frame so the primary's tally is keyed
+        /// to the current round.
+        consensus_id: u64,
+        /// The witnessing secondary's own id — the source of the
+        /// resolution claim. Mirrors the `secondary_id` field on the
+        /// peer-mesh reporting frames; the primary credits the claim
+        /// against this id when auditing the round.
+        observer_id: String,
+        /// The peer-id from the round's `suspected` list this frame
+        /// de-suspects. One-per-frame keeps the reply point-to-point
+        /// matchable against the round's suspect list without a
+        /// secondary-side batching concern.
+        resolved: String,
+    },
+    /// Primary -> all secondaries (#556, mesh-consensus respawn — round 2
+    /// commit frame). After the [`Self::SuspectPeers`] round narrows the
+    /// suspect list with [`Self::ResolvedPeer`] echoes, the primary
+    /// broadcasts this commit asking each secondary "ack — these
+    /// candidates remain unreachable from the mesh's collective view,
+    /// shall we restart them?". Receivers run a final liveness pass and
+    /// answer with [`Self::RestartConfirm`]; only on quorum confirmation
+    /// does the primary advance to the actual respawn / scancel.
+    ///
+    /// Broadcast pattern: `target: None` on construction; egress fans
+    /// per-recipient. `consensus_id` echoes the round's id (same one
+    /// the opening `SuspectPeers` carried), so a late-arriving
+    /// `ResolvedPeer` from a prior round is recognisably stale and
+    /// dropped. `primary_epoch` / `member_gen` pin the round to the
+    /// primary's incarnation + roster view at mint time, mirroring the
+    /// opening frame.
+    RestartRequest {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant. Broadcast frame: stays `None` at originate;
+        /// egress stamps per fan-out leg.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// Echoes the round's `consensus_id` from the opening
+        /// [`Self::SuspectPeers`] frame.
+        consensus_id: u64,
+        /// Mirrors the opening frame's `primary_epoch` — pins the commit
+        /// to the same incarnation as round 1.
+        primary_epoch: u64,
+        /// Mirrors the opening frame's `member_gen` — pins the commit to
+        /// the same membership view as round 1.
+        member_gen: u64,
+        /// The remaining unreachable peer ids the primary is asking the
+        /// cluster to confirm for restart (the suspect list MINUS the
+        /// peers a `ResolvedPeer` echoed for).
+        candidates: Vec<String>,
+    },
+    /// Secondary -> primary (#556). The commit-frame ack to a
+    /// [`Self::RestartRequest`]: the receiver re-checks each candidate
+    /// against its own liveness records once more before the destructive
+    /// step. `still_suspicious` lists the candidates this secondary
+    /// continues to see as unreachable (i.e. votes YES to restart);
+    /// `resolved_since` lists candidates the secondary heard from BETWEEN
+    /// the opening `SuspectPeers` and this commit (i.e. last-second
+    /// retractions — the secondary newly contradicts the primary's
+    /// continued suspicion). The primary tallies both halves on
+    /// `consensus_id` and only proceeds with restart for candidates that
+    /// hit quorum on `still_suspicious` AND have no `resolved_since`
+    /// retraction.
+    ///
+    /// `responder_id` is the answering secondary's id (the vote-credit
+    /// identity, mirroring [`Self::ResolvedPeer`]'s `observer_id`).
+    RestartConfirm {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant. Point-to-point reply back to the primary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// Echoes the round's `consensus_id` from the matching
+        /// [`Self::RestartRequest`] frame; the primary tallies votes
+        /// keyed by it.
+        consensus_id: u64,
+        /// The answering secondary's id (the witness credited with the
+        /// vote, distinct from a relay-forwarded `sender_id`).
+        responder_id: String,
+        /// Candidates this secondary continues to see as unreachable —
+        /// a YES vote for each. Empty when the secondary has heard from
+        /// every candidate since the opening round.
+        still_suspicious: Vec<String>,
+        /// Candidates the secondary has heard from since the opening
+        /// `SuspectPeers` — a last-second retraction. The primary
+        /// withdraws any candidate listed here from the restart batch
+        /// regardless of `still_suspicious` tallies elsewhere.
+        resolved_since: Vec<String>,
+    },
+    /// Secondary -> a suspected secondary (#556, point-to-point active
+    /// probe). When a peer appears silent on the local liveness records,
+    /// the prober addresses this frame DIRECTLY to the suspected peer to
+    /// elicit a fresh keepalive — the consensus FSM's positive-evidence
+    /// path (the negative path is the absence of receipt). A reachable
+    /// peer answers with a [`Self::PeerProbeAck`]; the probed peer's
+    /// reply lets the prober answer the primary's outstanding
+    /// [`Self::SuspectPeers`] with a [`Self::ResolvedPeer`].
+    ///
+    /// Point-to-point: `target` is stamped by the egress to the suspected
+    /// peer's `Destination` (the standard role-routing path). Reusable via
+    /// the Router/Relay layers — an unreachable direct leg falls through
+    /// to a `Relay` envelope without the probe variant needing to know
+    /// (same contract as every other point-to-point frame).
+    ///
+    /// `probed_id` names the addressee verbatim so the receiver can
+    /// self-filter on a fan-out delivery (some receivers may briefly hold
+    /// a stale role-route that still delivers the frame to the wrong
+    /// peer); the addressee answers iff `probed_id == its own id`.
+    PeerProbe {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant. Point-to-point: egress stamps the addressee's
+        /// `Destination` per the standard role-routing path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// Echoes the round's `consensus_id` so the prober can correlate
+        /// the eventual `PeerProbeAck` to the round whose suspect list
+        /// triggered it.
+        consensus_id: u64,
+        /// The suspected peer this probe addresses verbatim — the
+        /// addressee self-filters and answers iff `probed_id == its
+        /// own id`.
+        probed_id: String,
+    },
+    /// Suspected secondary -> prober (#556, point-to-point active probe
+    /// reply). A reachable peer that receives a [`Self::PeerProbe`]
+    /// addressed to it answers with this ack, which the prober reads
+    /// as positive liveness evidence and forwards as a
+    /// [`Self::ResolvedPeer`] to the primary on the current
+    /// `consensus_id`.
+    ///
+    /// Point-to-point: the egress stamps the prober's `Destination`.
+    /// Reusable via Router/Relay — an indirect path simply rides one or
+    /// more relay hops without the probe-ack variant needing to know.
+    ///
+    /// `prober_id` names the original prober verbatim (mirroring
+    /// `PeerProbe.probed_id`) so a fan-out / mis-routed delivery is
+    /// recognisable as off-target by the receiving prober (it self-
+    /// filters on `prober_id == its own id` before crediting the
+    /// evidence).
+    PeerProbeAck {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant. Point-to-point: egress stamps the prober's
+        /// `Destination`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// Echoes the `consensus_id` from the matching
+        /// [`Self::PeerProbe`] — the prober correlates the ack to the
+        /// round whose suspect list triggered the probe.
+        consensus_id: u64,
+        /// The original prober's id, echoed verbatim from
+        /// `PeerProbe.sender_id`, so the prober self-filters on a
+        /// mis-routed delivery before crediting the evidence.
+        prober_id: String,
+    },
     /// Secondary -> Primary unrecoverable-fault notification. The
     /// secondary sets this just before exiting non-zero, so the
     /// primary can drop it from the routable set + requeue any

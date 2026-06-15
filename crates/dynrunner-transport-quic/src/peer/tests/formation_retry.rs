@@ -50,6 +50,7 @@ async fn never_formed_leg_establishes_once_peer_becomes_reachable() {
                     port: peer_a.port(),
                     is_observer: false,
                     liveness_port: None,
+                    slurm_job_id: None,
                 },
                 PeerConnectionInfo {
                     secondary_id: "peer-b".into(),
@@ -62,6 +63,7 @@ async fn never_formed_leg_establishes_once_peer_becomes_reachable() {
                     port,
                     is_observer: false,
                     liveness_port: None,
+                    slurm_job_id: None,
                 },
             ];
 

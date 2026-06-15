@@ -244,6 +244,7 @@ mod tests {
             port,
             is_observer: false,
             liveness_port: None,
+            slurm_job_id: None,
         }
     }
 

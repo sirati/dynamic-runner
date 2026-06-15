@@ -59,6 +59,7 @@ fn seed_entry(secondary_id: &str, ipv4: &str, port: u16) -> PeerConnectionInfo {
         port,
         is_observer: false,
         liveness_port: None,
+        slurm_job_id: None,
     }
 }
 

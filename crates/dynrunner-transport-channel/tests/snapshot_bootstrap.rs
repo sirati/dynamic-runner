@@ -270,6 +270,7 @@ async fn join_running_cluster_returns_snapshot_with_capabilities() {
             port: 0,
             is_observer: *id == "observer-peer",
             liveness_port: None,
+            slurm_job_id: None,
         })
         .collect();
 
@@ -428,6 +429,7 @@ async fn join_running_cluster_collects_all_responders_for_union() {
             port: 0,
             is_observer: false,
             liveness_port: None,
+            slurm_job_id: None,
         })
         .collect();
 
@@ -497,6 +499,7 @@ async fn join_running_cluster_empty_seed_errors_fast() {
         port: 0,
         is_observer: false,
         liveness_port: None,
+        slurm_job_id: None,
     }];
 
     // Short timeout: with no candidates the connect-loop's
@@ -628,6 +631,7 @@ async fn join_rerequests_until_a_promotion_window_closes() {
             port: 0,
             is_observer: false,
             liveness_port: None,
+            slurm_job_id: None,
         })
         .collect();
 
@@ -781,6 +785,7 @@ async fn join_seats_from_secondary_reply_when_primary_is_mute() {
             port: 0,
             is_observer: false,
             liveness_port: None,
+            slurm_job_id: None,
         })
         .collect();
 
