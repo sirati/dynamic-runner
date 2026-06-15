@@ -19,6 +19,7 @@ use dynrunner_core::Identifier;
 
 use super::types::CustomMsgState;
 use super::{ApplyOutcome, ClusterState};
+use crate::custom_message_outcome::{CustomMessageOutcome, CustomMessageOutcomeEvent};
 
 /// Size facts of the replicated custom-message inbox on THIS replica —
 /// the accumulation-visibility read surface (every replica retains
@@ -90,6 +91,14 @@ impl<I: Identifier> ClusterState<I> {
     ///     occupied entry.
     ///
     /// Every Applied advances the per-origin watermark compaction.
+    ///
+    /// On `Applied`, the #570
+    /// [`CustomMessageOutcomeEvent`] is emitted BEFORE
+    /// [`Self::compact_custom_watermark`] erases the Handled/Failed
+    /// label, so the observer narrates the actual terminal even though
+    /// post-compaction state cannot tell the two apart. The emit is a
+    /// silent no-op when no observer has installed the sender (every
+    /// other role's apply path), like every apply-path event channel.
     pub(super) fn apply_custom_message_handled(&mut self, origin: String, seq: u64) -> ApplyOutcome {
         if self.custom_watermark_covers(&origin, seq) {
             return ApplyOutcome::NoOp;
@@ -108,6 +117,13 @@ impl<I: Identifier> ClusterState<I> {
             }
         };
         if matches!(outcome, ApplyOutcome::Applied) {
+            // Emit BEFORE compaction (the compactor in the same arm
+            // erases the Handled/Failed label).
+            self.emit_custom_message_outcome_event(CustomMessageOutcomeEvent {
+                origin: origin.clone(),
+                seq,
+                outcome: CustomMessageOutcome::Handled,
+            });
             self.compact_custom_watermark(&origin);
         }
         outcome
@@ -126,7 +142,22 @@ impl<I: Identifier> ClusterState<I> {
     ///
     /// Every Applied advances the per-origin watermark compaction
     /// (both terminals are tombstones the GC walks over).
-    pub(super) fn apply_custom_message_failed(&mut self, origin: String, seq: u64) -> ApplyOutcome {
+    ///
+    /// `reason` is the handler's raise message verbatim — narration-only
+    /// plumbing from the wire mutation's `reason` field. On `Applied`,
+    /// the #570 [`CustomMessageOutcomeEvent`] is emitted BEFORE
+    /// [`Self::compact_custom_watermark`] erases the Handled/Failed
+    /// label, carrying the reason for the observer's ERROR line. The
+    /// reason is then dropped — the `Failed` tombstone the apply rule
+    /// inserts is label-less and reason-less, and the per-origin
+    /// watermark sweeps it the same way as today (this rule's state
+    /// shape is unchanged from before the #570 field existed).
+    pub(super) fn apply_custom_message_failed(
+        &mut self,
+        origin: String,
+        seq: u64,
+        reason: String,
+    ) -> ApplyOutcome {
         if self.custom_watermark_covers(&origin, seq) {
             return ApplyOutcome::NoOp;
         }
@@ -144,6 +175,15 @@ impl<I: Identifier> ClusterState<I> {
             }
         };
         if matches!(outcome, ApplyOutcome::Applied) {
+            // Emit BEFORE compaction (the compactor in the same arm
+            // erases the Handled/Failed label). The reason is consumed
+            // for the emit and dropped after; it never enters the CRDT
+            // lattice.
+            self.emit_custom_message_outcome_event(CustomMessageOutcomeEvent {
+                origin: origin.clone(),
+                seq,
+                outcome: CustomMessageOutcome::Failed { reason },
+            });
             self.compact_custom_watermark(&origin);
         }
         outcome
@@ -221,6 +261,26 @@ impl<I: Identifier> ClusterState<I> {
     /// [`Self::unhandled_custom_messages`]: the monitor needs counts +
     /// identities every heartbeat tick, and cloning every ≤100 KB
     /// payload for that would be pure waste.
+    /// Borrow-only iterator over every live inbox entry as
+    /// `(origin, seq, &CustomMsgState)` — the [`crate::run_narrator`]'s read
+    /// surface for the F5 custom-message lifecycle (Posted / Handled /
+    /// Failed). Sibling of [`Self::unhandled_custom_messages`]
+    /// (handler-dispatch reads only `Unhandled`, owned-clone of the payload):
+    /// the narrator wants the FULL state machine on every observe so its
+    /// per-state edge-sets advance, and only borrows the `&CustomMsgState`
+    /// (the `Unhandled` carries the topic + body — narration reads just the
+    /// topic, the body never crosses the seam). Watermark-subsumed keys are
+    /// not surfaced — they have ALREADY been physically pruned and the
+    /// narrator's per-key edge-set already fired the terminal line at the
+    /// transition, so re-yielding them would do nothing.
+    pub(crate) fn custom_message_entries(
+        &self,
+    ) -> impl Iterator<Item = (&str, u64, &CustomMsgState)> {
+        self.custom_messages
+            .iter()
+            .map(|((origin, seq), state)| (origin.as_str(), *seq, state))
+    }
+
     pub(crate) fn unhandled_custom_message_keys(&self) -> Vec<(String, u64)> {
         let mut out: Vec<(String, u64)> = self
             .custom_messages

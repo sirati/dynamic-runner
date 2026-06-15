@@ -34,6 +34,7 @@
 //! DO NOT remove the lag; it is load-bearing (#543).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -69,6 +70,13 @@ pub trait SlurmAuthorityProbe: Send + Sync {
     /// Probe every secondary the manager has ever submitted a job for.
     /// The returned map is what the snapshot publisher installs.
     async fn probe_all(&self) -> HashMap<String, PeerLifeState>;
+    /// Probe every secondary AND count how many are PENDING with reason
+    /// "Resources" (unschedulable on the partition's capacity). Default
+    /// implementation delegates to `probe_all` with a zero count —
+    /// providers that parse the squeue reason field override this.
+    async fn probe_all_classified(&self) -> (HashMap<String, PeerLifeState>, usize) {
+        (self.probe_all().await, 0)
+    }
 }
 
 /// Snapshot is "stale" past `STALENESS_BOUND_MULTIPLE * probe_interval`.
@@ -79,6 +87,10 @@ pub const STALENESS_BOUND_MULTIPLE: u32 = 4;
 #[derive(Debug, Clone)]
 struct SnapshotInner {
     map: HashMap<String, PeerLifeState>,
+    /// Count of jobs whose squeue reason is "Resources" at the last probe.
+    /// Populated by probes that implement `probe_all_classified`; zero for
+    /// probes that only supply the 3-state `PeerLifeState` map.
+    pending_resources: usize,
     last_updated: Instant,
 }
 
@@ -91,11 +103,22 @@ struct SnapshotInner {
 ///   the fleet below initial count?" The answer is the count of jobs
 ///   the snapshot currently classifies `Alive`; `None` means we have
 ///   no positive evidence (snapshot stale or unable to read).
+/// - `pending_resources_count()`: the setup-quorum observability check
+///   (#565) asks "how many jobs are PENDING(Resources) right now?" A
+///   `Some(k)` with `k > 0` at setup-quorum-wait start means those k
+///   jobs will never schedule on the partition's current capacity.
+///   `None` means the snapshot is stale or the probe does not supply
+///   reason-level data (both are treated as "no signal" — no emit).
 ///
-/// Both fail-closed under stale snapshots: `Unknown` / `None`.
+/// All fail-closed under stale snapshots: `Unknown` / `None`.
 pub trait SlurmAuthoritativeSnapshot: Send + Sync {
     fn peer_life(&self, secondary_id: &str) -> PeerLifeState;
     fn secondary_active_or_queued_count(&self) -> Option<usize>;
+    /// Count of SLURM jobs whose squeue reason is "Resources" (the job is
+    /// PENDING because the partition has insufficient capacity to schedule
+    /// it now). `None` when the snapshot is stale or when the probe does
+    /// not supply reason-level classification (non-SLURM backends, stale).
+    fn pending_resources_count(&self) -> Option<usize>;
 }
 
 /// `ArcSwap`-backed snapshot publisher. Constructed by the deployment
@@ -117,6 +140,7 @@ impl OffLoopAuthoritySnapshot {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(SnapshotInner {
                 map: HashMap::new(),
+                pending_resources: 0,
                 last_updated: Instant::now(),
             })),
             staleness_bound: probe_interval.saturating_mul(STALENESS_BOUND_MULTIPLE),
@@ -126,9 +150,16 @@ impl OffLoopAuthoritySnapshot {
     /// A publisher handle for the off-loop updater. Cheap clones (one
     /// `Arc::clone`); the snapshot keeps its OWN `Arc` so the publisher
     /// can republish while the snapshot is shared with consumers.
+    ///
+    /// The returned handle has no emit config attached — call
+    /// [`AuthorityUpdaterHandle::with_emit_config`] before passing it to
+    /// `spawn_authority_updater` if PENDING(Resources) observability is
+    /// desired (#565/#572).
     pub fn updater_handle(&self) -> AuthorityUpdaterHandle {
         AuthorityUpdaterHandle {
             inner: Arc::clone(&self.inner),
+            emitted: Arc::new(AtomicBool::new(false)),
+            emit_config: None,
         }
     }
 
@@ -157,6 +188,43 @@ impl SlurmAuthoritativeSnapshot for OffLoopAuthoritySnapshot {
         let snap = self.inner.load();
         Some(snap.map.values().filter(|s| matches!(s, PeerLifeState::Alive)).count())
     }
+
+    fn pending_resources_count(&self) -> Option<usize> {
+        if self.is_stale(Instant::now()) {
+            return None;
+        }
+        Some(self.inner.load().pending_resources)
+    }
+}
+
+/// Emit-once context attached to an [`AuthorityUpdaterHandle`] for the
+/// PENDING(Resources) setup-quorum observability signal (#565/#572).
+///
+/// # Why this lives here, not in `wait_for_connections`
+///
+/// `wait_for_connections` reads `pending_resources_count()` synchronously
+/// the instant it starts — before the first probe round-trip returns.
+/// `spawn_authority_updater` fires the initial tick immediately, but the
+/// tick only STARTS the async squeue subprocess; the count stays at 0
+/// until that subprocess returns (10ms–100ms+ depending on cluster load).
+/// The synchronous read near-always beats the probe, so the emit is
+/// silently skipped. Moving the emit to the publish path means it fires
+/// the moment squeue data first becomes available — no probe race (#572).
+///
+/// # Latch semantics
+///
+/// `emitted` is set on the first `publish()` call that observes
+/// `pending_resources > 0`. Subsequent publishes (including later ones
+/// that still show `pending_resources > 0`) do NOT re-emit — one INFO
+/// line per run is sufficient to alert the operator.
+///
+/// # Fields
+///
+/// * `partition` — the SLURM partition label, for the emit message.
+/// * `num_secondaries` — the requested fleet size, for the emit message.
+pub struct PendingResourcesEmitConfig {
+    pub partition: Option<String>,
+    pub num_secondaries: usize,
 }
 
 /// Publisher side of the snapshot. The updater task `publish()`es a
@@ -164,18 +232,81 @@ impl SlurmAuthoritativeSnapshot for OffLoopAuthoritySnapshot {
 #[derive(Clone)]
 pub struct AuthorityUpdaterHandle {
     inner: Arc<ArcSwap<SnapshotInner>>,
+    /// Emit-once latch: set by the first `publish()` call that observes
+    /// `pending_resources > 0`. Guards the PENDING(Resources) INFO line.
+    emitted: Arc<AtomicBool>,
+    /// Optional emit config. `None` for handles created without context
+    /// (non-SLURM callers, test stubs) — the emit is a no-op without it.
+    emit_config: Option<Arc<PendingResourcesEmitConfig>>,
 }
 
 impl AuthorityUpdaterHandle {
+    /// Attach the PENDING(Resources) emit config to this handle.
+    ///
+    /// Called in `run.rs` right before `spawn_authority_updater`, where
+    /// both `slurm_partition` and `num_secondaries` are known. The latch
+    /// is shared: all clones of this handle see the same `emitted` flag,
+    /// so a clone used in a test sees the same fire-once semantics.
+    pub fn with_emit_config(
+        mut self,
+        partition: Option<String>,
+        num_secondaries: usize,
+    ) -> Self {
+        self.emit_config = Some(Arc::new(PendingResourcesEmitConfig {
+            partition,
+            num_secondaries,
+        }));
+        self
+    }
+
     /// Atomically install a fresh probe result. `last_updated` is set to
     /// `Instant::now()` at publish time, so the snapshot's staleness gate
     /// reads from the moment THIS publish landed (not the moment the
     /// probe started its round-trip).
-    pub fn publish(&self, map: HashMap<String, PeerLifeState>) {
+    ///
+    /// If this is the first publish that observes `pending_resources > 0`
+    /// AND an emit config is wired, emits the PENDING(Resources) INFO
+    /// line on the importance target (#565/#572). The emit is fire-once
+    /// per handle lineage (the `emitted` latch is shared across clones).
+    pub fn publish(&self, map: HashMap<String, PeerLifeState>, pending_resources: usize) {
         self.inner.store(Arc::new(SnapshotInner {
             map,
+            pending_resources,
             last_updated: Instant::now(),
         }));
+
+        // Emit the PENDING(Resources) observability line the first time
+        // a probe result shows k > 0 unschedulable jobs. The emit is
+        // gated on the latch so it fires at most once per updater
+        // lineage regardless of how many publishes carry pending_resources
+        // > 0. `AcqRel` on the CAS is the minimal ordering that makes the
+        // store visible to any reader that observes the flag = true.
+        if pending_resources > 0
+            && !self.emitted.load(Ordering::Relaxed)
+            && !self.emitted.swap(true, Ordering::AcqRel)
+            && let Some(cfg) = &self.emit_config
+        {
+            let partition_label = cfg
+                .partition
+                .as_deref()
+                .unwrap_or("<unknown partition>");
+            let expected = cfg.num_secondaries;
+            tracing::info!(
+                target: dynrunner_core::IMPORTANT_TARGET,
+                pending_resources,
+                requested = expected,
+                partition = partition_label,
+                "setup-quorum is waiting for {expected} secondaries; \
+                 however slurm queue shows {pending_resources} job(s) in \
+                 PENDING(Resources) on partition {partition_label} — those \
+                 may NEVER schedule on this partition's capacity. \
+                 Run will proceed at {} / {expected} after the setup \
+                 deadline elapses. To avoid the wait, lower --jobs to {} \
+                 or use a partition with more capacity.",
+                expected.saturating_sub(pending_resources),
+                expected.saturating_sub(pending_resources),
+            );
+        }
     }
 }
 
@@ -197,8 +328,8 @@ pub fn spawn_authority_updater(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            let map = probe.probe_all().await;
-            publisher.publish(map);
+            let (map, pending_resources) = probe.probe_all_classified().await;
+            publisher.publish(map, pending_resources);
         }
     })
 }
@@ -222,18 +353,25 @@ impl SlurmAuthoritativeSnapshot for NoSlurmAuthoritySnapshot {
     fn secondary_active_or_queued_count(&self) -> Option<usize> {
         None
     }
+    fn pending_resources_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[cfg(test)]
 pub mod test_helpers {
     use super::*;
     /// Deterministic snapshot for unit tests. `map` answers `peer_life`;
-    /// `count` answers `secondary_active_or_queued_count`. The two are
-    /// independently controllable so a test can pin one without
-    /// implying the other.
+    /// `count` answers `secondary_active_or_queued_count`;
+    /// `pending_resources` answers `pending_resources_count`. All three are
+    /// independently controllable so a test can pin one without implying
+    /// the others.
     pub struct StaticSnapshot {
         pub map: HashMap<String, PeerLifeState>,
         pub count: Option<usize>,
+        /// How many jobs to report as PENDING(Resources). `None` means
+        /// "no reason-level data available" (e.g. non-SLURM or stale).
+        pub pending_resources: Option<usize>,
     }
     impl SlurmAuthoritativeSnapshot for StaticSnapshot {
         fn peer_life(&self, secondary_id: &str) -> PeerLifeState {
@@ -241,6 +379,9 @@ pub mod test_helpers {
         }
         fn secondary_active_or_queued_count(&self) -> Option<usize> {
             self.count
+        }
+        fn pending_resources_count(&self) -> Option<usize> {
+            self.pending_resources
         }
     }
 }

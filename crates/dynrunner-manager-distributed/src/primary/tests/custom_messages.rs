@@ -246,6 +246,9 @@ async fn promotion_replay_skips_failed_entries() {
         origin_state.apply(ClusterMutation::CustomMessageFailed {
             origin: "sec-1".into(),
             seq: 2,
+            // This promotion-replay test inspects only that a Failed
+            // tombstone is NOT replayed; the reason is irrelevant.
+            reason: String::new(),
         });
         let snapshot = origin_state.snapshot();
 

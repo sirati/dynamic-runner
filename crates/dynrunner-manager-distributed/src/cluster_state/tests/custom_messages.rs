@@ -29,6 +29,12 @@ fn failed(origin: &str, seq: u64) -> ClusterMutation<RunnerIdentifier> {
     ClusterMutation::CustomMessageFailed {
         origin: origin.into(),
         seq,
+        // Existing F5 lattice tests don't inspect the reason — the
+        // sticky `Unhandled → Failed` latch + watermark-compaction
+        // semantics are reason-independent. Empty matches the
+        // legacy-decoder default (`#[serde(default)]`), which is the
+        // path most existing wire tests exercise.
+        reason: String::new(),
     }
 }
 

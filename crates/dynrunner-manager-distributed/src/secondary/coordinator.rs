@@ -191,6 +191,7 @@ where
             announcer_outbox_tx: None,
             announcer_outbox_rx: None,
             panik_signal_rx: None,
+            tunnel_gave_up_rx: None,
             fatal_exit_signal_rx: None,
             on_phase_end: None,
             on_phase_start: None,
@@ -483,6 +484,26 @@ where
         rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     ) {
         self.fatal_exit_signal_rx = Some(rx);
+    }
+
+    /// Register the setup-phase tunnel-gave-up signal receiver (#571).
+    ///
+    /// The matching sender lives in the background bootstrap bring-up
+    /// dial (`transport_factory::dial_secondary_mesh`): it fires `Ok(())`
+    /// when the dial exhausts its deadline without connecting — the
+    /// submitter's reverse tunnel never appeared.
+    ///
+    /// Must be called BEFORE `run_until_setup_or_done` enters. The
+    /// `wait_for_setup` loop selects on the receiver: on fire it logs to
+    /// `IMPORTANT_TARGET` and returns a non-zero error that propagates to
+    /// a clean SLURM exit, releasing the allocation instead of squatting
+    /// until the outer `unconfigured_deadline` fires.
+    ///
+    /// `None`-registration (the default) leaves the `wait_for_setup` arm
+    /// parked on `pending()` — channel-only fixtures and observer paths
+    /// that never register a bootstrap dial are unaffected.
+    pub fn register_tunnel_gave_up_rx(&mut self, rx: tokio::sync::oneshot::Receiver<()>) {
+        self.tunnel_gave_up_rx = Some(rx);
     }
 
     /// Register a [`crate::task_completed::TaskCompletedListener`].

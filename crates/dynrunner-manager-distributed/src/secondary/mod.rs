@@ -66,6 +66,7 @@ mod peer;
 mod primary_link;
 mod processing;
 pub(crate) mod resource;
+pub(crate) mod resource_buffer;
 mod sampler_hooks;
 mod setup;
 mod setup_deadline;
@@ -627,6 +628,26 @@ where
     /// hence the loop owns it across `select!` iterations.
     pub(super) panik_signal_rx:
         Option<tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>>,
+
+    /// #571 — setup-phase tunnel-gave-up signal. Fires `Ok(())` if the
+    /// background bootstrap bring-up dial exhausts its deadline without
+    /// ever connecting (the tunnel never appeared, the submitter crashed /
+    /// SSH dropped / gateway rebooted mid-run).
+    ///
+    /// Installed via [`Self::register_tunnel_gave_up_rx`] before
+    /// `run_until_setup_or_done` (the pyo3 wrapper extracts it from the
+    /// `SecondaryMeshBundle` returned by
+    /// `transport_factory::dial_secondary_mesh`). `None` when no receiver
+    /// was registered (channel-only fixtures, observer paths) — the
+    /// `wait_for_setup` arm parks on `pending()`.
+    ///
+    /// Consumed ONCE in `wait_for_setup`: on fire the arm logs to
+    /// `IMPORTANT_TARGET` ("setup-phase tunnel-wait deadline expired") and
+    /// returns `Err(...)` so the secondary exits non-zero and releases
+    /// its SLURM allocation. `None`-s itself at the `wait_for_setup` entry
+    /// so only the setup phase observes it (post-`Operational` the signal
+    /// is irrelevant — the tunnel connected).
+    pub(super) tunnel_gave_up_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 
     /// Externally-armed fatal-exit signal. Installed via
     /// [`Self::register_fatal_exit_signal_rx`] before

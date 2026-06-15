@@ -70,6 +70,8 @@ fn roundtrip_state_digest_payload() {
         tasks_hash: 0x0123_4567_89AB_CDEF,
         secondary_capacities_count: 3,
         secondary_capacities_hash: 0xFEED,
+        latest_resource_samples_count: 4,
+        latest_resource_samples_hash: 0x1234_ABCD,
         task_outputs_count: 6,
         task_outputs_hash: 0x9999_8888,
         phase_deps_count: 7,

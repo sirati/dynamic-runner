@@ -2499,6 +2499,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             dynrunner_protocol_primary_secondary::PeerId::from(dynrunner_core::SETUP_NODE_ID),
             self.config.node_id.clone(),
             pending.clone(),
+            Arc::clone(&self.authority_snapshot),
+            self.config.num_secondaries as usize,
         );
         self.remote_respawn_pending = Some(pending);
         // The spec's endpoint/pubkey snapshot is unused by the remote
@@ -4549,11 +4551,99 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 node = %self.config.node_id,
                 "primary exiting: run loop returned cleanly (Ok)"
             ),
-            Err(e) => tracing::error!(
-                node = %self.config.node_id,
-                reason = %e,
-                "primary exiting: run loop returned an error"
-            ),
+            Err(e) => {
+                tracing::error!(
+                    node = %self.config.node_id,
+                    reason = %e,
+                    "primary exiting: run loop returned an error"
+                );
+                // ── #563 Seam 0 — UNIFORM terminal verdict on ANY fatal Err ──
+                //
+                // CONTRACT: any `Err(e)` returned from `run_pipeline_inner` is
+                // a deliberate fatal exit — the run is over by this primary's
+                // verdict and the fleet must tear down on the SAME authority.
+                // Every Err return-site below this chokepoint broadcasts a
+                // verdict THROUGH this chokepoint; per-variant call sites that
+                // already invoke `broadcast_terminal_verdict` (the named
+                // variants in `broadcast_terminal_verdict`'s doc: #3a/#3b
+                // duplicate, ClusterCollapsed strand, SpawnRejected,
+                // RunShouldFail / PolicyFatalExit, NoRelocationTarget,
+                // InvalidComposedGraph) author the FIRST `RunAborted` latch —
+                // the sticky first-writer-wins rule (apply.rs:395) makes the
+                // chokepoint's late broadcast a NoOp on the wire
+                // (`apply_locally_for_broadcast` filters the duplicate apply),
+                // so the per-variant reason text stays authoritative. The
+                // remaining Err sites — every `?`-escape of a `RunError::Other`
+                // (queue_initial_staging / staging walks /
+                // send_transfer_complete / wait_for_mesh_ready /
+                // discover_on_promotion failures), `PanikShutdown`,
+                // `AbortedByClusterVerdict`, `Deposed`, `GracefulAbort`,
+                // and every future RunError variant — author their FIRST
+                // latch HERE, so the observer's `evaluate_exit` and every
+                // secondary's loop-tail `run_aborted()` exit see the verdict
+                // and finish in bounded time (#562: the in-process
+                // distributed runner's relocate-target returning
+                // `RunError::Other(StagingError)` previously left the
+                // standalone-observer awaiting a verdict that never came —
+                // an infinite hang the await_terminal_observer_delivery 60s
+                // hold cannot cover because that hold is the OBSERVER's
+                // re-broadcast, not the primary's first-emit).
+                //
+                // `broadcast_terminal_verdict` is the SINGLE broadcast +
+                // settle-window mechanism (rides PRIMARY_BROADCAST_SETTLE +
+                // await_terminal_observer_delivery); routing through it
+                // means every emit site — pre-existing per-variant or this
+                // chokepoint — converges on identical wire semantics.
+                //
+                // VARIANT EXCLUSIONS — three "authority-not-here" cases
+                // whose existing contracts forbid authoring a verdict:
+                //
+                //   * `PanikShutdown` — per-NODE kill, NOT a run-terminal
+                //     (the self-departure `PeerRemoved` is the signal; the
+                //     run continues / re-elects). Doc'd in
+                //     `broadcast_terminal_verdict`'s "NO VERDICT"
+                //     enumeration.
+                //   * `Deposed` — the replicated register names another
+                //     primary at a higher epoch, so THIS node holds no
+                //     authority to conclude the run. The recognized
+                //     primary owns the verdict. Pinned by
+                //     `deposed_standdown::deposed_primary_authors_no_clean_verdict_at_run_end`
+                //     ("a deposed primary must not author a RunAborted
+                //     verdict either — it holds no authority"). Without
+                //     this exclusion, the chokepoint would corrupt the
+                //     post-deposition wire fact (the recognized holder's
+                //     verdict is the first-writer, but a chokepoint emit
+                //     from a deposed primary that runs FIRST would
+                //     occupy the latch).
+                //   * `AbortedByClusterVerdict` — the verdict has ALREADY
+                //     converged on this node's CRDT (`already_authored`
+                //     covers it via the `run_aborted().is_some()` factor,
+                //     but it's enumerated here for clarity: this variant
+                //     means "I adopted a cluster verdict that landed
+                //     before I could author my own", which by construction
+                //     has the latch in hand).
+                let already_authored = self.cluster_state.run_aborted().is_some()
+                    || self.cluster_state.run_complete();
+                let authority_not_here = matches!(
+                    e,
+                    RunError::PanikShutdown { .. }
+                        | RunError::Deposed { .. }
+                        | RunError::AbortedByClusterVerdict { .. }
+                );
+                if !already_authored && !authority_not_here {
+                    tracing::warn!(
+                        node = %self.config.node_id,
+                        reason = %e,
+                        "no per-variant terminal verdict was authored before this \
+                         primary exit; broadcasting the uniform-chokepoint RunAborted \
+                         verdict so the fleet exits on the authority (#563 Seam 0)"
+                    );
+                    self.broadcast_terminal_verdict(
+                        super::lifecycle::TerminalVerdict::Aborted(e.to_string()),
+                    )
+                    .await;
+                }
+            }
         }
         result
     }
@@ -5175,6 +5265,46 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// warms the role cache, emits a keepalive), then runs the shared
     /// operational-loop-and-finalize tail to completion in place.
     pub(crate) async fn bootstrap_tail_dispatch(&mut self) -> Result<(), RunError> {
+        // Pre-loop run-terminal verdict adoption (#563 Seam 2). The
+        // `finalize_terminal_accounting` adoption gate already exists for the
+        // EXIT-edge case (`coordinator.rs::run_aborted()` check after the
+        // operational loop returns), but the BOOTSTRAP entry has no such
+        // check: a newly-promoted primary whose snapshot / inbound RunAborted
+        // delivered the verdict BEFORE promotion would still call
+        // `activate_local_primary` (broadcasting a fresh `PrimaryChanged` and
+        // emitting a keepalive) and then enter `operational_loop`, which
+        // re-dispatches every Pending task in the inherited ledger. The
+        // production cascade (#563): a peer wins election against a dying
+        // primary that already authored `RunAborted`, the new primary
+        // re-assigns `dependency_graph` (and every other ledger-Pending task)
+        // BEFORE its finalize gate even has a chance to fire. Adopt the
+        // verdict HERE so a promotion into an already-terminal run is a
+        // clean Err without re-dispatch — the same `RunError` the
+        // finalize-tail adoption gate uses, so the PyO3 boundary translates
+        // it uniformly. Clean `RunComplete` returns `Ok(())`: the inherited
+        // ledger is fully terminal and there is no work left, so the
+        // operational loop would immediately fall through to a counter
+        // exit; short-circuiting saves the empty pass + spurious
+        // PrimaryChanged broadcast.
+        if let Some(reason) = self.cluster_state.run_aborted().map(str::to_owned) {
+            tracing::error!(
+                node = %self.config.node_id,
+                reason = %reason,
+                "promoted primary adopting the cluster's replicated RunAborted \
+                 verdict; not entering operational loop (no new PrimaryChanged \
+                 broadcast, no re-dispatch)"
+            );
+            return Err(RunError::AbortedByClusterVerdict { reason });
+        }
+        if self.cluster_state.run_complete() {
+            tracing::info!(
+                node = %self.config.node_id,
+                "promoted primary adopting the cluster's replicated RunComplete \
+                 verdict; not entering operational loop (clean run already \
+                 terminal)"
+            );
+            return Ok(());
+        }
         self.activate_local_primary().await?;
         self.run_operational_and_finalize().await
     }

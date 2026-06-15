@@ -59,7 +59,7 @@ use dynrunner_scheduler_api::Scheduler;
 use crate::monitor::{MemoryCharge, measure_worker_charge};
 use crate::pool::{ResourcePressureResult, WorkerPool};
 
-use self::probe::{HostMemoryReading, ProcSysProbe, SystemProbe};
+use self::probe::{CpuStat, HostMemoryReading, ProcSysProbe, SystemProbe, cpu_busy_milli};
 
 /// Default cadence of the self-paced charge sweep: the sweep task
 /// `sleep`s this long after EACH sweep completes (await-before-resleep
@@ -218,6 +218,15 @@ pub struct OomWatcherSnapshot {
     pub tracked_workers_charged_sum: u64,
     pub tracked_workers_count: u32,
     pub captured_at: Option<Instant>,
+    /// Host CPU busy fraction in milli-percent over the interval
+    /// between THIS sweep and the prior one (100_000 = every core at
+    /// 100% — the aggregate `/proc/stat` "cpu" line already sums
+    /// across cores). `None` on the FIRST sweep (no prior to diff
+    /// against), or when the probe returned no `cpu_stat` (parse
+    /// failure / non-Linux), or when two reads landed inside the
+    /// same tick. Consumed by the secondary's resource-stats rolling
+    /// buffer (#575) and ignored by every other reader.
+    pub cpu_busy_milli: Option<u32>,
 }
 
 /// Constructor knobs for [`OomWatcher`]. Splits the cadence /
@@ -302,6 +311,14 @@ pub struct OomWatcher {
     /// covers ~10 samples worth of race tolerance between
     /// `oom_kill` counter increment and pipe-EOF observation.
     recent_kernel_oom_at: Option<Instant>,
+    /// Previous sweep's raw cumulative `/proc/stat` CPU readout. `None`
+    /// before the first sweep, OR when the probe returned no
+    /// `cpu_stat` (parse failure / non-Linux). The next sweep diffs
+    /// against this to populate `OomWatcherSnapshot::cpu_busy_milli`;
+    /// a sweep that itself returns no `cpu_stat` keeps the stored prev
+    /// intact (so a transient parse hiccup doesn't reset the diff
+    /// chain across subsequent good reads).
+    last_cpu_stat: Option<CpuStat>,
 }
 
 /// The three fields the delta trigger compares against their value
@@ -351,6 +368,7 @@ impl OomWatcher {
             last_log_values: TrackedDeltaFields::default(),
             last_kernel_oom_count: None,
             recent_kernel_oom_at: None,
+            last_cpu_stat: None,
         }
     }
 
@@ -475,6 +493,18 @@ impl OomWatcher {
         }
         let (charged_sum, swap_sum) = sum_worker_charge(pool);
         let tracked_workers_count = pool.workers.len() as u32;
+        // Derive the host CPU busy fraction over the interval between
+        // THIS sweep and the prior one (#575). The prior cumulative
+        // reading lives on `last_cpu_stat`; we update it ONLY when the
+        // probe surfaced a fresh reading, so a transient parse hiccup
+        // does not reset the diff chain across subsequent good reads.
+        let cpu_busy = match (self.last_cpu_stat, host.cpu_stat) {
+            (Some(prev), Some(cur)) => cpu_busy_milli(prev, cur),
+            _ => None,
+        };
+        if let Some(cur) = host.cpu_stat {
+            self.last_cpu_stat = Some(cur);
+        }
         self.last_snapshot = OomWatcherSnapshot {
             host,
             tracked_workers_rss_sum: charged_sum.saturating_sub(swap_sum),
@@ -482,6 +512,7 @@ impl OomWatcher {
             tracked_workers_charged_sum: charged_sum,
             tracked_workers_count,
             captured_at: Some(now),
+            cpu_busy_milli: cpu_busy,
         };
 
         if !self.config.log_enabled {

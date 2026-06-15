@@ -12,11 +12,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dynrunner_core::{Identifier, PhaseId, TaskOutputs, TerminalOutcomeCounts};
-use dynrunner_protocol_primary_secondary::{DiscoveryDebt, RoleTable, SecondaryCapacityRecord};
+use dynrunner_protocol_primary_secondary::{
+    DiscoveryDebt, RoleTable, SecondaryCapacityRecord, SecondaryResourceSampleRecord,
+};
 
 use crate::fulfillability_matcher::MatcherTriggerEvent;
 use crate::peer_lifecycle::PeerLifecycleEvent;
 use crate::task_completed::TaskCompletedEvent;
+use crate::custom_message_outcome::CustomMessageOutcomeEvent;
 use crate::task_state_change::TaskStateChangeEvent;
 use crate::worker_signal::WorkerMgmtSignal;
 
@@ -271,6 +274,21 @@ pub struct ClusterState<I> {
     /// snapshot, and restore — same CCD-9 rationale as `task_completed_tx`.
     pub(super) task_state_change_tx:
         Option<tokio::sync::mpsc::UnboundedSender<TaskStateChangeEvent>>,
+    /// Sender for the #570 F5 custom-message outcome narration channel.
+    /// Installed via [`Self::install_custom_message_outcome_sender`]
+    /// when the OBSERVER wires its narrator; `None` everywhere else
+    /// (primary / secondary never narrate, so they never install it —
+    /// the emit is a silent drop for them, like every other apply-path
+    /// channel with no receiver). Carries the per-mutation outcome
+    /// (`Handled` | `Failed { reason }`) captured at the apply site
+    /// BEFORE the per-origin watermark compactor erases the
+    /// Handled/Failed label, so the observer narrates the truth even
+    /// though the post-compaction state cannot tell the two terminals
+    /// apart (the #568 / #570 boundary). Skipped from `Clone`,
+    /// snapshot, and restore — same CCD-9 rationale as
+    /// `task_completed_tx`.
+    pub(super) custom_message_outcome_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<CustomMessageOutcomeEvent>>,
     /// Per-peer set of opaque resource strings each peer announces
     /// it currently holds locally. Maintained by the
     /// `PeerResourceHoldingsUpdated` apply rule and round-tripped via
@@ -323,6 +341,29 @@ pub struct ClusterState<I> {
     /// reconstructs `alive_worker_count()` / `self.workers` from this
     /// replicated source rather than starting empty.
     pub(super) secondary_capacities: HashMap<String, SecondaryCapacityRecord>,
+    /// Latest aggregated resource-sample broadcast from each compute
+    /// secondary (#575) — keyed by `secondary` id, valued by the LWW
+    /// [`SecondaryResourceSampleRecord`] the secondary's
+    /// `SecondaryResourceSample` mutation supplied.
+    ///
+    /// LWW on the per-record stamp `(member_gen, emitted_at_ms)`: a
+    /// strictly-greater stamp wins (the apply rule overwrites in place),
+    /// equal or older is a NoOp. Member-gen takes precedence so a
+    /// respawned member's first aggregate dominates whatever stale
+    /// record the dead incarnation left; emit-time breaks ties within
+    /// one membership.
+    ///
+    /// Replicated CRDT data — clone preserves it; included in
+    /// snapshot/restore so a freshly-promoted primary and late-joining
+    /// observers hold the latest resource picture per secondary. Anti-
+    /// entropy-reconciled (see `digest.rs`).
+    ///
+    /// CONSUMED BY: the observer's important-update reporter — the
+    /// projection averages each field across `alive_secondary_members()`
+    /// and applies the per-field 25% inclusion threshold (#575). The
+    /// primary NEVER reads it for a scheduling decision; resource stats
+    /// are observability-only.
+    pub(super) latest_resource_samples: HashMap<String, SecondaryResourceSampleRecord>,
     /// Node-local per-task monotone "next seq" counter — the originator's
     /// half of the `TaskVersion` stamp. The originating primary (or a
     /// promoted secondary holding a `ClusterState`) bumps this at the
@@ -639,9 +680,12 @@ where
             task_completed_tx: _task_completed_tx,
             // Deliberately not cloned — same rationale as `lifecycle_tx`.
             task_state_change_tx: _task_state_change_tx,
+            // Deliberately not cloned — same rationale as `lifecycle_tx`.
+            custom_message_outcome_tx: _custom_message_outcome_tx,
             peer_holdings,
             task_outputs,
             secondary_capacities,
+            latest_resource_samples,
             // Node-local originator counter — reset on clone (a cloned
             // replica originates nothing inherited from the source).
             task_seq: _task_seq,
@@ -725,12 +769,16 @@ where
             task_completed_tx: None,
             // Deliberately not cloned — same rationale as `lifecycle_tx`.
             task_state_change_tx: None,
+            // Deliberately not cloned — same rationale as `lifecycle_tx`.
+            custom_message_outcome_tx: None,
             // Replicated CRDT data — clone preserves it.
             peer_holdings: peer_holdings.clone(),
             // Replicated CRDT data — clone preserves it.
             task_outputs: task_outputs.clone(),
             // Replicated CRDT data — clone preserves it.
             secondary_capacities: secondary_capacities.clone(),
+            // Replicated CRDT data (#575) — clone preserves it.
+            latest_resource_samples: latest_resource_samples.clone(),
             // Node-local originator counter — reset on clone (a cloned
             // replica originates nothing inherited from the source).
             task_seq: HashMap::new(),
@@ -807,9 +855,11 @@ where
             worker_mgmt_tx,
             task_completed_tx,
             task_state_change_tx,
+            custom_message_outcome_tx,
             peer_holdings,
             task_outputs,
             secondary_capacities,
+            latest_resource_samples,
             task_seq,
             phase_event_tallies,
             retry_passes_used,
@@ -849,9 +899,14 @@ where
             .field("worker_mgmt_tx", &worker_mgmt_tx.is_some())
             .field("task_completed_tx", &task_completed_tx.is_some())
             .field("task_state_change_tx", &task_state_change_tx.is_some())
+            .field(
+                "custom_message_outcome_tx",
+                &custom_message_outcome_tx.is_some(),
+            )
             .field("peer_holdings", peer_holdings)
             .field("task_outputs", &task_outputs.len())
             .field("secondary_capacities", secondary_capacities)
+            .field("latest_resource_samples", &latest_resource_samples.len())
             .field("task_seq", &task_seq.len())
             .field("phase_event_tallies", &phase_event_tallies.len())
             .field("retry_passes_used", &retry_passes_used.len())
@@ -899,9 +954,11 @@ impl<I> Default for ClusterState<I> {
             worker_mgmt_tx: None,
             task_completed_tx: None,
             task_state_change_tx: None,
+            custom_message_outcome_tx: None,
             peer_holdings: HashMap::new(),
             task_outputs: HashMap::new(),
             secondary_capacities: HashMap::new(),
+            latest_resource_samples: HashMap::new(),
             task_seq: HashMap::new(),
             phase_event_tallies: HashMap::new(),
             retry_passes_used: HashMap::new(),

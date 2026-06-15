@@ -126,6 +126,32 @@ pub struct StatsSnapshot {
     /// secondary — `ClusterState::total_worker_count()` (sum of each
     /// secondary's replicated `worker_count`).
     pub total_workers: usize,
+    /// #575 averaged aggregated resource stats — each field is the
+    /// arithmetic mean across the compute secondaries that have
+    /// emitted at least one `SecondaryResourceSampleRecord` (the
+    /// `live_compute_resource_samples` accessor's filter). `None`
+    /// when NO secondary has yet emitted a sample (the freshly-
+    /// promoted-primary / cold-start window before the 5-minute
+    /// cadence has fired); the reporter's per-field render arm omits
+    /// a `None` metric without consuming its baseline (the next emit
+    /// then trips the zero-baseline include).
+    ///
+    /// Per-field independence: each field is fed by the SAME accessor
+    /// iteration and folded INDEPENDENTLY; a secondary that emitted a
+    /// sample contributes to every field, but the 25% threshold
+    /// against the last-printed baseline is decided per field by the
+    /// reporter (the snapshot only carries the averaged values; the
+    /// inclusion gate lives in `format.rs`).
+    pub avg_mem_p10_bytes: Option<u64>,
+    pub avg_mem_p30_bytes: Option<u64>,
+    pub avg_mem_p50_bytes: Option<u64>,
+    pub avg_mem_p70_bytes: Option<u64>,
+    pub avg_mem_p90_bytes: Option<u64>,
+    pub avg_mem_avg_bytes: Option<u64>,
+    pub avg_total_free_memory_bytes: Option<u64>,
+    pub avg_total_swap_used_bytes: Option<u64>,
+    pub avg_total_free_swap_bytes: Option<u64>,
+    pub avg_cpu_utilization_milli: Option<u32>,
 }
 
 impl StatsSnapshot {
@@ -141,6 +167,105 @@ impl StatsSnapshot {
     /// and pushes the result into the reporter's snapshot source via
     /// `SharedSnapshotSource::publish` (the reporter's own test suite also
     /// exercises it directly).
+    /// Skip-predicate for the 10-min periodic report: returns `true` iff
+    /// every field that DIFFERS between `self` and `prev` is in the
+    /// skip-eligible set — i.e. the only movement since the last
+    /// announcement is routine throughput OR a high-frequency
+    /// resource-stat reading (#575). A `true` return tells the driver
+    /// to elide this 10-minute emission (the 1-hour safety net will
+    /// print the accumulated delta later); a `false` return means at
+    /// least one non-eligible field moved and the report must run on
+    /// the normal cadence.
+    ///
+    /// Skip-eligible set:
+    ///   * Throughput counters: `succeeded`, `fail_retry`, `fail_oom`,
+    ///     `fail_final` (owner-decision 2026-06-15).
+    ///   * #575 averaged resource stats: `avg_mem_p10/p30/p50/p70/p90/avg`,
+    ///     `avg_total_free_memory`, `avg_total_swap_used`,
+    ///     `avg_total_free_swap`, `avg_cpu_utilization_milli` — these
+    ///     are continuous measurements with a per-field 25% inclusion
+    ///     gate inside `format.rs`; a resource-stat-only change must
+    ///     NOT force a 10-min print (high-frequency noise; brief #575).
+    ///     When the OUTER predicate fires and the print does happen
+    ///     (because something OUTSIDE the skip set changed, OR the
+    ///     1-hour safety net fires, OR a force-print was signalled),
+    ///     `format.rs::render_report` then runs the 25% gate on each
+    ///     resource line to decide actual line inclusion.
+    ///
+    /// Subset semantics (not strict equality): an all-equal snapshot
+    /// (diff = ∅) trivially satisfies "all changes are in the eligible
+    /// set" and returns `true` — the spec elides such ticks too (an
+    /// empty report has nothing wake-worthy; the operator uses SIGUSR1
+    /// to force a heartbeat read).
+    ///
+    /// Scope rationale (owner-decision 2026-06-15): `unfulfillable`,
+    /// `invalid_task`, and `setup_succeeded` are EXCLUDED — they are
+    /// exceptional-flow categories (structural failures, capability-loss
+    /// cascades, setup-task outcomes), not routine throughput, and the
+    /// operator wants those changes promptly. The maps
+    /// (`per_secondary_in_flight`, `per_secondary_queued_after_local_dep`)
+    /// and the roster (`alive_secondaries`) are also excluded so a peer
+    /// joining/leaving or a task moving between secondaries is never
+    /// skipped.
+    pub fn diff_subset_of_skip_eligible(&self, prev: &Self) -> bool {
+        // Destructure once so a future field addition forces a compile
+        // error here — every snapshot field must be classified
+        // "skip-eligible counter" or "must-print-on-change".
+        let Self {
+            succeeded: _cur_succeeded,
+            setup_succeeded,
+            fail_retry: _cur_fail_retry,
+            fail_oom: _cur_fail_oom,
+            fail_final: _cur_fail_final,
+            unfulfillable,
+            invalid_task,
+            in_flight,
+            queued_after_local_dependency,
+            per_secondary_queued_after_local_dep,
+            waiting_on_deps,
+            blocked,
+            ready_in_queue,
+            per_secondary_in_flight,
+            alive_secondaries,
+            busy_secondaries,
+            total_secondaries,
+            busy_workers,
+            total_workers,
+            // #575 resource-stat averages are SKIP-ELIGIBLE — see the
+            // method docs. Bound with `_` prefix so the destructure
+            // stays exhaustive (a future resource field is a compile
+            // error here until classified), but skipped from the
+            // equality comparisons below: a resource-only change
+            // never trips this predicate.
+            avg_mem_p10_bytes: _,
+            avg_mem_p30_bytes: _,
+            avg_mem_p50_bytes: _,
+            avg_mem_p70_bytes: _,
+            avg_mem_p90_bytes: _,
+            avg_mem_avg_bytes: _,
+            avg_total_free_memory_bytes: _,
+            avg_total_swap_used_bytes: _,
+            avg_total_free_swap_bytes: _,
+            avg_cpu_utilization_milli: _,
+        } = self;
+        setup_succeeded == &prev.setup_succeeded
+            && unfulfillable == &prev.unfulfillable
+            && invalid_task == &prev.invalid_task
+            && in_flight == &prev.in_flight
+            && queued_after_local_dependency == &prev.queued_after_local_dependency
+            && per_secondary_queued_after_local_dep
+                == &prev.per_secondary_queued_after_local_dep
+            && waiting_on_deps == &prev.waiting_on_deps
+            && blocked == &prev.blocked
+            && ready_in_queue == &prev.ready_in_queue
+            && per_secondary_in_flight == &prev.per_secondary_in_flight
+            && alive_secondaries == &prev.alive_secondaries
+            && busy_secondaries == &prev.busy_secondaries
+            && total_secondaries == &prev.total_secondaries
+            && busy_workers == &prev.busy_workers
+            && total_workers == &prev.total_workers
+    }
+
     pub fn from_cluster_state<I: Identifier>(state: &ClusterState<I>) -> Self {
         let outcome = state.outcome_counts();
         let counts = state.counts();
@@ -231,6 +356,51 @@ impl StatsSnapshot {
             }
         }
 
+        // #575 aggregated resource stats — average each field across
+        // EVERY compute secondary that has emitted a sample. The fold
+        // is a single pass over `live_compute_resource_samples()`; a
+        // secondary that has not yet emitted is excluded from the
+        // denominator for ALL fields (per-secondary atomicity — a
+        // present record contributes to every field).
+        let (resource_sum, resource_n) = state.live_compute_resource_samples().fold(
+            (ResourceFieldSums::default(), 0u64),
+            |(mut acc, n), (_id, record)| {
+                acc.mem_p10 = acc.mem_p10.saturating_add(record.mem_p10_bytes as u128);
+                acc.mem_p30 = acc.mem_p30.saturating_add(record.mem_p30_bytes as u128);
+                acc.mem_p50 = acc.mem_p50.saturating_add(record.mem_p50_bytes as u128);
+                acc.mem_p70 = acc.mem_p70.saturating_add(record.mem_p70_bytes as u128);
+                acc.mem_p90 = acc.mem_p90.saturating_add(record.mem_p90_bytes as u128);
+                acc.mem_avg = acc.mem_avg.saturating_add(record.mem_avg_bytes as u128);
+                acc.total_free_memory = acc
+                    .total_free_memory
+                    .saturating_add(record.total_free_memory_bytes as u128);
+                acc.total_swap_used = acc
+                    .total_swap_used
+                    .saturating_add(record.total_swap_used_bytes as u128);
+                acc.total_free_swap = acc
+                    .total_free_swap
+                    .saturating_add(record.total_free_swap_bytes as u128);
+                acc.cpu_utilization_milli = acc
+                    .cpu_utilization_milli
+                    .saturating_add(record.cpu_utilization_milli as u128);
+                (acc, n + 1)
+            },
+        );
+        let avg_mem_p10_bytes = avg_u64_from_sum(resource_sum.mem_p10, resource_n);
+        let avg_mem_p30_bytes = avg_u64_from_sum(resource_sum.mem_p30, resource_n);
+        let avg_mem_p50_bytes = avg_u64_from_sum(resource_sum.mem_p50, resource_n);
+        let avg_mem_p70_bytes = avg_u64_from_sum(resource_sum.mem_p70, resource_n);
+        let avg_mem_p90_bytes = avg_u64_from_sum(resource_sum.mem_p90, resource_n);
+        let avg_mem_avg_bytes = avg_u64_from_sum(resource_sum.mem_avg, resource_n);
+        let avg_total_free_memory_bytes =
+            avg_u64_from_sum(resource_sum.total_free_memory, resource_n);
+        let avg_total_swap_used_bytes =
+            avg_u64_from_sum(resource_sum.total_swap_used, resource_n);
+        let avg_total_free_swap_bytes =
+            avg_u64_from_sum(resource_sum.total_free_swap, resource_n);
+        let avg_cpu_utilization_milli =
+            avg_u32_from_sum(resource_sum.cpu_utilization_milli, resource_n);
+
         StatsSnapshot {
             succeeded: outcome.succeeded,
             setup_succeeded: outcome.setup_succeeded,
@@ -271,8 +441,52 @@ impl StatsSnapshot {
             total_workers: state.total_worker_count() as usize,
             per_secondary_in_flight,
             alive_secondaries: state.alive_secondary_members().map(String::from).collect(),
+            avg_mem_p10_bytes,
+            avg_mem_p30_bytes,
+            avg_mem_p50_bytes,
+            avg_mem_p70_bytes,
+            avg_mem_p90_bytes,
+            avg_mem_avg_bytes,
+            avg_total_free_memory_bytes,
+            avg_total_swap_used_bytes,
+            avg_total_free_swap_bytes,
+            avg_cpu_utilization_milli,
         }
     }
+}
+
+/// Per-field running u128 sums of the #575 resource-stat averages,
+/// folded across `live_compute_resource_samples()`. Lives here (not
+/// on the public `StatsSnapshot`) — a fold-local intermediate, never
+/// reported.
+#[derive(Debug, Default, Clone, Copy)]
+struct ResourceFieldSums {
+    mem_p10: u128,
+    mem_p30: u128,
+    mem_p50: u128,
+    mem_p70: u128,
+    mem_p90: u128,
+    mem_avg: u128,
+    total_free_memory: u128,
+    total_swap_used: u128,
+    total_free_swap: u128,
+    cpu_utilization_milli: u128,
+}
+
+/// `Some(sum / n)` saturating back into `u64`, OR `None` when `n == 0`.
+fn avg_u64_from_sum(sum: u128, n: u64) -> Option<u64> {
+    if n == 0 {
+        return None;
+    }
+    Some((sum / n as u128).min(u64::MAX as u128) as u64)
+}
+
+/// `Some(sum / n)` saturating back into `u32`, OR `None` when `n == 0`.
+fn avg_u32_from_sum(sum: u128, n: u64) -> Option<u32> {
+    if n == 0 {
+        return None;
+    }
+    Some((sum / n as u128).min(u32::MAX as u128) as u32)
 }
 
 // These helpers are reached only through `from_cluster_state`, the live

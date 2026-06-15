@@ -10,7 +10,7 @@ pub mod traits;
 pub mod types;
 
 pub use bounded_string::BoundedString;
-pub use importance::IMPORTANT_TARGET;
+pub use importance::{IMPORTANT_TARGET, OBSERVER_TASK_TARGET};
 pub use node_id::SETUP_NODE_ID;
 pub use output_gather::gather_predecessor_outputs;
 pub use path_resolve::{ResolvedPath, resolve_against_root};

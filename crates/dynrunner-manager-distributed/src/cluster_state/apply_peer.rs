@@ -23,7 +23,9 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use dynrunner_core::{Identifier, ResourceAmount, TaskVersion};
-use dynrunner_protocol_primary_secondary::{RemovalCause, SecondaryCapacityRecord};
+use dynrunner_protocol_primary_secondary::{
+    RemovalCause, SecondaryCapacityRecord, SecondaryResourceSampleRecord,
+};
 
 use super::merge::merge_capability;
 use super::types::{CapabilityEntry, PeerEntry, PeerState};
@@ -523,6 +525,51 @@ impl<I: Identifier> ClusterState<I> {
             ApplyOutcome::Applied
         } else {
             ApplyOutcome::NoOp
+        }
+    }
+
+    /// Apply a `ClusterMutation::SecondaryResourceSample` (#575).
+    ///
+    /// LWW per `secondary` on `(member_gen, emitted_at_ms)`: the
+    /// incoming record wins iff its stamp is strictly greater than
+    /// the local entry's stamp (or the local has no entry). Equal or
+    /// older stamps are NoOp.
+    ///
+    /// The two-component stamp's discipline: a respawned-member's
+    /// fresh aggregate carries a higher `member_gen` and therefore
+    /// strictly dominates whatever stale record the dead incarnation
+    /// left in the map (so the observer's projection switches to the
+    /// new incarnation's numbers on the next emit, not after the dead
+    /// record falls out of some TTL). Within one membership the
+    /// `emitted_at_ms` clock breaks ties — that is the steady-state
+    /// 5-minute monotone advance.
+    ///
+    /// Snapshot replay / redundant re-broadcast / anti-entropy heal:
+    /// each carries the same `(member_gen, emitted_at_ms)` stamp as
+    /// the originating apply, so a duplicate landing finds an
+    /// already-equal local stamp and NoOps — idempotent under at-
+    /// least-once delivery (matching the broader CRDT contract).
+    pub(super) fn apply_secondary_resource_sample(
+        &mut self,
+        secondary: String,
+        record: SecondaryResourceSampleRecord,
+    ) -> ApplyOutcome {
+        let incoming = (record.member_gen, record.emitted_at_ms);
+        match self.latest_resource_samples.entry(secondary) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(record);
+                ApplyOutcome::Applied
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let local = e.get();
+                let local_stamp = (local.member_gen, local.emitted_at_ms);
+                if incoming > local_stamp {
+                    e.insert(record);
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
+                }
+            }
         }
     }
 }

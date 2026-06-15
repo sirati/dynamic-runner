@@ -33,6 +33,66 @@ pub struct SecondaryCapacityRecord {
     pub resources: Vec<ResourceAmount>,
 }
 
+/// Aggregated per-secondary resource sample (#575) — one tuple of
+/// statistics summarising the last 10 minutes of LOCAL raw resource
+/// samples on the originating secondary, broadcast every 5 minutes.
+///
+/// The RAW per-sample readings (sub-second cadence, the OOM watcher's
+/// 20Hz sweep) never leave the secondary; this aggregate is the only
+/// resource-shape value the cluster ledger carries.
+///
+/// Memory percentiles + average are over the secondary's per-sample
+/// `tracked_workers_charged_sum` (the resident-plus-swap workload sum
+/// the kill decision also consumes), expressed in bytes. The total
+/// free / swap fields are averages of the host's `/proc/meminfo` deltas
+/// over the same window — averages rather than the emit-instant
+/// snapshot so the value is comparable to the percentile lines and
+/// does not jitter on a single transient sample. `cpu_utilization_milli`
+/// is the window-mean of the busy fraction of the host's aggregate
+/// `/proc/stat` "cpu" line, scaled so 100_000 = every core at 100%.
+///
+/// LWW-on-stamp apply semantics (see
+/// `ClusterState::apply_secondary_resource_sample`): newer
+/// `(member_gen, emitted_at_ms)` wins. The member-generation half
+/// makes a respawn observable (a re-admitted member's first sample
+/// dominates whatever stale aggregate the dead incarnation left
+/// behind); the emit-time half breaks ties within one membership.
+/// Same shape the `PeerResourceHoldingsUpdated` LWW-by-epoch rule
+/// uses for its replicated per-peer holdings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecondaryResourceSampleRecord {
+    /// The membership generation under which the originating secondary
+    /// observed itself. A respawn (re-admitted after a removal) bumps
+    /// this so the new incarnation's aggregate strictly dominates the
+    /// dead one's last broadcast.
+    pub member_gen: u64,
+    /// Milliseconds since the UNIX epoch at the moment the originating
+    /// secondary built and emitted this aggregate. Breaks `member_gen`
+    /// ties (same membership, later emit wins).
+    pub emitted_at_ms: u64,
+    /// Per-sample `tracked_workers_charged_sum` (bytes): P10/P30/P50/P70/P90
+    /// + arithmetic mean over the 10-minute rolling window.
+    pub mem_p10_bytes: u64,
+    pub mem_p30_bytes: u64,
+    pub mem_p50_bytes: u64,
+    pub mem_p70_bytes: u64,
+    pub mem_p90_bytes: u64,
+    pub mem_avg_bytes: u64,
+    /// Window mean of `MemTotal - MemAvailable`-style host free RAM
+    /// (bytes). `MemTotal - MemUsed` exactly; the host's notion of
+    /// "free", not the cgroup's.
+    pub total_free_memory_bytes: u64,
+    /// Window mean of `SwapTotal - SwapFree` (bytes).
+    pub total_swap_used_bytes: u64,
+    /// Window mean of `SwapFree` (bytes).
+    pub total_free_swap_bytes: u64,
+    /// Window mean of the host's CPU utilisation in milli-percent.
+    /// 100_000 = all cores at 100%. `/proc/stat`'s aggregate "cpu" line
+    /// already sums across cores, so the ratio is naturally normalised
+    /// to `[0, 100_000]`.
+    pub cpu_utilization_milli: u32,
+}
+
 /// Replicated per-RUN "discovery owed" fact (V6) — a THREE-state
 /// sticky-monotone scalar lattice. The value half of the discovery-debt
 /// CRDT field: set by [`ClusterMutation::DiscoveryDebtDeclared`] /
@@ -1078,8 +1138,57 @@ pub enum ClusterMutation<I> {
     /// the late `Posted` NoOps. Each Applied advances the per-origin
     /// terminal watermark exactly as `Handled` does (both terminals are
     /// payload-dropping tombstones the GC compacts).
+    ///
+    /// `reason` carries the handler's raise message verbatim — the SAME
+    /// string the originating primary already structured-logs at
+    /// [`primary/custom_message.rs`]. It is NARRATION-ONLY plumbing for
+    /// the #570 `CustomMessageOutcomeEvent` (consumed at the apply site,
+    /// before the per-origin watermark compactor erases the
+    /// Handled/Failed label); it never enters the CRDT lattice (the
+    /// apply rule still only inserts a label-less `Failed` tombstone
+    /// that the compactor then sweeps, exactly as it did before this
+    /// field existed) and is dropped on every replica the instant the
+    /// event is emitted. `#[serde(default)]` so a legacy sender's
+    /// reason-less frame decodes to the empty string (the same default
+    /// the apply rule sees when this carriage is unused).
     CustomMessageFailed {
         origin: String,
         seq: u64,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
+    /// A secondary's 5-minute aggregated resource-sample broadcast
+    /// (#575): one [`SecondaryResourceSampleRecord`] summarising the
+    /// last 10 minutes of LOCAL raw resource samples on `secondary`.
+    /// The raw per-sample readings never leave the secondary; this
+    /// aggregate is the only resource-shape value the cluster ledger
+    /// carries, and it never feeds a primary scheduling/budget
+    /// decision — it is observability-only (the observer's important-
+    /// update reporter consumes it).
+    ///
+    /// Originated by every compute secondary on a 5-minute interval
+    /// out of the OOM-watcher sweep loop's host of the rolling sample
+    /// buffer. Carried through the same one-mesh broadcast every other
+    /// secondary-originated mutation uses
+    /// ([`crate::secondary::origination::apply_and_broadcast_mutations`]):
+    /// one fan-out reaches every mesh member.
+    ///
+    /// Apply rule (see
+    /// [`crate::cluster_state::apply_peer::apply_secondary_resource_sample`]):
+    /// LWW per `secondary` on the tuple `(record.member_gen,
+    /// record.emitted_at_ms)`. A strictly-greater stamp wins (Applied,
+    /// overwrites in place); equal or older is a NoOp (idempotent
+    /// under at-least-once delivery; safe for snapshot replay).
+    ///
+    /// Wire-compat: a deployment with no compute secondaries on a #575-
+    /// adopting build never originates this mutation, so non-adopters
+    /// see zero new wire bytes. A receiver that doesn't recognise the
+    /// variant cannot occur — JSON-tag dispatch fails the whole frame,
+    /// and serde flags the closed enum; rolling upgrade is therefore
+    /// release-gated (matching the
+    /// `QueuedAfterLocalDependencySet` / `AffineReady` discipline).
+    SecondaryResourceSample {
+        secondary: String,
+        record: SecondaryResourceSampleRecord,
     },
 }

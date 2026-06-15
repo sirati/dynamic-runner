@@ -45,6 +45,7 @@ pub mod lifecycle;
 pub mod lost_visibility;
 pub mod reconnect;
 pub mod reporting;
+mod custom_message_outcome_narrator;
 mod setup_exec;
 mod task_narrator;
 

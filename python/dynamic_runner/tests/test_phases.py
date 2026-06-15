@@ -101,6 +101,15 @@ class _PhasedTask:
     kill_phase: str | None = None
     kill_marker: Path | None = None
 
+    # ── class fact: items are synthetic (no on-disk source) ─────────
+    # The framework's auto-staging pipeline reads + hashes every item's
+    # source file at run-start when `uses_file_based_items=True` (the
+    # default). Our items only encode their (phase, type, affinity,
+    # index) into the path string; they have no on-disk backing. Tell
+    # the framework to skip auto-staging entirely (matches
+    # `_localout_consumer.uses_file_based_items=False`).
+    uses_file_based_items: bool = False
+
     # ── topology ───────────────────────────────────────────────────
     def get_phases(self) -> tuple[PhaseSpec, ...]:
         return self.phases
@@ -131,6 +140,13 @@ class _PhasedTask:
                 type_id=type_id,
                 affinity_id=spec.affinity,
                 payload={},
+                # ``task_id`` became REQUIRED (non-empty) at the
+                # Python->Rust boundary in commit c0a05719
+                # ("core(task): task_id is now required"). ``stem``
+                # already encodes (phase, type, affinity, idx)
+                # uniquely across the items list, so it is a stable,
+                # collision-free id without an extra synthesis step.
+                task_id=stem,
             )
 
     # ── per-type plumbing ──────────────────────────────────────────

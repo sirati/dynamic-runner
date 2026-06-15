@@ -9,6 +9,7 @@ pub mod settled_spill;
 pub mod snapshot_stream;
 pub mod discovery;
 pub mod fulfillability_matcher;
+pub mod force_print_trigger;
 pub mod graceful_abort_trigger;
 pub mod liveness;
 pub mod message_router;
@@ -27,6 +28,7 @@ pub mod secondary;
 pub mod setup_exec;
 pub mod state;
 pub mod upload_action;
+pub mod custom_message_outcome;
 pub mod task_completed;
 pub mod task_state_change;
 pub mod worker_messages;
@@ -46,6 +48,7 @@ pub use discovery::{SetupDiscovery, SetupDiscoveryFn};
 // The operator's SIGUSR2 graceful-abort trigger — armed once at process
 // entry and consumed by whichever role loop (primary or observer) is active
 // (the PyO3 entry paths arm it; see the module header).
+pub use force_print_trigger::ForcePrintTrigger;
 pub use graceful_abort_trigger::GracefulAbortTrigger;
 pub use secondary::{
     DEFAULT_PRIMARY_SILENCE_BACKSTOP, FinalizeRunConfigFn, PeerCertInfo, RunOutcome,

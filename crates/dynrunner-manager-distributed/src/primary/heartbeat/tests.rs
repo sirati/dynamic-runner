@@ -2498,6 +2498,7 @@ async fn chronically_starved_primary_removes_dead_member_and_requests_respawn() 
                 crate::authority_snapshot::test_helpers::StaticSnapshot {
                     map: std::collections::HashMap::new(),
                     count: Some(0),
+                    pending_resources: None,
                 },
             ));
             register_operational_secondary(&mut primary, "doomed", 0, "victim");
@@ -3012,6 +3013,7 @@ async fn remote_evidence_ends_deferral_and_remaining_silent_are_declared() {
                 primary.set_authority_snapshot(std::sync::Arc::new(StaticSnapshot {
                     map,
                     count: None,
+                    pending_resources: None,
                 }));
             }
 
@@ -3121,6 +3123,7 @@ async fn collective_silence_escalates_and_declares_after_bounded_window() {
                 primary.set_authority_snapshot(std::sync::Arc::new(StaticSnapshot {
                     map,
                     count: None,
+                    pending_resources: None,
                 }));
             }
 

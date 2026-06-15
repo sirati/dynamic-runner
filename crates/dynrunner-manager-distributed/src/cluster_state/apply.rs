@@ -967,6 +967,9 @@ impl<I: Identifier> ClusterState<I> {
                 worker_count,
                 resources,
             } => self.apply_secondary_capacity(secondary, worker_count, resources),
+            ClusterMutation::SecondaryResourceSample { secondary, record } => {
+                self.apply_secondary_resource_sample(secondary, record)
+            }
             ClusterMutation::TasksSpawned { tasks } => {
                 self.apply_tasks_spawned(tasks, newly_pending_from_spawn)
             }
@@ -979,9 +982,11 @@ impl<I: Identifier> ClusterState<I> {
             ClusterMutation::CustomMessageHandled { origin, seq } => {
                 self.apply_custom_message_handled(origin, seq)
             }
-            ClusterMutation::CustomMessageFailed { origin, seq } => {
-                self.apply_custom_message_failed(origin, seq)
-            }
+            ClusterMutation::CustomMessageFailed {
+                origin,
+                seq,
+                reason,
+            } => self.apply_custom_message_failed(origin, seq, reason),
         }
     }
 

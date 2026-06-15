@@ -25,6 +25,7 @@ pub use address::{
 };
 pub use cluster_mutation::{
     ClusterMutation, DiscoveryDebt, PrimaryChangeReason, SecondaryCapacityRecord,
+    SecondaryResourceSampleRecord,
 };
 pub use chunking::{
     AbandonedTransfer, ChunkIngest, ChunkOutcome, ChunkReassembler, split_frame,

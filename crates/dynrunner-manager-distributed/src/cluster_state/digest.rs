@@ -147,6 +147,13 @@ impl<I: Identifier> ClusterState<I> {
             peer_holdings: _peer_holdings,
             task_outputs,
             secondary_capacities,
+            // #575 LWW per-secondary aggregated resource sample —
+            // summarised: count + STAMP-fold (member_gen + emitted_at_ms).
+            // The aggregate VALUES are not folded: a same-stamp record
+            // carries the same aggregate by construction, so the stamp
+            // pair is a sufficient fingerprint and keeps the fold matching
+            // the apply rule's tuple comparison.
+            latest_resource_samples,
             // Replicated grow-only-MAX maps (F4 + P3) — summarised: count +
             // VALUE-folding XOR (the count diverges before convergence, so
             // the fold must see the value, same shape as `task_outputs`).
@@ -204,6 +211,7 @@ impl<I: Identifier> ClusterState<I> {
             worker_mgmt_tx: _worker_mgmt_tx,
             task_completed_tx: _task_completed_tx,
             task_state_change_tx: _task_state_change_tx,
+            custom_message_outcome_tx: _custom_message_outcome_tx,
             // node-local: the originator's per-hash version counter carries
             // no convergence signal (each replica mints its own).
             task_seq: _task_seq,
@@ -289,6 +297,17 @@ impl<I: Identifier> ClusterState<I> {
             secondary_capacities_hash ^= hash_one(key);
         }
 
+        // #575 per-secondary aggregated resource sample: count + XOR-fold
+        // over the `(secondary, (member_gen, emitted_at_ms))` pairs. The
+        // LWW STAMP makes a same-key newer-stamp aggregate fold
+        // differently — the divergence the restore-side LWW merge
+        // actually heals.
+        let mut latest_resource_samples_hash = 0u64;
+        for (key, record) in latest_resource_samples {
+            latest_resource_samples_hash ^=
+                hash_one((key, (record.member_gen, record.emitted_at_ms)));
+        }
+
         // Keyed-output cache: count + KEY+VALUE-content-hash fold (AE-5).
         // Was key-only; now also folds the output VALUE so a divergent
         // value at an equal key is detected (the apply/restore
@@ -357,6 +376,8 @@ impl<I: Identifier> ClusterState<I> {
             tasks_hash,
             secondary_capacities_count: secondary_capacities.len() as u64,
             secondary_capacities_hash,
+            latest_resource_samples_count: latest_resource_samples.len() as u64,
+            latest_resource_samples_hash,
             task_outputs_count: task_outputs.len() as u64,
             task_outputs_hash,
             phase_deps_count: phase_deps.len() as u64,

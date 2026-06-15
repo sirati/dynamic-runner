@@ -162,6 +162,8 @@ fn roundtrip_all_message_types() {
                 tasks_hash: 0xDEAD_BEEF,
                 secondary_capacities_count: 2,
                 secondary_capacities_hash: 0x42,
+                latest_resource_samples_count: 0,
+                latest_resource_samples_hash: 0,
                 task_outputs_count: 4,
                 task_outputs_hash: 0xABC,
                 phase_deps_count: 5,

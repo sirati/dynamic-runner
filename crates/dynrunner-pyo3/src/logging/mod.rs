@@ -974,6 +974,64 @@ mod tests {
         );
     }
 
+    /// Drive the same layer set as [`run_capture`] but emit on the
+    /// observer per-task target — the non-wake-worthy channel for the
+    /// #520 per-task INFO narration. Returns `(full, stdio)` so the
+    /// caller can assert routing under both modes.
+    fn run_capture_observer_task(important_only: bool) -> (String, String) {
+        use dynrunner_core::OBSERVER_TASK_TARGET;
+
+        let full_buf = BufWriter::default();
+        let stdio_buf = BufWriter::default();
+        let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![
+            full_layer::<Registry, _>(full_buf.clone()),
+            stdio_layer::<Registry, _>(stdio_buf.clone(), important_only),
+        ];
+        let subscriber = Registry::default().with(layers).with(LevelFilter::INFO);
+        with_default(subscriber, || {
+            tracing::info!(
+                target: OBSERVER_TASK_TARGET,
+                "task t42 assigned to sec-a-3",
+            );
+        });
+        (full_buf.contents(), stdio_buf.contents())
+    }
+
+    /// Regression for #573: per-task observer narration (target
+    /// [`dynrunner_core::OBSERVER_TASK_TARGET`]) is SUPPRESSED FROM
+    /// stdio when `--important-stdio-only` is set, while the full
+    /// sink still records it. The 46k-task build phase would
+    /// otherwise flood the operator's wake stream with tens of
+    /// thousands of non-wake lines.
+    #[test]
+    fn importance_mode_suppresses_observer_task_target_from_stdio_but_full_keeps_it() {
+        let (full, stdio) = run_capture_observer_task(true);
+
+        assert!(
+            full.contains("task t42 assigned to sec-a-3"),
+            "full sink lost the per-task line: {full}"
+        );
+        assert!(
+            !stdio.contains("task t42"),
+            "per-task narration LEAKED to stdio under --important-stdio-only: {stdio}"
+        );
+    }
+
+    /// In default mode the per-task observer narration IS visible on
+    /// stdio — operators running without `--important-stdio-only`
+    /// still see the live per-task stream (#520's default-mode
+    /// contract).
+    #[test]
+    fn default_mode_admits_observer_task_target_on_stdio() {
+        let (full, stdio) = run_capture_observer_task(false);
+
+        assert!(full.contains("task t42 assigned to sec-a-3"));
+        assert!(
+            stdio.contains("task t42 assigned to sec-a-3"),
+            "default-mode stdio dropped per-task narration: {stdio}"
+        );
+    }
+
     /// Drive a full layer under a GLOBAL `level` ceiling over an in-memory
     /// buffer, emit one INFO and one DEBUG event, and return the captured
     /// contents. The verbosity ceiling is the only variable under test, and

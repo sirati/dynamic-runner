@@ -35,18 +35,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // every free worker; on a large idle fleet (e.g. 96 workers ×
         // a 46 k pool) the per-worker view rebuild + scheduler scan is
         // O(P) per worker, so the burst is O(M × P) of contiguous CPU
-        // on the coordinator's single-thread runtime. The worker-mgmt
-        // arm is itself a select! arm body, so other arms can't
-        // re-fire until this returns — but unlike the SpawnTasks
-        // wedge (per-batch 150 s), a single recheck burst is
-        // bounded enough (~hundreds of ms) that yielding INSIDE the
-        // arm body is sufficient: each chunk of K workers releases
-        // the runtime to sibling spawn_local tasks (the lifecycle /
-        // task_completed dispatchers, etc.) and the next chunk
-        // re-derives `order` and `all_infos` from the current worker
-        // roster, so a worker that became busy mid-recheck (a
-        // completion landed via the OTHER select! arm running before
-        // we return) is naturally dropped.
+        // on the coordinator's single-thread runtime. Each chunk's
+        // `yield_now()` releases the runtime to sibling `spawn_local`
+        // tasks on the LocalSet (respawn watchers,
+        // task_completed_dispatcher, etc.) — this prevents starving
+        // them on long bursts. NOTE: this does NOT return to the
+        // parent `select!`; sibling select! arms (ARM_INBOX,
+        // ARM_HEARTBEAT) cannot fire until
+        // react_to_worker_signal_batch's ARM_WORKER_MGMT body fully
+        // returns. For a 96-worker × 46k-pool burst the cumulative
+        // wall-clock is hundreds of ms, well below the
+        // dispatch-starvation thresholds; if a future workload needs
+        // ARM_INBOX/ARM_HEARTBEAT to re-fire mid-batch, the fix is a
+        // PumpDispatchContinuation kick analogous to #547's
+        // PumpSpawnContinuation. The next chunk re-derives `order`
+        // and `all_infos` from the current worker roster, so a worker
+        // that became busy between chunks is naturally dropped.
         let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
         loop {
             let progressed = self
@@ -288,13 +292,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     "task assigned: identity"
                 );
             }
-            // Chunk break: yield after `DISPATCH_CHUNK_WORKERS` workers'
-            // worth of processing so sibling LocalSet tasks (the lifecycle
-            // / task_completed dispatchers) get an opportunity to run
-            // between chunks. The outer `dispatch_to_idle_workers` re-
-            // enters this function on the next chunk; `visited` carries
-            // forward so the new chunk's `order` skips already-visited
-            // workers.
+            // Chunk break: `yield_now()` releases the runtime to sibling
+            // `spawn_local` tasks on the LocalSet (respawn watchers,
+            // task_completed_dispatcher, etc.) between chunks. NOTE: this
+            // does NOT return to the parent `select!`; sibling select! arms
+            // (ARM_INBOX, ARM_HEARTBEAT) cannot fire until
+            // react_to_worker_signal_batch's ARM_WORKER_MGMT body fully
+            // returns. The outer `dispatch_to_idle_workers` re-enters this
+            // function on the next chunk; `visited` carries forward so the
+            // new chunk's `order` skips already-visited workers.
             if visited_this_chunk >= Self::DISPATCH_CHUNK_WORKERS {
                 break;
             }

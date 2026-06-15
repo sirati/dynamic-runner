@@ -86,6 +86,7 @@ use crate::observer::cluster_gone::{ClusterGoneDetector, ClusterGoneVerdict};
 use crate::observer::failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 use crate::observer::fleet_death::{FleetDeathDetector, FleetDeathVerdict};
 use crate::observer::job_ledger::{ClusterTerminalOutcome, JobLedgerProbeHandle};
+use crate::force_print_trigger::ForcePrintTrigger;
 use crate::graceful_abort_trigger::GracefulAbortTrigger;
 use crate::observer::lifecycle::{AnnouncerHandle, attach_observer_announcer};
 use crate::observer::lost_visibility::{
@@ -103,6 +104,8 @@ use crate::task_completed::{
     TaskCompletedEvent, TaskCompletedListener, run_collector, run_task_completed_dispatcher,
     windowed_failure_collector,
 };
+use crate::custom_message_outcome::CustomMessageOutcomeEvent;
+use crate::observer::custom_message_outcome_narrator::ObserverCustomMessageOutcomeNarrator;
 use crate::task_state_change::TaskStateChangeEvent;
 use crate::warn_throttle::WarnThrottle;
 
@@ -330,6 +333,20 @@ where
     /// (the observer is the operator narrator on every path); the primary /
     /// secondary install no such sender, so this channel is observer-only.
     task_state_change_rx: Option<mpsc::UnboundedReceiver<TaskStateChangeEvent>>,
+    /// Receiver end of the #570 F5 custom-message outcome-narration
+    /// channel. Captured at construction (the sender is installed into
+    /// `cluster_state` at the SAME point, BEFORE any restore — so any
+    /// outcome events the bootstrap restore fires buffer here as the
+    /// catch-up batch). [`Self::run`] takes it, drains the buffered
+    /// batch SILENTLY (a baseline replay narrates nothing — the
+    /// originating ERROR/INFO already happened cluster-wide at the
+    /// originator's apply time, so re-narrating on a late-joiner's
+    /// snapshot bootstrap would be a duplicate from the operator's
+    /// perspective), then narrates each subsequent LIVE outcome
+    /// per-event. Set by BOTH constructors (the observer is the
+    /// operator narrator on every path); primary / secondary install
+    /// no such sender, so this channel is observer-only.
+    custom_message_outcome_rx: Option<mpsc::UnboundedReceiver<CustomMessageOutcomeEvent>>,
     /// AE-3 recovery-cadence state: the LAST-SEEN `(declared-observer bit,
     /// [`StateDigest`])` of each peer that has broadcast one, keyed by
     /// sender-id. The timer-driven recovery arm intersects this with the
@@ -451,6 +468,17 @@ where
     /// Either way the run loop consumes the SAME trigger, so a buffered
     /// pre-seat delivery is serviced exactly like a post-seat one.
     graceful_abort_trigger: Option<GracefulAbortTrigger>,
+    /// The operator's SIGUSR1 force-print trigger (observer-only;
+    /// repurposes a signal the framework otherwise registers with
+    /// Python's `faulthandler` on primary / secondary processes). `Some`
+    /// when the late-joiner pre-armed it before bootstrap so a pre-seat
+    /// delivery is latched; `None` on a relocated submitter→observer
+    /// path (the relocated process still has the worker-side SIGUSR1
+    /// frame-dump registered through the regular dispatch route — it is
+    /// not a force-print consumer). Consumed by the reporter task via
+    /// a forwarder spawned in `run_inner`. See
+    /// [`crate::force_print_trigger`].
+    force_print_trigger: Option<ForcePrintTrigger>,
 }
 
 /// Per-replacement-id state of the observer-side respawn execution arm.
@@ -605,6 +633,16 @@ where
         let (state_change_tx, state_change_rx) =
             mpsc::unbounded_channel::<TaskStateChangeEvent>();
         cluster_state.install_task_state_change_sender(state_change_tx);
+        // Install the #570 F5 custom-message outcome-narration channel
+        // on the moved-in `cluster_state` (the observer is the operator
+        // narrator). Same buffering semantics as `state_change_tx`: on
+        // the relocation path the moved-in ledger is already converged
+        // and no post-construction restore runs, so this channel
+        // buffers nothing as baseline — `run`'s drain finds it empty
+        // and live outcomes narrate from the next apply onward.
+        let (custom_outcome_tx, custom_outcome_rx) =
+            mpsc::unbounded_channel::<CustomMessageOutcomeEvent>();
+        cluster_state.install_custom_message_outcome_sender(custom_outcome_tx);
         // Attach the resource-holdings announcer's role-change hook on the
         // moved-in (already-converged) ledger. The relocation path does no
         // post-attach restore, so no initial trigger is dropped here; the
@@ -649,6 +687,7 @@ where
             announcer_handle: Some(announcer_handle),
             task_completed_rx: Some(task_rx),
             task_state_change_rx: Some(state_change_rx),
+            custom_message_outcome_rx: Some(custom_outcome_rx),
             peer_digests: std::collections::HashMap::new(),
             snapshot_streams,
             settled_spill,
@@ -683,6 +722,12 @@ where
             // `None` when the primary was never injected one — the observer's
             // own `run`-start arm then takes over (the cold-join behaviour).
             graceful_abort_trigger,
+            // A relocated submitter→observer path leaves SIGUSR1 wired
+            // to the worker-side `faulthandler` frame-dump (installed by
+            // its original dispatch route); only the late-joiner observer
+            // route repurposes SIGUSR1 to force-print, and that route
+            // injects via `set_force_print_trigger` post-construction.
+            force_print_trigger: None,
         }
     }
 
@@ -719,6 +764,19 @@ where
         let (state_change_tx, state_change_rx) =
             mpsc::unbounded_channel::<TaskStateChangeEvent>();
         cluster_state.install_task_state_change_sender(state_change_tx);
+        // Install the #570 F5 custom-message outcome-narration channel
+        // HERE too — BEFORE the cold-join factory's bootstrap restore,
+        // so any outcome event the restore fires (the snapshot's
+        // already-Handled / already-Failed terminals are
+        // watermark-subsumed and re-apply as NoOps — no event — but a
+        // belt-and-suspenders install lets a non-NoOp re-emit also
+        // buffer) goes into this unbounded channel. `run` drains the
+        // batch SILENTLY (a restore-time re-narration would duplicate
+        // the originator's already-emitted line cluster-wide), then
+        // narrates each live outcome per-event from the next apply on.
+        let (custom_outcome_tx, custom_outcome_rx) =
+            mpsc::unbounded_channel::<CustomMessageOutcomeEvent>();
+        cluster_state.install_custom_message_outcome_sender(custom_outcome_tx);
         // Attach the resource-holdings announcer's role-change hook HERE,
         // BEFORE the cold-join factory's snapshot restore runs. The
         // restore's `primary_epoch > local` branch fires
@@ -761,6 +819,7 @@ where
             announcer_handle: Some(announcer_handle),
             task_completed_rx: Some(task_rx),
             task_state_change_rx: Some(state_change_rx),
+            custom_message_outcome_rx: Some(custom_outcome_rx),
             peer_digests: std::collections::HashMap::new(),
             snapshot_streams,
             settled_spill,
@@ -790,6 +849,11 @@ where
             respawn_exec_tx,
             respawn_exec_rx: Some(respawn_exec_rx),
             graceful_abort_trigger: None,
+            // Cold-join late-joiners inject via `set_force_print_trigger`
+            // after construction (arm at process entry, hand off here);
+            // unset construction = the trigger lives parked in the run
+            // loop's forwarder until then.
+            force_print_trigger: None,
         }
     }
 
@@ -846,6 +910,21 @@ where
     /// consume. Without an injection, [`Self::run`] arms at loop start.
     pub fn set_graceful_abort_trigger(&mut self, trigger: GracefulAbortTrigger) {
         self.graceful_abort_trigger = Some(trigger);
+    }
+
+    /// Inject a pre-armed operator force-print trigger AFTER construction
+    /// — the SIGUSR1 sibling of [`Self::set_graceful_abort_trigger`].
+    /// Used by the late-joiner observer entry path, which arms the
+    /// trigger at process entry (BEFORE its bootstrap rendezvous, so a
+    /// signal received pre-seat is latched rather than killing the
+    /// process via the kernel's default disposition for SIGUSR1) and
+    /// hands the SAME trigger here for the reporter task's force-print
+    /// arm to consume. Without an injection, no force-print arm is
+    /// driven and the reporter runs the periodic cadences alone — the
+    /// degraded but always-correct fallback. See
+    /// [`crate::force_print_trigger`].
+    pub fn set_force_print_trigger(&mut self, trigger: ForcePrintTrigger) {
+        self.force_print_trigger = Some(trigger);
     }
 
     /// Read-only access to the replicated ledger (tests / result getters).
@@ -1098,6 +1177,17 @@ where
             .task_state_change_rx
             .take()
             .expect("task_state_change_rx is set by both constructors and taken once by run");
+        // #570 F5 custom-message outcome-narration channel receiver
+        // (the same take-once shape as `task_state_change_rx`): drained
+        // by the loop's outcome arm below. The buffered baseline
+        // (bootstrap restore's apply events) is drained SILENTLY at
+        // loop entry — re-narrating the originator's already-emitted
+        // INFO/ERROR on a late-joiner snapshot bootstrap would be a
+        // duplicate from the operator's perspective.
+        let mut custom_message_outcome_rx = self
+            .custom_message_outcome_rx
+            .take()
+            .expect("custom_message_outcome_rx is set by both constructors and taken once by run");
 
         // Drive each policy's window timer.
         let (invalid_cancel_tx, invalid_cancel_rx) = oneshot::channel::<()>();
@@ -1148,10 +1238,35 @@ where
         // skip-one grid bookkeeping; the shared note slot lets the
         // reporter's emissions host the parked reconnection note.
         let (outage_tx, outage_rx) = mpsc::unbounded_channel::<EndedOutage>();
+        // The SIGUSR1 force-print channel feeding the reporter's
+        // off-cadence arm. The forwarder spawned below consumes the
+        // pre-armed `ForcePrintTrigger` (if injected via
+        // `set_force_print_trigger`) and pushes one `()` per delivery
+        // into this channel; the reporter task's arm then renders the
+        // full snapshot. No-trigger paths leave the rx parked — the
+        // periodic cadences keep running, the operator just has no
+        // off-grid force-print channel (the degraded-arm contract from
+        // `force_print_trigger`).
+        let (force_print_tx, force_print_rx) = mpsc::unbounded_channel::<()>();
+        if let Some(mut trigger) = self.force_print_trigger.take() {
+            tokio::task::spawn_local(async move {
+                // Forward each SIGUSR1 delivery into the reporter's
+                // arm. `recv()` parks on a closed/disabled stream;
+                // a failed `send` means the reporter has already torn
+                // down (rx dropped on cancel), so the forwarder exits
+                // — there is no listener left to wake.
+                while let Some(()) = trigger.recv().await {
+                    if force_print_tx.send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         let reporter_task = tokio::task::spawn_local(run_reporter(
             snapshot_source,
             TokioClock,
             outage_rx,
+            force_print_rx,
             self.wake_note.clone(),
             async move {
                 let _ = reporter_cancel_rx.await;
@@ -1213,6 +1328,19 @@ where
                 baseline_transitions += 1;
             }
             task_narrator.narrate_baseline(baseline_transitions, self.cluster_state.counts());
+            // #570 F5 custom-message outcome-narration arm setup. The
+            // narrator holds no state — every field rides the event. A
+            // bootstrap restore's apply may have fired non-NoOp outcome
+            // events into this channel before `run` began; drain them
+            // SILENTLY here (re-narrating the originator's
+            // already-emitted INFO/ERROR on a late-joiner snapshot
+            // bootstrap would duplicate the operator's stream). From
+            // the next live apply on the select! arm narrates each
+            // outcome per-event. A `Disconnected` here is impossible —
+            // `self.cluster_state` still holds the sender — so
+            // `try_recv` only ever returns `Empty` at the batch end.
+            let custom_message_outcome_narrator = ObserverCustomMessageOutcomeNarrator;
+            while custom_message_outcome_rx.try_recv().is_ok() {}
             // The report-lost-and-keep-observing state machine (BUG-B): the
             // observer's loss of its OWN transport view is reported + retried,
             // NEVER a run verdict — see [`crate::observer::lost_visibility`].
@@ -1606,6 +1734,22 @@ where
                     // note right after, exactly like `RunNarrator::observe`.
                     Some(change) = task_state_change_rx.recv() => {
                         if task_narrator.narrate_live(&change) {
+                            self.wake_note.flush_after_host();
+                        }
+                    }
+                    // #570 F5 custom-message outcome-narration arm: one
+                    // LIVE Handled/Failed apply (live broadcast OR
+                    // apply-side emit on the originator's local apply —
+                    // path-independent, same emit seam) → one operator
+                    // wake-line at the spec-fixed level (INFO for
+                    // Handled, ERROR for Failed). Never `None`:
+                    // `self.cluster_state` holds the sender for the
+                    // coordinator's lifetime. Cancel-safe: a single
+                    // mpsc recv. A narrated outcome is a wake-stream
+                    // HOST — flush the parked reconnection note right
+                    // after, exactly like the task-narration arm above.
+                    Some(outcome) = custom_message_outcome_rx.recv() => {
+                        if custom_message_outcome_narrator.narrate_live(&outcome) {
                             self.wake_note.flush_after_host();
                         }
                     }

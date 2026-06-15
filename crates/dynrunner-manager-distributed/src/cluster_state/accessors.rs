@@ -13,7 +13,9 @@ use std::sync::Arc;
 use dynrunner_core::{
     ErrorType, Identifier, PhaseId, TaskInfo, TaskOutputs, TerminalOutcomeCounts, WorkerId,
 };
-use dynrunner_protocol_primary_secondary::{DiscoveryDebt, RoleTable, SecondaryCapacityRecord};
+use dynrunner_protocol_primary_secondary::{
+    DiscoveryDebt, RoleTable, SecondaryCapacityRecord, SecondaryResourceSampleRecord,
+};
 
 use super::settled::{SettledClass, SettledEntry};
 use super::{
@@ -1114,6 +1116,23 @@ impl<I: Identifier> ClusterState<I> {
             .contains(&(secondary_id.to_string(), member_gen))
     }
 
+    /// Iterator over every `(secondary_id, member_gen)` pair the grow-only
+    /// [`ClusterMutation::WindDownRequested`] set contains — the narrator's
+    /// read surface for the per-incarnation wind-down directives. Sibling of
+    /// the point-query [`Self::wind_down_requested`]: that one answers
+    /// "AM I targeted at THIS generation?" for the directed secondary; this
+    /// one yields every recorded pair so the [`crate::run_narrator`]'s
+    /// edge-set can emit ONE WARN line per `(id, gen)` the moment it lands
+    /// in the converged mirror. Borrow-only — the set is grow-only and
+    /// per-pair narration is once-only via the narrator's
+    /// `wind_down_announced` edge-set, so an owned-clone copy would be pure
+    /// waste at the observer cadence.
+    pub fn wind_down_requested_pairs(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.wind_down_requested
+            .iter()
+            .map(|(id, member_gen)| (id.as_str(), *member_gen))
+    }
+
     /// Count of `InFlight` ledger entries currently assigned to
     /// `secondary` — the CRDT-derived "active workers" occupancy of one
     /// secondary. Pure projection of the replicated `tasks` ledger, so
@@ -1213,6 +1232,31 @@ impl<I: Identifier> ClusterState<I> {
             .filter(|(_, record)| record.worker_count > 0)
             .map(|(id, _)| id.as_str())
             .filter(move |id| self.is_peer_alive(id))
+    }
+
+    /// The latest aggregated resource-sample record (#575) for each
+    /// LIVE compute secondary — pairs the [`Self::alive_secondary_members`]
+    /// roster with whatever
+    /// [`crate::cluster_state::state::ClusterState::latest_resource_samples`]
+    /// the LWW apply rule recorded for that id.
+    ///
+    /// Excludes secondaries that have not yet emitted a 5-minute aggregate
+    /// (the `latest_resource_samples` lookup misses them); the observer's
+    /// projection treats absent secondaries as "no signal yet" and folds
+    /// only the present ones into its averages. Equally excludes any
+    /// secondary whose membership is dead (the alive-secondary-members
+    /// filter is what gates "compute member, currently up"), so a stale
+    /// LWW record left by a removed incarnation never reaches the
+    /// observer projection.
+    ///
+    /// Consumed ONLY by the observer's important-update reporter; the
+    /// primary's scheduling/budget surface never reads it (resource
+    /// stats are observability-only per #575).
+    pub fn live_compute_resource_samples(
+        &self,
+    ) -> impl Iterator<Item = (&str, &SecondaryResourceSampleRecord)> {
+        self.alive_secondary_members()
+            .filter_map(move |id| self.latest_resource_samples.get(id).map(|r| (id, r)))
     }
 
     /// Count of [`Self::alive_secondary_members`] — the fleet-liveness
