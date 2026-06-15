@@ -71,6 +71,7 @@ mod setup_promote;
 mod setup_staging;
 mod stranded;
 mod terminal_ack;
+mod terminal_ack_custom_ordering;
 mod terminal_verdict;
 mod wire;
 mod worker_lifecycle;
