@@ -1214,14 +1214,14 @@ mod tests {
                 .await
                 .expect("dial_secondary_mesh must return promptly (dial is background)");
 
-                // Advance time past the dial deadline — the background
-                // spawn_local fires `tunnel_gave_up_tx` after its loop exits.
-                tokio::time::advance(Duration::from_millis(500)).await;
-                // Yield to let the spawned task run.
-                tokio::task::yield_now().await;
-
+                // `dial_until_deadline` tracks its own deadline via
+                // `std::time::Instant` (not tokio time), so advancing the
+                // tokio clock has no effect on when it exits.  Resume real
+                // time so the 100 ms `connect_timeout` can expire naturally
+                // and `tunnel_gave_up_tx` fires through the spawn_local.
+                tokio::time::resume();
                 tokio::time::timeout(
-                    Duration::from_millis(50),
+                    Duration::from_millis(500),
                     bundle.tunnel_gave_up_rx,
                 )
                 .await
