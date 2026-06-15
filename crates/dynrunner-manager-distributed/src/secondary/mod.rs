@@ -54,6 +54,7 @@ pub(crate) use dispatch::TASK_ALREADY_HELD_WIRE_MESSAGE;
 pub(crate) use dispatch::{
     TASK_STALE_ADDRESSEE_GEN_WIRE_MESSAGE, TASK_SUPPLANTED_BY_LIVE_HOLDER_WIRE_MESSAGE,
 };
+pub mod consensus;
 pub(crate) mod election;
 mod lifecycle;
 // `pub(crate)` only so the `cascade_drain_done` pool-cascade primitive
