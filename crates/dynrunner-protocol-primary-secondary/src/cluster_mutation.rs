@@ -1089,6 +1089,19 @@ pub enum ClusterMutation<I> {
         seq: u64,
         topic: String,
         data: Vec<u8>,
+        /// Operator-narration volume class — RIDES the originating
+        /// `DistributedMessage::CustomMessage::is_high_volume` (#583/#587)
+        /// verbatim onto the CRDT entry so the observer's per-message
+        /// landing / handled / failed narrators route their wake lines
+        /// to OBSERVER_TASK_TARGET (off IMPORTANT_TARGET) for the
+        /// high-fanout consumer case. Defaults `false` on the wire
+        /// (`#[serde(default, skip_serializing_if = "<not is_true>")]`),
+        /// keeping the wire bytes byte-identical for a legacy peer and
+        /// for low-fanout messages. NOT consulted by any CRDT decision
+        /// (the lattice / apply rules / watermark compaction stay
+        /// unchanged); pure observability carriage.
+        #[serde(default, skip_serializing_if = "crate::is_false_ref")]
+        is_high_volume: bool,
     },
     /// The primary's consumer handler CONSUMED the `(origin, seq)`
     /// custom message (F5): `Unhandled → Handled`, DROPPING the payload

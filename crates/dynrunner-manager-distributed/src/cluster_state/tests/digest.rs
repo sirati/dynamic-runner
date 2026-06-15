@@ -466,6 +466,7 @@ fn digest_memo_matches_fresh_fold() {
         seq: 1,
         topic: "topic".into(),
         data: b"data".to_vec(),
+        is_high_volume: false,
     });
     assert_memo_fresh!();
     s.apply(ClusterMutation::CustomMessageHandled {

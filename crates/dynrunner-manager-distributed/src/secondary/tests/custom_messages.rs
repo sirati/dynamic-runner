@@ -79,7 +79,7 @@ async fn important_custom_through_no_route_window_redelivers_to_new_primary() {
             secondary.publish_membership();
 
             let send = secondary
-                .send_custom_to_primary("phase4-batch".into(), b"batch-1".to_vec(), true)
+                .send_custom_to_primary("phase4-batch".into(), b"batch-1".to_vec(), true, false)
                 .await;
             assert!(
                 send.is_ok(),
@@ -182,6 +182,7 @@ async fn important_custom_through_no_route_window_redelivers_to_new_primary() {
                     seq: 1,
                     topic: "phase4-batch".into(),
                     data: b"batch-1".to_vec(),
+                    is_high_volume: false,
                 },
             ]);
             assert!(
@@ -252,7 +253,7 @@ async fn important_custom_retains_through_ack_until_crdt_convergence_observed() 
             // delivery_seq and queues the frame; the Ok-side retention
             // enters AwaitingCrdtConvergence for an IMPORTANT custom.
             secondary
-                .send_custom_to_primary("phase4-batch".into(), b"batch-1".to_vec(), true)
+                .send_custom_to_primary("phase4-batch".into(), b"batch-1".to_vec(), true, false)
                 .await
                 .unwrap();
             secondary.drain_egress().await;
@@ -321,6 +322,7 @@ async fn important_custom_retains_through_ack_until_crdt_convergence_observed() 
                     seq: 1,
                     topic: "phase4-batch".into(),
                     data: b"batch-1".to_vec(),
+                    is_high_volume: false,
                 },
             ]);
             assert!(
@@ -360,7 +362,7 @@ async fn important_custom_retention_not_dropped_by_other_origin_or_other_seq() {
             *secondary.pool_mut() = pool;
 
             secondary
-                .send_custom_to_primary("own".into(), b"body".to_vec(), true)
+                .send_custom_to_primary("own".into(), b"body".to_vec(), true, false)
                 .await
                 .unwrap();
             secondary.drain_egress().await;
@@ -375,6 +377,7 @@ async fn important_custom_retention_not_dropped_by_other_origin_or_other_seq() {
                     seq: own_msg_seq,
                     topic: "peer-topic".into(),
                     data: b"peer-body".to_vec(),
+                    is_high_volume: false,
                 },
             ]);
             assert_eq!(
@@ -393,6 +396,7 @@ async fn important_custom_retention_not_dropped_by_other_origin_or_other_seq() {
                     seq: own_msg_seq + 42,
                     topic: "future".into(),
                     data: b"future-body".to_vec(),
+                    is_high_volume: false,
                 },
             ]);
             assert_eq!(
@@ -409,6 +413,7 @@ async fn important_custom_retention_not_dropped_by_other_origin_or_other_seq() {
                     seq: own_msg_seq,
                     topic: "own".into(),
                     data: b"body".to_vec(),
+                    is_high_volume: false,
                 },
             ]);
             assert!(
@@ -441,7 +446,7 @@ async fn droppable_custom_is_lost_on_no_route_and_never_retained() {
             membership.borrow_mut().retain(|id| id.as_str() != "setup");
             secondary.publish_membership();
             secondary
-                .send_custom_to_primary("progress".into(), b"p1".to_vec(), false)
+                .send_custom_to_primary("progress".into(), b"p1".to_vec(), false, false)
                 .await
                 .unwrap();
             assert!(
@@ -466,7 +471,7 @@ async fn droppable_custom_is_lost_on_no_route_and_never_retained() {
             // in the gate-counted important identity space, so a lost one
             // can never be awaited), and leaves no retention entry.
             secondary
-                .send_custom_to_primary("progress".into(), b"p2".to_vec(), false)
+                .send_custom_to_primary("progress".into(), b"p2".to_vec(), false, false)
                 .await
                 .unwrap();
             secondary.drain_egress().await;
@@ -499,7 +504,7 @@ async fn oversize_custom_is_rejected_naming_size_and_limit() {
 
             let oversize = vec![0u8; CUSTOM_MESSAGE_MAX_BYTES + 1];
             let err = secondary
-                .send_custom_to_primary("big".into(), oversize, true)
+                .send_custom_to_primary("big".into(), oversize, true, false)
                 .await
                 .expect_err("an over-limit payload must be rejected");
             assert!(
@@ -511,7 +516,7 @@ async fn oversize_custom_is_rejected_naming_size_and_limit() {
 
             // The rejected send burned NO msg_seq: the next message is 1.
             secondary
-                .send_custom_to_primary("ok".into(), b"fits".to_vec(), true)
+                .send_custom_to_primary("ok".into(), b"fits".to_vec(), true, false)
                 .await
                 .unwrap();
             secondary.drain_egress().await;

@@ -120,9 +120,14 @@ fn completed_narrates_info_with_prior_holder() {
     assert!(msg.contains("sec-b-7"));
 }
 
-/// A terminal failure narrates ERROR on the importance marker
-/// (wake-worthy: reaches stdio under `--important-stdio-only`) and
-/// carries BOTH the reason AND the full last_error.
+/// T3 (#587): a terminal failure narrates ERROR on the
+/// `OBSERVER_TASK_TARGET` — under the #583/#587 per-narration-kind
+/// classification the per-task class is uniformly HIGH-VOLUME, so the
+/// per-event ERROR is suppressed from stdio under
+/// `--important-stdio-only`; the rate-limited
+/// `ErrorAggregationPolicy` rollup on `IMPORTANT_TARGET` is the wake
+/// signal. The line still carries BOTH the reason AND the full
+/// last_error.
 #[test]
 fn terminal_failure_narrates_error_with_full_last_error() {
     let events = capture(|| {
@@ -137,7 +142,10 @@ fn terminal_failure_narrates_error_with_full_last_error() {
         )));
     });
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].target, IMPORTANT_TARGET, "wake-worthy target");
+    assert_eq!(
+        events[0].target, OBSERVER_TASK_TARGET,
+        "per-task terminal failure is HIGH-VOLUME (#587); wake signal is the aggregator rollup",
+    );
     assert_eq!(events[0].leveled.level, Level::ERROR, "terminal fail is ERROR");
     let msg = &events[0].leveled.event.message;
     assert!(msg.contains("terminally failed on"));
@@ -149,7 +157,8 @@ fn terminal_failure_narrates_error_with_full_last_error() {
 }
 
 /// A recoverable failure narrates WARN "(recoverable)" on the
-/// importance marker (wake-worthy).
+/// per-task observer-task target (HIGH-VOLUME under #583/#587, like
+/// every per-task arm).
 #[test]
 fn recoverable_failure_narrates_warn() {
     let events = capture(|| {
@@ -163,15 +172,15 @@ fn recoverable_failure_narrates_warn() {
         )));
     });
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].target, IMPORTANT_TARGET, "wake-worthy target");
+    assert_eq!(events[0].target, OBSERVER_TASK_TARGET, "per-task HIGH-VOLUME (#587)");
     assert_eq!(events[0].leveled.level, Level::WARN, "recoverable fail is WARN");
     let msg = &events[0].leveled.event.message;
     assert!(msg.contains("(recoverable)"));
     assert!(msg.contains("sec-d-0"));
 }
 
-/// An OOM failure narrates WARN "(oom)" on the importance marker
-/// (wake-worthy).
+/// An OOM failure narrates WARN "(oom)" on the per-task observer-task
+/// target (HIGH-VOLUME under #583/#587, like every per-task arm).
 #[test]
 fn oom_failure_narrates_warn() {
     let events = capture(|| {
@@ -185,7 +194,7 @@ fn oom_failure_narrates_warn() {
         )));
     });
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].target, IMPORTANT_TARGET, "wake-worthy target");
+    assert_eq!(events[0].target, OBSERVER_TASK_TARGET, "per-task HIGH-VOLUME (#587)");
     assert_eq!(events[0].leveled.level, Level::WARN, "oom fail is WARN");
     assert!(events[0].leveled.event.message.contains("(oom)"));
 }

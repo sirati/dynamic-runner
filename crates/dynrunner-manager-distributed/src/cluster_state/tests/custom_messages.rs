@@ -15,6 +15,11 @@ fn posted(origin: &str, seq: u64, topic: &str, data: &[u8]) -> ClusterMutation<R
         seq,
         topic: topic.into(),
         data: data.to_vec(),
+        // Most F5 lattice tests don't exercise the volume class; the
+        // default (low-volume = `false`) is wire-byte-identical to a
+        // pre-#583/#587 sender and matches the
+        // `#[serde(default)]` decode path.
+        is_high_volume: false,
     }
 }
 
@@ -49,12 +54,13 @@ fn posted_vacant_inserts_unhandled_and_duplicate_noops() {
         s.custom_message_state("sec-1", 1),
         Some(CustomMsgState::Unhandled {
             topic: "t".into(),
-            data: b"v1".to_vec()
+            data: b"v1".to_vec(),
+            is_high_volume: false,
         })
     );
     assert_eq!(
         s.unhandled_custom_messages(),
-        vec![("sec-1".to_string(), 1, "t".to_string(), b"v1".to_vec())]
+        vec![("sec-1".to_string(), 1, "t".to_string(), b"v1".to_vec(), false)]
     );
 }
 
@@ -174,8 +180,8 @@ fn origins_are_independent_and_read_surface_is_sorted() {
     assert_eq!(
         s.unhandled_custom_messages(),
         vec![
-            ("sec-2".to_string(), 1, "t".to_string(), b"b1".to_vec()),
-            ("sec-2".to_string(), 2, "t".to_string(), b"b2".to_vec()),
+            ("sec-2".to_string(), 1, "t".to_string(), b"b1".to_vec(), false),
+            ("sec-2".to_string(), 2, "t".to_string(), b"b2".to_vec(), false),
         ]
     );
 }
@@ -358,7 +364,7 @@ fn snapshot_with_nonempty_custom_messages_survives_wire_codec_and_restores() {
     );
     assert_eq!(
         cold.unhandled_custom_messages(),
-        vec![("sec-1".to_string(), 2, "batch".to_string(), b"two".to_vec())]
+        vec![("sec-1".to_string(), 2, "batch".to_string(), b"two".to_vec(), false)]
     );
 
     // Idempotent: re-restoring the same snapshot changes nothing.
@@ -393,7 +399,7 @@ fn restore_merges_latch_and_watermark_over_local_state() {
     assert_eq!(b.custom_terminal_watermark("sec-1"), Some(2));
     assert_eq!(
         b.unhandled_custom_messages(),
-        vec![("sec-1".to_string(), 3, "t".to_string(), b"z".to_vec())]
+        vec![("sec-1".to_string(), 3, "t".to_string(), b"z".to_vec(), false)]
     );
 
     // A pulls B: gains the Unhandled 3; its own handled state is never
@@ -402,7 +408,7 @@ fn restore_merges_latch_and_watermark_over_local_state() {
     assert_eq!(a.custom_terminal_watermark("sec-1"), Some(2));
     assert_eq!(
         a.unhandled_custom_messages(),
-        vec![("sec-1".to_string(), 3, "t".to_string(), b"z".to_vec())]
+        vec![("sec-1".to_string(), 3, "t".to_string(), b"z".to_vec(), false)]
     );
 
     // Convergence: both replicas now digest identically on the F5 fields.

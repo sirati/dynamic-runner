@@ -927,6 +927,22 @@ pub enum DistributedMessage<I> {
         data: Vec<u8>,
         /// Delivery class — see the variant doc.
         important: bool,
+        /// Operator-narration volume class (#583/#587). When `true` the
+        /// observer's per-message landing/handled/failed narration emits
+        /// route to [`dynrunner_core::OBSERVER_TASK_TARGET`] instead of
+        /// [`dynrunner_core::IMPORTANT_TARGET`], so a high-fanout
+        /// consumer (asm-dataset's per-spawn-batch dep_graph_spawn) does
+        /// not drown the wake-stream — the rate-limited aggregator
+        /// rollup line replaces the per-event lines as the wake signal.
+        /// Defaults `false` (normal): keeps the wire bytes
+        /// byte-identical for low-fanout consumers AND for a legacy peer
+        /// that pre-dates the field. The flag does NOT change delivery
+        /// semantics — it is observability-routing only — and lives
+        /// alongside `important` because narration volume and delivery
+        /// class are independent (an important high-volume stream is
+        /// the asm-dataset case).
+        #[serde(default, skip_serializing_if = "is_false_ref")]
+        is_high_volume: bool,
         /// App-level delivery-confirmation sequence id (#352),
         /// IMPORTANT-only: stamped at the secondary's `send_to_primary`
         /// chokepoint (the same per-secondary monotonic counter the
@@ -1900,6 +1916,19 @@ pub enum DistributedMessage<I> {
         /// The wire hash of the duplicate task to withdraw.
         task_hash: String,
     },
+}
+
+/// Helper for `#[serde(skip_serializing_if = ...)]` on `bool` fields
+/// whose wire-default is `false`. Keeps the wire bytes byte-identical
+/// for a legacy peer that never knew the field, AND for any sender
+/// that did not opt-in to the non-default value. Used by
+/// [`DistributedMessage::CustomMessage::is_high_volume`] AND the
+/// sibling [`crate::cluster_mutation::ClusterMutation::CustomMessagePosted::is_high_volume`]
+/// (#583/#587) — one helper, both wire shapes, so the skip predicate
+/// can never diverge between them.
+#[inline]
+pub fn is_false_ref(b: &bool) -> bool {
+    !*b
 }
 
 /// Which role's liveness a [`DistributedMessage::Keepalive`] asserts.

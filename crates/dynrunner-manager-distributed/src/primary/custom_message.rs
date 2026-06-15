@@ -204,6 +204,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             topic,
             data,
             important,
+            is_high_volume,
             ..
         } = msg
         else {
@@ -257,6 +258,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             seq: msg_seq,
             topic,
             data,
+            // Rides verbatim from the originating wire frame so the
+            // observer's per-message narration target (#583/#587) is
+            // chosen by the consumer at send time.
+            is_high_volume,
         }])
         .await;
         self.dispatch_unhandled_custom_messages(command_rx).await;
@@ -300,7 +305,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // below hold exactly the handler's own commands — a discard
         // must never eat a command some other site queued earlier.
         self.drain_callback_queued_commands(command_rx).await;
-        for (origin, seq, topic, data) in unhandled {
+        // `is_high_volume` rides the inbox entry but the primary's
+        // handler-dispatch decision is invariant to it — the flag is
+        // observability-routing only, consumed downstream at narration
+        // time by the observer (#583/#587).
+        for (origin, seq, topic, data, _is_high_volume) in unhandled {
             match self.invoke_custom_handler(&origin, &topic, &data, true) {
                 Ok(()) => {
                     // ATOMIC effect+terminal batch: drain the handler's

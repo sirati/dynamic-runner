@@ -146,6 +146,7 @@ fn important_custom(seq: u64, topic: &str) -> DistributedMessage<TestId> {
         topic: topic.into(),
         data: seq.to_string().into_bytes(),
         important: true,
+        is_high_volume: false,
         delivery_seq: Some(seq),
     }
 }

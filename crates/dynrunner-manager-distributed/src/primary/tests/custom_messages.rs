@@ -57,6 +57,7 @@ where
             seq,
             topic: topic.into(),
             data: seq.to_string().into_bytes(),
+            is_high_volume: false,
         });
 }
 
@@ -124,12 +125,14 @@ async fn promotion_replay_dispatches_inherited_unhandled_exactly_once() {
             seq: 1,
             topic: "batch".into(),
             data: b"1".to_vec(),
+            is_high_volume: false,
         });
         origin_state.apply(ClusterMutation::CustomMessagePosted {
             origin: "sec-1".into(),
             seq: 2,
             topic: "batch".into(),
             data: b"2".to_vec(),
+            is_high_volume: false,
         });
         let snapshot = origin_state.snapshot();
 
@@ -242,6 +245,7 @@ async fn promotion_replay_skips_failed_entries() {
             seq: 2,
             topic: "batch".into(),
             data: b"2".to_vec(),
+            is_high_volume: false,
         });
         origin_state.apply(ClusterMutation::CustomMessageFailed {
             origin: "sec-1".into(),
@@ -330,6 +334,7 @@ async fn ingest_routes_droppable_direct_and_important_via_inbox_with_dedup() {
             topic: "t".into(),
             data: msg_seq.to_string().into_bytes(),
             important,
+            is_high_volume: false,
             delivery_seq: if important { Some(7) } else { None },
         };
 

@@ -934,6 +934,8 @@ fn roundtrip_custom_message_posted() {
         seq: 11,
         topic: "phase4-batch".into(),
         data: b"batch payload".to_vec(),
+        // #583/#587: an explicit-true on the originator round-trips.
+        is_high_volume: true,
     };
     let json = serde_json::to_string(&mutation).unwrap();
     let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
@@ -943,11 +945,13 @@ fn roundtrip_custom_message_posted() {
             seq,
             topic,
             data,
+            is_high_volume,
         } => {
             assert_eq!(origin, "sec-1");
             assert_eq!(seq, 11);
             assert_eq!(topic, "phase4-batch");
             assert_eq!(data, b"batch payload".to_vec());
+            assert!(is_high_volume, "#583/#587: explicit-true survives the wire");
         }
         _ => panic!("expected CustomMessagePosted"),
     }
@@ -1048,9 +1052,14 @@ fn custom_message_mutations_decode_literal_sender_bytes() {
             seq,
             topic,
             data,
+            is_high_volume,
         } => {
             assert_eq!((origin.as_str(), seq, topic.as_str()), ("sec-1", 3, "t"));
             assert_eq!(data, vec![1, 2]);
+            assert!(
+                !is_high_volume,
+                "#583/#587: legacy bytes (no is_high_volume field) decode to false (skip_serializing_if default)"
+            );
         }
         _ => panic!("expected CustomMessagePosted"),
     }
@@ -1092,6 +1101,35 @@ fn custom_message_mutations_decode_literal_sender_bytes() {
         }
         _ => panic!("expected CustomMessageFailed"),
     }
+    // #583/#587 wire-shape pin: a CustomMessagePosted with
+    // is_high_volume=true round-trips with the field PRESENT on the
+    // wire; the false default is dropped (skip_serializing_if).
+    let posted_hv: ClusterMutation<TestId> = ClusterMutation::CustomMessagePosted {
+        origin: "sec-1".into(),
+        seq: 5,
+        topic: "t".into(),
+        data: vec![1, 2],
+        is_high_volume: true,
+    };
+    let hv_json = serde_json::to_string(&posted_hv).unwrap();
+    assert_eq!(
+        hv_json,
+        r#"{"CustomMessagePosted":{"origin":"sec-1","seq":5,"topic":"t","data":[1,2],"is_high_volume":true}}"#,
+        "is_high_volume=true rides the wire as a present field"
+    );
+    let posted_lv: ClusterMutation<TestId> = ClusterMutation::CustomMessagePosted {
+        origin: "sec-1".into(),
+        seq: 6,
+        topic: "t".into(),
+        data: vec![1, 2],
+        is_high_volume: false,
+    };
+    let lv_json = serde_json::to_string(&posted_lv).unwrap();
+    assert_eq!(
+        lv_json,
+        r#"{"CustomMessagePosted":{"origin":"sec-1","seq":6,"topic":"t","data":[1,2]}}"#,
+        "is_high_volume=false is dropped (wire-byte-identical to a legacy sender)"
+    );
 }
 
 /// `PeerRemoved` round-trips carrying a NON-DEFAULT `member_gen` (the

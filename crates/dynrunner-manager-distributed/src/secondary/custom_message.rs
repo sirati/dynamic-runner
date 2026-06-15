@@ -67,6 +67,7 @@ where
         topic: String,
         data: Vec<u8>,
         important: bool,
+        is_high_volume: bool,
     ) -> Result<(), String> {
         if data.len() > CUSTOM_MESSAGE_MAX_BYTES {
             return Err(format!(
@@ -95,6 +96,14 @@ where
             topic,
             data,
             important,
+            // Operator-narration volume class — consumer-controlled flag
+            // (#583/#587). Routes the observer's Posted/Handled/Failed
+            // narration off IMPORTANT_TARGET onto OBSERVER_TASK_TARGET
+            // when `true`, so a high-fanout consumer's per-message wake
+            // lines collapse into the rate-limited aggregator rollup.
+            // Independent of `important`: the asm-dataset case is
+            // important AND high-volume.
+            is_high_volume,
             // Stamped at the send_to_primary chokepoint (#352),
             // important-only.
             delivery_seq: None,

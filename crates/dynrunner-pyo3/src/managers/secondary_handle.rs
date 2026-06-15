@@ -95,11 +95,28 @@ impl PySecondaryHandle {
     /// `custom_message_handler` resolves it (see the
     /// `CustomMessageHandler` contract in `task_protocol.py`).
     ///
+    /// `is_high_volume` (default `False`) is the OPERATOR-NARRATION
+    /// volume class (#583/#587): when `True`, the observer's per-message
+    /// Posted/Handled/Failed wake lines route to OBSERVER_TASK_TARGET
+    /// (suppressed under `--important-stdio-only`); the rate-limited
+    /// custom-message aggregator emits a periodic rollup on
+    /// IMPORTANT_TARGET as the wake signal. The flag is INDEPENDENT of
+    /// `important`: a high-fanout IMPORTANT consumer (asm-dataset's
+    /// per-spawn-batch `dep_graph_spawn`) sets both, and a low-volume
+    /// IMPORTANT consumer sets only `important`. Delivery semantics are
+    /// UNCHANGED — narration-routing only.
+    ///
     /// Raises `ValueError` (naming size + limit) when `data` exceeds
     /// `CUSTOM_MESSAGE_MAX_BYTES` (100 KiB); `RuntimeError` when the
     /// secondary's operational loop is gone (run torn down).
-    #[pyo3(signature = (topic, data, important = false))]
-    fn send_to_primary(&self, topic: &str, data: &[u8], important: bool) -> PyResult<()> {
+    #[pyo3(signature = (topic, data, important = false, is_high_volume = false))]
+    fn send_to_primary(
+        &self,
+        topic: &str,
+        data: &[u8],
+        important: bool,
+        is_high_volume: bool,
+    ) -> PyResult<()> {
         if data.len() > CUSTOM_MESSAGE_MAX_BYTES {
             return Err(PyValueError::new_err(format!(
                 "send_to_primary data for topic {topic:?} is {} bytes, exceeding the \
@@ -115,6 +132,7 @@ impl PySecondaryHandle {
                 topic: topic.to_owned(),
                 data: data.to_vec(),
                 important,
+                is_high_volume,
             })
             .map_err(|_| {
                 PyRuntimeError::new_err(

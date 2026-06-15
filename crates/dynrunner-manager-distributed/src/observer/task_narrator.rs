@@ -6,15 +6,26 @@
 //! merge join fires into ONE operator narration line at the level the
 //! spec fixes (INFO assign/complete/state-change, WARN recoverable/oom
 //! fail, ERROR terminal fail), routed to the tracing target that matches
-//! its operator-wake class:
-//!   - The per-task INFO arms (assign / complete / non-terminal state
-//!     change) emit on [`dynrunner_core::OBSERVER_TASK_TARGET`]: visible
-//!     on the default stdio stream, suppressed FROM stdio under
-//!     `--important-stdio-only` (the full log keeps them at TRACE).
-//!   - The per-task FAILURE arms (terminal ERROR, recoverable WARN, oom
-//!     WARN) and the once-per-run baseline summary emit on
-//!     [`dynrunner_core::IMPORTANT_TARGET`]: wake-worthy, reach stdio
-//!     under the flag too.
+//! its operator-wake class. Under the #583/#587 per-narration-kind
+//! classification the per-task class is uniformly HIGH-VOLUME (a
+//! per-task emit scales with the task count, drowning the wake stream
+//! at the 46k-task or asm-dataset thousand-failure scale), so EVERY
+//! arm here — INFO assign/complete/state-change, WARN recoverable/oom
+//! fail, ERROR terminal fail — emits on
+//! [`dynrunner_core::OBSERVER_TASK_TARGET`] via
+//! [`dynrunner_core::high_volume_target`]: visible on the default stdio
+//! stream, suppressed FROM stdio under `--important-stdio-only`, kept
+//! on the full log at TRACE. The wake signal for per-task failures is
+//! the rate-limited `ErrorAggregationPolicy` rollup on
+//! [`dynrunner_core::IMPORTANT_TARGET`]
+//! (`observer::failure_response::aggregation`), which already
+//! aggregates the failure events into a periodic "task failures
+//! (aggregated, last 60s): …" line — that is the operator-visible
+//! wake line at scale.
+//!
+//! The once-per-run baseline summary stays on
+//! [`dynrunner_core::IMPORTANT_TARGET`]: per-RUN, not per-task, so the
+//! volume class is "normal".
 //!
 //! The narrator owns NO state beyond a single baseline-vs-live latch —
 //! every narrated field rides the event, which the merge join derived
@@ -45,7 +56,29 @@
 //! two narrators are sibling concerns over the same mirror; there is no
 //! double-emit.
 
-use dynrunner_core::{IMPORTANT_TARGET, OBSERVER_TASK_TARGET};
+use dynrunner_core::{IMPORTANT_TARGET, high_volume_target};
+
+/// Every per-task narration arm (assign / complete / fail-terminal /
+/// fail-recoverable / fail-oom / non-terminal state change) is
+/// classified HIGH-VOLUME under the #583/#587 contract: a per-task
+/// emit is intrinsically per-task and scales with the task count
+/// (a 46k-task build fires N assigns + N completes; an asm-dataset
+/// untuned-packages run fires thousands of `non_recoverable`
+/// terminal-failure ERRORs). The wake signal is the rate-limited
+/// `ErrorAggregationPolicy` rollup on `IMPORTANT_TARGET`
+/// (`observer::failure_response::aggregation`); the per-task lines
+/// here go to `OBSERVER_TASK_TARGET` (visible in the default stdio
+/// stream, suppressed under `--important-stdio-only`, captured
+/// unconditionally on the full log).
+///
+/// The non-failure baseline summary (one line per run) stays on
+/// `IMPORTANT_TARGET` — per-RUN, not per-task, so it is the
+/// "normal" volume class. Every site routes through
+/// [`dynrunner_core::high_volume_target`] so the
+/// `is_high_volume → target` mapping has ONE owner; if a future
+/// arm needs the other class, the call site flips its boolean and
+/// the target follows.
+const PER_TASK_TARGET: &str = high_volume_target(true);
 
 use crate::cluster_state::StateCounts;
 use crate::task_state_change::{TaskStateChange, TaskStateChangeEvent};
@@ -120,7 +153,7 @@ impl ObserverTaskNarrator {
         match &event.change {
             TaskStateChange::Assigned => {
                 tracing::info!(
-                    target: OBSERVER_TASK_TARGET,
+                    target: PER_TASK_TARGET,
                     task = %id,
                     holder = %holder,
                     "task {id} assigned to {holder}",
@@ -128,7 +161,7 @@ impl ObserverTaskNarrator {
             }
             TaskStateChange::Completed => {
                 tracing::info!(
-                    target: OBSERVER_TASK_TARGET,
+                    target: PER_TASK_TARGET,
                     task = %id,
                     holder = %holder,
                     "task {id} completed on {holder}",
@@ -136,7 +169,7 @@ impl ObserverTaskNarrator {
             }
             TaskStateChange::TerminalFailure { reason, last_error } => {
                 tracing::error!(
-                    target: IMPORTANT_TARGET,
+                    target: PER_TASK_TARGET,
                     task = %id,
                     holder = %holder,
                     reason = %reason,
@@ -146,7 +179,7 @@ impl ObserverTaskNarrator {
             }
             TaskStateChange::RecoverableFailure { reason } => {
                 tracing::warn!(
-                    target: IMPORTANT_TARGET,
+                    target: PER_TASK_TARGET,
                     task = %id,
                     holder = %holder,
                     reason = %reason,
@@ -155,7 +188,7 @@ impl ObserverTaskNarrator {
             }
             TaskStateChange::OomFailure { reason } => {
                 tracing::warn!(
-                    target: IMPORTANT_TARGET,
+                    target: PER_TASK_TARGET,
                     task = %id,
                     holder = %holder,
                     reason = %reason,
@@ -164,7 +197,7 @@ impl ObserverTaskNarrator {
             }
             TaskStateChange::Other { state } => {
                 tracing::info!(
-                    target: OBSERVER_TASK_TARGET,
+                    target: PER_TASK_TARGET,
                     task = %id,
                     state = %state,
                     "task {id} changed state to {state}",

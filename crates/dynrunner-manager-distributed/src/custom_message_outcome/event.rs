@@ -92,4 +92,16 @@ pub struct CustomMessageOutcomeEvent {
     pub origin: String,
     pub seq: u64,
     pub outcome: CustomMessageOutcome,
+    /// Operator-narration volume class (#583/#587) — captured at apply
+    /// time from the originating `Unhandled` entry's `is_high_volume`
+    /// field BEFORE the terminal latch erases it. The observer's
+    /// outcome narrator routes the Handled / Failed wake line to
+    /// OBSERVER_TASK_TARGET when `true` (off IMPORTANT_TARGET) so a
+    /// high-fanout consumer's terminals do not drown the wake stream;
+    /// the aggregator rollup line is the wake signal in that mode.
+    /// Defaults `false` on the Vacant / Failed→Handled convergence-
+    /// insurance arms (the apply never saw the Posted, so cannot honor
+    /// the consumer's class — narration-only divergence on that
+    /// theoretical race; see `apply_custom.rs::apply_custom_message_handled`).
+    pub is_high_volume: bool,
 }

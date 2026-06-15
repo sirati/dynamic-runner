@@ -657,7 +657,34 @@ pub enum CustomMsgState {
     /// Posted at the authority but not yet consumed by a
     /// `custom_message_handler` — the promoted-primary hydrate replays
     /// every entry in this state (and ONLY this state).
-    Unhandled { topic: String, data: Vec<u8> },
+    ///
+    /// `is_high_volume` is the OPERATOR-NARRATION volume class
+    /// (#583/#587). It rides the originating
+    /// `DistributedMessage::CustomMessage::is_high_volume` field into
+    /// the wire `ClusterMutation::CustomMessagePosted` and the apply
+    /// rule stamps it here verbatim. Read by
+    /// [`crate::run_narrator::RunNarrator::narrate_custom_messages`]
+    /// (Posted line) AND by the apply rules that build the
+    /// [`crate::custom_message_outcome::CustomMessageOutcomeEvent`]
+    /// (the Handled / Failed terminal lines) so the observer routes
+    /// every wake line to OBSERVER_TASK_TARGET (off IMPORTANT_TARGET)
+    /// for the high-fanout consumer case. Not consulted by any merge /
+    /// apply / watermark decision — pure observability carriage on the
+    /// lattice payload that the terminal-latch drops anyway, so the
+    /// flag never participates in convergence (a Handled-outruns-Posted
+    /// race latches the terminal with the field's default; the late
+    /// Posted NoOps on the occupied entry, so the observer's terminal
+    /// narration routes via the default — narration-only divergence on
+    /// a theoretical-but-never-exercised race, never a CRDT divergence).
+    Unhandled {
+        topic: String,
+        data: Vec<u8>,
+        #[serde(
+            default,
+            skip_serializing_if = "dynrunner_protocol_primary_secondary::is_false_ref"
+        )]
+        is_high_volume: bool,
+    },
     /// Consumed by a clean handler return — payload dropped; sticky.
     Handled,
     /// The handler RAISED — a terminal USER ERROR, never retried, the

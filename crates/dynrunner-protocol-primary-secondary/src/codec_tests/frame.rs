@@ -235,6 +235,7 @@ fn roundtrip_all_message_types() {
             topic: "phase4-batch".into(),
             data: vec![1, 2, 3],
             important: true,
+            is_high_volume: false,
             delivery_seq: Some(9),
         },
         DistributedMessage::TaskHoldQuery {

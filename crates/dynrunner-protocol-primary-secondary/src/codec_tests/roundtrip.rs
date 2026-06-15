@@ -1351,6 +1351,8 @@ fn roundtrip_custom_message_important() {
         topic: "phase4-batch".into(),
         data: b"descriptor batch".to_vec(),
         important: true,
+        // #583/#587: explicit-true rides the wire (asserted below).
+        is_high_volume: true,
         delivery_seq: Some(42),
     };
     let bytes = serialize_message(&msg).unwrap();
@@ -1370,6 +1372,7 @@ fn roundtrip_custom_message_important() {
             topic,
             data,
             important,
+            is_high_volume,
             ..
         } => {
             assert_eq!(origin_secondary_id, "sec-1");
@@ -1377,6 +1380,7 @@ fn roundtrip_custom_message_important() {
             assert_eq!(topic, "phase4-batch");
             assert_eq!(data, b"descriptor batch".to_vec());
             assert!(important);
+            assert!(is_high_volume, "#583/#587: explicit-true survives the wire");
         }
         _ => panic!("expected CustomMessage"),
     }
@@ -1396,6 +1400,7 @@ fn droppable_custom_message_is_not_confirmable_and_elides_delivery_seq() {
         topic: "progress".into(),
         data: vec![0xFF],
         important: false,
+        is_high_volume: false,
         delivery_seq: None,
     };
     assert!(!msg.requires_delivery_ack());
@@ -1418,6 +1423,8 @@ fn droppable_custom_message_is_not_confirmable_and_elides_delivery_seq() {
 /// cannot see (the wire-shape mirror discipline).
 #[test]
 fn custom_message_decodes_literal_sender_bytes() {
+    // Legacy sender (no is_high_volume field) decodes to default false
+    // — the forward-compat half of the #583/#587 wire shape.
     let literal = r#"{"msg_type":"custom_message","sender_id":"sec-1","timestamp":1.0,"origin_secondary_id":"sec-1","msg_seq":2,"topic":"phase4-batch","data":[104,105],"important":true,"delivery_seq":5}"#;
     let decoded: DistributedMessage<TestId> = serde_json::from_str(literal).unwrap();
     match decoded {
@@ -1427,6 +1434,7 @@ fn custom_message_decodes_literal_sender_bytes() {
             topic,
             data,
             important,
+            is_high_volume,
             delivery_seq,
             ..
         } => {
@@ -1435,7 +1443,19 @@ fn custom_message_decodes_literal_sender_bytes() {
             assert_eq!(topic, "phase4-batch");
             assert_eq!(data, b"hi".to_vec());
             assert!(important);
+            assert!(!is_high_volume, "legacy sender ⇒ default false (#583/#587)");
             assert_eq!(delivery_seq, Some(5));
+        }
+        _ => panic!("expected CustomMessage"),
+    }
+    // Current sender stamping is_high_volume=true: the field rides the
+    // wire literally so the observer routes the narration correctly
+    // after a CRDT replay across this wire boundary.
+    let hv_literal = r#"{"msg_type":"custom_message","sender_id":"sec-1","timestamp":1.0,"origin_secondary_id":"sec-1","msg_seq":3,"topic":"dep_graph_spawn","data":[104,105],"important":true,"is_high_volume":true,"delivery_seq":5}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(hv_literal).unwrap();
+    match decoded {
+        DistributedMessage::CustomMessage { is_high_volume, .. } => {
+            assert!(is_high_volume, "is_high_volume=true rides the wire literally");
         }
         _ => panic!("expected CustomMessage"),
     }

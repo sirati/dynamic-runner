@@ -67,6 +67,7 @@ async fn predrain_orders_queued_customs_before_terminal_and_stamps_watermark() {
                         topic: "spawn_batch".into(),
                         data: seq.to_string().into_bytes(),
                         important: true,
+                        is_high_volume: false,
                     })
                     .unwrap();
             }
@@ -75,6 +76,7 @@ async fn predrain_orders_queued_customs_before_terminal_and_stamps_watermark() {
                     topic: "progress".into(),
                     data: b"ping".to_vec(),
                     important: false,
+                    is_high_volume: false,
                 })
                 .unwrap();
             control_tx
@@ -82,6 +84,7 @@ async fn predrain_orders_queued_customs_before_terminal_and_stamps_watermark() {
                     topic: "summary".into(),
                     data: b"4".to_vec(),
                     important: true,
+                    is_high_volume: false,
                 })
                 .unwrap();
 
@@ -259,6 +262,7 @@ async fn trace_426_completion_covers_customs_still_in_dispatcher_pipeline() {
                             topic: event.topic.clone(),
                             data: event.data.clone(),
                             important: true,
+                            is_high_volume: false,
                         })
                         .expect("control channel alive");
                 }
@@ -286,7 +290,7 @@ async fn trace_426_completion_covers_customs_still_in_dispatcher_pipeline() {
             // stream the production stamp DID cover.
             for n in [617u64, 618] {
                 secondary
-                    .send_custom_to_primary("spawn_batch".into(), n.to_string().into_bytes(), true)
+                    .send_custom_to_primary("spawn_batch".into(), n.to_string().into_bytes(), true, false)
                     .await
                     .unwrap();
             }
@@ -460,7 +464,7 @@ async fn retained_terminal_replays_with_original_watermark() {
 
             // One important custom precedes the terminal: watermark 1.
             secondary
-                .send_custom_to_primary("spawn_batch".into(), b"1".to_vec(), true)
+                .send_custom_to_primary("spawn_batch".into(), b"1".to_vec(), true, false)
                 .await
                 .unwrap();
 
@@ -504,7 +508,7 @@ async fn retained_terminal_replays_with_original_watermark() {
 
             // Later sends advance the counter while the terminal waits.
             secondary
-                .send_custom_to_primary("spawn_batch".into(), b"2".to_vec(), true)
+                .send_custom_to_primary("spawn_batch".into(), b"2".to_vec(), true, false)
                 .await
                 .unwrap();
 

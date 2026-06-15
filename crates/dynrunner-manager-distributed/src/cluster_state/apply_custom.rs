@@ -63,13 +63,18 @@ impl<I: Identifier> ClusterState<I> {
         seq: u64,
         topic: String,
         data: Vec<u8>,
+        is_high_volume: bool,
     ) -> ApplyOutcome {
         if self.custom_watermark_covers(&origin, seq) {
             return ApplyOutcome::NoOp;
         }
         match self.custom_messages.entry((origin, seq)) {
             std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(CustomMsgState::Unhandled { topic, data });
+                e.insert(CustomMsgState::Unhandled {
+                    topic,
+                    data,
+                    is_high_volume,
+                });
                 ApplyOutcome::Applied
             }
             std::collections::hash_map::Entry::Occupied(_) => ApplyOutcome::NoOp,
@@ -103,6 +108,22 @@ impl<I: Identifier> ClusterState<I> {
         if self.custom_watermark_covers(&origin, seq) {
             return ApplyOutcome::NoOp;
         }
+        // Capture the message's volume class BEFORE overwriting the
+        // entry — the terminal latch drops the payload along with the
+        // flag, but the outcome event the observer narrates carries it
+        // so the per-message Handled wake line routes to the same
+        // target as the originating Posted line (#583/#587). A
+        // Handled-outruns-Posted race (Vacant arm, or a Failed→Handled
+        // theoretical convergence join) defaults the flag to `false`:
+        // we never saw the Posted, so we cannot know the consumer's
+        // class — the late Posted that NoOps cannot retroactively
+        // re-route an already-narrated terminal, and the
+        // rate-limited aggregator wake signal still fires on the
+        // IMPORTANT path for that one edge.
+        let is_high_volume = match self.custom_messages.get(&(origin.clone(), seq)) {
+            Some(CustomMsgState::Unhandled { is_high_volume, .. }) => *is_high_volume,
+            _ => false,
+        };
         let outcome = match self.custom_messages.entry((origin.clone(), seq)) {
             std::collections::hash_map::Entry::Occupied(mut e) => match e.get() {
                 CustomMsgState::Unhandled { .. } | CustomMsgState::Failed => {
@@ -123,6 +144,7 @@ impl<I: Identifier> ClusterState<I> {
                 origin: origin.clone(),
                 seq,
                 outcome: CustomMessageOutcome::Handled,
+                is_high_volume,
             });
             self.compact_custom_watermark(&origin);
         }
@@ -161,6 +183,12 @@ impl<I: Identifier> ClusterState<I> {
         if self.custom_watermark_covers(&origin, seq) {
             return ApplyOutcome::NoOp;
         }
+        // Capture the volume class BEFORE the latch drops the payload
+        // — same contract as the Handled twin (`#583/#587`).
+        let is_high_volume = match self.custom_messages.get(&(origin.clone(), seq)) {
+            Some(CustomMsgState::Unhandled { is_high_volume, .. }) => *is_high_volume,
+            _ => false,
+        };
         let outcome = match self.custom_messages.entry((origin.clone(), seq)) {
             std::collections::hash_map::Entry::Occupied(mut e) => match e.get() {
                 CustomMsgState::Unhandled { .. } => {
@@ -183,6 +211,7 @@ impl<I: Identifier> ClusterState<I> {
                 origin: origin.clone(),
                 seq,
                 outcome: CustomMessageOutcome::Failed { reason },
+                is_high_volume,
             });
             self.compact_custom_watermark(&origin);
         }
@@ -240,14 +269,24 @@ impl<I: Identifier> ClusterState<I> {
     /// `Failed` — are never surfaced: a promoted primary replays ONLY
     /// `Unhandled`. Owned clones so the caller holds no borrow against
     /// the `&mut self` coordinator while dispatching.
-    pub(crate) fn unhandled_custom_messages(&self) -> Vec<(String, u64, String, Vec<u8>)> {
-        let mut out: Vec<(String, u64, String, Vec<u8>)> = self
+    pub(crate) fn unhandled_custom_messages(
+        &self,
+    ) -> Vec<(String, u64, String, Vec<u8>, bool)> {
+        let mut out: Vec<(String, u64, String, Vec<u8>, bool)> = self
             .custom_messages
             .iter()
             .filter_map(|((origin, seq), state)| match state {
-                CustomMsgState::Unhandled { topic, data } => {
-                    Some((origin.clone(), *seq, topic.clone(), data.clone()))
-                }
+                CustomMsgState::Unhandled {
+                    topic,
+                    data,
+                    is_high_volume,
+                } => Some((
+                    origin.clone(),
+                    *seq,
+                    topic.clone(),
+                    data.clone(),
+                    *is_high_volume,
+                )),
                 CustomMsgState::Handled | CustomMsgState::Failed => None,
             })
             .collect();
@@ -345,7 +384,7 @@ impl<I: Identifier> ClusterState<I> {
         let mut stats = CustomInboxStats::default();
         for state in self.custom_messages.values() {
             match state {
-                CustomMsgState::Unhandled { topic, data } => {
+                CustomMsgState::Unhandled { topic, data, .. } => {
                     stats.unhandled += 1;
                     stats.payload_bytes += topic.len() + data.len();
                 }

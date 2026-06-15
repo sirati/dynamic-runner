@@ -57,7 +57,7 @@
 
 use std::collections::HashSet;
 
-use dynrunner_core::{IMPORTANT_TARGET, Identifier, PhaseId, TerminalOutcomeCounts};
+use dynrunner_core::{IMPORTANT_TARGET, Identifier, PhaseId, TerminalOutcomeCounts, narrate_routed};
 
 use crate::ClusterState;
 use crate::cluster_state::{CustomMsgState, DiscoveryDebt};
@@ -981,13 +981,29 @@ impl RunNarrator {
     fn narrate_custom_messages<I: Identifier>(&mut self, state: &ClusterState<I>) -> bool {
         let mut emitted = false;
         for (origin, seq, msg_state) in state.custom_message_entries() {
-            if let CustomMsgState::Unhandled { topic, .. } = msg_state
+            if let CustomMsgState::Unhandled {
+                topic,
+                is_high_volume,
+                ..
+            } = msg_state
                 && self
                     .custom_posted_emitted
                     .insert((origin.to_string(), seq))
             {
-                tracing::info!(
-                    target: IMPORTANT_TARGET,
+                // Operator-narration volume class (#583/#587). A
+                // consumer-flagged high-volume custom message emits
+                // the landing line on `OBSERVER_TASK_TARGET`
+                // (suppressed under `--important-stdio-only`); the
+                // rate-limited custom-message-activity aggregator
+                // emits a rollup line on `IMPORTANT_TARGET` as the
+                // wake signal. Default (low-volume) lines stay on
+                // `IMPORTANT_TARGET` unchanged. The `narrate_routed!`
+                // macro is the SINGLE OWNER of the `is_high_volume →
+                // target` branch for runtime-decided emits — the
+                // narrator never spells the if.
+                narrate_routed!(
+                    info,
+                    *is_high_volume,
                     origin = %origin,
                     seq = seq,
                     topic = %topic,
@@ -3058,6 +3074,7 @@ mod tests {
                 seq: 1,
                 topic: "important-topic".to_string(),
                 data: vec![1, 2, 3],
+                is_high_volume: false,
             });
             narrator.observe(&state);
             narrator.observe(&state); // idempotent re-observe.
@@ -3068,6 +3085,7 @@ mod tests {
                 seq: 1,
                 topic: "user-topic".to_string(),
                 data: vec![4, 5],
+                is_high_volume: false,
             });
             narrator.observe(&state);
             narrator.observe(&state); // idempotent.
@@ -3096,6 +3114,135 @@ mod tests {
         assert!(posted_origins.contains(&Some("n2")));
     }
 
+    /// T1 (#583/#587): a CustomMessagePosted with `is_high_volume=true`
+    /// narrates the "custom message posted" line on
+    /// `OBSERVER_TASK_TARGET` instead of `IMPORTANT_TARGET`. The
+    /// `--important-stdio-only` stdio gate (an allow-list on
+    /// `IMPORTANT_TARGET`) drops it; the full log still captures it on
+    /// either target. The rate-limited custom-message aggregator
+    /// rollup on `IMPORTANT_TARGET` is the wake signal at scale.
+    #[test]
+    fn high_volume_posted_routes_to_observer_task_target() {
+        use crate::test_capture::TargetCapture;
+        use dynrunner_core::{IMPORTANT_TARGET, OBSERVER_TASK_TARGET};
+        let on_observer = TargetCapture::for_target(OBSERVER_TASK_TARGET);
+        let on_important = TargetCapture::for_target(IMPORTANT_TARGET);
+        let subscriber = Registry::default()
+            .with(on_observer.clone())
+            .with(on_important.clone());
+        with_default(subscriber, || {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            let mut narrator = RunNarrator::new();
+            state.apply(ClusterMutation::CustomMessagePosted {
+                origin: "n1".to_string(),
+                seq: 1,
+                topic: "dep_graph_spawn".to_string(),
+                data: vec![1, 2, 3],
+                is_high_volume: true,
+            });
+            narrator.observe(&state);
+        });
+        let on_observer_events = on_observer.events();
+        let on_important_events = on_important.events();
+        assert!(
+            on_observer_events
+                .iter()
+                .any(|e| e.event.message.starts_with("custom message posted:")),
+            "high-volume Posted narrates on OBSERVER_TASK_TARGET: {on_observer_events:?}"
+        );
+        assert!(
+            !on_important_events
+                .iter()
+                .any(|e| e.event.message.starts_with("custom message posted:")),
+            "high-volume Posted MUST NOT narrate on IMPORTANT_TARGET: {on_important_events:?}"
+        );
+    }
+
+    /// T2 (#583/#587 regression guard): a CustomMessagePosted with the
+    /// DEFAULT `is_high_volume=false` keeps narrating the "custom
+    /// message posted" line on `IMPORTANT_TARGET` (the pre-#583 shape
+    /// — a low-fanout consumer's wake-worthy custom-message landing).
+    #[test]
+    fn low_volume_posted_stays_on_important_target() {
+        use crate::test_capture::TargetCapture;
+        use dynrunner_core::{IMPORTANT_TARGET, OBSERVER_TASK_TARGET};
+        let on_observer = TargetCapture::for_target(OBSERVER_TASK_TARGET);
+        let on_important = TargetCapture::for_target(IMPORTANT_TARGET);
+        let subscriber = Registry::default()
+            .with(on_observer.clone())
+            .with(on_important.clone());
+        with_default(subscriber, || {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            let mut narrator = RunNarrator::new();
+            state.apply(ClusterMutation::CustomMessagePosted {
+                origin: "n1".to_string(),
+                seq: 1,
+                topic: "low-fanout-control".to_string(),
+                data: vec![],
+                is_high_volume: false,
+            });
+            narrator.observe(&state);
+        });
+        let on_important_events = on_important.events();
+        let on_observer_events = on_observer.events();
+        assert!(
+            on_important_events
+                .iter()
+                .any(|e| e.event.message.starts_with("custom message posted:")),
+            "low-volume Posted stays on IMPORTANT_TARGET: {on_important_events:?}"
+        );
+        assert!(
+            !on_observer_events
+                .iter()
+                .any(|e| e.event.message.starts_with("custom message posted:")),
+            "low-volume Posted MUST NOT route to OBSERVER_TASK_TARGET: {on_observer_events:?}"
+        );
+    }
+
+    /// T5 (#583/#587 regression guard): the peer-membership /
+    /// phase-lifecycle narration arms are NOT per-task and NOT
+    /// custom-message — they stay on `IMPORTANT_TARGET`, the
+    /// wake-worthy class. A peer-left + a phase-start round-trips
+    /// through the narrator AND lands on `IMPORTANT_TARGET` only —
+    /// nothing in the new high-volume primitive may flip these normal
+    /// arms onto OBSERVER_TASK_TARGET.
+    #[test]
+    fn peer_leave_and_phase_start_stay_on_important_target() {
+        use crate::test_capture::TargetCapture;
+        use dynrunner_core::{IMPORTANT_TARGET, OBSERVER_TASK_TARGET};
+        let on_observer = TargetCapture::for_target(OBSERVER_TASK_TARGET);
+        let on_important = TargetCapture::for_target(IMPORTANT_TARGET);
+        let subscriber = Registry::default()
+            .with(on_observer.clone())
+            .with(on_important.clone());
+        with_default(subscriber, || {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            // Phase start path: a fresh dispatchable phase fires
+            // "starting job phase" on IMPORTANT_TARGET (the canonical
+            // wake line for the operator's run-start signal).
+            add(&mut state, &task("compile", "a", &[]));
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state);
+        });
+        let on_important_events = on_important.events();
+        let on_observer_events = on_observer.events();
+        assert!(
+            on_important_events
+                .iter()
+                .any(|e| e.event.message.contains("starting job phase")),
+            "phase-start narrates on IMPORTANT_TARGET (regression guard for #583/#587): \
+             {on_important_events:?}"
+        );
+        // Cross-target check: nothing from this narration arm leaks
+        // onto OBSERVER_TASK_TARGET — the new primitive is opt-in per
+        // narration kind, not a blanket move.
+        assert!(
+            on_observer_events.is_empty(),
+            "phase-start MUST NOT route to OBSERVER_TASK_TARGET (regression guard): \
+             {on_observer_events:?}"
+        );
+    }
+
     /// #570 follow-up boundary — the state-derived narrator does NOT emit a
     /// terminal line for `CustomMessageHandled` / `CustomMessageFailed`.
     /// `compact_custom_watermark` (apply_custom.rs) erases the
@@ -3117,6 +3264,7 @@ mod tests {
                 seq: 1,
                 topic: "t".to_string(),
                 data: vec![1],
+                is_high_volume: false,
             });
             narrator.observe(&state);
             // Clean handler → Handled (compacts immediately, label erased).
@@ -3132,6 +3280,7 @@ mod tests {
                 seq: 1,
                 topic: "u".to_string(),
                 data: vec![2],
+                is_high_volume: false,
             });
             narrator.observe(&state);
             state.apply(ClusterMutation::CustomMessageFailed {

@@ -55,5 +55,14 @@ pub enum SecondaryControlCommand {
         topic: String,
         data: Vec<u8>,
         important: bool,
+        /// Operator-narration volume class (#583/#587). Routes the
+        /// observer's per-message Posted/Handled/Failed narration off
+        /// IMPORTANT_TARGET onto OBSERVER_TASK_TARGET when `true`;
+        /// independent of `important` (a high-volume IMPORTANT message
+        /// is the asm-dataset dep_graph_spawn case). Pure carriage —
+        /// the operational loop hands it verbatim to the
+        /// `send_custom_to_primary` seam, which stamps it on the wire
+        /// frame.
+        is_high_volume: bool,
     },
 }

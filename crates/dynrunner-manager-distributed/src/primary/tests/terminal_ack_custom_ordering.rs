@@ -153,6 +153,7 @@ async fn important_custom_ack_follows_custom_message_posted_broadcast() {
                 topic: "phase-marker".into(),
                 data: b"opaque-payload".to_vec(),
                 important: true,
+                is_high_volume: false,
                 delivery_seq: Some(11),
             };
 
@@ -243,6 +244,7 @@ async fn droppable_custom_ack_path_unchanged_by_539() {
                 topic: "transient".into(),
                 data: b"oneshot".to_vec(),
                 important: false,
+                is_high_volume: false,
                 // A droppable IS sometimes stamped with a delivery_seq
                 // (the chokepoint stamps every confirmable; droppables
                 // aren't confirmable so they shouldn't be — but a

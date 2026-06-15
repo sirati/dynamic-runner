@@ -296,19 +296,25 @@ mod tests {
                 topic,
                 data,
                 important,
+                is_high_volume,
             } => {
                 assert_eq!(topic, "t");
                 assert_eq!(data, b"d");
                 assert!(!important, "default delivery class is droppable");
+                assert!(!is_high_volume, "default volume class is low-volume (#583/#587)");
             }
             other => panic!("expected SendToPrimary, got {other:?}"),
         }
         match rx.try_recv().expect("important command queued") {
             SecondaryControlCommand::SendToPrimary {
-                topic, important, ..
+                topic, important, is_high_volume, ..
             } => {
                 assert_eq!(topic, "u");
                 assert!(important, "important kwarg forwarded");
+                assert!(
+                    !is_high_volume,
+                    "is_high_volume not set ⇒ default low-volume (#583/#587)"
+                );
             }
             other => panic!("expected SendToPrimary, got {other:?}"),
         }
@@ -331,6 +337,39 @@ mod tests {
             );
         });
         assert!(rx.try_recv().is_err(), "nothing queued on oversize");
+    }
+
+    /// T1 (#583/#587): the consumer's `is_high_volume=True` kwarg
+    /// rides verbatim onto the queued `SendToPrimary` control command
+    /// (the operational loop hands it to `send_custom_to_primary`,
+    /// which stamps it on the wire frame). Independent of `important`:
+    /// a high-volume IMPORTANT send sets both, and the kwarg-default
+    /// (False) covers a legacy caller that pre-dates the field.
+    #[test]
+    fn handle_send_to_primary_carries_is_high_volume_kwarg() {
+        let (handle, mut rx) = make_handle();
+        Python::attach(|py| {
+            let bound = handle.bind(py);
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs.set_item("important", true).unwrap();
+            kwargs.set_item("is_high_volume", true).unwrap();
+            bound
+                .call_method("send_to_primary", ("hv", PyBytes::new(py, b"x")), Some(&kwargs))
+                .expect("high-volume important send queues");
+        });
+        match rx.try_recv().expect("high-volume command queued") {
+            SecondaryControlCommand::SendToPrimary {
+                topic,
+                important,
+                is_high_volume,
+                ..
+            } => {
+                assert_eq!(topic, "hv");
+                assert!(important, "important kwarg forwarded");
+                assert!(is_high_volume, "is_high_volume=True kwarg forwarded");
+            }
+            other => panic!("expected SendToPrimary, got {other:?}"),
+        }
     }
 
     /// A `PyErr` raised inside the listener is swallowed (logged at

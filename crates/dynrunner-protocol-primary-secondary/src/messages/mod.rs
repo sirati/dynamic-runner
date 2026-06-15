@@ -22,7 +22,7 @@ pub mod range_digest;
 pub mod state_digest;
 
 pub use binary_info::{DistributedBinaryInfo, StagedFileRecord, ZipBinaryEntry, ZipFileAssignment};
-pub use distributed::{DistributedMessage, KeepaliveRole};
+pub use distributed::{DistributedMessage, KeepaliveRole, is_false_ref};
 pub use illegal_assignment::AssignedTaskRef;
 pub use inflight_roster::InFlightRosterEntry;
 pub use message_type::MessageType;

@@ -978,7 +978,8 @@ impl<I: Identifier> ClusterState<I> {
                 seq,
                 topic,
                 data,
-            } => self.apply_custom_message_posted(origin, seq, topic, data),
+                is_high_volume,
+            } => self.apply_custom_message_posted(origin, seq, topic, data, is_high_volume),
             ClusterMutation::CustomMessageHandled { origin, seq } => {
                 self.apply_custom_message_handled(origin, seq)
             }

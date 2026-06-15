@@ -56,6 +56,7 @@ async fn handled_terminal_emits_handled_outcome_before_compaction() {
         seq: 1,
         topic: "t".into(),
         data: b"payload".to_vec(),
+        is_high_volume: false,
     });
     // Posted itself fires no outcome event — it is the landing edge,
     // not a terminal.
@@ -100,6 +101,7 @@ async fn failed_terminal_emits_failed_outcome_with_verbatim_reason() {
         seq: 1,
         topic: "u".into(),
         data: b"x".to_vec(),
+        is_high_volume: false,
     });
     let _ = drain(&mut rx);
 
@@ -136,6 +138,7 @@ async fn redelivered_terminal_emits_no_second_event() {
         seq: 1,
         topic: "t".into(),
         data: b"z".to_vec(),
+        is_high_volume: false,
     });
     s.apply(ClusterMutation::CustomMessageHandled {
         origin: "sec-c".into(),
@@ -177,6 +180,7 @@ async fn handled_wins_lattice_emits_handled_on_failed_to_handled_join() {
         seq: 2,
         topic: "t".into(),
         data: b"data".to_vec(),
+        is_high_volume: false,
     });
     let _ = drain(&mut rx);
 

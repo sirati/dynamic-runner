@@ -1450,11 +1450,15 @@ where
                 topic,
                 data,
                 important,
+                is_high_volume,
             } => {
                 // The only Err class is the size gate, which the API
                 // call site already rejected with a ValueError — this
                 // is the defensive re-check.
-                if let Err(e) = self.send_custom_to_primary(topic, data, important).await {
+                if let Err(e) = self
+                    .send_custom_to_primary(topic, data, important, is_high_volume)
+                    .await
+                {
                     tracing::warn!(
                         error = %e,
                         "send_to_primary custom message rejected at \
