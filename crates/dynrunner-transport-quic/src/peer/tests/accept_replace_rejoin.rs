@@ -109,6 +109,7 @@ async fn rejoiner_fresh_inbound_replaces_stale_entry() {
                     port: peer_a.port(),
                     is_observer: false,
                     liveness_port: None,
+                    slurm_job_id: None,
                 },
                 PeerConnectionInfo {
                     secondary_id: "peer-b".into(),
@@ -118,6 +119,7 @@ async fn rejoiner_fresh_inbound_replaces_stale_entry() {
                     port: peer_b.port(),
                     is_observer: false,
                     liveness_port: None,
+                    slurm_job_id: None,
                 },
             ];
             peer_a.connect_to_peers(&peers);

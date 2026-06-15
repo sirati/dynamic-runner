@@ -55,6 +55,7 @@ async fn read_loop_stamps_arrival_without_recv_peer() {
                     port: port_a,
                     is_observer: false,
                     liveness_port: None,
+                    slurm_job_id: None,
                 },
                 PeerConnectionInfo {
                     secondary_id: "peer-b".into(),
@@ -64,6 +65,7 @@ async fn read_loop_stamps_arrival_without_recv_peer() {
                     port: port_b,
                     is_observer: false,
                     liveness_port: None,
+                    slurm_job_id: None,
                 },
             ];
 

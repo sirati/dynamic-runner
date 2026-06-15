@@ -95,6 +95,7 @@ fn peer_info_roundtrip() {
             port: 0,
             is_observer: false,
             liveness_port: None,
+            slurm_job_id: None,
         }],
     };
     let wire: DistributedMessage<()> = original.into();

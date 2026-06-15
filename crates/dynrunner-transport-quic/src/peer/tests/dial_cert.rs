@@ -27,6 +27,7 @@ fn seed_entry(port: u16, cert: &str) -> PeerConnectionInfo {
         port,
         is_observer: false,
         liveness_port: None,
+        slurm_job_id: None,
     }
 }
 

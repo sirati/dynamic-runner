@@ -499,6 +499,7 @@ fn roundtrip_peer_info() {
                 port: 5000,
                 is_observer: false,
                 liveness_port: None,
+                slurm_job_id: None,
             },
             PeerConnectionInfo {
                 secondary_id: "sec-2".into(),
@@ -508,6 +509,7 @@ fn roundtrip_peer_info() {
                 port: 5001,
                 is_observer: false,
                 liveness_port: None,
+                slurm_job_id: None,
             },
         ],
     };

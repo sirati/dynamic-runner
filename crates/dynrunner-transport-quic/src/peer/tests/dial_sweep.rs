@@ -32,6 +32,7 @@ fn pinfo(id: &str) -> PeerConnectionInfo {
         port: 59124,
         is_observer: false,
         liveness_port: None,
+        slurm_job_id: None,
     }
 }
 

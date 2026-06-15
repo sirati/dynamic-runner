@@ -50,6 +50,18 @@ pub struct SecondaryConnection<S> {
     /// so every node can beacon this peer once it becomes primary (the
     /// "primary on ANY peer" invariant). `None` for a pre-beacon sender.
     pub liveness_port: Option<u16>,
+    /// SLURM job id this secondary's process runs under, when the
+    /// secondary was launched via SLURM. Required by the mesh-consensus
+    /// respawn pipeline (#556): the primary that decides to scancel a
+    /// confirmed-dead peer reads this off the per-peer record on the
+    /// authoritative side. `None` means EITHER a pre-upgrade peer OR a
+    /// non-SLURM-launched secondary (local/in-process, observer-mode);
+    /// the respawn path skips the scancel rather than guess.
+    ///
+    /// Layer 1 (wire): the field is purely additive — every constructor
+    /// passes `None`; the value-source plumbing through
+    /// `SecondaryWelcome` / a dedicated registration frame is Layer 4.
+    pub slurm_job_id: Option<String>,
     _state: PhantomData<S>,
 }
 
@@ -69,6 +81,7 @@ impl SecondaryConnection<AwaitingWelcome> {
             is_observer: false,
             can_be_primary: false,
             liveness_port: None,
+            slurm_job_id: None,
             _state: PhantomData,
         }
     }
@@ -110,6 +123,7 @@ impl SecondaryConnection<AwaitingWelcome> {
             is_observer: self.is_observer,
             can_be_primary: self.can_be_primary,
             liveness_port: self.liveness_port,
+            slurm_job_id: self.slurm_job_id,
             _state: PhantomData,
         }
     }
@@ -143,6 +157,7 @@ impl SecondaryConnection<Handshaking> {
             is_observer: self.is_observer,
             can_be_primary: self.can_be_primary,
             liveness_port: self.liveness_port,
+            slurm_job_id: self.slurm_job_id,
             _state: PhantomData,
         }
     }
@@ -164,6 +179,7 @@ impl SecondaryConnection<CertExchanging> {
             is_observer: self.is_observer,
             can_be_primary: self.can_be_primary,
             liveness_port: self.liveness_port,
+            slurm_job_id: self.slurm_job_id,
             _state: PhantomData,
         }
     }
@@ -185,6 +201,7 @@ impl SecondaryConnection<PeerDiscovery> {
             is_observer: self.is_observer,
             can_be_primary: self.can_be_primary,
             liveness_port: self.liveness_port,
+            slurm_job_id: self.slurm_job_id,
             _state: PhantomData,
         }
     }
@@ -206,6 +223,7 @@ impl SecondaryConnection<InitialAssigning> {
             is_observer: self.is_observer,
             can_be_primary: self.can_be_primary,
             liveness_port: self.liveness_port,
+            slurm_job_id: self.slurm_job_id,
             _state: PhantomData,
         }
     }
@@ -227,6 +245,7 @@ impl SecondaryConnection<Operational> {
             is_observer: self.is_observer,
             can_be_primary: self.can_be_primary,
             liveness_port: self.liveness_port,
+            slurm_job_id: self.slurm_job_id,
             _state: PhantomData,
         }
     }
@@ -387,6 +406,23 @@ impl SecondaryConnectionState {
             Self::InitialAssigning(c) => c.can_be_primary,
             Self::Operational(c) => c.can_be_primary,
             Self::ShuttingDown(c) => c.can_be_primary,
+        }
+    }
+
+    /// SLURM job id this secondary's process runs under (#556). `None`
+    /// until the value-source plumbing lands (Layer 4) AND for any peer
+    /// the deployment never launched under SLURM. The mesh-consensus
+    /// respawn pipeline reads it on the authority that decides to
+    /// scancel a confirmed-dead peer; a `None` skips the scancel.
+    pub fn slurm_job_id(&self) -> Option<&str> {
+        match self {
+            Self::AwaitingWelcome(c) => c.slurm_job_id.as_deref(),
+            Self::Handshaking(c) => c.slurm_job_id.as_deref(),
+            Self::CertExchanging(c) => c.slurm_job_id.as_deref(),
+            Self::PeerDiscovery(c) => c.slurm_job_id.as_deref(),
+            Self::InitialAssigning(c) => c.slurm_job_id.as_deref(),
+            Self::Operational(c) => c.slurm_job_id.as_deref(),
+            Self::ShuttingDown(c) => c.slurm_job_id.as_deref(),
         }
     }
 

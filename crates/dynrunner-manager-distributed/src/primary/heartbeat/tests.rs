@@ -1710,6 +1710,7 @@ fn peer_info(id: &str, ipv4: &str, port: u16) -> dynrunner_protocol_primary_seco
         port: 0,
         is_observer: false,
         liveness_port: Some(port),
+        slurm_job_id: None,
     }
 }
 

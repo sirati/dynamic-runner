@@ -53,4 +53,25 @@ pub struct PeerConnectionInfo {
     /// omitted field deserializes to `None`.
     #[serde(default)]
     pub liveness_port: Option<u16>,
+    /// SLURM job id this peer's secondary process runs under, when the
+    /// secondary was launched via SLURM (the typical compute case). The
+    /// mesh-consensus respawn pipeline (#556) reads this on the
+    /// authority that decides to scancel a confirmed-dead peer — without
+    /// the job id, no scancel can be addressed.
+    ///
+    /// `None` means EITHER (a) a pre-upgrade peer that pre-dates this
+    /// field, OR (b) a peer the deployment never launched under SLURM
+    /// (a local/in-process secondary, an observer-mode peer, etc.).
+    /// Both shapes share one contract: the respawn path MUST skip the
+    /// scancel for a `None` peer rather than guess — the decision falls
+    /// back to the standard mesh-side teardown (membership removal +
+    /// in-process kill). Layer 1 (wire) makes the field additive only;
+    /// the value-source plumbing is Layer 4.
+    ///
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// keeps the wire bytes unchanged while the field is `None`: a
+    /// pre-upgrade sender omits the key and a receiver decodes it as
+    /// `None`, and a `None` value re-encodes WITHOUT the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slurm_job_id: Option<String>,
 }
