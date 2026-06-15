@@ -57,6 +57,11 @@
           install -m 0755 ${./deploy/reboot-node.sh}     $out/bin/slurm-test-env-reboot-node
           install -m 0755 ${./scripts/provision-user.sh} $out/bin/slurm-test-env-provision-user
           install -m 0755 ${./scripts/smoke-test.sh}     $out/bin/slurm-test-env-smoke-test
+          # Per-fix e2e assertion scripts. The shell wrapper resolves
+          # its sibling driver under $out/bin (same nix-store closure)
+          # so both must install together.
+          install -m 0755 ${./scripts/test-540-barrier-false.sh} $out/bin/slurm-test-env-test-540-barrier-false
+          install -m 0755 ${./scripts/test-540-driver.py}        $out/bin/slurm-test-env-test-540-driver
 
           # PATH wrapping: include the system deps each script needs, plus
           # $out/bin itself so e.g. smoke-test can call the wrapped
@@ -82,6 +87,13 @@
                   pkgs.gnugrep
                   pkgs.findutils
                   pkgs.util-linux
+                  # python3 for the test-540 driver (a sibling Python
+                  # script the shell wrapper shells out to). Keeping
+                  # the dep in the deploy closure lets a flake-installed
+                  # ``slurm-test-env-test-540-barrier-false`` run without
+                  # depending on whatever python3 the operator's shell
+                  # provides.
+                  pkgs.python3
                 ]
               }
           done
@@ -119,6 +131,10 @@
           smoke-test = {
             type = "app";
             program = "${deploy}/bin/slurm-test-env-smoke-test";
+          };
+          test-540-barrier-false = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-test-540-barrier-false";
           };
         };
       }
