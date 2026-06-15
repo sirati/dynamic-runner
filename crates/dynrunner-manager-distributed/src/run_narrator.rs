@@ -60,6 +60,7 @@ use std::collections::HashSet;
 use dynrunner_core::{IMPORTANT_TARGET, Identifier, PhaseId, TerminalOutcomeCounts};
 
 use crate::ClusterState;
+use crate::cluster_state::{CustomMsgState, DiscoveryDebt};
 use crate::primary::retry_bucket::BucketKind;
 
 /// The terminal-summary count source for the narrator: the verdict's CARRIED
@@ -181,6 +182,54 @@ pub struct RunNarrator {
     /// ([`ClusterState::is_peer_alive`] false) and never again for that id.
     /// A dead id is sticky-`Dead` (never resurrects), so once-per-id is exact.
     primary_lost_emitted: HashSet<String>,
+    /// `(secondary_id, member_gen)` pairs the "wind-down requested" WARN has
+    /// fired for. The replicated
+    /// [`dynrunner_protocol_primary_secondary::ClusterMutation::WindDownRequested`]
+    /// set is grow-only, so each pair narrates exactly once via this edge-set
+    /// — the per-incarnation sibling of `graceful_abort_announced`. The line
+    /// is an operator-wake event because a SLURM job slot is about to be
+    /// released intentionally (the directed secondary self-departs once its
+    /// in-flight work drains, releasing its slot), and that resource loss
+    /// has no other operator signal.
+    wind_down_announced: HashSet<(String, u64)>,
+    /// Whether the one-shot "discovery owed" INFO line has fired — the mode-2
+    /// startup-boundary announcement of the replicated
+    /// [`crate::cluster_state::DiscoveryDebt::Owed`] lattice value. Once the
+    /// debt is settled the [`Self::discovery_settled_announced`] twin fires
+    /// the matching closing line; both are sticky bools (the lattice is
+    /// monotone, no de-narration on revert). A run that never declares debt
+    /// (`Undeclared`) keeps both silent — exactly the precedent shape of
+    /// `setup_started_emitted`/`setup_done_emitted` for a setup-free run.
+    discovery_owed_announced: bool,
+    /// Whether the one-shot "discovery settled" INFO line has fired — the
+    /// `Settled` lattice TOP, the mode-2 startup-completion edge. May fire
+    /// without [`Self::discovery_owed_announced`] having fired first when the
+    /// observer's first observe already sees a `Settled` debt (the empty-
+    /// corpus path latches `Settled` immediately alongside `RunComplete`),
+    /// so the narration is a PRESENCE latch on the value, not a transition
+    /// diff: an `Owed` observed first emits `discovery_owed_announced`, a
+    /// `Settled` observed first emits `discovery_settled_announced` only;
+    /// neither retroactively emits the other (the operator's question is
+    /// "is discovery done?", not "did this observer watch every step?").
+    discovery_settled_announced: bool,
+    /// `(origin, seq)` keys for which the "custom message posted" INFO line
+    /// has fired — the F5 inbox landing edge, narrating the topic the
+    /// consumer handler is about to dispatch on. Per-key edge-set; mirrors
+    /// `primary_lost_emitted` exactly.
+    ///
+    /// Posted is the only F5 lifecycle edge surfaced from state alone in
+    /// this narrator (#568): the matching `Handled`/`Failed` terminal lines
+    /// require label-preserving observation that the `compact_custom_watermark`
+    /// apply rule strips at the SAME apply that lands the terminal (see
+    /// `apply_custom.rs::compact_custom_watermark` and the doc-comment at
+    /// `apply_custom.rs`'s `custom_message_state` accessor — "the watermark
+    /// erases the Handled/Failed label"). The audit's terminal arms (Gap B
+    /// and Gap D-Handled) are therefore queued for the event-driven channel
+    /// follow-up #570; the state-derived narrator only surfaces the
+    /// lifecycle edge whose label IS in the converged mirror — the
+    /// `Unhandled` snapshot the [`ClusterState::custom_message_entries`]
+    /// iterator yields.
+    custom_posted_emitted: HashSet<(String, u64)>,
 }
 
 impl RunNarrator {
@@ -205,6 +254,10 @@ impl RunNarrator {
             live_remote_secondaries: HashSet::new(),
             last_primary: None,
             primary_lost_emitted: HashSet::new(),
+            wind_down_announced: HashSet::new(),
+            discovery_owed_announced: false,
+            discovery_settled_announced: false,
+            custom_posted_emitted: HashSet::new(),
         }
     }
 
@@ -370,6 +423,32 @@ impl RunNarrator {
         // the one-shot terminal summary: a failover is a mid-run transition,
         // the summary is the run's end.
         emitted |= self.narrate_failover(state);
+
+        // Per-incarnation wind-down directives (mid-run edge, #568): each
+        // landed `(secondary_id, member_gen)` pair narrates ONCE — the
+        // grow-only set + per-pair edge-set is the per-peer sibling of the
+        // global `graceful_abort_announced` latch below. WARN class: a SLURM
+        // job slot is about to be released intentionally (the directed
+        // secondary self-departs once its in-flight work drains) and the
+        // operator's `--important-stdio` stream is the only signal for that
+        // resource loss.
+        emitted |= self.narrate_wind_down(state);
+
+        // Discovery-debt startup boundaries (mid-run edges, #568): a one-shot
+        // INFO pair latched on the replicated three-state lattice. `Owed`
+        // narrates the mode-2 "awaiting compute-peer primary to seed task
+        // ledger" announcement; `Settled` narrates the "task ledger fully
+        // seeded" closing line. Neither retroactively emits the other — see
+        // the field docs (`Settled`-first on first observe is the empty-corpus
+        // path).
+        emitted |= self.narrate_discovery_debt(state);
+
+        // F5 custom-message LANDING edge (mid-run, #568): per-`(origin, seq)`
+        // INFO line carrying the topic the consumer handler will dispatch on.
+        // Terminal lines (Handled/Failed) are not surfaced here — see
+        // `narrate_custom_messages` for the label-erasure reason and the
+        // queued follow-up (#570).
+        emitted |= self.narrate_custom_messages(state);
 
         // One-shot graceful-abort REQUEST announcement (mid-run edge): the
         // replicated dispatch-freeze latch landed in the mirror. Narrated
@@ -651,6 +730,26 @@ impl RunNarrator {
         // iteration. While not operational, formation churn is absorbed into
         // the tracked baseline below but never emitted.
         let operational = !self.started_phases.is_empty();
+        // Run-terminal latch suppresses failover / membership narration
+        // (#563 Seam 3). The replicated terminal verdict — `RunAborted` (the
+        // deliberate failure twin every `broadcast_terminal_verdict`
+        // originator latches) or `RunComplete` (the clean-end latch) — means
+        // the run is over from the cluster's authoritative POV: a
+        // primary-changed line, a primary-lost line, or a peer-left line
+        // observed alongside (or after) the terminal latch is teardown
+        // churn, not a wake-worthy mid-run transition. The completion block
+        // in `observe` (the one-shot run-aborted / run-complete summary)
+        // owns the operator's terminal-state line; suppressing the
+        // failover-shaped lines here keeps that authoritative narration
+        // from being upstaged by a misleading "primary failed over to X"
+        // alarm. The baselines (`live_remote_secondaries`, `last_primary`)
+        // continue to advance UNCONDITIONALLY below so a fresh narrator
+        // started against a future un-aborted run still emits correctly;
+        // suppression is per-call on the emit predicates only, never
+        // retroactive. An UNRESOLVED in-flight failover (latch not yet
+        // observed) still narrates normally — this gate is reached only
+        // once the latch has converged on THIS observer.
+        let terminal = state.run_aborted().is_some() || state.run_complete();
 
         // PEER-LOST: a remote secondary that was live and is now absent from
         // the live set departed. A secondary that became the primary is NOT a
@@ -660,7 +759,10 @@ impl RunNarrator {
         // flicker.
         let live_count = live_remote.len();
         for departed in self.live_remote_secondaries.difference(&live_remote) {
-            if operational && Some(departed.as_str()) != current_primary.as_deref() {
+            if operational
+                && !terminal
+                && Some(departed.as_str()) != current_primary.as_deref()
+            {
                 tracing::warn!(
                     target: IMPORTANT_TARGET,
                     secondary = %departed,
@@ -674,7 +776,7 @@ impl RunNarrator {
         // joined AFTER the run was operational (a never-before-seen id — the
         // sticky-Dead ledger means a departed id cannot reappear).
         for joined in live_remote.difference(&self.live_remote_secondaries) {
-            if operational {
+            if operational && !terminal {
                 tracing::info!(
                     target: IMPORTANT_TARGET,
                     secondary = %joined,
@@ -695,6 +797,7 @@ impl RunNarrator {
         // edge-set advances only on a real emit, so a loss that began while
         // gated still narrates once work starts if still unresolved.
         if operational
+            && !terminal
             && let Some(primary) = current_primary.as_deref()
             && !state.is_peer_alive(primary)
             && self.primary_lost_emitted.insert(primary.to_owned())
@@ -716,7 +819,7 @@ impl RunNarrator {
         // same id (different epoch) still narrates.
         let current = current_primary.map(|id| (id, state.primary_epoch()));
         if current.is_some() && current != self.last_primary {
-            if operational && let Some((id, epoch)) = current.as_ref() {
+            if operational && !terminal && let Some((id, epoch)) = current.as_ref() {
                 tracing::warn!(
                     target: IMPORTANT_TARGET,
                     primary = %id,
@@ -726,6 +829,119 @@ impl RunNarrator {
                 emitted = true;
             }
             self.last_primary = current;
+        }
+        emitted
+    }
+
+    /// Narrate every newly-landed `(secondary_id, member_gen)` pair from the
+    /// replicated [`dynrunner_protocol_primary_secondary::ClusterMutation::WindDownRequested`]
+    /// grow-only set, idempotently per pair. The line is WARN because the
+    /// directed secondary will self-depart at its next quiescence and
+    /// release its SLURM job slot — the operator must see the resource loss
+    /// landing. Mirrors the per-id-edge-set shape of
+    /// [`Self::primary_lost_emitted`] exactly.
+    ///
+    /// Returns whether ≥1 line was emitted (folded into [`Self::observe`]'s
+    /// emitted-anything contract).
+    fn narrate_wind_down<I: Identifier>(&mut self, state: &ClusterState<I>) -> bool {
+        let mut emitted = false;
+        for (secondary_id, member_gen) in state.wind_down_requested_pairs() {
+            if self
+                .wind_down_announced
+                .insert((secondary_id.to_string(), member_gen))
+            {
+                tracing::warn!(
+                    target: IMPORTANT_TARGET,
+                    secondary = %secondary_id,
+                    member_gen = member_gen,
+                    "wind-down requested for replacement secondary {secondary_id} \
+                     (gen {member_gen}) — will drain and release slot",
+                );
+                emitted = true;
+            }
+        }
+        emitted
+    }
+
+    /// Narrate the mode-2 discovery-debt startup boundary — the `Owed` /
+    /// `Settled` lattice values, each as a one-shot INFO. `Undeclared` (the
+    /// default/cold-seeded shape) keeps both bools `false` and the block is
+    /// inert — exactly the precedent the setup-task block uses for a
+    /// setup-free run (`total == 0` early-returns).
+    ///
+    /// PRESENCE latch (not a transition diff): an observer whose first
+    /// observe sees the CRDT already at `Settled` (the relocation-inherited
+    /// shape) narrates ONLY the `Settled` line — `Owed` is silent in that
+    /// case, since the operator's question is "is discovery done?", not
+    /// "did this observer watch every step?". An observer that watches
+    /// `Owed` then `Settled` narrates both lines in order on the respective
+    /// observes.
+    ///
+    /// Returns whether ≥1 line was emitted (folded into [`Self::observe`]'s
+    /// emitted-anything contract).
+    fn narrate_discovery_debt<I: Identifier>(&mut self, state: &ClusterState<I>) -> bool {
+        let mut emitted = false;
+        match state.discovery_debt() {
+            DiscoveryDebt::Undeclared => {}
+            DiscoveryDebt::Owed => {
+                if !self.discovery_owed_announced {
+                    self.discovery_owed_announced = true;
+                    tracing::info!(
+                        target: IMPORTANT_TARGET,
+                        "discovery owed — awaiting compute-peer primary to seed task ledger",
+                    );
+                    emitted = true;
+                }
+            }
+            DiscoveryDebt::Settled => {
+                if !self.discovery_settled_announced {
+                    self.discovery_settled_announced = true;
+                    tracing::info!(
+                        target: IMPORTANT_TARGET,
+                        "discovery settled — task ledger fully seeded by compute-peer primary",
+                    );
+                    emitted = true;
+                }
+            }
+        }
+        emitted
+    }
+
+    /// Narrate the F5 custom-message LANDING edge — the `Unhandled` state
+    /// from the replicated `custom_messages` inbox, one INFO line per
+    /// `(origin, seq)` key. Mirrors the per-id-edge-set shape of
+    /// [`Self::primary_lost_emitted`]: the line carries the topic so the
+    /// operator's wake-stream names what the handler is about to dispatch
+    /// on.
+    ///
+    /// Terminals (`Handled`, `Failed`) are NOT surfaced here — the
+    /// `compact_custom_watermark` apply rule erases the Handled/Failed
+    /// label at the SAME apply that lands the terminal, so a state-derived
+    /// narrator cannot tell the two apart from the post-apply mirror; the
+    /// audit's Gap B (Failed → ERROR) and Gap D-Handled (→ INFO) split is
+    /// queued for the event-driven follow-up #570 (sibling to
+    /// [`crate::observer::task_narrator::ObserverTaskNarrator`], which
+    /// receives per-mutation events that retain the label).
+    ///
+    /// Returns whether ≥1 line was emitted (folded into [`Self::observe`]'s
+    /// emitted-anything contract).
+    fn narrate_custom_messages<I: Identifier>(&mut self, state: &ClusterState<I>) -> bool {
+        let mut emitted = false;
+        for (origin, seq, msg_state) in state.custom_message_entries() {
+            if let CustomMsgState::Unhandled { topic, .. } = msg_state
+                && self
+                    .custom_posted_emitted
+                    .insert((origin.to_string(), seq))
+            {
+                tracing::info!(
+                    target: IMPORTANT_TARGET,
+                    origin = %origin,
+                    seq = seq,
+                    topic = %topic,
+                    "custom message posted: {topic} from {origin} (seq {seq})",
+                );
+                emitted = true;
+            }
         }
         emitted
     }
@@ -2353,6 +2569,569 @@ mod tests {
         assert!(
             start_idx < notes[0] && notes[0] < done_idx,
             "the note rides together with the hosting iteration: {events:?}"
+        );
+    }
+
+    // ── #563 Seam 3 — failover-narration suppression under the run-terminal latch ──
+    //
+    // Production trace (asm-tokenizer 2026-06-15): the observer saw a
+    // "primary failed over to secondary-1 (epoch 2)" WARN line and NO "run
+    // aborted — shutting down" ERROR line, because the dying primary's
+    // RunAborted broadcast was lost on the observer's leg (the existing
+    // `await_terminal_observer_delivery` 60s re-broadcast hold is observer-
+    // leg-only and cannot retroactively cover a never-formed leg). When the
+    // verdict DID converge — via snapshot pull / anti-entropy — the
+    // narrator's emit ordering puts `narrate_failover` BEFORE the
+    // run_aborted completion block, so the operator's eye lands on the
+    // failover narrative even when the run-aborted line ALSO fires the
+    // same iteration. Seam 3 gates the FAILOVER / MEMBERSHIP narration on
+    // `run_aborted().is_some() || run_complete()`: under a terminal latch
+    // all churn is teardown noise; the completion block is the single
+    // owner of the operator's terminal-state line.
+
+    /// SEAM 3 — when a `PrimaryChanged` and a `RunAborted` are both
+    /// observed in the same window (the asm-tokenizer 2026-06-15 race), the
+    /// "primary failed over" WARN is SUPPRESSED and the "run aborted —
+    /// shutting down" ERROR fires with the verbatim reason. Pinned here so
+    /// the operator's authoritative terminal-state line is not upstaged by
+    /// the now-noise failover label.
+    #[test]
+    fn primary_failed_over_suppressed_under_run_aborted_latch() {
+        const ABORT_REASON: &str = "runtime spawn_tasks rejected 46497 task(s): \
+                                    [duplicate task identity dependency_graph, ...]";
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            set_primary(&mut state, "p1", 1);
+            join_secondary(&mut state, "p1");
+            join_secondary(&mut state, "p2");
+
+            let mut narrator = RunNarrator::new();
+            // Seed at p1 silently.
+            narrator.observe(&state);
+            // The failover + the terminal verdict converge in the same observe
+            // window — the production race the user's transcript captured.
+            remove_peer(&mut state, "p1");
+            set_primary(&mut state, "p2", 2);
+            state.apply(ClusterMutation::RunAborted {
+                reason: ABORT_REASON.into(),
+                counts: Default::default(),
+            });
+            narrator.observe(&state);
+            // Subsequent observes must stay quiet on the failover seam (the
+            // baseline advanced; the gate stays terminal-suppressed).
+            narrator.observe(&state);
+        });
+
+        assert!(
+            events.iter().all(|e| !e.message.contains("failed over to")),
+            "the failover narration must be SUPPRESSED under a latched RunAborted; \
+             got events: {events:?}",
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| !e.message.contains("failover in progress")),
+            "the primary-lost narration must also be SUPPRESSED under the latch; \
+             got events: {events:?}",
+        );
+        let aborted: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("run aborted"))
+            .collect();
+        assert_eq!(
+            aborted.len(),
+            1,
+            "exactly one 'run aborted — shutting down' line carries the operator's \
+             terminal state: {events:?}",
+        );
+        assert_eq!(
+            aborted[0].fields.get("reason").map(String::as_str),
+            Some(ABORT_REASON),
+            "the run-aborted line must carry the dying primary's VERBATIM reason \
+             (the rejection-id list the user expects to see)",
+        );
+    }
+
+    /// SEAM 3 — symmetric clean-finish: a `RunComplete` latch ALSO
+    /// suppresses the failover narration. The previously-flagged BUG-B
+    /// shape (a clean-end leg drop racing the completion broadcast) must
+    /// not narrate as a benign-looking failover.
+    #[test]
+    fn primary_failed_over_suppressed_under_run_complete_latch() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            set_primary(&mut state, "p1", 1);
+            join_secondary(&mut state, "p1");
+            join_secondary(&mut state, "p2");
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state);
+            remove_peer(&mut state, "p1");
+            set_primary(&mut state, "p2", 2);
+            state.apply(ClusterMutation::RunComplete {
+                counts: Default::default(),
+            });
+            narrator.observe(&state);
+        });
+
+        assert!(
+            events.iter().all(|e| !e.message.contains("failed over to")),
+            "the failover narration must be SUPPRESSED under a latched RunComplete; \
+             got events: {events:?}",
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.message.contains("run complete"))
+                .count(),
+            1,
+            "exactly one 'run complete' line is the operator's terminal-state line: \
+             {events:?}",
+        );
+    }
+
+    /// SEAM 3 — secondary-membership churn (peer-left / peer-rejoined)
+    /// is ALSO suppressed under the terminal latch. A teardown phase's
+    /// membership flicker (peers dropping out as the cluster winds down)
+    /// is not a wake-worthy operator event under an authored terminal.
+    #[test]
+    fn membership_churn_suppressed_under_run_terminal_latch() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            set_primary(&mut state, "p1", 1);
+            join_secondary(&mut state, "p1");
+            join_secondary(&mut state, "p2");
+            join_secondary(&mut state, "p3");
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state); // seed
+            // Terminal latch lands first.
+            state.apply(ClusterMutation::RunAborted {
+                reason: "deliberate".into(),
+                counts: Default::default(),
+            });
+            // Now a peer departs as part of teardown — should NOT narrate.
+            remove_peer(&mut state, "p2");
+            narrator.observe(&state);
+        });
+
+        assert!(
+            events
+                .iter()
+                .all(|e| !e.message.contains("secondary left the cluster")),
+            "peer-departure narration is teardown noise under the latch: {events:?}",
+        );
+    }
+
+    /// SEAM 3 NEGATIVE REGRESSION — a mid-run failover with NO terminal
+    /// latch still narrates exactly as before. Pinned here so a future
+    /// refactor that misplaced the `terminal` factor (e.g. inverted, or
+    /// applied unconditionally) is caught locally to the narrator file.
+    /// Mirrors the existing `primary_changed_on_failover_once` test —
+    /// kept here so the suppression's negative twin is grouped with its
+    /// positive cases.
+    #[test]
+    fn no_latch_still_narrates_failover_regression() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            set_primary(&mut state, "p1", 1);
+            join_secondary(&mut state, "p1");
+            join_secondary(&mut state, "p2");
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state); // seed at p1 silently
+            remove_peer(&mut state, "p1");
+            set_primary(&mut state, "p2", 2);
+            // NO RunAborted / RunComplete applied — pure mid-run failover.
+            narrator.observe(&state);
+        });
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.message.contains("failed over to"))
+                .count(),
+            1,
+            "without a terminal latch, mid-run failover must still narrate (no \
+             regression on the BUG-H shape): {events:?}",
+        );
+    }
+
+    /// SEAM 3 — UNRESOLVED failover (latch not yet observed) still
+    /// narrates the primary-lost line; the terminal-suppression is
+    /// strictly per-call. This is the "primary left the mesh — failover
+    /// in progress" path: observed BEFORE the verdict converges, narrated
+    /// as normal; once the verdict converges, subsequent observes do not
+    /// re-emit (the once-per-id edge-set advances on the real emit). No
+    /// prior emit is rewound — the gate is per-call only.
+    #[test]
+    fn unresolved_failover_pre_latch_still_narrates_then_suppresses() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            set_primary(&mut state, "p1", 1);
+            join_secondary(&mut state, "p1");
+            join_secondary(&mut state, "p2");
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state); // seed at p1
+            // p1 leaves; NO terminal latch yet — primary-lost must narrate.
+            remove_peer(&mut state, "p1");
+            narrator.observe(&state);
+            // Verdict converges later; the membership-departure has ALREADY
+            // narrated. The terminal-suppression gate does NOT rewind it.
+            state.apply(ClusterMutation::RunAborted {
+                reason: "late convergence".into(),
+                counts: Default::default(),
+            });
+            narrator.observe(&state);
+        });
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.message.contains("failover in progress"))
+                .count(),
+            1,
+            "the in-flight failover narrated before the verdict converged (per-call \
+             suppression, not retroactive): {events:?}",
+        );
+        // The completion block also fires once.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.message.contains("run aborted"))
+                .count(),
+            1,
+            "the terminal verdict narrates once when it lands: {events:?}",
+        );
+    }
+
+    // ── #568 — completion of #520's CRDT-change coverage ──
+    //
+    // The 4 audit gaps below are all PRESENCE / once-per-key edge emits over
+    // CRDT projections — the same shape as the started/done/retry/setup
+    // blocks above. Each test applies the relevant `ClusterMutation`, drives
+    // `observe()`, and asserts exactly ONE line on the IMPORTANT target with
+    // the right class. A regression sibling at the bottom verifies a static
+    // sibling (`PhaseDepsSet`) stays SILENT — the negative twin pinning that
+    // the new arms emit only on the CRDT changes they own.
+
+    /// Gap A — `WindDownRequested` for `(secondary_id, member_gen)` narrates
+    /// one WARN line carrying the pair (operator wake: a SLURM slot is about
+    /// to be released). Idempotent across re-observes; a SECOND directive at
+    /// a NEW generation for the same id narrates again (different pair).
+    #[test]
+    fn wind_down_requested_narrates_once_per_pair() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            let mut narrator = RunNarrator::new();
+            // First directive lands → one WARN.
+            state.apply(ClusterMutation::WindDownRequested {
+                secondary_id: "replacement-1".to_string(),
+                member_gen: 7,
+            });
+            narrator.observe(&state);
+            // Re-observe of the unchanged ledger: idempotent.
+            narrator.observe(&state);
+            // A directive at a NEW generation for the SAME id is a distinct
+            // pair → narrates again (the grow-only set keys on the full pair).
+            state.apply(ClusterMutation::WindDownRequested {
+                secondary_id: "replacement-1".to_string(),
+                member_gen: 9,
+            });
+            narrator.observe(&state);
+            // And a directive for a different id at gen 7.
+            state.apply(ClusterMutation::WindDownRequested {
+                secondary_id: "replacement-2".to_string(),
+                member_gen: 7,
+            });
+            narrator.observe(&state);
+            // Final stable re-observe: idempotent.
+            narrator.observe(&state);
+        });
+
+        let wd: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("wind-down requested"))
+            .collect();
+        assert_eq!(
+            wd.len(),
+            3,
+            "one WARN per distinct (id, member_gen) pair: {events:?}",
+        );
+        // Pin the exact identity each line carries.
+        let pairs: Vec<(Option<&str>, Option<&str>)> = wd
+            .iter()
+            .map(|e| {
+                (
+                    e.fields.get("secondary").map(String::as_str),
+                    e.fields.get("member_gen").map(String::as_str),
+                )
+            })
+            .collect();
+        assert!(pairs.contains(&(Some("replacement-1"), Some("7"))));
+        assert!(pairs.contains(&(Some("replacement-1"), Some("9"))));
+        assert!(pairs.contains(&(Some("replacement-2"), Some("7"))));
+    }
+
+    /// Gap D-Posted — the F5 inbox LANDING edge narrates one INFO line per
+    /// `(origin, seq)` key the moment the `Unhandled` snapshot lands, carrying
+    /// the topic the handler is about to dispatch on. Idempotent across
+    /// re-observes; per-key — distinct origins and seqs each narrate once.
+    ///
+    /// Terminals (`Handled`/`Failed`) are NOT covered by THIS narrator —
+    /// the `compact_custom_watermark` apply rule erases the label, so the
+    /// state-derived path cannot distinguish them; #570 owns the
+    /// event-driven follow-up that surfaces the terminal split.
+    #[test]
+    fn custom_message_posted_narrates_once_per_key() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            let mut narrator = RunNarrator::new();
+
+            // Key #1 lands as Posted (Unhandled) → one INFO carrying topic.
+            state.apply(ClusterMutation::CustomMessagePosted {
+                origin: "n1".to_string(),
+                seq: 1,
+                topic: "important-topic".to_string(),
+                data: vec![1, 2, 3],
+            });
+            narrator.observe(&state);
+            narrator.observe(&state); // idempotent re-observe.
+
+            // A distinct (origin, seq) — second INFO.
+            state.apply(ClusterMutation::CustomMessagePosted {
+                origin: "n2".to_string(),
+                seq: 1,
+                topic: "user-topic".to_string(),
+                data: vec![4, 5],
+            });
+            narrator.observe(&state);
+            narrator.observe(&state); // idempotent.
+        });
+
+        let posted: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.starts_with("custom message posted:"))
+            .collect();
+        assert_eq!(
+            posted.len(),
+            2,
+            "one posted line per (origin, seq) key: {events:?}"
+        );
+        let posted_topics: Vec<Option<&str>> = posted
+            .iter()
+            .map(|e| e.fields.get("topic").map(String::as_str))
+            .collect();
+        assert!(posted_topics.contains(&Some("important-topic")));
+        assert!(posted_topics.contains(&Some("user-topic")));
+        let posted_origins: Vec<Option<&str>> = posted
+            .iter()
+            .map(|e| e.fields.get("origin").map(String::as_str))
+            .collect();
+        assert!(posted_origins.contains(&Some("n1")));
+        assert!(posted_origins.contains(&Some("n2")));
+    }
+
+    /// #570 follow-up boundary — the state-derived narrator does NOT emit a
+    /// terminal line for `CustomMessageHandled` / `CustomMessageFailed`.
+    /// `compact_custom_watermark` (apply_custom.rs) erases the
+    /// Handled/Failed label at the SAME apply that lands the terminal, so a
+    /// state-derived path cannot distinguish the two; the audit's Gap B +
+    /// Gap D-Handled split lines belong on the event-driven channel (#570)
+    /// that retains the label per-mutation. This test pins the silence so a
+    /// future change that re-adds a degraded "terminal" line from state
+    /// alone is caught here.
+    #[test]
+    fn custom_message_terminals_are_silent_in_state_narrator() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            let mut narrator = RunNarrator::new();
+
+            // Unhandled → Posted line narrates as usual.
+            state.apply(ClusterMutation::CustomMessagePosted {
+                origin: "n1".to_string(),
+                seq: 1,
+                topic: "t".to_string(),
+                data: vec![1],
+            });
+            narrator.observe(&state);
+            // Clean handler → Handled (compacts immediately, label erased).
+            state.apply(ClusterMutation::CustomMessageHandled {
+                origin: "n1".to_string(),
+                seq: 1,
+            });
+            narrator.observe(&state);
+
+            // Different key: handler raises → Failed (compacts immediately).
+            state.apply(ClusterMutation::CustomMessagePosted {
+                origin: "n2".to_string(),
+                seq: 1,
+                topic: "u".to_string(),
+                data: vec![2],
+            });
+            narrator.observe(&state);
+            state.apply(ClusterMutation::CustomMessageFailed {
+                origin: "n2".to_string(),
+                seq: 1,
+            });
+            narrator.observe(&state);
+        });
+
+        assert!(
+            events
+                .iter()
+                .all(|e| !e.message.starts_with("custom message handled:")),
+            "the state-derived narrator never emits a 'handled' terminal line — #570 \
+             owns the event-driven follow-up that retains the label: {events:?}",
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| !e.message.starts_with("custom message handler FAILED")),
+            "the state-derived narrator never emits a 'handler FAILED' terminal line — \
+             #570 owns the event-driven follow-up: {events:?}",
+        );
+        // The Posted lines DO narrate, one per key — pins that the
+        // landing-edge arm is unaffected by the terminal-silence policy.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.message.starts_with("custom message posted:"))
+                .count(),
+            2,
+            "the landing-edge narration is unaffected by the terminal-silence policy: \
+             {events:?}",
+        );
+    }
+
+    /// Gap C — `DiscoveryDebtDeclared` narrates the "discovery owed" INFO
+    /// once; the later `DiscoverySettled` narrates the "discovery settled"
+    /// INFO once. A run that never declares debt stays silent on this seam.
+    #[test]
+    fn discovery_debt_owed_then_settled_narrates_each_once() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            let mut narrator = RunNarrator::new();
+            // Owed lands first → one INFO.
+            state.apply(ClusterMutation::DiscoveryDebtDeclared);
+            narrator.observe(&state);
+            narrator.observe(&state); // idempotent on Owed.
+            // Then Settled lands → one INFO closing line.
+            state.apply(ClusterMutation::DiscoverySettled);
+            narrator.observe(&state);
+            narrator.observe(&state); // idempotent on Settled.
+        });
+
+        let owed: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("discovery owed"))
+            .collect();
+        assert_eq!(owed.len(), 1, "one owed line: {events:?}");
+
+        let settled: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("discovery settled"))
+            .collect();
+        assert_eq!(settled.len(), 1, "one settled line: {events:?}");
+
+        // Ordering: owed precedes settled.
+        let oi = events
+            .iter()
+            .position(|e| e.message.contains("discovery owed"))
+            .unwrap();
+        let si = events
+            .iter()
+            .position(|e| e.message.contains("discovery settled"))
+            .unwrap();
+        assert!(oi < si, "owed precedes settled: {events:?}");
+    }
+
+    /// Gap C — the PRESENCE-latch shape: an observer whose first observe
+    /// already sees a converged `Settled` mirror (the relocation-inherited
+    /// shape, OR the empty-corpus path that latches `Settled` immediately)
+    /// narrates ONLY the "discovery settled" line. The intermediate `Owed`
+    /// line is silent because this observer never saw that value.
+    #[test]
+    fn discovery_settled_first_observe_skips_the_owed_line() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            // A relocated observer inherits the already-converged Settled.
+            state.apply(ClusterMutation::DiscoveryDebtDeclared);
+            state.apply(ClusterMutation::DiscoverySettled);
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state);
+            narrator.observe(&state); // idempotent.
+        });
+
+        assert!(
+            events.iter().all(|e| !e.message.contains("discovery owed")),
+            "first-observe at Settled skips the Owed line: {events:?}",
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.message.contains("discovery settled"))
+                .count(),
+            1,
+            "the Settled-first observer narrates the settled line once: {events:?}",
+        );
+    }
+
+    /// Gap C negative — a run that never declares debt (the cold-seeded /
+    /// mode-1 shape, `DiscoveryDebt::Undeclared`) narrates NEITHER line.
+    /// Mirrors the `no_setup_tasks_narrates_no_setup_lines` precedent: a
+    /// state-derived feature must be inert when its CRDT projection is the
+    /// default/bottom value.
+    #[test]
+    fn discovery_debt_undeclared_narrates_nothing() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            add(&mut state, &task("compile", "a", &[]));
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state);
+        });
+        assert!(
+            events.iter().all(|e| !e.message.contains("discovery")),
+            "an Undeclared run narrates no discovery line: {events:?}",
+        );
+    }
+
+    /// Negative-regression for the bundle — a sibling state-shape mutation
+    /// (`PhaseDepsSet`) that this narrator does NOT own emits ZERO new
+    /// lines on its own. Pins that the new emit arms are gated on their
+    /// own CRDT projections; an unrelated static-config mutation does not
+    /// trigger any of them.
+    #[test]
+    fn unrelated_static_config_mutation_emits_no_new_lines() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            state.apply(ClusterMutation::PhaseDepsSet {
+                deps: std::collections::HashMap::from([(
+                    PhaseId::from("late"),
+                    vec![PhaseId::from("early")],
+                )]),
+            });
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state);
+            narrator.observe(&state);
+        });
+
+        assert!(
+            events.iter().all(|e| {
+                let m = &e.message;
+                !m.contains("wind-down")
+                    && !m.contains("discovery owed")
+                    && !m.contains("discovery settled")
+                    && !m.contains("custom message")
+            }),
+            "PhaseDepsSet emits none of the #568 narration lines: {events:?}",
         );
     }
 }

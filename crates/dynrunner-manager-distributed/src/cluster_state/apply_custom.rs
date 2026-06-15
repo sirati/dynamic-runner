@@ -221,6 +221,26 @@ impl<I: Identifier> ClusterState<I> {
     /// [`Self::unhandled_custom_messages`]: the monitor needs counts +
     /// identities every heartbeat tick, and cloning every ≤100 KB
     /// payload for that would be pure waste.
+    /// Borrow-only iterator over every live inbox entry as
+    /// `(origin, seq, &CustomMsgState)` — the [`crate::run_narrator`]'s read
+    /// surface for the F5 custom-message lifecycle (Posted / Handled /
+    /// Failed). Sibling of [`Self::unhandled_custom_messages`]
+    /// (handler-dispatch reads only `Unhandled`, owned-clone of the payload):
+    /// the narrator wants the FULL state machine on every observe so its
+    /// per-state edge-sets advance, and only borrows the `&CustomMsgState`
+    /// (the `Unhandled` carries the topic + body — narration reads just the
+    /// topic, the body never crosses the seam). Watermark-subsumed keys are
+    /// not surfaced — they have ALREADY been physically pruned and the
+    /// narrator's per-key edge-set already fired the terminal line at the
+    /// transition, so re-yielding them would do nothing.
+    pub(crate) fn custom_message_entries(
+        &self,
+    ) -> impl Iterator<Item = (&str, u64, &CustomMsgState)> {
+        self.custom_messages
+            .iter()
+            .map(|((origin, seq), state)| (origin.as_str(), *seq, state))
+    }
+
     pub(crate) fn unhandled_custom_message_keys(&self) -> Vec<(String, u64)> {
         let mut out: Vec<(String, u64)> = self
             .custom_messages
