@@ -48,6 +48,7 @@ fn pinfo(id: &str) -> PeerConnectionInfo {
         port: 59124,
         is_observer: false,
         liveness_port: None,
+        slurm_job_id: None,
     }
 }
 
@@ -149,6 +150,7 @@ async fn joiner_above_seed_forms_real_leg() {
                 port: seed.port(),
                 is_observer: false,
                 liveness_port: None,
+                slurm_job_id: None,
             };
 
             // The joiner dials its seed (joining-mode: it dials a lower-id

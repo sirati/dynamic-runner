@@ -58,6 +58,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // advertised none (older sender) rides `None` and is
                 // simply not beaconed.
                 liveness_port: s.liveness_port(),
+                // #556: the per-peer SLURM job id from the typestate
+                // record. `None` for the pre-upgrade peer + the non-
+                // SLURM-launched secondary (local/in-process, observer);
+                // the respawn pipeline's scancel step skips `None`.
+                slurm_job_id: s.slurm_job_id().map(str::to_string),
             })
             .collect()
     }

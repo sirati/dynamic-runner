@@ -215,6 +215,6 @@ pub(super) fn push_timeout_query<I: Identifier>(
 /// `TimeoutResponse` (so it cannot agree) nor accept a `PromotionVote` (so
 /// it cannot confirm), so counting it would inflate the quorum past what
 /// the agreeing/confirming set can ever reach (re-opening a quorum trap).
-pub(super) fn failover_quorum(live_peer_count: usize) -> usize {
+pub(crate) fn failover_quorum(live_peer_count: usize) -> usize {
     live_peer_count.div_ceil(2) + 1
 }

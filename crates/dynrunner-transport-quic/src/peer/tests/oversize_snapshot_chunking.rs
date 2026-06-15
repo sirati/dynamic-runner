@@ -37,6 +37,7 @@ async fn connected_pair() -> (PeerNetwork<TestId>, PeerNetwork<TestId>) {
             port: peer_a.port(),
             is_observer: false,
             liveness_port: None,
+            slurm_job_id: None,
         },
         PeerConnectionInfo {
             secondary_id: "peer-b".into(),
@@ -46,6 +47,7 @@ async fn connected_pair() -> (PeerNetwork<TestId>, PeerNetwork<TestId>) {
             port: peer_b.port(),
             is_observer: false,
             liveness_port: None,
+            slurm_job_id: None,
         },
     ];
     peer_a.connect_to_peers(&peers);

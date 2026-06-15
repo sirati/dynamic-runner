@@ -92,6 +92,7 @@ async fn half_open_member_leg_heals_via_redial_request() {
                     port: peer_a.port(),
                     is_observer: false,
                     liveness_port: None,
+                    slurm_job_id: None,
                 },
                 PeerConnectionInfo {
                     secondary_id: "peer-b".into(),
@@ -101,6 +102,7 @@ async fn half_open_member_leg_heals_via_redial_request() {
                     port: peer_b.port(),
                     is_observer: false,
                     liveness_port: None,
+                    slurm_job_id: None,
                 },
                 PeerConnectionInfo {
                     secondary_id: "peer-c".into(),
@@ -110,6 +112,7 @@ async fn half_open_member_leg_heals_via_redial_request() {
                     port: peer_c.port(),
                     is_observer: false,
                     liveness_port: None,
+                    slurm_job_id: None,
                 },
             ];
 
@@ -514,6 +517,7 @@ async fn member_redial_tracking_stops_on_membership_departure() {
                     port: 1,
                     is_observer: false,
                     liveness_port: None,
+                    slurm_job_id: None,
                 },
                 PeerConnectionInfo {
                     secondary_id: "peer-b".into(),
@@ -523,6 +527,7 @@ async fn member_redial_tracking_stops_on_membership_departure() {
                     port: peer_b.port(),
                     is_observer: false,
                     liveness_port: None,
+                    slurm_job_id: None,
                 },
             ];
             peer_b.connect_to_peers(&roster);

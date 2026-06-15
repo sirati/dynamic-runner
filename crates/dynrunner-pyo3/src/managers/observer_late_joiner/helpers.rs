@@ -94,6 +94,7 @@ pub(super) fn records_to_seed(records: &[PeerInfoRecord]) -> Vec<PeerConnectionI
                 // The on-disk peer-info-dir record carries no liveness port,
                 // and the observer needs none, so `None`.
                 liveness_port: None,
+                slurm_job_id: None,
             })
         })
         .collect()
@@ -347,6 +348,7 @@ mod tests {
             port: 5000,
             is_observer: false,
             liveness_port: None,
+            slurm_job_id: None,
         }
     }
 

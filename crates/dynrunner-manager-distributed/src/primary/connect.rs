@@ -488,6 +488,65 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // recognise the member as the holder and withdraw any requeued
             // duplicate copy on another member. See `handle_inflight_roster`.
             MessageType::InFlightRoster => self.handle_inflight_roster(msg).await,
+            // #556 mesh-consensus replies from non-suspected secondaries.
+            // `ResolvedPeer` is positive liveness evidence for a suspect
+            // (the witness heard back from the probed peer); `RestartConfirm`
+            // is the round-2 commit reply on whether to proceed with
+            // mesh-declaring the candidate batch dead. Both feed the
+            // FSM via the thin wiring layer; the FSM owns the tally + the
+            // round verdict. A frame that arrives outside the FSM's
+            // in-flight round (stale `consensus_id`) is dropped inside
+            // the FSM — no special-case here.
+            MessageType::ResolvedPeer => {
+                if let DistributedMessage::ResolvedPeer {
+                    consensus_id,
+                    observer_id,
+                    resolved,
+                    ..
+                } = msg
+                {
+                    self.apply_consensus_resolved(
+                        consensus_id,
+                        &observer_id,
+                        &resolved,
+                    )
+                    .await;
+                }
+            }
+            MessageType::RestartConfirm => {
+                if let DistributedMessage::RestartConfirm {
+                    consensus_id,
+                    responder_id,
+                    still_suspicious,
+                    resolved_since,
+                    ..
+                } = msg
+                {
+                    self.apply_consensus_confirm(
+                        consensus_id,
+                        &responder_id,
+                        still_suspicious,
+                        resolved_since,
+                    )
+                    .await;
+                }
+            }
+            // The primary never legitimately RECEIVES `SuspectPeers` /
+            // `RestartRequest` (those are primary-emitted) or
+            // `PeerProbe` / `PeerProbeAck` (those are secondary-to-secondary).
+            // A landing here is either a wire-routing bug or a
+            // co-located-loopback echo and is dropped silently — same
+            // shape as the historical `other` catchall.
+            MessageType::SuspectPeers
+            | MessageType::RestartRequest
+            | MessageType::PeerProbe
+            | MessageType::PeerProbeAck => {
+                tracing::debug!(
+                    msg_type = ?msg.msg_type(),
+                    "#556 consensus frame addressed to primary that the \
+                     primary does not consume; dropping (wire-routing edge)"
+                );
+            }
             other => {
                 tracing::debug!(?other, "unhandled message type");
             }

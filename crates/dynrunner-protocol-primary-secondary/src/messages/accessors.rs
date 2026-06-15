@@ -66,7 +66,13 @@ impl<I> DistributedMessage<I> {
             | Self::IllegallyAssignedToNonidleWorker { target, .. }
             | Self::RequestInFlightRoster { target, .. }
             | Self::InFlightRoster { target, .. }
-            | Self::WithdrawTask { target, .. } => target.as_ref(),
+            | Self::WithdrawTask { target, .. }
+            | Self::SuspectPeers { target, .. }
+            | Self::ResolvedPeer { target, .. }
+            | Self::RestartRequest { target, .. }
+            | Self::RestartConfirm { target, .. }
+            | Self::PeerProbe { target, .. }
+            | Self::PeerProbeAck { target, .. } => target.as_ref(),
         }
     }
 
@@ -126,7 +132,13 @@ impl<I> DistributedMessage<I> {
             | Self::IllegallyAssignedToNonidleWorker { target, .. }
             | Self::RequestInFlightRoster { target, .. }
             | Self::InFlightRoster { target, .. }
-            | Self::WithdrawTask { target, .. } => target,
+            | Self::WithdrawTask { target, .. }
+            | Self::SuspectPeers { target, .. }
+            | Self::ResolvedPeer { target, .. }
+            | Self::RestartRequest { target, .. }
+            | Self::RestartConfirm { target, .. }
+            | Self::PeerProbe { target, .. }
+            | Self::PeerProbeAck { target, .. } => target,
         };
         *slot = Some(dst);
     }
@@ -200,7 +212,13 @@ impl<I> DistributedMessage<I> {
             | Self::IllegallyAssignedToNonidleWorker { target, .. }
             | Self::RequestInFlightRoster { target, .. }
             | Self::InFlightRoster { target, .. }
-            | Self::WithdrawTask { target, .. } => target,
+            | Self::WithdrawTask { target, .. }
+            | Self::SuspectPeers { target, .. }
+            | Self::ResolvedPeer { target, .. }
+            | Self::RestartRequest { target, .. }
+            | Self::RestartConfirm { target, .. }
+            | Self::PeerProbe { target, .. }
+            | Self::PeerProbeAck { target, .. } => target,
         };
         *slot = None;
     }
@@ -255,7 +273,13 @@ impl<I> DistributedMessage<I> {
             | Self::IllegallyAssignedToNonidleWorker { sender_id, .. }
             | Self::RequestInFlightRoster { sender_id, .. }
             | Self::InFlightRoster { sender_id, .. }
-            | Self::WithdrawTask { sender_id, .. } => sender_id,
+            | Self::WithdrawTask { sender_id, .. }
+            | Self::SuspectPeers { sender_id, .. }
+            | Self::ResolvedPeer { sender_id, .. }
+            | Self::RestartRequest { sender_id, .. }
+            | Self::RestartConfirm { sender_id, .. }
+            | Self::PeerProbe { sender_id, .. }
+            | Self::PeerProbeAck { sender_id, .. } => sender_id,
         }
     }
 
@@ -309,7 +333,13 @@ impl<I> DistributedMessage<I> {
             | Self::IllegallyAssignedToNonidleWorker { timestamp, .. }
             | Self::RequestInFlightRoster { timestamp, .. }
             | Self::InFlightRoster { timestamp, .. }
-            | Self::WithdrawTask { timestamp, .. } => *timestamp,
+            | Self::WithdrawTask { timestamp, .. }
+            | Self::SuspectPeers { timestamp, .. }
+            | Self::ResolvedPeer { timestamp, .. }
+            | Self::RestartRequest { timestamp, .. }
+            | Self::RestartConfirm { timestamp, .. }
+            | Self::PeerProbe { timestamp, .. }
+            | Self::PeerProbeAck { timestamp, .. } => *timestamp,
         }
     }
 
@@ -597,6 +627,12 @@ impl<I> DistributedMessage<I> {
             Self::RequestInFlightRoster { .. } => MessageType::RequestInFlightRoster,
             Self::InFlightRoster { .. } => MessageType::InFlightRoster,
             Self::WithdrawTask { .. } => MessageType::WithdrawTask,
+            Self::SuspectPeers { .. } => MessageType::SuspectPeers,
+            Self::ResolvedPeer { .. } => MessageType::ResolvedPeer,
+            Self::RestartRequest { .. } => MessageType::RestartRequest,
+            Self::RestartConfirm { .. } => MessageType::RestartConfirm,
+            Self::PeerProbe { .. } => MessageType::PeerProbe,
+            Self::PeerProbeAck { .. } => MessageType::PeerProbeAck,
         }
     }
 }

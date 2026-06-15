@@ -683,6 +683,32 @@ where
                     "peer list received (operational); the mesh-pump re-runs \
                      the peer-dial sweep off it"
                 );
+                // #556 mixed-version warning: any peer connecting from a
+                // pre-Layer 1 build presents no `slurm_job_id`. The
+                // operator MUST know — Layer 5 cannot scancel that peer's
+                // SLURM job through the consensus pipeline; a manual
+                // scancel will be required on a real death. One WARN per
+                // peer-id (the gate is `consensus_mixed_version_warned`)
+                // so an operator sees the upgrade-window mismatch but
+                // not a per-frame spam.
+                for peer in &peers {
+                    if peer.slurm_job_id.is_none()
+                        && !peer.secondary_id.is_empty()
+                        && peer.secondary_id != self.config.secondary_id
+                        && self
+                            .consensus_mixed_version_warned
+                            .insert(peer.secondary_id.clone())
+                    {
+                        tracing::warn!(
+                            target: "dynrunner_consensus",
+                            peer = %peer.secondary_id,
+                            "#556 mixed-version: peer joined without slurm_job_id \
+                             (pre-Layer 1 build); consensus-driven restart for \
+                             this peer will skip scancel — operator must scancel \
+                             the peer's SLURM job manually if it actually dies"
+                        );
+                    }
+                }
                 self.ingest_peer_liveness_addrs(&peers);
                 Ok(())
             }
@@ -745,6 +771,79 @@ where
                 // The executor body + the terminal report to the primary live
                 // in `secondary::setup_exec`; this is the one-line delegate.
                 self.execute_setup_assignment(task_hash).await
+            }
+            // #556 mesh-consensus inbound. Each arm hands the frame to the
+            // FSM via the thin wiring layer (`secondary::consensus::wiring`)
+            // and dispatches any emitted frames through the existing
+            // egress. `SuspectPeers` / `RestartRequest` come FROM the
+            // primary (observe its epoch on arrival); `PeerProbe` /
+            // `PeerProbeAck` are secondary-to-secondary frames the mesh
+            // routes between probers and suspects. The FSM owns every
+            // stale-round / stale-epoch defensive drop.
+            DistributedMessage::SuspectPeers {
+                consensus_id,
+                primary_epoch,
+                member_gen,
+                suspected,
+                ..
+            } => {
+                self.handle_consensus_suspect_peers(
+                    consensus_id,
+                    primary_epoch,
+                    member_gen,
+                    suspected,
+                )
+                .await;
+                Ok(())
+            }
+            DistributedMessage::RestartRequest {
+                consensus_id,
+                primary_epoch,
+                member_gen,
+                candidates,
+                ..
+            } => {
+                self.handle_consensus_restart_request(
+                    consensus_id,
+                    primary_epoch,
+                    member_gen,
+                    candidates,
+                )
+                .await;
+                Ok(())
+            }
+            DistributedMessage::PeerProbe {
+                sender_id,
+                consensus_id,
+                probed_id,
+                ..
+            } => {
+                self.handle_consensus_probe(&sender_id, consensus_id, &probed_id)
+                    .await;
+                Ok(())
+            }
+            DistributedMessage::PeerProbeAck {
+                sender_id,
+                consensus_id,
+                prober_id,
+                ..
+            } => {
+                self.handle_consensus_probe_ack(&sender_id, consensus_id, &prober_id)
+                    .await;
+                Ok(())
+            }
+            // The secondary never legitimately RECEIVES `ResolvedPeer` /
+            // `RestartConfirm` (those are secondary-to-primary replies).
+            // A landing here is either a wire-routing bug or a
+            // co-located-loopback echo; drop silently.
+            DistributedMessage::ResolvedPeer { .. }
+            | DistributedMessage::RestartConfirm { .. } => {
+                tracing::debug!(
+                    msg_type = ?msg.msg_type(),
+                    "#556 consensus reply variant addressed to secondary; \
+                     dropping (wire-routing edge)"
+                );
+                Ok(())
             }
             _ => {
                 tracing::debug!(msg_type = ?msg.msg_type(), "unhandled message in secondary");

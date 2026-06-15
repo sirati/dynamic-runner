@@ -243,24 +243,37 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
     /// The dispatch-altitude consult of the starvation oracle + command.
     /// Single concern: translate "only silent-held work remains" into a
-    /// dead-secondary declaration. Pure consumer of the liveness module's
-    /// two boundary methods — it neither computes the silent set nor
-    /// touches the worker-management bus (the wrapped
-    /// `requeue_dead_secondary` re-nudges `TasksAdded`).
+    /// LOCAL scheduling-suspect — recover the in-flight tasks back into
+    /// the pool so idle workers don't starve waiting on stalled holders,
+    /// but DO NOT mesh-declare the holders dead (no `PeerRemoved`, no
+    /// `TimeoutDetected`, no respawn). The owner-approved #556 split: a
+    /// primary may suspect a secondary locally for scheduling purposes
+    /// (work-redistribution), but mesh-declaring requires consensus and
+    /// flows through the FSM path on the heartbeat hard backstop.
+    ///
+    /// The silent peer stays alive in the roster and may re-prove itself
+    /// with a fresh keepalive; its workers stay registered for future
+    /// dispatch (a brief network blip that resolves before the hard
+    /// backstop does not cost the cluster a respawn). The FSM is seeded
+    /// with the local scheduling-suspect set so the operator-visible FSM
+    /// state mirrors reality — even though [`Self::consensus_escalate`]
+    /// is NOT called here (escalation is the hard-backstop's job).
     async fn maybe_requeue_silent_held_work(&mut self) {
         if !self.only_silent_held_work_remains() {
             return;
         }
         let dead = self.silent_held_dead_declarations();
-        // Reuse the keepalive-miss cause: a silent secondary whose only
-        // remaining role is sitting on un-dispatchable in-flight work is a
-        // missed-keepalive outage by the consumer-facing semantic.
-        self.declare_silent_secondaries_dead(
-            dead,
-            dynrunner_protocol_primary_secondary::RemovalCause::KeepaliveMiss,
-        )
-        .await
-        .ok();
+        let suspect_set: std::collections::BTreeSet<String> =
+            dead.iter().map(|d| d.secondary_id.clone()).collect();
+        // Local-only requeue: TaskRequeued mutations + supplanted_holders
+        // fence + TasksAdded re-nudge, NO PeerRemoved / TimeoutDetected /
+        // worker drop / roster clear (the silent peer stays in
+        // `self.secondaries` and `self.workers`).
+        self.requeue_silent_held_work_locally(&suspect_set).await.ok();
+        // Reflect the local scheduling-suspect in the FSM (no escalate).
+        // A subsequent hard-backstop sweep on the same peers will be the
+        // one to call `consensus_escalate` and run the round.
+        self.set_consensus_scheduling_suspect(suspect_set);
     }
 
     /// Liveness check for a started phase that needs workers. The phase

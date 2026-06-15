@@ -25,14 +25,42 @@
 //! starved — the bounded escalation of the tick-lag deferral, see
 //! [`PrimaryCoordinator::process_heartbeat_tick`].
 //!
-//! Both declaration paths — the hard backstop here and the lazy on-demand
-//! requeue at the dispatch altitude (`only_silent_held_work_remains` →
-//! `declare_silent_secondaries_dead`) — funnel through
-//! [`PrimaryCoordinator::declare_silent_secondaries_dead`], which wraps
-//! the [`PrimaryCoordinator::requeue_dead_secondary`] primitive (it takes
-//! the in-flight tasks back into the pending pool, evicts per-worker
-//! tracking, drops the connection state, and notifies surviving peers via
-//! `TimeoutDetected`).
+//! # #556 split: scheduling-suspect vs mesh-declare-dead
+//!
+//! Two declaration paths existed in the pre-#556 wiring and BOTH funneled
+//! through the destructive [`PrimaryCoordinator::requeue_dead_secondary`]
+//! primitive (which broadcasts `PeerRemoved` + `TimeoutDetected`, drops
+//! workers, and clears the secondary from the roster). Layer 4 splits
+//! their post-detection behaviour while keeping detection unified:
+//!
+//! - The **lazy dispatch-altitude path** (`only_silent_held_work_remains`
+//!   → [`PrimaryCoordinator::maybe_requeue_silent_held_work`]) now calls
+//!   [`PrimaryCoordinator::requeue_silent_held_work_locally`], which
+//!   recovers in-flight tasks back into the pending pool BUT keeps the
+//!   silent peer alive in the roster. No `PeerRemoved` is emitted, no
+//!   `TimeoutDetected` is broadcast, no scancel can ever follow — this is
+//!   purely a local scheduling-suspect, the work-redistribution policy
+//!   the owner approved for idle survivors. The silent peer may
+//!   re-prove itself with a fresh keepalive and rejoin dispatch.
+//! - The **heartbeat hard backstop** (`decide_dead_secondaries`) no longer
+//!   unilaterally calls the destructive primitive. Instead it seeds the
+//!   primary-side mesh-consensus FSM
+//!   ([`PrimaryCoordinator::set_consensus_scheduling_suspect`] then
+//!   [`PrimaryCoordinator::consensus_escalate`]) and the FSM runs the
+//!   two-round consensus over the surviving fleet. Only on a successful
+//!   `ConsensusOutput::Restart` does the coordinator call
+//!   [`PrimaryCoordinator::declare_secondaries_confirmed_dead`] — the
+//!   full destructive primitive wrapped per peer (it dispatches the
+//!   matching respawn requests too).
+//!
+//! The pre-#556 [`PrimaryCoordinator::requeue_dead_secondary`] primitive
+//! is preserved verbatim and is now reached only via two paths:
+//! (a) [`PrimaryCoordinator::handle_secondary_fatal_error`], which is a
+//! self-reported death (the secondary itself is exiting non-zero — no
+//! consensus is meaningful, and Layer 5 will recognise this branch as
+//! the one path that bypasses the scancel-gate); and
+//! (b) the FSM-Restart consumer
+//! [`PrimaryCoordinator::declare_secondaries_confirmed_dead`].
 
 mod collective_silence;
 mod ingest_gate;
@@ -166,6 +194,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             self.secondary_keepalives
                 .insert(secondary_id.into(), Instant::now());
             self.silence_warn_stage.remove(secondary_id);
+            // #556 — a fresh frame is positive liveness evidence; if the
+            // FSM was holding this peer in its LOCAL scheduling-suspect
+            // set (the lazy-path seed), drop it so dispatch unfreezes the
+            // peer's workers on the next pass. An ESCALATED round (the
+            // hard-backstop path) is governed by its own consensus
+            // discipline — the FSM ignores `set_scheduling_suspect`
+            // edits mid-round, so a single-peer recovery during an
+            // in-flight round flows through `ResolvedPeer` echoes
+            // instead. The narrow-cast helper below differentiates.
+            self.consensus_fsm
+                .clear_scheduling_suspect_if_present(secondary_id);
         }
     }
 
@@ -748,7 +787,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }
         }
         let report = self.collect_heartbeat_report();
-        self.decide_dead_secondaries(report).await
+        let decision = self.decide_dead_secondaries(report).await;
+        // #556 — drive the consensus FSM on the same heartbeat cadence
+        // so deadlines (resolution, confirmation) fire on time even when
+        // the inbound dispatch arms are idle. The FSM is a no-op in
+        // `Idle`, so the steady-state cost is one snapshot read + one
+        // poll-tick per ~5s.
+        self.drive_consensus_fsm().await;
+        decision
     }
 
     /// Apply the staged silence schedule to one heartbeat sweep.
@@ -760,9 +806,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// - a WARN stage logs ONCE per stage (the per-secondary
     ///   `silence_warn_stage` counter tracks how many WARN stages have
     ///   already fired for the current streak) and does NOT declare death;
-    /// - the HARD backstop declares the secondary dead and requeues its
-    ///   in-flight tasks REGARDLESS of dispatch state, via
-    ///   [`Self::declare_silent_secondaries_dead`].
+    /// - the HARD backstop (#556) SEEDS the mesh-consensus FSM with the
+    ///   suspect set and ESCALATES it; the destructive declaration
+    ///   ([`Self::declare_secondaries_confirmed_dead`]) only fires on a
+    ///   successful FSM Restart commit. A side-gate failure or responder
+    ///   timeout aborts the round with no removal.
     ///
     /// The hard backstop is the load-bearing forward-progress guarantee: a
     /// purely starvation-driven declaration would never empty
@@ -784,7 +832,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// genuinely all-dead fleet). The co-located same-peer member is
     /// not wire evidence and never counts toward the inference.
     ///
-    /// [`Self::declare_silent_secondaries_dead`] wraps the existing
+    /// [`Self::declare_secondaries_confirmed_dead`] wraps the existing
     /// [`Self::requeue_dead_secondary`] primitive, which already emits
     /// `WorkerMgmtSignal::TasksAdded` after requeueing — so this method
     /// does NOT re-nudge the worker-management bus.
@@ -884,8 +932,76 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             return Ok(());
         }
 
-        self.declare_silent_secondaries_dead(hard_dead, RemovalCause::KeepaliveMiss)
-            .await
+        // #556 hard-backstop replacement: the hard-multiple peers do NOT
+        // unilaterally trip `declare_silent_secondaries_dead` any more —
+        // mesh-declaring a peer dead requires consensus. Seed the FSM
+        // with the scheduling-suspect set and escalate; the FSM's next
+        // `poll` (driven from the heartbeat tick, sibling of this sweep)
+        // will mint the `consensus_id` and emit the opening
+        // `SuspectPeers` frame. On a successful round the
+        // `ConsensusOutput::Restart` consumer (in
+        // `crate::primary::PrimaryCoordinator::handle_consensus_output`)
+        // calls [`Self::declare_secondaries_confirmed_dead`] — the
+        // wrapper around the original destructive primitive — and
+        // dispatches respawn per target. On an aborted round (side-gate
+        // failure, responder timeout after retry) NO peer is removed and
+        // the next hard-backstop sweep re-evaluates from a fresh
+        // suspect-set baseline (the FSM returned to `Idle`). The local
+        // scheduling-suspect (the lazy dispatch path) operates
+        // independently — see [`Self::requeue_silent_held_work_locally`].
+        if !hard_dead.is_empty() {
+            let suspect_ids: std::collections::BTreeSet<String> = hard_dead
+                .iter()
+                .map(|d| d.secondary_id.clone())
+                .collect();
+            // No stash of `DeadSecondary` records: the FSM-Restart
+            // consumer ([`Self::declare_secondaries_confirmed_dead`])
+            // re-derives `last_keepalive` from `self.secondary_keepalives`
+            // at commit time. A peer that recovered mid-round will have
+            // dropped out of the FSM's suspect set already (via
+            // `ResolvedPeer` echoes), so the consumer only ever sees
+            // targets the round did NOT clear — and their entries in
+            // `secondary_keepalives` are still the operator-relevant
+            // silence-age inputs. Drop the per-sweep `hard_dead` Vec on
+            // the floor; the FSM owns the suspect set from here.
+            let _ = hard_dead;
+            // Re-seeding the scheduling-suspect set on every tick is
+            // cheap (BTree replace) and idempotent. Only the FIRST
+            // sweep per silence streak escalates: a subsequent sweep
+            // with the FSM already in an in-flight round (or having
+            // just aborted on the side-gate) doesn't re-escalate —
+            // both because the FSM no-ops escalate in non-`Idle`
+            // states AND because spamming the WARN log + the
+            // `SuspectPeers` broadcast on every tick is operator-spam
+            // (the run_20260615 producer_backstop wedge: a small fleet
+            // whose side-gate keeps aborting paid the 100ms-cadence
+            // WARN-fire cost across the whole hard-backstop tail and
+            // starved completion handling).
+            let already_in_flight = self
+                .consensus_fsm
+                .current_consensus_id()
+                .is_some();
+            self.set_consensus_scheduling_suspect(suspect_ids.clone());
+            if !already_in_flight {
+                self.consensus_escalate(suspect_ids).await;
+            }
+            // Nudge the worker-management bus: the silence detection
+            // updated. Pre-#556 the destructive `requeue_dead_secondary`
+            // emitted TasksAdded as a tail effect, which is what woke
+            // the lazy dispatch-altitude path. Under #556 the
+            // hard-backstop is no longer destructive (it escalates the
+            // FSM instead), but the lazy path STILL needs the wakeup —
+            // its trigger is `react_to_worker_signal_batch`, which is
+            // fed by `TasksAdded`. Without this nudge a small-fleet
+            // failover where the FSM aborts on the side-gate would
+            // park: sec-1+sec-2 idle, sec-0 silent, no event to drive
+            // the lazy recheck. The nudge is idempotent (a no-op
+            // batch coalesce on a healthy iteration) and bounded
+            // (one per heartbeat tick that classifies a hard-dead).
+            self.cluster_state
+                .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
+        }
+        Ok(())
     }
 
     /// Fire the WARN log for `stage_idx` of `secondary_id` AT MOST ONCE per
@@ -936,9 +1052,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `decide_dead_secondaries`: while the ingest path is backlogged
         // OR the self-suspect collective-silence gate defers, every
         // staleness reading is suspect, so the dispatch-altitude
-        // early-requeue path (the only other author of staleness-based
-        // `PeerRemoved`s, via `only_silent_held_work_remains` →
-        // `declare_silent_secondaries_dead`) must see NO silent peers
+        // early-requeue path (now a LOCAL-only scheduling-suspect, via
+        // `only_silent_held_work_remains` →
+        // `requeue_silent_held_work_locally`) must see NO silent peers
         // either. Reads the most recent sweep's verdicts (at most one
         // tick stale — the same staleness class as the keepalive clocks
         // this method samples anyway).
@@ -994,28 +1110,143 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .collect()
     }
 
-    /// Declare every secondary in `dead` dead and requeue its in-flight
-    /// tasks, routing each through the existing [`Self::requeue_dead_secondary`]
-    /// primitive. THE single command both declaration paths funnel through:
+    /// FSM-Restart commit path (#556). Declares every secondary in `dead`
+    /// confirmed-dead and runs the destructive primitive per peer
+    /// ([`Self::requeue_dead_secondary`]: PeerRemoved broadcast,
+    /// TimeoutDetected unicast, worker drop, roster clear, and the
+    /// supplanted-holders fence). Reached only via the FSM-driven commit
+    /// path ([`super::super::consensus::wiring`]'s
+    /// `commit_consensus_restart`) — never by the unilateral hard-backstop
+    /// path, which now seeds the FSM and waits for the consensus round
+    /// verdict.
     ///
-    /// - the hard backstop in [`Self::decide_dead_secondaries`] (fires
-    ///   regardless of dispatch state, at the ≈2m bound), and
-    /// - the lazy on-demand requeue at the dispatch altitude
-    ///   ([`PrimaryCoordinator::only_silent_held_work_remains`] →
-    ///   this method), which fires EARLIER than the backstop only when an
-    ///   idle worker has nothing but silent-held work left.
+    /// `handle_secondary_fatal_error` continues to call
+    /// [`Self::requeue_dead_secondary`] directly: a self-reported fatal
+    /// exit is authoritative testimony of the secondary's own death, so
+    /// no consensus round is meaningful (and Layer 5 will recognise this
+    /// branch as the one path that bypasses the scancel gate — the
+    /// secondary's process is already exiting).
     ///
-    /// Dispatch sees ONLY this method and the oracle; the silent-id set is
-    /// otherwise private to the liveness module. `requeue_dead_secondary`
-    /// owns the `TasksAdded` re-nudge, so this method does not touch the
-    /// bus.
-    pub(super) async fn declare_silent_secondaries_dead(
+    /// `requeue_dead_secondary` owns the `TasksAdded` re-nudge, so this
+    /// method does not touch the worker-management bus directly.
+    pub(in crate::primary) async fn declare_secondaries_confirmed_dead(
         &mut self,
         dead: Vec<DeadSecondary>,
         cause: RemovalCause,
     ) -> Result<(), String> {
         for d in dead {
             self.requeue_dead_secondary(d, cause.clone()).await?;
+        }
+        Ok(())
+    }
+
+    /// Local scheduling-suspect requeue (#556 lazy path). Recovers
+    /// in-flight tasks held by silent peers back into the pending pool
+    /// AND records the supplanted-holder fence — exactly the local-only
+    /// half of [`Self::requeue_dead_secondary`]. The silent peers STAY
+    /// in `self.secondaries` and `self.workers`; no `PeerRemoved`, no
+    /// `TimeoutDetected`, no respawn. A peer that re-proves itself
+    /// before the hard-backstop sweep escalates can rejoin dispatch
+    /// without ever having been mesh-declared dead.
+    ///
+    /// Each per-peer step is idempotent: a peer with no in-flight tasks
+    /// is a no-op (the ledger walk returns nothing). The FSM is NOT
+    /// consulted here — the caller (the dispatch-altitude path in
+    /// `lifecycle::worker_mgmt::maybe_requeue_silent_held_work`) is the
+    /// owner of the local-suspect signal, and it threads the suspect
+    /// set into the FSM via
+    /// [`super::super::PrimaryCoordinator::set_consensus_scheduling_suspect`]
+    /// alongside this call.
+    pub(in crate::primary) async fn requeue_silent_held_work_locally(
+        &mut self,
+        suspects: &std::collections::BTreeSet<String>,
+    ) -> Result<(), String> {
+        if suspects.is_empty() {
+            return Ok(());
+        }
+        for secondary_id in suspects {
+            // Skip a peer the primary no longer believes connected
+            // (defensive: a concurrent fatal-error path may have already
+            // removed the peer between the sweep and this call).
+            if !self.secondaries.contains_key(secondary_id) {
+                continue;
+            }
+            let requeue_mutations =
+                self.recover_inflight_for_dead_secondary(secondary_id);
+            if requeue_mutations.is_empty() {
+                continue;
+            }
+            // Free the silent peer's worker slots LOCALLY (the tasks
+            // they held just moved to the pool). The workers stay in
+            // `self.workers` (the peer is still in roster and its CRDT
+            // capacity record is untouched), but their slot state
+            // transitions `Assigned → Idle` so the run-completion gate
+            // (`run_complete_check`'s `active_workers == 0` check)
+            // can advance once every other task settles. Without this,
+            // `Assigned`-state slots on a permanently-silent peer
+            // count as "mid-dispatch" forever and the run never
+            // exits, regardless of how many tasks succeed on
+            // survivors (the producer_backstop wedge). The
+            // companion dispatch-side gate
+            // (`should_skip_worker_for_dispatch`'s FSM-suspect
+            // check) prevents the freed slot from being re-dispatched
+            // back to the same silent holder until either the peer
+            // sends a fresh frame (the lazy-suspect FSM clears on
+            // `record_keepalive`) or the consensus round commits its
+            // removal.
+            let pool_freed: Vec<u32> = self
+                .workers
+                .iter_mut()
+                .filter(|w| w.secondary_id == *secondary_id)
+                .filter_map(|w| {
+                    if w.is_idle() {
+                        None
+                    } else {
+                        let wid = w.worker_id;
+                        w.vacate();
+                        Some(wid)
+                    }
+                })
+                .collect();
+            for wid in pool_freed {
+                self.pool_mut().release_worker(wid);
+            }
+            // DELIBERATELY no `supplanted_holders` fence. The fence
+            // (#530a) is a compute-dedup hint that the destructive
+            // requeue path records to prove a re-dispatched task's
+            // duplicate is the false-dead-recovery case — but the
+            // destructive path emits `PeerRemoved` and bumps the
+            // peer's `peer_member_gen` on re-admission, which is the
+            // event the fence's gen check is gated on. The local-only
+            // requeue here keeps the silent peer alive at its current
+            // generation, so the fence would mis-classify a normal
+            // cross-member re-dispatch as a duplicate-on-the-still-
+            // alive-original (the `#518` cross-member dedup path)
+            // and withdraw the survivor's copy — re-stranding the
+            // task on the silent holder. The at-least-once contract
+            // is the documented behaviour for this lazy path: a peer
+            // that recovers AFTER its work was redistributed runs the
+            // tasks it still believes it holds; accounting-dedup
+            // happens at the terminal level. See
+            // `feedback_at_least_once_execution_deliberate`.
+            tracing::info!(
+                target: "dynrunner_consensus",
+                secondary = %secondary_id,
+                requeued = requeue_mutations.len(),
+                "#556 local scheduling-suspect: requeued in-flight tasks; peer stays in roster"
+            );
+            // Apply + broadcast the requeue mutations only — no
+            // `PeerRemoved` is appended here (the peer stays alive in
+            // the roster). The CRDT writers see `TaskRequeued`s
+            // identical to the destructive path; only the membership
+            // half is omitted.
+            self.apply_and_broadcast_cluster_mutations(requeue_mutations)
+                .await;
+            // Re-nudge worker management so the freshly-pooled work is
+            // picked up by surviving free workers in the next dispatch
+            // pass. Mirrors `requeue_dead_secondary`'s tail emit.
+            self.cluster_state
+                .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
         }
         Ok(())
     }

@@ -5,6 +5,29 @@
 //! no-op — see the doc on `dispatch_respawn_lifecycle` for why) and
 //! `handle_respawn_join` (called when the `JoinSet<RespawnOutcome>`
 //! yields a finished task).
+//!
+//! # #556 mesh-consensus invariant
+//!
+//! All scancel calls in the respawn path MUST originate from a
+//! [`crate::primary::consensus::ConsensusOutput::Restart`] output. Direct
+//! kill paths bypassing the FSM are forbidden by #556: the architectural
+//! restriction is that a primary may LOCALLY suspect a secondary for
+//! scheduling purposes (work-redistribution onto idle survivors), but
+//! MESH-DECLARING the peer dead — the destructive step that triggers
+//! both `PeerRemoved`/`TimeoutDetected` broadcasts AND any SLURM-level
+//! scancel — must be gated on a successful consensus round. Layer 4
+//! wires the heartbeat hard-backstop through `ConsensusFsm::escalate`
+//! and the lazy `maybe_requeue_silent_held_work` path through
+//! `requeue_silent_held_work_locally` (local-only, no mesh declaration).
+//! Layer 5 will add the actual scancel call inside the
+//! `ConsensusOutput::Restart` consumer — at which point a grep-assertion
+//! enforces "every `scancel` invocation is reachable only from the
+//! Restart handler". A pre-existing fatal-error path
+//! ([`crate::primary::PrimaryCoordinator::handle_secondary_fatal_error`])
+//! is the one EXEMPT path: a secondary self-reporting fatal exit is
+//! authoritative testimony of its own death, so the mesh-declare runs
+//! without consensus (no SLURM scancel is appropriate either — the
+//! secondary's process is already exiting).
 
 use std::sync::Arc;
 

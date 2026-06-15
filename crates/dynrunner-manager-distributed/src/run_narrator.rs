@@ -294,12 +294,72 @@ impl RunNarrator {
         // phase the setup unblocks.
         emitted |= self.narrate_setup(state);
         // Phase transitions, read off the single owning phase-state
-        // accessor. A phase counts as STARTED once it is dispatchable
-        // (every dep-phase has fully terminated) and owns ≥1 task; it
-        // counts as COMPLETE once it owns ≥1 task and has no live task
-        // left (every task reached a terminal state).
-        for (phase, rollup) in state.phase_rollups() {
-            if rollup.has_any && rollup.dispatchable && self.started_phases.insert(phase.clone()) {
+        // accessor. Two edges per phase:
+        //   * STARTED: owns ≥1 task AND its formal boundary is open
+        //     (every phase-dep has had `PhaseEnded` applied — the I1
+        //     invariant, `ClusterState::phase_boundary_open`).
+        //   * COMPLETE: owns ≥1 task, has no live task left, the formal
+        //     start has already been emitted for it, and its formal
+        //     boundary is open (I2).
+        //
+        // Evaluated in TWO PASSES against the same rollup snapshot, with
+        // all completes emitted BEFORE any starts within this `observe()`
+        // call: semantically a phase's `PhaseEnded` enables its
+        // successors' formal starts (I1 reads the predecessors'
+        // `PhaseEnded`), so complete-before-start matches the boundary
+        // semantics even when one observe simultaneously sees a
+        // predecessor reach all-terminal AND a successor newly cross its
+        // open-boundary start edge. Pre-fix the loop iterated
+        // `HashMap<&PhaseId, PhaseRollup>` in iter order and emitted both
+        // edges interleaved per phase — so the operator's log could show
+        // `successor start` BEFORE `predecessor complete` when they
+        // landed in the same sweep (cosmetic, no causal violation, but
+        // misleading). Sorted by `PhaseId` within each pass for a
+        // deterministic order across observe calls (a `HashMap` iter is
+        // otherwise per-build).
+        let rollups = state.phase_rollups();
+        let mut ordered: Vec<(&PhaseId, crate::cluster_state::PhaseRollup)> =
+            rollups.into_iter().collect();
+        ordered.sort_by(|a, b| a.0.cmp(b.0));
+
+        // PASS 1: complete edges. The complete predicate ANDs the start
+        // edge having already been observed (`started_phases.contains`)
+        // and the boundary being open (`phase_boundary_open`) — closes
+        // V-A2: pre-fix the `has_any && !has_live` arm carried NO
+        // start-fired check and NO boundary check, so a barrier=False
+        // phase whose tasks all completed FAST while its predecessor
+        // was still draining false-narrated `phase complete`.
+        for (phase, rollup) in &ordered {
+            if rollup.has_any
+                && !rollup.has_live
+                && self.started_phases.contains(*phase)
+                && state.phase_boundary_open(phase)
+                && self.done_phases.insert((*phase).clone())
+            {
+                tracing::info!(
+                    target: IMPORTANT_TARGET,
+                    phase = %phase,
+                    "phase complete",
+                );
+                emitted = true;
+            }
+        }
+
+        // PASS 2: start edges. The start predicate is the strict
+        // boundary predicate (`phase_boundary_open`) — closes V-A1b:
+        // pre-fix this gated on `rollup.dispatchable` (the WEAKER
+        // "every transitive dep has no live task" predicate computed
+        // from `phase_rollups`), which can flip true before the
+        // predecessor's `PhaseEnded` lands. The narrator's
+        // "starting job phase" line is the operator-facing twin of the
+        // primary's same-named line from `fire_initial_phase_starts`,
+        // so the gates must match — both now consult
+        // `phase_boundary_open`.
+        for (phase, rollup) in &ordered {
+            if rollup.has_any
+                && state.phase_boundary_open(phase)
+                && self.started_phases.insert((*phase).clone())
+            {
                 // REUSE of the exact phrase the primary emits at
                 // `fire_initial_phase_starts` (coordinator.rs) so the
                 // operator reads ONE consistent line pre- and
@@ -310,13 +370,14 @@ impl RunNarrator {
                     "starting job phase",
                 );
                 // PhaseTaskSpawning milestone, derived on the SAME
-                // `has_any && dispatchable` edge the "starting job phase"
-                // line fires on — the CRDT-side twin of the milestone the
-                // removed projection emitted from `fire_initial_phase_starts`
-                // (which originated `PhaseTaskSpawning` on the same
-                // `phase_started_emitted.insert` edge as that line). Sharing
-                // the `started_phases` edge keeps the two lines on one
-                // once-per-phase guard, exactly as the authority did.
+                // start edge the "starting job phase" line fires on — the
+                // CRDT-side twin of the milestone the removed projection
+                // emitted from `fire_initial_phase_starts` (which
+                // originated `PhaseTaskSpawning` on the same
+                // `phase_started_emitted.insert` edge as that line).
+                // Sharing the `started_phases` edge keeps the two lines
+                // on one once-per-phase guard, exactly as the authority
+                // did.
                 tracing::info!(
                     target: IMPORTANT_TARGET,
                     phase = %phase,
@@ -369,14 +430,6 @@ impl RunNarrator {
                     overall.done,
                     overall.failed,
                     overall.skipped,
-                );
-                emitted = true;
-            }
-            if rollup.has_any && !rollup.has_live && self.done_phases.insert(phase.clone()) {
-                tracing::info!(
-                    target: IMPORTANT_TARGET,
-                    phase = %phase,
-                    "phase complete",
                 );
                 emitted = true;
             }
@@ -1142,7 +1195,12 @@ mod tests {
     }
 
     /// A phase gated on an upstream phase does NOT emit "starting job
-    /// phase" until the upstream phase fully terminates.
+    /// phase" until the upstream phase's FORMAL boundary closes — every
+    /// task terminal AND the upstream's `PhaseEnded` fact applied
+    /// (`phase_boundary_open(compile)` requires `phase_ended(build)`).
+    /// Closes V-A1b: pre-fix the gate was the weaker
+    /// `rollup.dispatchable` (transitive no-live), which can flip true
+    /// while the upstream's end edge has not formally completed.
     #[test]
     fn phase_started_waits_for_upstream_to_terminate() {
         let events = capture(|| {
@@ -1157,10 +1215,20 @@ mod tests {
             add(&mut state, &task("compile", "a", &[]));
 
             let mut narrator = RunNarrator::new();
-            // Build is live → compile not dispatchable yet; only build starts.
+            // Build is live → compile's boundary closed; only build starts.
             narrator.observe(&state);
-            // Build completes → compile becomes dispatchable.
+            // Build's task terminal but `PhaseEnded(build)` not yet
+            // landed → compile's boundary STILL closed. Pre-fix this
+            // would have narrated compile started here on the weaker
+            // dispatchable gate.
             complete(&mut state, "tc");
+            narrator.observe(&state);
+            // Authoritative end edge for build (the cascade's
+            // `phase_can_proceed → PhaseEnded → mark_phase_done` step) —
+            // boundary now opens for compile.
+            state.apply(ClusterMutation::PhaseEnded {
+                phase: PhaseId::from("build"),
+            });
             narrator.observe(&state);
         });
 
@@ -1172,7 +1240,7 @@ mod tests {
         assert_eq!(
             started,
             vec!["build", "compile"],
-            "build starts first; compile only after build terminates: {events:?}"
+            "build starts first; compile only after PhaseEnded(build): {events:?}"
         );
     }
 
@@ -1208,6 +1276,67 @@ mod tests {
         assert_eq!(
             done[0].fields.get("phase").map(String::as_str),
             Some("compile")
+        );
+    }
+
+    /// #584 ordering symptom: in ONE observe sweep that simultaneously
+    /// sees `build` reach all-terminal AND `compile` cross its open-
+    /// boundary start edge (`PhaseEnded(build)` lands in the same sweep
+    /// that completes build's tasks), the operator's log must read
+    /// `phase complete build` STRICTLY BEFORE `starting job phase
+    /// compile`. Pre-fix the narrator iterated `phase_rollups()` (an
+    /// unordered HashMap) and emitted both edges interleaved per phase,
+    /// so the HashMap iter order could put `starting job phase compile`
+    /// before `phase complete build` even when the underlying events
+    /// fired in causal order. The two-pass split (completes first, then
+    /// starts) pins the deterministic order.
+    #[test]
+    fn complete_emits_before_start_within_one_observe() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            state.apply(ClusterMutation::PhaseDepsSet {
+                deps: std::collections::HashMap::from([(
+                    PhaseId::from("compile"),
+                    vec![PhaseId::from("build")],
+                )]),
+            });
+            add(&mut state, &task("build", "tc", &[]));
+            add(&mut state, &task("compile", "a", &[]));
+
+            let mut narrator = RunNarrator::new();
+            // Sweep 1: only build is open; compile's boundary is closed.
+            // build narrates started.
+            narrator.observe(&state);
+            // Now within ONE observe sweep, build's task completes AND
+            // its end edge fires — both atomically applied to the ledger
+            // before the observe. compile's boundary opens; build
+            // simultaneously crosses its complete edge.
+            complete(&mut state, "tc");
+            state.apply(ClusterMutation::PhaseEnded {
+                phase: PhaseId::from("build"),
+            });
+            narrator.observe(&state);
+        });
+
+        let build_done_idx = events
+            .iter()
+            .position(|e| {
+                e.message.contains("phase complete")
+                    && e.fields.get("phase").map(String::as_str) == Some("build")
+            })
+            .expect("build phase complete narrated");
+        let compile_start_idx = events
+            .iter()
+            .position(|e| {
+                e.message.contains("starting job phase")
+                    && e.fields.get("phase").map(String::as_str) == Some("compile")
+            })
+            .expect("compile starting job phase narrated");
+        assert!(
+            build_done_idx < compile_start_idx,
+            "complete-before-start within one observe: \
+             `phase complete build` (idx {build_done_idx}) must precede \
+             `starting job phase compile` (idx {compile_start_idx}). events={events:?}"
         );
     }
 
@@ -1247,12 +1376,24 @@ mod tests {
             narrator.observe(&state);
             // Sweep 3: no advance → no new aggregate line (idempotent sweep).
             narrator.observe(&state);
-            // Sweep 4: the last setup task completes → ALL-DONE, and "build"
-            // becomes dispatchable so its "starting job phase" fires in the
-            // SAME sweep — after the setup all-done line.
+            // Sweep 4: the last setup task completes → ALL-DONE (the
+            // setup-task block fires off its own progress projection,
+            // not gated on `phase_boundary_open`). Build's boundary is
+            // still closed (no `PhaseEnded(setup)` yet), so its "starting
+            // job phase" line does NOT fire here — the strict I1 the
+            // narrator now enforces.
             setup_complete(&mut state, "s3");
             narrator.observe(&state);
-            // Sweep 5: stable → fully idempotent.
+            // Sweep 5: the authoritative end edge for setup (the
+            // cascade's `PhaseEnded → mark_phase_done` step) lands —
+            // boundary opens for build, and its "starting job phase"
+            // narrates here, AFTER the setup all-done line emitted in
+            // sweep 4.
+            state.apply(ClusterMutation::PhaseEnded {
+                phase: PhaseId::from("setup"),
+            });
+            narrator.observe(&state);
+            // Sweep 6: stable → fully idempotent.
             narrator.observe(&state);
         });
 
@@ -1843,10 +1984,19 @@ mod tests {
             let mut narrator = RunNarrator::new();
             // matrix_eval starts → overall #1.
             narrator.observe(&state);
-            // matrix_eval fully terminates → dependency_graph starts →
-            // overall #2 on the same observe.
+            // matrix_eval's tasks all terminate but its formal end edge
+            // has not yet completed (`PhaseEnded(matrix_eval)` is the
+            // authoritative wire fact `phase_can_proceed` originates AT
+            // the same point it calls `mark_phase_done`). Without it,
+            // dependency_graph's `phase_boundary_open` is closed — the
+            // I1 the narrator now enforces.
             complete(&mut state, "m1");
             complete(&mut state, "m2");
+            state.apply(ClusterMutation::PhaseEnded {
+                phase: PhaseId::from("matrix_eval"),
+            });
+            // dependency_graph's boundary opens → it starts → overall
+            // #2 on this observe.
             narrator.observe(&state);
         });
 
@@ -1977,9 +2127,11 @@ mod tests {
         );
     }
 
-    /// A gated phase emits NO task-spawning milestone until its upstream
-    /// fully terminates and it becomes dispatchable — pinning the milestone
-    /// to the dispatchable edge, not mere task presence.
+    /// A gated phase emits NO task-spawning milestone until its
+    /// upstream's formal end edge completes (`PhaseEnded` lands) — the
+    /// milestone shares the start edge, which the narrator now gates on
+    /// `phase_boundary_open` (strict I1), not the weaker
+    /// `rollup.dispatchable`.
     #[test]
     fn phase_task_spawning_waits_for_dispatchable() {
         let events = capture(|| {
@@ -1994,10 +2146,16 @@ mod tests {
             add(&mut state, &task("compile", "a", &[]));
 
             let mut narrator = RunNarrator::new();
-            // build dispatchable, compile gated.
+            // build dispatchable, compile's boundary closed.
             narrator.observe(&state);
             complete(&mut state, "tc");
-            // compile now dispatchable.
+            // build's task terminal but its formal end edge has not
+            // completed — compile's boundary stays closed.
+            narrator.observe(&state);
+            // Authoritative end edge: compile's boundary now opens.
+            state.apply(ClusterMutation::PhaseEnded {
+                phase: PhaseId::from("build"),
+            });
             narrator.observe(&state);
         });
 
@@ -2009,7 +2167,7 @@ mod tests {
         assert_eq!(
             spawned,
             vec!["build", "compile"],
-            "task-spawning fires per phase only once it is dispatchable: {events:?}"
+            "task-spawning fires per phase only once boundary is open: {events:?}"
         );
     }
 

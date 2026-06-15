@@ -45,6 +45,7 @@ fn dialed_unreachable_peer() -> PeerConnectionInfo {
         ipv6: None,
         is_observer: false,
         liveness_port: None,
+        slurm_job_id: None,
     }
 }
 
@@ -61,6 +62,7 @@ fn non_dialed_peer() -> PeerConnectionInfo {
         ipv6: None,
         is_observer: false,
         liveness_port: None,
+        slurm_job_id: None,
     }
 }
 
@@ -232,6 +234,7 @@ fn cert_less_peer_at_closed_port() -> PeerConnectionInfo {
         ipv6: None,
         is_observer: false,
         liveness_port: None,
+        slurm_job_id: None,
     }
 }
 
