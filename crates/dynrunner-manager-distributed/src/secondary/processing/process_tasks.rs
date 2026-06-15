@@ -25,6 +25,7 @@ use dynrunner_protocol_primary_secondary::{
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
+use super::super::loop_health::LoopHealthTracker;
 use super::super::resource_buffer::{RawResourceSample, ResourceSampleBuffer};
 use super::super::{RunOutcome, SecondaryCoordinator};
 
@@ -247,6 +248,13 @@ where
         // post-respawn samples only, matching the
         // member_gen-stamped LWW semantics on the apply side).
         let mut resource_buffer = ResourceSampleBuffer::new();
+        // #589 loop-health: tracker holds the prior arm-stats endpoint
+        // so the next emit's iter-rate + dominant-arm shares are over
+        // the inter-emit WINDOW, not lifetime totals. Loop-local so it
+        // dies with the operational loop — a respawn starts cold (the
+        // first emit returns Default; the second emits real numbers),
+        // matching the resource-buffer's own respawn semantics.
+        let mut loop_health_tracker = LoopHealthTracker::new();
         let mut resource_stats_interval = tokio::time::interval(RESOURCE_STATS_EMIT_INTERVAL);
         resource_stats_interval
             .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -797,8 +805,18 @@ where
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
+                    // #589 loop-health: compute the iter-rate / dominant-arm /
+                    // max-unacked fields off the SAME oploop arm-stats this
+                    // arm just incremented and the SAME report-replay queue
+                    // the report_replay arm drains. The tracker owns the
+                    // prior-snapshot delta arithmetic; the max-unacked
+                    // accessor reads the live queue.
+                    let now_instant = std::time::Instant::now();
+                    let max_unacked = self.max_unacked_for_secs(now_instant);
+                    let loop_health =
+                        loop_health_tracker.compute(&arm_stats, max_unacked, now_instant);
                     if let Some(record) =
-                        resource_buffer.aggregate(member_gen, emitted_at_ms)
+                        resource_buffer.aggregate(member_gen, emitted_at_ms, loop_health)
                     {
                         let mutation: ClusterMutation<I> =
                             ClusterMutation::SecondaryResourceSample {

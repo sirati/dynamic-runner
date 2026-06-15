@@ -1784,3 +1784,221 @@ fn render_report_full_emits_every_line_including_zeros() {
     assert!(!body.contains("Omitted"));
     assert!(!body.contains("(+"), "full-render must not show parenthetical deltas");
 }
+
+// ── #589 loop-health: observer fleet aggregation + 25%-threshold + skip-eligible ──
+
+use dynrunner_protocol_primary_secondary::SecondaryResourceSampleRecord;
+use super::stats::DominantArm;
+
+/// Helper: drop a (PeerJoined + SecondaryCapacity + SecondaryResourceSample)
+/// triple onto a fresh ClusterState so a secondary is alive AND has a
+/// resource sample record the observer's `live_compute_resource_samples`
+/// accessor returns. Lets the loop-health tests build a 3-secondary
+/// fleet with crafted per-secondary samples.
+fn seed_resource_fleet(
+    samples: &[(&str, SecondaryResourceSampleRecord)],
+) -> ClusterState<()> {
+    let mut s = ClusterState::<()>::new();
+    for (secondary, record) in samples {
+        s.apply(ClusterMutation::PeerJoined {
+            peer_id: secondary.to_string(),
+            is_observer: false,
+            can_be_primary: false,
+            cap_version: Default::default(),
+            member_gen: 0,
+        });
+        s.apply(ClusterMutation::SecondaryCapacity {
+            secondary: secondary.to_string(),
+            worker_count: 1,
+            resources: Vec::new(),
+        });
+        s.apply(ClusterMutation::SecondaryResourceSample {
+            secondary: secondary.to_string(),
+            record: record.clone(),
+        });
+    }
+    s
+}
+
+fn lh_record(
+    member_gen: u64,
+    iters_per_sec_milli: u64,
+    dominant: (&str, u32),
+    unacked: u32,
+) -> SecondaryResourceSampleRecord {
+    SecondaryResourceSampleRecord {
+        member_gen,
+        emitted_at_ms: 1_700_000_000_000,
+        mem_p10_bytes: 0,
+        mem_p30_bytes: 0,
+        mem_p50_bytes: 0,
+        mem_p70_bytes: 0,
+        mem_p90_bytes: 0,
+        mem_avg_bytes: 0,
+        total_free_memory_bytes: 0,
+        total_swap_used_bytes: 0,
+        total_free_swap_bytes: 0,
+        cpu_utilization_milli: 0,
+        oploop_iters_per_sec_milli: iters_per_sec_milli,
+        dominant_arm_name: dominant.0.to_string(),
+        dominant_arm_pct_milli: dominant.1,
+        max_unacked_for_secs: unacked,
+    }
+}
+
+/// T3 — `max_unacked_for_secs` fleet aggregation: across 3 secondaries
+/// with values {30s, 60s, 120s}, the observer emits max=120.
+#[test]
+fn loop_health_max_unacked_fleet_max() {
+    let s = seed_resource_fleet(&[
+        ("sec-a", lh_record(0, 5_000, ("inbox", 40_000), 30)),
+        ("sec-b", lh_record(0, 6_000, ("inbox", 45_000), 60)),
+        ("sec-c", lh_record(0, 4_000, ("oom_sweep", 90_000), 120)),
+    ]);
+    let snap = Snap::from_cluster_state(&s);
+    assert_eq!(snap.max_unacked_for_secs, Some(120));
+}
+
+/// T2 (observer side) — `dominant_arm`: max-by-pct across secondaries
+/// emits the single hottest arm name+pct, NOT the fleet average.
+#[test]
+fn loop_health_dominant_arm_max_by_pct() {
+    let s = seed_resource_fleet(&[
+        ("sec-a", lh_record(0, 5_000, ("inbox", 40_000), 0)),
+        ("sec-b", lh_record(0, 6_000, ("oom_sweep", 80_000), 0)),
+        ("sec-c", lh_record(0, 4_000, ("anti_entropy", 30_000), 0)),
+    ]);
+    let snap = Snap::from_cluster_state(&s);
+    let dominant = snap.dominant_arm.expect("at least one secondary with a non-empty dominant arm");
+    assert_eq!(dominant.arm_name, "oom_sweep");
+    assert_eq!(dominant.pct_milli, 80_000);
+}
+
+/// T1 (observer side) — `avg_oploop_iters_per_sec_milli` is the
+/// arithmetic mean across secondaries with NON-ZERO readings; a
+/// zero (cold-start / pre-#589) secondary is excluded from the
+/// denominator.
+#[test]
+fn loop_health_avg_iters_excludes_zero_sentinels() {
+    let s = seed_resource_fleet(&[
+        ("sec-a", lh_record(0, 10_000, ("inbox", 50_000), 0)),
+        ("sec-b", lh_record(0, 20_000, ("inbox", 50_000), 0)),
+        // sec-c is cold-start / pre-#589 (iter rate at the wire-default
+        // sentinel) — MUST NOT drag the average toward zero.
+        ("sec-c", lh_record(0, 0, ("", 0), 0)),
+    ]);
+    let snap = Snap::from_cluster_state(&s);
+    // (10_000 + 20_000) / 2 = 15_000; cold-start sec-c excluded.
+    assert_eq!(snap.avg_oploop_iters_per_sec_milli, Some(15_000));
+}
+
+/// Empty fleet (no secondary has emitted) ⇒ every loop-health
+/// aggregate is `None` — the freshly-promoted-primary cold-start
+/// window contract carried over from #575.
+#[test]
+fn loop_health_empty_fleet_yields_none() {
+    let s = ClusterState::<()>::new();
+    let snap = Snap::from_cluster_state(&s);
+    assert!(snap.avg_oploop_iters_per_sec_milli.is_none());
+    assert!(snap.dominant_arm.is_none());
+    assert!(snap.max_unacked_for_secs.is_none());
+}
+
+/// T4 — 25%-threshold inclusion: a dominant_arm_pct change from 30% to
+/// 50% is INCLUDED (>25% relative); from 50% to 55% is EXCLUDED
+/// (<25% relative). Mirrors the #575 resource-line gate.
+#[test]
+fn loop_health_dominant_pct_25pct_threshold() {
+    let cur_50 = StatsSnapshot {
+        dominant_arm: Some(DominantArm {
+            arm_name: "oom_sweep".to_string(),
+            pct_milli: 50_000,
+        }),
+        ..Default::default()
+    };
+    let prev = StatsSnapshot::default();
+
+    // 30% baseline → 50% current: rel = (50_000 - 30_000) / 30_000 =
+    // ~0.667 > 0.25, INCLUDE.
+    let baseline_30 = ResourceBaseline {
+        dominant_arm_pct_milli: Some(30_000),
+        ..Default::default()
+    };
+    let r1 = render_report_full(&cur_50, &prev, &baseline_30);
+    let body1 = r1.body.expect("at least one line moved enough to include");
+    assert!(
+        body1.contains("dominant arm (fleet max): oom_sweep:50.00%"),
+        "30%→50% must include the dominant-arm line; got:\n{body1}"
+    );
+
+    // 50% baseline → 50% current: rel = 0 ≤ 0.25, EXCLUDE.
+    let baseline_50 = ResourceBaseline {
+        dominant_arm_pct_milli: Some(50_000),
+        ..Default::default()
+    };
+    let r2 = render_report_full(&cur_50, &prev, &baseline_50);
+    assert!(
+        r2.body.is_none(),
+        "50%→50% must exclude (no other line moved); got:\n{:?}",
+        r2.body
+    );
+
+    // 50% baseline → 55% current (rel = 0.1 < 0.25), EXCLUDE.
+    let cur_55 = StatsSnapshot {
+        dominant_arm: Some(DominantArm {
+            arm_name: "oom_sweep".to_string(),
+            pct_milli: 55_000,
+        }),
+        ..Default::default()
+    };
+    let r3 = render_report_full(&cur_55, &prev, &baseline_50);
+    assert!(
+        r3.body.is_none(),
+        "50%→55% (rel ≈ 0.1) must exclude; got:\n{:?}",
+        r3.body
+    );
+}
+
+/// T5 — skip-predicate interaction: a tick where ONLY the new
+/// loop-health fields change is SKIP-eligible (per #574 extension).
+/// The destructure-or-die trip stays compile-checked (the new fields
+/// are bound with `_` in `diff_subset_of_skip_eligible`); this test
+/// pins the BEHAVIOUR — a loop-health-only change must not force a
+/// 10-minute emission.
+#[test]
+fn loop_health_only_change_is_skip_eligible() {
+    let prev = StatsSnapshot::default();
+    let cur = StatsSnapshot {
+        avg_oploop_iters_per_sec_milli: Some(15_000),
+        dominant_arm: Some(DominantArm {
+            arm_name: "oom_sweep".to_string(),
+            pct_milli: 80_000,
+        }),
+        max_unacked_for_secs: Some(120),
+        ..Default::default()
+    };
+    assert!(
+        cur.diff_subset_of_skip_eligible(&prev),
+        "a loop-health-only change must be SKIP-eligible (the 10-minute \
+         emission elides; the 1-hour safety net or an outside-the-skip- \
+         set field forces the print)"
+    );
+}
+
+/// Companion to T5: a non-skip-eligible field moving DEFEATS the skip
+/// predicate even when the loop-health axis moved too. Pins that the
+/// new loop-health fields do not accidentally widen the skip set.
+#[test]
+fn loop_health_plus_in_flight_change_is_not_skip_eligible() {
+    let prev = StatsSnapshot::default();
+    let cur = StatsSnapshot {
+        avg_oploop_iters_per_sec_milli: Some(15_000),
+        in_flight: 7, // outside the skip set
+        ..Default::default()
+    };
+    assert!(
+        !cur.diff_subset_of_skip_eligible(&prev),
+        "an in_flight change must defeat skip-eligibility regardless of \
+         loop-health movement"
+    );
+}

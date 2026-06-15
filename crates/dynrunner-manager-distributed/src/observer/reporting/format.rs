@@ -18,7 +18,7 @@
 //! delta/inclusion rules are unit-testable without a clock, a CRDT, or
 //! the tracing sink.
 
-use super::stats::StatsSnapshot;
+use super::stats::{DominantArm, StatsSnapshot};
 
 /// Per-field last-PRINTED baseline for the #575 resource-stat averages
 /// — kept ALONGSIDE the snapshot-shaped `last_announced` baseline (the
@@ -43,6 +43,20 @@ pub struct ResourceBaseline {
     pub total_swap_used_bytes: Option<u64>,
     pub total_free_swap_bytes: Option<u64>,
     pub cpu_utilization_milli: Option<u32>,
+    /// #589 loop-health: last-PRINTED fleet-average iter-rate in
+    /// milli-iters-per-second. The 25%-threshold gate uses this as
+    /// the prior to decide if the next emit's reading is worth
+    /// printing.
+    pub oploop_iters_per_sec_milli: Option<u64>,
+    /// #589 loop-health: last-PRINTED dominant-arm SHARE in milli-
+    /// percent. The threshold gate fires on the share moving >25%;
+    /// the arm NAME is rendered each emit but is NOT part of the
+    /// baseline (a name change at a steady share is operator-routine
+    /// — the share movement is the wake-worthy signal).
+    pub dominant_arm_pct_milli: Option<u32>,
+    /// #589 loop-health: last-PRINTED fleet-max oldest-unACKed age
+    /// in seconds.
+    pub max_unacked_for_secs: Option<u32>,
 }
 
 /// Relative-change inclusion threshold for the #575 resource lines —
@@ -89,6 +103,20 @@ enum MetricShape {
         prev_printed: Option<u64>,
         unit: ResourceUnit,
     },
+    /// A #589 loop-health dominant-arm line — the (name, pct) pair
+    /// rendered as `oom_sweep:55.00%`. Inclusion shape mirrors
+    /// `ResourceAvg`: present iff `value.is_some()`; changed iff
+    /// `prev_printed_pct_milli` is `None` OR the relative move from
+    /// it exceeds `RESOURCE_THRESHOLD` (the share is the wake-worthy
+    /// signal — a name swap at a steady share is operator-routine).
+    /// Carries the NAME alongside the share so the rendered line
+    /// names the secondary's hot arm verbatim — a single string
+    /// field on the wire-bound output, mapped from the structural
+    /// pair on the snapshot ([`DominantArm`]).
+    DominantArmLine {
+        value: Option<DominantArm>,
+        prev_printed_pct_milli: Option<u32>,
+    },
 }
 
 /// How to format a `ResourceAvg`'s body — owns the byte→human or
@@ -102,6 +130,11 @@ enum ResourceUnit {
     Bytes,
     /// Milli-percent (100_000 = 100%), rendered as `XX.YY%`.
     Percent,
+    /// #589 loop-health iter-rate: milli-iters-per-second (12_500 =
+    /// 12.5/s), rendered as `XX.YY/s`.
+    IterPerSec,
+    /// #589 loop-health unacked age: seconds, rendered as `Ns`.
+    Secs,
 }
 
 /// One metric's render decision. Carries the human label and the shape
@@ -132,6 +165,7 @@ impl MetricShape {
             MetricShape::Counter { total, .. } | MetricShape::Gauge { total, .. } => *total > 0,
             MetricShape::Ratio { busy, .. } => *busy > 0,
             MetricShape::ResourceAvg { value, .. } => value.is_some(),
+            MetricShape::DominantArmLine { value, .. } => value.is_some(),
         }
     }
 
@@ -161,6 +195,22 @@ impl MetricShape {
                     rel > RESOURCE_THRESHOLD
                 }
             },
+            // Dominant-arm threshold is on the SHARE (pct_milli) only —
+            // the name re-renders each emit but is not part of the
+            // gate. Mirrors the `ResourceAvg` zero-baseline rule
+            // (`Some(_), None` always includes the first non-zero).
+            MetricShape::DominantArmLine {
+                value,
+                prev_printed_pct_milli,
+            } => match (value, prev_printed_pct_milli) {
+                (None, _) => false,
+                (Some(_), None) => true,
+                (Some(v), Some(p)) => {
+                    let prev_floor = (*p as f64).max(1.0);
+                    let rel = ((v.pct_milli as f64) - (*p as f64)).abs() / prev_floor;
+                    rel > RESOURCE_THRESHOLD
+                }
+            },
         }
     }
 
@@ -172,7 +222,19 @@ impl MetricShape {
             MetricShape::ResourceAvg { value, unit, .. } => match (value, unit) {
                 (Some(v), ResourceUnit::Bytes) => format!("{label}: {}", format_bytes(*v)),
                 (Some(v), ResourceUnit::Percent) => format!("{label}: {}", format_milli_percent(*v)),
+                (Some(v), ResourceUnit::IterPerSec) => {
+                    format!("{label}: {}", format_iter_per_sec(*v))
+                }
+                (Some(v), ResourceUnit::Secs) => format!("{label}: {}", format_secs(*v)),
                 (None, _) => format!("{label}: -"),
+            },
+            MetricShape::DominantArmLine { value, .. } => match value {
+                Some(v) => format!(
+                    "{label}: {}:{}",
+                    v.arm_name,
+                    format_milli_percent(v.pct_milli as u64)
+                ),
+                None => format!("{label}: -"),
             },
         }
     }
@@ -184,6 +246,10 @@ impl MetricShape {
     fn resource_value_for_baseline(&self) -> Option<u64> {
         match self {
             MetricShape::ResourceAvg { value, .. } => *value,
+            // For DominantArmLine the baseline is the SHARE (the gate
+            // axis) — the per-field baseline advance below routes
+            // through this projection.
+            MetricShape::DominantArmLine { value, .. } => value.as_ref().map(|v| v.pct_milli as u64),
             _ => None,
         }
     }
@@ -213,6 +279,17 @@ fn format_bytes(v: u64) -> String {
 /// Milli-percent → percent string (`100_000` = 100.00%).
 fn format_milli_percent(v: u64) -> String {
     format!("{:.2}%", v as f64 / 1000.0)
+}
+
+/// #589 milli-iters-per-second → human iter-per-second string
+/// (`12_500` = `12.50/s`).
+fn format_iter_per_sec(v: u64) -> String {
+    format!("{:.2}/s", v as f64 / 1000.0)
+}
+
+/// #589 seconds → human seconds string (`125` = `125s`).
+fn format_secs(v: u64) -> String {
+    format!("{v}s")
 }
 
 impl MetricLine {
@@ -319,6 +396,27 @@ pub fn render_report_full(cur: &StatsSnapshot) -> String {
         lines.push(format!(
             "host CPU utilization (avg per secondary): {}",
             format_milli_percent(v as u64)
+        ));
+    }
+    // #589 loop-health lines on the force-print, same conditional-on-
+    // signal shape as the #575 averages.
+    if let Some(v) = cur.avg_oploop_iters_per_sec_milli {
+        lines.push(format!(
+            "oploop iter rate (avg per secondary): {}",
+            format_iter_per_sec(v)
+        ));
+    }
+    if let Some(v) = &cur.dominant_arm {
+        lines.push(format!(
+            "dominant arm (fleet max): {}:{}",
+            v.arm_name,
+            format_milli_percent(v.pct_milli as u64)
+        ));
+    }
+    if let Some(v) = cur.max_unacked_for_secs {
+        lines.push(format!(
+            "max unacked report age (fleet max): {}",
+            format_secs(v as u64)
         ));
     }
     lines.join("\n")
@@ -442,12 +540,13 @@ pub fn render_report(
         },
     ];
 
-    // #575 resource-stat lines — per-field 25% threshold against the
-    // last-PRINTED baseline (not the last-announced snapshot). The
-    // order pairs with [`ResourceFieldKind`] one-to-one so the
-    // per-field baseline advance below can route an "Include" outcome
-    // back to the right baseline slot.
-    let resource_lines: [(MetricLine, ResourceFieldKind); 10] = [
+    // #575 resource-stat lines + #589 loop-health lines — per-field 25%
+    // threshold against the last-PRINTED baseline (not the
+    // last-announced snapshot). The order pairs with
+    // [`ResourceFieldKind`] one-to-one so the per-field baseline
+    // advance below can route an "Include" outcome back to the right
+    // baseline slot.
+    let resource_lines: [(MetricLine, ResourceFieldKind); 13] = [
         (
             MetricLine {
                 label: "mem P10 (workers, avg per secondary)",
@@ -558,6 +657,42 @@ pub fn render_report(
             },
             ResourceFieldKind::CpuUtilization,
         ),
+        // #589 loop-health lines. Same 25%-threshold-against-last-
+        // printed gate as the #575 averages; per-field baseline
+        // advance below routes an Include outcome to the matching
+        // baseline slot.
+        (
+            MetricLine {
+                label: "oploop iter rate (avg per secondary)",
+                shape: MetricShape::ResourceAvg {
+                    value: cur.avg_oploop_iters_per_sec_milli,
+                    prev_printed: resource_prev.oploop_iters_per_sec_milli,
+                    unit: ResourceUnit::IterPerSec,
+                },
+            },
+            ResourceFieldKind::OploopItersPerSec,
+        ),
+        (
+            MetricLine {
+                label: "dominant arm (fleet max)",
+                shape: MetricShape::DominantArmLine {
+                    value: cur.dominant_arm.clone(),
+                    prev_printed_pct_milli: resource_prev.dominant_arm_pct_milli,
+                },
+            },
+            ResourceFieldKind::DominantArmPct,
+        ),
+        (
+            MetricLine {
+                label: "max unacked report age (fleet max)",
+                shape: MetricShape::ResourceAvg {
+                    value: cur.max_unacked_for_secs.map(|v| v as u64),
+                    prev_printed: resource_prev.max_unacked_for_secs.map(|v| v as u64),
+                    unit: ResourceUnit::Secs,
+                },
+            },
+            ResourceFieldKind::MaxUnackedSecs,
+        ),
     ];
 
     let mut body: Vec<String> = Vec::new();
@@ -623,6 +758,14 @@ enum ResourceFieldKind {
     TotalSwapUsed,
     TotalFreeSwap,
     CpuUtilization,
+    /// #589 loop-health: fleet-average oploop iter-rate in milli-
+    /// iters-per-second.
+    OploopItersPerSec,
+    /// #589 loop-health: dominant-arm SHARE in milli-percent (the
+    /// name is rendered each emit but is not part of the baseline).
+    DominantArmPct,
+    /// #589 loop-health: fleet-max oldest-unACKed age in seconds.
+    MaxUnackedSecs,
 }
 
 impl ResourceBaseline {
@@ -642,6 +785,13 @@ impl ResourceBaseline {
             ResourceFieldKind::CpuUtilization => {
                 self.cpu_utilization_milli =
                     value.map(|v| v.min(u32::MAX as u64) as u32);
+            }
+            ResourceFieldKind::OploopItersPerSec => self.oploop_iters_per_sec_milli = value,
+            ResourceFieldKind::DominantArmPct => {
+                self.dominant_arm_pct_milli = value.map(|v| v.min(u32::MAX as u64) as u32);
+            }
+            ResourceFieldKind::MaxUnackedSecs => {
+                self.max_unacked_for_secs = value.map(|v| v.min(u32::MAX as u64) as u32);
             }
         }
     }

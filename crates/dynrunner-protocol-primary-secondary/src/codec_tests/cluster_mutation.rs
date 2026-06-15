@@ -292,6 +292,15 @@ fn roundtrip_secondary_resource_sample() {
         total_swap_used_bytes: 256 * 1024 * 1024,
         total_free_swap_bytes: 2 * 1024 * 1024 * 1024,
         cpu_utilization_milli: 65_500,
+        // #589 loop-health: exercise the wire-compat path by carrying
+        // the present fields too. The legacy round-trip is covered by
+        // the separate `roundtrip_secondary_resource_sample_pre_589`
+        // test below (a JSON literal omitting these fields must
+        // serde-default to zero / empty).
+        oploop_iters_per_sec_milli: 12_500,
+        dominant_arm_name: "oom_sweep".to_string(),
+        dominant_arm_pct_milli: 55_000,
+        max_unacked_for_secs: 120,
     };
     let mutation: ClusterMutation<TestId> = ClusterMutation::SecondaryResourceSample {
         secondary: "sec-3".into(),
@@ -316,9 +325,50 @@ fn roundtrip_secondary_resource_sample() {
             assert_eq!(record.total_swap_used_bytes, 256 * 1024 * 1024);
             assert_eq!(record.total_free_swap_bytes, 2 * 1024 * 1024 * 1024);
             assert_eq!(record.cpu_utilization_milli, 65_500);
+            assert_eq!(record.oploop_iters_per_sec_milli, 12_500);
+            assert_eq!(record.dominant_arm_name, "oom_sweep");
+            assert_eq!(record.dominant_arm_pct_milli, 55_000);
+            assert_eq!(record.max_unacked_for_secs, 120);
         }
         _ => panic!("expected SecondaryResourceSample"),
     }
+}
+
+/// `SecondaryResourceSample` (#589) wire-compat: a pre-#589 record
+/// JSON literal omitting the 3 new loop-health fields decodes cleanly
+/// into the new struct shape, with each loop-health field at its
+/// serde-default (zero / empty). Proves the rolling-upgrade contract:
+/// a #589-adopting receiver consuming a still-pre-#589 originator's
+/// broadcast NEVER drops the frame, just treats the loop-health axis
+/// as "no signal yet" (which the observer's 25%-against-zero gate
+/// then suppresses).
+#[test]
+fn roundtrip_secondary_resource_sample_pre_589() {
+    use crate::SecondaryResourceSampleRecord;
+
+    // Hand-written pre-#589 JSON: every #575 field is present, none of
+    // the 3 loop-health fields. A serde-default decode MUST yield a
+    // valid record with the new fields all zero/empty.
+    let json = r#"{
+        "member_gen": 3,
+        "emitted_at_ms": 1700000000000,
+        "mem_p10_bytes": 0,
+        "mem_p30_bytes": 0,
+        "mem_p50_bytes": 0,
+        "mem_p70_bytes": 0,
+        "mem_p90_bytes": 0,
+        "mem_avg_bytes": 0,
+        "total_free_memory_bytes": 0,
+        "total_swap_used_bytes": 0,
+        "total_free_swap_bytes": 0,
+        "cpu_utilization_milli": 0
+    }"#;
+    let decoded: SecondaryResourceSampleRecord = serde_json::from_str(json).unwrap();
+    assert_eq!(decoded.member_gen, 3);
+    assert_eq!(decoded.oploop_iters_per_sec_milli, 0);
+    assert!(decoded.dominant_arm_name.is_empty());
+    assert_eq!(decoded.dominant_arm_pct_milli, 0);
+    assert_eq!(decoded.max_unacked_for_secs, 0);
 }
 
 /// `TaskRequeued` round-trips through serde with its `hash` preserved

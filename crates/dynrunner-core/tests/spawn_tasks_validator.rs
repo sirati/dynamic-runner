@@ -390,6 +390,109 @@ fn barrier_violation_per_task_in_mixed_batch() {
     }
 }
 
+/// #590 regression — the canonical two-task-types-over-one-input
+/// shape: a `build_index`-style phase emits a `realized_lengths` task
+/// and a `sorted_index` task over the SAME binary. They share
+/// `(phase_id, path, identifier)` but differ in `(type_id, task_id)`.
+/// Pre-#590 the validator dedup'd on a content hash that omitted
+/// `(type_id, task_id)`, so the second task was silently dropped as
+/// `DuplicateInBatch`. The post-#590 hash recipe distinguishes them, so
+/// BOTH must validate without error.
+#[test]
+fn spawn_590_two_task_types_over_one_binary_both_validate() {
+    let mut rlen = task_in("index", "rlen:nping", &[]);
+    let mut sidx = task_in("index", "sidx:nping", &[]);
+    // Same content (path, identifier) — the canonical 2-types-1-phase
+    // shape collapses on `(path, identifier)` and differs only on
+    // identity components.
+    rlen.path = PathBuf::from("nping");
+    rlen.identifier = Arc::<str>::from("nping");
+    rlen.type_id = TypeId::from("realized_lengths");
+    sidx.path = PathBuf::from("nping");
+    sidx.identifier = Arc::<str>::from("nping");
+    sidx.type_id = TypeId::from("sorted_index");
+    // Confirm the precondition: the two tasks share `(phase, path,
+    // identifier)` but differ in `(type_id, task_id)`.
+    assert_eq!(rlen.phase_id, sidx.phase_id);
+    assert_eq!(rlen.path, sidx.path);
+    assert_ne!(rlen.type_id, sidx.type_id);
+    assert_ne!(rlen.task_id, sidx.task_id);
+    // And the new hash recipe now distinguishes them.
+    assert_ne!(
+        compute_task_hash(&rlen),
+        compute_task_hash(&sidx),
+        "post-#590 hash must distinguish 2-types-1-phase"
+    );
+    let (present, known, accepts) = empty_receiver();
+    let (valid, errors) =
+        validate_spawn_tasks(present, known, accepts, vec![rlen.clone(), sidx.clone()]);
+    assert_eq!(
+        valid.len(),
+        2,
+        "both rlen and sidx must spawn (pre-#590 only one survived)"
+    );
+    assert!(errors.is_empty(), "no per-task error expected");
+    // Order is preserved.
+    assert_eq!(valid[0].task_id, rlen.task_id);
+    assert_eq!(valid[1].task_id, sidx.task_id);
+}
+
+/// #590 regression guard: the true within-batch duplicate case still
+/// fires. Two copies of the SAME `(phase_id, type_id, task_id, path,
+/// identifier)` in one batch — the first validates, the second is
+/// `DuplicateInBatch`. Pins that the fix doesn't over-correct.
+#[test]
+fn spawn_590_true_duplicate_still_drops() {
+    let a = task("dup", vec![]);
+    let a_hash = compute_task_hash(&a);
+    let (present, known, accepts) = empty_receiver();
+    let (valid, errors) =
+        validate_spawn_tasks(present, known, accepts, vec![a.clone(), a.clone()]);
+    assert_eq!(valid.len(), 1, "first occurrence validates");
+    assert_eq!(errors.len(), 1, "second occurrence is DuplicateInBatch");
+    match &errors[0].1 {
+        SpawnError::DuplicateInBatch(h) => assert_eq!(h, &a_hash),
+        other => panic!("expected DuplicateInBatch, got {other:?}"),
+    }
+}
+
+/// #590 cross-batch order preservation: rlen + sidx in one batch end up
+/// in the valid vector in original order, even with an intervening
+/// already-in-ledger entry that drops.
+#[test]
+fn spawn_590_mixed_batch_preserves_order() {
+    let mut rlen = task_in("index", "rlen:nping", &[]);
+    let mut sidx = task_in("index", "sidx:nping", &[]);
+    rlen.path = PathBuf::from("nping");
+    rlen.identifier = Arc::<str>::from("nping");
+    rlen.type_id = TypeId::from("realized_lengths");
+    sidx.path = PathBuf::from("nping");
+    sidx.identifier = Arc::<str>::from("nping");
+    sidx.type_id = TypeId::from("sorted_index");
+    // Intervening task whose hash IS already in the receiver's ledger.
+    let stale = task("stale", vec![]);
+    let stale_hash = compute_task_hash(&stale);
+    let present_hash = stale_hash.clone();
+    let is_present = move |h: &str| h == present_hash;
+    let is_known = |_p: &PhaseId, _id: &str| false;
+    let phase_accepts = |_p: &PhaseId| true;
+    let (valid, errors) = validate_spawn_tasks(
+        is_present,
+        is_known,
+        phase_accepts,
+        vec![rlen.clone(), stale.clone(), sidx.clone()],
+    );
+    assert_eq!(valid.len(), 2);
+    assert_eq!(valid[0].task_id, rlen.task_id, "rlen first");
+    assert_eq!(valid[1].task_id, sidx.task_id, "sidx second");
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, 1, "stale at index 1 drops as ledger-dup");
+    match &errors[0].1 {
+        SpawnError::DuplicateTaskHash(h) => assert_eq!(h, &stale_hash),
+        other => panic!("expected DuplicateTaskHash, got {other:?}"),
+    }
+}
+
 #[test]
 fn unknown_dep_takes_precedence_over_barrier_violation() {
     // A task that fails BOTH the dep check AND the barrier interlock
