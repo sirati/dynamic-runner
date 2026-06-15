@@ -2628,19 +2628,41 @@ struct ScriptedJobLedger {
     script: std::sync::Mutex<std::collections::VecDeque<crate::observer::JobLedgerStatus>>,
     last: crate::observer::JobLedgerStatus,
     consults: std::sync::Mutex<usize>,
+    /// The authoritative terminal disposition the `run_terminal_outcome`
+    /// consult returns once the cluster is proven gone. Defaults to
+    /// `Failed` (the conservative disposition a real crash would show), so
+    /// tests that only script the queue probe keep the original "no clean
+    /// completion → FAILED" behaviour; the #532 clean-completion tests set
+    /// it to `Completed`.
+    outcome: crate::observer::ClusterTerminalOutcome,
+    /// How many times the authoritative `run_terminal_outcome` consult ran
+    /// — proves it is NOT called on the cheap per-cadence streak probe (only
+    /// once the cluster is proven gone).
+    outcome_consults: std::sync::Mutex<usize>,
 }
 
 impl ScriptedJobLedger {
     fn new(script: Vec<crate::observer::JobLedgerStatus>) -> std::sync::Arc<Self> {
+        Self::with_outcome(script, crate::observer::ClusterTerminalOutcome::Failed)
+    }
+    fn with_outcome(
+        script: Vec<crate::observer::JobLedgerStatus>,
+        outcome: crate::observer::ClusterTerminalOutcome,
+    ) -> std::sync::Arc<Self> {
         let last = *script.last().expect("non-empty script");
         std::sync::Arc::new(Self {
             script: std::sync::Mutex::new(script.into_iter().collect()),
             last,
             consults: std::sync::Mutex::new(0),
+            outcome,
+            outcome_consults: std::sync::Mutex::new(0),
         })
     }
     fn consult_count(&self) -> usize {
         *self.consults.lock().expect("mutex")
+    }
+    fn outcome_consult_count(&self) -> usize {
+        *self.outcome_consults.lock().expect("mutex")
     }
 }
 
@@ -2649,6 +2671,10 @@ impl crate::observer::JobLedgerProbe for ScriptedJobLedger {
     async fn jobs_still_queued(&self) -> crate::observer::JobLedgerStatus {
         *self.consults.lock().expect("mutex") += 1;
         self.script.lock().expect("mutex").pop_front().unwrap_or(self.last)
+    }
+    async fn run_terminal_outcome(&self) -> crate::observer::ClusterTerminalOutcome {
+        *self.outcome_consults.lock().expect("mutex") += 1;
+        self.outcome
     }
 }
 
@@ -2989,6 +3015,175 @@ async fn clean_run_complete_is_not_reclassified_by_the_ledger_consult() {
     })
     .await
     .expect("the observer must exit immediately on the already-converged RunComplete");
+}
+
+/// THE #532 REPLAY (the 66k LMU recovery false-FAIL, gateway-verified clean
+/// completion): a relocated submitter→observer hosts the job ledger; the
+/// primary terminated RIGHT AFTER completing the run, the observer's leg
+/// dropped at that instant so it NEVER received `RunComplete`, and after the
+/// 900s+ lost-visibility episode the queue is empty on two consecutive
+/// consults — the cluster is GONE. The AUTHORITATIVE accounting (sacct)
+/// shows every job COMPLETED (exit 0), so the gone-cluster is gone BECAUSE
+/// the run finished cleanly. The observer MUST exit `Done` (success / exit
+/// 0), NEVER the false `FatalPolicyExit` (exit 1) the pre-fix path returned.
+///
+/// REVERT-CONFIRM: this is the SAME script + cadence as
+/// `cluster_empty_ledger_consult_renders_bounded_terminal_verdict` (which
+/// exits `Err`) — the ONLY difference is the authoritative disposition
+/// (`Completed` here vs the default `Failed` there). Without the
+/// disambiguation the COMPLETED case would take the identical `Err`
+/// (FatalPolicyExit) path — the production bug. The two tests pin both arms
+/// of the fork.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cluster_gone_but_authoritatively_completed_exits_done_not_failed() {
+    use crate::observer::{ClusterTerminalOutcome, JobLedgerStatus};
+
+    tokio::time::timeout(Duration::from_secs(1500), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Queue empty on every consult (the cluster left the queue),
+                // BUT the authoritative accounting says every job COMPLETED.
+                let probe = ScriptedJobLedger::with_outcome(
+                    vec![JobLedgerStatus::Empty],
+                    ClusterTerminalOutcome::Completed,
+                );
+                let mut config = observer_config("obs");
+                config.fleet_dead_timeout = Duration::from_millis(50);
+                // Far longer than the wake-loss cadence so the ground-truth
+                // ledger verdict wins ahead of the fleet-death presumption.
+                config.fleet_death_presumption = Duration::from_secs(100_000);
+                let mut observer = observer_with_ledger(probe.clone(), config);
+
+                let terminal = observer.run().await.expect(
+                    "a cluster that left the queue because the run COMPLETED cleanly \
+                     (authoritative sacct = all COMPLETED) must exit Done — NEVER the \
+                     false FatalPolicyExit the pre-fix path returned (the #532 \
+                     false-FAIL of a clean 66k run)",
+                );
+                assert!(
+                    matches!(terminal, ObserverTerminal::Done),
+                    "a clean completion whose RunComplete was lost to the dropped leg \
+                     must surface as Done (exit 0), not a failure; got {terminal:?}"
+                );
+                assert!(
+                    probe.consult_count() >= 2,
+                    "the cluster-gone double-check still requires two consecutive \
+                     empties before the authoritative consult runs; got {}",
+                    probe.consult_count()
+                );
+                assert_eq!(
+                    probe.outcome_consult_count(),
+                    1,
+                    "the authoritative sacct consult runs EXACTLY once — only after the \
+                     double-check proves the cluster gone, never on the cheap \
+                     per-cadence streak probe"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect(
+        "BOUNDED clean terminal: the observer must exit Done within the wake-loss \
+         cadence window — neither spinning nor false-FAILing",
+    );
+}
+
+/// COUNTERPART to the #532 clean-completion replay: the same "cluster gone"
+/// (queue empty on two consecutive consults) but the AUTHORITATIVE
+/// accounting (sacct) shows a real failure (a scancelled / crashed / OOM
+/// job). The observer MUST keep the FAILED verdict (`FatalPolicyExit`,
+/// non-zero) — the disambiguation must NEVER turn a genuine failure into a
+/// false success. Also pins that the success is gated ON the authoritative
+/// consult (it ran exactly once, after the double-check).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cluster_gone_with_authoritative_failure_keeps_failed_verdict() {
+    use crate::observer::{ClusterTerminalOutcome, JobLedgerStatus};
+    use crate::primary::RunError;
+
+    tokio::time::timeout(Duration::from_secs(1500), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let probe = ScriptedJobLedger::with_outcome(
+                    vec![JobLedgerStatus::Empty],
+                    ClusterTerminalOutcome::Failed,
+                );
+                let mut config = observer_config("obs");
+                config.fleet_dead_timeout = Duration::from_millis(50);
+                config.fleet_death_presumption = Duration::from_secs(100_000);
+                let mut observer = observer_with_ledger(probe.clone(), config);
+
+                let err = observer.run().await.expect_err(
+                    "a cluster gone with an authoritative FAILURE terminal (sacct = a \
+                     crashed/scancelled/OOM job) must still surface FAILED — the \
+                     disambiguation must never optimistically call a real failure a \
+                     success",
+                );
+                match err {
+                    RunError::FatalPolicyExit { reason } => {
+                        assert!(
+                            reason.contains("GONE"),
+                            "carries the cluster-gone wording: {reason}"
+                        );
+                        assert!(
+                            reason.contains("FAILED") || reason.contains("FAILURE"),
+                            "names the authoritative-failure treatment: {reason}"
+                        );
+                    }
+                    other => panic!("expected the structured FatalPolicyExit, got {other:?}"),
+                }
+                assert_eq!(
+                    probe.outcome_consult_count(),
+                    1,
+                    "the authoritative consult gates the verdict — it ran once after \
+                     the double-check"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("the FAILED verdict must be reached within the wake-loss cadence window");
+}
+
+/// The conservative fail-safe: the cluster is gone but the AUTHORITATIVE
+/// accounting is UNREADABLE (`Indeterminate` — sacct down, or no terminal
+/// state for part of the cohort). Without positive proof of a clean
+/// completion the observer keeps the FAILED verdict — the optimistic `Done`
+/// is asserted ONLY on a positive all-completed reading, never on an
+/// unreadable probe (a flaky sacct must not turn a maybe-failed run green).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cluster_gone_with_indeterminate_authority_keeps_failed_verdict() {
+    use crate::observer::{ClusterTerminalOutcome, JobLedgerStatus};
+    use crate::primary::RunError;
+
+    tokio::time::timeout(Duration::from_secs(1500), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let probe = ScriptedJobLedger::with_outcome(
+                    vec![JobLedgerStatus::Empty],
+                    ClusterTerminalOutcome::Indeterminate,
+                );
+                let mut config = observer_config("obs");
+                config.fleet_dead_timeout = Duration::from_millis(50);
+                config.fleet_death_presumption = Duration::from_secs(100_000);
+                let mut observer = observer_with_ledger(probe.clone(), config);
+
+                let err = observer.run().await.expect_err(
+                    "an unreadable authoritative state is NOT positive evidence of a \
+                     clean completion — the observer must keep the conservative FAILED \
+                     verdict, never optimistically report Done",
+                );
+                assert!(
+                    matches!(err, RunError::FatalPolicyExit { .. }),
+                    "an indeterminate authority keeps FatalPolicyExit; got {err:?}"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("the conservative FAILED verdict must be reached within the cadence window");
 }
 
 /// PRODUCTION REPLAY (the late-joined-observer keepalive blackout, owner

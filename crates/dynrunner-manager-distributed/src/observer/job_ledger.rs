@@ -70,6 +70,53 @@ pub enum JobLedgerStatus {
     ProbeFailed,
 }
 
+/// The AUTHORITATIVE terminal disposition of a run whose jobs have all
+/// left the queue — the disambiguation `JobLedgerStatus::Empty` cannot
+/// carry.
+///
+/// # Why this is needed (the run_20260613 66k false-FAIL)
+///
+/// `jobs_still_queued` rides `squeue`, which only ever reports
+/// PENDING/RUNNING; once every job leaves the queue it returns nothing
+/// REGARDLESS of WHY they left — a clean COMPLETED framework shutdown
+/// (every job exit-0) and a crash/scancel/OOM both collapse to
+/// [`JobLedgerStatus::Empty`]. So "the cluster is gone" alone is
+/// AMBIGUOUS. A relocated submitter→observer whose verdict leg dropped at
+/// the instant of a clean completion (it never received `RunComplete`)
+/// would then conservatively treat the gone-cluster as FAILED and exit 1
+/// — a clean 66k run surfacing as a non-zero failure, breaking exit-code
+/// automation. This outcome — read from `sacct`'s retained terminal
+/// State, which survives the job leaving the queue — distinguishes the
+/// two so the observer reports the run's ACTUAL disposition.
+///
+/// Consulted ONLY after the [`super::cluster_gone::ClusterGoneDetector`]'s
+/// two-consecutive-empty double-check has already concluded the cluster
+/// is gone — the authoritative classification is the more expensive probe
+/// (`sacct` over the whole cohort), so it is reserved for the moment a
+/// verdict is actually about to be authored, never run on the cheap
+/// per-cadence streak probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterTerminalOutcome {
+    /// EVERY one of the run's jobs reached a clean terminal (`sacct`
+    /// State `COMPLETED`, exit 0) — a clean framework shutdown. The run
+    /// reached its terminal; the missing `RunComplete` verdict was lost to
+    /// the dropped leg, not absent because the run failed. Report the run
+    /// as COMPLETED (exit 0), NOT failed.
+    Completed,
+    /// At least one job reached a FAILURE terminal (`FAILED` / `CANCELLED`
+    /// / `TIMEOUT` / `NODE_FAIL` / `OUT_OF_MEMORY` / a non-zero exit) — a
+    /// real failure (crash / scancel / OOM). Keep the FAILED verdict.
+    Failed,
+    /// The authoritative state could not be read (the `sacct` consult
+    /// failed at the gateway, or accounting returned nothing for the
+    /// cohort — e.g. accounting purged or disabled). NOT positive
+    /// evidence of a clean completion, so the caller keeps the
+    /// conservative FAILED verdict (a clean completion is asserted ONLY on
+    /// a positive [`Self::Completed`] reading — the genuine-failure path
+    /// must never be turned optimistic by an unreadable probe).
+    Indeterminate,
+}
+
 /// Port the observer crosses to consult the job ledger it hosts.
 ///
 /// `#[async_trait(?Send)]` because the production binding drives a squeue
@@ -93,6 +140,23 @@ pub trait JobLedgerProbe: Send + Sync {
     /// [`JobLedgerStatus::ProbeFailed`] rather than a panic/error, so the
     /// observer's defensive double-check treats it as "no information".
     async fn jobs_still_queued(&self) -> JobLedgerStatus;
+
+    /// Read the AUTHORITATIVE terminal disposition of the run's jobs from
+    /// SLURM accounting (`sacct`), which retains each job's final State
+    /// after it leaves the queue. Consulted ONLY once the
+    /// two-consecutive-empty double-check has concluded the cluster is
+    /// gone, to disambiguate gone-because-COMPLETED (clean framework
+    /// shutdown) from gone-because-FAILED (crash / scancel / OOM) — the
+    /// distinction `jobs_still_queued` collapses (see
+    /// [`ClusterTerminalOutcome`]).
+    ///
+    /// A best-effort read: an unreadable consult (gateway failure, or
+    /// accounting that returned nothing) surfaces as
+    /// [`ClusterTerminalOutcome::Indeterminate`] rather than a
+    /// panic/error, so the caller keeps the conservative FAILED verdict —
+    /// the optimistic COMPLETED disposition is asserted ONLY on a positive
+    /// reading that EVERY job completed cleanly.
+    async fn run_terminal_outcome(&self) -> ClusterTerminalOutcome;
 }
 
 /// A job-ledger probe handle the observer holds. [`None`] on a path that

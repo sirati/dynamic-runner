@@ -85,7 +85,7 @@ use crate::observer::announcer::{AnnouncerOutboxItem, PeerMeshAnnouncerSender};
 use crate::observer::cluster_gone::{ClusterGoneDetector, ClusterGoneVerdict};
 use crate::observer::failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 use crate::observer::fleet_death::{FleetDeathDetector, FleetDeathVerdict};
-use crate::observer::job_ledger::JobLedgerProbeHandle;
+use crate::observer::job_ledger::{ClusterTerminalOutcome, JobLedgerProbeHandle};
 use crate::graceful_abort_trigger::GracefulAbortTrigger;
 use crate::observer::lifecycle::{AnnouncerHandle, attach_observer_announcer};
 use crate::observer::lost_visibility::{
@@ -476,6 +476,32 @@ struct RespawnExecOutcome {
 enum RespawnExecKind {
     Spawn,
     Revoke,
+}
+
+/// The observer's exit decision after a cluster-gone job-ledger consult —
+/// the disambiguated outcome the run loop acts on.
+///
+/// The streak double-check (`squeue` empty twice) only establishes the
+/// cluster is GONE; the authoritative `sacct` consult then resolves WHY,
+/// which is what determines the EXIT CODE (the #532 false-FAIL fix). A
+/// cluster that emptied because the run COMPLETED cleanly must exit `Done`
+/// (success), not FAILED.
+enum ClusterGoneDecision {
+    /// The double-check has not yet concluded the cluster is gone (one
+    /// empty consult, a `Present`/`ProbeFailed` reset, etc.). Keep
+    /// observing — no exit.
+    KeepWatching,
+    /// The cluster is gone BECAUSE the run completed cleanly (the
+    /// authoritative accounting shows every job COMPLETED, exit 0). The
+    /// missing `RunComplete` was lost to the dropped observer leg, not
+    /// absent because the run failed — the run loop exits
+    /// [`ObserverTerminal::Done`] (success). `note` is the operator-facing
+    /// line (honest about the observer's stale counts).
+    CompletedClean { note: String },
+    /// The cluster is gone and the authoritative state is a real failure
+    /// (or could not confirm a clean completion) — the run loop exits the
+    /// structured non-zero [`RunError::FatalPolicyExit`] with `reason`.
+    Failed { reason: String },
 }
 
 impl<I> ObserverCoordinator<I>
@@ -1368,20 +1394,37 @@ where
                 // cadence (no new timer) and the two-consecutive-empty
                 // double-check is one wake-loss interval apart. Conditional
                 // on hosting a ledger (`Some`): a cold-join observer keeps
-                // the never-terminal report-and-retry behaviour. On the
-                // verdict: the same single wake-stream terminal-reason emit
-                // + structured non-zero `FatalPolicyExit` every local
-                // terminal uses (which routes through the single-teardown
-                // below, exactly like the fleet-death exit above).
+                // the never-terminal report-and-retry behaviour.
+                //
+                // Once the double-check concludes the cluster is GONE, the
+                // consult disambiguates WHY via SLURM accounting (the #532
+                // false-FAIL fix): a clean COMPLETED framework shutdown — the
+                // run reached its terminal but the `RunComplete` verdict was
+                // lost to the dropped observer leg — exits `Done` (success),
+                // NEVER FAILED; a real crash/scancel/OOM (or an unreadable
+                // authoritative state) keeps the structured non-zero
+                // `FatalPolicyExit`. Both route the single wake-stream
+                // terminal-reason emit + the single-teardown below, exactly
+                // like the fleet-death exit above.
                 let wake_emit = visibility_reporter.wake_emit_instant();
                 if wake_emit.is_some() && wake_emit != last_consulted_wake_emit {
                     last_consulted_wake_emit = wake_emit;
-                    if let Some(ClusterGoneVerdict::Gone { reason }) =
-                        self.consult_job_ledger(&mut cluster_gone).await
-                    {
-                        let err = RunError::FatalPolicyExit { reason };
-                        self.emit_terminal_reason_important(&err.to_string());
-                        return Err(err);
+                    match self.consult_cluster_gone(&mut cluster_gone).await {
+                        Some(ClusterGoneDecision::CompletedClean { note }) => {
+                            // The cluster is gone BECAUSE the run completed
+                            // cleanly — report success, not a false FAILED.
+                            self.emit_terminal_reason_important(&note);
+                            return Ok(ObserverTerminal::Done);
+                        }
+                        Some(ClusterGoneDecision::Failed { reason }) => {
+                            let err = RunError::FatalPolicyExit { reason };
+                            self.emit_terminal_reason_important(&err.to_string());
+                            return Err(err);
+                        }
+                        // The double-check has not (yet) proven the cluster
+                        // gone, or this observer hosts no ledger — keep
+                        // observing.
+                        Some(ClusterGoneDecision::KeepWatching) | None => {}
                     }
                 }
 
@@ -1759,36 +1802,96 @@ where
             .max()
     }
 
-    /// Consult the hosted job ledger for the cluster-empty terminal
-    /// verdict — the relocated-submitter ground truth.
+    /// Consult the hosted job ledger for the cluster-gone terminal — and,
+    /// once the cluster is proven gone, DISAMBIGUATE whether it left
+    /// CLEANLY (a completed framework shutdown) or in FAILURE.
     ///
     /// Single concern at this seam: cross the
-    /// [`crate::observer::job_ledger::JobLedgerProbe`] port to ask "are the
-    /// run's jobs still queued?", feed the result into the
-    /// [`ClusterGoneDetector`]'s two-consecutive-empty double-check, and
-    /// return its verdict. The observer never names squeue — the provider
-    /// layer owns the query.
+    /// [`crate::observer::job_ledger::JobLedgerProbe`] port to learn the
+    /// run's authoritative terminal disposition when its jobs have left the
+    /// queue, and turn it into the observer's exit decision. The observer
+    /// never names squeue/sacct — the provider layer owns the queries.
+    ///
+    /// Two ordered probes (cheap-then-authoritative):
+    ///  1. `jobs_still_queued` (a `squeue` probe) feeds the
+    ///     [`ClusterGoneDetector`]'s two-consecutive-empty double-check.
+    ///     Until that renders [`ClusterGoneVerdict::Gone`] there is no
+    ///     decision (`None`).
+    ///  2. ONLY when GONE: `run_terminal_outcome` (the authoritative
+    ///     `sacct` consult) classifies WHY the queue emptied. `squeue` going
+    ///     empty is AMBIGUOUS — every job COMPLETED-exit-0 (a clean
+    ///     framework shutdown) and a crash/scancel/OOM both leave the queue
+    ///     — so the gone-cluster cannot be authored as FAILED on the
+    ///     empty-queue evidence alone (the #532 false-FAIL: a clean 66k run
+    ///     whose `RunComplete` was lost to the dropped observer leg exited 1).
     ///
     /// CONDITIONAL on hosting a ledger: a cold-join observer (no probe
     /// wired) returns `None` and keeps the never-terminal report-and-retry
-    /// behaviour (it cannot teardown a cluster it did not submit). On
-    /// `Some(Gone)` the caller renders the terminal reason + the non-zero
-    /// `FatalPolicyExit`, whose return drives the existing pipeline-guard
-    /// teardown (the #451 clean-completion job sweep + tunnel teardown — the
-    /// SAME path the normal exit's `cancel_all_jobs` runs) and the
-    /// non-zero exit.
+    /// behaviour (it cannot teardown a cluster it did not submit).
     ///
-    /// The verdict line carries the observer's last-known run state from its
-    /// converged CRDT (the last narrated phase, or that no terminal
-    /// converged) so the operator learns what the run was doing when its
-    /// cluster vanished — what is DERIVABLE, distinct from the verdict.
-    async fn consult_job_ledger(
+    /// Disposition mapping (the optimistic COMPLETED is gated on a POSITIVE
+    /// all-completed reading; everything else stays the conservative FAILED,
+    /// so the genuine-failure path is preserved):
+    ///  - [`ClusterTerminalOutcome::Completed`] ⇒
+    ///    [`ClusterGoneDecision::CompletedClean`] (the caller exits `Done`).
+    ///  - [`ClusterTerminalOutcome::Failed`] / `Indeterminate` ⇒
+    ///    [`ClusterGoneDecision::Failed`] (the caller exits `FatalPolicyExit`).
+    ///
+    /// On either decision the caller drives the existing pipeline-guard
+    /// teardown (the #451 clean-completion job sweep + tunnel teardown — the
+    /// SAME path the normal exit's `cancel_all_jobs` runs); only the EXIT
+    /// CODE + the operator-facing line differ between the two.
+    ///
+    /// Each reason/note carries the observer's last-known run state from its
+    /// converged CRDT (the last narrated phase / counts) so the operator
+    /// learns what the run was doing — what is DERIVABLE, distinct from the
+    /// authoritative disposition.
+    async fn consult_cluster_gone(
         &self,
         detector: &mut ClusterGoneDetector,
-    ) -> Option<ClusterGoneVerdict> {
+    ) -> Option<ClusterGoneDecision> {
         let probe = self.job_ledger.as_ref()?;
-        let status = probe.jobs_still_queued().await;
-        Some(detector.observe(status, &self.last_known_run_state()))
+        let last_known = self.last_known_run_state();
+        // Cheap streak probe first: no authoritative consult until the
+        // double-check has proven the cluster gone.
+        let ClusterGoneVerdict::Gone { reason } =
+            detector.observe(probe.jobs_still_queued().await, &last_known)
+        else {
+            return Some(ClusterGoneDecision::KeepWatching);
+        };
+        // Cluster proven GONE — now read the AUTHORITATIVE terminal state to
+        // disambiguate clean-completion from failure.
+        match probe.run_terminal_outcome().await {
+            ClusterTerminalOutcome::Completed => Some(ClusterGoneDecision::CompletedClean {
+                note: format!(
+                    "run completed cleanly — all of the run's SLURM jobs reached \
+                     COMPLETED (exit 0) per the authoritative accounting (sacct), so \
+                     the cluster left the queue because the run FINISHED, not because \
+                     it failed. The observer's connection dropped before the primary's \
+                     RunComplete verdict reached it, so its last converged ledger is \
+                     STALE: {last_known}. The authoritative final counts are on the \
+                     gateway/primary host; the observer reports the run as COMPLETED \
+                     (exit 0)."
+                ),
+            }),
+            ClusterTerminalOutcome::Failed => Some(ClusterGoneDecision::Failed {
+                reason: format!(
+                    "{reason} The authoritative accounting (sacct) shows at least one \
+                     of the run's jobs reached a FAILURE terminal (FAILED / CANCELLED \
+                     / TIMEOUT / NODE_FAIL / OUT_OF_MEMORY), so the run is treated as \
+                     FAILED."
+                ),
+            }),
+            ClusterTerminalOutcome::Indeterminate => Some(ClusterGoneDecision::Failed {
+                reason: format!(
+                    "{reason} The authoritative accounting (sacct) could not confirm a \
+                     clean completion for every job (it was unreadable, or returned no \
+                     terminal state for part of the cohort), so — conservatively — the \
+                     run is treated as FAILED. If the run actually completed cleanly, \
+                     consult the gateway/primary host for the run's verdict."
+                ),
+            }),
+        }
     }
 
     /// A human description of the run's last-known state from the

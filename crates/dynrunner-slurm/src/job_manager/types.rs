@@ -20,6 +20,34 @@ pub enum JobStatus {
     Unknown(String),
 }
 
+/// The AUTHORITATIVE terminal disposition of a whole job cohort, read from
+/// `sacct` accounting (which retains each job's final State after it leaves
+/// the queue). Distinct from [`JobStatus`] (a single squeue snapshot,
+/// which a left-the-queue job has no row for): this is the post-departure
+/// ground truth the [`SlurmJobManager::run_terminal_disposition`] consult
+/// folds over the run's entire cohort.
+///
+/// The disambiguation a `squeue`-empty consult cannot make: every job
+/// COMPLETED-exit-0 (a clean framework shutdown) vs ANY job FAILED /
+/// CANCELLED / TIMEOUT / OOM / NODE_FAIL (a real failure). See the
+/// observer-side mirror `ClusterTerminalOutcome` in
+/// `dynrunner-manager-distributed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunTerminalDisposition {
+    /// EVERY job in the cohort reached `sacct` State `COMPLETED`
+    /// (exit 0) — a clean framework shutdown.
+    AllCompleted,
+    /// At least one job reached a non-COMPLETED terminal (FAILED /
+    /// CANCELLED / TIMEOUT / NODE_FAIL / OUT_OF_MEMORY / any non-zero
+    /// exit) — a real failure.
+    AnyFailed,
+    /// The authoritative state could not be read for at least one job
+    /// (gateway failure, or accounting returned nothing — purged/disabled)
+    /// AND no job was positively seen failed. Not positive evidence of a
+    /// clean completion; the caller keeps its conservative verdict.
+    Indeterminate,
+}
+
 /// Full snapshot returned by `get_job_status`.
 ///
 /// `state`/`state_kind` are `None` when squeue had no record for the
