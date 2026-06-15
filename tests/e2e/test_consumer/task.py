@@ -109,6 +109,28 @@ AFFINE_BUILD_MARKER = "_affine_build.marker"
 _logger = logging.getLogger(__name__)
 
 
+# ── Narration arms (#568 / #570 e2e) ────────────────────────────────────
+# Opt-in custom-message exercise for the narration-completeness e2e: the
+# produce worker emits one Task.send_message frame per produce task when
+# its payload carries ``narration_custom_message in {"ok", "fail"}``, and
+# the primary's custom_message_handler narrates Posted / Handled (#568) or
+# Failed (#570) depending on whether the handler returns or raises. The
+# mode rides on the payload (set by discover_items when the run-wide flag
+# is on) so the worker branches per-task without a second source of truth.
+# Default ``"none"`` opts out — the handler attribute is still defined
+# (no message means it never fires) but never narrates either arm.
+NARRATION_CUSTOM_MESSAGE_TOPIC = "narration-probe"
+NARRATION_CUSTOM_MESSAGE_PAYLOAD = b"narration-probe-payload"
+_NARRATION_MODE_NONE = "none"
+_NARRATION_MODE_OK = "ok"
+_NARRATION_MODE_FAIL = "fail"
+_NARRATION_MODES = (
+    _NARRATION_MODE_NONE,
+    _NARRATION_MODE_OK,
+    _NARRATION_MODE_FAIL,
+)
+
+
 def _destination_root() -> Path:
     """The shared publish destination root, resolved the SAME way the worker
     does (``DYNRUNNER_PUBLISH_DST_ROOT`` env, default ``/app/out-network``).
@@ -239,6 +261,13 @@ class SyntheticTask:
         # the worker can branch on it per-task without re-parsing CLI;
         # discovery is the single place that knows the run-wide opt-in.
         keyed_outputs = bool(getattr(args, "keyed_outputs", False))
+        # Narration-arms opt-in (#568 / #570 e2e): read the run-wide mode
+        # here so the worker branches on payload, not env (env propagation
+        # to worker containers is scenario-specific; discovery runs in the
+        # dispatcher / setup-secondary where the env IS set, and the
+        # payload travels with the task — mirrors how ``keyed_outputs``
+        # rides on every payload from this single source-of-truth point).
+        narration_custom_message = _narration_custom_message_mode()
         items: list[TaskInfo] = []
 
         for idx in range(n):
@@ -260,6 +289,7 @@ class SyntheticTask:
                         "kind": _PHASE_PRODUCE,
                         "idx": idx,
                         "keyed_outputs": keyed_outputs,
+                        "narration_custom_message": narration_custom_message,
                     },
                 )
             )
@@ -734,3 +764,93 @@ def _probe_size(path: Path) -> int:
         return max(1, path.stat().st_size)
     except OSError:
         return 1
+
+
+# ── Narration-arms handler binding (#568 / #570 e2e) ────────────────────
+# Bind ``SyntheticTask.custom_message_handler`` ONLY when the run-wide opt-
+# in env var is set, so existing scenarios using this consumer keep
+# ``has_custom_message_handler() == False`` and pick up no F5 hook at all.
+# Reading the mode at module import time matches how the SLURM-relocated
+# primary reconstructs the task definition in its own process — the env
+# var must be propagated to every process that imports this module (the
+# dispatcher AND any compute-peer process the primary role lands on); the
+# narration scenarios thread it through ``ScenarioPlan.extra_env`` the same
+# way ``DYNRUNNER_E2E_TASK_SLEEP_S`` rides into secondary processes.
+def _narration_custom_message_mode() -> str:
+    raw = os.environ.get("DYNRUNNER_E2E_CUSTOM_MESSAGE_MODE", _NARRATION_MODE_NONE)
+    if raw not in _NARRATION_MODES:
+        return _NARRATION_MODE_NONE
+    return raw
+
+
+def _narration_worker_message_listener(
+    self,  # noqa: ARG001 — bound as a method on SyntheticTask
+    worker_id: int,
+    type_id: str,
+    topic: str,
+    data: bytes,
+    secondary_handle,
+) -> None:
+    """Secondary-side listener for the #568/#570 narration arms.
+
+    The worker's :meth:`Task.send_message` puts a CustomMessageResponse
+    on the worker channel; the secondary receives it and fires this
+    listener. The framework does NOT auto-forward worker customs to the
+    primary — the consumer's listener must call
+    ``secondary_handle.send_to_primary(topic, data, important)`` to drive
+    the Posted/Handled/Failed narration. The narration arms ride on the
+    IMPORTANT delivery class (``important=True``) so #570's Handled /
+    Failed event-driven path actually fires (droppables are at-most-once
+    and never run through the outcome event channel).
+    """
+    _logger.info(
+        "narration worker_message_listener forwarding to primary: "
+        "worker=%d type=%s topic=%s data_len=%d",
+        worker_id,
+        type_id,
+        topic,
+        len(data),
+    )
+    secondary_handle.send_to_primary(topic, data, important=True)
+
+
+def _narration_custom_message_handler(
+    self,  # noqa: ARG001 — bound as a method on SyntheticTask
+    origin: str,
+    topic: str,
+    data: bytes,
+    important: bool,
+    primary_handle,  # noqa: ARG001 — handler exercises narration only
+) -> None:
+    """Primary-side handler for the #568/#570 narration arms.
+
+    Default-mode (``ok``): logs the receipt and returns cleanly so the
+    framework narrates ``custom message handled: from <origin> (seq <seq>)``
+    on the IMPORTANT target.
+
+    Failure-mode (``fail``): raises ``RuntimeError`` with a verbatim,
+    grep-able reason so the #570 ``custom message handler FAILED (raised):
+    ... — <reason>`` ERROR line carries a recognisable substring the
+    narration assertion can pin against.
+    """
+    _logger.info(
+        "narration custom_message_handler invoked: origin=%s topic=%s "
+        "data_len=%d important=%s mode=%s",
+        origin,
+        topic,
+        len(data),
+        important,
+        _narration_custom_message_mode(),
+    )
+    if _narration_custom_message_mode() == _NARRATION_MODE_FAIL:
+        # The handler's exception text rides verbatim into the #570
+        # ERROR narration line — keep the substring stable so the
+        # scenario's assertion can match it without escaping.
+        raise RuntimeError(
+            "test-induced narration failure: synthetic handler raise"
+        )
+
+
+if _narration_custom_message_mode() in (_NARRATION_MODE_OK, _NARRATION_MODE_FAIL):
+    SyntheticTask.custom_message_handler = _narration_custom_message_handler
+    SyntheticTask.worker_message_listener = _narration_worker_message_listener

@@ -67,6 +67,7 @@
           install -m 0755 ${./scripts/test-563-fatal-abort.sh} $out/bin/slurm-test-env-test-563-fatal-abort
           install -m 0755 ${./scripts/test-565-572-pending-resources.sh} \
             $out/bin/slurm-test-env-test-565-572-pending-resources
+          install -m 0755 ${./scripts/test-568-570-narration.sh} $out/bin/slurm-test-env-test-568-570-narration
           install -m 0755 ${./scripts/test-571-tunnel-deadline.sh} $out/bin/slurm-test-env-test-571-tunnel-deadline
           install -m 0755 ${./scripts/test-573-stdio-filter.sh} $out/bin/slurm-test-env-test-573-stdio-filter
           install -m 0755 ${./scripts/test-574-stats-skip.sh} $out/bin/slurm-test-env-test-574-stats-skip
@@ -174,6 +175,10 @@
           test-565-572-pending-resources = {
             type = "app";
             program = "${deploy}/bin/slurm-test-env-test-565-572-pending-resources";
+          };
+          test-568-570-narration = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-test-568-570-narration";
           };
           test-571-tunnel-deadline = {
             type = "app";
