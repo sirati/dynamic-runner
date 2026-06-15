@@ -101,6 +101,8 @@ pub(super) fn task_assignment(
         local_path: binary.path.to_string_lossy().into_owned(),
         file_hash: file_hash.into(),
         predecessor_outputs: std::collections::BTreeMap::new(),
+        supplanted_holder: None,
+        secondary_id_member_gen: None,
     }
 }
 

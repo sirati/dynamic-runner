@@ -120,6 +120,7 @@ mod keepalive_emission;
 mod keepalive_recognition;
 mod late_joiner_accept_emits_peer_joined;
 mod late_joiner_observer;
+mod member_gen_fence;
 mod memprofile_hook;
 mod mesh_ready_reannounce;
 mod no_route_diagnostics;

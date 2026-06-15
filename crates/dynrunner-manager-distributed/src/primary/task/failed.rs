@@ -27,6 +27,11 @@ use crate::worker_signal::WorkerMgmtSignal;
 ///     — the reconciliation probe's holder positively denied holding
 ///     the task (#308): its terminal will never come, but it did not
 ///     FAIL anywhere, so it requeues without burning retry budget.
+///   * [`crate::secondary::TASK_STALE_ADDRESSEE_GEN_WIRE_MESSAGE`] —
+///     the pre-start fence B (#530b) refused a dispatch naming a stale
+///     incarnation of the addressee secondary. The lease was wholly
+///     invalid; the task never ran, so it requeues for re-dispatch
+///     under the live incarnation without burning retry budget.
 ///
 /// Deliberately NOT in this set:
 /// [`crate::secondary::TASK_ALREADY_HELD_WIRE_MESSAGE`] — the
@@ -42,6 +47,7 @@ fn is_backpressure_shaped(error_message: &str) -> bool {
         || error_message == "worker pipe broken; respawning"
         || error_message == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE
         || error_message == crate::primary::reconciliation_probe::RECONCILIATION_LOST_WIRE_MESSAGE
+        || error_message == crate::secondary::TASK_STALE_ADDRESSEE_GEN_WIRE_MESSAGE
 }
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
@@ -74,6 +80,52 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             if error_message == crate::secondary::TASK_ALREADY_HELD_WIRE_MESSAGE {
                 self.note_task_already_held(secondary_id, *worker_id, task_hash)
                     .await;
+                return;
+            }
+            // Pre-start fence A reply (#530a): the addressee REFUSED to start
+            // a duplicate copy because the original (supplanted) holder is
+            // alive again at gen >= supplanted gen. The supplanted holder
+            // identity lives in this primary's `supplanted_holders` side-map
+            // (the dispatch's fence stamp came from there); route the
+            // reconcile through the existing already-held primitive, naming
+            // the SUPPLANTED HOLDER as the authoritative one. The
+            // already-held CASE-1b path withdraws the duplicate from the
+            // ledger's current member (the rejecting addressee) and re-seats
+            // it onto the supplanted holder. A side-map miss (a primary that
+            // never minted the hint — e.g. a reply that crossed a failover)
+            // is a defensive no-op: there is nothing on this primary to
+            // reconcile against, and the eventual real terminal from the
+            // genuinely-live holder still settles via the existing #518
+            // post-start dedup machinery.
+            if error_message == crate::secondary::TASK_SUPPLANTED_BY_LIVE_HOLDER_WIRE_MESSAGE {
+                if let Some((supplanted_id, _gen)) =
+                    self.supplanted_holders.get(task_hash).cloned()
+                {
+                    tracing::warn!(
+                        rejecting_member = %secondary_id,
+                        supplanted_holder = %supplanted_id,
+                        task_hash = %task_hash,
+                        "fence A reply (#530a): the addressee refused to start a \
+                         duplicate copy because the supplanted holder is alive \
+                         again; reconciling the ledger onto the supplanted holder \
+                         and withdrawing the duplicate from the addressee"
+                    );
+                    // worker_id 0: the supplanted holder's actual worker is
+                    // unknown here; it is diagnostic-only in the re-seat path
+                    // and the eventual terminal from the live holder resolves
+                    // the holder by ledger entry, not the re-seat worker id.
+                    self.note_task_already_held(&supplanted_id, 0, task_hash)
+                        .await;
+                } else {
+                    tracing::debug!(
+                        rejecting_member = %secondary_id,
+                        task_hash = %task_hash,
+                        "fence A reply (#530a) for a hash with no side-map \
+                         entry on this primary (a failover lost the hint, or \
+                         a spurious reply); no reconcile — best-effort #518 \
+                         post-start dedup remains"
+                    );
+                }
                 return;
             }
             // Dedup gate (#50 peer-forwarding redundancy):
@@ -251,6 +303,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // stays untouched.
             self.failed_tasks
                 .insert(task_hash.clone(), error_type.clone());
+            // Pre-start fence A side-map drop (#530a): a terminal failure
+            // ends the fence for this hash. Symmetric with the in-flight
+            // ledger drop in `free_slot_on_terminal` above. NOT done on the
+            // backpressure-requeue arm above (the hash re-enters the pool,
+            // so the next dispatch must still be fenced) and NOT done on
+            // the already-held arm (the task stays in flight on the holder).
+            self.drop_supplanted_holder(&task_hash);
             // Replicated-ledger update: every node mirrors the
             // post-failure state. The wire `error_type` is now the
             // typed `ErrorType` enum (Phase D), so the CRDT mutation
@@ -378,6 +437,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 }
                 self.failed_tasks
                     .insert(dep_hash.clone(), dynrunner_core::ErrorType::NonRecoverable);
+                // Pre-start fence A side-map drop (#530a): an unfulfillable
+                // cascade is a terminal — no further dispatch will fence on
+                // this hash, the hint must not outlive it.
+                self.drop_supplanted_holder(&dep_hash);
                 tracing::warn!(
                     task_id = %dep.task_id,
                     phase = %dep.phase_id,

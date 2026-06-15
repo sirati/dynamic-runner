@@ -142,6 +142,8 @@ pub(super) fn send_task_assignment(
         local_path: binary.path.to_string_lossy().into_owned(),
         file_hash: hash,
         predecessor_outputs: std::collections::BTreeMap::new(),
+        supplanted_holder: None,
+        secondary_id_member_gen: None,
     })
     .unwrap();
 }
@@ -581,6 +583,8 @@ async fn stage_file_then_assign_task_succeeds() {
                                         local_path: "/nowhere/staged_bin".into(),
                                         file_hash: real_hash_clone.clone(),
                                         predecessor_outputs: std::collections::BTreeMap::new(),
+                                        supplanted_holder: None,
+                                        secondary_id_member_gen: None,
                                     })
                                     .unwrap();
                                 sent_assignment = true;

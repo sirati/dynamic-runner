@@ -535,6 +535,26 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // are then removed below; the ledger is the source of truth for
         // the requeue so the two can't diverge.
         let requeue_mutations = self.recover_inflight_for_dead_secondary(&secondary_id);
+        // Pre-start fence A (#530a): every task this peer-removal just
+        // requeued may be re-dispatched onto another member while the
+        // "dead" peer is actually still alive (a false-dead recovery —
+        // the run_20260612 #518 wasted-compute window). Record the
+        // supplanted holder identity NOW, BEFORE the `PeerRemoved`
+        // below kills the live `peer_member_gen` for this id: the
+        // generation stamped on the hint is the LIVE incarnation at
+        // requeue time, which is exactly the value the receiver
+        // compares against the supplanted holder's CURRENT
+        // `peer_member_gen` (re-admission would have bumped it). Only
+        // genuine `TaskRequeued` mutations carry a fence — a
+        // setup-task's `TaskFailed` (non-reassignable) is a real
+        // terminal, no redirect dispatch follows.
+        let supplanted_gen = self.cluster_state.peer_member_gen(&secondary_id);
+        for mutation in &requeue_mutations {
+            if let ClusterMutation::TaskRequeued { hash, .. } = mutation {
+                self.supplanted_holders
+                    .insert(hash.clone(), (secondary_id.clone(), supplanted_gen));
+            }
+        }
         let requeued = requeue_mutations.len();
         // Drop every worker hosted by the dead secondary — its host is
         // gone. The slot state is discarded with the worker; the task

@@ -112,6 +112,8 @@ fn roundtrip_all_message_types() {
             local_path: "l".into(),
             file_hash: "h".into(),
             predecessor_outputs: std::collections::BTreeMap::new(),
+            supplanted_holder: None,
+            secondary_id_member_gen: None,
         },
         DistributedMessage::TransferComplete {
             target: None,

@@ -63,6 +63,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // exactly one of {completed, failed}.
             self.failed_tasks.remove(task_hash);
             self.completed_tasks.insert(task_hash.clone());
+            // Pre-start fence A side-map drop (#530a): a completion is a
+            // terminal — the fence is over for this hash. Symmetric with
+            // the in-flight ledger drop in `free_slot_on_terminal` below.
+            self.drop_supplanted_holder(task_hash);
             // Replicated-ledger update: every node mirrors the
             // post-completion state by applying this mutation. CRDT
             // semantics make duplicate applies (e.g. on a re-broadcast

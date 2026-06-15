@@ -634,6 +634,27 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// to the held task regardless of whether the dispatch was local or
     /// inherited.
     pub(super) in_flight: HashMap<String, InFlightEntry<I>>,
+    /// Pre-start fence A side-map (#530a): when the dead-secondary
+    /// recovery path turns a peer-removed peer's in-flight tasks back to
+    /// `Pending` ([`Self::recover_inflight_for_dead_secondary`] run from
+    /// the heartbeat-driven `requeue_dead_secondary`), record the
+    /// supplanted holder identity — `(supplanted_peer_id,
+    /// peer_member_gen_at_removal)` — keyed by task hash. The NEXT
+    /// dispatch of the same hash reads it and stamps `supplanted_holder`
+    /// on the outgoing [`DistributedMessage::TaskAssignment`], so the
+    /// new addressee can pre-start-fence the duplicate execution iff
+    /// the supplanted holder is alive again at gen ≥ supplanted gen
+    /// (the false-dead recovery case). The entry is dropped on every
+    /// terminal settle (TaskComplete / TaskFailed / the CRDT-terminal
+    /// settle) symmetrically with the `in_flight.remove` calls.
+    ///
+    /// Deliberately NOT CRDT-replicated: a primary failover BEFORE the
+    /// re-dispatch loses the hint and degrades to today's best-effort
+    /// #518 inflight-reconcile post-start dedup — the pre-existing
+    /// at-least-once contract. The fence is a strict best-effort
+    /// COMPUTE-dedup improvement; the accounting-dedup guarantee is
+    /// untouched.
+    pub(super) supplanted_holders: HashMap<String, (String, u64)>,
     /// Failed-task ledger keyed by task hash. The value carries the
     /// most-recent ErrorType so the dispatcher can report per-class
     /// failure counts (Recoverable → fail_retry, ResourceExhausted
@@ -1652,6 +1673,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             phase_no_barrier_decl: std::collections::HashSet::new(),
             completed_tasks: HashSet::new(),
             in_flight: HashMap::new(),
+            supplanted_holders: HashMap::new(),
             failed_tasks: HashMap::new(),
             in_flight_per_type: HashMap::new(),
             on_phase_start: None,
@@ -3296,6 +3318,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// Vec) can never leave this pointing at the wrong worker or out of
     /// bounds. The inbound wire `worker_id` is retained for diagnostics;
     /// the ledger entry is the authoritative holder record.
+    /// Drop the pre-start fence A side-map entry for `task_hash`, if any.
+    /// Called from every terminal-settlement site symmetric with the
+    /// in-flight ledger drops (`free_slot_on_terminal`'s `in_flight.remove`,
+    /// the setup-terminal `in_flight.remove`, the `finalize_phase_soft_failures`
+    /// cascade) so a hint never outlives the task it fences. A no-op for a
+    /// hash with no recorded hint (the common case: a hash that was never a
+    /// dead-secondary-requeue redirect). Not part of the requeue path — a
+    /// requeue is precisely when the hint must SURVIVE for the next dispatch.
+    pub(super) fn drop_supplanted_holder(&mut self, task_hash: &str) {
+        self.supplanted_holders.remove(task_hash);
+    }
+
     pub(super) fn free_slot_on_terminal(
         &mut self,
         secondary_id: &str,
@@ -4016,6 +4050,49 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// (replaces the manual `RemoteWorkerState { current_task: Some(..)
     /// }` construction the removed two-field model allowed). Returns the
     /// computed task hash so the caller can drive a matching terminal.
+    /// Test accessor for the pre-start fence A side-map (#530a). The
+    /// production field stays `pub(super)`; this read-only view is the
+    /// minimum surface tests need to assert the requeue→fence-stamp and
+    /// terminal→fence-drop invariants without touching internals.
+    #[cfg(test)]
+    pub fn supplanted_holder_for_test(&self, task_hash: &str) -> Option<(String, u64)> {
+        self.supplanted_holders.get(task_hash).cloned()
+    }
+
+    /// Test accessor for the side-map's size (#530a) — equivalent in
+    /// purpose to `in_flight_len_for_test` for the in-flight ledger.
+    #[cfg(test)]
+    pub fn supplanted_holders_len_for_test(&self) -> usize {
+        self.supplanted_holders.len()
+    }
+
+    /// Test seeder for the pre-start fence A side-map (#530a). Lets a
+    /// terminal-drop test isolate the drop invariant without driving the
+    /// full requeue path (which is exercised by the sibling
+    /// requeue→stamp test).
+    #[cfg(test)]
+    pub fn install_supplanted_holder_for_test(
+        &mut self,
+        task_hash: &str,
+        peer_id: &str,
+        member_gen: u64,
+    ) {
+        self.supplanted_holders
+            .insert(task_hash.to_string(), (peer_id.to_string(), member_gen));
+    }
+
+    /// Test accessor for the in-flight ledger (#530 tests use it to look
+    /// up the deterministic hash that `stage_in_flight_for_test`'s
+    /// `register_operational_secondary` chose for the fixture's holder).
+    ///
+    /// `pub(crate)` matches `InFlightEntry`'s own visibility — making it
+    /// `pub` would surface a `pub(crate)` type through a `pub` API. The
+    /// tests that consume it live in this crate.
+    #[cfg(test)]
+    pub(crate) fn in_flight_for_test(&self) -> &HashMap<String, InFlightEntry<I>> {
+        &self.in_flight
+    }
+
     #[cfg(test)]
     pub fn stage_in_flight_for_test(
         &mut self,

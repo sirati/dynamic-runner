@@ -3255,3 +3255,151 @@ async fn primary_repoint_fan_reaches_observer_members_directed() {
         })
         .await;
 }
+
+/// Pre-start fence A (#530a) — the requeue-stamp invariant: when
+/// `requeue_dead_secondary` turns a peer-removed member's in-flight
+/// tasks back to `Pending`, every `TaskRequeued` mutation must seed an
+/// entry in `supplanted_holders` keyed by hash, recording the dead
+/// member's identity AND its `peer_member_gen` AS IT STOOD BEFORE the
+/// `PeerRemoved` killed the incarnation. The next dispatch reads this
+/// to stamp the wire frame's `supplanted_holder` field; a primary
+/// failover before re-dispatch loses the hint by design.
+#[tokio::test(flavor = "current_thread")]
+async fn requeue_dead_secondary_records_supplanted_holders() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut _sec_rxs, _incoming_tx) = two_secondary_transport();
+            let (mut primary, _mesh) = build_primary_pumped(
+                config(Duration::from_millis(50), 2),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+            install_default_pool(&mut primary);
+            register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
+            register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
+
+            // Capture the supplanted member_gen BEFORE the death — this is
+            // exactly the read the stamp performs in production: at requeue
+            // time, BEFORE `PeerRemoved` is applied.
+            let gen_before = primary.cluster_state_for_test().peer_member_gen("sec-a");
+            // sec-a's hash is the deterministic hash of its in-flight TaskInfo.
+            // Snapshot the ledger entry's key (one entry per holder in this
+            // fixture) so we can assert against it after the death.
+            let victim_hash: String = primary
+                .in_flight_for_test()
+                .iter()
+                .find(|(_, e)| e.secondary_id == "sec-a")
+                .map(|(h, _)| h.clone())
+                .expect("fixture invariant: sec-a holds one in-flight entry");
+
+            // Pre-death: no hint yet.
+            assert_eq!(
+                primary.supplanted_holders_len_for_test(),
+                0,
+                "no fence hint before any death"
+            );
+
+            // Drive sec-a through the full death path — handle_secondary_fatal_error
+            // → requeue_dead_secondary → recover_inflight_for_dead_secondary +
+            // PeerRemoved apply.
+            let fatal = DistributedMessage::<TestId>::SecondaryFatalError {
+                target: None,
+                sender_id: "sec-a".into(),
+                timestamp: 0.0,
+                secondary_id: "sec-a".into(),
+                error: "test-driven fatal death".into(),
+            };
+            primary.handle_secondary_fatal_error(fatal).await.unwrap();
+            crate::primary::tests::settle_pump().await;
+
+            // Post-death: the fence hint exists for the requeued hash, naming
+            // sec-a at the pre-death incarnation.
+            assert_eq!(
+                primary.supplanted_holders_len_for_test(),
+                1,
+                "one fence hint per requeued task"
+            );
+            assert_eq!(
+                primary.supplanted_holder_for_test(&victim_hash),
+                Some(("sec-a".into(), gen_before)),
+                "fence hint must name the supplanted holder and its pre-death gen"
+            );
+            // Sanity: post-PeerRemoved sec-a is no longer alive.
+            assert!(
+                !primary.cluster_state_for_test().is_peer_alive("sec-a"),
+                "sec-a is removed in the CRDT after the death"
+            );
+        })
+        .await;
+}
+
+/// Pre-start fence A (#530a) — the terminal-drop invariant: every
+/// terminal-settlement path that drops the in-flight ledger entry must
+/// also drop the side-map entry symmetrically, so a hint can never
+/// outlive the task it fences. Drives the `TaskComplete` path; the
+/// failure path is exercised symmetrically inside the same wire handler.
+#[tokio::test(flavor = "current_thread")]
+async fn supplanted_holder_drops_on_task_complete_terminal() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
+            let (mut primary, _mesh) = build_primary_pumped(
+                config(Duration::from_millis(50), 2),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+            install_default_pool(&mut primary);
+            register_operational_secondary(&mut primary, "sec-b", 0, "redirected");
+
+            // The redirected dispatch is on sec-b, but the side-map records
+            // that it ORIGINATED as a requeue of sec-a's prior in-flight
+            // entry. Production stamps this in `requeue_dead_secondary` (the
+            // sibling test above); here we install it directly to keep the
+            // test focused on terminal drop semantics.
+            let redirected_hash: String = primary
+                .in_flight_for_test()
+                .iter()
+                .find(|(_, e)| e.secondary_id == "sec-b")
+                .map(|(h, _)| h.clone())
+                .expect("fixture invariant: sec-b holds one in-flight entry");
+            primary
+                .install_supplanted_holder_for_test(&redirected_hash, "sec-a", 1);
+            assert_eq!(
+                primary.supplanted_holders_len_for_test(),
+                1,
+                "fixture precondition: the side-map carries the redirect hint"
+            );
+
+            // The redirect completes successfully. The terminal path must
+            // drop the in-flight ledger entry AND the supplanted-holder hint
+            // symmetrically.
+            let complete = DistributedMessage::<TestId>::TaskComplete {
+                target: None,
+                sender_id: "sec-b".into(),
+                timestamp: 0.0,
+                secondary_id: "sec-b".into(),
+                worker_id: 0,
+                task_hash: redirected_hash.clone(),
+                result_data: None,
+                delivery_seq: None,
+                msgs_posted_through: None,
+            };
+            primary.handle_task_complete(complete, &mut None).await;
+
+            assert_eq!(
+                primary.supplanted_holders_len_for_test(),
+                0,
+                "the side-map entry must be dropped on terminal completion \
+                 (symmetric with the in-flight ledger drop)"
+            );
+            assert_eq!(
+                primary.supplanted_holder_for_test(&redirected_hash),
+                None
+            );
+        })
+        .await;
+}

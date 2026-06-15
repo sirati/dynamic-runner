@@ -244,6 +244,49 @@ pub enum DistributedMessage<I> {
         /// it had pre-feature.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         predecessor_outputs: BTreeMap<String, TaskOutputs>,
+        /// Pre-start fence A (#530): a hint stamped by the primary IFF
+        /// this dispatch is the dead-secondary-requeue redirection of a
+        /// task previously held by another, peer-removed member. The
+        /// tuple is `(supplanted_peer_id, supplanted_member_gen)` — the
+        /// id of the original holder and its `peer_member_gen` AT THE
+        /// MOMENT the recovery requeue ran (i.e. before `PeerRemoved`
+        /// killed that incarnation). The receiving secondary's router
+        /// consults the live cluster_state: if the supplanted holder is
+        /// alive again at gen ≥ the supplanted gen (its peer-removal was
+        /// false-dead and it was re-admitted), it REFUSES to start the
+        /// duplicate copy and replies via the already-held-style
+        /// `TASK_SUPPLANTED_BY_LIVE_HOLDER_WIRE_MESSAGE` so the primary
+        /// reconciles + withdraws. `None` on a normal first dispatch
+        /// (and on re-dispatches whose ledger entry isn't a requeue
+        /// redirection); `Some` only on the supplanted-redirect path.
+        ///
+        /// The hint is primary-LOCAL (not CRDT-replicated): a primary
+        /// failover before re-dispatch loses it and degrades to today's
+        /// best-effort #518 inflight-reconcile post-start dedup — the
+        /// pre-existing contract.
+        /// `#[serde(default, skip_serializing_if = "Option::is_none")]`
+        /// keeps pre-#530 senders' wire bytes byte-identical while the
+        /// field is `None` (the common case), exactly like every other
+        /// optional add to this variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supplanted_holder: Option<(String, u64)>,
+        /// Pre-start fence B (#530b): the receiving secondary's
+        /// `peer_member_gen` (its membership incarnation) AS THE PRIMARY
+        /// KNEW IT when it minted this dispatch. The receiver compares
+        /// against its OWN current `peer_member_gen` and rejects the
+        /// frame via the `TASK_STALE_ADDRESSEE_GEN_WIRE_MESSAGE` reply
+        /// when the two diverge: a re-removal-and-re-admission has
+        /// crossed the dispatch in flight, so the lease names a stale
+        /// incarnation of this secondary and the work is owed to the
+        /// previous one. Symmetric to the secondary→primary
+        /// `InFlightRoster` gen-staleness gate (the primary→secondary
+        /// direction). `None` on a pre-#530 sender (the gate is open,
+        /// pre-existing behaviour); `Some` on every primary that knows
+        /// the addressee's recorded gen.
+        /// `#[serde(default, skip_serializing_if = "Option::is_none")]`
+        /// keeps pre-#530 wire bytes byte-identical when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secondary_id_member_gen: Option<u64>,
     },
     TransferComplete {
         /// Mesh routing target (Phase-C C3): the resolved role-bearing
