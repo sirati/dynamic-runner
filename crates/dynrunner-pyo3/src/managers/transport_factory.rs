@@ -175,6 +175,24 @@ pub(crate) struct SecondaryDialParams {
     /// what makes the recorded port actually dialable (a late-joining
     /// observer dials exactly this `ip:port`).
     pub quic_bind_port: Option<u16>,
+    /// Optional sender side of the
+    /// [`dynrunner_transport_quic::PeerNetwork::notify_persistent_dial_failures`]
+    /// channel (#542 cause-B). The factory installs it on the freshly
+    /// constructed `PeerNetwork` BEFORE the bundle returns + the network
+    /// is consumed into the mesh-host, mirroring how the observer
+    /// late-joiner wires its OWN dial-failure trigger (the per-leg
+    /// forward-recovery for `-R` tunnels). On THIS path the rx side is
+    /// parked on the secondary's
+    /// [`super::secondary::new::PromotePrimaryRecipe`] and installed on
+    /// the promoted primary via `set_persistent_dial_failure_rx` so the
+    /// primary's operational loop's arm consumes
+    /// `DIAL_SUMMARY_THRESHOLD`-crossed peer ids and originates a
+    /// `PeerRemoved` for any that name a `role_table.observers` entry —
+    /// the cause-B prune that ends the recurring 60s "peer unreachable"
+    /// WARN. `None` for callers that don't wire the cause-B prune
+    /// (channel-only fixtures, the late-joiner observer path that has
+    /// its own subscriber on the same channel).
+    pub dial_failure_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 /// Cap on the bring-up dial's backoff delay. The delay starts at the
@@ -428,6 +446,7 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
         ipv4_address,
         ipv6_address,
         quic_bind_port,
+        dial_failure_tx,
     } = params;
     // Per-attempt candidate order: v4 first, loopback family-completed
     // (the dial-side half of the partial-`-R`-bind defense — see
@@ -456,12 +475,21 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
     // the cert CN must match the logical id. `quic_bind_port` (when the
     // operator/wrapper pre-allocated one) pins BOTH mesh listeners to the
     // advertised port; `None` keeps the OS-picked bind.
-    let transport = PeerNetwork::<I>::start(&secondary_id, quic_bind_port)
+    let mut transport = PeerNetwork::<I>::start(&secondary_id, quic_bind_port)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "failed to start peer network");
             format!("peer network start failed: {e}")
         })?;
+    // #542 cause-B: install the persistent-dial-failure tx on the
+    // freshly minted `PeerNetwork` BEFORE it is consumed into the
+    // mesh-host (the same SHAPE the observer late-joiner uses for its
+    // `-R` per-leg forward-recovery sink — see
+    // `observer_late_joiner/run.rs`). `None` leaves the channel
+    // un-subscribed, preserving the historical no-op default.
+    if let Some(tx) = dial_failure_tx {
+        transport.notify_persistent_dial_failures(tx);
+    }
     let cert_pem = transport.cert_pem().to_string();
     let port = transport.port();
 
@@ -1006,6 +1034,7 @@ mod tests {
                         ipv4_address: Some("127.0.0.1".to_string()),
                         ipv6_address: None,
                         quic_bind_port: None,
+                        dial_failure_tx: None,
                     }),
                 )
                 .await
@@ -1099,6 +1128,7 @@ mod tests {
                     ipv4_address: Some("127.0.0.1".to_string()),
                     ipv6_address: None,
                     quic_bind_port: Some(mesh_port),
+                    dial_failure_tx: None,
                 })
                 .await
                 .expect("dial_secondary_mesh");

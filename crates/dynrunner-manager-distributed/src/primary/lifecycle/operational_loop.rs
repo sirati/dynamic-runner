@@ -30,6 +30,7 @@ const ARM_TASK_BACKOFF: usize = 11;
 const ARM_SNAPSHOT_STREAM: usize = 12;
 const ARM_SETTLED_SPILL: usize = 13;
 const ARM_PULL: usize = 14;
+const ARM_PERSISTENT_DIAL_FAILURE: usize = 15;
 
 /// Arm names, index-aligned with the `ARM_*` ids above. The render order of
 /// the compact stats line.
@@ -49,6 +50,7 @@ const OP_LOOP_ARM_NAMES: &[&str] = &[
     "snapshot_stream",
     "settled_spill",
     "pull",
+    "persistent_dial_failure",
 ];
 
 /// Render a drain-by-`MessageType` tally as a single diagnostic string:
@@ -292,6 +294,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // (beacon OR mesh frame), so a busy secondary whose tokio runtime
         // is CPU-starved by a build still beacons and is NOT reaped.
         let mut liveness_ping_rx = self.liveness_ping_rx.take();
+
+        // Persistent-dial-failure receiver (#542 cause-B). Same
+        // disabled-arm shape: `None` when no transport→coordinator wire
+        // was installed (channel-only fixtures, the in-process
+        // multi-computer-local manager, anyone who doesn't run on QUIC)
+        // → the arm parks on `pending().await`. Each forwarded peer id is
+        // one the QUIC transport has tried + failed to dial for
+        // `DIAL_SUMMARY_THRESHOLD` consecutive sweeps without a connect;
+        // the arm's handler decides whether to originate a
+        // `ClusterMutation::PeerRemoved { cause: PersistentDialFailure }`
+        // for the id — OBSERVER-only (see the handler).
+        let mut persistent_dial_failure_rx = self.persistent_dial_failure_rx.take();
 
         // Panik-watcher signal receiver. Same shape as the closed-
         // channel arms above: taken out for the loop's duration so
@@ -953,6 +967,47 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         }
                     }
                 }
+                // Persistent-dial-failure drain (#542 cause-B). The QUIC
+                // transport's reconnect tick crossed
+                // `DIAL_SUMMARY_THRESHOLD` consecutive failed sweeps for
+                // a peer and gave up; the operational-loop arm consumes
+                // the id and, if the peer is an OBSERVER (in
+                // `role_table.observers`), originates a
+                // `ClusterMutation::PeerRemoved { cause:
+                // PersistentDialFailure }`. Observer-only: secondaries
+                // have an authoritative heartbeat-miss dead-declaration
+                // path (`requeue_dead_secondary`), and adding a second
+                // source would race that path; observers run no tasks
+                // and emit no keepalives, so the dial-give-up signal IS
+                // their authoritative removal trigger. A non-observer id
+                // (a secondary, an unknown peer) is logged at DEBUG and
+                // dropped — the dial-give-up is informational for
+                // anyone-not-an-observer. Disabled-arm shape mirrors
+                // `liveness_ping`: `None` rx → parks on `pending()`.
+                dial_failure = async {
+                    match persistent_dial_failure_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    arm_stats.record(ARM_PERSISTENT_DIAL_FAILURE);
+                    match dial_failure {
+                        Some(peer_id) => {
+                            self.handle_persistent_dial_failure(peer_id).await;
+                        }
+                        None => {
+                            // Transport sender dropped (run winding
+                            // down). Drop the receiver; without a wire
+                            // to dial there's no leg to give up on.
+                            persistent_dial_failure_rx = None;
+                            tracing::debug!(
+                                "persistent-dial-failure channel closed; \
+                                 disabling the dial-failure arm for the \
+                                 remainder of the loop"
+                            );
+                        }
+                    }
+                }
                 outcome = async {
                     // `JoinSet::join_next` returns `None` when the
                     // set is empty. To avoid hot-looping the select!
@@ -1100,6 +1155,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // death-clocks from beacon datagrams (the union half), or a busy
         // secondary's beacon would stop counting during retry passes.
         self.liveness_ping_rx = liveness_ping_rx;
+        // Same rationale for the persistent-dial-failure receiver: a
+        // retry pass that re-enters the operational loop must keep
+        // listening for dial-give-up signals so a stale observer
+        // entry detected during a retry still drives the PeerRemoved
+        // (#542 cause-B).
+        self.persistent_dial_failure_rx = persistent_dial_failure_rx;
         // Same rationale for the panik-signal receiver: a retry
         // pass that re-enters the operational loop must keep its
         // panik arm wired up. The receiver is `Some` only while the

@@ -32,6 +32,7 @@ mod crdt_convergence;
 mod custom_messages;
 mod dependent_cascade;
 mod deposed_standdown;
+mod dial_failure_observer;
 mod dispatch_decoupling;
 mod dispatch_differential;
 mod e2e;

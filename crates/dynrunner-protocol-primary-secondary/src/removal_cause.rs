@@ -57,6 +57,22 @@ pub enum RemovalCause {
     /// names the re-emit itself — observability-only and idempotent at the
     /// sticky receiver (a node that already buried the id NoOps).
     RosterReemit,
+    /// The transport's persistent-dial-failure trigger fired for an id in
+    /// `role_table.observers`: this node owns the dial to it, the 5s redial
+    /// ticker crossed `DIAL_SUMMARY_THRESHOLD` consecutive failed sweeps
+    /// without a connect, and the leg never re-folded. The dial-give-up
+    /// threshold IS the miss-threshold gate here (the same boundary the
+    /// operator dial-failure WARN already throttles to); the relocated
+    /// primary's role_table.observers entry would otherwise stay alive
+    /// forever (observers run no tasks → no heartbeat keepalive miss path
+    /// → no other authoritative removal trigger), and the QUIC dial loop
+    /// would log the unreachable WARN every 60s indefinitely (#542). A
+    /// false-positive (a recoverable but flaky observer reaped here)
+    /// recovers via the existing PeerJoined re-admission path on the next
+    /// connect — apply_peer_removed merges a Departed tombstone at the
+    /// current `member_gen`, and a higher-generation Advertised
+    /// supersedes it.
+    PersistentDialFailure,
 }
 
 #[cfg(test)]

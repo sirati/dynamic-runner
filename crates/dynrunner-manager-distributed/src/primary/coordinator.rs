@@ -1249,6 +1249,24 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// fixtures), in which case the loop arm parks on `pending()`.
     pub(super) liveness_ping_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 
+    /// Receiver side of the persistent-dial-failure listener →
+    /// operational-loop channel (#542 cause-B). Each id forwarded here is
+    /// a peer this node's QUIC transport has tried + failed to dial
+    /// across `DIAL_SUMMARY_THRESHOLD` consecutive sweeps without a
+    /// connect (the same boundary that throttles the operator
+    /// "peer unreachable" WARN — see
+    /// `crates/dynrunner-transport-quic/src/peer/reconnect.rs`). The
+    /// operational loop's arm originates a
+    /// `ClusterMutation::PeerRemoved { cause: PersistentDialFailure }`
+    /// for ids in `role_table.observers` only — the OBSERVER half of the
+    /// removal authority (secondaries already have the heartbeat-miss
+    /// dead-declaration path; observers run no tasks and emit no
+    /// keepalives, so the dial-give-up signal is their authoritative
+    /// removal trigger). `None` when no listener was wired (channel-only
+    /// fixtures, single-process tests), in which case the loop arm parks
+    /// on `pending()`.
+    pub(super) persistent_dial_failure_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+
     /// The runtime→beacon-thread bridge for the PRIMARY→secondaries liveness
     /// direction: the SET of this primary's live secondaries' liveness
     /// `SocketAddr`s. The coordinator PUBLISHES the set into it whenever the
@@ -1702,6 +1720,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 crate::authority_snapshot::NoSlurmAuthoritySnapshot,
             ),
             liveness_ping_rx: None,
+            persistent_dial_failure_rx: None,
             beacon_target: crate::liveness::BeaconTarget::new(),
             peer_liveness_addrs: crate::liveness::PeerLivenessAddrs::new(),
             primary_beacon: None,
@@ -2382,6 +2401,32 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// secondary's death-clock as the UNION half (beacon OR mesh frame).
     pub fn set_liveness_ping_rx(&mut self, rx: tokio::sync::mpsc::UnboundedReceiver<String>) {
         self.liveness_ping_rx = Some(rx);
+    }
+
+    /// Install the persistent-dial-failure receiver (#542 cause-B). The
+    /// run boundary creates a `(tx, rx)` pair, hands the `tx` to the QUIC
+    /// transport via
+    /// [`dynrunner_transport_quic::PeerNetwork::notify_persistent_dial_failures`],
+    /// and hands the `rx` here. The QUIC transport fires the channel on
+    /// the `DIAL_SUMMARY_THRESHOLD` boundary (3 consecutive failed dial
+    /// sweeps without a connect — see the transport's reconnect
+    /// constants), at which point the operational loop's dial-failure arm
+    /// consumes the peer id and originates a
+    /// `ClusterMutation::PeerRemoved { cause: PersistentDialFailure }`
+    /// FOR PEERS IN `role_table.observers` ONLY. Secondaries are
+    /// unaffected: they already have an authoritative dead-declaration
+    /// path through the heartbeat watchdog (`requeue_dead_secondary`),
+    /// and adding a second source would race that path. Must be called
+    /// BEFORE `run()` enters; same `take()` lifecycle as
+    /// `liveness_ping_rx`.
+    ///
+    /// `None` (the default) leaves the arm parked, preserving prior
+    /// behaviour for any caller that hasn't wired the channel.
+    pub fn set_persistent_dial_failure_rx(
+        &mut self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        self.persistent_dial_failure_rx = Some(rx);
     }
 
     /// A clone of the PRIMARY→secondaries beacon-target cell. The run

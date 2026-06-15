@@ -171,6 +171,10 @@ fn encode_cause<'py>(py: Python<'py>, cause: &RemovalCause) -> PyResult<Bound<'p
             dict.set_item("kind", "roster_reemit")?;
             dict.set_item("reason", py.None())?;
         }
+        RemovalCause::PersistentDialFailure => {
+            dict.set_item("kind", "persistent_dial_failure")?;
+            dict.set_item("reason", py.None())?;
+        }
     }
     Ok(dict)
 }
@@ -282,6 +286,25 @@ mod tests {
         let (peer_id, kind, reason) = captured_removed(&globals, 0);
         assert_eq!(peer_id, "sec-1");
         assert_eq!(kind, "keepalive_miss");
+        assert_eq!(reason, None);
+    }
+
+    /// #542 cause-B: the new `RemovalCause::PersistentDialFailure`
+    /// variant must encode as `kind = "persistent_dial_failure"` with
+    /// `reason = None` (it's an observability tag, not a structured
+    /// payload). Pinned alongside the other cause-encoding tests so a
+    /// future cause that drifts is caught at the same boundary.
+    #[test]
+    fn removed_persistent_dial_failure_emits_typed_dict() {
+        let (listener_obj, globals) = make_recording_listener();
+        let bridge = PyPeerLifecycleListener::new(listener_obj);
+        bridge.on_event(&PeerLifecycleEvent::Removed {
+            id: "obs".to_owned(),
+            cause: RemovalCause::PersistentDialFailure,
+        });
+        let (peer_id, kind, reason) = captured_removed(&globals, 0);
+        assert_eq!(peer_id, "obs");
+        assert_eq!(kind, "persistent_dial_failure");
         assert_eq!(reason, None);
     }
 

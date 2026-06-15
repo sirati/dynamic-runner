@@ -430,6 +430,17 @@ impl PySecondaryCoordinator {
                         .unwrap_or("<none>"),
                     "resolved advertised peer-mesh address for this node"
                 );
+                // #542 cause-B: mint the persistent-dial-failure channel
+                // before the mesh constructs the `PeerNetwork`. The tx
+                // is installed inside `dial_secondary_mesh` ON the live
+                // transport; the rx is parked in the recipe + handed to
+                // the promoted primary on relocation so its operational
+                // loop's arm consumes `DIAL_SUMMARY_THRESHOLD`-crossed
+                // peer ids + originates `PeerRemoved` for any that
+                // name a `role_table.observers` entry.
+                let (dial_failure_tx, dial_failure_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<String>();
+                let mut dial_failure_rx_for_recipe = Some(dial_failure_rx);
                 let dial_params = transport_factory::SecondaryDialParams {
                     addrs,
                     connect_timeout: dist_connect_timeout,
@@ -439,6 +450,7 @@ impl PySecondaryCoordinator {
                     ipv4_address: Some(advertised_ipv4),
                     ipv6_address: advertised_ipv6.map(|(addr, _)| addr),
                     quic_bind_port,
+                    dial_failure_tx: Some(dial_failure_tx),
                 };
                 // The transport is CONSTRUCTED and PUMPED on the dedicated
                 // mesh runtime thread (`MeshHost::on_dedicated_thread`):
@@ -971,6 +983,12 @@ impl PySecondaryCoordinator {
                     // promoted primary folds beacon datagrams into the
                     // death-clock (union). `None` if the listener didn't bind.
                     liveness_ping_rx: liveness_ping_rx_for_recipe,
+                    // #542 cause-B: the transport's persistent-dial-failure
+                    // tx was installed inside `dial_secondary_mesh`; the
+                    // rx travels to the promoted primary via this recipe
+                    // field so its operational loop's arm fires the
+                    // observer-prune on `DIAL_SUMMARY_THRESHOLD`.
+                    persistent_dial_failure_rx: dial_failure_rx_for_recipe.take(),
                     // The node's peer→liveness-address book (captured above):
                     // the promoted primary's own beacon resolves its
                     // secondaries' addresses from it (primary→secondaries).
@@ -1300,6 +1318,19 @@ pub(crate) struct PromotedPrimaryRecipeInputs {
     /// and taken on the fire — same single-use discipline as the command
     /// channel + phase callbacks. `None` when no listener was bound.
     pub liveness_ping_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    /// The persistent-dial-failure receiver (#542 cause-B). The
+    /// transport's tx counterpart was installed inside
+    /// `dial_secondary_mesh` on the freshly-minted `PeerNetwork`;
+    /// when the QUIC reconnect tick crosses `DIAL_SUMMARY_THRESHOLD`
+    /// consecutive failed sweeps on a peer leg, the tx sends the peer
+    /// id and this rx delivers it to the promoted primary's
+    /// operational loop. Installed on the primary via
+    /// `set_persistent_dial_failure_rx` on the single recipe fire so
+    /// the cause-B observer-prune arm is wired. Same single-use
+    /// (`mpsc::UnboundedReceiver` is one-owner) discipline as
+    /// [`Self::liveness_ping_rx`]; `None` when no channel was minted
+    /// (channel-only fixtures).
+    pub persistent_dial_failure_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     /// The node-scoped peer→liveness-address book (a clone of the one the
     /// co-located `SecondaryCoordinator` populated from `PeerInfo`). The
     /// promoted primary reads it to resolve its secondaries' raw beacon
@@ -1455,6 +1486,7 @@ pub(crate) fn build_promoted_primary_recipe(
         staging_strategy,
         setup_discovery,
         liveness_ping_rx,
+        persistent_dial_failure_rx,
         peer_liveness_addrs,
         op_loop_arm_stats_cell,
     } = inputs;
@@ -1463,6 +1495,10 @@ pub(crate) fn build_promoted_primary_recipe(
     // promotes at most once per lifetime — same discipline as the command
     // channel / phase callbacks).
     let mut liveness_ping_rx = liveness_ping_rx;
+    // #542 cause-B: same single-use discipline for the persistent-dial-
+    // failure receiver (the tx counterpart was installed on the QUIC
+    // transport at secondary setup).
+    let mut persistent_dial_failure_rx = persistent_dial_failure_rx;
     // Single-use on the one recipe fire (a node promotes at most once): the
     // promoted primary spawns its OWN dedicated-thread liveness beacon from
     // this book. `take`-n in the closure like `liveness_ping_rx`.
@@ -1616,6 +1652,18 @@ pub(crate) fn build_promoted_primary_recipe(
             // receiver moves to whichever primary is active.
             if let Some(rx) = liveness_ping_rx.take() {
                 primary.set_liveness_ping_rx(rx);
+            }
+            // #542 cause-B: hand the persistent-dial-failure receiver to
+            // THIS promoted primary so its operational loop's arm
+            // consumes `DIAL_SUMMARY_THRESHOLD`-crossed peer ids and
+            // originates a `PeerRemoved` for ids that name a
+            // `role_table.observers` entry — the cause-B observer prune
+            // that ends the recurring 60s "peer unreachable" WARN. The
+            // tx counterpart was installed on the transport at secondary
+            // setup; this rx travels the same recipe pattern as
+            // `liveness_ping_rx`.
+            if let Some(rx) = persistent_dial_failure_rx.take() {
+                primary.set_persistent_dial_failure_rx(rx);
             }
             // Spawn the PROMOTED primary's OWN dedicated-thread liveness beacon
             // (the PRIMARY→secondaries direction). The promoted primary's NODE
@@ -2776,6 +2824,7 @@ task = Task()
                 staging_strategy: dynrunner_manager_distributed::StagingStrategy::Disabled,
                 setup_discovery: None,
                 liveness_ping_rx: None,
+                persistent_dial_failure_rx: None,
                 peer_liveness_addrs: None,
                 op_loop_arm_stats_cell:
                     dynrunner_manager_distributed::oploop_instrumentation::OpLoopArmStatsCell::new(),
@@ -2888,6 +2937,7 @@ task = Task()
                 staging_strategy: dynrunner_manager_distributed::StagingStrategy::Disabled,
                 setup_discovery: None,
                 liveness_ping_rx: None,
+                persistent_dial_failure_rx: None,
                 peer_liveness_addrs: None,
                 op_loop_arm_stats_cell:
                     dynrunner_manager_distributed::oploop_instrumentation::OpLoopArmStatsCell::new(),
@@ -2999,6 +3049,7 @@ task = Task()
                 staging_strategy: dynrunner_manager_distributed::StagingStrategy::Disabled,
                 setup_discovery: None,
                 liveness_ping_rx: None,
+                persistent_dial_failure_rx: None,
                 peer_liveness_addrs: None,
                 op_loop_arm_stats_cell:
                     dynrunner_manager_distributed::oploop_instrumentation::OpLoopArmStatsCell::new(),
@@ -3181,6 +3232,7 @@ def finalize_run_config(delivered):
                 staging_strategy: dynrunner_manager_distributed::StagingStrategy::Disabled,
                 setup_discovery: None,
                 liveness_ping_rx: None,
+                persistent_dial_failure_rx: None,
                 peer_liveness_addrs: None,
                 op_loop_arm_stats_cell:
                     dynrunner_manager_distributed::oploop_instrumentation::OpLoopArmStatsCell::new(),
