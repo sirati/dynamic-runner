@@ -280,6 +280,15 @@ fn empty_upstream_phase_with_blocked_dependent_proceeds() {
 /// nothing → PROCEED. Pins that the discriminator is outstanding work, not
 /// topology: a leaf empty phase is no more a wedge than an upstream one when
 /// real work remains.
+///
+/// I2 INTERLEAVE: tail's formal-complete predicate (`phase_boundary_open`)
+/// also requires its predecessor `work` to have its `PhaseEnded` applied,
+/// regardless of the F-honesty branch — the empty drain proceeding through
+/// the may-be-empty / pool-non-empty discriminator no longer skips the
+/// strict boundary check (the V-A5 fix). The test seeds `PhaseEnded(work)`
+/// before asserting proceed; the assertion before the seed pins the
+/// invariant — an empty-leaf phase whose predecessor has not formally ended
+/// is held, not proceeded.
 #[test]
 fn empty_leaf_phase_proceeds_when_work_remains_elsewhere() {
     let (mut primary, _mesh) = make_primary();
@@ -305,6 +314,20 @@ fn empty_leaf_phase_proceeds_when_work_remains_elsewhere() {
         !primary.pool().is_empty(),
         "the pending `work` item is real outstanding work"
     );
+    // Boundary closed: predecessor `work` has not yet formally ended,
+    // so the strict I2 invariant holds tail back regardless of the
+    // F-honesty branch underneath. Closes V-A5.
+    assert!(
+        !primary.phase_can_proceed(&tail),
+        "I2: empty-leaf must not formally complete before predecessor's PhaseEnded"
+    );
+    // Land the authoritative end edge for `work` → tail's boundary
+    // opens → F-honesty proceed re-evaluates → PROCEED.
+    primary
+        .cluster_state_mut_for_test()
+        .apply(ClusterMutation::PhaseEnded {
+            phase: PhaseId::from("work"),
+        });
     assert!(primary.phase_can_proceed(&tail));
 }
 
@@ -381,9 +404,25 @@ fn declared_may_be_empty_phase_proceeds_when_empty() {
     let tail = PhaseId::from("tail");
     assert!(primary.cluster_state_for_test().phase_may_be_empty(&gate));
     assert!(primary.cluster_state_for_test().phase_may_be_empty(&tail));
-    // Both empty + declared may_be_empty ⇒ proceed (non-leaf gate AND leaf
-    // tail), even though an UNDECLARED empty phase in the same position fails.
+    // `gate` has no declared deps in the dep graph ⇒ boundary open
+    // vacuously ⇒ proceeds on the may_be_empty branch.
     assert!(primary.phase_can_proceed(&gate));
+    // `tail` depends on `work`, whose item is still pending ⇒ work's
+    // PhaseEnded has not fired ⇒ `tail`'s boundary is closed regardless
+    // of the may_be_empty opt-out. I2 holds strictly: the
+    // may_be_empty branch is for the empty-DRAIN policy, not a
+    // relaxation of the formal-complete boundary. Closes V-A5.
+    assert!(
+        !primary.phase_can_proceed(&tail),
+        "I2: may_be_empty does NOT relax the strict boundary; tail must wait for PhaseEnded(work)"
+    );
+    // Land work's authoritative end edge → tail's boundary opens →
+    // may_be_empty + boundary-open ⇒ proceed.
+    primary
+        .cluster_state_mut_for_test()
+        .apply(ClusterMutation::PhaseEnded {
+            phase: PhaseId::from("work"),
+        });
     assert!(primary.phase_can_proceed(&tail));
 }
 
@@ -497,6 +536,17 @@ fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
     // to Active — the same cascade `run_pipeline`'s pre-loop performs before
     // `fire_initial_phase_starts`.
     crate::secondary::origination::cascade_drain_done(primary.pool_mut());
+    // Seed the authoritative end-edge fact for `build` so `compile`'s
+    // formal-start boundary is open (strict I1). The live pre-loop cascade
+    // (`process_phase_lifecycle`) originates `PhaseEnded` at the same
+    // decision point as `mark_phase_done`; the silent `cascade_drain_done`
+    // path here skips that origination, so the test seeds it directly to
+    // mirror the wire fact `fire_initial_phase_starts` now consults.
+    primary
+        .cluster_state_mut_for_test()
+        .apply(ClusterMutation::PhaseEnded {
+            phase: PhaseId::from("build"),
+        });
 
     // Install the worker-management bus sender, then fire phase starts.
     let (tx, mut rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
@@ -590,4 +640,272 @@ fn fire_initial_phase_starts_emits_one_starting_job_phase_important_event() {
          work-carrying phase: {msgs:?}"
     );
     assert!(msgs[0].contains("starting job phase"), "{msgs:?}");
+}
+
+// ── #584 phase-boundary tests ──
+//
+// The single phase-boundary predicate (`phase_boundary_open`) is now
+// consulted by `phase_can_proceed` (formal-complete I2) and
+// `fire_initial_phase_starts` (formal-start I1). The narrator's gates
+// consult the same predicate (covered in run_narrator tests). The four
+// tests below pin the LATENT-violation races the audit identified.
+
+/// V-A2 race: `matrix_eval` (depends on `build`) drains its tasks FAST
+/// while `build` is still draining its own. Pre-fix `phase_can_proceed`
+/// returned true on the `has_any && !has_live` arm with NO predecessor
+/// `PhaseEnded` check, so `matrix_eval`'s PhaseEnded could land BEFORE
+/// `build`'s, racing `mark_phase_done`. With the predicate at the
+/// function-entry gate, `phase_can_proceed(matrix_eval)` returns FALSE
+/// until `PhaseEnded(build)` is applied, then flips to TRUE.
+#[test]
+fn phase_can_proceed_holds_until_predecessor_ended() {
+    let (mut primary, _mesh) = make_primary();
+
+    let build = dep_binary("b1", "build", &[]);
+    let eval = dep_binary("e1", "matrix_eval", &[]);
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([(
+                PhaseId::from("matrix_eval"),
+                vec![PhaseId::from("build")],
+            )]),
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "b1".into(),
+            task: build,
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "e1".into(),
+            task: eval,
+        });
+        // matrix_eval's task completes FAST; build's task is still live.
+        cs.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
+            hash: "e1".into(),
+            result_data: None,
+        });
+    }
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
+
+    let matrix_eval = PhaseId::from("matrix_eval");
+    let build_phase = PhaseId::from("build");
+    // matrix_eval rolls up has_any && !has_live (its one task completed),
+    // but its boundary is still closed — build's PhaseEnded has not fired.
+    assert!(
+        !primary.phase_can_proceed(&matrix_eval),
+        "I2: matrix_eval must wait for PhaseEnded(build); V-A2 race"
+    );
+
+    // Apply the authoritative end edge for build → matrix_eval's boundary
+    // opens → proceed-or-fail re-evaluates → PROCEED.
+    primary
+        .cluster_state_mut_for_test()
+        .apply(ClusterMutation::PhaseEnded {
+            phase: build_phase,
+        });
+    assert!(primary.phase_can_proceed(&matrix_eval));
+}
+
+/// V-A1 init scenario: a `barrier=False` phase `P` (depends on `Q`) is
+/// pre-flipped Active by `set_no_barrier_phases` at pool construction
+/// (the I3 dispatch-authorization). Pre-fix `fire_initial_phase_starts`
+/// iterated `pool.active_phases()` and emitted "starting job phase" +
+/// the `on_phase_start` callback for `P` immediately — BEFORE `Q`'s
+/// `PhaseEnded` could fire. With the predicate gate, the call skips `P`
+/// while the boundary is closed and the post-`mark_phase_done` cascade
+/// re-fires it once `PhaseEnded(Q)` lands.
+#[test]
+fn fire_initial_phase_starts_skips_barrier_false_phase_until_predecessor_ended() {
+    use crate::test_capture::{ImportantCapture, important_only};
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::{Layer, Registry};
+
+    let (mut primary, _mesh) = make_primary();
+
+    // Phase graph: matrix_eval depends on build; matrix_eval is barrier=False
+    // (the consumer opt-in for early task dispatch). Both have one task.
+    let build = dep_binary("b1", "build", &[]);
+    let eval = dep_binary("e1", "matrix_eval", &[]);
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([(
+                PhaseId::from("matrix_eval"),
+                vec![PhaseId::from("build")],
+            )]),
+        });
+        cs.apply(ClusterMutation::PhaseNoBarrierSet {
+            phases: vec![PhaseId::from("matrix_eval")],
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "b1".into(),
+            task: build,
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "e1".into(),
+            task: eval,
+        });
+    }
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
+
+    // Worker-mgmt sender so the emit path does not drop.
+    let (tx, _rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
+    primary
+        .cluster_state_mut_for_test()
+        .install_worker_mgmt_sender(tx);
+
+    // First fire: build's boundary is open (no deps); matrix_eval's is
+    // closed (depends on build, no PhaseEnded yet). Only build narrates.
+    let capture = ImportantCapture::default();
+    let subscriber = Registry::default().with(capture.clone().with_filter(important_only()));
+    with_default(subscriber, || {
+        primary.fire_initial_phase_starts();
+    });
+    let phases: Vec<String> = capture
+        .events()
+        .into_iter()
+        .filter(|e| e.message.contains("starting job phase"))
+        .filter_map(|e| e.fields.get("phase").cloned())
+        .collect();
+    assert_eq!(
+        phases,
+        vec!["build".to_string()],
+        "V-A1: matrix_eval (barrier=False) must NOT formally start before \
+         PhaseEnded(build); only build narrates here, even though the pool \
+         pre-flipped matrix_eval Active for I3 task dispatch"
+    );
+
+    // Land PhaseEnded(build) → matrix_eval's boundary opens → the next
+    // fire (the post-`mark_phase_done` cascade) emits its start line.
+    primary
+        .cluster_state_mut_for_test()
+        .apply(ClusterMutation::PhaseEnded {
+            phase: PhaseId::from("build"),
+        });
+    let capture2 = ImportantCapture::default();
+    let subscriber2 = Registry::default().with(capture2.clone().with_filter(important_only()));
+    with_default(subscriber2, || {
+        primary.fire_initial_phase_starts();
+    });
+    let phases2: Vec<String> = capture2
+        .events()
+        .into_iter()
+        .filter(|e| e.message.contains("starting job phase"))
+        .filter_map(|e| e.fields.get("phase").cloned())
+        .collect();
+    assert_eq!(
+        phases2,
+        vec!["matrix_eval".to_string()],
+        "matrix_eval narrates AFTER its predecessor's PhaseEnded"
+    );
+}
+
+/// V-A5 empty-phase: a phase `P` (no tasks, depends on `Q`) cannot
+/// `phase_can_proceed` on the `may_be_empty` / outstanding-work branch
+/// before `Q`'s `PhaseEnded`. Pre-fix the boundary check was missing on
+/// this branch, so an empty `P` whose dep was still draining could
+/// false-complete. The function-entry boundary gate now closes that path:
+/// the may_be_empty branch is reached only when the boundary is open.
+#[test]
+fn empty_phase_holds_proceed_until_predecessor_ended_v_a5() {
+    let (mut primary, _mesh) = make_primary();
+
+    // P depends on Q; P has zero tasks; Q has one PENDING task (still
+    // live). Real work outstanding (`!pool.is_empty()`), so the pre-fix
+    // F-honesty branch would have proceeded.
+    let q_item = dep_binary("q1", "q", &[]);
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([(PhaseId::from("p"), vec![PhaseId::from("q")])]),
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "q1".into(),
+            task: q_item,
+        });
+    }
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
+
+    let p = PhaseId::from("p");
+    assert!(
+        !primary.pool().is_empty(),
+        "Q's pending item keeps the pool non-empty (V-A5 setup)"
+    );
+    // Pre-fix this returned true via the outstanding-work branch even
+    // though Q's PhaseEnded had not fired. With V-A5 closed: HOLD.
+    assert!(
+        !primary.phase_can_proceed(&p),
+        "V-A5: an empty phase must not formally complete before predecessor's PhaseEnded"
+    );
+
+    // Land PhaseEnded(Q) → P's boundary opens → outstanding-work branch
+    // is reached and proceeds (Q's task is still in the pool — non-empty).
+    primary
+        .cluster_state_mut_for_test()
+        .apply(ClusterMutation::PhaseEnded {
+            phase: PhaseId::from("q"),
+        });
+    assert!(primary.phase_can_proceed(&p));
+}
+
+/// I3 preserved: a barrier=False phase's TASKS are still authorized for
+/// early dispatch by the runtime-spawn interlock (the pool reports the
+/// phase Active and the per-task `task_depends_on` graph gates per-task
+/// readiness). The phase-boundary predicate gates only the FORMAL
+/// boundary; it must not affect the pool's `Active` state nor the
+/// per-task readiness path.
+#[test]
+fn barrier_false_phase_tasks_dispatchable_before_predecessor_ended() {
+    let (mut primary, _mesh) = make_primary();
+
+    // matrix_eval (barrier=False) depends on build. matrix_eval has one
+    // task with NO task-level deps (so per-task readiness is satisfied
+    // immediately). build has one pending task (predecessor still live).
+    let build = dep_binary("b1", "build", &[]);
+    let eval = dep_binary("e1", "matrix_eval", &[]);
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([(
+                PhaseId::from("matrix_eval"),
+                vec![PhaseId::from("build")],
+            )]),
+        });
+        cs.apply(ClusterMutation::PhaseNoBarrierSet {
+            phases: vec![PhaseId::from("matrix_eval")],
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "b1".into(),
+            task: build,
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "e1".into(),
+            task: eval,
+        });
+    }
+    primary.hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
+
+    let matrix_eval = PhaseId::from("matrix_eval");
+    // The pool reports matrix_eval Active despite build still being live —
+    // the I3 set_no_barrier_phases pre-flip, the path the runtime-spawn
+    // interlock authorizes early dispatch on. Pinning the pool state here
+    // is the I3 invariant the brief requires the boundary fix to
+    // PRESERVE — `phase_boundary_open` is the formal-boundary gate, not a
+    // dispatch gate.
+    let active: std::collections::HashSet<PhaseId> =
+        primary.pool().active_phases().into_iter().collect();
+    assert!(
+        active.contains(&matrix_eval),
+        "I3: pool's active_phases still carries the barrier=False phase \
+         for early task dispatch, even with its boundary closed"
+    );
+    // And the cluster_state still records the barrier-set membership —
+    // the data the runtime-spawn interlock consults.
+    assert!(primary.cluster_state_for_test().phase_no_barrier(&matrix_eval));
 }

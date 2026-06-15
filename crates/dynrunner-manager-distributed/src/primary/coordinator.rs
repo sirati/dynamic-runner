@@ -5730,6 +5730,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     pub(super) fn fire_initial_phase_starts(&mut self) {
         let active: Vec<PhaseId> = self.pool().active_phases();
         for p in active {
+            // I1 (formal-start invariant): a phase the pool reports as
+            // Active is dispatch-authorized — `set_no_barrier_phases`
+            // pre-flips barrier=False phases to `Active` at construction
+            // regardless of `PhaseEnded` so their tasks can ride the I3
+            // early-dispatch path (the runtime-spawn interlock in
+            // `apply_spawn_tasks` is the I3 owner there) — but its FORMAL
+            // START (on_phase_start callback + "starting job phase"
+            // narration + worker-mgmt demand) must still wait until every
+            // phase-dep has formally completed. The single boundary
+            // predicate, consulted here AND by `phase_can_proceed` AND by
+            // the narrator's start gate. The post-`mark_phase_done` cascade
+            // (`process_phase_lifecycle`) re-enters this function for the
+            // skipped phases the moment their boundary opens, so a phase
+            // skipped here is never stranded. Closes V-A1.
+            if !self.cluster_state.phase_boundary_open(&p) {
+                continue;
+            }
             if self.phase_started_emitted.insert(p.clone()) {
                 // Starting-job-phase / phase-transition (phase start)
                 // important event. This `insert` guard is the single
@@ -5848,6 +5865,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// (`phase_min_workers`), and the `may_be_empty` opt-out lookup are all
     /// keyed on it.
     pub(super) fn phase_can_proceed(&self, phase: &PhaseId) -> bool {
+        // I2 (formal-complete invariant): the phase-boundary predicate is
+        // the FIRST gate — `phase` cannot formally complete until every
+        // phase-dep of `phase` has had its `PhaseEnded` fact applied,
+        // regardless of barrier. The single predicate the narrator's
+        // complete gate and `fire_initial_phase_starts` also consult; see
+        // `ClusterState::phase_boundary_open`. Closes V-A2b: a barrier=False
+        // phase whose tasks all completed FAST while its predecessor's
+        // PhaseEnded had not yet fired previously fell straight through the
+        // `has_any && !has_live` arm and broadcast its OWN PhaseEnded before
+        // the predecessor's, racing `mark_phase_done`. This gate makes the
+        // phase wait until the boundary opens, then re-evaluate.
+        if !self.cluster_state.phase_boundary_open(phase) {
+            return false;
+        }
         // The decision is derived from the replicated ledger, not from an
         // event tally. Skipped-as-existing items are now REAL terminal tasks
         // (`TaskState::SkippedAlreadyDone`), so any phase that had ANY
