@@ -13,7 +13,7 @@
 //!   - [`tests`] is the pre-run handle-factory contract suite (gated
 //!     on the `test-with-python` feature like the primary suite).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use pyo3::prelude::*;
@@ -64,6 +64,11 @@ pub(crate) struct PyDistributedManager {
     pub(super) skip_existing: bool,
     pub(super) uses_file_based_items: bool,
     pub(super) max_concurrent_per_type: HashMap<TypeId, u32>,
+    /// Task types marked `TaskTypeSpec.primary_pinned=True` (#580).
+    /// Propagated into `PrimaryConfig.primary_pinned_types` at run start
+    /// so the primary's dispatch view hides them from non-primary
+    /// workers.
+    pub(super) primary_pinned_types: HashSet<TypeId>,
     pub(super) estimator: PyMemoryEstimatorBridge,
     pub(super) completed: u32,
     pub(super) failed: u32,

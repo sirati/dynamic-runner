@@ -146,6 +146,13 @@ pub(crate) struct LoadedTopology {
     /// Absent type → unconstrained. Propagated into
     /// `PrimaryConfig.max_concurrent_per_type`.
     pub(crate) max_concurrent_per_type: HashMap<TypeId, u32>,
+    /// Task types whose `TaskTypeSpec.primary_pinned` is `True`. Items
+    /// of these types may only be dispatched to workers on the primary
+    /// node — never to peer secondaries, even after an eviction-driven
+    /// requeue. Propagated into `PrimaryConfig.primary_pinned_types`.
+    /// Absent (the default for every existing consumer) preserves the
+    /// historical any-worker dispatch behaviour.
+    pub(crate) primary_pinned_types: HashSet<TypeId>,
     raw_types: Vec<TypeSpecRaw>,
 }
 
@@ -161,6 +168,7 @@ impl LoadedTopology {
         let mut phase_no_barrier: Vec<PhaseId> = Vec::new();
         let mut estimator_specs: Vec<(TypeId, String)> = Vec::new();
         let mut max_concurrent_per_type: HashMap<TypeId, u32> = HashMap::new();
+        let mut primary_pinned_types: HashSet<TypeId> = HashSet::new();
 
         for phase_spec in &phases_iter {
             let phase_id_str: String = phase_spec.getattr("phase_id")?.extract()?;
@@ -222,6 +230,16 @@ impl LoadedTopology {
                     max_concurrent_per_type.insert(type_id.clone(), cap);
                 }
 
+                // Optional `primary_pinned` flag (#580). Missing attr
+                // (older task definitions) or `False` → no pin; `True`
+                // records the type as primary-pinned so the primary's
+                // dispatch view hides it from non-primary workers.
+                if let Ok(pp) = tts.getattr("primary_pinned")
+                    && pp.extract::<bool>().unwrap_or(false)
+                {
+                    primary_pinned_types.insert(type_id.clone());
+                }
+
                 if !seen_type_ids.insert(type_id.clone()) {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(
                         "duplicate TypeId in get_phases(): {}",
@@ -246,6 +264,7 @@ impl LoadedTopology {
             phase_may_be_empty,
             phase_no_barrier,
             max_concurrent_per_type,
+            primary_pinned_types,
             raw_types,
         })
     }
@@ -298,6 +317,10 @@ pub(crate) struct LoadedTaskDefinition {
     /// (FR-1). Carried over from `LoadedTopology` rather than re-parsed
     /// at every call site that needs to construct a `PrimaryConfig`.
     pub(crate) max_concurrent_per_type: HashMap<TypeId, u32>,
+    /// Task types marked `TaskTypeSpec.primary_pinned=True` (#580).
+    /// Carried over from `LoadedTopology` rather than re-parsed at
+    /// every call site that needs to construct a `PrimaryConfig`.
+    pub(crate) primary_pinned_types: HashSet<TypeId>,
 }
 
 impl LoadedTaskDefinition {
@@ -402,6 +425,7 @@ impl LoadedTaskDefinition {
             python_executable: PathBuf::from(python_executable),
             uses_file_based_items,
             max_concurrent_per_type: topology.max_concurrent_per_type,
+            primary_pinned_types: topology.primary_pinned_types,
         })
     }
 }

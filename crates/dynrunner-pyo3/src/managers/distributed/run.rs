@@ -147,6 +147,7 @@ impl PyDistributedManager {
         let skip_existing = self.skip_existing;
         let uses_file_based_items = self.uses_file_based_items;
         let max_concurrent_per_type = self.max_concurrent_per_type.clone();
+        let primary_pinned_types = self.primary_pinned_types.clone();
         let phase_deps = self.phase_deps.clone();
         // The consumer's `may_be_empty` phase opt-out, captured for
         // registration on the in-process primary (the empty-drain
@@ -971,6 +972,7 @@ impl PyDistributedManager {
                     source_pre_staged_root: source_pre_staged_root.clone(),
                     uses_file_based_items,
                     max_concurrent_per_type: max_concurrent_per_type.clone(),
+                    primary_pinned_types: primary_pinned_types.clone(),
                     retry_max_passes: dist_retry_max_passes,
                     oom_retry_max_passes: dist_oom_retry_max_passes,
                     fleet_dead_timeout: std::time::Duration::from_secs(30),
