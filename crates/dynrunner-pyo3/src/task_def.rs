@@ -130,6 +130,18 @@ pub(crate) struct LoadedTopology {
     /// (`register_phase_may_be_empty`) and replicated via
     /// `ClusterMutation::PhaseMayBeEmptySet`. Empty on the common run.
     pub(crate) phase_may_be_empty: Vec<PhaseId>,
+    /// Phases the consumer declared `PhaseSpec.barrier=False` — the
+    /// pipelined-edge opt-in that authorises the scheduler to dispatch
+    /// tasks from these phases without first waiting for whole-of-
+    /// upstream drain. Registered on the primary
+    /// (`register_phase_no_barrier`) and replicated via
+    /// `ClusterMutation::PhaseNoBarrierSet`; consumed by the pool's
+    /// `set_no_barrier_phases` initialiser (a no-barrier phase starts
+    /// `Active` instead of `Blocked`) and by the runtime-spawn barrier
+    /// interlock in `apply_spawn_tasks` (a `Blocked` barrier=True phase
+    /// rejects a runtime spawn). Empty on the common strict-barrier run
+    /// (every phase barrier=True, the default).
+    pub(crate) phase_no_barrier: Vec<PhaseId>,
     /// Per-type concurrency caps from `TaskTypeSpec.max_concurrent`.
     /// Absent type → unconstrained. Propagated into
     /// `PrimaryConfig.max_concurrent_per_type`.
@@ -146,6 +158,7 @@ impl LoadedTopology {
         let mut seen_type_ids: HashSet<TypeId> = HashSet::new();
         let mut phase_deps: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
         let mut phase_may_be_empty: Vec<PhaseId> = Vec::new();
+        let mut phase_no_barrier: Vec<PhaseId> = Vec::new();
         let mut estimator_specs: Vec<(TypeId, String)> = Vec::new();
         let mut max_concurrent_per_type: HashMap<TypeId, u32> = HashMap::new();
 
@@ -164,6 +177,23 @@ impl LoadedTopology {
                 && mbe.extract::<bool>().unwrap_or(false)
             {
                 phase_may_be_empty.push(phase_id.clone());
+            }
+            // Optional per-phase barrier flag (`PhaseSpec.barrier`).
+            // Defaults to `true` for old task definitions missing the attr
+            // — strict barriers preserve the historical behaviour every
+            // existing consumer relies on. Only `barrier=false` is the
+            // explicit pipelined-edge opt-in, which records the phase in
+            // `phase_no_barrier`; the scheduler then starts it `Active`
+            // (per the pool's `set_no_barrier_phases` rule) and the
+            // runtime-spawn interlock accepts spawns into it while its
+            // upstream is still draining.
+            let barrier = phase_spec
+                .getattr("barrier")
+                .ok()
+                .and_then(|v| v.extract::<bool>().ok())
+                .unwrap_or(true);
+            if !barrier {
+                phase_no_barrier.push(phase_id.clone());
             }
 
             let types_tuple: Vec<Bound<'_, PyAny>> = phase_spec.getattr("types")?.extract()?;
@@ -214,6 +244,7 @@ impl LoadedTopology {
             estimator,
             phase_deps,
             phase_may_be_empty,
+            phase_no_barrier,
             max_concurrent_per_type,
             raw_types,
         })
@@ -247,6 +278,11 @@ pub(crate) struct LoadedTaskDefinition {
     /// `LoadedTopology` to the manager constructors that register it on the
     /// primary (the empty-drain proceed-or-fail opt-out).
     pub(crate) phase_may_be_empty: Vec<PhaseId>,
+    /// Phases declared `PhaseSpec.barrier=False` — carried from
+    /// `LoadedTopology` to the manager constructors that register it on
+    /// the primary (the pipelined-edge opt-in). Empty on the common
+    /// strict-barrier run.
+    pub(crate) phase_no_barrier: Vec<PhaseId>,
     pub(crate) source_path: PathBuf,
     pub(crate) output_path: PathBuf,
     pub(crate) log_path: PathBuf,
@@ -358,6 +394,7 @@ impl LoadedTaskDefinition {
             types: TypeRegistry { types, index_by_id },
             phase_deps: topology.phase_deps,
             phase_may_be_empty: topology.phase_may_be_empty,
+            phase_no_barrier: topology.phase_no_barrier,
             source_path,
             output_path,
             log_path,
@@ -381,3 +418,193 @@ impl LoadedTaskDefinition {
 // extraction. The Python pytest suite under `python/dynamic_runner/`
 // already exercises this path end-to-end via the `RustLocalManager`
 // boot sequence.
+//
+// The `test-with-python` feature (introduced later for `estimator.rs`'s
+// gated test module) IS now wired up workspace-wide, so the barrier
+// extraction test below uses it directly. The broader `from_python`
+// surface still lives under the older NOTE above.
+
+#[cfg(test)]
+#[cfg(feature = "test-with-python")]
+mod tests {
+    //! `PhaseSpec.barrier` extraction contract for the pyo3
+    //! `LoadedTopology` adapter. The native scheduler USES the
+    //! extracted `phase_no_barrier` set to decide each phase's initial
+    //! state (`Active` vs `Blocked`) and to gate the runtime-spawn
+    //! interlock; if the extractor silently drops the field the whole
+    //! barrier=False semantic regresses to a no-op (the bug #540 fixes).
+    //! These tests pin the extractor to the wire shape Python sends.
+    //!
+    //! Tests require an embedded CPython interpreter; gated behind the
+    //! `test-with-python` feature. Invoke as:
+    //!   `cargo test -p dynrunner-pyo3 --lib --no-default-features \
+    //!        --features test-with-python task_def -- --test-threads=1`
+    use super::*;
+    use pyo3::types::PyModule;
+
+    /// Per-call atomic counter so each module gets a unique name (the
+    /// parallel `cargo test` harness resolves duplicate names through
+    /// `sys.modules`); the `--test-threads=1` flag is recommended but
+    /// the nonce is belt-and-braces.
+    static MODULE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Build a minimal Python `TaskDefinition`-shaped stub with two
+    /// phases and a single type, optionally setting `barrier=False` on
+    /// the named phase. `may_be_empty` is left at its default
+    /// (`False`) and `max_concurrent` at `None` so this test exercises
+    /// only the barrier field.
+    fn build_task_def<'py>(
+        py: Python<'py>,
+        barrier_false_phase: Option<&str>,
+    ) -> Bound<'py, PyAny> {
+        let nonce = MODULE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let module_name = format!("mock_task_def_{nonce}");
+        let file_name = format!("{module_name}.py");
+        // The stub defines a `TaskTypeSpec`-shaped object and a
+        // `PhaseSpec`-shaped object with the exact field names the
+        // pyo3 extractor reads via `getattr`. Mirrors the duck-typed
+        // contract: no class hierarchy required, just the fields. The
+        // `barrier` attribute is set per phase from the closure arg.
+        let phase_a_barrier = if barrier_false_phase == Some("A") {
+            "False"
+        } else {
+            "True"
+        };
+        let phase_b_barrier = if barrier_false_phase == Some("B") {
+            "False"
+        } else {
+            "True"
+        };
+        let source = format!(
+            r#"
+class TypeSpec:
+    def __init__(self, type_id):
+        self.type_id = type_id
+        self.worker_module = "stub.worker"
+        self.estimator_attr = "estimate_memory"
+        self.timeout_seconds = None
+        self.reserved_memory_per_worker = 0
+        self.max_concurrent = None
+
+
+class PhaseSpec:
+    def __init__(self, phase_id, depends_on, types, barrier):
+        self.phase_id = phase_id
+        self.depends_on = depends_on
+        self.types = types
+        self.barrier = barrier
+        self.may_be_empty = False
+
+
+class Task:
+    def get_phases(self):
+        return (
+            PhaseSpec("A", (), (TypeSpec("ta"),), barrier={phase_a_barrier}),
+            PhaseSpec("B", ("A",), (TypeSpec("tb"),), barrier={phase_b_barrier}),
+        )
+
+    def estimate_memory(self, task):
+        return 0
+"#
+        );
+        let module = PyModule::from_code(
+            py,
+            std::ffi::CString::new(source).unwrap().as_c_str(),
+            std::ffi::CString::new(file_name).unwrap().as_c_str(),
+            std::ffi::CString::new(module_name).unwrap().as_c_str(),
+        )
+        .expect("compile mock task-definition module");
+        module.getattr("Task").unwrap().call0().unwrap()
+    }
+
+    /// Build a stub task-definition that OMITS the `barrier` attribute
+    /// entirely (older task definitions / Python callers that predate
+    /// the field). The extractor must default the missing attribute to
+    /// `barrier=True` — every phase strict-barrier — preserving the
+    /// historical behaviour.
+    fn build_task_def_no_barrier_attr(py: Python<'_>) -> Bound<'_, PyAny> {
+        let nonce = MODULE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let module_name = format!("mock_task_def_no_barrier_{nonce}");
+        let file_name = format!("{module_name}.py");
+        let source = r#"
+class TypeSpec:
+    def __init__(self, type_id):
+        self.type_id = type_id
+        self.worker_module = "stub.worker"
+        self.estimator_attr = "estimate_memory"
+        self.timeout_seconds = None
+        self.reserved_memory_per_worker = 0
+        self.max_concurrent = None
+
+
+class PhaseSpec:
+    def __init__(self, phase_id, depends_on, types):
+        self.phase_id = phase_id
+        self.depends_on = depends_on
+        self.types = types
+        self.may_be_empty = False
+        # NB: no `barrier` attr — simulates an older task definition.
+
+
+class Task:
+    def get_phases(self):
+        return (PhaseSpec("A", (), (TypeSpec("ta"),)),)
+
+    def estimate_memory(self, task):
+        return 0
+"#
+        .to_string();
+        let module = PyModule::from_code(
+            py,
+            std::ffi::CString::new(source).unwrap().as_c_str(),
+            std::ffi::CString::new(file_name).unwrap().as_c_str(),
+            std::ffi::CString::new(module_name).unwrap().as_c_str(),
+        )
+        .expect("compile mock task-definition module");
+        module.getattr("Task").unwrap().call0().unwrap()
+    }
+
+    #[test]
+    fn barrier_true_default_yields_empty_no_barrier_set() {
+        Python::attach(|py| {
+            let task_def = build_task_def(py, None);
+            let topo = LoadedTopology::from_python(&task_def).expect("topology loaded");
+            assert!(
+                topo.phase_no_barrier.is_empty(),
+                "with every phase barrier=True, phase_no_barrier must be empty (got {:?})",
+                topo.phase_no_barrier
+            );
+        });
+    }
+
+    #[test]
+    fn barrier_false_on_one_phase_lands_in_no_barrier_set() {
+        Python::attach(|py| {
+            let task_def = build_task_def(py, Some("B"));
+            let topo = LoadedTopology::from_python(&task_def).expect("topology loaded");
+            assert_eq!(
+                topo.phase_no_barrier,
+                vec![PhaseId::from("B")],
+                "phase B was declared barrier=False; phase_no_barrier must contain exactly it"
+            );
+        });
+    }
+
+    #[test]
+    fn missing_barrier_attr_defaults_true() {
+        // Old task definitions predating the `barrier` attribute must
+        // continue to behave strict-barrier (the historical default).
+        // The extractor's `getattr().ok().and_then(extract)` fallback
+        // is what makes this wire-safe — pin it.
+        Python::attach(|py| {
+            let task_def = build_task_def_no_barrier_attr(py);
+            let topo = LoadedTopology::from_python(&task_def).expect("topology loaded");
+            assert!(
+                topo.phase_no_barrier.is_empty(),
+                "a task definition missing the `barrier` attribute must default to strict \
+                 barriers (got {:?})",
+                topo.phase_no_barrier
+            );
+        });
+    }
+}

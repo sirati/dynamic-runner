@@ -349,6 +349,23 @@ pub struct LocalManager<
     /// re-entrant `process_binaries` calls early.
     pub(crate) command_rx: Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
 
+    /// The set of phases the consumer declared `barrier=False`
+    /// (`PhaseSpec.barrier=False`), registered before `process_binaries`
+    /// via [`Self::set_no_barrier_phases`]. Consumed at pool
+    /// construction (`PendingPool::set_no_barrier_phases`) so a
+    /// no-barrier phase starts `Active` rather than `Blocked`, and the
+    /// per-task graph alone gates dispatch readiness. Empty on the
+    /// common strict-barrier run (every phase barrier=True).
+    ///
+    /// Local-backend twin of the distributed
+    /// `PrimaryCoordinator::phase_no_barrier_decl` — same single-concern
+    /// shape (an opt-in topology fact applied once at pool init); the
+    /// local backend has no peer concept so there is no replication
+    /// alongside this field, the pool's `phase_state` map is the SSoT
+    /// for the apply-side barrier interlock in
+    /// [`super::manager::command_channel::handle_local_command`].
+    pub(crate) phase_no_barrier_decl: HashSet<PhaseId>,
+
     /// Mirror of every task ever passed through `pool.extend` /
     /// `PrimaryCommand::SpawnTasks` keyed by wire-canonical content
     /// hash. Used by the command-channel handler to resolve
@@ -436,7 +453,26 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             command_rx: Some(command_rx),
             task_by_hash: HashMap::new(),
             unfulfillable_reinject_remaining: HashMap::new(),
+            phase_no_barrier_decl: HashSet::new(),
         }
+    }
+
+    /// Register the set of phases the consumer declared `barrier=False`
+    /// (`PhaseSpec.barrier=False`) BEFORE [`Self::process_binaries`].
+    /// The pool's initial-state assignment consumes it so a no-barrier
+    /// phase starts `Active` rather than `Blocked`, and the per-task
+    /// graph (`task_depends_on`) alone gates dispatch readiness. Same
+    /// before-`process_binaries` registration contract as the other
+    /// pre-run setters; empty (no call) on the common strict-barrier
+    /// run.
+    ///
+    /// Single-concern setter — local twin of the distributed
+    /// `PrimaryCoordinator::register_phase_no_barrier`. Each backend
+    /// surfaces the same opt-in through its own pre-run setter; the
+    /// pool API ([`PendingPool::set_no_barrier_phases`]) is identical
+    /// across backends.
+    pub fn set_no_barrier_phases(&mut self, phases: impl IntoIterator<Item = PhaseId>) {
+        self.phase_no_barrier_decl = phases.into_iter().collect();
     }
 
     /// Clone of the command-channel sender. Symmetric with
@@ -505,6 +541,14 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         self.on_phase_end_cb = Some(Box::new(on_phase_end));
 
         let mut pool = PendingPool::new(phase_ids, phase_deps).map_err(|e| e.to_string())?;
+        // Apply the consumer's `PhaseSpec.barrier=False` opt-in BEFORE
+        // any task seeding so the no-barrier phases start `Active`
+        // rather than `Blocked`. The set comes from the pre-run
+        // setter `Self::set_no_barrier_phases` (the local-backend twin
+        // of the distributed
+        // `PrimaryCoordinator::register_phase_no_barrier`); an empty
+        // set (the common strict-barrier run) is a no-op.
+        pool.set_no_barrier_phases(self.phase_no_barrier_decl.iter().cloned());
         // The pool's per-task re-dispatch backoff exists for the
         // EVENT-DRIVEN dispatch loop (the distributed primary), where
         // a requeued task is otherwise re-assignable at memory speed.

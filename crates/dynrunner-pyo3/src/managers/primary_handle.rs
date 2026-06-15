@@ -524,6 +524,19 @@ impl PyPrimaryHandle {
                     dict.set_item("task_hash", task_hash)?;
                     dict.set_item("dep_task_id", dep_task_id)?;
                 }
+                SpawnError::BarrierViolation {
+                    task_hash,
+                    phase_id,
+                } => {
+                    // The pipelined-edge contract violation: target
+                    // phase is `Blocked` (upstream barrier not yet
+                    // lifted) AND declared barrier=True. Consumer must
+                    // set `PhaseSpec(barrier=False)` on the target
+                    // phase to authorise this early-spawn.
+                    dict.set_item("kind", "barrier_violation")?;
+                    dict.set_item("task_hash", task_hash)?;
+                    dict.set_item("phase_id", phase_id.as_str())?;
+                }
             }
             let tuple = PyTuple::new(py, [idx.into_pyobject(py)?.into_any(), dict.into_any()])?;
             out.append(tuple)?;

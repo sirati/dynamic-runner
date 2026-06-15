@@ -73,6 +73,12 @@ pub(crate) struct PyLocalManager {
     memprofile_enabled: bool,
     types: TypeRegistry,
     phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    /// Phases the consumer declared `PhaseSpec.barrier=False` — applied
+    /// to the inner `LocalManager` via `set_no_barrier_phases` BEFORE
+    /// `process_binaries` (the local twin of the distributed primary's
+    /// `register_phase_no_barrier`). Empty on the common strict-barrier
+    /// run.
+    phase_no_barrier: Vec<PhaseId>,
     skip_existing: bool,
     estimator: PyMemoryEstimatorBridge,
     connection_mode: ConnectionMode,
@@ -286,6 +292,7 @@ impl PyLocalManager {
             memprofile_enabled,
             types: task.types,
             phase_deps: task.phase_deps,
+            phase_no_barrier: task.phase_no_barrier,
             skip_existing,
             estimator: task.estimator,
             connection_mode: conn_mode,
@@ -476,6 +483,7 @@ impl PyLocalManager {
         };
 
         let phase_deps = self.phase_deps.clone();
+        let phase_no_barrier = self.phase_no_barrier.clone();
         // Panik-watcher config captured before `py.detach`. The
         // LocalManager has no inner `panik_signal_rx` field — there's
         // only one operational loop (`process_binaries`) and the
@@ -552,6 +560,13 @@ impl PyLocalManager {
                     LocalManager::with_command_channel(
                         config, scheduler, estimator, command_tx, command_rx,
                     );
+                // Register the consumer's `PhaseSpec.barrier=False`
+                // opt-in BEFORE `process_binaries` so the pool's
+                // initial-state assignment flips no-barrier phases
+                // `Blocked → Active`. Same pre-run-setter contract as
+                // the distributed-primary `register_phase_no_barrier`
+                // call.
+                manager.set_no_barrier_phases(phase_no_barrier.iter().cloned());
                 // phase_deps comes from LoadedTaskDefinition (5A);
                 // on_phase_* closures bridge to Python (5B).
                 //

@@ -606,6 +606,19 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// every node — including a promoted primary — sees the same empty-drain
     /// opt-out. Empty between runs and on the common no-opt-out run.
     pub(super) phase_may_be_empty_decl: std::collections::HashSet<PhaseId>,
+    /// The set of phases the consumer declared `barrier=False`
+    /// (`PhaseSpec.barrier=False`), registered before `run()` via
+    /// [`Self::register_phase_no_barrier`]. The seed originators
+    /// (`originate_cold_seed` / `originate_relocated_seed`) emit it as
+    /// `ClusterMutation::PhaseNoBarrierSet` alongside `PhaseDepsSet`, so
+    /// every node — including a promoted primary — sees the same
+    /// pipelined-edge opt-in. Consumed by the pool's
+    /// `set_no_barrier_phases` initialiser (the no-barrier phase starts
+    /// `Active` rather than `Blocked`) and by the runtime-spawn barrier
+    /// interlock in `apply_spawn_tasks` (a `Blocked` barrier=True phase
+    /// rejects, a `Blocked` no-barrier phase accepts). Empty between
+    /// runs and on the common strict-barrier run.
+    pub(super) phase_no_barrier_decl: std::collections::HashSet<PhaseId>,
     pub(super) completed_tasks: HashSet<String>,
     /// THE single hash-keyed in-flight ledger. Records every task the
     /// primary believes is executing in the cluster, keyed by its
@@ -1614,6 +1627,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             pending: None,
             phase_deps: HashMap::new(),
             phase_may_be_empty_decl: std::collections::HashSet::new(),
+            phase_no_barrier_decl: std::collections::HashSet::new(),
             completed_tasks: HashSet::new(),
             in_flight: HashMap::new(),
             failed_tasks: HashMap::new(),
@@ -2538,6 +2552,25 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         phases: impl IntoIterator<Item = PhaseId>,
     ) {
         self.phase_may_be_empty_decl = phases.into_iter().collect();
+    }
+
+    /// Register the set of phases the consumer declared `barrier=False`
+    /// (`PhaseSpec.barrier=False`), before `run()`. The seed originators
+    /// emit it as `ClusterMutation::PhaseNoBarrierSet` (paired with
+    /// `PhaseDepsSet`) so the pipelined-edge opt-in reaches every node,
+    /// including a promoted primary. Consumed by:
+    ///   * the pool's `set_no_barrier_phases` initialiser (a no-barrier
+    ///     phase starts `Active` instead of `Blocked`, so its tasks
+    ///     dispatch as soon as per-task `task_depends_on` resolves);
+    ///   * the runtime-spawn barrier interlock in
+    ///     `apply_spawn_tasks` (a `Blocked` barrier=True phase rejects
+    ///     a runtime spawn; a no-barrier phase accepts).
+    ///
+    /// Same before-`run()` registration contract as
+    /// [`Self::register_phase_may_be_empty`]; empty (no call) on the
+    /// common strict-barrier run.
+    pub fn register_phase_no_barrier(&mut self, phases: impl IntoIterator<Item = PhaseId>) {
+        self.phase_no_barrier_decl = phases.into_iter().collect();
     }
 
     /// Set the per-task budget cap for

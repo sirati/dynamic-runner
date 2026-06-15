@@ -58,6 +58,9 @@ pub(crate) struct PyDistributedManager {
     /// Phases declared `PhaseSpec.may_be_empty` — registered on the
     /// in-process primary before `run()` (the empty-drain opt-out).
     pub(super) phase_may_be_empty: Vec<PhaseId>,
+    /// Phases declared `PhaseSpec.barrier=False` — registered on the
+    /// in-process primary before `run()` (the pipelined-edge opt-in).
+    pub(super) phase_no_barrier: Vec<PhaseId>,
     pub(super) skip_existing: bool,
     pub(super) uses_file_based_items: bool,
     pub(super) max_concurrent_per_type: HashMap<TypeId, u32>,

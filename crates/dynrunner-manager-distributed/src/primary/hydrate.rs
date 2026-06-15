@@ -565,6 +565,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
         let pool = match PendingPool::new(phase_ids, phase_deps) {
             Ok(mut p) => {
+                // Apply the consumer's `PhaseSpec.barrier=False` opt-in
+                // BEFORE any task seeding so the no-barrier phases start
+                // `Active` rather than `Blocked`. The set comes from the
+                // replicated `cluster_state.phase_no_barrier` (originated
+                // by the seed batch's `PhaseNoBarrierSet` — paired with
+                // `PhaseDepsSet`), so a hydrated/promoted primary uses
+                // the SAME initial state the live primary used. Empty
+                // (no-op) on the common strict-barrier run.
+                p.set_no_barrier_phases(
+                    self.cluster_state.phase_no_barrier_set().iter().cloned(),
+                );
                 p.mark_tasks_completed(completed_task_ids);
                 // Per-class terminal-FAILURE seeds (see the seed-vec docs
                 // at the top): Failed/InvalidTask roots enter the

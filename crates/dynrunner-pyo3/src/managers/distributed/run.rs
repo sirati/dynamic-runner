@@ -152,6 +152,7 @@ impl PyDistributedManager {
         // registration on the in-process primary (the empty-drain
         // proceed-or-fail discriminator).
         let phase_may_be_empty = self.phase_may_be_empty.clone();
+        let phase_no_barrier = self.phase_no_barrier.clone();
         // The shared node-local run-config (the operator's
         // `args.forwarded_argv`). One copy seeds the in-process primary's
         // `PrimaryConfig` and a per-secondary clone seeds each in-process
@@ -1065,6 +1066,11 @@ impl PyDistributedManager {
                 // `run()` enters, so the cold-/relocated-seed originator emits
                 // it paired with the phase graph (the empty-drain opt-out).
                 primary.register_phase_may_be_empty(phase_may_be_empty.iter().cloned());
+                // Register the consumer's `barrier=False` opt-in BEFORE
+                // `run()` enters, so the seed originator emits it as
+                // `PhaseNoBarrierSet` paired with the phase graph
+                // (the pipelined-edge opt-in).
+                primary.register_phase_no_barrier(phase_no_barrier.iter().cloned());
 
                 // Register the Python peer-lifecycle listener (if any)
                 // BEFORE the primary's `run()` enters — the

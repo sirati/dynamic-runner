@@ -60,19 +60,80 @@ pub(crate) async fn handle_local_command<M, S, E, I>(
             // probe; the full-identity `(phase_id, task_id)` known-set
             // is also derived from `task_by_hash` (the mirror covers
             // every task the manager has ever known about in this run).
-            let (valid, errors) = validate_spawn_tasks(
-                |hash| mgr.task_by_hash.contains_key(hash),
-                // Phase-aware dep resolution: a dep names a full
-                // `(phase_id, task_id)`. The SAME `task_id` in two phases
-                // is a DISTINCT task, so resolve against the full
-                // identity in the `task_by_hash` mirror.
-                |phase_id, task_id| {
-                    mgr.task_by_hash
-                        .values()
-                        .any(|t| t.task_id.as_str() == task_id && &t.phase_id == phase_id)
-                },
-                tasks,
-            );
+            let (valid, errors) = {
+                // Snapshot the pool's phase_state map AND its phase_deps
+                // graph BEFORE building the validator closures, so the
+                // `phase_accepts_runtime_spawn` closure does not require
+                // a live `&mgr.pool` borrow at call time (the surrounding
+                // match arm later takes `&mut mgr.pool` to extend;
+                // non-overlapping borrows). The composed gate mirrors
+                // the distributed primary's: accept iff the phase is
+                // declared no-barrier (`PhaseSpec.barrier=False`, which
+                // the pool's initial state already encodes by starting
+                // it `Active` instead of `Blocked`) OR every upstream
+                // dep has reached drain (state ∈ {Drained, Done}). The
+                // latter accepts the legitimate on_phase_end -> spawn
+                // idiom (the upstream's `on_phase_end` fires AT the
+                // drain edge, before `mark_phase_done`, and a spawn into
+                // the still-`Blocked` downstream phase races the
+                // about-to-fire activation).
+                use dynrunner_scheduler_api::pending_pool::PhaseState;
+                let phase_states: std::collections::HashMap<_, _> = mgr
+                    .pool_ref()
+                    .phase_state_iter()
+                    .map(|(p, s)| (p.clone(), s))
+                    .collect();
+                // The local pool exposes its `phase_deps` map indirectly
+                // via the topology; mirror it from the pool's view
+                // through the same iter accessor (single seam).
+                let phase_deps_snapshot: std::collections::HashMap<_, _> = mgr
+                    .pool_ref()
+                    .phase_deps_iter()
+                    .map(|(p, d)| (p.clone(), d.clone()))
+                    .collect();
+                let phase_no_barrier = mgr.phase_no_barrier_decl.clone();
+                let phase_accepts = |phase_id: &dynrunner_core::PhaseId| {
+                    // Explicit pipelined-edge opt-in: a no-barrier phase
+                    // accepts any spawn regardless of upstream state
+                    // (the consumer authorized early dispatch by
+                    // declaring `PhaseSpec(barrier=False)` on it).
+                    if phase_no_barrier.contains(phase_id) {
+                        return true;
+                    }
+                    // Otherwise accept iff every upstream dep has
+                    // reached drain (`Drained|Done`) — the legitimate
+                    // on_phase_end-spawn idiom; rejection surfaces a
+                    // genuine barrier violation (upstream still has
+                    // live work). An unknown phase id (no `phase_deps`
+                    // entry, no `phase_states` entry) treats the gate
+                    // as open — the validator's other classes own that
+                    // diagnosis.
+                    let deps = match phase_deps_snapshot.get(phase_id) {
+                        Some(d) => d,
+                        None => return true,
+                    };
+                    deps.iter().all(|dep| {
+                        phase_states
+                            .get(dep)
+                            .map(|s| matches!(s, PhaseState::Drained | PhaseState::Done))
+                            .unwrap_or(true)
+                    })
+                };
+                validate_spawn_tasks(
+                    |hash| mgr.task_by_hash.contains_key(hash),
+                    // Phase-aware dep resolution: a dep names a full
+                    // `(phase_id, task_id)`. The SAME `task_id` in two phases
+                    // is a DISTINCT task, so resolve against the full
+                    // identity in the `task_by_hash` mirror.
+                    |phase_id, task_id| {
+                        mgr.task_by_hash
+                            .values()
+                            .any(|t| t.task_id.as_str() == task_id && &t.phase_id == phase_id)
+                    },
+                    phase_accepts,
+                    tasks,
+                )
+            };
             // Mirror BEFORE `extend`: matches the initial-batch
             // mirror in `process_binaries` so the invariant "every
             // task the pool knows about is mirrored" holds even if

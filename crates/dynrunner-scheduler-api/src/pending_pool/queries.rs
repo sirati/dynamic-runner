@@ -357,6 +357,30 @@ impl<I: Identifier> PendingPool<I> {
         self.phase_state.get(phase_id).copied()
     }
 
+    /// Iterate every phase's current state as `(&PhaseId, PhaseState)`.
+    /// Useful for callers that need a snapshot of the whole phase-state
+    /// map (e.g. the local manager's runtime-spawn barrier-interlock
+    /// validator builds a borrow-free copy so the closure stays
+    /// independent of the live `&mut pool` borrow at extend time).
+    /// Single concern: a snapshot accessor over the existing private
+    /// `phase_state` map — the caller picks the collection shape.
+    pub fn phase_state_iter(&self) -> impl Iterator<Item = (&PhaseId, PhaseState)> + '_ {
+        self.phase_state.iter().map(|(p, s)| (p, *s))
+    }
+
+    /// Iterate every phase's declared `depends_on` list as
+    /// `(&PhaseId, &[PhaseId])`. Sibling of [`Self::phase_state_iter`]
+    /// for callers that need a snapshot of the dependency graph the
+    /// pool was built with (e.g. the local manager's runtime-spawn
+    /// barrier-interlock validator builds a borrow-free copy of the
+    /// graph alongside the state-map so its closure can walk each
+    /// spawned task's phase deps without re-borrowing the live pool).
+    /// Single concern: a snapshot accessor over the existing private
+    /// `phase_deps` map.
+    pub fn phase_deps_iter(&self) -> impl Iterator<Item = (&PhaseId, &Vec<PhaseId>)> + '_ {
+        self.phase_deps.iter()
+    }
+
     /// Number of in-flight items for a phase. Useful for tests.
     pub fn in_flight(&self, phase_id: &PhaseId) -> u32 {
         self.in_flight_per_phase.get(phase_id).copied().unwrap_or(0)
