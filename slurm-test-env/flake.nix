@@ -57,11 +57,34 @@
           install -m 0755 ${./deploy/reboot-node.sh}     $out/bin/slurm-test-env-reboot-node
           install -m 0755 ${./scripts/provision-user.sh} $out/bin/slurm-test-env-provision-user
           install -m 0755 ${./scripts/smoke-test.sh}     $out/bin/slurm-test-env-smoke-test
-          # Per-fix e2e assertion scripts. The shell wrapper resolves
-          # its sibling driver under $out/bin (same nix-store closure)
-          # so both must install together.
+          # Per-fix e2e assertion scripts. The shell wrapper for #540
+          # resolves its sibling driver under $out/bin (same nix-store
+          # closure), so both install together.
           install -m 0755 ${./scripts/test-540-barrier-false.sh} $out/bin/slurm-test-env-test-540-barrier-false
           install -m 0755 ${./scripts/test-540-driver.py}        $out/bin/slurm-test-env-test-540-driver
+          install -m 0755 ${./scripts/test-543-no-scancel.sh} $out/bin/slurm-test-env-test-543-no-scancel
+          install -m 0755 ${./scripts/test-547-chunking.sh} $out/bin/slurm-test-env-test-547-chunking
+          install -m 0755 ${./scripts/test-563-fatal-abort.sh} $out/bin/slurm-test-env-test-563-fatal-abort
+          install -m 0755 ${./scripts/test-565-572-pending-resources.sh} \
+            $out/bin/slurm-test-env-test-565-572-pending-resources
+          install -m 0755 ${./scripts/test-571-tunnel-deadline.sh} $out/bin/slurm-test-env-test-571-tunnel-deadline
+          install -m 0755 ${./scripts/test-573-stdio-filter.sh} $out/bin/slurm-test-env-test-573-stdio-filter
+          install -m 0755 ${./scripts/test-574-stats-skip.sh} $out/bin/slurm-test-env-test-574-stats-skip
+          install -m 0755 ${./scripts/test-575-resource-stats.sh} $out/bin/slurm-test-env-test-575-resource-stats
+
+          # Ship the #547 chunking-test workload package alongside the
+          # assertion script. The script wires the driver via
+          # DYNRUNNER_CMD which the operator points at the package
+          # location at execution time (the dynamic_runner wheel is
+          # deployed into the cluster out-of-band).
+          mkdir -p $out/share/slurm-test-env/test_547_workload
+          install -m 0644 ${./scripts/test_547_workload/__init__.py} \
+            $out/share/slurm-test-env/test_547_workload/__init__.py
+          install -m 0644 ${./scripts/test_547_workload/driver.py} \
+            $out/share/slurm-test-env/test_547_workload/driver.py
+          install -m 0644 ${./scripts/test_547_workload/worker.py} \
+            $out/share/slurm-test-env/test_547_workload/worker.py
+
 
           # PATH wrapping: include the system deps each script needs, plus
           # $out/bin itself so e.g. smoke-test can call the wrapped
@@ -135,6 +158,38 @@
           test-540-barrier-false = {
             type = "app";
             program = "${deploy}/bin/slurm-test-env-test-540-barrier-false";
+          };
+          test-543-no-scancel = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-test-543-no-scancel";
+          };
+          test-547-chunking = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-test-547-chunking";
+          };
+          test-563-fatal-abort = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-test-563-fatal-abort";
+          };
+          test-565-572-pending-resources = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-test-565-572-pending-resources";
+          };
+          test-571-tunnel-deadline = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-test-571-tunnel-deadline";
+          };
+          test-573-stdio-filter = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-test-573-stdio-filter";
+          };
+          test-574-stats-skip = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-test-574-stats-skip";
+          };
+          test-575-resource-stats = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-test-575-resource-stats";
           };
         };
       }
