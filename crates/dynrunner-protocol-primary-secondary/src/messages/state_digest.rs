@@ -60,6 +60,25 @@ pub struct StateDigest {
     /// identity is sufficient to detect a missing entry.
     #[serde(default)]
     pub secondary_capacities_hash: u64,
+    /// Number of per-secondary aggregated resource-sample records (#575
+    /// — `ClusterState::latest_resource_samples`).
+    #[serde(default)]
+    pub latest_resource_samples_count: u64,
+    /// XOR-fold over the per-secondary resource-sample
+    /// `(secondary, (member_gen, emitted_at_ms))` pairs (#575). Folding
+    /// the LWW STAMP (member_gen + emit time) ensures a same-key newer-
+    /// stamp aggregate produces a different fold — the divergence the
+    /// restore-side LWW merge actually heals (detect-WITH-heal). The
+    /// per-field aggregate values themselves are intentionally NOT
+    /// folded: a same-stamp record carries the same aggregate by
+    /// construction (the secondary emits one record per stamp), so the
+    /// stamp pair is a sufficient fingerprint and keeps the fold's
+    /// state-machine semantics matching the apply rule's tuple
+    /// comparison. `#[serde(default)]` keeps wire compat with pre-#575
+    /// peers (decodes as zero — the conservative
+    /// never-claims-ahead shape).
+    #[serde(default)]
+    pub latest_resource_samples_hash: u64,
     /// Number of keyed task-output cache entries.
     #[serde(default)]
     pub task_outputs_count: u64,
@@ -284,6 +303,18 @@ impl StateDigest {
                 self.task_outputs_hash,
                 other.task_outputs_count,
                 other.task_outputs_hash,
+            )
+            // #575 per-secondary aggregated resource samples: count-OR-hash
+            // compare. LWW per `secondary` on `(member_gen, emitted_at_ms)`
+            // — the hash folds the stamp pair, so a same-secondary newer
+            // stamp at an equal count makes the lagging side behind; the
+            // snapshot pull's LWW restore-merge converges both sides
+            // deterministically.
+            || field_behind(
+                self.latest_resource_samples_count,
+                self.latest_resource_samples_hash,
+                other.latest_resource_samples_count,
+                other.latest_resource_samples_hash,
             )
             // CRD-3/D-G: count-OR-hash (R5 — the count-only compare left a
             // divergent-but-equal-count graph invisible).

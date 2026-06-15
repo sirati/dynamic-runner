@@ -20,10 +20,19 @@ use dynrunner_manager_local::oom::{
     DEFAULT_HEARTBEAT_INTERVAL, OomWatcher, OomWatcherConfig, SAMPLE_SWEEP_INTERVAL,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{Destination, PeerId};
+use dynrunner_protocol_primary_secondary::{
+    ClusterMutation, Destination, PeerId, SecondaryResourceSampleRecord,
+};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
+use super::super::resource_buffer::{RawResourceSample, ResourceSampleBuffer};
 use super::super::{RunOutcome, SecondaryCoordinator};
+
+/// Cadence of the #575 aggregated-resource-sample broadcast. The
+/// secondary emits one [`SecondaryResourceSampleRecord`] every 5
+/// minutes summarising the rolling 10-minute window of raw samples
+/// the OOM-sweep arm has been buffering.
+const RESOURCE_STATS_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 // ── Secondary `process_tasks` `select!` arm ids (oploop instrumentation) ──
 //
@@ -46,6 +55,7 @@ const ARM_SNAPSHOT_STREAM: usize = 11;
 const ARM_SETTLED_SPILL: usize = 12;
 const ARM_PULL: usize = 13;
 const ARM_AFFINE_IMPORT: usize = 14;
+const ARM_RESOURCE_STATS_EMIT: usize = 15;
 
 /// Per-iteration inbox batch-drain bound (#491). After the awaited
 /// `inbox.recv()` arm yields ONE frame, the arm body synchronously sweeps
@@ -85,6 +95,7 @@ const PROCESS_TASKS_ARM_NAMES: &[&str] = &[
     "settled_spill",
     "pull",
     "affine_import",
+    "resource_stats_emit",
 ];
 
 impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
@@ -226,6 +237,24 @@ where
             workers_memory_events_path,
         );
         let oom_sweep_interval = oom_watcher.sweep_interval();
+
+        // #575 rolling-buffer of raw resource samples (LOCAL-ONLY,
+        // never broadcast). Fed by the OOM-sweep arm below; drained
+        // by the 5-minute resource-stats emit arm into one
+        // `SecondaryResourceSample` mutation. Loop-local so the buffer
+        // dies with the operational loop — a respawn re-fills from
+        // an empty buffer (its first 5-minute aggregate is over the
+        // post-respawn samples only, matching the
+        // member_gen-stamped LWW semantics on the apply side).
+        let mut resource_buffer = ResourceSampleBuffer::new();
+        let mut resource_stats_interval = tokio::time::interval(RESOURCE_STATS_EMIT_INTERVAL);
+        resource_stats_interval
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Suppress the immediate first tick — a freshly-started loop has
+        // no samples to aggregate yet, so the first emit lands one full
+        // interval in (≥5 minutes, well after the buffer has filled with
+        // ~6_000 samples at the 50ms sweep cadence).
+        resource_stats_interval.reset();
 
         // Tell the primary the peer-mesh has settled so it can release
         // its `PrimaryChanged` announcement. For the single-secondary /
@@ -640,6 +669,36 @@ where
                         .await
                         .expect("oom charge sweep read panicked");
                     oom_watcher.apply_sweep(&mut self.op_mut().pool, sweep);
+                    // #575: push the just-applied snapshot into the
+                    // 10-min rolling buffer. ONE additive seam off the
+                    // existing sweep arm — the resource-stats concern
+                    // never touches the kill-decision path. A fresh
+                    // snapshot is always available here (apply_sweep
+                    // just wrote it); reading the host/charged fields
+                    // off `last_snapshot()` keeps the buffer's RawSample
+                    // a pure projection of the sweep's output.
+                    let snap = oom_watcher.last_snapshot();
+                    let raw_sample = RawResourceSample {
+                        workers_charged_sum_bytes: snap.tracked_workers_charged_sum,
+                        host_free_memory_bytes: match (
+                            snap.host.host_ram_total_bytes,
+                            snap.host.host_ram_used_bytes,
+                        ) {
+                            (Some(total), Some(used)) => Some(total.saturating_sub(used)),
+                            _ => None,
+                        },
+                        host_swap_used_bytes: snap.host.host_swap_used_bytes,
+                        host_free_swap_bytes: match (
+                            snap.host.host_swap_total_bytes,
+                            snap.host.host_swap_used_bytes,
+                        ) {
+                            (Some(total), Some(used)) => Some(total.saturating_sub(used)),
+                            _ => None,
+                        },
+                        cpu_busy_milli: snap.cpu_busy_milli,
+                    };
+                    resource_buffer
+                        .push(tokio::time::Instant::now().into_std(), raw_sample);
                     self.check_resource_pressure_via_watcher(&mut oom_watcher, factory).await;
                     // Per-worker phase-progress observability — the
                     // SAME shared seam LocalManager fires off ITS sweep
@@ -824,6 +883,66 @@ where
                                 "affine-import completion release failed"
                             );
                         }
+                    }
+                }
+                // #575 aggregated-resource-sample emit arm: every 5
+                // minutes, build the wire-shape aggregate over the
+                // current 10-min rolling buffer (~12_000 samples at
+                // the 50ms sweep cadence in production) and broadcast
+                // it as one `SecondaryResourceSample` mutation through
+                // the existing `apply_and_broadcast_mutations` path.
+                //
+                // The buffer is LOCAL-ONLY — the wire only ever sees
+                // the aggregate. An empty buffer (the loop just
+                // started; the OOM sweep has not produced a sample
+                // yet) returns `None` from `aggregate` and we skip the
+                // broadcast — no zero-floor record reaches the CRDT.
+                //
+                // The `(member_gen, emitted_at_ms)` stamp is read at
+                // EMIT time: member_gen off the CRDT for THIS
+                // secondary's id (a respawn-bumped gen makes the new
+                // incarnation's aggregate strictly dominate the dead
+                // one's last broadcast under the LWW apply rule);
+                // emitted_at_ms off the system clock so the within-
+                // membership steady-state advance is monotonic.
+                //
+                // Cancel-safety: `interval.tick` is itself cancel-safe
+                // per tokio docs; the buffer is borrowed `&self` for
+                // aggregation (no mutation) so a sibling-arm cancel
+                // does not lose work.
+                _ = resource_stats_interval.tick() => {
+                    arm_stats.record(ARM_RESOURCE_STATS_EMIT);
+                    let member_gen = self
+                        .cluster_state
+                        .peer_member_gen(&self.config.secondary_id);
+                    let emitted_at_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    if let Some(record) =
+                        resource_buffer.aggregate(member_gen, emitted_at_ms)
+                    {
+                        let mutation: ClusterMutation<I> =
+                            ClusterMutation::SecondaryResourceSample {
+                                secondary: self.config.secondary_id.clone(),
+                                record,
+                            };
+                        // Best-effort broadcast: the LWW apply on every
+                        // replica is the durability proof. A re-broadcast
+                        // is at-most-once-effective (same stamp NoOps).
+                        if let Err(e) =
+                            self.apply_and_broadcast_mutations(vec![mutation]).await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                "SecondaryResourceSample apply+broadcast failed"
+                            );
+                        }
+                        // Useful for #575 mute the inert SecondaryResourceSampleRecord
+                        // unused-import lint when the operational binary
+                        // disables the consumer; the type is also used
+                        // through the wire codec test.
+                        let _ = std::any::type_name::<SecondaryResourceSampleRecord>();
                     }
                 }
                 // Anti-entropy tick: broadcast this secondary's digest so

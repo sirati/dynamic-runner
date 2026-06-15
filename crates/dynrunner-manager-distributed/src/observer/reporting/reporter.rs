@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use dynrunner_core::IMPORTANT_TARGET;
 
-use super::format::{render_report, render_report_full};
+use super::format::{ResourceBaseline, render_report, render_report_full};
 use super::idle::IdleDetector;
 use super::stats::StatsSnapshot;
 use crate::observer::lost_visibility::{EndedOutage, WakeNoteSlot};
@@ -130,6 +130,15 @@ impl Clock for TokioClock {
 /// driving the cadences.
 pub struct Reporter {
     last_announced: StatsSnapshot,
+    /// Per-field LAST-PRINTED baseline for the #575 resource-stat
+    /// averages (held alongside `last_announced` because the
+    /// resource lines advance per-field on emission, not atomically
+    /// with the whole snapshot — see `format::render_report`'s
+    /// returned `next_resource_baseline`). A resource line that was
+    /// OMITTED leaves its baseline slot untouched, so the next emit
+    /// decides inclusion against the same prior value the operator
+    /// last saw.
+    last_printed_resource: ResourceBaseline,
     idle: IdleDetector,
     /// Grid ticks consumed since the last actual emission. Increments on
     /// every grid tick the reporter processes (whether it emits or
@@ -154,6 +163,7 @@ impl Reporter {
     pub fn new() -> Self {
         Self {
             last_announced: StatsSnapshot::default(),
+            last_printed_resource: ResourceBaseline::default(),
             idle: IdleDetector::new(IDLE_THRESHOLD),
             ticks_since_print: 0,
         }
@@ -210,12 +220,18 @@ impl Reporter {
     /// report was emitted (the caller flushes the wake-note slot after a
     /// genuine emission — the emitted report is a wake-stream host).
     pub fn on_stats_tick(&mut self, snapshot: &StatsSnapshot) -> bool {
-        if let Some(report) = render_report(snapshot, &self.last_announced) {
+        let outcome = render_report(snapshot, &self.last_announced, &self.last_printed_resource);
+        if let Some(report) = outcome.body {
             // The whole report is one importance-channel event so the
             // dual-sink routes it to stdio atomically under
             // `--important-stdio-only` (C1's filter keys on the target).
             tracing::info!(target: IMPORTANT_TARGET, "periodic cluster stats (10m):\n{report}");
+            // Advance the operational baseline atomically + the
+            // per-field resource baseline per-line (the renderer wrote
+            // each included field into `next_resource_baseline`; an
+            // omitted line preserves its slot).
             self.last_announced = snapshot.clone();
+            self.last_printed_resource = outcome.next_resource_baseline;
             self.ticks_since_print = 0;
             true
         } else {
@@ -240,6 +256,24 @@ impl Reporter {
             "cluster stats (force-print):\n{report}"
         );
         self.last_announced = snapshot.clone();
+        // The force-print emits EVERY currently-`Some` resource line, so
+        // advance the per-field baseline to the just-printed values (an
+        // omitted "None" field stays None in the baseline — there is
+        // nothing to compare against next time anyway). Mirrors the
+        // operational baseline reset above (every field printed → every
+        // field advanced).
+        self.last_printed_resource = ResourceBaseline {
+            mem_p10_bytes: snapshot.avg_mem_p10_bytes,
+            mem_p30_bytes: snapshot.avg_mem_p30_bytes,
+            mem_p50_bytes: snapshot.avg_mem_p50_bytes,
+            mem_p70_bytes: snapshot.avg_mem_p70_bytes,
+            mem_p90_bytes: snapshot.avg_mem_p90_bytes,
+            mem_avg_bytes: snapshot.avg_mem_avg_bytes,
+            total_free_memory_bytes: snapshot.avg_total_free_memory_bytes,
+            total_swap_used_bytes: snapshot.avg_total_swap_used_bytes,
+            total_free_swap_bytes: snapshot.avg_total_free_swap_bytes,
+            cpu_utilization_milli: snapshot.avg_cpu_utilization_milli,
+        };
         self.ticks_since_print = 0;
         true
     }

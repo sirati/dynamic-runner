@@ -272,6 +272,55 @@ fn roundtrip_secondary_capacity() {
     }
 }
 
+/// `SecondaryResourceSample` (#575) round-trips through serde with every
+/// aggregate field preserved verbatim — the wire shape every observer
+/// projection consumes.
+#[test]
+fn roundtrip_secondary_resource_sample() {
+    use crate::SecondaryResourceSampleRecord;
+
+    let record = SecondaryResourceSampleRecord {
+        member_gen: 7,
+        emitted_at_ms: 1_700_000_000_000,
+        mem_p10_bytes: 100 * 1024 * 1024,
+        mem_p30_bytes: 200 * 1024 * 1024,
+        mem_p50_bytes: 400 * 1024 * 1024,
+        mem_p70_bytes: 800 * 1024 * 1024,
+        mem_p90_bytes: 1_600 * 1024 * 1024,
+        mem_avg_bytes: 512 * 1024 * 1024,
+        total_free_memory_bytes: 4 * 1024 * 1024 * 1024,
+        total_swap_used_bytes: 256 * 1024 * 1024,
+        total_free_swap_bytes: 2 * 1024 * 1024 * 1024,
+        cpu_utilization_milli: 65_500,
+    };
+    let mutation: ClusterMutation<TestId> = ClusterMutation::SecondaryResourceSample {
+        secondary: "sec-3".into(),
+        record,
+    };
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::SecondaryResourceSample { secondary, record } => {
+            assert_eq!(secondary, "sec-3");
+            assert_eq!(record.member_gen, 7);
+            assert_eq!(record.emitted_at_ms, 1_700_000_000_000);
+            assert_eq!(record.mem_p10_bytes, 100 * 1024 * 1024);
+            assert_eq!(record.mem_p30_bytes, 200 * 1024 * 1024);
+            assert_eq!(record.mem_p50_bytes, 400 * 1024 * 1024);
+            assert_eq!(record.mem_p70_bytes, 800 * 1024 * 1024);
+            assert_eq!(record.mem_p90_bytes, 1_600 * 1024 * 1024);
+            assert_eq!(record.mem_avg_bytes, 512 * 1024 * 1024);
+            assert_eq!(record.total_free_memory_bytes, 4 * 1024 * 1024 * 1024);
+            assert_eq!(record.total_swap_used_bytes, 256 * 1024 * 1024);
+            assert_eq!(record.total_free_swap_bytes, 2 * 1024 * 1024 * 1024);
+            assert_eq!(record.cpu_utilization_milli, 65_500);
+        }
+        _ => panic!("expected SecondaryResourceSample"),
+    }
+}
+
 /// `TaskRequeued` round-trips through serde with its `hash` preserved
 /// (the dead-secondary recovery `InFlight → Pending` mutation carries
 /// only the hash; the preserved `TaskInfo` lives on the ledger entry,

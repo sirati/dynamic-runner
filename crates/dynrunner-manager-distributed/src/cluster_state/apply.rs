@@ -967,6 +967,9 @@ impl<I: Identifier> ClusterState<I> {
                 worker_count,
                 resources,
             } => self.apply_secondary_capacity(secondary, worker_count, resources),
+            ClusterMutation::SecondaryResourceSample { secondary, record } => {
+                self.apply_secondary_resource_sample(secondary, record)
+            }
             ClusterMutation::TasksSpawned { tasks } => {
                 self.apply_tasks_spawned(tasks, newly_pending_from_spawn)
             }

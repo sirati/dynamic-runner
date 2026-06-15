@@ -50,6 +50,32 @@ pub struct HostMemoryReading {
     /// computes a delta across samples and routes a worker disconnect
     /// reclassification when the delta is positive in the same window.
     pub kernel_oom_kill_count: Option<u64>,
+    /// Cumulative CPU tick counts from the aggregate `cpu` line of
+    /// `/proc/stat`. `None` on parse failure / non-Linux. Raw cumulative
+    /// counters — the watcher diffs across sweeps to produce the busy
+    /// fraction (`cpu_busy_milli` on the watcher snapshot). The aggregate
+    /// "cpu" line sums across cores, so a 100% busy fraction reads as
+    /// "every core at 100%" — the natural normalisation the #575
+    /// observer aggregation wants.
+    pub cpu_stat: Option<CpuStat>,
+}
+
+/// Cumulative tick counts from the aggregate `cpu` line of
+/// `/proc/stat` — the substrate the OOM watcher's CPU-utilisation
+/// derivation (#575) consumes. `total` is the sum of EVERY tick column
+/// (user + nice + system + idle + iowait + irq + softirq + steal +
+/// guest + guest_nice); `idle` is the sum of the idle-shaped columns
+/// (`idle` + `iowait`). The watcher diffs across sweeps:
+/// `busy_milli = (Δtotal - Δidle) / Δtotal * 100_000`.
+///
+/// `Copy` so the probe's `HostMemoryReading` keeps its zero-allocation,
+/// flat-record shape across `apply_sweep`'s host reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CpuStat {
+    /// Sum of EVERY tick column on the aggregate `cpu` line.
+    pub total: u64,
+    /// Sum of `idle + iowait` ticks (the kernel's idle bucket).
+    pub idle: u64,
 }
 
 /// Trait the OOM watcher uses to read host + cgroup memory state.
@@ -181,8 +207,87 @@ impl SystemProbe for ProcSysProbe {
                 .workers_memory_events
                 .as_deref()
                 .and_then(read_memory_events_oom_kill),
+            cpu_stat: read_proc_stat_cpu(),
         }
     }
+}
+
+/// Read the aggregate `cpu` line of `/proc/stat` once and return its
+/// `(total_ticks, idle_ticks)` decomposition as a [`CpuStat`]. `None`
+/// on missing file, IO error, or unparseable header.
+///
+/// The aggregate line shape is `cpu <user> <nice> <system> <idle>
+/// <iowait> <irq> <softirq> <steal> <guest> <guest_nice>` (Linux ≥ 2.6.33;
+/// earlier kernels omit `steal`/`guest*`). The parser accepts any
+/// length ≥ 4 and sums ALL present columns into `total`, plus the
+/// `idle + iowait` pair into `idle` — extra columns on newer kernels
+/// fold into `total` naturally.
+pub(crate) fn read_proc_stat_cpu() -> Option<CpuStat> {
+    #[cfg(target_os = "linux")]
+    {
+        let contents = std::fs::read_to_string("/proc/stat").ok()?;
+        parse_proc_stat_cpu(&contents)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Parse the aggregate `cpu` line out of a `/proc/stat`-shaped blob.
+/// Split into its own function so the unit test exercises the parser
+/// without touching the filesystem.
+pub(crate) fn parse_proc_stat_cpu(contents: &str) -> Option<CpuStat> {
+    // The aggregate line is ALWAYS the first line of `/proc/stat`, and
+    // it begins with `cpu ` (a space — the per-core lines begin with
+    // `cpu0`, `cpu1`, … so the prefix check disambiguates without a
+    // regex).
+    let line = contents.lines().next()?;
+    let rest = line.strip_prefix("cpu ")?.trim_start();
+    let mut cols = rest.split_ascii_whitespace();
+    let user: u64 = cols.next()?.parse().ok()?;
+    let nice: u64 = cols.next()?.parse().ok()?;
+    let system: u64 = cols.next()?.parse().ok()?;
+    let idle: u64 = cols.next()?.parse().ok()?;
+    let iowait: u64 = cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Sum the remaining columns (irq, softirq, steal, guest, guest_nice
+    // on newer kernels) into total without naming each — a future
+    // kernel column extension folds in automatically.
+    let mut total = user
+        .saturating_add(nice)
+        .saturating_add(system)
+        .saturating_add(idle)
+        .saturating_add(iowait);
+    for col in cols {
+        if let Ok(v) = col.parse::<u64>() {
+            total = total.saturating_add(v);
+        }
+    }
+    Some(CpuStat {
+        total,
+        idle: idle.saturating_add(iowait),
+    })
+}
+
+/// Derive the busy-fraction in milli-percent from two cumulative
+/// readings (`prev` → `cur`). 100_000 = every core at 100% on the
+/// aggregate `/proc/stat` line. Returns `None` when the delta is
+/// non-positive (clock skew across a process restart, or two reads
+/// landing inside the same tick) — the caller leaves the field
+/// `None` rather than reporting zero.
+pub(crate) fn cpu_busy_milli(prev: CpuStat, cur: CpuStat) -> Option<u32> {
+    let dtotal = cur.total.saturating_sub(prev.total);
+    let didle = cur.idle.saturating_sub(prev.idle);
+    if dtotal == 0 {
+        return None;
+    }
+    let busy = dtotal.saturating_sub(didle);
+    // (busy / dtotal) * 100_000, computed in u128 to avoid the
+    // intermediate `busy * 100_000` overflowing u64 on a long-running
+    // host (a year of ticks per core × 100_000 still fits in u128 by
+    // many orders of magnitude).
+    let milli = (busy as u128).saturating_mul(100_000) / dtotal as u128;
+    Some(milli.min(100_000) as u32)
 }
 
 /// Read `<cgroup>/memory.events` and extract the cumulative `oom_kill`
@@ -327,5 +432,91 @@ mod tests {
         // pseudo-fs implementations emit them).
         let contents = "\n\noom_kill 5\n\n";
         assert_eq!(parse_memory_events_oom_kill(contents), Some(5));
+    }
+
+    #[test]
+    fn parse_proc_stat_cpu_extracts_total_and_idle() {
+        // Real `/proc/stat` shape on Linux ≥ 2.6.33: cpu <user> <nice>
+        // <system> <idle> <iowait> <irq> <softirq> <steal> <guest>
+        // <guest_nice>, followed by per-core lines.
+        let contents = "\
+            cpu  100 5 30 800 10 1 2 0 0 0\n\
+            cpu0 50 2 15 400 5 0 1 0 0 0\n\
+            intr 1234\n";
+        let stat = parse_proc_stat_cpu(contents).expect("aggregate line parses");
+        // 100 + 5 + 30 + 800 + 10 + 1 + 2 + 0 + 0 + 0 = 948
+        assert_eq!(stat.total, 948);
+        // idle + iowait = 800 + 10 = 810
+        assert_eq!(stat.idle, 810);
+    }
+
+    #[test]
+    fn parse_proc_stat_cpu_tolerates_old_kernel_short_line() {
+        // Pre-2.6.11 kernels (and some embedded fork) omit `iowait` and
+        // the later columns. The parser must still produce a sensible
+        // pair from the first four columns.
+        let contents = "cpu  100 5 30 800\n";
+        let stat = parse_proc_stat_cpu(contents).expect("aggregate line parses");
+        assert_eq!(stat.total, 935);
+        // No iowait column → idle is just `idle`.
+        assert_eq!(stat.idle, 800);
+    }
+
+    #[test]
+    fn parse_proc_stat_cpu_rejects_missing_aggregate_line() {
+        let contents = "intr 1\nctxt 2\n";
+        assert!(parse_proc_stat_cpu(contents).is_none());
+    }
+
+    #[test]
+    fn cpu_busy_milli_computes_busy_fraction() {
+        // 1 second on a 1-core box at 100 Hz: 100 ticks total, all
+        // busy → 100_000 milli-percent.
+        let prev = CpuStat { total: 0, idle: 0 };
+        let cur = CpuStat {
+            total: 100,
+            idle: 0,
+        };
+        assert_eq!(cpu_busy_milli(prev, cur), Some(100_000));
+    }
+
+    #[test]
+    fn cpu_busy_milli_half_busy() {
+        // 50/100 busy → 50_000 milli-percent (= 50%).
+        let prev = CpuStat { total: 0, idle: 0 };
+        let cur = CpuStat {
+            total: 100,
+            idle: 50,
+        };
+        assert_eq!(cpu_busy_milli(prev, cur), Some(50_000));
+    }
+
+    #[test]
+    fn cpu_busy_milli_returns_none_on_zero_delta() {
+        // Same reading twice — no time has passed. Reporting zero
+        // would lie ("CPU is 0% busy"); the convention is `None` so
+        // the caller leaves the aggregation field unpopulated.
+        let cur = CpuStat {
+            total: 100,
+            idle: 50,
+        };
+        assert_eq!(cpu_busy_milli(cur, cur), None);
+    }
+
+    #[test]
+    fn cpu_busy_milli_clamps_at_100_000_on_idle_overflow() {
+        // Defensive: clock-skew across a process restart (or a CRDT
+        // restore of a stale prev) could leave `prev.idle > cur.idle`.
+        // The saturating diff makes the busy share 100% of the delta;
+        // the cap keeps the field inside [0, 100_000].
+        let prev = CpuStat {
+            total: 0,
+            idle: 1000,
+        };
+        let cur = CpuStat {
+            total: 100,
+            idle: 0,
+        };
+        assert_eq!(cpu_busy_milli(prev, cur), Some(100_000));
     }
 }
