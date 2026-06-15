@@ -60,7 +60,7 @@
   # podman (and the in-container worker-isolation logic) can create child
   # cgroups and enable controllers under the user's own slice. This is the
   # twin of `loginctl enable-linger` (set in provision-user.sh): linger
-  # keeps `user@<uid>.service` ALIVE across logout, while `Delegate=yes`
+  # keeps `user@<uid>.service` ALIVE across logout, while `Delegate=…`
   # makes the kernel hand that service a WRITABLE cgroup subtree. Both are
   # needed — linger alone leaves the subtree undelegated, which is exactly
   # the Krater condition that defeats the conmon `--cgroup-parent` (a1)
@@ -73,5 +73,49 @@
   # regressions). On a real cluster (Krater) the framework cannot set this
   # — it is the site admin's systemd/PAM config — so the framework only
   # warns and degrades gracefully there.
-  systemd.services."user@".serviceConfig.Delegate = "yes";
+  #
+  # Why an EXPLICIT controller list (not `Delegate=yes`):
+  #
+  # systemd's CGROUP_DELEGATION.md (and issue #18293) is explicit that
+  # `Delegate=yes` requests "all available controllers" — where "available"
+  # is filtered by the parent slice's `cgroup.subtree_control`. cpu, io,
+  # memory, and pids get auto-enabled in user.slice because systemd's
+  # default unit accounting touches them; **cpuset does NOT**, because no
+  # default unit property references it.
+  #
+  # When linger force-starts user@<uid>.service at boot (via the
+  # provision-user.sh `loginctl enable-linger` step), the start happens
+  # before any PAM session can touch user.slice — so user.slice's
+  # subtree_control lacks cpuset, and the kernel's top-down constraint
+  # means user@<uid>.service silently degrades to a cpuset-less delegated
+  # subtree. Nested rootless podman scopes under it inherit the same
+  # absence; slurmd — which itself runs inside this rootless podman
+  # container's nested systemd — wedges in R-state when its cgroup-v2
+  # plugin writes to a cpuset attribute that the kernel refuses to expose
+  # (#560, 2026-06-15: /proc/<slurmd>/status SigPnd=0x100, SigCgt=0,
+  # cgroup.freeze=0, kernel-unkillable from userspace).
+  #
+  # Fix is two-part, both required (the kernel's top-down constraint
+  # means each part alone is a no-op):
+  #
+  #   (a) An explicit controller list on user@.service requests cpuset
+  #       (and the other four) be exposed to the per-user manager. Without
+  #       this, `Delegate=yes` would leave cpuset out by default.
+  #   (b) An AllowedCPUs= / AllowedMemoryNodes= reference on `-.slice`
+  #       coerces systemd to ACTUALLY add cpuset to each ancestor's
+  #       cgroup.subtree_control (the documented systemd trick — without a
+  #       resource-control property referencing cpuset, systemd has no
+  #       reason to enable it top-down, so (a) alone silently fails).
+  #
+  # `0-255` is a generous superset of any container's actual CPU set; the
+  # kernel intersects with the cpuset visible at the container root, so
+  # extra slots beyond physical cores are simply ignored. `0` for
+  # AllowedMemoryNodes is correct on every non-NUMA host (and on NUMA
+  # hosts is intersected the same way).
+  systemd.services."user@".serviceConfig.Delegate =
+    lib.mkForce "cpu cpuset io memory pids";
+  systemd.slices."-".sliceConfig = {
+    AllowedCPUs = "0-255";
+    AllowedMemoryNodes = "0";
+  };
 }
