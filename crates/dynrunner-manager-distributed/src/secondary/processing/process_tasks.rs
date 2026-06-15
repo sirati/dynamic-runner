@@ -378,86 +378,114 @@ where
             // inbound stream, an `mpsc::UnboundedReceiver::recv` fed by the
             // mesh-pump's demux (cancel-safe).
             // `interval.tick` is itself cancel-safe per tokio docs.
+            // ── Arm-priority discipline (#586) ─────────────────────────
+            // `biased;` polls arms top-to-bottom in source order; the
+            // FIRST READY arm wins each iteration. Without `biased;` the
+            // 20Hz `ARM_OOM_SWEEP` sleep_until-deadline would, by
+            // uniform-random tiebreak, win ~67% of races against the
+            // ~9Hz `ARM_INBOX` — structurally starving terminal-report
+            // reconciliation under steady-state load (the 30→60→120s
+            // unacked-report symptom that fed the fleet-wide replay
+            // backlog growth and idled secondaries). The order below is
+            // the explicit priority: (1) terminal emergency signals
+            // (panik / fatal_exit — rare oneshots that must always win
+            // when they fire), (2) ARM_INBOX (data path: starvation here
+            // = drain-strand), (3) ARM_POOL_EVENT (worker events: same
+            // data-path-priority justification), (4) ARM_KEEPALIVE
+            // (liveness: starvation = false-departure declarations),
+            // (5) external control / off-loop completion arms,
+            // (6) periodic broadcasts + storm-killer pull arm,
+            // (7) ARM_OOM_SWEEP last (forensic — 20Hz cadence preserved
+            // when no higher arm is ready, but never beats a ready
+            // data-path or liveness arm).
             tokio::select! {
-                // The pool lives inside `OperationalState`. The recv
-                // future is built via the `self.lifecycle.operational_mut()`
-                // FIELD path (a partial borrow of `self.lifecycle`), NOT
-                // the `op_mut()` coordinator method (which borrows ALL of
-                // `self` and would conflict with the sibling
-                // `self.inbox.recv()` arm). The two recv futures then borrow
-                // disjoint fields (`self.lifecycle` vs `self.inbox`), and
-                // both borrows release the moment `select!` picks a winner,
-                // so the arm BODIES are free to use `&mut self` methods. The
-                // `expect` is sound: this loop runs only after the
-                // `enter_operational` transition above.
-                event = self
-                    .lifecycle
-                    .operational_mut()
-                    .expect("process_tasks loop runs only when Operational")
-                    .pool
-                    .recv_event() =>
-                {
-                    arm_stats.record(ARM_POOL_EVENT);
-                    if let Some(event) = event {
-                        // The full per-event sequence (causal fence +
-                        // handler + restart scheduling) is owned by
-                        // [`Self::process_worker_pool_event`] — one seam
-                        // the loop arm and the seam's tests share.
-                        self.process_worker_pool_event(
-                            event,
-                            &oom_watcher,
-                            &mut secondary_control_rx,
-                        )
-                        .await?;
+                biased;
+                // Panik (operator-initiated emergency stop) arm. The
+                // watcher's `oneshot::Receiver<PanikSignal>` resolves
+                // with `Ok(signal)` the moment the watcher task
+                // observes any of its configured sentinel paths. `Err`
+                // means the sender dropped (watcher task aborted or
+                // configured with empty paths); we ignore the Err
+                // arm and let the future never re-fire — taking the
+                // `Option<_>` to `None` after the first resolution
+                // would otherwise hot-loop the select. The
+                // `pending().await` closure is the same idiom the
+                // announcer arm uses for the "no-receiver-attached"
+                // case.
+                //
+                // Cancel-safety: `oneshot::Receiver` IS cancel-safe by
+                // construction (it owns a single slot, no mid-send
+                // partial state to lose); when a sibling arm wins the
+                // race the in-flight await is dropped and re-built
+                // next iteration, against the same receiver.
+                panik = async {
+                    match panik_signal_rx.as_mut() {
+                        Some(rx) => rx.await,
+                        None => std::future::pending().await,
                     }
+                } => {
+                    arm_stats.record(ARM_PANIK);
+                    // Drop the rx slot so a subsequent loop iteration
+                    // (if any — the panik handler returns immediately
+                    // below) finds it None and re-parks on
+                    // `pending().await`.
+                    panik_signal_rx = None;
+                    if let Ok(signal) = panik {
+                        let (matched_path, reason) = self
+                            .handle_panik_signal(
+                                signal.matched_path,
+                                signal.sender_pid,
+                                PANIK_KILL_GRACE,
+                            )
+                            .await;
+                        // Record the per-secondary terminal on the lifecycle
+                        // (single source of truth); the PyO3 boundary reads
+                        // it back via `coordinator.terminal()` for exit(137).
+                        self.enter_terminal_panik(matched_path, reason);
+                        return Ok(RunOutcome::Terminal);
+                    }
+                    // Err(_) from the receiver — the watcher's sender
+                    // dropped before firing. This is the normal
+                    // shape on "watcher disabled" (empty paths
+                    // config) and a benign one on "watcher task
+                    // aborted by drop": no panik happened, the loop
+                    // continues as if the arm hadn't fired. Without
+                    // the take-to-None above this would resolve
+                    // Err immediately on every subsequent poll.
                 }
-                // Snapshot-stream production arm: ONE bounded package per
-                // wakeup (the driver re-enqueues its own token while the
-                // stream has more), so serving a joiner's bootstrap pull
-                // interleaves with every other arm instead of serializing
-                // a 100 MB ledger monolithically on the loop. Borrows
-                // `self.snapshot_streams` only (disjoint from the sibling
-                // arms' fields). Cancel-safe: a single mpsc recv.
-                stream_id = self.snapshot_streams.next_wake() => {
-                    arm_stats.record(ARM_SNAPSHOT_STREAM);
-                    if let Some((dst, frame)) = self.snapshot_streams.emit_next(
-                        &stream_id,
-                        &self.cluster_state,
-                        crate::secondary::wire::timestamp_now(),
-                    ) && let Err(e) = self.send_to(dst, frame).await
-                    {
-                        tracing::warn!(
-                            stream_id = %stream_id,
-                            error = %e,
-                            "snapshot-stream package send failed; dropping stream \
-                             (the requester's pull cadence resumes from its cursor)"
-                        );
-                        // The direct leg to the requester dropped mid-transfer;
-                        // signal it via a PullFail (delivered INDIRECTLY through
-                        // the relay) so its pull driver falls to the next target
-                        // instead of waiting out the 30s re-probe.
-                        if let Some((requester, requester_is_observer)) =
-                            self.snapshot_streams.abort_stream(&stream_id)
-                        {
-                            let (fail_dst, fail) = crate::pull_coordinator::pull_fail(
-                                &self.config.secondary_id,
-                                crate::secondary::wire::timestamp_now(),
-                                &requester,
-                                requester_is_observer,
-                                &stream_id,
-                            );
-                            let _ = self.send_to(fail_dst, fail).await;
+                // Externally-armed fatal-exit arm. A run-loop-external
+                // policy (the observer's invalid_task monitor) sends a
+                // reason string when its collection window elapses; we
+                // latch it into `self.fatal_exit` and let the loop's own
+                // exit check (below) propagate it as a non-zero `Err`
+                // exit. Single-concern wiring identical to every other
+                // fatal-exit setter: the arm only WRITES the flag, the
+                // loop owns its exit. `None`/`Some` parking mirrors the
+                // panik arm; `mpsc::Receiver::recv` is cancel-safe.
+                signal = async {
+                    match fatal_exit_signal_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    arm_stats.record(ARM_FATAL_EXIT);
+                    match signal {
+                        Some(reason) => {
+                            // First (and only consumed) signal: latch it.
+                            // Drop the rx so a later iteration re-parks on
+                            // `pending()` — the loop is about to exit on
+                            // the `fatal_exit.take()` check anyway.
+                            self.fatal_exit = Some(reason);
+                            fatal_exit_signal_rx = None;
+                        }
+                        None => {
+                            // All senders dropped (the policy / driver was
+                            // torn down without firing). Benign — re-park
+                            // by dropping the rx, exactly like the panik
+                            // Err arm.
+                            fatal_exit_signal_rx = None;
                         }
                     }
-                }
-                // Settled-CRDT spill arm: cadence sweep (collect a batch
-                // of join-fixed-point entries, kick ONE spawn_blocking
-                // write) or a write completion (commit: evict fat bodies
-                // into the slim index). Cancel-safe (interval tick / mpsc
-                // recv); bounded per-wakeup work.
-                event = self.settled_spill.next_event() => {
-                    arm_stats.record(ARM_SETTLED_SPILL);
-                    self.settled_spill.handle(event, &mut self.cluster_state);
                 }
                 // Single mesh inbound arm. There is one role inbound
                 // stream — the mesh-pump demuxes every wire frame addressed
@@ -468,6 +496,13 @@ where
                 // dropped (role teardown): no more frames can ever arrive,
                 // so exit cleanly — the historical "inbound closed = end of
                 // run" contract.
+                //
+                // Priority (#586): placed FIRST among data arms under
+                // `biased;` — when the inbox is ready, no lower-priority
+                // arm (including the 20Hz OOM sweep timer) ever beats it
+                // to the iteration. The pre-#586 unbiased select! gave
+                // ARM_OOM_SWEEP a structural ~67% win-share over inbox at
+                // steady-state report arrival rates.
                 msg = self.inbox.recv() => {
                     arm_stats.record(ARM_INBOX);
                     match msg {
@@ -498,6 +533,38 @@ where
                             );
                             break;
                         }
+                    }
+                }
+                // The pool lives inside `OperationalState`. The recv
+                // future is built via the `self.lifecycle.operational_mut()`
+                // FIELD path (a partial borrow of `self.lifecycle`), NOT
+                // the `op_mut()` coordinator method (which borrows ALL of
+                // `self` and would conflict with the sibling
+                // `self.inbox.recv()` arm). The two recv futures then borrow
+                // disjoint fields (`self.lifecycle` vs `self.inbox`), and
+                // both borrows release the moment `select!` picks a winner,
+                // so the arm BODIES are free to use `&mut self` methods. The
+                // `expect` is sound: this loop runs only after the
+                // `enter_operational` transition above.
+                event = self
+                    .lifecycle
+                    .operational_mut()
+                    .expect("process_tasks loop runs only when Operational")
+                    .pool
+                    .recv_event() =>
+                {
+                    arm_stats.record(ARM_POOL_EVENT);
+                    if let Some(event) = event {
+                        // The full per-event sequence (causal fence +
+                        // handler + restart scheduling) is owned by
+                        // [`Self::process_worker_pool_event`] — one seam
+                        // the loop arm and the seam's tests share.
+                        self.process_worker_pool_event(
+                            event,
+                            &oom_watcher,
+                            &mut secondary_control_rx,
+                        )
+                        .await?;
                     }
                 }
                 // Announcer-outbox drain. The observer-mode
@@ -648,168 +715,6 @@ where
                     // broadcast `PrimaryChanged { new = self }`.
                     if actions.promoted {
                         self.fire_local_promotion().await;
-                    }
-                }
-                // Self-paced OOM sweep arm. Parks on the stored
-                // `next_sweep_due` deadline; on fire it reads ALL
-                // workers' cgroup charges off the async runtime
-                // (`spawn_blocking`), applies them, runs the pressure
-                // decision inline, then re-arms the deadline. ONE
-                // operational-loop wakeup per sweep replaces the former
-                // per-fire sample + decision ticks (the 58%-of-wakeups
-                // blocking-IO hot path). The arm-stats `oom_sweep` count
-                // is therefore SWEEPS, not per-worker fires.
-                //
-                // Cancel-safety: `sleep_until` consumes nothing and the
-                // deadline is PERSISTENT local state, so a sibling arm
-                // winning merely re-creates the future against the SAME
-                // instant next iteration — the sweep cannot be starved
-                // into never firing by a busy loop.
-                _ = tokio::time::sleep_until(next_sweep_due) => {
-                    arm_stats.record(ARM_OOM_SWEEP);
-                    // Collect the CURRENT worker set's read inputs
-                    // (respawns / type-shifts picked up each sweep),
-                    // then read off the runtime — no pool borrow held
-                    // across the blocking call.
-                    let inputs = oom_watcher.collect_sweep_inputs(&self.op_mut().pool);
-                    let sweep = tokio::task::spawn_blocking(move || inputs.read())
-                        .await
-                        .expect("oom charge sweep read panicked");
-                    oom_watcher.apply_sweep(&mut self.op_mut().pool, sweep);
-                    // #575: push the just-applied snapshot into the
-                    // 10-min rolling buffer. ONE additive seam off the
-                    // existing sweep arm — the resource-stats concern
-                    // never touches the kill-decision path. A fresh
-                    // snapshot is always available here (apply_sweep
-                    // just wrote it); reading the host/charged fields
-                    // off `last_snapshot()` keeps the buffer's RawSample
-                    // a pure projection of the sweep's output.
-                    let snap = oom_watcher.last_snapshot();
-                    let raw_sample = RawResourceSample {
-                        workers_charged_sum_bytes: snap.tracked_workers_charged_sum,
-                        host_free_memory_bytes: match (
-                            snap.host.host_ram_total_bytes,
-                            snap.host.host_ram_used_bytes,
-                        ) {
-                            (Some(total), Some(used)) => Some(total.saturating_sub(used)),
-                            _ => None,
-                        },
-                        host_swap_used_bytes: snap.host.host_swap_used_bytes,
-                        host_free_swap_bytes: match (
-                            snap.host.host_swap_total_bytes,
-                            snap.host.host_swap_used_bytes,
-                        ) {
-                            (Some(total), Some(used)) => Some(total.saturating_sub(used)),
-                            _ => None,
-                        },
-                        cpu_busy_milli: snap.cpu_busy_milli,
-                    };
-                    resource_buffer
-                        .push(tokio::time::Instant::now().into_std(), raw_sample);
-                    self.check_resource_pressure_via_watcher(&mut oom_watcher, factory).await;
-                    // Per-worker phase-progress observability — the
-                    // SAME shared seam LocalManager fires off ITS sweep
-                    // (manager/worker_loop.rs). A long quiet task (deep
-                    // in a native op, emitting no keepalive/phase) now
-                    // produces an escalating "worker N in phase X for
-                    // 60s/120s/..." WARN ON THE SECONDARY too, so the
-                    // operator sees alive-and-churning instead of a
-                    // silent freeze. LOGGING ONLY: no force-fail /
-                    // timeout / kill is wired here (the secondary's
-                    // userland-kill path stays gated off; kernel
-                    // cgroup-OOM owns death). The config borrow is taken
-                    // disjoint from the `op_mut()` pool borrow.
-                    let intervals = self.config.phase_status_log_intervals.clone();
-                    self.op_mut().pool.report_stuck_workers(&intervals);
-                    // Await-before-resleep: arm the next sweep a full
-                    // interval after THIS one completed.
-                    next_sweep_due = tokio::time::Instant::now() + oom_sweep_interval;
-                }
-                // Panik (operator-initiated emergency stop) arm. The
-                // watcher's `oneshot::Receiver<PanikSignal>` resolves
-                // with `Ok(signal)` the moment the watcher task
-                // observes any of its configured sentinel paths. `Err`
-                // means the sender dropped (watcher task aborted or
-                // configured with empty paths); we ignore the Err
-                // arm and let the future never re-fire — taking the
-                // `Option<_>` to `None` after the first resolution
-                // would otherwise hot-loop the select. The
-                // `pending().await` closure is the same idiom the
-                // announcer arm uses for the "no-receiver-attached"
-                // case.
-                //
-                // Cancel-safety: `oneshot::Receiver` IS cancel-safe by
-                // construction (it owns a single slot, no mid-send
-                // partial state to lose); when a sibling arm wins the
-                // race the in-flight await is dropped and re-built
-                // next iteration, against the same receiver.
-                panik = async {
-                    match panik_signal_rx.as_mut() {
-                        Some(rx) => rx.await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    arm_stats.record(ARM_PANIK);
-                    // Drop the rx slot so a subsequent loop iteration
-                    // (if any — the panik handler returns immediately
-                    // below) finds it None and re-parks on
-                    // `pending().await`.
-                    panik_signal_rx = None;
-                    if let Ok(signal) = panik {
-                        let (matched_path, reason) = self
-                            .handle_panik_signal(
-                                signal.matched_path,
-                                signal.sender_pid,
-                                PANIK_KILL_GRACE,
-                            )
-                            .await;
-                        // Record the per-secondary terminal on the lifecycle
-                        // (single source of truth); the PyO3 boundary reads
-                        // it back via `coordinator.terminal()` for exit(137).
-                        self.enter_terminal_panik(matched_path, reason);
-                        return Ok(RunOutcome::Terminal);
-                    }
-                    // Err(_) from the receiver — the watcher's sender
-                    // dropped before firing. This is the normal
-                    // shape on "watcher disabled" (empty paths
-                    // config) and a benign one on "watcher task
-                    // aborted by drop": no panik happened, the loop
-                    // continues as if the arm hadn't fired. Without
-                    // the take-to-None above this would resolve
-                    // Err immediately on every subsequent poll.
-                }
-                // Externally-armed fatal-exit arm. A run-loop-external
-                // policy (the observer's invalid_task monitor) sends a
-                // reason string when its collection window elapses; we
-                // latch it into `self.fatal_exit` and let the loop's own
-                // exit check (below) propagate it as a non-zero `Err`
-                // exit. Single-concern wiring identical to every other
-                // fatal-exit setter: the arm only WRITES the flag, the
-                // loop owns its exit. `None`/`Some` parking mirrors the
-                // panik arm; `mpsc::Receiver::recv` is cancel-safe.
-                signal = async {
-                    match fatal_exit_signal_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    arm_stats.record(ARM_FATAL_EXIT);
-                    match signal {
-                        Some(reason) => {
-                            // First (and only consumed) signal: latch it.
-                            // Drop the rx so a later iteration re-parks on
-                            // `pending()` — the loop is about to exit on
-                            // the `fatal_exit.take()` check anyway.
-                            self.fatal_exit = Some(reason);
-                            fatal_exit_signal_rx = None;
-                        }
-                        None => {
-                            // All senders dropped (the policy / driver was
-                            // torn down without firing). Benign — re-park
-                            // by dropping the rx, exactly like the panik
-                            // Err arm.
-                            fatal_exit_signal_rx = None;
-                        }
                     }
                 }
                 // Secondary control-plane ingress: externally-issued
@@ -1042,6 +947,154 @@ where
                     }
                 } => {
                     arm_stats.record(ARM_WORKER_RESTART);
+                }
+                // Snapshot-stream production arm: ONE bounded package per
+                // wakeup (the driver re-enqueues its own token while the
+                // stream has more), so serving a joiner's bootstrap pull
+                // interleaves with every other arm instead of serializing
+                // a 100 MB ledger monolithically on the loop. Borrows
+                // `self.snapshot_streams` only (disjoint from the sibling
+                // arms' fields). Cancel-safe: a single mpsc recv.
+                stream_id = self.snapshot_streams.next_wake() => {
+                    arm_stats.record(ARM_SNAPSHOT_STREAM);
+                    if let Some((dst, frame)) = self.snapshot_streams.emit_next(
+                        &stream_id,
+                        &self.cluster_state,
+                        crate::secondary::wire::timestamp_now(),
+                    ) && let Err(e) = self.send_to(dst, frame).await
+                    {
+                        tracing::warn!(
+                            stream_id = %stream_id,
+                            error = %e,
+                            "snapshot-stream package send failed; dropping stream \
+                             (the requester's pull cadence resumes from its cursor)"
+                        );
+                        // The direct leg to the requester dropped mid-transfer;
+                        // signal it via a PullFail (delivered INDIRECTLY through
+                        // the relay) so its pull driver falls to the next target
+                        // instead of waiting out the 30s re-probe.
+                        if let Some((requester, requester_is_observer)) =
+                            self.snapshot_streams.abort_stream(&stream_id)
+                        {
+                            let (fail_dst, fail) = crate::pull_coordinator::pull_fail(
+                                &self.config.secondary_id,
+                                crate::secondary::wire::timestamp_now(),
+                                &requester,
+                                requester_is_observer,
+                                &stream_id,
+                            );
+                            let _ = self.send_to(fail_dst, fail).await;
+                        }
+                    }
+                }
+                // Settled-CRDT spill arm: cadence sweep (collect a batch
+                // of join-fixed-point entries, kick ONE spawn_blocking
+                // write) or a write completion (commit: evict fat bodies
+                // into the slim index). Cancel-safe (interval tick / mpsc
+                // recv); bounded per-wakeup work.
+                event = self.settled_spill.next_event() => {
+                    arm_stats.record(ARM_SETTLED_SPILL);
+                    self.settled_spill.handle(event, &mut self.cluster_state);
+                }
+                // Self-paced OOM sweep arm — LAST under `biased;` so a
+                // ready ARM_INBOX / ARM_POOL_EVENT / ARM_KEEPALIVE
+                // always beats the 20Hz forensic timer (#586). Parks on
+                // the stored `next_sweep_due` deadline; on fire it reads
+                // ALL workers' cgroup charges off the async runtime
+                // (`spawn_blocking`), applies them, runs the pressure
+                // decision inline, then re-arms the deadline. ONE
+                // operational-loop wakeup per sweep replaces the former
+                // per-fire sample + decision ticks (the 58%-of-wakeups
+                // blocking-IO hot path). The arm-stats `oom_sweep` count
+                // is therefore SWEEPS, not per-worker fires.
+                //
+                // Cancel-safety: `sleep_until` consumes nothing and the
+                // deadline is PERSISTENT local state, so a sibling arm
+                // winning merely re-creates the future against the SAME
+                // instant next iteration — the sweep cannot be starved
+                // into never firing by a busy loop.
+                _ = tokio::time::sleep_until(next_sweep_due) => {
+                    arm_stats.record(ARM_OOM_SWEEP);
+                    // Per-sweep cost telemetry (#586): the arm body
+                    // covers `spawn_blocking().await` (blocking cgroup +
+                    // /proc reads off the runtime), `apply_sweep`
+                    // (in-pool write-back), `check_resource_pressure`
+                    // (scheduler decision), `report_stuck_workers`
+                    // (phase-progress WARNs). The TRACE emit below
+                    // reports the total wall-clock the loop spent on
+                    // THIS sweep — high values indicate the sweep is
+                    // structurally responsible for inbox wait-time, low
+                    // values confirm the OOM cadence is honest. Per
+                    // [[feedback_oom_observability_is_framework]] +
+                    // trace-vs-info classifier: per-sweep is DECISION
+                    // cadence → trace level (file-log only via #585), not
+                    // info (which would flood stdout at 20Hz).
+                    let sweep_started_at = tokio::time::Instant::now();
+                    // Collect the CURRENT worker set's read inputs
+                    // (respawns / type-shifts picked up each sweep),
+                    // then read off the runtime — no pool borrow held
+                    // across the blocking call.
+                    let inputs = oom_watcher.collect_sweep_inputs(&self.op_mut().pool);
+                    let scanned_workers = inputs.worker_count();
+                    let sweep = tokio::task::spawn_blocking(move || inputs.read())
+                        .await
+                        .expect("oom charge sweep read panicked");
+                    oom_watcher.apply_sweep(&mut self.op_mut().pool, sweep);
+                    // #575: push the just-applied snapshot into the
+                    // 10-min rolling buffer. ONE additive seam off the
+                    // existing sweep arm — the resource-stats concern
+                    // never touches the kill-decision path. A fresh
+                    // snapshot is always available here (apply_sweep
+                    // just wrote it); reading the host/charged fields
+                    // off `last_snapshot()` keeps the buffer's RawSample
+                    // a pure projection of the sweep's output.
+                    let snap = oom_watcher.last_snapshot();
+                    let raw_sample = RawResourceSample {
+                        workers_charged_sum_bytes: snap.tracked_workers_charged_sum,
+                        host_free_memory_bytes: match (
+                            snap.host.host_ram_total_bytes,
+                            snap.host.host_ram_used_bytes,
+                        ) {
+                            (Some(total), Some(used)) => Some(total.saturating_sub(used)),
+                            _ => None,
+                        },
+                        host_swap_used_bytes: snap.host.host_swap_used_bytes,
+                        host_free_swap_bytes: match (
+                            snap.host.host_swap_total_bytes,
+                            snap.host.host_swap_used_bytes,
+                        ) {
+                            (Some(total), Some(used)) => Some(total.saturating_sub(used)),
+                            _ => None,
+                        },
+                        cpu_busy_milli: snap.cpu_busy_milli,
+                    };
+                    resource_buffer
+                        .push(tokio::time::Instant::now().into_std(), raw_sample);
+                    self.check_resource_pressure_via_watcher(&mut oom_watcher, factory).await;
+                    // Per-worker phase-progress observability — the
+                    // SAME shared seam LocalManager fires off ITS sweep
+                    // (manager/worker_loop.rs). A long quiet task (deep
+                    // in a native op, emitting no keepalive/phase) now
+                    // produces an escalating "worker N in phase X for
+                    // 60s/120s/..." WARN ON THE SECONDARY too, so the
+                    // operator sees alive-and-churning instead of a
+                    // silent freeze. LOGGING ONLY: no force-fail /
+                    // timeout / kill is wired here (the secondary's
+                    // userland-kill path stays gated off; kernel
+                    // cgroup-OOM owns death). The config borrow is taken
+                    // disjoint from the `op_mut()` pool borrow.
+                    let intervals = self.config.phase_status_log_intervals.clone();
+                    self.op_mut().pool.report_stuck_workers(&intervals);
+                    let cost_ms = sweep_started_at.elapsed().as_millis() as u64;
+                    tracing::trace!(
+                        target: "oom_sweep",
+                        scanned = scanned_workers,
+                        cost_ms,
+                        "oom_sweep fired"
+                    );
+                    // Await-before-resleep: arm the next sweep a full
+                    // interval after THIS one completed.
+                    next_sweep_due = tokio::time::Instant::now() + oom_sweep_interval;
                 }
             }
 

@@ -127,6 +127,7 @@ mod memprofile_hook;
 mod mesh_ready_reannounce;
 mod no_route_diagnostics;
 mod observer_announcer_wireup;
+mod oom_sweep_arm_priority;
 mod panik_integration;
 mod peer_mesh_watchdog;
 mod phase_progress;
