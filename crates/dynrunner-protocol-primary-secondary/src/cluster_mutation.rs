@@ -33,9 +33,11 @@ pub struct SecondaryCapacityRecord {
     pub resources: Vec<ResourceAmount>,
 }
 
-/// Aggregated per-secondary resource sample (#575) — one tuple of
-/// statistics summarising the last 10 minutes of LOCAL raw resource
-/// samples on the originating secondary, broadcast every 5 minutes.
+/// Aggregated per-secondary resource sample (#575) plus loop-health
+/// fields (#589) — one tuple of statistics summarising the last 10
+/// minutes of LOCAL raw resource samples on the originating secondary
+/// AND the operational-loop's iteration/dominant-arm/oldest-unacked
+/// readings over the same emit window, broadcast every 5 minutes.
 ///
 /// The RAW per-sample readings (sub-second cadence, the OOM watcher's
 /// 20Hz sweep) never leave the secondary; this aggregate is the only
@@ -59,7 +61,7 @@ pub struct SecondaryCapacityRecord {
 /// behind); the emit-time half breaks ties within one membership.
 /// Same shape the `PeerResourceHoldingsUpdated` LWW-by-epoch rule
 /// uses for its replicated per-peer holdings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecondaryResourceSampleRecord {
     /// The membership generation under which the originating secondary
     /// observed itself. A respawn (re-admitted after a removal) bumps
@@ -91,6 +93,70 @@ pub struct SecondaryResourceSampleRecord {
     /// already sums across cores, so the ratio is naturally normalised
     /// to `[0, 100_000]`.
     pub cpu_utilization_milli: u32,
+    /// #589 loop-health: the originating secondary's operational-loop
+    /// iteration rate over the emit window, in milli-iters-per-second
+    /// (`12_500` = 12.5 iter/s). Computed by the emit arm from the
+    /// arm-stats `iter` counter delta against the prior emit's snapshot
+    /// divided by the elapsed seconds; `0` is the cold-start sentinel
+    /// (no prior snapshot yet on the freshly-spawned loop) — the
+    /// observer treats `0` as "no signal" via the 25% zero-baseline
+    /// gate. Wire-compat: serde-default so a pre-#589 record decodes
+    /// cleanly into a `0` here; skip-if-default so a freshly-spawned
+    /// loop's first emit (no prior snapshot) costs zero wire bytes.
+    /// Loop-starvation observability: host CPU% in the same record
+    /// stays low (one wedged arm monopolising one tokio task does not
+    /// move the host-wide CPU line), but this iter-rate collapses to
+    /// near-zero — necessary-but-not-sufficient becomes
+    /// necessary-AND-sufficient.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub oploop_iters_per_sec_milli: u64,
+    /// #589 loop-health: the single hottest arm's NAME in the same
+    /// emit window — e.g. `"oom_sweep"`. The arm whose iteration
+    /// delta is the largest share of the total iteration delta;
+    /// paired with [`Self::dominant_arm_pct_milli`] (the share). Empty
+    /// string is the cold-start / no-signal sentinel (no prior
+    /// snapshot, or zero total deltas) — the observer's max-by-pct
+    /// aggregation passes over secondaries with an empty name. Wire-
+    /// compat: serde-default to `String::new()` so a pre-#589 record
+    /// decodes cleanly; skip-if-default trims the wire bytes when
+    /// empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dominant_arm_name: String,
+    /// #589 loop-health: the dominant arm's share of the emit window's
+    /// iteration deltas, in milli-percent (`55_000` = 55%). `0` is the
+    /// cold-start / no-signal sentinel (empty `dominant_arm_name`); the
+    /// observer's max-by-pct aggregation passes over zero. Wire-compat:
+    /// serde-default + skip-if-default.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub dominant_arm_pct_milli: u32,
+    /// #589 loop-health: the longest age (in seconds) of any retained
+    /// confirmable report on this secondary's buffered-report-replay
+    /// queue (#582) at emit time — `max(now - first_retained_at)` over
+    /// `pending_report_replays`. `0` when the queue is empty (no
+    /// unacked reports — the steady-state). The observer aggregates the
+    /// fleet MAX (the longest stuck leg anywhere) — surfaces a
+    /// blackholed-but-live leg (#352) class even when each individual
+    /// secondary's host stats look healthy. Wire-compat: serde-default
+    /// + skip-if-default (steady-state emits zero wire bytes).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub max_unacked_for_secs: u32,
+}
+
+/// `serde(skip_serializing_if)` helper — true when the value is `0`. A
+/// `u64` `is_zero` predicate that lets the #589 loop-health fields
+/// elide their wire bytes whenever the originating secondary has no
+/// signal yet (cold start) or the steady-state value is zero.
+#[allow(dead_code)]
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+/// `serde(skip_serializing_if)` helper — true when the value is `0`. A
+/// `u32` `is_zero` predicate; same wire-compat rationale as
+/// [`is_zero_u64`].
+#[allow(dead_code)]
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// Replicated per-RUN "discovery owed" fact (V6) — a THREE-state
