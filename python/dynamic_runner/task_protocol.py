@@ -304,6 +304,23 @@ class TaskTypeSpec:
     # capping a compile-heavy type at e.g. `cores // 4` while letting
     # cheap IO-bound types run at the full `--jobs` width.
     max_concurrent: int | None = None
+    # When `True`, items of this type may ONLY be dispatched to workers
+    # on the PRIMARY node (the secondary co-located with the primary
+    # coordinator). They are never offered to peer secondaries — not on
+    # the steady-state dispatch path, and not after an eviction-driven
+    # requeue (e.g. a collective-silence false-eviction of the primary's
+    # own secondary). When the primary's own secondary is evicted and
+    # later re-admitted, the requeued task waits in the pending pool
+    # until a primary-node worker becomes idle again.
+    #
+    # Use this for task types whose execution is inherently node-local
+    # to the primary — e.g. consumer-side planners that read from the
+    # primary process's in-memory state, or nix-eval bootstrappers that
+    # must run in the primary node's nix-store environment. `False`
+    # (the default) preserves the existing any-worker dispatch
+    # behaviour; the single concern crossing the framework boundary is
+    # one bit per task type.
+    primary_pinned: bool = False
 
 
 @dataclass(frozen=True)

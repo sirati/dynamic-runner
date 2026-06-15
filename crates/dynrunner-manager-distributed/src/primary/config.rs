@@ -221,6 +221,24 @@ pub struct PrimaryConfig {
     /// without rewriting the estimator API.
     pub max_concurrent_per_type: HashMap<dynrunner_core::TypeId, u32>,
 
+    /// Task types whose items must NEVER dispatch off the primary node
+    /// (#580). Set from `TaskTypeSpec.primary_pinned=True` per type.
+    /// Items of these types are hidden from the dispatch view for any
+    /// worker whose `secondary_id` differs from this primary's
+    /// `node_id` — including AFTER an eviction-driven requeue when the
+    /// primary's own secondary is wrongly declared dead (the
+    /// collective-silence false-eviction class). Re-admission of the
+    /// primary's own secondary lets the requeued task dispatch again,
+    /// always to a primary-node worker. Empty set (the historical
+    /// default) leaves dispatch unconstrained.
+    ///
+    /// Use case: task types whose execution is inherently node-local
+    /// to the primary — consumer-side planners that read the primary
+    /// process's in-memory state, or nix-eval bootstrappers that must
+    /// run in the primary node's nix-store environment (asm-dataset-
+    /// nix's `dep_graph` is the first user).
+    pub primary_pinned_types: std::collections::HashSet<dynrunner_core::TypeId>,
+
     /// Number of retry passes to run after the main operational loop
     /// drains. Default `1` (one retry pass; matches the local
     /// manager's `retry_max_attempts` semantics).
@@ -444,6 +462,7 @@ impl Default for PrimaryConfig {
             source_pre_staged_root: None,
             uses_file_based_items: true,
             max_concurrent_per_type: HashMap::new(),
+            primary_pinned_types: std::collections::HashSet::new(),
             retry_max_passes: 1,
             // Mirrors `retry_max_passes` so OOM tasks keep their
             // historical "one retry then permanent" budget unless the

@@ -3250,6 +3250,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             return view.filter(|_| false);
         }
         let view = self.apply_strict_preferred_secondaries(view, secondary_id);
+        // #580 primary-pinned filter: hide items whose task type is
+        // declared `primary_pinned=True` from any worker not on the
+        // primary node. Sits BEFORE `cap_filter_view` for the same
+        // reason the strict-preferred filter does — view-shape
+        // restrictions compose left-to-right, and a primary-pinned
+        // type that is ALSO capped should not consume a cap slot on a
+        // worker that can never receive it.
+        let view = self.apply_primary_pinned_filter(view, secondary_id);
         self.cap_filter_view(view)
     }
 
@@ -3562,6 +3570,34 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         for hash in hashes {
             if let Some(entry) = self.in_flight.remove(&hash) {
                 self.release_type_slot(&entry.task.type_id);
+                // #580 defense-in-depth: a primary-pinned task type that
+                // lands in `in_flight` under a NON-primary secondary is a
+                // structural impossibility — the dispatch view filter
+                // (`apply_primary_pinned_filter`) hides such items from
+                // every non-primary worker so they can never be assigned
+                // there in the first place. If one is observed here, it
+                // is a primary-side accounting bug; log loudly so the
+                // bug surfaces rather than silently relocating the task.
+                // The requeue itself proceeds — the dispatch filter
+                // remains the canonical enforcement seam on re-dispatch,
+                // so the task either flows back to the primary's
+                // secondary or sits in `Pending` until one is available.
+                if self.is_primary_pinned_type(&entry.task.type_id)
+                    && entry.secondary_id != self.config.node_id
+                {
+                    tracing::error!(
+                        secondary = %entry.secondary_id,
+                        primary_node = %self.config.node_id,
+                        type_id = %entry.task.type_id,
+                        task_id = %entry.task.task_id,
+                        task_hash = %hash,
+                        "primary-pinned task type observed in_flight on a non-primary \
+                         secondary at dead-secondary recovery; this is a primary-side \
+                         accounting bug — the dispatch view filter is supposed to \
+                         prevent assignment to non-primary workers. Requeueing through \
+                         the canonical path; the filter will hold on re-dispatch."
+                    );
+                }
                 if entry.task.kind.is_reassignable() {
                     // WORK task: recover it to `Pending` for another worker
                     // (`InFlight → Pending`, the dead-secondary requeue).
@@ -3829,6 +3865,41 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             None => true,
             Some(cap) => in_flight.get(&item.type_id).copied().unwrap_or(0) < *cap,
         })
+    }
+
+    /// Whether `type_id` is registered as primary-pinned (#580). A
+    /// primary-pinned task type may only dispatch to workers on the
+    /// primary node — the secondary co-located with this coordinator.
+    /// Items of these types are hidden from any dispatch view targeting
+    /// a non-primary worker; see [`Self::apply_primary_pinned_filter`].
+    pub(super) fn is_primary_pinned_type(&self, type_id: &dynrunner_core::TypeId) -> bool {
+        self.config.primary_pinned_types.contains(type_id)
+    }
+
+    /// Drop primary-pinned items from `view` when the targeted worker
+    /// is NOT on the primary node (#580). The primary's own secondary
+    /// shares its `secondary_id` with `PrimaryConfig.node_id`, so a
+    /// `secondary_id == config.node_id` worker sees the unfiltered
+    /// view; every other worker has primary-pinned items removed.
+    ///
+    /// No-op when the registered set is empty (the historical default,
+    /// every existing consumer). Kept as a tiny standalone helper so
+    /// the active-vs-inactive gating lives in exactly one place and
+    /// the dispatch-pipeline reads as a flat sequence of steps —
+    /// mirroring [`Self::apply_strict_preferred_secondaries`].
+    fn apply_primary_pinned_filter<'p>(
+        &self,
+        view: dynrunner_scheduler_api::WorkerView<'p, I>,
+        secondary_id: &str,
+    ) -> dynrunner_scheduler_api::WorkerView<'p, I> {
+        if self.config.primary_pinned_types.is_empty() {
+            return view;
+        }
+        if secondary_id == self.config.node_id {
+            return view;
+        }
+        let pinned = &self.config.primary_pinned_types;
+        view.filter(|item| !pinned.contains(&item.type_id))
     }
 
     /// Account for a freshly-dispatched item against its type's

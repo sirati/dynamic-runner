@@ -60,6 +60,7 @@ mod phase_end_raise;
 mod phase_ordering;
 mod prefer_dependency;
 mod preferred_secondaries;
+mod primary_pinned;
 mod producer_backstop;
 mod promotion;
 mod quorum_pending_signal;
