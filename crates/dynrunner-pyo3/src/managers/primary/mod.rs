@@ -30,6 +30,17 @@ use crate::config::distributed::DistributedConfig;
 use crate::config::scheduler::SchedulerConfig;
 use crate::estimator::PyMemoryEstimatorBridge;
 
+/// Bundle parked by `set_authority_snapshot_from_rust` before `run()` enters.
+/// The updater task is spawned inside the tokio runtime; until then the
+/// snapshot + probe + handle ride together in this one optional field so the
+/// coordinator struct stays free of `#[allow(clippy::type_complexity)]`.
+type AuthoritySnapshotParts = Option<(
+    Arc<dyn dynrunner_manager_distributed::authority_snapshot::SlurmAuthoritativeSnapshot>,
+    dynrunner_manager_distributed::authority_snapshot::AuthorityUpdaterHandle,
+    Arc<dyn dynrunner_manager_distributed::authority_snapshot::SlurmAuthorityProbe>,
+    std::time::Duration,
+)>;
+
 mod new;
 mod run;
 
@@ -257,6 +268,22 @@ pub(crate) struct PyPrimaryCoordinator {
     /// pipeline (`drive_rust_primary`) to a file in the run's local
     /// cert dir; `None` (the default) persists nothing.
     pub(super) peer_credentials_path: Option<std::path::PathBuf>,
+
+    /// The SLURM partition this run's secondaries were submitted to
+    /// (`SlurmConfig.partition`). Threaded at `run()` entry into
+    /// `PrimaryConfig.slurm_partition` so the setup-quorum
+    /// observability check (#565) can name the partition in its
+    /// unschedulable-signal message. `None` for non-SLURM deployments.
+    pub(super) slurm_partition: Option<String>,
+
+    /// Slurm-authoritative snapshot, its updater-handle (write side), probe,
+    /// and probe interval. Wired by the SLURM pipeline via
+    /// `set_authority_snapshot_from_rust` BEFORE `run()` enters. The
+    /// background updater task is spawned INSIDE the detached tokio runtime
+    /// in `run.rs` (it needs `tokio::spawn`). `None` for non-SLURM
+    /// deployments (defaults to `NoSlurmAuthoritySnapshot` on the inner
+    /// coordinator).
+    pub(super) authority_snapshot_parts: AuthoritySnapshotParts,
 }
 
 // Rust-only surface for the SLURM-pipeline orchestrator. Not exposed
@@ -303,5 +330,28 @@ impl PyPrimaryCoordinator {
         probe: Arc<dyn dynrunner_manager_distributed::observer::JobLedgerProbe>,
     ) {
         self.job_ledger_probe = Some(probe);
+    }
+
+    /// Park the SLURM-authoritative snapshot, probe, and probe interval so
+    /// that `run()` can spawn the updater task inside the tokio runtime and
+    /// install the snapshot on the inner `PrimaryCoordinator` before `run()`
+    /// enters. Called by `slurm::pipeline::drive_rust_primary` BEFORE
+    /// `run()` enters.
+    ///
+    /// Single concern: relay the snapshot primitives into the coordinator so
+    /// the setup-quorum observability check (#565) and the respawn quantity
+    /// gate (#543/#544) both see real squeue data from the submitter primary.
+    pub(crate) fn set_authority_snapshot_from_rust(
+        &mut self,
+        snapshot: Arc<
+            dyn dynrunner_manager_distributed::authority_snapshot::SlurmAuthoritativeSnapshot,
+        >,
+        updater_handle: dynrunner_manager_distributed::authority_snapshot::AuthorityUpdaterHandle,
+        probe: Arc<dyn dynrunner_manager_distributed::authority_snapshot::SlurmAuthorityProbe>,
+        probe_interval: std::time::Duration,
+        partition: String,
+    ) {
+        self.authority_snapshot_parts = Some((snapshot, updater_handle, probe, probe_interval));
+        self.slurm_partition = Some(partition);
     }
 }

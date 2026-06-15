@@ -418,6 +418,13 @@ pub struct PrimaryConfig {
     /// constant for why this is its own knob rather than derived from
     /// the keepalive/connect families.
     pub task_reconciliation_timeout: Duration,
+
+    /// The SLURM partition this run's secondaries were submitted to, or
+    /// `None` for non-SLURM deployments. Carried opaquely — this crate
+    /// has no SLURM dependency; the SLURM pipeline layer sets the field
+    /// from `SlurmConfig.partition` so setup-quorum observability can
+    /// name the partition in its unschedulable-signal message (#565).
+    pub slurm_partition: Option<String>,
 }
 
 impl Default for PrimaryConfig {
@@ -450,6 +457,7 @@ impl Default for PrimaryConfig {
             forwarded_argv: Vec::new(),
             peer_credentials_path: None,
             task_reconciliation_timeout: DEFAULT_TASK_RECONCILIATION_TIMEOUT,
+            slurm_partition: None,
         }
     }
 }

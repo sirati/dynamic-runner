@@ -308,6 +308,7 @@ mod tests {
         StaticSnapshot {
             map: HashMap::new(),
             count: None,
+            pending_resources: None,
         }
     }
 
@@ -316,7 +317,7 @@ mod tests {
     /// `Gone`; one `Alive` peer pins the gate in defer.
     fn snapshot_with(ids: &[&str], state: PeerLifeState) -> StaticSnapshot {
         let map = ids.iter().map(|i| ((*i).into(), state)).collect();
-        StaticSnapshot { map, count: None }
+        StaticSnapshot { map, count: None, pending_resources: None }
     }
 
     fn observe(
@@ -478,7 +479,7 @@ mod tests {
         // a is Alive, b/c are Unknown (no map entries).
         let mut map = HashMap::new();
         map.insert("a".into(), PeerLifeState::Alive);
-        let mixed = StaticSnapshot { map, count: None };
+        let mixed = StaticSnapshot { map, count: None, pending_resources: None };
 
         assert!(observe(&mut gate, &three_hard, t0, &mixed).is_some());
         assert!(

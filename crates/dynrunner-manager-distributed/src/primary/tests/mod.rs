@@ -61,6 +61,7 @@ mod prefer_dependency;
 mod preferred_secondaries;
 mod producer_backstop;
 mod promotion;
+mod quorum_pending_signal;
 mod reconciliation_probe;
 mod relocate_staging;
 mod requeue_terminal_race;
