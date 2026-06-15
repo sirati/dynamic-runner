@@ -2475,6 +2475,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             dynrunner_protocol_primary_secondary::PeerId::from(dynrunner_core::SETUP_NODE_ID),
             self.config.node_id.clone(),
             pending.clone(),
+            Arc::clone(&self.authority_snapshot),
+            self.config.num_secondaries as usize,
         );
         self.remote_respawn_pending = Some(pending);
         // The spec's endpoint/pubkey snapshot is unused by the remote

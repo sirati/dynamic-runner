@@ -31,6 +31,17 @@
 //!   never silently dropped, never fatal. The retry future lives on the
 //!   coordinator's `respawn_tasks` JoinSet exactly like a local spawn,
 //!   so run teardown drains it.
+//! - The loop consults [`crate::authority_snapshot::SlurmAuthoritativeSnapshot`]
+//!   on every timeout to detect that retrying is futile: if the
+//!   slurm-authoritative secondary count is back at or above the
+//!   initial fleet size (the spawn is moot — the slot has already been
+//!   filled by another path or the removal was a false-positive) OR the
+//!   provider host's job reads `Gone` from the snapshot, the future
+//!   aborts with [`SpawnError::ProviderUnavailable`] and logs a single
+//!   `respawn_remote_abandoned` WARN. The `Unknown` state is fail-closed:
+//!   a single `Unknown` answer is never enough to abandon — only a
+//!   persistent sequence (`STALENESS_BOUND_MULTIPLE` consecutive unknowns
+//!   with count also at/above initial) justifies abort.
 //! - The primary-minted `new_secondary_id` is the correlation AND
 //!   idempotency key: a re-send carries the SAME id, and the
 //!   observer-side execution arm dedupes on it (in-flight → ignore;
@@ -56,6 +67,7 @@ use dynrunner_protocol_primary_secondary::address::{Destination, PeerId};
 use dynrunner_protocol_primary_secondary::DistributedMessage;
 use tokio::sync::oneshot;
 
+use crate::authority_snapshot::{PeerLifeState, SlurmAuthoritativeSnapshot, STALENESS_BOUND_MULTIPLE};
 use crate::process::MeshClient;
 
 use super::types::{SecondarySpawnSpec, SecondarySpawner, SpawnError};
@@ -64,11 +76,13 @@ use super::types::{SecondarySpawnSpec, SecondarySpawner, SpawnError};
 /// attempt up to [`SPAWN_RESEND_CAP`]. The first window also covers the
 /// provider's normal execution time (sbatch + tunnel can take this
 /// long), so a healthy round-trip usually completes inside attempt 1.
-const SPAWN_RESEND_INITIAL: Duration = Duration::from_secs(10);
-/// Re-send backoff cap. Spawn requests retry INDEFINITELY at this
-/// cadence (never dropped, never fatal — the budget already spent, the
-/// id already minted; only delivery is pending). Run teardown aborts
-/// the retry future via the `respawn_tasks` drain.
+pub(super) const SPAWN_RESEND_INITIAL: Duration = Duration::from_secs(10);
+/// Re-send backoff cap. Spawn requests retry at this cadence (never
+/// silently dropped; the budget is spent and the id minted; only
+/// delivery is pending) with two escape hatches: (1) run teardown
+/// aborts the retry future via the `respawn_tasks` drain; (2) the
+/// authority-snapshot check aborts when the fleet is back at initial
+/// count or the provider job is `Gone` — see the module doc.
 const SPAWN_RESEND_CAP: Duration = Duration::from_secs(60);
 /// Which pending table a request correlates through. Spawn and revoke
 /// results for the SAME `new_secondary_id` must never cross-complete
@@ -205,6 +219,15 @@ pub struct RemoteSecondarySpawner<I: Identifier> {
     /// The shared correlation table (the coordinator holds the
     /// completing end).
     pending: RemoteRespawnPending,
+    /// Slurm-authoritative snapshot consulted in the resend loop to
+    /// detect that retrying is futile (fleet back at initial count, or
+    /// provider host's job `Gone`). The same single source of truth the
+    /// quantity gate in `handler.rs` uses — no new replicated state.
+    authority_snapshot: Arc<dyn SlurmAuthoritativeSnapshot>,
+    /// The initial secondary fleet size (`config.num_secondaries`). Used
+    /// to decide whether the slurm-authoritative count is "back to
+    /// initial" — the symmetric condition to the quantity gate's gate.
+    initial_count: usize,
 }
 
 impl<I: Identifier> RemoteSecondarySpawner<I> {
@@ -213,12 +236,16 @@ impl<I: Identifier> RemoteSecondarySpawner<I> {
         provider_host: PeerId,
         local_id: String,
         pending: RemoteRespawnPending,
+        authority_snapshot: Arc<dyn SlurmAuthoritativeSnapshot>,
+        initial_count: usize,
     ) -> Self {
         Self {
             client,
             provider_host,
             local_id,
             pending,
+            authority_snapshot,
+            initial_count,
         }
     }
 
@@ -236,13 +263,20 @@ impl<I: Identifier> RemoteSecondarySpawner<I> {
 impl<I: Identifier> SecondarySpawner for RemoteSecondarySpawner<I> {
     /// Send the spawn request and await the observer's result,
     /// re-sending on a bounded-backoff cadence (loud WARN per re-send)
-    /// until a result lands. Indefinite by design: the budget is spent
-    /// and the id minted, so delivery is the only pending step; the
-    /// `respawn_tasks` drain aborts this future at run teardown.
+    /// until a result lands or the authority-snapshot escape hatch fires.
+    /// The budget is spent and the id minted, so delivery is the only
+    /// pending step; the `respawn_tasks` drain aborts this future at run
+    /// teardown. See the module doc for the abandonment condition.
     async fn spawn(&self, spec: SecondarySpawnSpec) -> Result<(), SpawnError> {
         let mut waiter = self.pending.register(ExecKind::Spawn, &spec.new_secondary_id);
         let mut delay = SPAWN_RESEND_INITIAL;
         let mut attempt: u32 = 0;
+        // Tracks how many consecutive resend timeouts have seen the
+        // provider host's slurm job as `Unknown`. Past
+        // `STALENESS_BOUND_MULTIPLE` consecutive unknowns combined with
+        // the fleet count being at/above initial, we abandon the resend
+        // (same staleness window the snapshot's own gate uses).
+        let mut consecutive_unknown: u32 = 0;
         loop {
             attempt += 1;
             let frame = DistributedMessage::RespawnSpawnRequest {
@@ -278,6 +312,64 @@ impl<I: Identifier> SecondarySpawner for RemoteSecondarySpawner<I> {
                     ));
                 }
                 Err(_elapsed) => {
+                    // ── Authority-snapshot escape hatch ──────────────────
+                    // Before re-sending, check whether retrying is still
+                    // worthwhile. Two conditions justify abandonment:
+                    //
+                    // (A) The provider host's slurm job is definitively
+                    //     Gone — the process can never reply.
+                    // (B) The snapshot has persistently returned Unknown
+                    //     for `STALENESS_BOUND_MULTIPLE` consecutive
+                    //     resend cycles AND the fleet count is at or above
+                    //     initial — meaning either the slot has been filled
+                    //     by another path or the removal was a false-
+                    //     positive. We never abandon on a single Unknown
+                    //     (a transient CLI hiccup must not kill a
+                    //     legitimate in-flight spawn).
+                    //
+                    // This is the same single source of truth the quantity
+                    // gate in `handler.rs` uses (#543); no new replicated
+                    // state is introduced.
+                    let provider_life =
+                        self.authority_snapshot.peer_life(self.provider_host.as_str());
+                    let count = self.authority_snapshot.secondary_active_or_queued_count();
+
+                    let abandon_gone = matches!(provider_life, PeerLifeState::Gone);
+                    let abandon_persistent_unknown = {
+                        if matches!(provider_life, PeerLifeState::Unknown) {
+                            consecutive_unknown += 1;
+                        } else {
+                            consecutive_unknown = 0;
+                        }
+                        consecutive_unknown >= STALENESS_BOUND_MULTIPLE
+                            && matches!(count, Some(c) if c >= self.initial_count)
+                    };
+
+                    if abandon_gone || abandon_persistent_unknown {
+                        let reason = if abandon_gone {
+                            "provider host gone per slurm-authoritative"
+                        } else {
+                            "provider host Unknown for multiple resend cycles and fleet count at initial"
+                        };
+                        tracing::warn!(
+                            target: "dynrunner_respawn",
+                            new_secondary_id = %spec.new_secondary_id,
+                            provider_host = %self.provider_host,
+                            attempt,
+                            consecutive_unknown,
+                            slurm_count = ?count,
+                            initial_count = self.initial_count,
+                            reason,
+                            event = "respawn_remote_abandoned",
+                            "aborting remote respawn resend loop: retrying is \
+                             futile (provider host no longer present per the \
+                             slurm-authoritative snapshot)",
+                        );
+                        return Err(SpawnError::ProviderUnavailable(
+                            "provider host gone".into(),
+                        ));
+                    }
+
                     tracing::warn!(
                         target: "dynrunner_respawn",
                         new_secondary_id = %spec.new_secondary_id,
