@@ -101,6 +101,15 @@ class _PhasedTask:
     kill_phase: str | None = None
     kill_marker: Path | None = None
 
+    # ── class fact: items are synthetic (no on-disk source) ─────────
+    # The framework's auto-staging pipeline reads + hashes every item's
+    # source file at run-start when `uses_file_based_items=True` (the
+    # default). Our items only encode their (phase, type, affinity,
+    # index) into the path string; they have no on-disk backing. Tell
+    # the framework to skip auto-staging entirely (matches
+    # `_localout_consumer.uses_file_based_items=False`).
+    uses_file_based_items: bool = False
+
     # ── topology ───────────────────────────────────────────────────
     def get_phases(self) -> tuple[PhaseSpec, ...]:
         return self.phases
@@ -288,14 +297,6 @@ def _run_distributed(
 # ─── scenario 1: 4-phase pipeline with deps ──────────────────────────
 
 
-@pytest.mark.xfail(
-    run=False,
-    reason=(
-        "#558: multi-phase A→B→C→D distributed pipeline deadlocks at the "
-        "primary→promoted-primary→secondary dispatch chain. Tracked separately; "
-        "run=False so the deadlock does not hang the suite."
-    ),
-)
 def test_phase_dependencies_respected(tmp_path: Path) -> None:
     """Items in a child phase only dispatch after every item of every
     parent phase has finished.
