@@ -115,10 +115,11 @@ impl ClusterGoneDetector {
                         "all of the run's jobs have left the cluster queue on {} \
                          consecutive consults (one wake-loss interval apart) — the \
                          cluster is GONE. Last known run state: {last_known_run_state}. \
-                         The run did not report a completion verdict of its own, so the \
-                         observer treats it as FAILED and tears down (the submitter \
-                         process that hosts the job ledger cannot keep spinning on a \
-                         cluster it can prove is over).",
+                         The run did not report a completion verdict of its own over \
+                         the (dropped) observer leg; the submitter process that hosts \
+                         the job ledger cannot keep spinning on a cluster it can prove \
+                         is over, so it consults SLURM accounting for the run's \
+                         authoritative terminal disposition and tears down.",
                         self.consecutive_empty,
                     ),
                 }
@@ -150,8 +151,10 @@ mod tests {
                     "carries the last known run state: {reason}"
                 );
                 assert!(
-                    reason.contains("FAILED"),
-                    "names the failed treatment: {reason}"
+                    reason.contains("accounting"),
+                    "names the authoritative-disposition consult (no longer hardcodes \
+                     the FAILED treatment — disambiguation owns COMPLETED-vs-FAILED): \
+                     {reason}"
                 );
             }
             other => panic!("two consecutive empties must render Gone; got {other:?}"),

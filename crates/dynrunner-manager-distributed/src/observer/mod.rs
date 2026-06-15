@@ -57,7 +57,9 @@ pub use coordinator::{
     build_cold_join_observer,
 };
 pub use failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
-pub use job_ledger::{JobLedgerProbe, JobLedgerProbeHandle, JobLedgerStatus};
+pub use job_ledger::{
+    ClusterTerminalOutcome, JobLedgerProbe, JobLedgerProbeHandle, JobLedgerStatus,
+};
 pub use lifecycle::{AnnouncerHandle, attach_observer_announcer};
 pub use lost_visibility::{
     EndedOutage, LostVisibilityReporter, MeshLiveness, RetryDirective, Visibility, WakeNoteSlot,

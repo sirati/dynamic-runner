@@ -7,8 +7,8 @@ use dynrunner_gateway::traits::Gateway;
 use tracing;
 
 use super::types::{
-    CancelOutcome, CancelVerifyPolicy, JobStatus, JobStatusInfo, SlurmError, SlurmJobManager,
-    PENDING_SUBMISSION_MARKER,
+    CancelOutcome, CancelVerifyPolicy, JobStatus, JobStatusInfo, RunTerminalDisposition,
+    SlurmError, SlurmJobManager, PENDING_SUBMISSION_MARKER,
 };
 
 impl<G: Gateway> SlurmJobManager<G> {
@@ -600,6 +600,116 @@ impl<G: Gateway> SlurmJobManager<G> {
         // "gone" signal (the marker arm returns `true`; a never-submitted
         // ledger carries no leave-the-queue evidence and returns `false`).
         Ok(false)
+    }
+
+    /// The AUTHORITATIVE terminal disposition of the whole cohort, read
+    /// from `sacct` accounting — the disambiguation [`Self::any_job_still_queued`]
+    /// (a `squeue` probe) CANNOT make.
+    ///
+    /// `squeue` only ever lists PENDING/RUNNING jobs; once every job leaves
+    /// the queue it reports nothing REGARDLESS of WHY they left, so
+    /// `any_job_still_queued`'s `Ok(false)` ("every job is gone") collapses
+    /// a clean COMPLETED framework shutdown and a crash/scancel/OOM into the
+    /// same answer. `sacct` retains each job's final State after it leaves
+    /// the queue, so it can tell the two apart: this folds the cohort's
+    /// per-job States into ONE [`RunTerminalDisposition`].
+    ///
+    /// Each real job id (markers skipped — a marker means an sbatch was in
+    /// flight with an unknown id, which is NOT a clean terminal, so it forces
+    /// [`RunTerminalDisposition::AnyFailed`]) is queried with
+    /// `sacct -j <id> -n -P -X -o State`: `-X` reports allocations only (no
+    /// `.batch`/`.extern` step lines), `-n` no header, `-P` parsable, so a
+    /// well-formed reply is ONE State token per job. The token's leading
+    /// word is taken (SLURM prints e.g. `CANCELLED by 12345`).
+    ///
+    /// Folding rule (FAILURE-dominant, fail-safe toward the conservative
+    /// verdict): ANY job whose State is a recognised FAILURE terminal
+    /// (FAILED / CANCELLED / TIMEOUT / NODE_FAIL / OUT_OF_MEMORY, or any
+    /// non-COMPLETED non-running terminal) ⇒ [`RunTerminalDisposition::AnyFailed`]
+    /// immediately. Only when EVERY job is positively `COMPLETED` is the
+    /// disposition [`RunTerminalDisposition::AllCompleted`]. If any job's
+    /// state is UNREADABLE (gateway failure, or accounting returned nothing)
+    /// and none was seen failed, the disposition is
+    /// [`RunTerminalDisposition::Indeterminate`] — not positive evidence of
+    /// a clean completion, so the caller keeps its conservative verdict (the
+    /// optimistic AllCompleted is asserted ONLY on a fully-positive read).
+    ///
+    /// An empty/all-marker ledger has no positive clean-completion evidence:
+    /// no real id was COMPLETED, so this returns `Indeterminate` (an empty
+    /// ledger carries no "everything completed" proof) — the same fail-safe
+    /// direction.
+    pub async fn run_terminal_disposition(&self) -> RunTerminalDisposition {
+        let mut saw_any_completed = false;
+        let mut saw_unreadable = false;
+        for id in &self.job_ids {
+            if id == PENDING_SUBMISSION_MARKER {
+                // An sbatch was in flight with an unknown id when the run
+                // ended — that is NOT a clean terminal; treat the cohort as
+                // failed (the same direction the cancel-verify sweep WARNs
+                // a marker in).
+                return RunTerminalDisposition::AnyFailed;
+            }
+            match self.sacct_terminal_state(id).await {
+                Some(JobStatus::Completed) => saw_any_completed = true,
+                // Any recognised FAILURE terminal OR an unrecognised
+                // terminal token short-circuits to AnyFailed: a cohort with
+                // even one non-clean exit is a real failure.
+                Some(_) => return RunTerminalDisposition::AnyFailed,
+                // Unreadable for this job (gateway failure or no accounting
+                // row) — remember it, but a later positively-failed job
+                // still wins.
+                None => saw_unreadable = true,
+            }
+        }
+        if saw_unreadable {
+            // At least one job's authoritative state could not be read and
+            // none was seen failed — not positive proof of a clean
+            // completion.
+            RunTerminalDisposition::Indeterminate
+        } else if saw_any_completed {
+            // Every real job read back COMPLETED (and at least one existed)
+            // — a clean framework shutdown.
+            RunTerminalDisposition::AllCompleted
+        } else {
+            // No real ids at all (empty / all-marker ledger): no
+            // clean-completion evidence exists.
+            RunTerminalDisposition::Indeterminate
+        }
+    }
+
+    /// The authoritative terminal `JobStatus` of one job from `sacct`, or
+    /// `None` when accounting cannot be read (gateway failure, non-zero
+    /// `sacct` exit, or no row for the id — purged/disabled accounting).
+    ///
+    /// `sacct -j <id> -n -P -X -o State`: `-X` allocations-only (no step
+    /// lines), `-n` no header, `-P` parsable. The first data line's State
+    /// is parsed; SLURM prints compound tokens like `CANCELLED by 12345`,
+    /// so only the leading word is matched. A still-running State
+    /// (PENDING/RUNNING) — possible if `sacct` is consulted while a job has
+    /// not yet left the queue — maps to `None` (no terminal recorded yet),
+    /// the same fail-safe "no clean-completion evidence" direction as an
+    /// unreadable consult.
+    async fn sacct_terminal_state(&self, job_id: &str) -> Option<JobStatus> {
+        let cmd = format!("sacct -j {job_id} -n -P -X -o State 2>/dev/null");
+        let result = self.gateway.execute_command(&cmd, None).await.ok()?;
+        if !result.success() {
+            return None;
+        }
+        let token = result.stdout.lines().find_map(|line| {
+            let t = line.trim();
+            (!t.is_empty()).then(|| t.split_whitespace().next().unwrap_or("").to_string())
+        })?;
+        match token.as_str() {
+            "COMPLETED" => Some(JobStatus::Completed),
+            "FAILED" | "NODE_FAIL" | "TIMEOUT" | "OUT_OF_MEMORY" | "BOOT_FAIL" | "DEADLINE" => {
+                Some(JobStatus::Failed)
+            }
+            "CANCELLED" => Some(JobStatus::Cancelled),
+            // PENDING/RUNNING (no terminal recorded yet) or an empty/
+            // unrecognised token: no authoritative terminal to classify.
+            "PENDING" | "RUNNING" | "" => None,
+            other => Some(JobStatus::Unknown(other.to_string())),
+        }
     }
 
     /// Query the status of a SLURM job.
