@@ -63,6 +63,59 @@ use role_holder::RoleHolderView;
 /// overflow drops the OLDEST with a WARN naming kind/target, never silently.
 pub(crate) const SLOTLESS_HOLD_CAPACITY: usize = 64;
 
+/// One frame held in the egress-loopback retention buffer.
+///
+/// Carries the full [`super::super::mesh_client::LocalDispatch`] tuple
+/// (`origin`, `target`, `frame`) so the replay re-enters
+/// [`Mesh::dispatch`] with the SAME inputs the original send produced,
+/// PLUS the [`LocalRole`] the dispatch resolved against — the replay key.
+/// A held frame replays when the matching slot registers (or a retag
+/// moves a live slot into the matching field), and a held frame whose
+/// target LATER resolves to a different host (the role moved peers, e.g.
+/// after a relocation) still reaches its destination because dispatch
+/// re-runs from scratch.
+pub(in crate::process) struct EgressHeld<I: Identifier> {
+    /// The local role the original dispatch resolved against (the replay
+    /// key). A held frame is replayed when this role's slot registers or
+    /// a retag moves a slot into this role's field.
+    pub(in crate::process) target_role: LocalRole,
+    /// The original origin role (carried so an `All` exclusion would
+    /// still be correct, even though held frames are always directed).
+    pub(in crate::process) origin: LocalRole,
+    /// The original routing-target the sender stamped onto the queued
+    /// `LocalDispatch`.
+    pub(in crate::process) routing_target: Destination,
+    /// The frame, stamped with its C3 receiver-demux target unchanged.
+    pub(in crate::process) frame: DistributedMessage<I>,
+}
+
+/// Bound on the egress-loopback retention buffer (see
+/// [`Mesh::egress_loopback_hold`]).
+///
+/// The EGRESS analogue of [`SLOTLESS_HOLD_CAPACITY`]: a queued
+/// [`super::super::mesh_client::LocalDispatch`] whose routing-target resolves
+/// to a LOCAL slot can fail at dispatch when the slot's `Arc` has been
+/// dropped (graceful teardown), retagged to a different role
+/// (submitter-primary→observer swap), or is otherwise momentarily absent
+/// between the sender's enqueue and the pump's apply. The historical
+/// behaviour was a silent drop with a WARN — the sender observed `Ok` at
+/// `MeshClient::send` and nothing retransmitted (#551, the at-least-once
+/// contract violation). Instead each such frame is HELD here, keyed by the
+/// [`LocalRole`] it was trying to reach, and replayed when the matching
+/// slot registers ([`Mesh::register_local_role`]) or is retagged into
+/// place ([`Mesh::retag_local_role`]).
+///
+/// The window between enqueue and slot re-registration is short and the
+/// at-risk frames are sparse (the same control-frame profile as the
+/// ingress slot-less hold), so a small ring suffices. Overflow drops the
+/// OLDEST with a throttled WARN naming kind/target, never silently. Frames
+/// still held at process wind-down
+/// ([`super::pump::MeshControl::WindDown`]) are reported with a WARN — the
+/// genuine "process exited with undelivered frames" case — and that is the
+/// only remaining drop site under the strengthened `MeshClient::send`
+/// contract.
+pub(crate) const EGRESS_LOOPBACK_HOLD_CAPACITY: usize = 64;
+
 /// Bound on the ingress relay-ring (the role-relay loop guard — see
 /// `routing.rs`).
 ///
@@ -157,6 +210,26 @@ pub struct Mesh<I: Identifier, Tr: PeerTransport<I>> {
     /// (or a storm of frames into a slotless process) cannot spam one WARN
     /// per frame at wire rate.
     slotless_hold_warn: crate::warn_throttle::WarnThrottle,
+    /// Egress frames whose routing-target resolved to a LOCAL slot at
+    /// dispatch but found the slot's `Arc` dropped or retagged between the
+    /// sender's enqueue and the pump's apply — held in arrival order,
+    /// keyed by the [`LocalRole`] they were trying to reach, and replayed
+    /// when the matching slot registers ([`Self::register_local_role`]) or
+    /// is retagged into place ([`Self::retag_local_role`]). The EGRESS
+    /// analogue of [`Self::slotless_hold`]: the at-least-once contract
+    /// [`super::super::mesh_client::MeshClient::send`] documents (the
+    /// strengthened version that the historical silent-drop WARN at
+    /// dispatch failure violated — #551) is upheld here. A bounded ring;
+    /// overflow drops the OLDEST with a WARN naming kind/target. The
+    /// replay re-enters [`Self::dispatch`], so a held frame whose target
+    /// LATER resolves to a remote (the role moved peers in the meantime,
+    /// e.g. a relocation) still reaches its destination. See
+    /// [`EGRESS_LOOPBACK_HOLD_CAPACITY`].
+    egress_loopback_hold: VecDeque<EgressHeld<I>>,
+    /// Min-interval gate for the per-frame egress-loopback-hold WARN so a
+    /// long swap with a sustained outbound stream from one coordinator
+    /// cannot spam one WARN per frame at wire rate.
+    egress_loopback_hold_warn: crate::warn_throttle::WarnThrottle,
     /// Min-interval gate for the ingress fan-fallback WARNs (a directed frame
     /// naming an absent local role, or an unstamped frame) so a long
     /// role-swap with a sustained inbound stream cannot spam one WARN per
@@ -212,6 +285,10 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
             slotless_hold: VecDeque::new(),
             slotless_hold_warn: crate::warn_throttle::WarnThrottle::new(INGRESS_WARN_INTERVAL),
             ingress_fallback_warn: crate::warn_throttle::WarnThrottle::new(INGRESS_WARN_INTERVAL),
+            egress_loopback_hold: VecDeque::new(),
+            egress_loopback_hold_warn: crate::warn_throttle::WarnThrottle::new(
+                INGRESS_WARN_INTERVAL,
+            ),
             role_holder: RoleHolderView::new(),
             local_peer_id: None,
             relayed_ring: VecDeque::new(),
@@ -273,7 +350,27 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
         // through that window so the new coordinator sees them (the
         // promotion / role-swap no-drop guarantee).
         self.drain_slotless_hold();
+        // The EGRESS analogue: a queued frame whose dispatch failed because
+        // THIS role's slot was momentarily absent (graceful teardown
+        // racing a sender's enqueue, or a `retag` that emptied this field
+        // before a fresh `register` re-filled it — #551 at-least-once) is
+        // replayed now that the slot exists. The drain is role-keyed: a
+        // held Primary-targeted frame fires when Primary registers; a held
+        // Secondary-targeted one fires when Secondary registers; etc. Both
+        // drains are bounded single passes — a re-failure re-holds, but
+        // the drain itself never loops.
+        self.drain_egress_loopback_hold(role);
         (slot, client, inbox)
+    }
+
+    /// Drain the egress-loopback hold buffer, returning every still-held
+    /// entry in arrival order. Used by the mesh-pump's `WindDown` arm to
+    /// report each undelivered frame with a WARN — the genuine "process
+    /// is exiting with this frame still pending" case, which the
+    /// strengthened `MeshClient::send` contract surfaces instead of
+    /// silently dropping (#551).
+    pub(in crate::process) fn take_egress_loopback_hold(&mut self) -> Vec<EgressHeld<I>> {
+        self.egress_loopback_hold.drain(..).collect()
     }
 
     /// Borrow of one role's `Weak`, role-keyed.

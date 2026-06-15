@@ -135,6 +135,33 @@ impl<I: Identifier> MeshClient<I> {
     /// down. The frame is unrecoverable then (no pump to drain it), so the
     /// error is a small reason string — matching the existing
     /// `MeshSendHandle` send shape.
+    ///
+    /// # AT-LEAST-ONCE CONTRACT (the strengthened post-#551 promise)
+    ///
+    /// `Ok` here means the frame has been QUEUED FOR AT-LEAST-ONCE
+    /// DELIVERY through the mesh — never best-effort. After this method
+    /// returns `Ok` the mesh-pump guarantees the frame either:
+    ///
+    /// 1. reaches a LIVE LOCAL slot (the loopback path) — possibly after
+    ///    a transient slot-less / retag window resolves, at which point
+    ///    the mesh's egress-loopback hold replays the frame through
+    ///    dispatch
+    ///    ([`super::mesh::EGRESS_LOOPBACK_HOLD_CAPACITY`]);
+    /// 2. is HANDED TO THE TRANSPORT on a remote connection (the wire
+    ///    path) — the transport's own at-least-once / failover semantics
+    ///    take over from there (a `transport.send_to_peer` error is the
+    ///    one remaining wire-path drop site, surfaced as a WARN by the
+    ///    mesh-pump);
+    /// 3. is REPORTED AS UNDELIVERED on process wind-down — when the
+    ///    pump's `WindDown` arm finds a still-held egress-loopback frame,
+    ///    it WARNs with kind/target/origin instead of silently dropping
+    ///    (the genuine "process exited with this frame still pending"
+    ///    case the operator must see).
+    ///
+    /// **The mesh-pump never silently drops a queued frame.** A code path
+    /// that converts this `Ok` into a silent drop is a bug (the kind
+    /// #551 catalogued). Surface every drop with a WARN naming
+    /// kind/target so the operator and the test harness can see it.
     pub fn send(&self, target: Destination, frame: DistributedMessage<I>) -> Result<(), String> {
         self.egress
             .send(LocalDispatch {

@@ -215,6 +215,66 @@ pub fn resolve_destination(
     }
 }
 
+/// Project a resolved [`SendTarget`] back into the role-bearing
+/// [`Destination`] the mesh-pump's `dispatch` routes by — the EGRESS
+/// COLLAPSE that keeps the routing-target and the C3 frame stamp distinct.
+///
+/// # Two `Destination`s: routing-target vs C3 stamp
+///
+/// A coordinator's egress produces TWO role-bearing destinations from one
+/// `Destination` intent:
+///
+/// - The **routing-target** the local mesh-pump's `Mesh::dispatch`
+///   matches on to pick loopback-vs-wire. The receiver-demuxes-by-stamp /
+///   sender-dispatches-by-routing-target asymmetry means a REMOTE
+///   `Destination::Primary` must carry the resolved host id at this
+///   layer; otherwise the pump cannot route it (its Primary arm is
+///   loopback-only). Hence the collapse:
+///   `(Destination::Primary, SendTarget::Peer(id)) → Destination::Secondary(id)`.
+///   For SendTarget::Loopback the routing-target stays bare
+///   `Destination::Primary` (so the pump enters its Primary arm and calls
+///   `deliver_local(LocalRole::Primary)` against the same-host primary
+///   slot — collapsing to `Destination::Secondary(local_id)` would land
+///   the loopback in the Secondary slot, the wrong coordinator).
+/// - The **C3 stamp** on the frame, which the RECEIVER's `route_incoming`
+///   reads to demux to one of its own slots. The stamp is always the
+///   original role-bearing intent (`Destination::Primary` for a primary
+///   send, etc.), so the receiver picks the right LocalRole regardless of
+///   the routing-target the sender used to reach it.
+///
+/// # Why centralized here
+///
+/// Two coordinator edges (`SecondaryCoordinator::send_to`,
+/// `ObserverCoordinator::send_to`) used to do this collapse inline (#551
+/// uncovered that the dispatch-failure path was silently dropping
+/// loopback races; the collapse itself was correct, but it was duplicated
+/// — the same imports + match pattern at the same call-site level in two
+/// files, an anti-spec). Lifting it here keeps ONE owner of the
+/// "routing-target vs C3 stamp" dual semantic, so future variant
+/// additions (e.g. the C3-frame-target rewire) need only one update.
+///
+/// # `SendTarget::Broadcast`
+///
+/// `Destination::All` is its own routing-target (broadcast fan); the
+/// collapse is a no-op for it. The caller is responsible for stamping
+/// `Destination::All` on the frame.
+pub fn routing_target_for(intent: &Destination, resolved: &SendTarget) -> Destination {
+    match (intent, resolved) {
+        // The REMOTE-primary collapse: route under the resolved host id
+        // so the mesh delivers it by-id over the wire; the C3 stamp
+        // stays `Destination::Primary` (handled by the caller via
+        // `msg.with_target(intent)`) so the receiver's pump demuxes to
+        // its primary slot.
+        (Destination::Primary, SendTarget::Peer(id)) => Destination::Secondary(id.clone()),
+        // Loopback Primary keeps the bare intent so dispatch's Primary
+        // arm fires (loopback to LocalRole::Primary). All other
+        // intent/resolved combinations route under the original intent
+        // (which already carries the host id for Secondary/Observer or
+        // is the broadcast for All).
+        _ => intent.clone(),
+    }
+}
+
 /// Replicated role bookkeeping. The authoritative owner is the
 /// downstream `ClusterState`; the manager edge reads it to resolve
 /// [`Destination::Primary`] (the transport never does).
@@ -386,6 +446,52 @@ mod tests {
         assert_eq!(
             resolve_destination(Destination::All, Some("primary"), None, "peer-a"),
             Some(SendTarget::Broadcast)
+        );
+    }
+
+    /// `routing_target_for` collapses a REMOTE `Destination::Primary` to
+    /// `Destination::Secondary(id)` (the id-bearing routing-target the
+    /// mesh-pump can route by host) but leaves a LOOPBACK
+    /// `Destination::Primary` as bare `Destination::Primary` (so the
+    /// pump's Primary arm fires and loopbacks to `LocalRole::Primary`,
+    /// not the wrong-slot Secondary). The receiver-demuxes-by-stamp /
+    /// sender-dispatches-by-routing-target asymmetry the helper exists
+    /// to enforce.
+    #[test]
+    fn routing_target_for_remote_primary_collapses_loopback_stays_bare() {
+        let id = PeerId::from("primary-host");
+        // REMOTE primary: collapse to id-bearing routing-target.
+        assert_eq!(
+            routing_target_for(&Destination::Primary, &SendTarget::Peer(id.clone())),
+            Destination::Secondary(id.clone())
+        );
+        // LOOPBACK primary: stays bare so dispatch's Primary arm fires.
+        // Collapsing this to Destination::Secondary(local_id) would land
+        // the loopback in the wrong-role slot.
+        assert_eq!(
+            routing_target_for(&Destination::Primary, &SendTarget::Loopback),
+            Destination::Primary
+        );
+        // BROADCAST is unchanged.
+        assert_eq!(
+            routing_target_for(&Destination::All, &SendTarget::Broadcast),
+            Destination::All
+        );
+        // Secondary/Observer carry their id; the helper is a no-op.
+        let pb = PeerId::from("peer-b");
+        assert_eq!(
+            routing_target_for(
+                &Destination::Secondary(pb.clone()),
+                &SendTarget::Peer(pb.clone())
+            ),
+            Destination::Secondary(pb.clone())
+        );
+        assert_eq!(
+            routing_target_for(
+                &Destination::Observer(pb.clone()),
+                &SendTarget::Peer(pb.clone())
+            ),
+            Destination::Observer(pb)
         );
     }
 

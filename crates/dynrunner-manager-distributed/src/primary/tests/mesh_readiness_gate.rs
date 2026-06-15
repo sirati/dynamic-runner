@@ -63,6 +63,28 @@ fn assigned_ids(rx: &mut tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId
     ids
 }
 
+/// Drain every `TaskAssignment` `task_id` from a CO-LOCATED secondary's
+/// loopback inbox (the [`crate::process::RoleInbox`] minted by registering
+/// `LocalRole::Secondary` on the primary's mesh). Production-faithful
+/// counterpart to [`assigned_ids`]: in production a primary that runs on
+/// the same OS process as one of its members delivers that member's
+/// assignments via the mesh loopback (`deliver_local(LocalRole::Secondary)`),
+/// not the wire — so the test fixture reads from the local inbox here,
+/// not the channel transport's `outgoing` slot. Underpins the #551
+/// at-least-once contract: a queued frame whose loopback target's slot
+/// raced the apply is retained, not silently dropped.
+fn assigned_ids_inbox(
+    inbox: &mut crate::process::RoleInbox<TestId>,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    while let Some(msg) = inbox.try_recv() {
+        if let DistributedMessage::TaskAssignment { binary_info, .. } = msg {
+            ids.push(binary_info.task_id);
+        }
+    }
+    ids
+}
+
 /// Run one `TasksAdded` recheck (the operational-loop worker-management
 /// arm's body) so `dispatch_to_idle_workers` re-evaluates every free
 /// worker against the live pool.
@@ -380,10 +402,10 @@ async fn co_located_member_is_assignable_without_mesh_ready() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (transport, mut ends) = setup_test(1);
+            let (transport, ends) = setup_test(1);
             // The promoted-primary shape: this primary RUNS ON the
             // member's host — node_id == the member's peer-id.
-            let (mut primary, _mesh) = build_test_primary(
+            let (mut primary, keepalive) = build_test_primary(
                 PrimaryConfig {
                     node_id: ends[0].0.clone(),
                     ..test_primary_config()
@@ -393,6 +415,26 @@ async fn co_located_member_is_assignable_without_mesh_ready() {
                 FixedEstimator(100),
             );
             let own_id = ends[0].0.clone();
+            // Production-faithful: a primary co-located with its
+            // secondary shares ONE mesh; the secondary slot must be
+            // registered so the primary's `Destination::Secondary(own_id)`
+            // dispatch finds it via `deliver_local(LocalRole::Secondary)`.
+            // Pre-#551 the fixture relied on the channel transport's
+            // wire-fallthrough (the dispatch's `is_local_host && !deliver_local`
+            // arm bounced to `transport.send_to_peer`); post-#551 the
+            // dispatch retains-for-resolution and the loopback inbox is
+            // the production-faithful capture point. Drop the secondary
+            // role's `Arc` immediately — the inbox + the pump's `Weak`
+            // keep the channel alive for delivery.
+            let (_sec_slot, _sec_client, mut sec_inbox) = keepalive
+                .control()
+                .expect("co-located fixture runs on the async/pump path")
+                .register(
+                    crate::process::LocalRole::Secondary,
+                    dynrunner_protocol_primary_secondary::address::PeerId::from(own_id.as_str()),
+                )
+                .await
+                .expect("Secondary registration via mesh-pump control");
 
             let t0 = one_task("lone0");
             let t1 = one_task("lone1");
@@ -424,7 +466,10 @@ async fn co_located_member_is_assignable_without_mesh_ready() {
             run_dispatch_recheck(&mut primary).await;
             settle_pump().await;
 
-            let mut got = assigned_ids(&mut ends[0].1);
+            // Drain the co-located secondary's LOOPBACK inbox (production-
+            // faithful) rather than the wire end of `ends[0]` — see
+            // `assigned_ids_inbox`.
+            let mut got = assigned_ids_inbox(&mut sec_inbox);
             got.sort();
             assert_eq!(
                 got,
@@ -439,6 +484,10 @@ async fn co_located_member_is_assignable_without_mesh_ready() {
                 0,
                 "no task may sit queued while the co-located member's workers idle"
             );
+            // Silence unused-variable warning for the wire-end of the
+            // co-located member (we now capture via the loopback inbox).
+            let _ = ends;
+            let _ = keepalive;
         })
         .await;
 }
@@ -453,7 +502,7 @@ async fn co_located_rule_does_not_lift_gate_for_remote_members() {
     local
         .run_until(async {
             let (transport, mut ends) = setup_test(2);
-            let (mut primary, _mesh) = build_test_primary(
+            let (mut primary, keepalive) = build_test_primary(
                 PrimaryConfig {
                     node_id: ends[0].0.clone(),
                     ..test_primary_config()
@@ -464,6 +513,20 @@ async fn co_located_rule_does_not_lift_gate_for_remote_members() {
             );
             let own_id = ends[0].0.clone();
             let remote_id = ends[1].0.clone();
+            // Production-faithful co-located Secondary registration: see
+            // the sibling test `co_located_member_is_assignable_without_mesh_ready`
+            // for the #551 reasoning. The remote member's leg stays on
+            // the wire (it is a true remote — `is_local_host` is false
+            // there — and continues to land at `ends[1].1`).
+            let (_sec_slot, _sec_client, mut sec_inbox) = keepalive
+                .control()
+                .expect("co-located fixture runs on the async/pump path")
+                .register(
+                    crate::process::LocalRole::Secondary,
+                    dynrunner_protocol_primary_secondary::address::PeerId::from(own_id.as_str()),
+                )
+                .await
+                .expect("Secondary registration via mesh-pump control");
 
             let t0 = one_task("m0");
             let t1 = one_task("m1");
@@ -495,7 +558,10 @@ async fn co_located_rule_does_not_lift_gate_for_remote_members() {
             run_dispatch_recheck(&mut primary).await;
             settle_pump().await;
 
-            let own_got = assigned_ids(&mut ends[0].1);
+            // CO-LOCATED secondary reads via its LOOPBACK inbox (the
+            // production-faithful path post-#551); the REMOTE member's
+            // leg stays on the wire at `ends[1].1`.
+            let own_got = assigned_ids_inbox(&mut sec_inbox);
             assert_eq!(
                 own_got.len(),
                 1,
@@ -531,6 +597,7 @@ async fn co_located_rule_does_not_lift_gate_for_remote_members() {
                 "after its MeshReady lands the remote member receives the \
                  queued task; got {remote_got:?}"
             );
+            let _ = keepalive;
         })
         .await;
 }

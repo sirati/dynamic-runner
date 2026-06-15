@@ -1258,6 +1258,28 @@ pub(super) struct PrimaryMeshKeepalive {
     _mesh: Option<Mesh<TestId, ChannelPeerTransport<TestId>>>,
 }
 
+impl PrimaryMeshKeepalive {
+    /// Clone of the mesh-pump's control handle (when a pump was spawned —
+    /// i.e. the async/e2e path). Tests that exercise a co-located /
+    /// promoted-self scenario use this to register the SECONDARY slot on
+    /// the same mesh AFTER `build_test_primary` returns, so the local
+    /// mesh state matches production-faithful "two roles, one mesh" — see
+    /// `Mesh::dispatch`'s `is_local_host(id) && deliver_local` loopback
+    /// arm. Pre-#551 the fixture relied on the wire-fallthrough at this
+    /// arm to capture the assignments via the channel transport's
+    /// `outgoing` map; post-#551 the dispatch retains-for-resolution
+    /// (the at-least-once contract), so the test fixture must register
+    /// the local Secondary slot to receive the loopback in its inbox,
+    /// matching production.
+    ///
+    /// `None` on the SYNC unit-test path (no tokio runtime, no pump
+    /// spawned) — those tests do not drive a wire round trip and never
+    /// observe loopback delivery.
+    pub(in crate::primary) fn control(&self) -> Option<crate::process::MeshControlHandle<TestId>> {
+        self._control.clone()
+    }
+}
+
 impl Drop for PrimaryMeshKeepalive {
     fn drop(&mut self) {
         if let Some(h) = self.pump.take() {

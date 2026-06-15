@@ -21,6 +21,7 @@ pub mod transport;
 
 pub use address::{
     Destination, PeerId, RoleChangeHookRegistrar, RoleTable, SendTarget, resolve_destination,
+    routing_target_for,
 };
 pub use cluster_mutation::{
     ClusterMutation, DiscoveryDebt, PrimaryChangeReason, SecondaryCapacityRecord,
