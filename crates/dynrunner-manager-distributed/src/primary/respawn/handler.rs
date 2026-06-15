@@ -419,8 +419,9 @@ where
             target: "dynrunner_respawn",
             aborted = in_flight,
             event = "respawn_drain_complete",
-            "respawn tasks aborted; any successfully-spawned-but-unregistered \
-             secondary may require manual scancel/cleanup",
+            "respawn drain interrupted; {in_flight} partially-spawned secondary \
+             job(s) may continue running until they exit naturally (SLURM timeout) \
+             — this is by design under the no-scancel respawn invariant",
         );
     }
 }
