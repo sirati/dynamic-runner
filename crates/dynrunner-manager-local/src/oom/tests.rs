@@ -144,6 +144,7 @@ fn reading_with_pressure(host_used: u64, host_total: u64) -> HostMemoryReading {
         container_swap_current: Some(0),
         container_swap_max: Some(0),
         kernel_oom_kill_count: None,
+        cpu_stat: None,
     }
 }
 
@@ -184,6 +185,7 @@ fn cgroup_unavailable_yields_none_or_zero() {
         container_swap_current: None,
         container_swap_max: None,
         kernel_oom_kill_count: None,
+        cpu_stat: None,
     };
     let (probe, _) = MockProbe::new(reading);
     let mut watcher = OomWatcher::with_probe(
@@ -203,6 +205,7 @@ fn cgroup_unavailable_yields_none_or_zero() {
         tracked_workers_charged_sum: 0,
         tracked_workers_count: 0,
         captured_at: Some(Instant::now()),
+        cpu_busy_milli: None,
     });
     let snap = watcher.last_snapshot();
     assert!(snap.host.container_memory_current.is_none());
@@ -222,7 +225,8 @@ fn heartbeat_log_fires_on_first_emission_then_every_10s() {
             tracked_workers_charged_sum: 0,
             tracked_workers_count: 0,
             captured_at: Some(t0),
-        });
+            cpu_busy_milli: None,
+            });
         // First emission: last_log_at = None → heartbeat fires.
         let fired = watcher.evaluate_and_emit_for_test(t0);
         assert_eq!(fired, Some(LogTrigger::Heartbeat));
@@ -258,7 +262,8 @@ fn delta_log_under_pressure_fires_on_1gb_jump() {
             tracked_workers_charged_sum: 4 * GIB,
             tracked_workers_count: 2,
             captured_at: Some(t0),
-        });
+            cpu_busy_milli: None,
+            });
         let first = watcher.evaluate_and_emit_for_test(t0);
         assert_eq!(first, Some(LogTrigger::Heartbeat));
         // 100ms later (well inside heartbeat window): jump RSS.
@@ -270,7 +275,8 @@ fn delta_log_under_pressure_fires_on_1gb_jump() {
             tracked_workers_charged_sum: 4 * GIB + (3 * GIB / 2),
             tracked_workers_count: 2,
             captured_at: Some(t0 + Duration::from_millis(100)),
-        });
+            cpu_busy_milli: None,
+            });
         let fired = watcher.evaluate_and_emit_for_test(t0 + Duration::from_millis(100));
         assert_eq!(fired, Some(LogTrigger::DeltaUnderPressure));
     });
@@ -298,7 +304,8 @@ fn delta_log_below_pressure_does_not_fire() {
             tracked_workers_charged_sum: 2 * GIB,
             tracked_workers_count: 2,
             captured_at: Some(t0),
-        });
+            cpu_busy_milli: None,
+            });
         let first = watcher.evaluate_and_emit_for_test(t0);
         assert_eq!(first, Some(LogTrigger::Heartbeat));
         watcher.set_snapshot_for_test(OomWatcherSnapshot {
@@ -308,7 +315,8 @@ fn delta_log_below_pressure_does_not_fire() {
             tracked_workers_charged_sum: 4 * GIB,
             tracked_workers_count: 2,
             captured_at: Some(t0 + Duration::from_millis(100)),
-        });
+            cpu_busy_milli: None,
+            });
         let fired = watcher.evaluate_and_emit_for_test(t0 + Duration::from_millis(100));
         assert_eq!(fired, None, "below-pressure 2GiB jump must not fire");
     });
@@ -332,7 +340,8 @@ fn kill_event_emits_trigger_kill_log() {
             tracked_workers_charged_sum: 6 * GIB,
             tracked_workers_count: 2,
             captured_at: Some(Instant::now()),
-        });
+            cpu_busy_milli: None,
+            });
         watcher.note_kill();
     });
     let all_lines = cap.lines();
@@ -368,7 +377,8 @@ fn swap_growth_with_shrinking_rss_fires_delta_and_logs_swap() {
             tracked_workers_charged_sum: 4 * GIB,
             tracked_workers_count: 2,
             captured_at: Some(t0),
-        });
+            cpu_busy_milli: None,
+            });
         let first = watcher.evaluate_and_emit_for_test(t0);
         assert_eq!(first, Some(LogTrigger::Heartbeat));
         // Dying: RSS collapsed to 1 GiB, 5 GiB migrated to swap.
@@ -380,7 +390,8 @@ fn swap_growth_with_shrinking_rss_fires_delta_and_logs_swap() {
             tracked_workers_charged_sum: 6 * GIB,
             tracked_workers_count: 2,
             captured_at: Some(t0 + Duration::from_millis(100)),
-        });
+            cpu_busy_milli: None,
+            });
         let fired = watcher.evaluate_and_emit_for_test(t0 + Duration::from_millis(100));
         assert_eq!(
             fired,
@@ -429,7 +440,8 @@ fn log_disabled_emits_nothing() {
             tracked_workers_charged_sum: 6 * GIB,
             tracked_workers_count: 2,
             captured_at: Some(Instant::now()),
-        });
+            cpu_busy_milli: None,
+            });
         let _ = watcher.evaluate_and_emit_for_test(Instant::now());
         watcher.note_kill();
     });

@@ -13,7 +13,9 @@ use std::sync::Arc;
 use dynrunner_core::{
     ErrorType, Identifier, PhaseId, TaskInfo, TaskOutputs, TerminalOutcomeCounts, WorkerId,
 };
-use dynrunner_protocol_primary_secondary::{DiscoveryDebt, RoleTable, SecondaryCapacityRecord};
+use dynrunner_protocol_primary_secondary::{
+    DiscoveryDebt, RoleTable, SecondaryCapacityRecord, SecondaryResourceSampleRecord,
+};
 
 use super::settled::{SettledClass, SettledEntry};
 use super::{
@@ -1230,6 +1232,31 @@ impl<I: Identifier> ClusterState<I> {
             .filter(|(_, record)| record.worker_count > 0)
             .map(|(id, _)| id.as_str())
             .filter(move |id| self.is_peer_alive(id))
+    }
+
+    /// The latest aggregated resource-sample record (#575) for each
+    /// LIVE compute secondary — pairs the [`Self::alive_secondary_members`]
+    /// roster with whatever
+    /// [`crate::cluster_state::state::ClusterState::latest_resource_samples`]
+    /// the LWW apply rule recorded for that id.
+    ///
+    /// Excludes secondaries that have not yet emitted a 5-minute aggregate
+    /// (the `latest_resource_samples` lookup misses them); the observer's
+    /// projection treats absent secondaries as "no signal yet" and folds
+    /// only the present ones into its averages. Equally excludes any
+    /// secondary whose membership is dead (the alive-secondary-members
+    /// filter is what gates "compute member, currently up"), so a stale
+    /// LWW record left by a removed incarnation never reaches the
+    /// observer projection.
+    ///
+    /// Consumed ONLY by the observer's important-update reporter; the
+    /// primary's scheduling/budget surface never reads it (resource
+    /// stats are observability-only per #575).
+    pub fn live_compute_resource_samples(
+        &self,
+    ) -> impl Iterator<Item = (&str, &SecondaryResourceSampleRecord)> {
+        self.alive_secondary_members()
+            .filter_map(move |id| self.latest_resource_samples.get(id).map(|r| (id, r)))
     }
 
     /// Count of [`Self::alive_secondary_members`] — the fleet-liveness

@@ -65,6 +65,7 @@ mod peer;
 mod primary_link;
 mod processing;
 pub(crate) mod resource;
+pub(crate) mod resource_buffer;
 mod sampler_hooks;
 mod setup;
 mod setup_deadline;
