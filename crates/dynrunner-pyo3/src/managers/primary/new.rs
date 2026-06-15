@@ -95,6 +95,7 @@ impl PyPrimaryCoordinator {
             stage_via_setup_tasks,
             uses_file_based_items,
             max_concurrent_per_type: topology.max_concurrent_per_type,
+            primary_pinned_types: topology.primary_pinned_types,
             task_definition: task_definition.clone().unbind(),
             control_plane,
             peer_lifecycle_listener,
