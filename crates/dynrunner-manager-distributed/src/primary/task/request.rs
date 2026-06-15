@@ -267,23 +267,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             .await;
 
                         // Operator-facing INFO: which secondary/
-                        // worker just took the task. Per-task
-                        // identity (task_id / phase / type) →
-                        // DEBUG sibling.
+                        // worker just took the task, with enough
+                        // human-readable identity to correlate
+                        // without grepping by hash.
                         tracing::info!(
-                            secondary = %sec_id,
-                            worker_id,
-                            task_hash = %task_hash,
-                            "task assigned"
-                        );
-                        tracing::debug!(
                             secondary = %sec_id,
                             worker_id,
                             task_id = ?binary.task_id,
                             phase = %binary.phase_id,
                             task_type = %binary.type_id,
                             task_hash = %task_hash,
-                            "task assigned: identity"
+                            "task assigned"
                         );
                         assigned = true;
                     }
