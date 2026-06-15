@@ -88,6 +88,14 @@ pub(crate) struct DistributedConfig {
     /// delta + kill log lines at `target = "oom_watcher"`. Operators
     /// flip this via `--log-oom-watcher`. Default `false`.
     log_oom_watcher: bool,
+    /// Per-secondary stuck-worker reporting cadence in seconds.
+    /// Mirrors `LocalManagerConfig.phase_status_log_intervals_secs`.
+    /// After one of this secondary's OWN workers sits in the same
+    /// phase past any of these durations, the secondary emits a
+    /// status WARN (current phase + elapsed) — the OBSERVABILITY twin
+    /// of the LocalManager reporter. Default `vec![60.0]`. LOGGING
+    /// ONLY: no kill/timeout path is wired off these intervals.
+    phase_status_log_intervals_secs: Vec<f64>,
 }
 
 impl Default for DistributedConfig {
@@ -105,6 +113,7 @@ impl Default for DistributedConfig {
             unconfigured_deadline_secs: 600.0,
             resource_check_interval_secs: 0.1,
             log_oom_watcher: false,
+            phase_status_log_intervals_secs: vec![60.0],
         }
     }
 }
@@ -125,6 +134,7 @@ impl DistributedConfig {
         unconfigured_deadline_secs = None,
         resource_check_interval_secs = None,
         log_oom_watcher = None,
+        phase_status_log_intervals_secs = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -142,6 +152,7 @@ impl DistributedConfig {
         unconfigured_deadline_secs: Option<f64>,
         resource_check_interval_secs: Option<f64>,
         log_oom_watcher: Option<bool>,
+        phase_status_log_intervals_secs: Option<Vec<f64>>,
     ) -> Self {
         let d = DistributedConfig::default();
         // Default `oom_retry_max_passes` mirrors the effective
@@ -171,6 +182,8 @@ impl DistributedConfig {
             resource_check_interval_secs: resource_check_interval_secs
                 .unwrap_or(d.resource_check_interval_secs),
             log_oom_watcher: log_oom_watcher.unwrap_or(d.log_oom_watcher),
+            phase_status_log_intervals_secs: phase_status_log_intervals_secs
+                .unwrap_or(d.phase_status_log_intervals_secs),
         }
     }
 }
@@ -233,6 +246,15 @@ impl DistributedConfig {
     pub(crate) fn log_oom_watcher(&self) -> bool {
         self.log_oom_watcher
     }
+    /// The configured stuck-worker intervals as `Duration`s, in
+    /// declaration order — the value a `SecondaryConfig` reads to drive
+    /// the shared per-worker phase-progress reporter.
+    pub(crate) fn phase_status_log_intervals(&self) -> Vec<std::time::Duration> {
+        self.phase_status_log_intervals_secs
+            .iter()
+            .map(|s| std::time::Duration::from_secs_f64(*s))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -251,7 +273,7 @@ mod tests {
         // And via the kwarg-merge constructor with everything omitted.
         let cfg = DistributedConfig::new(
             None, None, None, None, None, None, None, None, None,
-            /* unconfigured_deadline_secs */ None, None, None,
+            /* unconfigured_deadline_secs */ None, None, None, None,
         );
         assert_eq!(
             cfg.unconfigured_deadline(),
@@ -277,6 +299,7 @@ mod tests {
             None,
             None,
             /* unconfigured_deadline_secs */ Some(123.0),
+            None,
             None,
             None,
         );

@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use dynrunner_core::{
     ErrorType, FailedTask, Identifier, ResourceKind, ResourceMap, TaskInfo, TaskResult, WorkerId,
@@ -226,15 +226,15 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 ..
             } => {
                 tracing::debug!(worker_id, phase = %phase_name, "phase update");
-                let worker = &mut self.pool.workers[worker_id as usize];
-                worker.phase = Some(phase_name);
-                worker.last_keepalive = Some(Instant::now());
-                worker.phase_started_at = Some(Instant::now());
-                worker.phase_status_log_idx = 0;
+                // Record the phase transition through the shared pool
+                // seam — the same path the distributed secondary uses,
+                // so the per-worker phase-progress reporter stays
+                // single-owner. Consumer-driven semantics unchanged.
+                self.pool.note_phase_update(worker_id, phase_name);
             }
             WorkerEvent::Keepalive { worker_id, .. } => {
                 tracing::trace!(worker_id, "keepalive");
-                self.pool.workers[worker_id as usize].last_keepalive = Some(Instant::now());
+                self.pool.note_keepalive(worker_id);
             }
             WorkerEvent::CustomMessage {
                 worker_id, topic, ..
@@ -252,7 +252,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     "custom worker message received by LocalManager (no listener \
                      surface in single-process mode; dropped)"
                 );
-                self.pool.workers[worker_id as usize].last_keepalive = Some(Instant::now());
+                self.pool.note_keepalive(worker_id);
             }
         }
     }

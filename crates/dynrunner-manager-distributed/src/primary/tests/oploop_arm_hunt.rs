@@ -122,6 +122,7 @@ fn arm_hunt_sec_config(id: &str, num_workers: u32, can_be_primary: bool) -> Seco
         can_be_primary,
         resource_check_interval: StdDuration::from_millis(100),
         log_oom_watcher: false,
+        phase_status_log_intervals: vec![Duration::from_secs(60)],
         promoted_primary_quiesce_grace: StdDuration::from_millis(100),
         unfulfillable_reinject_max_per_task: None,
         mem_manager_reserved_bytes: None,

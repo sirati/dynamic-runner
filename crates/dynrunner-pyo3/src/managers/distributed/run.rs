@@ -129,6 +129,8 @@ impl PyDistributedManager {
         let dist_unconfigured_deadline = self.distributed_config.unconfigured_deadline();
         let dist_resource_check_interval = self.distributed_config.resource_check_interval();
         let dist_log_oom_watcher = self.distributed_config.log_oom_watcher();
+        let dist_phase_status_log_intervals =
+            self.distributed_config.phase_status_log_intervals();
         let worker_spec = self.worker_spec.clone();
         // Per-type subprocess dispatch: the factory carries the full
         // `TypeRegistry`. `spawn_worker` defaults to `types.first()`
@@ -534,6 +536,12 @@ impl PyDistributedManager {
                     // (`sec_recipe_namespace`) — uniform with the SLURM path's
                     // single-source-of-truth derivation.
                     let promote_uses_file_based_items = uses_file_based_items;
+                    // Per-secondary clone of the stuck-worker reporter
+                    // intervals (a non-`Copy` `Vec`): each spawned `move`
+                    // task owns its own copy, mirroring `sec_phase_deps`
+                    // above. The shared run-level binding is read once per
+                    // iteration so the loop can move a fresh copy in.
+                    let sec_phase_status_log_intervals = dist_phase_status_log_intervals.clone();
 
                     let handle = tokio::task::spawn_local(async move {
                         // This secondary's all-to-all mpsc mesh transport
@@ -598,6 +606,7 @@ impl PyDistributedManager {
                             can_be_primary: true,
                             resource_check_interval: dist_resource_check_interval,
                             log_oom_watcher: dist_log_oom_watcher,
+                            phase_status_log_intervals: sec_phase_status_log_intervals,
                             promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
                             // In-process distributed manager: the
                             // `ReinjectTask` per-task budget cap, mirrored

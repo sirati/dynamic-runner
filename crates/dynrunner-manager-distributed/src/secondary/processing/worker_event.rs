@@ -492,6 +492,14 @@ where
                 ..
             } => {
                 tracing::debug!(worker_id, phase = %phase_name, "phase update");
+                // Record the phase transition on the slot through the
+                // shared pool seam (the SAME path LocalManager uses) so
+                // the per-worker phase-progress reporter fired off the
+                // OOM-sweep cadence (process_tasks.rs) can SEE this
+                // secondary's own workers churn. Consumer-driven phase
+                // semantics unchanged; this only stops the secondary
+                // discarding the update it already received.
+                self.op_mut().pool.note_phase_update(worker_id, phase_name);
                 Ok(None)
             }
             WorkerEvent::CustomMessage {
@@ -519,6 +527,14 @@ where
                     .as_ref()
                     .map(|b| b.type_id.to_string())
                     .unwrap_or_default();
+                // A custom message means the worker is alive — refresh
+                // the slot's liveness clock through the shared pool seam
+                // (mirrors LocalManager's CustomMessage arm), so a
+                // worker that streams customs without an explicit
+                // keepalive is still seen as recently-active by the
+                // stuck-worker reporter. Non-terminal; attribution
+                // untouched.
+                self.op_mut().pool.note_keepalive(worker_id);
                 tracing::debug!(
                     worker_id,
                     topic = %topic,
@@ -540,6 +556,11 @@ where
             }
             WorkerEvent::Keepalive { worker_id, .. } => {
                 tracing::trace!(worker_id, "worker keepalive");
+                // A keepalive is a liveness signal — refresh the slot's
+                // clock through the shared pool seam so the stuck-worker
+                // reporter sees the worker as recently-seen (same path
+                // LocalManager uses). Consumer-driven; non-terminal.
+                self.op_mut().pool.note_keepalive(worker_id);
                 Ok(None)
             }
             WorkerEvent::Ready { worker_id, .. } => {

@@ -641,6 +641,20 @@ where
                         .expect("oom charge sweep read panicked");
                     oom_watcher.apply_sweep(&mut self.op_mut().pool, sweep);
                     self.check_resource_pressure_via_watcher(&mut oom_watcher, factory).await;
+                    // Per-worker phase-progress observability — the
+                    // SAME shared seam LocalManager fires off ITS sweep
+                    // (manager/worker_loop.rs). A long quiet task (deep
+                    // in a native op, emitting no keepalive/phase) now
+                    // produces an escalating "worker N in phase X for
+                    // 60s/120s/..." WARN ON THE SECONDARY too, so the
+                    // operator sees alive-and-churning instead of a
+                    // silent freeze. LOGGING ONLY: no force-fail /
+                    // timeout / kill is wired here (the secondary's
+                    // userland-kill path stays gated off; kernel
+                    // cgroup-OOM owns death). The config borrow is taken
+                    // disjoint from the `op_mut()` pool borrow.
+                    let intervals = self.config.phase_status_log_intervals.clone();
+                    self.op_mut().pool.report_stuck_workers(&intervals);
                     // Await-before-resleep: arm the next sweep a full
                     // interval after THIS one completed.
                     next_sweep_due = tokio::time::Instant::now() + oom_sweep_interval;

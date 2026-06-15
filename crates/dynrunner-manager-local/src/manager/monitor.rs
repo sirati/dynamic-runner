@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::time::Instant;
 
 use dynrunner_core::{ErrorType, FailedTask, Identifier, ResourceKind, TaskResult, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
@@ -85,40 +84,15 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         }
     }
 
-    /// Walk all workers and emit a status log for any that has been in their
-    /// current phase longer than the next configured interval. Each worker
-    /// fires at most once per interval until it transitions phases.
+    /// Emit the per-worker phase-progress status WARNs through the
+    /// shared [`crate::pool::WorkerPool::report_stuck_workers`] seam.
+    /// The reporting logic (the cursor-driven escalating WARN) is owned
+    /// by the pool so the distributed secondary fires the SAME reporter
+    /// off its own OOM-sweep cadence; this manager only supplies its
+    /// configured intervals.
     pub(super) fn report_stuck_workers(&mut self) {
-        if self.config.phase_status_log_intervals.is_empty() {
-            return;
-        }
-        let intervals = &self.config.phase_status_log_intervals;
-        let now = Instant::now();
-        for worker in &mut self.pool.workers {
-            let Some(started_at) = worker.phase_started_at else {
-                continue;
-            };
-            let elapsed = now.duration_since(started_at);
-            while worker.phase_status_log_idx < intervals.len()
-                && elapsed >= intervals[worker.phase_status_log_idx]
-            {
-                let phase = worker.phase.as_deref().unwrap_or("(unknown)");
-                let task = worker
-                    .current_binary
-                    .as_ref()
-                    .map(|b| b.path.display().to_string())
-                    .unwrap_or_else(|| "(no task)".into());
-                tracing::warn!(
-                    worker_id = worker.worker_id,
-                    phase,
-                    elapsed_s = elapsed.as_secs_f64(),
-                    task = %task,
-                    "worker has been in the same phase for {:.0}s",
-                    elapsed.as_secs_f64()
-                );
-                worker.phase_status_log_idx += 1;
-            }
-        }
+        self.pool
+            .report_stuck_workers(&self.config.phase_status_log_intervals);
     }
 
     /// Route the resource-pressure decision tick through the OOM

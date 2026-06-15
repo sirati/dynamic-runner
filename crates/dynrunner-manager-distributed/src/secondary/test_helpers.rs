@@ -612,6 +612,7 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
         can_be_primary: false,
         resource_check_interval: Duration::from_millis(100),
         log_oom_watcher: false,
+        phase_status_log_intervals: vec![Duration::from_secs(60)],
         // Short grace so promotion-gated tests can drive the
         // natural-quiesce branch without waiting the production
         // 2-second default. Production code-path semantics are

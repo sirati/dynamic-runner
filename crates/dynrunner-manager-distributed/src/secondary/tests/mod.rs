@@ -126,6 +126,7 @@ mod no_route_diagnostics;
 mod observer_announcer_wireup;
 mod panik_integration;
 mod peer_mesh_watchdog;
+mod phase_progress;
 mod processing;
 mod r1;
 mod relay_coherence;

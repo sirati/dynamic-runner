@@ -375,6 +375,7 @@ impl PySecondaryConfig {
             can_be_primary: false,
             resource_check_interval: self.distributed_config.resource_check_interval(),
             log_oom_watcher: self.distributed_config.log_oom_watcher(),
+            phase_status_log_intervals: self.distributed_config.phase_status_log_intervals(),
             // Hardcoded to the SecondaryConfig::default() value (2 s).
             // The grace gate is an internal heuristic on the
             // promoted-primary natural-quiesce branch (see

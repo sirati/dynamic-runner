@@ -66,6 +66,8 @@ impl PySecondaryCoordinator {
         let dist_unconfigured_deadline = self.distributed_config.unconfigured_deadline();
         let dist_resource_check_interval = self.distributed_config.resource_check_interval();
         let dist_log_oom_watcher = self.distributed_config.log_oom_watcher();
+        let dist_phase_status_log_intervals =
+            self.distributed_config.phase_status_log_intervals();
         let cfg_mem_manager_reserved_bytes = self.mem_manager_reserved_bytes;
         // The node-local run-config SEED (the consumer's boot-CLI
         // `args.forwarded_argv`, usually empty — the post-welcome push delivers
@@ -493,6 +495,7 @@ impl PySecondaryCoordinator {
                     can_be_primary: true,
                     resource_check_interval: dist_resource_check_interval,
                     log_oom_watcher: dist_log_oom_watcher,
+                    phase_status_log_intervals: dist_phase_status_log_intervals,
                     promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
                     unfulfillable_reinject_max_per_task,
                     mem_manager_reserved_bytes: cfg_mem_manager_reserved_bytes,

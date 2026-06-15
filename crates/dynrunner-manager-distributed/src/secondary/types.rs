@@ -290,6 +290,24 @@ pub struct SecondaryConfig {
     /// secondaries through the SLURM wrapper's `forwarded_argv`.
     pub log_oom_watcher: bool,
 
+    /// Stuck-worker reporting cadence — the OBSERVABILITY twin of
+    /// `LocalManagerConfig::phase_status_log_intervals`. After one of
+    /// this secondary's OWN workers has been in the same phase for any
+    /// of these durations, the secondary's OOM-sweep arm emits a status
+    /// WARN (current phase + elapsed) through the shared
+    /// [`dynrunner_manager_local::WorkerPool::report_stuck_workers`]
+    /// seam. The list does not have to be sorted; the first matching
+    /// interval the worker has just crossed fires. Empty disables the
+    /// reporter.
+    ///
+    /// LOGGING ONLY: this drives no force-fail / timeout / kill path on
+    /// the secondary (its userland-kill path stays gated off; kernel
+    /// cgroup-OOM handles death). It makes a quiet long-running worker
+    /// VISIBLE so an operator can tell alive-and-churning from a silent
+    /// freeze. Default `vec![60.0]` — matches the operator-facing
+    /// LocalManager surface (`DistributedConfig` / pyo3 default).
+    pub phase_status_log_intervals: Vec<Duration>,
+
     /// Maximum wall-clock a secondary will spend NOT-YET-CONFIGURED —
     /// in the pre-`Operational` lifecycle states (`AwaitingPrimary` +
     /// `Configuring`), i.e. before the primary has announced itself and
@@ -462,6 +480,11 @@ impl Default for SecondaryConfig {
             can_be_primary: false,
             resource_check_interval: Duration::from_millis(100),
             log_oom_watcher: false,
+            // Matches the operator-facing LocalManager surface
+            // (`DistributedConfig` / pyo3 `vec![60.0]`): one escalating
+            // WARN after a worker sits 60s in a phase. Observability
+            // only — no kill/timeout path on the secondary.
+            phase_status_log_intervals: vec![Duration::from_secs(60)],
             unconfigured_deadline: Duration::from_secs(600),
             promoted_primary_quiesce_grace: Duration::from_secs(2),
             unfulfillable_reinject_max_per_task: None,

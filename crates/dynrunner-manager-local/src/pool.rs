@@ -1015,6 +1015,93 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         self.workers.iter().map(|w| w.budget_info()).collect()
     }
 
+    /// Record a worker's phase transition on its slot — the single
+    /// owner of the `PhaseUpdate`-driven phase-progress bookkeeping.
+    ///
+    /// Sets the slot's `phase`, stamps both `phase_started_at` and
+    /// `last_keepalive` to NOW (a phase update is also a liveness
+    /// signal), and resets `phase_status_log_idx` so the stuck-worker
+    /// reporter ([`Self::report_stuck_workers`]) re-fires from the
+    /// first interval for the new phase. The pool owns worker identity
+    /// and per-slot lifecycle state, so this mutation lives here; both
+    /// event-consumer loops (the LocalManager's `handle_event` and the
+    /// distributed secondary's `handle_worker_event`) are thin call
+    /// sites. No-op for an out-of-range `worker_id`.
+    ///
+    /// Does NOT change keepalive/phase SEMANTICS — `PhaseUpdate`s stay
+    /// 100% consumer-driven; this method only records the update the
+    /// consumer already sent.
+    pub fn note_phase_update(&mut self, worker_id: WorkerId, phase_name: String) {
+        if let Some(worker) = self.workers.get_mut(worker_id as usize) {
+            let now = std::time::Instant::now();
+            worker.phase = Some(phase_name);
+            worker.last_keepalive = Some(now);
+            worker.phase_started_at = Some(now);
+            worker.phase_status_log_idx = 0;
+        }
+    }
+
+    /// Refresh a worker slot's liveness clock — the single owner of the
+    /// `Keepalive`/`CustomMessage`-driven `last_keepalive` bump.
+    ///
+    /// A worker that streams a keepalive or a custom message is alive;
+    /// both non-terminal signals refresh `last_keepalive` so the
+    /// stuck-worker reporter and timeout machinery see the worker as
+    /// recently-seen. Does NOT touch the phase or the report index —
+    /// those advance only on a real [`Self::note_phase_update`]. No-op
+    /// for an out-of-range `worker_id`.
+    pub fn note_keepalive(&mut self, worker_id: WorkerId) {
+        if let Some(worker) = self.workers.get_mut(worker_id as usize) {
+            worker.last_keepalive = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Walk all workers and emit a status WARN for any that has been in
+    /// its current phase longer than the next configured `intervals`
+    /// entry. Each worker fires at most once per interval until it
+    /// transitions phases (the `phase_status_log_idx` cursor, reset by
+    /// [`Self::note_phase_update`]).
+    ///
+    /// OBSERVABILITY ONLY: this emits an escalating WARN so an operator
+    /// can SEE a worker that has been quiet in one phase for a long
+    /// time — it never force-fails, kills, or times out the worker.
+    /// `intervals` is owned by the CALLING manager's config
+    /// (`LocalManagerConfig::phase_status_log_intervals` /
+    /// `SecondaryConfig::phase_status_log_intervals`); the pool reads it
+    /// as a borrowed slice so the same seam serves both. An empty slice
+    /// disables the reporter.
+    pub fn report_stuck_workers(&mut self, intervals: &[std::time::Duration]) {
+        if intervals.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        for worker in &mut self.workers {
+            let Some(started_at) = worker.phase_started_at else {
+                continue;
+            };
+            let elapsed = now.duration_since(started_at);
+            while worker.phase_status_log_idx < intervals.len()
+                && elapsed >= intervals[worker.phase_status_log_idx]
+            {
+                let phase = worker.phase.as_deref().unwrap_or("(unknown)");
+                let task = worker
+                    .current_binary
+                    .as_ref()
+                    .map(|b| b.path.display().to_string())
+                    .unwrap_or_else(|| "(no task)".into());
+                tracing::warn!(
+                    worker_id = worker.worker_id,
+                    phase,
+                    elapsed_s = elapsed.as_secs_f64(),
+                    task = %task,
+                    "worker has been in the same phase for {:.0}s",
+                    elapsed.as_secs_f64()
+                );
+                worker.phase_status_log_idx += 1;
+            }
+        }
+    }
+
     /// Stop all workers that aren't already stopped.
     pub async fn stop_all(&mut self) {
         for worker in &mut self.workers {
@@ -2165,5 +2252,199 @@ mod sweep_decision_tests {
         );
         // The decision still inspected both swept charges.
         assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod stuck_worker_report_tests {
+    //! The shared phase-progress reporter seam
+    //! ([`WorkerPool::report_stuck_workers`]) + its slot-state feeders
+    //! ([`WorkerPool::note_phase_update`] / [`WorkerPool::note_keepalive`]).
+    //!
+    //! This is the SAME logic both managers route through — LocalManager's
+    //! `report_stuck_workers` (unchanged behaviour, now delegating) and the
+    //! distributed secondary's OOM-sweep arm. Testing it here pins the
+    //! escalating WARN + once-per-interval cursor + phase-reset semantics in
+    //! one place for both callers.
+
+    use super::*;
+    use dynrunner_transport_channel::{ChannelManagerEnd, channel_pair};
+    use serde::{Deserialize, Serialize};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tracing::Subscriber;
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    struct TestId(String);
+
+    /// Capture every WARN whose message is the stuck-worker line, so a
+    /// test can assert the escalating phase-progress WARN fired the
+    /// expected number of times. Records the `message` field verbatim.
+    #[derive(Clone, Default)]
+    struct WarnCapture {
+        lines: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl WarnCapture {
+        fn stuck_count(&self) -> usize {
+            self.lines
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| m.contains("in the same phase for"))
+                .count()
+        }
+    }
+
+    impl<S> Layer<S> for WarnCapture
+    where
+        S: Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            #[derive(Default)]
+            struct MsgVisitor(String);
+            impl tracing::field::Visit for MsgVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut v = MsgVisitor::default();
+            event.record(&mut v);
+            self.lines.lock().unwrap().push(v.0);
+        }
+    }
+
+    fn pool_with_workers(n: u32) -> WorkerPool<ChannelManagerEnd, TestId> {
+        let mut pool = WorkerPool::<ChannelManagerEnd, TestId>::new();
+        for i in 0..n {
+            let (manager_end, _runner_end) = channel_pair();
+            let handle =
+                crate::worker::WorkerHandle::new(i, 0, manager_end, pool.event_tx().clone());
+            pool.workers.push(handle);
+        }
+        pool
+    }
+
+    /// A worker driven into a phase via `note_phase_update` and then held
+    /// past a tiny interval emits exactly ONE escalating WARN per crossed
+    /// interval, and re-fires for each further interval as time advances.
+    /// This is the report half both managers share.
+    #[test]
+    fn report_stuck_workers_fires_per_crossed_interval() {
+        let capture = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        with_default(subscriber, || {
+            let mut pool = pool_with_workers(1);
+            // Record a phase transition through the shared feeder (the
+            // path PhaseUpdate events take on BOTH managers).
+            pool.note_phase_update(0, "indexing".into());
+
+            // Two tiny intervals so the test drives sub-second without a
+            // real long sleep. A zero-length first interval fires
+            // immediately; the second fires after a short wait.
+            let intervals = [Duration::from_millis(0), Duration::from_millis(40)];
+
+            // First report: elapsed >= 0ms crosses interval[0] only.
+            pool.report_stuck_workers(&intervals);
+            assert_eq!(
+                capture.stuck_count(),
+                1,
+                "the first crossed interval emits exactly one WARN"
+            );
+
+            // Before the second interval elapses, no new WARN (the cursor
+            // gates re-firing to once per interval).
+            pool.report_stuck_workers(&intervals);
+            assert_eq!(
+                capture.stuck_count(),
+                1,
+                "no re-fire until the next interval is crossed"
+            );
+
+            // Advance past interval[1]; the second WARN fires.
+            std::thread::sleep(Duration::from_millis(55));
+            pool.report_stuck_workers(&intervals);
+            assert_eq!(
+                capture.stuck_count(),
+                2,
+                "crossing the next interval emits one more WARN"
+            );
+        });
+    }
+
+    /// A fresh `note_phase_update` resets the per-worker cursor so the
+    /// reporter re-fires from the first interval for the NEW phase — the
+    /// phase-transition semantic LocalManager relied on and the secondary
+    /// now shares.
+    #[test]
+    fn note_phase_update_resets_the_report_cursor() {
+        let capture = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        with_default(subscriber, || {
+            let mut pool = pool_with_workers(1);
+            let intervals = [Duration::from_millis(0)];
+
+            pool.note_phase_update(0, "phase-a".into());
+            pool.report_stuck_workers(&intervals);
+            assert_eq!(capture.stuck_count(), 1, "phase-a crosses interval[0]");
+
+            // Same phase: cursor exhausted, no re-fire.
+            pool.report_stuck_workers(&intervals);
+            assert_eq!(capture.stuck_count(), 1, "no re-fire within the same phase");
+
+            // New phase resets the cursor + the started-at clock; the
+            // reporter fires afresh.
+            pool.note_phase_update(0, "phase-b".into());
+            pool.report_stuck_workers(&intervals);
+            assert_eq!(
+                capture.stuck_count(),
+                2,
+                "a new phase re-arms the reporter from the first interval"
+            );
+        });
+    }
+
+    /// An empty intervals slice disables the reporter entirely (the
+    /// operator opt-out), and a worker that never received a phase update
+    /// (no `phase_started_at`) is silently skipped.
+    #[test]
+    fn report_stuck_workers_empty_intervals_and_no_phase_are_silent() {
+        let capture = WarnCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        with_default(subscriber, || {
+            let mut pool = pool_with_workers(2);
+            // Worker 0 has a phase; worker 1 never did.
+            pool.note_phase_update(0, "phase-a".into());
+
+            // Empty intervals → reporter is a no-op even for the
+            // phase-bearing worker.
+            pool.report_stuck_workers(&[]);
+            assert_eq!(capture.stuck_count(), 0, "empty intervals disables the reporter");
+
+            // With a zero interval only worker 0 (which has a
+            // phase_started_at) fires; worker 1 is skipped.
+            pool.report_stuck_workers(&[Duration::from_millis(0)]);
+            assert_eq!(
+                capture.stuck_count(),
+                1,
+                "only the phase-bearing worker reports; the never-updated slot is skipped"
+            );
+        });
     }
 }
