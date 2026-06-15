@@ -69,6 +69,13 @@ pub trait SlurmAuthorityProbe: Send + Sync {
     /// Probe every secondary the manager has ever submitted a job for.
     /// The returned map is what the snapshot publisher installs.
     async fn probe_all(&self) -> HashMap<String, PeerLifeState>;
+    /// Probe every secondary AND count how many are PENDING with reason
+    /// "Resources" (unschedulable on the partition's capacity). Default
+    /// implementation delegates to `probe_all` with a zero count —
+    /// providers that parse the squeue reason field override this.
+    async fn probe_all_classified(&self) -> (HashMap<String, PeerLifeState>, usize) {
+        (self.probe_all().await, 0)
+    }
 }
 
 /// Snapshot is "stale" past `STALENESS_BOUND_MULTIPLE * probe_interval`.
@@ -79,6 +86,10 @@ pub const STALENESS_BOUND_MULTIPLE: u32 = 4;
 #[derive(Debug, Clone)]
 struct SnapshotInner {
     map: HashMap<String, PeerLifeState>,
+    /// Count of jobs whose squeue reason is "Resources" at the last probe.
+    /// Populated by probes that implement `probe_all_classified`; zero for
+    /// probes that only supply the 3-state `PeerLifeState` map.
+    pending_resources: usize,
     last_updated: Instant,
 }
 
@@ -91,11 +102,22 @@ struct SnapshotInner {
 ///   the fleet below initial count?" The answer is the count of jobs
 ///   the snapshot currently classifies `Alive`; `None` means we have
 ///   no positive evidence (snapshot stale or unable to read).
+/// - `pending_resources_count()`: the setup-quorum observability check
+///   (#565) asks "how many jobs are PENDING(Resources) right now?" A
+///   `Some(k)` with `k > 0` at setup-quorum-wait start means those k
+///   jobs will never schedule on the partition's current capacity.
+///   `None` means the snapshot is stale or the probe does not supply
+///   reason-level data (both are treated as "no signal" — no emit).
 ///
-/// Both fail-closed under stale snapshots: `Unknown` / `None`.
+/// All fail-closed under stale snapshots: `Unknown` / `None`.
 pub trait SlurmAuthoritativeSnapshot: Send + Sync {
     fn peer_life(&self, secondary_id: &str) -> PeerLifeState;
     fn secondary_active_or_queued_count(&self) -> Option<usize>;
+    /// Count of SLURM jobs whose squeue reason is "Resources" (the job is
+    /// PENDING because the partition has insufficient capacity to schedule
+    /// it now). `None` when the snapshot is stale or when the probe does
+    /// not supply reason-level classification (non-SLURM backends, stale).
+    fn pending_resources_count(&self) -> Option<usize>;
 }
 
 /// `ArcSwap`-backed snapshot publisher. Constructed by the deployment
@@ -117,6 +139,7 @@ impl OffLoopAuthoritySnapshot {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(SnapshotInner {
                 map: HashMap::new(),
+                pending_resources: 0,
                 last_updated: Instant::now(),
             })),
             staleness_bound: probe_interval.saturating_mul(STALENESS_BOUND_MULTIPLE),
@@ -157,6 +180,13 @@ impl SlurmAuthoritativeSnapshot for OffLoopAuthoritySnapshot {
         let snap = self.inner.load();
         Some(snap.map.values().filter(|s| matches!(s, PeerLifeState::Alive)).count())
     }
+
+    fn pending_resources_count(&self) -> Option<usize> {
+        if self.is_stale(Instant::now()) {
+            return None;
+        }
+        Some(self.inner.load().pending_resources)
+    }
 }
 
 /// Publisher side of the snapshot. The updater task `publish()`es a
@@ -171,9 +201,10 @@ impl AuthorityUpdaterHandle {
     /// `Instant::now()` at publish time, so the snapshot's staleness gate
     /// reads from the moment THIS publish landed (not the moment the
     /// probe started its round-trip).
-    pub fn publish(&self, map: HashMap<String, PeerLifeState>) {
+    pub fn publish(&self, map: HashMap<String, PeerLifeState>, pending_resources: usize) {
         self.inner.store(Arc::new(SnapshotInner {
             map,
+            pending_resources,
             last_updated: Instant::now(),
         }));
     }
@@ -197,8 +228,8 @@ pub fn spawn_authority_updater(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            let map = probe.probe_all().await;
-            publisher.publish(map);
+            let (map, pending_resources) = probe.probe_all_classified().await;
+            publisher.publish(map, pending_resources);
         }
     })
 }
@@ -222,18 +253,25 @@ impl SlurmAuthoritativeSnapshot for NoSlurmAuthoritySnapshot {
     fn secondary_active_or_queued_count(&self) -> Option<usize> {
         None
     }
+    fn pending_resources_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[cfg(test)]
 pub mod test_helpers {
     use super::*;
     /// Deterministic snapshot for unit tests. `map` answers `peer_life`;
-    /// `count` answers `secondary_active_or_queued_count`. The two are
-    /// independently controllable so a test can pin one without
-    /// implying the other.
+    /// `count` answers `secondary_active_or_queued_count`;
+    /// `pending_resources` answers `pending_resources_count`. All three are
+    /// independently controllable so a test can pin one without implying
+    /// the others.
     pub struct StaticSnapshot {
         pub map: HashMap<String, PeerLifeState>,
         pub count: Option<usize>,
+        /// How many jobs to report as PENDING(Resources). `None` means
+        /// "no reason-level data available" (e.g. non-SLURM or stale).
+        pub pending_resources: Option<usize>,
     }
     impl SlurmAuthoritativeSnapshot for StaticSnapshot {
         fn peer_life(&self, secondary_id: &str) -> PeerLifeState {
@@ -241,6 +279,9 @@ pub mod test_helpers {
         }
         fn secondary_active_or_queued_count(&self) -> Option<usize> {
             self.count
+        }
+        fn pending_resources_count(&self) -> Option<usize> {
+            self.pending_resources
         }
     }
 }

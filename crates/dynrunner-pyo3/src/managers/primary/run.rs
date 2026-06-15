@@ -99,6 +99,16 @@ impl PyPrimaryCoordinator {
         // job ledger.
         let job_ledger_probe = self.job_ledger_probe.take();
 
+        // SLURM-authoritative snapshot + probe + interval, parked by the SLURM
+        // pipeline via `set_authority_snapshot_from_rust` BEFORE `run()`.
+        // The updater task is spawned INSIDE the detached tokio runtime below
+        // (needs `tokio::spawn`); the snapshot is installed on the inner
+        // coordinator before `run()` enters.
+        let authority_snapshot_parts = self.authority_snapshot_parts.take();
+
+        // The SLURM partition label for setup-quorum observability (#565).
+        let slurm_partition = self.slurm_partition.clone();
+
         // Materialise the respawn pipeline wiring. Only the
         // (budget, spawner) pair is meaningful — when either is
         // absent the inner coordinator's respawn pipeline stays
@@ -490,6 +500,9 @@ impl PyPrimaryCoordinator {
                     // (the late-joiner pickup); `None` outside the
                     // SLURM submitter path.
                     peer_credentials_path,
+                    // SLURM partition label for setup-quorum observability (#565).
+                    // `None` for non-SLURM deployments.
+                    slurm_partition,
                     // Staged silence schedule: keepalive-interval-relative
                     // defaults (not surfaced on the Python config today).
                     ..PrimaryConfig::default()
@@ -613,6 +626,31 @@ impl PyPrimaryCoordinator {
                 // cluster-empty terminal verdict. Same pre-run contract.
                 if let Some(probe) = job_ledger_probe {
                     primary.set_job_ledger_probe(probe);
+                }
+
+                // Wire the SLURM-authoritative snapshot for setup-quorum
+                // observability (#565) and respawn quantity gate (#543).
+                // The SLURM pipeline parks (snapshot, probe, interval) via
+                // `set_authority_snapshot_from_rust` BEFORE `run()` is
+                // called. If present, install the snapshot on the coordinator
+                // and spawn the background updater task (needs tokio runtime
+                // — we are inside the detached async block). The first tick
+                // of the interval fires immediately, so the snapshot is
+                // populated by the time `wait_for_connections` reads it.
+                if let Some((snapshot, updater_handle, probe, probe_interval)) =
+                    authority_snapshot_parts
+                {
+                    primary.set_authority_snapshot(std::sync::Arc::clone(&snapshot));
+                    let join_handle =
+                        dynrunner_manager_distributed::authority_snapshot::spawn_authority_updater(
+                            probe,
+                            updater_handle,
+                            probe_interval,
+                        );
+                    // Drop guard: abort the updater when the run exits.
+                    tokio::spawn(async move {
+                        let _ = join_handle.await;
+                    });
                 }
 
                 // Wire the respawn pipeline iff both a budget and a

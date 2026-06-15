@@ -112,6 +112,8 @@ impl PyPrimaryCoordinator {
             panik_watcher_poll_interval_secs,
             forwarded_argv,
             peer_credentials_path,
+            slurm_partition: None,
+            authority_snapshot_parts: None,
         })
     }
 

@@ -659,7 +659,7 @@ fn snapshot_alive(ids: &[&str]) -> Arc<StaticSnapshot> {
         .iter()
         .map(|i| ((*i).to_string(), PeerLifeState::Alive))
         .collect();
-    Arc::new(StaticSnapshot { map, count: None })
+    Arc::new(StaticSnapshot { map, count: None, pending_resources: None })
 }
 
 #[test]
@@ -687,7 +687,7 @@ fn apply_peer_joined_keeps_sticky_when_authority_gone() {
     install_dead_at_gen(&mut s, "p1", 5);
     let map: HashMap<String, PeerLifeState> =
         std::iter::once(("p1".to_string(), PeerLifeState::Gone)).collect();
-    s.set_authority_snapshot(Arc::new(StaticSnapshot { map, count: None }));
+    s.set_authority_snapshot(Arc::new(StaticSnapshot { map, count: None, pending_resources: None }));
     let outcome = s.apply(ClusterMutation::PeerJoined {
         peer_id: "p1".into(),
         is_observer: false,
@@ -710,6 +710,7 @@ fn apply_peer_joined_keeps_sticky_when_authority_unknown() {
     s.set_authority_snapshot(Arc::new(StaticSnapshot {
         map: HashMap::new(),
         count: None,
+        pending_resources: None,
     }));
     let outcome = s.apply(ClusterMutation::PeerJoined {
         peer_id: "p1".into(),

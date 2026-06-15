@@ -294,13 +294,45 @@ pub(super) fn drive_rust_primary<'py>(
         // of `--respawn-policy` — the consult is read-only. Cold-join
         // observers host no ledger and keep the never-terminal
         // report-and-retry behaviour.
+        // Clone the Arc before it is consumed by the ledger probe below
+        // so the authority probe gets an independent handle to the same
+        // shared manager.
+        let probe_arc = std::sync::Arc::clone(&job_manager_arc);
         let job_ledger_probe: std::sync::Arc<
             dyn dynrunner_manager_distributed::observer::JobLedgerProbe,
         > = std::sync::Arc::new(dynrunner_slurm::SlurmJobLedgerProbe::new(job_manager_arc));
+        // Build the SLURM-authoritative snapshot for setup-quorum
+        // observability (#565) and respawn quantity gate (#543/#544).
+        // The probe interval is 30s — matching the existing respawn-guard
+        // cadence; the staleness bound is 4× the interval so a single
+        // missed tick does not suppress the unschedulable signal.
+        let authority_probe_interval = std::time::Duration::from_secs(30);
+        let authority_snapshot =
+            dynrunner_manager_distributed::authority_snapshot::OffLoopAuthoritySnapshot::new(
+                authority_probe_interval,
+            );
+        let authority_updater_handle = authority_snapshot.updater_handle();
+        let authority_probe: std::sync::Arc<
+            dyn dynrunner_manager_distributed::authority_snapshot::SlurmAuthorityProbe,
+        > = std::sync::Arc::new(
+            dynrunner_slurm::authority::SlurmJobManagerProbe::new(probe_arc),
+        );
+        let partition: String = slurm_config
+            .getattr("partition")
+            .ok()
+            .and_then(|v| v.extract().ok())
+            .unwrap_or_else(|| String::from("<unknown partition>"));
         let coord_ref = coord.cast::<crate::managers::primary::PyPrimaryCoordinator>()?;
         let mut coord_mut = coord_ref.borrow_mut();
         coord_mut.set_slurm_job_manager_from_rust(arc);
         coord_mut.set_job_ledger_probe_from_rust(job_ledger_probe);
+        coord_mut.set_authority_snapshot_from_rust(
+            std::sync::Arc::new(authority_snapshot),
+            authority_updater_handle,
+            authority_probe,
+            authority_probe_interval,
+            partition,
+        );
     }
 
     // Wire the observer's transport-recovery port (BUG-B reconnect) onto

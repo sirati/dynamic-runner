@@ -44,6 +44,49 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let deadline = tokio::time::Instant::now() + self.config.connect_timeout;
         let expected = self.config.num_secondaries as usize;
 
+        // #565 setup-quorum observability: emit ONE INFO line if the
+        // slurm-authoritative snapshot shows any PENDING(Resources) jobs at
+        // wait-start. PENDING(Resources) means the job cannot schedule on the
+        // partition's current capacity — those secondaries will NEVER connect,
+        // so the quorum-proceed deadline WILL fire and the run will proceed at
+        // (expected - k) / expected. Telling the operator NOW avoids a ~7min
+        // "is this a deadlock?" false alarm (the asm-tokenizer 2026-06-15
+        // incident).
+        //
+        // Gate: `Some(k)` with `k > 0` only — `None` means the snapshot is
+        // absent (non-SLURM, stale, or not yet probed) and we stay silent.
+        // The emit is best-effort: a first-probe race (snapshot still empty)
+        // silently skips rather than blocking the wait.
+        if let Some(k) = self.authority_snapshot.pending_resources_count()
+            && k > 0
+        {
+            let partition_label = self
+                .config
+                .slurm_partition
+                .as_deref()
+                .unwrap_or("<unknown partition>");
+            let alive_count = self
+                .authority_snapshot
+                .secondary_active_or_queued_count()
+                .unwrap_or(0);
+            let deadline_secs = self.config.connect_timeout.as_secs();
+            tracing::info!(
+                target: super::important_events::IMPORTANT_TARGET,
+                pending_resources = k,
+                alive = alive_count,
+                requested = expected,
+                partition = partition_label,
+                deadline_secs,
+                "setup-quorum is waiting for {expected} secondaries ({alive_count} alive); \
+                 however slurm queue shows {k} job(s) in PENDING(Resources) on partition \
+                 {partition_label} — those may NEVER schedule on this partition's capacity. \
+                 Run will proceed at {} / {expected} after the setup deadline (~{deadline_secs}s) \
+                 elapses. To avoid the wait, lower --jobs to {} or use a partition with more capacity.",
+                expected.saturating_sub(k),
+                expected.saturating_sub(k),
+            );
+        }
+
         // Whether the wait exits via the quorum-proceed timeout arm
         // (k<expected welcomed) rather than the full-fleet break. Drives
         // the bring-up milestone's full-vs-quorum phrasing after the loop

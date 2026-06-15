@@ -122,6 +122,7 @@ fn make_coordinator() -> (
         crate::authority_snapshot::test_helpers::StaticSnapshot {
             map: std::collections::HashMap::new(),
             count: Some(0),
+            pending_resources: None,
         },
     ));
     (coordinator, mesh)
@@ -998,6 +999,7 @@ async fn build_remote_rig() -> RemoteRig {
         crate::authority_snapshot::test_helpers::StaticSnapshot {
             map: StdHashMap::new(),
             count: Some(0),
+            pending_resources: None,
         },
     ));
 
@@ -1320,6 +1322,7 @@ fn install_count_snapshot(
     coordinator.set_authority_snapshot(Arc::new(StaticSnapshot {
         map: std::collections::HashMap::new(),
         count,
+        pending_resources: None,
     }));
 }
 
@@ -1434,6 +1437,7 @@ async fn remote_resend_loop_aborts_when_provider_host_is_gone() {
                     PeerLifeState::Gone,
                 )]),
                 count: Some(0),
+                pending_resources: None,
             }));
 
             // Wire the remote execution backend. It captures the

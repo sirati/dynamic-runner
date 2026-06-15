@@ -90,4 +90,57 @@ impl<G: Gateway + Send + Sync + 'static> SlurmAuthorityProbe for SlurmJobManager
         }
         out
     }
+
+    /// Probe every secondary AND count how many are PENDING with reason
+    /// "Resources". The reason field is the squeue `%r` column; "Resources"
+    /// is the SLURM scheduler's signal that the job cannot schedule because
+    /// the partition has insufficient capacity (nodes, CPUs, memory) to
+    /// satisfy the request at any point with the current allocation. Jobs
+    /// pending for any other reason (Priority, Dependency, QOSMaxCpuPerUser,
+    /// …) are NOT counted — they may schedule once higher-priority work
+    /// clears, so they are NOT unschedulable on the partition's capacity.
+    async fn probe_all_classified(
+        &self,
+    ) -> (std::collections::HashMap<String, PeerLifeState>, usize) {
+        let entries: Vec<(String, String)> = {
+            let mgr = self.manager.lock().await;
+            mgr.secondary_jobs_snapshot()
+        };
+        let mut out = std::collections::HashMap::with_capacity(entries.len());
+        let mut pending_resources: usize = 0;
+        for (secondary_id, job_id) in entries {
+            // Query each job's status including the reason field.
+            let mgr = self.manager.lock().await;
+            let status_result = mgr.get_job_status(&job_id).await;
+            drop(mgr); // release the lock before the sacct fallback below
+            let life = match status_result {
+                Ok(ref info) => match info.state_kind {
+                    Some(crate::job_manager::JobStatus::Pending) => {
+                        // "Resources" is the reason SLURM prints when the
+                        // job cannot schedule on the partition's capacity.
+                        if info.reason == "Resources" {
+                            pending_resources += 1;
+                        }
+                        PeerLifeState::Alive
+                    }
+                    Some(crate::job_manager::JobStatus::Running)
+                    | Some(crate::job_manager::JobStatus::Unknown(_)) => PeerLifeState::Alive,
+                    Some(crate::job_manager::JobStatus::Completed)
+                    | Some(crate::job_manager::JobStatus::Failed)
+                    | Some(crate::job_manager::JobStatus::Cancelled) => PeerLifeState::Gone,
+                    None => {
+                        // squeue has no row — check sacct for terminal state.
+                        let mgr2 = self.manager.lock().await;
+                        match mgr2.sacct_terminal_state_pub(&job_id).await {
+                            Some(_) => PeerLifeState::Gone,
+                            None => PeerLifeState::Unknown,
+                        }
+                    }
+                },
+                Err(_) => PeerLifeState::Unknown,
+            };
+            out.insert(secondary_id, life);
+        }
+        (out, pending_resources)
+    }
 }
