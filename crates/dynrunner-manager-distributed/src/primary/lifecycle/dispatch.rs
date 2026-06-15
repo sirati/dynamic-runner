@@ -31,22 +31,76 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         &mut self,
         bypass_backpressure: bool,
     ) -> Result<(), String> {
-        // Visit free workers in load-aware order so a secondary with
-        // many in-flight tasks doesn't keep winning tail-of-phase
-        // dispatches against an idler peer. `dispatch_order` selects on
-        // the authoritative free predicate (`held_task().is_none()`)
-        // and sorts by the advisory busy-load count.
+        // Chunked-yield outer loop (#547). The dispatch recheck visits
+        // every free worker; on a large idle fleet (e.g. 96 workers ×
+        // a 46 k pool) the per-worker view rebuild + scheduler scan is
+        // O(P) per worker, so the burst is O(M × P) of contiguous CPU
+        // on the coordinator's single-thread runtime. The worker-mgmt
+        // arm is itself a select! arm body, so other arms can't
+        // re-fire until this returns — but unlike the SpawnTasks
+        // wedge (per-batch 150 s), a single recheck burst is
+        // bounded enough (~hundreds of ms) that yielding INSIDE the
+        // arm body is sufficient: each chunk of K workers releases
+        // the runtime to sibling spawn_local tasks (the lifecycle /
+        // task_completed dispatchers, etc.) and the next chunk
+        // re-derives `order` and `all_infos` from the current worker
+        // roster, so a worker that became busy mid-recheck (a
+        // completion landed via the OTHER select! arm running before
+        // we return) is naturally dropped.
+        let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        loop {
+            let progressed = self
+                .dispatch_to_idle_workers_chunk(bypass_backpressure, &mut visited)
+                .await;
+            if !progressed {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// One chunk of the dispatch recheck (#547). Re-derives `order` AND
+    /// `all_infos` from the CURRENT roster + the per-worker
+    /// idle/backpressure/cap state, then dispatches up to
+    /// [`DISPATCH_CHUNK_WORKERS`] workers' worth of assignments before
+    /// returning. Returns `true` iff a worker was visited (caller's loop
+    /// re-iterates), `false` once the order is exhausted (the outer loop
+    /// terminates).
+    ///
+    /// `visited` accumulates worker indices already attempted in this
+    /// recheck so a worker that COULDN'T fit a task in one chunk (no view
+    /// match for its budget) is not retried in a later chunk — the
+    /// scheduler's view-construction is deterministic given the pool +
+    /// roster, so a no-fit verdict at chunk N would re-fire at chunk N+1
+    /// against the same inputs. Skipping already-visited indices keeps
+    /// the outer loop O(M).
+    async fn dispatch_to_idle_workers_chunk(
+        &mut self,
+        bypass_backpressure: bool,
+        visited: &mut std::collections::HashSet<usize>,
+    ) -> bool {
+        // Re-derive the order from the CURRENT roster every chunk: a
+        // worker freed by a completion landing via the inbox arm between
+        // chunks shows up in the fresh order, and a worker that just
+        // committed an assignment drops out. `dispatch_order` filters to
+        // idle on the authoritative `held_task().is_none()` predicate.
         let order = dispatch_order(&self.workers);
-        // Fleet-wide budget snapshot, built ONCE per recheck (not per
-        // idle worker — the rebuild-inside-the-loop shape made the
-        // recheck O(workers²) in `budget_info` clones). The snapshot
-        // stays faithful to a per-worker rebuild because the loop's
-        // only worker-state mutations are `commit_assignment` /
-        // `rollback_assignment` on the CURRENT `worker_idx`, and both
-        // sites below refresh exactly that entry.
+        // Fleet-wide budget snapshot — see the parent function's note on
+        // why this is built ONCE per chunk (vs per-worker inside the
+        // loop). The chunked outer loop re-builds it per chunk so a
+        // mid-recheck completion's effect on the snapshot lands by the
+        // next chunk.
         let mut all_infos: Vec<dynrunner_scheduler_api::WorkerBudgetInfo<I>> =
             self.workers.iter().map(|w| w.budget_info()).collect();
+        let mut visited_this_chunk = 0usize;
+        let mut any_progress = false;
         for worker_idx in order {
+            if visited.contains(&worker_idx) {
+                continue;
+            }
+            any_progress = true;
+            visited.insert(worker_idx);
+            visited_this_chunk += 1;
             // Composed dispatch-shape gate: backpressure backoff +
             // OOM-bucket single-worker masking. The predicate lives
             // on `PrimaryCoordinator` so this call site stays
@@ -221,7 +275,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     "task assigned: identity"
                 );
             }
+            // Chunk break: yield after `DISPATCH_CHUNK_WORKERS` workers'
+            // worth of processing so sibling LocalSet tasks (the lifecycle
+            // / task_completed dispatchers) get an opportunity to run
+            // between chunks. The outer `dispatch_to_idle_workers` re-
+            // enters this function on the next chunk; `visited` carries
+            // forward so the new chunk's `order` skips already-visited
+            // workers.
+            if visited_this_chunk >= Self::DISPATCH_CHUNK_WORKERS {
+                break;
+            }
         }
-        Ok(())
+        any_progress
     }
 }

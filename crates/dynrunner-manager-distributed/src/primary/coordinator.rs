@@ -1570,6 +1570,26 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// stalls. The owner-approved default is the conservative midpoint.
     pub(super) const APPLY_SPAWN_CHUNK_SIZE: usize = 256;
 
+    /// Per-chunk worker count for the chunked `dispatch_to_idle_workers`
+    /// loop (#547).
+    ///
+    /// Unlike `APPLY_SPAWN_CHUNK_SIZE`, this chunk size only releases the
+    /// coordinator runtime to SIBLING `spawn_local`'d tasks (the lifecycle
+    /// / task_completed dispatchers) — the chunked loop runs INSIDE the
+    /// worker-mgmt arm body, so the operational `select!`'s OTHER arms
+    /// (heartbeat_tick, inbox, COMMAND) still wait for the recheck to
+    /// finish. The recheck duration on a large fleet (e.g. ~96 workers
+    /// against a 46 k pool ≈ several hundred ms total) is bounded enough
+    /// that missing at most one heartbeat tick per recheck is acceptable,
+    /// so the chunk size only controls per-chunk fairness against the
+    /// LocalSet siblings.
+    ///
+    /// K=8 gives ~10 chunks across a 96-worker fleet, ~5 ms per chunk —
+    /// fine-grained enough for sibling fairness without exploding the
+    /// re-derive overhead (each chunk re-derives `dispatch_order` and
+    /// the `all_infos` snapshot from the current roster).
+    pub(super) const DISPATCH_CHUNK_WORKERS: usize = 8;
+
     pub fn new(
         config: PrimaryConfig,
         client: crate::process::MeshClient<I>,
