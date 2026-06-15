@@ -167,6 +167,105 @@ impl StatsSnapshot {
     /// and pushes the result into the reporter's snapshot source via
     /// `SharedSnapshotSource::publish` (the reporter's own test suite also
     /// exercises it directly).
+    /// Skip-predicate for the 10-min periodic report: returns `true` iff
+    /// every field that DIFFERS between `self` and `prev` is in the
+    /// skip-eligible set — i.e. the only movement since the last
+    /// announcement is routine throughput OR a high-frequency
+    /// resource-stat reading (#575). A `true` return tells the driver
+    /// to elide this 10-minute emission (the 1-hour safety net will
+    /// print the accumulated delta later); a `false` return means at
+    /// least one non-eligible field moved and the report must run on
+    /// the normal cadence.
+    ///
+    /// Skip-eligible set:
+    ///   * Throughput counters: `succeeded`, `fail_retry`, `fail_oom`,
+    ///     `fail_final` (owner-decision 2026-06-15).
+    ///   * #575 averaged resource stats: `avg_mem_p10/p30/p50/p70/p90/avg`,
+    ///     `avg_total_free_memory`, `avg_total_swap_used`,
+    ///     `avg_total_free_swap`, `avg_cpu_utilization_milli` — these
+    ///     are continuous measurements with a per-field 25% inclusion
+    ///     gate inside `format.rs`; a resource-stat-only change must
+    ///     NOT force a 10-min print (high-frequency noise; brief #575).
+    ///     When the OUTER predicate fires and the print does happen
+    ///     (because something OUTSIDE the skip set changed, OR the
+    ///     1-hour safety net fires, OR a force-print was signalled),
+    ///     `format.rs::render_report` then runs the 25% gate on each
+    ///     resource line to decide actual line inclusion.
+    ///
+    /// Subset semantics (not strict equality): an all-equal snapshot
+    /// (diff = ∅) trivially satisfies "all changes are in the eligible
+    /// set" and returns `true` — the spec elides such ticks too (an
+    /// empty report has nothing wake-worthy; the operator uses SIGUSR1
+    /// to force a heartbeat read).
+    ///
+    /// Scope rationale (owner-decision 2026-06-15): `unfulfillable`,
+    /// `invalid_task`, and `setup_succeeded` are EXCLUDED — they are
+    /// exceptional-flow categories (structural failures, capability-loss
+    /// cascades, setup-task outcomes), not routine throughput, and the
+    /// operator wants those changes promptly. The maps
+    /// (`per_secondary_in_flight`, `per_secondary_queued_after_local_dep`)
+    /// and the roster (`alive_secondaries`) are also excluded so a peer
+    /// joining/leaving or a task moving between secondaries is never
+    /// skipped.
+    pub fn diff_subset_of_skip_eligible(&self, prev: &Self) -> bool {
+        // Destructure once so a future field addition forces a compile
+        // error here — every snapshot field must be classified
+        // "skip-eligible counter" or "must-print-on-change".
+        let Self {
+            succeeded: _cur_succeeded,
+            setup_succeeded,
+            fail_retry: _cur_fail_retry,
+            fail_oom: _cur_fail_oom,
+            fail_final: _cur_fail_final,
+            unfulfillable,
+            invalid_task,
+            in_flight,
+            queued_after_local_dependency,
+            per_secondary_queued_after_local_dep,
+            waiting_on_deps,
+            blocked,
+            ready_in_queue,
+            per_secondary_in_flight,
+            alive_secondaries,
+            busy_secondaries,
+            total_secondaries,
+            busy_workers,
+            total_workers,
+            // #575 resource-stat averages are SKIP-ELIGIBLE — see the
+            // method docs. Bound with `_` prefix so the destructure
+            // stays exhaustive (a future resource field is a compile
+            // error here until classified), but skipped from the
+            // equality comparisons below: a resource-only change
+            // never trips this predicate.
+            avg_mem_p10_bytes: _,
+            avg_mem_p30_bytes: _,
+            avg_mem_p50_bytes: _,
+            avg_mem_p70_bytes: _,
+            avg_mem_p90_bytes: _,
+            avg_mem_avg_bytes: _,
+            avg_total_free_memory_bytes: _,
+            avg_total_swap_used_bytes: _,
+            avg_total_free_swap_bytes: _,
+            avg_cpu_utilization_milli: _,
+        } = self;
+        setup_succeeded == &prev.setup_succeeded
+            && unfulfillable == &prev.unfulfillable
+            && invalid_task == &prev.invalid_task
+            && in_flight == &prev.in_flight
+            && queued_after_local_dependency == &prev.queued_after_local_dependency
+            && per_secondary_queued_after_local_dep
+                == &prev.per_secondary_queued_after_local_dep
+            && waiting_on_deps == &prev.waiting_on_deps
+            && blocked == &prev.blocked
+            && ready_in_queue == &prev.ready_in_queue
+            && per_secondary_in_flight == &prev.per_secondary_in_flight
+            && alive_secondaries == &prev.alive_secondaries
+            && busy_secondaries == &prev.busy_secondaries
+            && total_secondaries == &prev.total_secondaries
+            && busy_workers == &prev.busy_workers
+            && total_workers == &prev.total_workers
+    }
+
     pub fn from_cluster_state<I: Identifier>(state: &ClusterState<I>) -> Self {
         let outcome = state.outcome_counts();
         let counts = state.counts();

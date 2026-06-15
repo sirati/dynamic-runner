@@ -86,6 +86,7 @@ use crate::observer::cluster_gone::{ClusterGoneDetector, ClusterGoneVerdict};
 use crate::observer::failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 use crate::observer::fleet_death::{FleetDeathDetector, FleetDeathVerdict};
 use crate::observer::job_ledger::{ClusterTerminalOutcome, JobLedgerProbeHandle};
+use crate::force_print_trigger::ForcePrintTrigger;
 use crate::graceful_abort_trigger::GracefulAbortTrigger;
 use crate::observer::lifecycle::{AnnouncerHandle, attach_observer_announcer};
 use crate::observer::lost_visibility::{
@@ -467,6 +468,17 @@ where
     /// Either way the run loop consumes the SAME trigger, so a buffered
     /// pre-seat delivery is serviced exactly like a post-seat one.
     graceful_abort_trigger: Option<GracefulAbortTrigger>,
+    /// The operator's SIGUSR1 force-print trigger (observer-only;
+    /// repurposes a signal the framework otherwise registers with
+    /// Python's `faulthandler` on primary / secondary processes). `Some`
+    /// when the late-joiner pre-armed it before bootstrap so a pre-seat
+    /// delivery is latched; `None` on a relocated submitter→observer
+    /// path (the relocated process still has the worker-side SIGUSR1
+    /// frame-dump registered through the regular dispatch route — it is
+    /// not a force-print consumer). Consumed by the reporter task via
+    /// a forwarder spawned in `run_inner`. See
+    /// [`crate::force_print_trigger`].
+    force_print_trigger: Option<ForcePrintTrigger>,
 }
 
 /// Per-replacement-id state of the observer-side respawn execution arm.
@@ -710,6 +722,12 @@ where
             // `None` when the primary was never injected one — the observer's
             // own `run`-start arm then takes over (the cold-join behaviour).
             graceful_abort_trigger,
+            // A relocated submitter→observer path leaves SIGUSR1 wired
+            // to the worker-side `faulthandler` frame-dump (installed by
+            // its original dispatch route); only the late-joiner observer
+            // route repurposes SIGUSR1 to force-print, and that route
+            // injects via `set_force_print_trigger` post-construction.
+            force_print_trigger: None,
         }
     }
 
@@ -831,6 +849,11 @@ where
             respawn_exec_tx,
             respawn_exec_rx: Some(respawn_exec_rx),
             graceful_abort_trigger: None,
+            // Cold-join late-joiners inject via `set_force_print_trigger`
+            // after construction (arm at process entry, hand off here);
+            // unset construction = the trigger lives parked in the run
+            // loop's forwarder until then.
+            force_print_trigger: None,
         }
     }
 
@@ -887,6 +910,21 @@ where
     /// consume. Without an injection, [`Self::run`] arms at loop start.
     pub fn set_graceful_abort_trigger(&mut self, trigger: GracefulAbortTrigger) {
         self.graceful_abort_trigger = Some(trigger);
+    }
+
+    /// Inject a pre-armed operator force-print trigger AFTER construction
+    /// — the SIGUSR1 sibling of [`Self::set_graceful_abort_trigger`].
+    /// Used by the late-joiner observer entry path, which arms the
+    /// trigger at process entry (BEFORE its bootstrap rendezvous, so a
+    /// signal received pre-seat is latched rather than killing the
+    /// process via the kernel's default disposition for SIGUSR1) and
+    /// hands the SAME trigger here for the reporter task's force-print
+    /// arm to consume. Without an injection, no force-print arm is
+    /// driven and the reporter runs the periodic cadences alone — the
+    /// degraded but always-correct fallback. See
+    /// [`crate::force_print_trigger`].
+    pub fn set_force_print_trigger(&mut self, trigger: ForcePrintTrigger) {
+        self.force_print_trigger = Some(trigger);
     }
 
     /// Read-only access to the replicated ledger (tests / result getters).
@@ -1200,10 +1238,35 @@ where
         // skip-one grid bookkeeping; the shared note slot lets the
         // reporter's emissions host the parked reconnection note.
         let (outage_tx, outage_rx) = mpsc::unbounded_channel::<EndedOutage>();
+        // The SIGUSR1 force-print channel feeding the reporter's
+        // off-cadence arm. The forwarder spawned below consumes the
+        // pre-armed `ForcePrintTrigger` (if injected via
+        // `set_force_print_trigger`) and pushes one `()` per delivery
+        // into this channel; the reporter task's arm then renders the
+        // full snapshot. No-trigger paths leave the rx parked — the
+        // periodic cadences keep running, the operator just has no
+        // off-grid force-print channel (the degraded-arm contract from
+        // `force_print_trigger`).
+        let (force_print_tx, force_print_rx) = mpsc::unbounded_channel::<()>();
+        if let Some(mut trigger) = self.force_print_trigger.take() {
+            tokio::task::spawn_local(async move {
+                // Forward each SIGUSR1 delivery into the reporter's
+                // arm. `recv()` parks on a closed/disabled stream;
+                // a failed `send` means the reporter has already torn
+                // down (rx dropped on cancel), so the forwarder exits
+                // — there is no listener left to wake.
+                while let Some(()) = trigger.recv().await {
+                    if force_print_tx.send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         let reporter_task = tokio::task::spawn_local(run_reporter(
             snapshot_source,
             TokioClock,
             outage_rx,
+            force_print_rx,
             self.wake_note.clone(),
             async move {
                 let _ = reporter_cancel_rx.await;

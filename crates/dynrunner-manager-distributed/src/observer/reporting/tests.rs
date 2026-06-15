@@ -813,6 +813,7 @@ async fn driver_emits_stats_on_10min_cadence_and_idle_on_threshold() {
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let (_outage_tx, outage_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::observer::lost_visibility::EndedOutage>();
+    let (_force_print_tx, force_print_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let driver = tokio::spawn({
         let src = src.clone();
         async move {
@@ -820,6 +821,7 @@ async fn driver_emits_stats_on_10min_cadence_and_idle_on_threshold() {
                 src,
                 VirtualClock,
                 outage_rx,
+                force_print_rx,
                 crate::observer::lost_visibility::WakeNoteSlot::default(),
                 async move {
                     let _ = cancel_rx.await;
@@ -1127,15 +1129,23 @@ async fn driver_runs_late_stats_on_ended_outage_signal() {
     let note = WakeNoteSlot::default();
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let (outage_tx, outage_rx) = tokio::sync::mpsc::unbounded_channel::<EndedOutage>();
+    let (_force_print_tx, force_print_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     // Virtual t0 (the paused clock's view) — the whole run is "down".
     let down_since = tokio::time::Instant::now().into_std();
     let driver = tokio::task::spawn({
         let src = src.clone();
         let note = note.clone();
         async move {
-            super::reporter::run_reporter(src, VirtualClock, outage_rx, note, async move {
-                let _ = cancel_rx.await;
-            })
+            super::reporter::run_reporter(
+                src,
+                VirtualClock,
+                outage_rx,
+                force_print_rx,
+                note,
+                async move {
+                    let _ = cancel_rx.await;
+                },
+            )
             .await;
         }
     });
@@ -1180,13 +1190,21 @@ async fn driver_skips_late_stats_when_no_periodic_elapsed_while_down() {
     let note = WakeNoteSlot::default();
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let (outage_tx, outage_rx) = tokio::sync::mpsc::unbounded_channel::<EndedOutage>();
+    let (_force_print_tx, force_print_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let driver = tokio::task::spawn({
         let src = src.clone();
         let note = note.clone();
         async move {
-            super::reporter::run_reporter(src, VirtualClock, outage_rx, note, async move {
-                let _ = cancel_rx.await;
-            })
+            super::reporter::run_reporter(
+                src,
+                VirtualClock,
+                outage_rx,
+                force_print_rx,
+                note,
+                async move {
+                    let _ = cancel_rx.await;
+                },
+            )
             .await;
         }
     });
@@ -1218,6 +1236,37 @@ async fn driver_skips_late_stats_when_no_periodic_elapsed_while_down() {
     tokio::time::advance(Duration::from_millis(1)).await;
     let joined = tokio::time::timeout(Duration::from_secs(1), driver).await;
     assert!(joined.is_ok(), "driver must terminate on cancel");
+}
+
+// ── #574: 10-min skip predicate + 1-hour safety net + SIGUSR1 force-print ──
+
+/// `snap_with` only sets the two earlier helpers' fields; for the skip
+/// predicate tests we need to move each candidate field independently.
+/// 8 inputs is intentional — every field the skip predicate distinguishes
+/// gets its own positional slot so test bodies stay readable as flat
+/// `snap_full(succeeded, fail_retry, fail_oom, fail_final, …)`.
+#[allow(clippy::too_many_arguments)]
+fn snap_full(
+    succeeded: usize,
+    fail_retry: usize,
+    fail_oom: usize,
+    fail_final: usize,
+    unfulfillable: usize,
+    invalid_task: usize,
+    setup_succeeded: usize,
+    in_flight: usize,
+) -> StatsSnapshot {
+    StatsSnapshot {
+        succeeded,
+        fail_retry,
+        fail_oom,
+        fail_final,
+        unfulfillable,
+        invalid_task,
+        setup_succeeded,
+        in_flight,
+        ..Default::default()
+    }
 }
 
 // ── #575 resource-stat inclusion tests (per-field 25% threshold + zero-baseline) ──
@@ -1357,4 +1406,381 @@ fn resource_avg_per_field_baseline_independence() {
         Some(1000),
         "P90's baseline must NOT advance just because P50 emitted"
     );
+}
+/// T1: a tick whose ONLY diff is `succeeded` (an in-set throughput
+/// counter) elides under `on_stats_tick_skippable`, and the
+/// last-announced baseline is NOT advanced — invariant 1. The
+/// no-advance is observed via a follow-on `on_stats_tick_skippable`
+/// call on a snapshot where a non-eligible field has ALSO moved: the
+/// emitted body's `succeeded` line carries the ACCUMULATED delta
+/// against the seed (proving the skipped tick did not reset the
+/// baseline to its own value).
+#[test]
+fn skippable_succeeded_only_elides_and_keeps_baseline() {
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        // Seed the baseline by emitting one regular tick at succeeded=1.
+        assert!(reporter.on_stats_tick(&snap_full(1, 0, 0, 0, 0, 0, 0, 0)));
+        // Only `succeeded` moves; the skippable path elides.
+        assert!(!reporter.on_stats_tick_skippable(&snap_full(2, 0, 0, 0, 0, 0, 0, 0)));
+        // Now a tick where a non-eligible field (in_flight) has moved
+        // too — predicate fails, the emit fires. Critically, the
+        // succeeded delta in the EMITTED body must be against the
+        // SEED's succeeded=1 (the last-PRINTED baseline), NOT against
+        // the prior skipped tick's succeeded=2 — proving the skip did
+        // not advance `last_announced`.
+        assert!(reporter.on_stats_tick_skippable(&snap_full(3, 0, 0, 0, 0, 0, 0, 7)));
+    });
+    assert_eq!(events.len(), 2, "seed + the post-skip mixed-diff emission");
+    let body = &events[1].message;
+    assert!(
+        body.contains("succeeded: 3(+2)"),
+        "the post-skip emit's succeeded delta is against the last-PRINTED snapshot (1, not 2): got\n{body}"
+    );
+}
+
+/// T2: a tick whose ONLY diff is `fail_retry` elides — invariant 1.
+#[test]
+fn skippable_fail_retry_only_elides() {
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        assert!(reporter.on_stats_tick(&snap_full(1, 0, 0, 0, 0, 0, 0, 0)));
+        assert!(!reporter.on_stats_tick_skippable(&snap_full(1, 5, 0, 0, 0, 0, 0, 0)));
+    });
+    assert_eq!(events.len(), 1);
+}
+
+/// T3: a tick whose diff covers MULTIPLE in-set counters
+/// (succeeded + fail_oom + fail_final) elides — the skip predicate is
+/// subset (not strict equality on one field) — invariant 6.
+#[test]
+fn skippable_multiple_eligible_counters_elide() {
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        assert!(reporter.on_stats_tick(&snap_full(1, 0, 0, 0, 0, 0, 0, 0)));
+        assert!(!reporter.on_stats_tick_skippable(&snap_full(3, 0, 1, 1, 0, 0, 0, 0)));
+    });
+    assert_eq!(events.len(), 1);
+}
+
+/// T4: a tick whose diff includes a NON-eligible field (here
+/// `in_flight`) is NOT skipped — the eligible counter moving alongside
+/// is irrelevant: the predicate is a subset check on the WHOLE diff.
+#[test]
+fn skippable_mixed_with_in_flight_prints() {
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        assert!(reporter.on_stats_tick(&snap_full(1, 0, 0, 0, 0, 0, 0, 0)));
+        // succeeded AND in_flight both change → not a subset.
+        assert!(reporter.on_stats_tick_skippable(&snap_full(2, 0, 0, 0, 0, 0, 0, 3)));
+    });
+    // Two emissions: seed + the mixed-diff tick.
+    assert_eq!(events.len(), 2);
+}
+
+/// T4b: `unfulfillable` is OUT of the skip-eligible set (owner
+/// decision: it is an exceptional-flow counter, not routine throughput).
+/// A diff that moves only `unfulfillable` prints.
+#[test]
+fn skippable_unfulfillable_only_prints() {
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        assert!(reporter.on_stats_tick(&snap_full(1, 0, 0, 0, 0, 0, 0, 0)));
+        assert!(reporter.on_stats_tick_skippable(&snap_full(1, 0, 0, 0, 1, 0, 0, 0)));
+    });
+    assert_eq!(events.len(), 2);
+}
+
+/// T4c: `invalid_task` is OUT of the skip-eligible set. A diff that
+/// moves only `invalid_task` prints.
+#[test]
+fn skippable_invalid_task_only_prints() {
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        assert!(reporter.on_stats_tick(&snap_full(1, 0, 0, 0, 0, 0, 0, 0)));
+        assert!(reporter.on_stats_tick_skippable(&snap_full(1, 0, 0, 0, 0, 1, 0, 0)));
+    });
+    assert_eq!(events.len(), 2);
+}
+
+/// T4d: `setup_succeeded` is OUT of the skip-eligible set (owner
+/// decision: it is a setup-task category, not the routine
+/// worker-throughput counters).
+#[test]
+fn skippable_setup_succeeded_only_prints() {
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        assert!(reporter.on_stats_tick(&snap_full(1, 0, 0, 0, 0, 0, 0, 0)));
+        assert!(reporter.on_stats_tick_skippable(&snap_full(1, 0, 0, 0, 0, 0, 1, 0)));
+    });
+    assert_eq!(events.len(), 2);
+}
+
+/// T5: the 6th consecutive skippable tick is the 1-hour safety net and
+/// IS emitted, even with only `succeeded` movement — invariant 2.
+#[test]
+fn safety_net_fires_on_6th_skippable_tick() {
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        // Seed: emit one tick so the baseline is non-default.
+        assert!(reporter.on_stats_tick(&snap_full(1, 0, 0, 0, 0, 0, 0, 0)));
+        // 5 skipped throughput-only ticks.
+        for n in 2..=6 {
+            assert!(
+                !reporter.on_stats_tick_skippable(&snap_full(n, 0, 0, 0, 0, 0, 0, 0)),
+                "tick {n} after seed must skip (counter < safety net)"
+            );
+        }
+        // 6th skippable tick after the seed = the safety-net boundary.
+        assert!(
+            reporter.on_stats_tick_skippable(&snap_full(7, 0, 0, 0, 0, 0, 0, 0)),
+            "the 6th routine tick since the last emit must fire the safety net"
+        );
+    });
+    // Seed + safety-net = 2 emissions; the 5 intermediate ticks elided.
+    assert_eq!(events.len(), 2);
+}
+
+/// T6: the 1-hour safety net's delta is against the LAST-PRINTED
+/// snapshot, not the last-tick snapshot — invariant 3. Across 5 skipped
+/// 10-min ticks each bumping `succeeded` by 1_000, the 1-hour emission
+/// shows the accumulated +5_000 delta plus the 6th tick's own +1_000 =
+/// +6_000.
+#[test]
+fn safety_net_delta_is_against_last_printed_snapshot() {
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        // First emit at succeeded = 1_000 so the baseline is durable.
+        assert!(reporter.on_stats_tick(&snap_full(1_000, 0, 0, 0, 0, 0, 0, 0)));
+        // 5 skipped ticks: succeeded keeps climbing by 1_000 each tick.
+        for k in 1..=5 {
+            let snap = snap_full(1_000 + 1_000 * k, 0, 0, 0, 0, 0, 0, 0);
+            assert!(!reporter.on_stats_tick_skippable(&snap));
+        }
+        // 6th tick = safety net boundary. succeeded = 7_000.
+        assert!(reporter.on_stats_tick_skippable(&snap_full(7_000, 0, 0, 0, 0, 0, 0, 0)));
+    });
+    assert_eq!(events.len(), 2, "seed + safety net = 2 emissions");
+    let safety_body = &events[1].message;
+    assert!(
+        safety_body.contains("succeeded: 7000(+6000)"),
+        "safety-net emission must render the accumulated delta against the last-PRINTED snapshot; got:\n{safety_body}"
+    );
+}
+
+/// T7: a SIGUSR1 force-print renders the FULL snapshot — every field is
+/// in the emitted body, including unchanged and zero values —
+/// invariant 4.
+#[test]
+fn force_print_emits_full_snapshot_including_unchanged() {
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        // Seed an emission so `last_announced` is non-default; the
+        // force-print must still show every field of the CURRENT snap.
+        assert!(reporter.on_stats_tick(&snap_full(5, 0, 0, 0, 0, 0, 0, 2)));
+        // Force-print on a snapshot identical to the seed: every line
+        // (including the unchanged ones) MUST appear in the body.
+        assert!(reporter.on_force_print(&snap_full(5, 0, 0, 0, 0, 0, 0, 2)));
+    });
+    assert_eq!(events.len(), 2);
+    let force_body = &events[1].message;
+    for needle in [
+        "succeeded: 5",
+        "setup: 0",
+        "failed (retry): 0",
+        "failed (oom): 0",
+        "failed (final): 0",
+        "unfulfillable: 0",
+        "invalid_task: 0",
+        "in-flight: 2",
+        "waiting on deps: 0",
+        "blocked (upstream unfulfillable): 0",
+        "ready in queue: 0",
+        "busy secondaries: 0/0",
+        "busy workers: 0/0",
+    ] {
+        assert!(
+            force_body.contains(needle),
+            "force-print body must include `{needle}` (full-snapshot contract); got:\n{force_body}"
+        );
+    }
+    assert!(!force_body.contains("Omitted"));
+}
+
+/// T8: after a force-print, the next 10-min tick diffs against the
+/// POST-signal snapshot (the force-print advanced `last_announced`) —
+/// invariant 5. The diff against the same snapshot is ∅, so the next
+/// tick elides cleanly without re-emitting the (now-already-printed)
+/// fields.
+#[test]
+fn force_print_advances_last_announced() {
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        // Force-print at succeeded=5.
+        assert!(reporter.on_force_print(&snap_full(5, 0, 0, 0, 0, 0, 0, 0)));
+        // The next ordinary 10-min tick with the SAME snapshot must
+        // elide — the baseline was advanced by the force-print, so the
+        // diff is empty.
+        assert!(!reporter.on_stats_tick_skippable(&snap_full(5, 0, 0, 0, 0, 0, 0, 0)));
+    });
+    assert_eq!(events.len(), 1, "exactly one emission (the force-print)");
+}
+
+/// T9: a 10-min tick whose diff is exactly ∅ (no field moved at all)
+/// elides — the skip predicate is `diff ⊆ {eligible}` and ∅ is a
+/// subset of any set — invariant 6 (owner-approved default).
+#[test]
+fn skippable_empty_diff_elides() {
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        assert!(reporter.on_stats_tick(&snap_full(2, 1, 0, 0, 0, 0, 0, 4)));
+        // Exact same snapshot — diff is ∅.
+        assert!(!reporter.on_stats_tick_skippable(&snap_full(2, 1, 0, 0, 0, 0, 0, 4)));
+    });
+    assert_eq!(events.len(), 1);
+}
+
+/// T10: a SIGUSR1 force-print mid-skip-streak emits regardless of how
+/// many ticks have been skipped, and resets the safety-net counter so
+/// the next 1-hour boundary is 6 ticks AWAY from the force-print —
+/// invariant 5 (the force-print is on the same baseline-write path as
+/// the periodic emit).
+#[test]
+fn force_print_during_skip_streak_resets_safety_net() {
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = Reporter::new();
+        // Seed.
+        assert!(reporter.on_stats_tick(&snap_full(1, 0, 0, 0, 0, 0, 0, 0)));
+        // 3 skipped ticks.
+        for n in 2..=4 {
+            assert!(!reporter.on_stats_tick_skippable(&snap_full(n, 0, 0, 0, 0, 0, 0, 0)));
+        }
+        // Force-print mid-streak.
+        assert!(reporter.on_force_print(&snap_full(4, 0, 0, 0, 0, 0, 0, 0)));
+        // 5 more skipped ticks — none should fire the safety net
+        // (we just printed). The counter restarted at 0.
+        for n in 5..=9 {
+            assert!(
+                !reporter.on_stats_tick_skippable(&snap_full(n, 0, 0, 0, 0, 0, 0, 0)),
+                "tick {n} (5 ticks after force-print) must still skip"
+            );
+        }
+        // The 6th routine tick after the force-print fires the safety
+        // net — measured from the force-print's emission, not from the
+        // seed before it.
+        assert!(reporter.on_stats_tick_skippable(&snap_full(10, 0, 0, 0, 0, 0, 0, 0)));
+    });
+    // Seed + force-print + safety-net-after-force-print = 3 emissions.
+    assert_eq!(events.len(), 3);
+    let safety_body = &events[2].message;
+    assert!(
+        safety_body.contains("succeeded: 10(+6)"),
+        "safety net delta must be against the force-print baseline (succeeded=4); got:\n{safety_body}"
+    );
+}
+
+/// Predicate-direct: `diff_subset_of_skip_eligible` is the single seam
+/// the skip path consults. Pin the eligible / non-eligible classification
+/// directly so a future field addition lands on the destructure-or-die
+/// check in `StatsSnapshot`.
+#[test]
+fn diff_subset_of_skip_eligible_classifies_fields_correctly() {
+    let base = snap_full(10, 5, 2, 1, 0, 0, 0, 0);
+
+    // Eligible counters: any subset of {succeeded, fail_retry,
+    // fail_oom, fail_final} moving alone returns true.
+    let mut cur = base.clone();
+    cur.succeeded = 11;
+    assert!(cur.diff_subset_of_skip_eligible(&base));
+    let mut cur = base.clone();
+    cur.fail_retry = 99;
+    assert!(cur.diff_subset_of_skip_eligible(&base));
+    let mut cur = base.clone();
+    cur.fail_oom = 99;
+    assert!(cur.diff_subset_of_skip_eligible(&base));
+    let mut cur = base.clone();
+    cur.fail_final = 99;
+    assert!(cur.diff_subset_of_skip_eligible(&base));
+    // Multiple eligible counters moving simultaneously — still in.
+    let mut cur = base.clone();
+    cur.succeeded = 99;
+    cur.fail_retry = 99;
+    cur.fail_oom = 99;
+    cur.fail_final = 99;
+    assert!(cur.diff_subset_of_skip_eligible(&base));
+    // Zero diff — ∅ is a subset of any set.
+    assert!(base.diff_subset_of_skip_eligible(&base));
+
+    // NON-eligible: any of these fields moving (even alone) FAILS the
+    // predicate (the tick must print).
+    let mut cur = base.clone();
+    cur.unfulfillable = 1;
+    assert!(!cur.diff_subset_of_skip_eligible(&base));
+    let mut cur = base.clone();
+    cur.invalid_task = 1;
+    assert!(!cur.diff_subset_of_skip_eligible(&base));
+    let mut cur = base.clone();
+    cur.setup_succeeded = 1;
+    assert!(!cur.diff_subset_of_skip_eligible(&base));
+    let mut cur = base.clone();
+    cur.in_flight = 1;
+    assert!(!cur.diff_subset_of_skip_eligible(&base));
+    let mut cur = base.clone();
+    cur.waiting_on_deps = 1;
+    assert!(!cur.diff_subset_of_skip_eligible(&base));
+    let mut cur = base.clone();
+    cur.blocked = 1;
+    assert!(!cur.diff_subset_of_skip_eligible(&base));
+    let mut cur = base.clone();
+    cur.ready_in_queue = 1;
+    assert!(!cur.diff_subset_of_skip_eligible(&base));
+    let mut cur = base.clone();
+    cur.busy_secondaries = 1;
+    cur.total_secondaries = 1;
+    assert!(!cur.diff_subset_of_skip_eligible(&base));
+    let mut cur = base.clone();
+    cur.busy_workers = 1;
+    cur.total_workers = 1;
+    assert!(!cur.diff_subset_of_skip_eligible(&base));
+    let mut cur = base.clone();
+    cur.queued_after_local_dependency = 1;
+    assert!(!cur.diff_subset_of_skip_eligible(&base));
+    let mut cur = base.clone();
+    cur.alive_secondaries.insert("sec-x".to_string());
+    assert!(!cur.diff_subset_of_skip_eligible(&base));
+    let mut cur = base.clone();
+    cur.per_secondary_in_flight
+        .insert("sec-x".to_string(), 1);
+    assert!(!cur.diff_subset_of_skip_eligible(&base));
+    let mut cur = base.clone();
+    cur.per_secondary_queued_after_local_dep
+        .insert("sec-x".to_string(), 1);
+    assert!(!cur.diff_subset_of_skip_eligible(&base));
+}
+
+/// `render_report_full` is unconditional: every line is emitted,
+/// including zero values. No footer, no parenthetical deltas.
+#[test]
+fn render_report_full_emits_every_line_including_zeros() {
+    let snap = StatsSnapshot::default();
+    let body = super::format::render_report_full(&snap);
+    for needle in [
+        "succeeded: 0",
+        "setup: 0",
+        "failed (retry): 0",
+        "failed (oom): 0",
+        "failed (final): 0",
+        "unfulfillable: 0",
+        "invalid_task: 0",
+        "in-flight: 0",
+        "waiting on deps: 0",
+        "blocked (upstream unfulfillable): 0",
+        "ready in queue: 0",
+        "busy secondaries: 0/0",
+        "busy workers: 0/0",
+    ] {
+        assert!(body.contains(needle), "full-render must include `{needle}` (zero-valued); got:\n{body}");
+    }
+    assert!(!body.contains("Omitted"));
+    assert!(!body.contains("(+"), "full-render must not show parenthetical deltas");
 }

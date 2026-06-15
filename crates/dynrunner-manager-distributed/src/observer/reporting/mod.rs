@@ -71,7 +71,7 @@ mod tests;
 // primary tail's `select!` arms) reaches them by short name without
 // descending into `reporter`.
 pub use reporter::{
-    Clock, CrdtSnapshotSource, IDLE_INTERVAL, Reporter, STATS_INTERVAL, SharedSnapshotSource,
-    TokioClock, run_reporter,
+    Clock, CrdtSnapshotSource, IDLE_INTERVAL, Reporter, SAFETY_NET_TICKS, STATS_INTERVAL,
+    SharedSnapshotSource, TokioClock, run_reporter,
 };
 pub use stats::StatsSnapshot;

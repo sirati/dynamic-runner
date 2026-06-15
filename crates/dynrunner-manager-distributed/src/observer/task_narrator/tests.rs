@@ -14,19 +14,54 @@ use super::*;
 use crate::cluster_state::StateCounts;
 use crate::task_state_change::{TaskStateChange, TaskStateChangeEvent};
 use crate::test_capture::{IMPORTANT_TARGET, LeveledEvent, TargetCapture};
+use dynrunner_core::OBSERVER_TASK_TARGET;
 
-/// Run `body` with a [`TargetCapture`] on the importance marker
-/// installed as the thread-local default, returning every captured
-/// leveled event (level preserved — this is the crux for the
-/// ERROR/WARN/INFO assertions).
-fn capture(body: impl FnOnce()) -> Vec<LeveledEvent> {
+/// One captured event annotated with which target it landed on.
+#[derive(Clone, Debug)]
+struct TargetedEvent {
+    target: &'static str,
+    leveled: LeveledEvent,
+}
+
+/// Run `body` under captures on BOTH narrator targets — the
+/// importance marker (wake-worthy failure arms + baseline summary)
+/// AND the per-task observer-task target (non-wake-worthy
+/// assign/complete/state-change INFO). Returns each captured event
+/// tagged with the target it landed on, so a test asserts BOTH the
+/// level and the routing — the crux of the #573 split.
+fn capture(body: impl FnOnce()) -> Vec<TargetedEvent> {
     use tracing_subscriber::Registry;
     use tracing_subscriber::layer::SubscriberExt;
 
-    let cap = TargetCapture::for_target(IMPORTANT_TARGET);
-    let subscriber = Registry::default().with(cap.clone());
+    let important = TargetCapture::for_target(IMPORTANT_TARGET);
+    let observer_task = TargetCapture::for_target(OBSERVER_TASK_TARGET);
+    let subscriber = Registry::default()
+        .with(important.clone())
+        .with(observer_task.clone());
     tracing::subscriber::with_default(subscriber, body);
-    cap.events()
+    // The two captures are siblings of the same subscriber, so a
+    // single emit lands in exactly one of them — never both, never
+    // neither. Concatenation order is meaningful only within a single
+    // target (each capture preserves emission order for its own
+    // target); cross-target ordering is not asserted by these tests
+    // (a narrator call produces at most one line).
+    important
+        .events()
+        .into_iter()
+        .map(|leveled| TargetedEvent {
+            target: IMPORTANT_TARGET,
+            leveled,
+        })
+        .chain(
+            observer_task
+                .events()
+                .into_iter()
+                .map(|leveled| TargetedEvent {
+                    target: OBSERVER_TASK_TARGET,
+                    leveled,
+                }),
+        )
+        .collect()
 }
 
 fn evt(task_id: &str, change: TaskStateChange, holder: Option<(&str, u32)>) -> TaskStateChangeEvent {
@@ -47,7 +82,9 @@ fn armed() -> ObserverTaskNarrator {
     n
 }
 
-/// Assignment narrates INFO "assigned to {secondary}-{worker}".
+/// Assignment narrates INFO "assigned to {secondary}-{worker}" on the
+/// per-task observer-task target (non-wake-worthy: suppressed from
+/// stdio under `--important-stdio-only`).
 #[test]
 fn assigned_narrates_info_with_holder() {
     let events = capture(|| {
@@ -55,17 +92,19 @@ fn assigned_narrates_info_with_holder() {
         assert!(n.narrate_live(&evt("t1", TaskStateChange::Assigned, Some(("sec-a", 3)))));
     });
     assert_eq!(events.len(), 1, "one line: {events:?}");
-    assert_eq!(events[0].level, Level::INFO);
+    assert_eq!(events[0].target, OBSERVER_TASK_TARGET, "non-wake target");
+    assert_eq!(events[0].leveled.level, Level::INFO);
+    let msg = &events[0].leveled.event.message;
     assert!(
-        events[0].event.message.contains("t1") && events[0].event.message.contains("sec-a-3"),
-        "assign line names task + holder: {:?}",
-        events[0].event.message
+        msg.contains("t1") && msg.contains("sec-a-3"),
+        "assign line names task + holder: {msg:?}",
     );
-    assert!(events[0].event.message.contains("assigned to"));
+    assert!(msg.contains("assigned to"));
 }
 
-/// Completion narrates INFO "completed on {secondary}-{worker}", where
-/// the holder is the PRIOR InFlight holder carried on the event.
+/// Completion narrates INFO "completed on {secondary}-{worker}" on the
+/// per-task observer-task target (non-wake-worthy), where the holder is
+/// the PRIOR InFlight holder carried on the event.
 #[test]
 fn completed_narrates_info_with_prior_holder() {
     let events = capture(|| {
@@ -73,14 +112,17 @@ fn completed_narrates_info_with_prior_holder() {
         assert!(n.narrate_live(&evt("t2", TaskStateChange::Completed, Some(("sec-b", 7)))));
     });
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].level, Level::INFO);
-    assert!(events[0].event.message.contains("t2"));
-    assert!(events[0].event.message.contains("completed on"));
-    assert!(events[0].event.message.contains("sec-b-7"));
+    assert_eq!(events[0].target, OBSERVER_TASK_TARGET, "non-wake target");
+    assert_eq!(events[0].leveled.level, Level::INFO);
+    let msg = &events[0].leveled.event.message;
+    assert!(msg.contains("t2"));
+    assert!(msg.contains("completed on"));
+    assert!(msg.contains("sec-b-7"));
 }
 
-/// A terminal failure narrates ERROR and carries BOTH the reason AND the
-/// full last_error.
+/// A terminal failure narrates ERROR on the importance marker
+/// (wake-worthy: reaches stdio under `--important-stdio-only`) and
+/// carries BOTH the reason AND the full last_error.
 #[test]
 fn terminal_failure_narrates_error_with_full_last_error() {
     let events = capture(|| {
@@ -95,17 +137,19 @@ fn terminal_failure_narrates_error_with_full_last_error() {
         )));
     });
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].level, Level::ERROR, "terminal fail is ERROR");
-    assert!(events[0].event.message.contains("terminally failed on"));
-    assert!(events[0].event.message.contains("sec-c-1"));
+    assert_eq!(events[0].target, IMPORTANT_TARGET, "wake-worthy target");
+    assert_eq!(events[0].leveled.level, Level::ERROR, "terminal fail is ERROR");
+    let msg = &events[0].leveled.event.message;
+    assert!(msg.contains("terminally failed on"));
+    assert!(msg.contains("sec-c-1"));
     assert!(
-        events[0].event.message.contains("index out of bounds"),
-        "the FULL last_error rides the ERROR line: {:?}",
-        events[0].event.message
+        msg.contains("index out of bounds"),
+        "the FULL last_error rides the ERROR line: {msg:?}",
     );
 }
 
-/// A recoverable failure narrates WARN "(recoverable)".
+/// A recoverable failure narrates WARN "(recoverable)" on the
+/// importance marker (wake-worthy).
 #[test]
 fn recoverable_failure_narrates_warn() {
     let events = capture(|| {
@@ -119,12 +163,15 @@ fn recoverable_failure_narrates_warn() {
         )));
     });
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].level, Level::WARN, "recoverable fail is WARN");
-    assert!(events[0].event.message.contains("(recoverable)"));
-    assert!(events[0].event.message.contains("sec-d-0"));
+    assert_eq!(events[0].target, IMPORTANT_TARGET, "wake-worthy target");
+    assert_eq!(events[0].leveled.level, Level::WARN, "recoverable fail is WARN");
+    let msg = &events[0].leveled.event.message;
+    assert!(msg.contains("(recoverable)"));
+    assert!(msg.contains("sec-d-0"));
 }
 
-/// An OOM failure narrates WARN "(oom)".
+/// An OOM failure narrates WARN "(oom)" on the importance marker
+/// (wake-worthy).
 #[test]
 fn oom_failure_narrates_warn() {
     let events = capture(|| {
@@ -138,12 +185,14 @@ fn oom_failure_narrates_warn() {
         )));
     });
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].level, Level::WARN, "oom fail is WARN");
-    assert!(events[0].event.message.contains("(oom)"));
+    assert_eq!(events[0].target, IMPORTANT_TARGET, "wake-worthy target");
+    assert_eq!(events[0].leveled.level, Level::WARN, "oom fail is WARN");
+    assert!(events[0].leveled.event.message.contains("(oom)"));
 }
 
-/// Any other (non-terminal / non-fail) transition narrates INFO "changed
-/// state to {state}".
+/// Any other (non-terminal / non-fail) transition narrates INFO
+/// "changed state to {state}" on the per-task observer-task target
+/// (non-wake-worthy).
 #[test]
 fn other_state_change_narrates_info() {
     let events = capture(|| {
@@ -151,9 +200,11 @@ fn other_state_change_narrates_info() {
         assert!(n.narrate_live(&evt("t6", TaskStateChange::Other { state: "blocked" }, None)));
     });
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].level, Level::INFO);
-    assert!(events[0].event.message.contains("t6"));
-    assert!(events[0].event.message.contains("changed state to blocked"));
+    assert_eq!(events[0].target, OBSERVER_TASK_TARGET, "non-wake target");
+    assert_eq!(events[0].leveled.level, Level::INFO);
+    let msg = &events[0].leveled.event.message;
+    assert!(msg.contains("t6"));
+    assert!(msg.contains("changed state to blocked"));
 }
 
 /// A completion / failure whose prior InFlight was never observed (no
@@ -166,7 +217,8 @@ fn missing_holder_narrates_unknown_holder() {
         assert!(n.narrate_live(&evt("t7", TaskStateChange::Completed, None)));
     });
     assert_eq!(events.len(), 1);
-    assert!(events[0].event.message.contains("unknown-holder"));
+    assert_eq!(events[0].target, OBSERVER_TASK_TARGET, "non-wake target");
+    assert!(events[0].leveled.event.message.contains("unknown-holder"));
 }
 
 /// BOOTSTRAP-FLOOD guard: a baseline of N transitions narrates exactly
@@ -198,17 +250,20 @@ fn baseline_narrates_one_summary_not_n_lines_and_gates_live() {
         "the 66k-task baseline narrates ONE summary line, not 66k changes: {} lines",
         events.len()
     );
-    assert_eq!(events[0].level, Level::INFO);
-    assert!(events[0].event.message.contains("mirroring baseline"));
+    // Baseline summary is a once-per-run milestone: wake-worthy.
+    assert_eq!(events[0].target, IMPORTANT_TARGET, "baseline summary is wake-worthy");
+    assert_eq!(events[0].leveled.level, Level::INFO);
+    let msg = &events[0].leveled.event.message;
+    assert!(msg.contains("mirroring baseline"));
     assert!(
-        events[0].event.message.contains("60000") && events[0].event.message.contains("4000"),
-        "summary carries the converged partition: {:?}",
-        events[0].event.message
+        msg.contains("60000") && msg.contains("4000"),
+        "summary carries the converged partition: {msg:?}",
     );
 }
 
 /// An EMPTY baseline (cold-join before any snapshot) emits NO summary
-/// line but still arms live narration.
+/// line but still arms live narration; the live line lands on the
+/// per-task (non-wake-worthy) target.
 #[test]
 fn empty_baseline_emits_no_line_but_arms_live() {
     let events = capture(|| {
@@ -219,5 +274,6 @@ fn empty_baseline_emits_no_line_but_arms_live() {
     });
     // No baseline summary line; exactly the one live line.
     assert_eq!(events.len(), 1);
-    assert!(events[0].event.message.contains("assigned to"));
+    assert_eq!(events[0].target, OBSERVER_TASK_TARGET, "non-wake target");
+    assert!(events[0].leveled.event.message.contains("assigned to"));
 }
