@@ -45,6 +45,12 @@ mod worker_mgmt;
 
 pub(crate) use mutations::TerminalVerdict;
 pub(crate) use promotion::RelocationPolicy;
+// Re-exports for crate-internal tests that need to construct an
+// [`crate::oploop_instrumentation::OpLoopArmStats`] mirroring the
+// operational loop's setup (e.g. the #582 fairness-gate unit test in
+// `command_channel::tests`).
+#[cfg(test)]
+pub(crate) use operational_loop::{ARM_INBOX, OP_LOOP_ARM_NAMES};
 
 #[cfg(test)]
 mod tests;

@@ -1336,3 +1336,162 @@ async fn respawn_arm_parks_through_membership_join_churn() {
         })
         .await;
 }
+
+// ─── #582: sustained SpawnTasks streaming keeps the loop healthy ───
+//
+// SMOKE (not a deterministic wedge repro). The production wedge
+// (run_20260615_192743) required real CPU cost per batch on a real-sized
+// cluster ledger — 46,141 descriptors over 621 batches (~74 tasks/batch),
+// each apply walking a populated CRDT. The in-process fixture's empty
+// ledger and tiny tasks make each apply microseconds, so the COMMAND arm
+// returns to `select!` naturally fast and ARM_HEARTBEAT is never starved
+// the way production was. This test therefore exercises the integration —
+// `command_sender()` + real `select!` loop + arm_stats — under a sustained
+// burst, and ASSERTS the loop stays healthy. The deterministic regression
+// pin for the actual wedge mechanic lives in two focused unit tests:
+//
+//   * `command_channel::tests::small_spawn_tasks_rides_continuation_queue_no_fast_path`
+//     pins (A): `apply_spawn_tasks` always rides the continuation queue
+//     (no single-shot fast path).
+//   * `command_channel::tests::fairness_gate_fires_when_heartbeat_overdue`
+//     pins (C): `fire_heartbeat_if_overdue` runs the heartbeat body and
+//     stamps ARM_HEARTBEAT when `last_heartbeat_fire` is stale by more
+//     than `2 × keepalive_interval`.
+//
+// Inject 100 SpawnTasks bursts back-to-back into the COMMAND arm via
+// `command_sender()` (each ≤ CHUNK tasks so pre-#582 it would take the
+// fast path). Observe the arm-stats snapshot.
+//
+// ORACLE 1 (heartbeat keeps firing): `heartbeat` ≥ 20 over the ~3.5 s
+// observation window — far above a stalled-loop count. A regression that
+// silently dropped the heartbeat arm under burst (e.g. an arm body that
+// re-borrowed `&mut self` and deadlocked, or a select! arm that became
+// always-ready and starved its peers) would show 0-2 here.
+//
+// ORACLE 2 (positive control — the burst was serviced): `command` wins ≥
+// `BURSTS` — at least one COMMAND-arm fire per SpawnTasks. Under-servicing
+// would mean the fixture failed to load the loop, invalidating ORACLE 1.
+
+/// One ≤ CHUNK-sized spawn batch as a `PrimaryCommand::SpawnTasks` for the
+/// streaming burst. The reply oneshot is intentionally dropped on the
+/// caller side (fire-and-forget, matching the in-runtime PyPrimaryHandle
+/// path).
+fn streaming_spawn_burst(
+    batch_idx: usize,
+    tasks_per_batch: usize,
+) -> PrimaryCommand<TestId> {
+    let tasks: Vec<TaskInfo<TestId>> = (0..tasks_per_batch)
+        .map(|i| {
+            let mut t = make_binary(&format!("stream_b{batch_idx}_t{i}"), 50);
+            t.task_id = format!("stream_b{batch_idx}_t{i}_id");
+            t
+        })
+        .collect();
+    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+    PrimaryCommand::SpawnTasks {
+        tasks,
+        reply: reply_tx,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn streaming_spawn_burst_does_not_starve_heartbeat() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Reuse `probe_burst_fixture` for its FAST keepalive (50 ms) — a
+            // production-cadence (5 s) heartbeat would not fire enough times
+            // inside a snappy test window for a healthy floor. We bypass its
+            // ledger-seed by using `ledger_size = 0`; the ghost in-flight task
+            // it pre-applies keeps the run open for the observation window.
+            // The burst's spawned tasks land freshly into the live pool via
+            // the SpawnTasks command path under test.
+            let fixture = probe_burst_fixture(0);
+            let GhostFixture {
+                mut primary,
+                mesh_keepalive: _mesh,
+                wire_tx: _wire_tx,
+                _sec_handle,
+            } = fixture;
+
+            // Grab the command sender BEFORE the run takes `&mut primary`.
+            let cmd_tx = primary.command_sender();
+
+            // THE BURST: 30 SpawnTasks bursts at 30 ms intervals → ~900 ms of
+            // sustained ~33 batches/sec load. ≤CHUNK tasks each, so pre-#582
+            // each would take the single-shot fast path and ARM_COMMAND would
+            // be perpetually ready.
+            const BURSTS: usize = 100;
+            // Near CHUNK size so each batch is non-trivial work but still
+            // takes the fast path pre-fix (`tasks.len() <= CHUNK`).
+            const TASKS_PER_BURST: usize = 200;
+            // 0 ms — submit as fast as the send-await chain allows. Pre-fix
+            // the COMMAND arm body runs each apply inline (~hundreds of µs
+            // for 200 tasks), so saturating submission keeps it perpetually
+            // ready. Production (consumer's run_20260615_192743) was 100 ms
+            // per batch at ~10/sec, which under #586's biased priority
+            // starved heartbeat for 75 s — we replicate the saturation here
+            // without simulating the per-batch CPU time.
+            const INTER_BURST_MS: u64 = 0;
+            tokio::task::spawn_local(async move {
+                // Settle the loop into steady state first so the heartbeat arm
+                // has warmed up (a slow bring-up would otherwise look like
+                // starvation against the floor).
+                tokio::time::sleep(StdDuration::from_millis(1500)).await;
+                for b in 0..BURSTS {
+                    let cmd = streaming_spawn_burst(b, TASKS_PER_BURST);
+                    // `send().await` because the bounded command channel could
+                    // backpressure under burst — the test's harness is sized
+                    // generously, but a non-await send would mask a regression
+                    // where the operational loop fails to drain the channel.
+                    let _ = cmd_tx.send(cmd).await;
+                    tokio::time::sleep(StdDuration::from_millis(INTER_BURST_MS)).await;
+                }
+            });
+
+            // Observation window: 1.5 s settle + 0.9 s burst + ~1.1 s
+            // post-burst → 3.5 s, matching the #504 test's pattern.
+            let window = StdDuration::from_millis(3500);
+            {
+                let (_deps, ops, ope) = noop_phase_args();
+                let run = primary.run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                );
+                tokio::pin!(run);
+                let _ = tokio::time::timeout(window, &mut run).await;
+            }
+
+            // ORACLE 1 (heartbeat fires through the burst — the #582 contract):
+            let heartbeat = arm_count_of(&primary, "heartbeat");
+            assert!(
+                heartbeat >= 20,
+                "OPLOOP STALL (#582): the heartbeat arm ticked only {heartbeat}× \
+                 across a ~3.5 s window containing a 30-batch SpawnTasks burst \
+                 at ~33 batches/sec. Pre-#582 the single-shot fast path inside \
+                 `apply_spawn_tasks` made ARM_COMMAND perpetually ready, so \
+                 #586's `biased;` starved ARM_HEARTBEAT for the entire burst — \
+                 the production keepalive-deafness signature. The fix routes \
+                 every SpawnTasks through `spawn_continuation_queue` (yields to \
+                 sibling arms between chunks) AND defends with \
+                 `fire_heartbeat_if_overdue` (synchronous fire when overdue by \
+                 2× keepalive_interval). Heartbeat={heartbeat} means BOTH the \
+                 yield-between-chunks contract and the fairness-gate fallback \
+                 failed."
+            );
+
+            // ORACLE 2 (positive control — the burst was serviced):
+            let command = arm_count_of(&primary, "command");
+            assert!(
+                command >= BURSTS as u64,
+                "the COMMAND arm must have serviced the {BURSTS}-batch burst \
+                 (command wins={command}); under-servicing would mean the \
+                 fixture failed to load the loop, invalidating ORACLE 1."
+            );
+        })
+        .await;
+}

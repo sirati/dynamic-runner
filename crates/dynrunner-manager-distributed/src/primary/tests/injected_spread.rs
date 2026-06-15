@@ -128,6 +128,14 @@ async fn inject_and_recheck(
     tasks: Vec<TaskInfo<TestId>>,
 ) {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    // Post-#582 `apply_spawn_tasks` always rides the continuation queue
+    // (no single-shot fast path), so the helper must mirror the
+    // operational loop's COMMAND arm: drain PumpSpawnContinuation kicks
+    // off `command_rx` until the reply oneshot fires.
+    let mut command_rx = primary
+        .command_rx
+        .take()
+        .expect("test fixture: command_rx must be armed");
     handle_primary_command(
         primary,
         PrimaryCommand::SpawnTasks {
@@ -137,10 +145,21 @@ async fn inject_and_recheck(
         &mut None,
     )
     .await;
-    let errors = reply_rx
-        .await
-        .expect("spawn reply oneshot closed")
-        .expect("spawn_tasks failed");
+    let mut reply_rx = reply_rx;
+    let errors = loop {
+        tokio::select! {
+            cmd = command_rx.recv() => {
+                let cmd = cmd.expect("command channel closed mid-spawn");
+                handle_primary_command(primary, cmd, &mut None).await;
+            }
+            received = &mut reply_rx => {
+                break received
+                    .expect("spawn reply oneshot closed")
+                    .expect("spawn_tasks failed");
+            }
+        }
+    };
+    primary.command_rx = Some(command_rx);
     assert!(
         errors.is_empty(),
         "no spawn rejections expected: {errors:?}"
