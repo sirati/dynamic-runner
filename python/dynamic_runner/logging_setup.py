@@ -331,11 +331,13 @@ def setup_logging(args: argparse.Namespace) -> logging.Logger:
     from . import init_logging
 
     # `--debug` raises BOTH the Python root logger (below) AND the Rust
-    # subscriber's verbosity ceiling: without the param the per-role/full
-    # sinks stay INFO-only, so a `--debug` secondary's `secondary.log`
-    # carried no DEBUG lines. Forwarded verbatim to secondaries (it is
-    # neither framework-regenerated nor submitter-local), so this same path
-    # raises the secondary's sink too.
+    # subscriber's STDIO verbosity ceiling. The per-role file sinks
+    # (`primary.log` / `secondary.log` / `observer.log`) are forensic-
+    # complete at TRACE regardless of this flag — every event a peer emits
+    # is on the durable record. `--debug` only widens the operator-facing
+    # stdio stream from INFO to DEBUG. Forwarded verbatim to secondaries
+    # (it is neither framework-regenerated nor submitter-local), so this
+    # same path raises the secondary's stdio sink too.
     init_logging(
         important_stdio_only=important_stdio_only,
         full_log_file=full_log_file,

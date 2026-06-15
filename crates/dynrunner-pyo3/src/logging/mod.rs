@@ -1,15 +1,23 @@
 //! Tracing-subscriber wiring for the native extension.
 //!
 //! Single concern: build the process-wide tracing subscriber. Two sinks
-//! compose in one [`Registry`]:
+//! compose in one [`Registry`], each carrying its OWN level filter — the
+//! file sink is the FORENSIC-COMPLETE record (TRACE), the stdio sink is
+//! the OPERATOR-RELEVANT view (`config.level`, i.e. INFO or DEBUG):
 //!
-//!   * a **full sink** that records every event (subject only to the
-//!     verbosity ceiling — a [`LevelFilter`] resolved from the parsed
-//!     `--debug` flag, never from `RUST_LOG`/any env), and
+//!   * a **full sink** (file or stdout-fallback) that records every event
+//!     at TRACE: every peer's file log is the forensic-complete record of
+//!     its run, so per-call-site `tracing::trace!(...)` emits land in
+//!     `primary.log` / `secondary.log` / `observer.log` regardless of the
+//!     `--debug` flag (the flag drives stdio verbosity only). The only
+//!     narrowing each file layer applies is its role/scope routing.
 //!   * a **stdio sink** that, when *importance mode* is active, passes
 //!     ONLY events whose tracing target is [`IMPORTANT_TARGET`]; when
 //!     inactive it behaves exactly like the historical single `fmt`
-//!     layer (everything to stdout).
+//!     layer (everything to stdout). Bounded by `config.level` (INFO or
+//!     DEBUG from `--debug`) so the operator-facing stream is unchanged
+//!     by the file sink's TRACE ceiling — `--debug` widens stdio, file
+//!     verbosity is the contract, not a knob.
 //!
 //! The gate is one target-keyed *layer filter* ([`important_stdio_filter`]),
 //! never a per-call-site `if`. Emitting at `target: "dynrunner_important"`
@@ -46,16 +54,21 @@
 //!     arg, the single-file knob is the submitter-only path. When neither
 //!     is set, the full log stays on stdout and shell/sbatch redirection
 //!     captures it, preserving today's single-stream behaviour.
-//!   * `debug` — the parsed `--debug` flag. Raises the verbosity ceiling
-//!     from the historical `info` to `debug`, so a `--debug` run produces
-//!     DEBUG lines in the full/per-role files (the secondary's
-//!     `secondary.log`), not just at the Python root logger. It is the only
-//!     verbosity knob — there is no `RUST_LOG` read. The ceiling is applied
-//!     ONCE as a global subscriber-level filter on the registry (see
-//!     [`init_with`]), not per-sink: every sink layer narrows only by
-//!     target/role, so the process-wide `max_level_hint` authoritatively
-//!     reflects `--debug` (the per-sink-filter shape left it implicit — see
-//!     [`init_with`]).
+//!   * `debug` — the parsed `--debug` flag. Raises the STDIO sink's
+//!     verbosity ceiling from the historical `INFO` to `DEBUG`, so a
+//!     `--debug` run shows DEBUG lines on the operator-facing stream. The
+//!     file sink is FORENSIC-COMPLETE at TRACE independently of this knob
+//!     (the file-level contract is not operator-tunable — every event a
+//!     peer emits is on the durable record, including TRACE), so a `trace!`
+//!     emit always lands in `primary.log` / `secondary.log` / `observer.log`
+//!     whether or not `--debug` is set. It is the only stdio verbosity knob
+//!     — there is no `RUST_LOG` read. The ceiling is applied PER LAYER (the
+//!     stdio layer carries `config.level`; each file layer carries
+//!     `LevelFilter::TRACE` for the forensic-complete contract) rather than
+//!     as one global registry-level filter, because the two sinks have
+//!     genuinely different ceilings by design — the process-wide
+//!     `max_level_hint` is therefore the max across attached layers
+//!     (TRACE whenever any file sink is attached).
 //!
 //! The subscriber is NOT installed at `_native` import — installing it
 //! there forced the config to be read from the environment before argparse
@@ -77,7 +90,7 @@ use compact_format::{CompactRoleFormat, RoleTagLayer};
 use pyo3::prelude::*;
 use tracing::{Event, Metadata};
 use tracing_subscriber::Layer;
-use tracing_subscriber::filter::{FilterFn, LevelFilter};
+use tracing_subscriber::filter::{FilterExt, FilterFn, LevelFilter};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::layer::{Context, Filter, SubscriberExt};
@@ -186,8 +199,12 @@ pub(crate) struct LogConfig {
     pub(crate) important_stdio_only: bool,
     /// Destination of the full sink.
     pub(crate) full_sink: FullSink,
-    /// Verbosity ceiling for every sink, resolved from the `--debug` flag:
-    /// `DEBUG` when debug is on, else the default `INFO`.
+    /// Verbosity ceiling for the STDIO sink only, resolved from the
+    /// `--debug` flag: `DEBUG` when debug is on, else the default `INFO`.
+    /// The file sink is forensic-complete at TRACE independently of this
+    /// (see [`role_full_layer`] / [`full_layer`] / [`unattributed_full_layer`]),
+    /// so the field name reflects the only knob `--debug` actually drives —
+    /// the operator-facing stream.
     pub(crate) level: LevelFilter,
 }
 
@@ -200,10 +217,14 @@ impl LogConfig {
     /// Neither set → stdout (historical single-stream). Whitespace-only
     /// strings are treated as unset so an empty CLI value collapses cleanly.
     ///
-    /// `debug` raises the verbosity ceiling on EVERY sink to `DEBUG`; off it
-    /// stays at the historical `INFO`. The level is parametric (from the
-    /// parsed `--debug` flag), never read from `RUST_LOG`/any env — matching
-    /// the explicit-parameter design of the rest of this module.
+    /// `debug` raises the STDIO sink's verbosity ceiling to `DEBUG`; off it
+    /// stays at the historical `INFO`. The file sink is forensic-complete
+    /// at TRACE regardless of this flag (every peer's file log records
+    /// EVERY event — operator stream verbosity and forensic record are two
+    /// different concerns owned by two different per-layer filters). The
+    /// level is parametric (from the parsed `--debug` flag), never read
+    /// from `RUST_LOG`/any env — matching the explicit-parameter design of
+    /// the rest of this module.
     pub(crate) fn new(
         important_stdio_only: bool,
         full_log_file: Option<String>,
@@ -226,18 +247,32 @@ impl LogConfig {
     }
 }
 
-/// The verbosity ceiling for every layer, resolved from the explicit
-/// `--debug` flag: `DEBUG` when on, else the historical `INFO`. This is the
-/// single place verbosity is decided — parametric, never read from
+/// The STDIO-sink verbosity ceiling, resolved from the explicit `--debug`
+/// flag: `DEBUG` when on, else the historical `INFO`. This is the single
+/// place STDIO verbosity is decided — parametric, never read from
 /// `RUST_LOG`/any env, consistent with this module's explicit-parameter
-/// design. A fresh `LevelFilter` is handed to each layer because filters are
-/// consumed on layer attachment.
+/// design. The file sink ignores this knob and runs at TRACE for the
+/// forensic-complete contract (the file-level ceiling is fixed by the
+/// invariant, not the operator). A fresh `LevelFilter` is handed to each
+/// layer because filters are consumed on layer attachment.
 fn level_filter(debug: bool) -> LevelFilter {
     if debug {
         LevelFilter::DEBUG
     } else {
         LevelFilter::INFO
     }
+}
+
+/// The FILE-sink verbosity ceiling — fixed at TRACE by the framework's
+/// forensic-complete contract: every peer's file log records EVERY event
+/// it emits, including `tracing::trace!(...)` decision narration, so the
+/// durable per-role record never silently elides a TRACE emit. Not
+/// parametric — there is no operator knob to lower it (the operator-facing
+/// knob is `--debug`, which is the STDIO ceiling only). A fresh
+/// `LevelFilter` is handed to each file layer because filters are
+/// consumed on layer attachment.
+fn file_level_filter() -> LevelFilter {
+    LevelFilter::TRACE
 }
 
 /// The single layer-level gate for the stdio sink. Passes an event iff it
@@ -250,11 +285,12 @@ pub(crate) fn important_stdio_filter() -> FilterFn<fn(&Metadata<'_>) -> bool> {
     FilterFn::new(predicate as fn(&Metadata<'_>) -> bool)
 }
 
-/// Build the full (everything) `fmt` layer over `writer`. Unfiltered at the
-/// layer level: the verbosity ceiling is a SINGLE global subscriber-level
-/// filter applied once on the registry (see [`init_with`]), so this layer
-/// owns only the "record everything that passes the global ceiling" concern.
-/// Generic over the writer so tests can inject an in-memory buffer.
+/// Build the full (everything) `fmt` layer over `writer`. Carries
+/// [`file_level_filter`] (TRACE) so this file sink is forensic-complete —
+/// the framework's contract is that every peer's file log records EVERY
+/// event, including TRACE-level decision narration, regardless of `--debug`
+/// (which is the STDIO ceiling, owned per [`stdio_layer`]). Generic over
+/// the writer so tests can inject an in-memory buffer.
 ///
 /// The line shape is the compact, human-readable per-role format
 /// ([`CompactRoleFormat`]) — the same shape the role-split files emit, so the
@@ -273,6 +309,7 @@ where
         .event_format(CompactRoleFormat)
         // Plain text for the persisted full-log file (see `role_full_layer`).
         .with_ansi(false)
+        .with_filter(file_level_filter())
         .boxed()
 }
 
@@ -313,10 +350,12 @@ where
 
 /// Build a per-role full (everything) `fmt` layer over `writer`, scope-gated
 /// to the role span named `role_span_name`. Used by the per-node-dir sink to
-/// split `primary.log` / `secondary.log`. The verbosity ceiling is the
-/// single global subscriber-level filter (see [`init_with`]); this layer
-/// owns only the ROLE-routing concern, so a `--debug` run reaches the
-/// per-role files via the global ceiling, never a per-layer level filter.
+/// split `primary.log` / `secondary.log` / `observer.log`. Carries TWO
+/// per-layer filters composed by `Filter::and`: [`file_level_filter`] (TRACE,
+/// the forensic-complete file-sink ceiling) AND a [`RoleFilter`] for span
+/// routing. The TRACE ceiling is the file-sink contract — every event a
+/// role's run future emits lands in its per-role log, including `trace!`,
+/// regardless of `--debug` (which only widens stdio).
 ///
 /// The line shape is the compact, human-readable per-role format
 /// ([`CompactRoleFormat`]): `{h:mm:ss local} {LEVEL} {P|S}-{id}  {message}`
@@ -339,7 +378,11 @@ where
         // corrupt the host-readable log (same reason the important-stdio sink
         // sets `with_ansi(false)`).
         .with_ansi(false)
-        .with_filter(RoleFilter { role_span_name })
+        // File-sink ceiling: TRACE (forensic-complete contract). Composed
+        // with the role-routing filter so the layer narrows on BOTH the
+        // level (≤ TRACE — admit all) AND the role-span scope. Order is
+        // immaterial — `Filter::and` short-circuits on either rejection.
+        .with_filter(file_level_filter().and(RoleFilter { role_span_name }))
         .boxed()
 }
 
@@ -369,8 +412,11 @@ where
 
 /// Build the catch-all full `fmt` layer over `writer` for events under NO
 /// role span — the per-node dir's `setup.log` (see [`SETUP_LOG_FILENAME`]
-/// for why it must exist). Same compact format and ANSI policy as the
-/// role files; the only difference is the complement gate.
+/// for why it must exist). Same compact format, ANSI policy AND file-sink
+/// TRACE ceiling as the role files; the only difference is the complement
+/// gate. The TRACE ceiling means the pre-role preparation phase's TRACE
+/// emits land in setup.log too — forensic-complete, same contract as the
+/// per-role files.
 fn unattributed_full_layer<S, W>(make_writer: W) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
@@ -380,7 +426,7 @@ where
         .with_writer(make_writer)
         .event_format(CompactRoleFormat)
         .with_ansi(false)
-        .with_filter(UnattributedFilter)
+        .with_filter(file_level_filter().and(UnattributedFilter))
         .boxed()
 }
 
@@ -426,9 +472,12 @@ fn non_bridge_stdio_filter() -> FilterFn<fn(&Metadata<'_>) -> bool> {
 /// Build the stdio `fmt` layer over `writer`. Target-gated to
 /// [`IMPORTANT_TARGET`] when `important_only`; otherwise admits everything
 /// EXCEPT the Python→tracing bridge target (see [`non_bridge_stdio_filter`]).
-/// The verbosity ceiling is the single global subscriber-level filter (see
-/// [`init_with`]), so this layer owns only the IMPORTANCE/bridge-gate concern
-/// — never a per-layer level filter.
+/// The stdio verbosity ceiling (`stdio_level`, the parsed `--debug` resolved
+/// by [`level_filter`]) is attached HERE as a per-layer filter — sibling
+/// file layers carry their own (TRACE, forensic-complete) ceiling, so the
+/// operator stream's INFO/DEBUG bound is decoupled from the file sinks'
+/// TRACE bound. This layer owns BOTH narrowings: the importance/bridge
+/// gate AND the stdio verbosity ceiling.
 ///
 /// In importance mode the layer is also reformatted for operators: a
 /// compact local-time [`LocalHhMm`] stamp and no event target (so the
@@ -440,6 +489,7 @@ fn non_bridge_stdio_filter() -> FilterFn<fn(&Metadata<'_>) -> bool> {
 pub(crate) fn stdio_layer<S, W>(
     make_writer: W,
     important_only: bool,
+    stdio_level: LevelFilter,
 ) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
@@ -456,7 +506,11 @@ where
             // target line forbids, and corruption when this sink is captured
             // to a file / sbatch log rather than a terminal).
             .with_ansi(false)
-            .with_filter(important_stdio_filter())
+            // Compose the stdio verbosity ceiling with the importance gate:
+            // both must pass. The file sinks' TRACE ceiling sits on sibling
+            // layers and does NOT widen this stream — `--debug` is the only
+            // operator-facing knob.
+            .with_filter(stdio_level.and(important_stdio_filter()))
             .boxed()
     } else {
         tracing_subscriber::fmt::layer()
@@ -464,7 +518,9 @@ where
             // Drop the bridged consumer-Python copy: it is already on stdout
             // via the Python root console handler (see logging_setup.py); the
             // bridge's durable destination is the per-role/full file sinks.
-            .with_filter(non_bridge_stdio_filter())
+            // AND the stdio verbosity ceiling (`stdio_level`, INFO/DEBUG from
+            // `--debug`) — the file sinks' TRACE does NOT widen stdout.
+            .with_filter(stdio_level.and(non_bridge_stdio_filter()))
             .boxed()
     }
 }
@@ -503,10 +559,13 @@ fn open_append_create(path: &std::path::Path) -> std::fs::File {
 /// only the important target to stdout). This is one rule per sink shape,
 /// not a per-event branch.
 ///
-/// None of these layers carry a verbosity filter: the `--debug`-resolved
-/// ceiling is applied ONCE as a global subscriber-level filter on the
-/// registry (see [`init_with`]), so it authoritatively drives the process
-/// `max_level_hint` and every layer only narrows further by target/role.
+/// Each layer carries its OWN verbosity ceiling: file layers run at TRACE
+/// (forensic-complete contract, [`file_level_filter`]); the stdio layer
+/// runs at `config.level` (INFO/DEBUG from `--debug`). The two ceilings are
+/// genuinely different by design — the operator stream and the durable
+/// record are different concerns — so they are NOT collapsed into a global
+/// subscriber filter; the process-wide `max_level_hint` is therefore the
+/// max across attached layers (TRACE whenever any file sink is attached).
 fn build_layers<S>(config: &LogConfig) -> Vec<Box<dyn Layer<S> + Send + Sync>>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
@@ -547,9 +606,13 @@ where
     // stay unaware; only the `MakeWriter` changes. Normal mode keeps the
     // historical unbuffered, line-buffered `io::stdout`.
     if config.important_stdio_only {
-        layers.push(stdio_layer(debounce::install_debounced_stdout(), true));
+        layers.push(stdio_layer(
+            debounce::install_debounced_stdout(),
+            true,
+            config.level,
+        ));
     } else {
-        layers.push(stdio_layer(io::stdout, false));
+        layers.push(stdio_layer(io::stdout, false, config.level));
     }
     layers
 }
@@ -559,19 +622,16 @@ where
 /// no-op, so a secondary that re-enters `init_logging` after a respawn or
 /// a consumer that calls `cli_main` then `run` cannot panic.
 ///
-/// The `--debug`-resolved verbosity ceiling (`config.level`) is installed as
-/// a SINGLE global subscriber-level filter on the registry — `LevelFilter`
-/// implements `Layer`, so `registry().with(level)` is a subscriber-wide
-/// gate, not a per-layer one. This is the one place verbosity is decided, so
-/// the process-wide `max_level_hint` is authoritatively the level (a
-/// `--debug` run reports `DEBUG`), and the per-sink layers
-/// ([`build_layers`]) only narrow further by target/role. The previous
-/// per-layer `.with_filter(level)` shape left the ceiling implicit: a layer
-/// whose OUTERMOST per-layer filter is the role/importance gate reports
-/// `None` for its `max_level_hint`, so the registry's global hint never
-/// reflected `--debug` (it worked only because `tracing`'s static default is
-/// `TRACE`). Hoisting the level to the registry makes the ceiling explicit
-/// and robust.
+/// Verbosity is owned PER LAYER, not by the registry: each file sink layer
+/// carries [`file_level_filter`] (TRACE, the forensic-complete contract)
+/// and the stdio sink layer carries `config.level` (INFO/DEBUG from
+/// `--debug`). The two ceilings differ by design — the durable record is
+/// not bound by the operator stream — so a global registry-level filter
+/// would conflate them and silently truncate the file sink. The process-
+/// wide `max_level_hint` is therefore the max across attached layers
+/// (TRACE whenever any file sink is attached), which is exactly what the
+/// runtime needs to evaluate `tracing::trace!(...)` call sites without
+/// pre-filter elision.
 pub(crate) fn init_with(config: &LogConfig) {
     // The [`RoleTagLayer`] recognises each coordinator's role span at
     // creation and records the `{P|S}-{id}` attribution the per-role/full
@@ -581,7 +641,6 @@ pub(crate) fn init_with(config: &LogConfig) {
     // read. Harmless when the full sink is stdout-only (no compact-format
     // layer reads the tag), so it is unconditional.
     let _ = tracing_subscriber::registry()
-        .with(config.level)
         .with(RoleTagLayer)
         .with(build_layers(config))
         .try_init();
@@ -781,8 +840,9 @@ mod tests {
 
     /// Drive a full + stdio layer set over in-memory buffers, emit one
     /// important and one normal event, and return (full, stdio) contents.
-    /// Verbosity stays at the historical `INFO` default for the
-    /// importance-mode/format tests.
+    /// Verbosity is per-layer as production composes it: the file layer
+    /// admits TRACE (forensic-complete), the stdio layer is bounded by the
+    /// historical `INFO` for the importance-mode/format tests.
     fn run_capture(important_only: bool) -> (String, String) {
         let full_buf = BufWriter::default();
         let stdio_buf = BufWriter::default();
@@ -791,15 +851,14 @@ mod tests {
         // attach in one `.with(...)`.
         let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![
             full_layer::<Registry, _>(full_buf.clone()),
-            stdio_layer::<Registry, _>(stdio_buf.clone(), important_only),
+            stdio_layer::<Registry, _>(stdio_buf.clone(), important_only, LevelFilter::INFO),
         ];
-        // The verbosity ceiling is a single global subscriber-level filter
-        // (one `LevelFilter` as a registry-wide gate), exactly as production
-        // composes it in `init_with`; the importance-mode/format tests run at
-        // the historical `INFO` ceiling. Attached last so the boxed
-        // `Layer<Registry>` set keeps its base-subscriber type — the gate
-        // and global hint are order-independent for a global level filter.
-        let subscriber = Registry::default().with(layers).with(LevelFilter::INFO);
+        // No global registry-level filter: each sink layer carries its own
+        // ceiling (TRACE for file, `stdio_level` for stdio), exactly how
+        // production composes it in `init_with`. Stacking a global INFO
+        // here would cap the file sink to INFO and defeat the forensic-
+        // complete contract.
+        let subscriber = Registry::default().with(layers);
         with_default(subscriber, || {
             tracing::info!(target: IMPORTANT_TARGET, "wake-the-llm");
             tracing::info!(target: "dynrunner_normal", "routine-chatter");
@@ -985,9 +1044,11 @@ mod tests {
         let stdio_buf = BufWriter::default();
         let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![
             full_layer::<Registry, _>(full_buf.clone()),
-            stdio_layer::<Registry, _>(stdio_buf.clone(), important_only),
+            stdio_layer::<Registry, _>(stdio_buf.clone(), important_only, LevelFilter::INFO),
         ];
-        let subscriber = Registry::default().with(layers).with(LevelFilter::INFO);
+        // Per-layer ceilings — no global registry filter (file = TRACE,
+        // stdio = INFO above).
+        let subscriber = Registry::default().with(layers);
         with_default(subscriber, || {
             tracing::info!(
                 target: OBSERVER_TASK_TARGET,
@@ -1032,62 +1093,121 @@ mod tests {
         );
     }
 
-    /// Drive a full layer under a GLOBAL `level` ceiling over an in-memory
-    /// buffer, emit one INFO and one DEBUG event, and return the captured
-    /// contents. The verbosity ceiling is the only variable under test, and
-    /// it is the single global subscriber-level filter — exactly how
-    /// production (`init_with`) applies it.
-    fn run_capture_level(level: LevelFilter) -> String {
+    /// Drive a full + stdio layer set under the per-layer ceilings
+    /// (file = TRACE, stdio = `stdio_level`) over in-memory buffers, emit
+    /// one INFO + one DEBUG + one TRACE event, and return (full, stdio)
+    /// contents. The stdio ceiling is the only variable under test — the
+    /// file ceiling is fixed at TRACE by the forensic-complete contract.
+    fn run_capture_level(stdio_level: LevelFilter) -> (String, String) {
         let full_buf = BufWriter::default();
-        let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> =
-            vec![full_layer::<Registry, _>(full_buf.clone())];
-        // Global level gate attached last (order-independent for a global
-        // filter); the boxed `Layer<Registry>` set keeps its base type.
-        let subscriber = Registry::default().with(layers).with(level);
+        let stdio_buf = BufWriter::default();
+        let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![
+            full_layer::<Registry, _>(full_buf.clone()),
+            stdio_layer::<Registry, _>(stdio_buf.clone(), false, stdio_level),
+        ];
+        // Per-layer ceilings — no global registry filter.
+        let subscriber = Registry::default().with(layers);
         with_default(subscriber, || {
             tracing::info!("an-info-line");
             tracing::debug!("a-debug-line");
+            tracing::trace!("a-trace-line");
         });
-        full_buf.contents()
+        (full_buf.contents(), stdio_buf.contents())
     }
 
     #[test]
     fn debug_flag_resolves_to_debug_level_else_info() {
-        // The `--debug` flag is the only verbosity knob: on → DEBUG ceiling,
-        // off → the historical INFO. Parametric, never from `RUST_LOG`.
+        // The `--debug` flag is the only STDIO verbosity knob: on → DEBUG
+        // ceiling, off → the historical INFO. Parametric, never from
+        // `RUST_LOG`. The file ceiling is TRACE regardless (forensic-
+        // complete contract).
         assert_eq!(level_filter(true), LevelFilter::DEBUG);
         assert_eq!(level_filter(false), LevelFilter::INFO);
 
-        // And it lands on the config every sink reads its level from.
+        // And it lands on the config the stdio layer reads its level from.
         let cfg = LogConfig::new(false, None, None, true);
         assert_eq!(cfg.level, LevelFilter::DEBUG);
         let cfg = LogConfig::new(false, None, None, false);
         assert_eq!(cfg.level, LevelFilter::INFO);
+
+        // The file ceiling is fixed at TRACE — not parametric.
+        assert_eq!(file_level_filter(), LevelFilter::TRACE);
     }
 
+    /// The file sink is FORENSIC-COMPLETE: DEBUG and TRACE events land in
+    /// it regardless of `--debug`. This is the #585 invariant — primary.log
+    /// / secondary.log / observer.log capture EVERY event a peer emits.
     #[test]
-    fn debug_true_emits_debug_lines_false_drops_them() {
-        // End-to-end through the real layer builder: with debug on, a DEBUG
-        // event reaches the sink (this is the `secondary.log` fix); with it
-        // off, the INFO ceiling drops it. The INFO line passes either way.
-        let debug_on = run_capture_level(level_filter(true));
+    fn file_sink_records_trace_and_debug_regardless_of_debug_flag() {
+        // --debug OFF: file still records TRACE + DEBUG (the contract).
+        let (full_off, _stdio_off) = run_capture_level(level_filter(false));
         assert!(
-            debug_on.contains("an-info-line"),
-            "INFO line missing under debug: {debug_on}"
+            full_off.contains("an-info-line"),
+            "INFO line missing from file under --debug-off: {full_off}"
         );
         assert!(
-            debug_on.contains("a-debug-line"),
-            "DEBUG line missing under --debug — verbosity ceiling not raised: {debug_on}"
+            full_off.contains("a-debug-line"),
+            "DEBUG line missing from file under --debug-off — the #585 \
+             forensic-complete contract regressed: {full_off}"
+        );
+        assert!(
+            full_off.contains("a-trace-line"),
+            "TRACE line missing from file under --debug-off — the #585 \
+             forensic-complete contract regressed: {full_off}"
         );
 
-        let debug_off = run_capture_level(level_filter(false));
+        // --debug ON: file still records TRACE + DEBUG (same contract).
+        let (full_on, _stdio_on) = run_capture_level(level_filter(true));
         assert!(
-            debug_off.contains("an-info-line"),
-            "INFO line missing under default level: {debug_off}"
+            full_on.contains("an-info-line"),
+            "INFO line missing from file under --debug-on: {full_on}"
         );
         assert!(
-            !debug_off.contains("a-debug-line"),
-            "DEBUG line leaked at the default INFO ceiling: {debug_off}"
+            full_on.contains("a-debug-line"),
+            "DEBUG line missing from file under --debug-on: {full_on}"
+        );
+        assert!(
+            full_on.contains("a-trace-line"),
+            "TRACE line missing from file under --debug-on: {full_on}"
+        );
+    }
+
+    /// The stdio sink admits DEBUG only when `--debug` is set, and NEVER
+    /// admits TRACE — the operator stream stays operator-relevant. This is
+    /// the dual contract to `file_sink_records_trace_and_debug_*`: file is
+    /// forensic-complete, stdio is operator-relevant, decoupled.
+    #[test]
+    fn stdio_sink_caps_at_info_or_debug_per_debug_flag_never_trace() {
+        // --debug OFF: stdio capped at INFO (historical default).
+        let (_full_off, stdio_off) = run_capture_level(level_filter(false));
+        assert!(
+            stdio_off.contains("an-info-line"),
+            "INFO line missing from stdio under default: {stdio_off}"
+        );
+        assert!(
+            !stdio_off.contains("a-debug-line"),
+            "DEBUG line leaked to stdio at the default INFO ceiling: {stdio_off}"
+        );
+        assert!(
+            !stdio_off.contains("a-trace-line"),
+            "TRACE line leaked to stdio at the default INFO ceiling: {stdio_off}"
+        );
+
+        // --debug ON: stdio admits DEBUG but still NEVER TRACE.
+        let (_full_on, stdio_on) = run_capture_level(level_filter(true));
+        assert!(
+            stdio_on.contains("an-info-line"),
+            "INFO line missing from stdio under --debug: {stdio_on}"
+        );
+        assert!(
+            stdio_on.contains("a-debug-line"),
+            "DEBUG line missing from stdio under --debug — operator ceiling \
+             not raised: {stdio_on}"
+        );
+        assert!(
+            !stdio_on.contains("a-trace-line"),
+            "TRACE line leaked to stdio under --debug — the file-sink TRACE \
+             contract bled into the operator stream: {stdio_on}"
         );
     }
 
@@ -1202,9 +1322,9 @@ mod tests {
             false,
         );
         let layers = build_layers::<Registry>(&config);
-        // Layers first, then the global level gate (order-independent for a
-        // global filter; keeps the boxed `Layer<Registry>` set's base type).
-        let subscriber = Registry::default().with(layers).with(config.level);
+        // No global level gate — each layer in `build_layers` carries its
+        // own (file = TRACE, stdio = `config.level`).
+        let subscriber = Registry::default().with(layers);
 
         with_default(subscriber, || {
             // The preparation pipeline emits with NO role span entered.
@@ -1255,7 +1375,8 @@ mod tests {
             role_full_layer::<Registry, _>(secondary_buf.clone(), SECONDARY_ROLE_SPAN),
             role_full_layer::<Registry, _>(observer_buf.clone(), OBSERVER_ROLE_SPAN),
         ];
-        let subscriber = Registry::default().with(layers).with(LevelFilter::INFO);
+        // Per-layer ceilings — file layers carry TRACE already.
+        let subscriber = Registry::default().with(layers);
         with_default(subscriber, || {
             tracing::info_span!(OBSERVER_ROLE_SPAN, kind = "observer")
                 .in_scope(|| tracing::info!("observer-event"));
@@ -1290,7 +1411,8 @@ mod tests {
             role_full_layer::<Registry, _>(primary_buf.clone(), PRIMARY_ROLE_SPAN),
             role_full_layer::<Registry, _>(secondary_buf.clone(), SECONDARY_ROLE_SPAN),
         ];
-        let subscriber = Registry::default().with(layers).with(LevelFilter::INFO);
+        // Per-layer ceilings (file = TRACE).
+        let subscriber = Registry::default().with(layers);
         with_default(subscriber, || {
             tracing::info_span!(PRIMARY_ROLE_SPAN, kind = "primary")
                 .in_scope(|| tracing::info!("primary-event"));
@@ -1342,7 +1464,8 @@ mod tests {
             role_full_layer::<Registry, _>(primary_buf.clone(), PRIMARY_ROLE_SPAN),
             role_full_layer::<Registry, _>(secondary_buf.clone(), SECONDARY_ROLE_SPAN),
         ];
-        let subscriber = Registry::default().with(layers).with(LevelFilter::INFO);
+        // Per-layer ceilings (file = TRACE).
+        let subscriber = Registry::default().with(layers);
         with_default(subscriber, || {
             tracing::info_span!(PRIMARY_ROLE_SPAN, kind = "primary").in_scope(|| {
                 tracing::info_span!("phase", n = 1)
@@ -1359,57 +1482,62 @@ mod tests {
         );
     }
 
-    /// REPRODUCTION (the gap the single-filter unit test missed): the EXACT
-    /// cluster layer stack — `important_stdio_only` + per-node-dir (so the
-    /// two nested `role_full_layer`s) + DEBUG level — must let a `debug!`
-    /// emitted INSIDE the secondary role span land in `secondary.log`.
-    ///
-    /// This drives the production `build_layers` (not the single-filter
-    /// `full_layer`), so it exercises the nested
-    /// `.with_filter(level).with_filter(RoleFilter/important)` shape the
-    /// cluster uses. The on-cluster symptom is ZERO debug lines anywhere.
+    /// REPRODUCTION (#585): the EXACT cluster layer stack —
+    /// `important_stdio_only` + per-node-dir (so the three nested
+    /// `role_full_layer`s plus the catch-all) — must let a TRACE-level event
+    /// emitted INSIDE the secondary role span land in `secondary.log`
+    /// regardless of `--debug` (the forensic-complete file-sink contract).
+    /// Same for DEBUG with `--debug` off — file is not bounded by stdio's
+    /// `--debug` knob. Drives the production `build_layers` so the per-layer
+    /// TRACE ceiling on every file sink is exercised end-to-end.
     #[test]
-    fn cluster_stack_debug_reaches_secondary_log() {
+    fn cluster_stack_trace_and_debug_reach_secondary_log_without_debug_flag() {
         use tracing::level_filters::LevelFilter as CurrentLevel;
 
         let dir = tempfile::tempdir().unwrap();
         let node_dir = dir.path().join("secondary-0");
+        // CRUCIAL: `--debug` is OFF here. Under the OLD global-ceiling shape
+        // a DEBUG/TRACE emit would be elided; the #585 fix is that file sinks
+        // carry their own TRACE ceiling and ignore `--debug`.
         let config = LogConfig::new(
-            true, // important_stdio_only — the cluster flag
+            true,                                 // important_stdio_only — the cluster flag
             None,
             Some(node_dir.display().to_string()), // PerNodeDir → role_full_layers
-            true,                                 // --debug → DEBUG level
+            false,                                // --debug OFF
         );
-        // Compose EXACTLY as `init_with`: the level is one global subscriber-
-        // level filter, the per-sink layers only narrow by target/role. The
-        // layers are generic over the post-level subscriber type (inferred),
-        // matching `init_with`'s `registry().with(level).with(build_layers())`.
-        let subscriber = Registry::default()
-            .with(config.level)
-            .with(build_layers(&config));
+        // Compose EXACTLY as `init_with`: per-layer ceilings, no global
+        // registry-level filter.
+        let subscriber = Registry::default().with(build_layers(&config));
 
         with_default(subscriber, || {
-            // The verbosity ceiling is now an explicit GLOBAL filter, so the
-            // process max-level hint authoritatively reflects `--debug`
-            // (DEBUG) rather than relying on `tracing`'s `TRACE` default —
-            // the robustness this hoist buys.
+            // The process max-level hint is the max across attached layers;
+            // the file layers carry TRACE, so it is TRACE — call sites for
+            // `tracing::trace!(...)` are evaluated rather than pre-filtered.
             let hint = CurrentLevel::current();
             assert_eq!(
                 hint,
-                CurrentLevel::DEBUG,
-                "global max-level hint should be DEBUG under --debug, got {hint:?}"
+                CurrentLevel::TRACE,
+                "max-level hint should be TRACE under the file-sink \
+                 forensic-complete contract, got {hint:?}"
             );
 
-            tracing::info_span!(SECONDARY_ROLE_SPAN, kind = "secondary")
-                .in_scope(|| tracing::debug!("cluster-debug-line"));
+            tracing::info_span!(SECONDARY_ROLE_SPAN, kind = "secondary").in_scope(|| {
+                tracing::debug!("cluster-debug-line");
+                tracing::trace!("cluster-trace-line");
+            });
 
             let secondary = std::fs::read_to_string(node_dir.join(SECONDARY_LOG_FILENAME))
                 .expect("secondary.log should exist");
             assert!(
                 secondary.contains("cluster-debug-line"),
                 "DEBUG event did not reach secondary.log under the cluster \
-                 stack — global max-level hint is {hint:?} (expected DEBUG). \
-                 secondary.log contents: {secondary:?}"
+                 stack with --debug OFF — file-sink forensic-complete \
+                 contract regressed (#585). secondary.log: {secondary:?}"
+            );
+            assert!(
+                secondary.contains("cluster-trace-line"),
+                "TRACE event did not reach secondary.log under the cluster \
+                 stack — the #585 violation: {secondary:?}"
             );
         });
     }
@@ -1452,12 +1580,11 @@ mod tests {
                 open_append_create(&node_dir.join(OBSERVER_LOG_FILENAME)),
                 OBSERVER_ROLE_SPAN,
             ),
-            stdio_layer::<Registry, _>(stdio_buf.clone(), config.important_stdio_only),
+            stdio_layer::<Registry, _>(stdio_buf.clone(), config.important_stdio_only, config.level),
         ];
-        // Layers first then the global level (order-independent for a global
-        // filter), so the boxed `Layer<Registry>` set keeps its base type —
-        // exactly how the sibling `role_span_routes_*` tests compose.
-        let subscriber = Registry::default().with(layers).with(config.level);
+        // No global level filter — per-layer ceilings (file = TRACE; stdio
+        // = `config.level`). Mirrors production `init_with`.
+        let subscriber = Registry::default().with(layers);
 
         with_default(subscriber, || {
             // The consumer hook runs INSIDE the run future's role span (here
@@ -1514,7 +1641,8 @@ mod tests {
         let node_dir = dir.path().join("compute-0");
         let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false);
         let layers = build_layers::<Registry>(&config);
-        let subscriber = Registry::default().with(layers).with(config.level);
+        // No global level filter — per-layer ceilings.
+        let subscriber = Registry::default().with(layers);
 
         with_default(subscriber, || {
             // No role span entered (the detached blocking thread): the emit has
@@ -1547,37 +1675,81 @@ mod tests {
         );
     }
 
-    /// The `py_log` level NAME maps to the tracing level: a Python `WARNING`
-    /// forwarded under a `--debug`-OFF (INFO ceiling) config still passes
-    /// (WARN ≥ INFO), while a `DEBUG` record is dropped by the same ceiling —
-    /// confirming the level mapping feeds the real verbosity gate rather than
-    /// being a flat INFO emit.
+    /// The `py_log` level NAME maps to the tracing level: it feeds the
+    /// real verbosity gates rather than being a flat INFO emit. Asserted on
+    /// the STDIO sink (the only one with an INFO/DEBUG-bounded ceiling) — a
+    /// Python `WARNING` passes the stdio INFO ceiling and a `DEBUG` is
+    /// dropped from stdio. The FILE sink admits both regardless (forensic-
+    /// complete contract), so the file-sink half of the assertion is the
+    /// dual: a DEBUG bridge record IS preserved in the per-role log.
     #[test]
     fn py_log_level_name_maps_to_tracing_level() {
         let dir = tempfile::tempdir().unwrap();
         let node_dir = dir.path().join("compute-0");
-        // INFO ceiling (debug off).
+        // Stdio at INFO (debug off); file at TRACE (forensic contract).
         let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false);
-        let layers = build_layers::<Registry>(&config);
-        let subscriber = Registry::default().with(layers).with(config.level);
+
+        // We need to observe stdio too — substitute an in-memory writer for
+        // the always-present stdio layer so the bridge-exclusion + level
+        // gate are both visible. The file layers come straight from the
+        // production `build_layers` path (PerNodeDir → role files +
+        // setup.log).
+        let stdio_buf = BufWriter::default();
+        let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![
+            role_full_layer(
+                open_append_create(&node_dir.join(PRIMARY_LOG_FILENAME)),
+                PRIMARY_ROLE_SPAN,
+            ),
+            role_full_layer(
+                open_append_create(&node_dir.join(SECONDARY_LOG_FILENAME)),
+                SECONDARY_ROLE_SPAN,
+            ),
+            role_full_layer(
+                open_append_create(&node_dir.join(OBSERVER_LOG_FILENAME)),
+                OBSERVER_ROLE_SPAN,
+            ),
+            unattributed_full_layer(open_append_create(&node_dir.join(SETUP_LOG_FILENAME))),
+        ];
+        layers.push(stdio_layer::<Registry, _>(
+            stdio_buf.clone(),
+            config.important_stdio_only,
+            config.level,
+        ));
+        let subscriber = Registry::default().with(layers);
 
         with_default(subscriber, || {
             tracing::info_span!(PRIMARY_ROLE_SPAN, kind = "primary", node = "c0").in_scope(|| {
                 py_log("WARNING", "consumer.task", "warn-passes-info-ceiling");
-                py_log("DEBUG", "consumer.task", "debug-dropped-by-info-ceiling");
+                py_log("DEBUG", "consumer.task", "debug-passes-file-but-not-stdio");
             });
         });
 
         let primary = std::fs::read_to_string(node_dir.join(PRIMARY_LOG_FILENAME))
             .expect("primary.log should exist");
+        let stdio = stdio_buf.contents();
+
+        // FILE sink (TRACE ceiling, forensic-complete): both bridged records
+        // land in primary.log, confirming the level mapping is real (not a
+        // flat-INFO emit) AND that the file ceiling admits DEBUG.
         assert!(
             primary.contains("warn-passes-info-ceiling"),
-            "WARNING-level bridge record did not pass the INFO ceiling: {primary:?}"
+            "WARNING-level bridge record missing from primary.log: {primary:?}"
         );
         assert!(
-            !primary.contains("debug-dropped-by-info-ceiling"),
-            "DEBUG-level bridge record leaked past the INFO ceiling — the level \
-             name is not feeding the verbosity gate: {primary:?}"
+            primary.contains("debug-passes-file-but-not-stdio"),
+            "DEBUG-level bridge record missing from primary.log — the file \
+             sink should be forensic-complete: {primary:?}"
+        );
+
+        // STDIO sink: the bridge is gated out (already on Python console);
+        // confirm explicitly so the test pins both halves.
+        assert!(
+            !stdio.contains("warn-passes-info-ceiling"),
+            "bridged record leaked onto stdout (bridge-exclusion broke): {stdio:?}"
+        );
+        assert!(
+            !stdio.contains("debug-passes-file-but-not-stdio"),
+            "bridged record leaked onto stdout: {stdio:?}"
         );
     }
 
@@ -1587,12 +1759,15 @@ mod tests {
     #[test]
     fn debug_does_not_widen_important_stdio_gate() {
         let stdio_buf = BufWriter::default();
-        let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> =
-            vec![stdio_layer::<Registry, _>(stdio_buf.clone(), true)];
-        // DEBUG ceiling applied globally (as production does); the important-
-        // stdio gate is the layer's only narrowing — raising the level must
-        // not widen it. Global gate attached last (order-independent).
-        let subscriber = Registry::default().with(layers).with(LevelFilter::DEBUG);
+        // DEBUG stdio ceiling carried by the layer itself (no global filter);
+        // the important-stdio gate is the other half of the layer's filter —
+        // raising the level must not widen the target gate.
+        let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![stdio_layer::<Registry, _>(
+            stdio_buf.clone(),
+            true,
+            LevelFilter::DEBUG,
+        )];
+        let subscriber = Registry::default().with(layers);
         with_default(subscriber, || {
             tracing::debug!(target: IMPORTANT_TARGET, "important-debug");
             tracing::debug!(target: "dynrunner_normal", "routine-debug");
@@ -1626,9 +1801,10 @@ mod tests {
         // submitter's `--important-stdio-only --full-log-file=...` stack.
         let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![
             full_layer::<Registry, _>(open_append_create(&full_file)),
-            stdio_layer::<Registry, _>(stdio_buf.clone(), true),
+            stdio_layer::<Registry, _>(stdio_buf.clone(), true, LevelFilter::INFO),
         ];
-        let subscriber = Registry::default().with(layers).with(LevelFilter::INFO);
+        // No global filter — per-layer ceilings (file = TRACE, stdio = INFO).
+        let subscriber = Registry::default().with(layers);
         with_default(subscriber, || {
             // The fatal-error primitive — emits at the IMPORTANT target.
             py_log_important("SLURM dispatch failed: boom", "ERROR");
@@ -1664,78 +1840,101 @@ mod tests {
         );
     }
 
-    /// GLOBAL-INSTALL REPRODUCTION: the cluster installs the subscriber
-    /// process-globally via `init_with` (`try_init` → `set_global_default`),
-    /// NOT the scoped `with_default` the other tests use. `set_global_default`
-    /// sets the process-wide `MAX_LEVEL` static from the subscriber's
-    /// `max_level_hint()`; `with_default` sets a per-thread one. This test
-    /// pins that the GLOBAL path also lets a secondary-span `debug!` reach
-    /// `secondary.log` under the cluster stack.
+    /// GLOBAL-INSTALL REPRODUCTION (#585): the cluster installs the
+    /// subscriber process-globally via `init_with` (`try_init` →
+    /// `set_global_default`), NOT the scoped `with_default` the other tests
+    /// use. `set_global_default` sets the process-wide `MAX_LEVEL` static
+    /// from the subscriber's `max_level_hint()`; `with_default` sets a
+    /// per-thread one. This test pins that the GLOBAL path lets a
+    /// secondary-span `trace!` AND `debug!` reach `secondary.log` even with
+    /// `--debug` OFF — the file-sink forensic-complete contract owned
+    /// PER-LAYER (not by the operator-facing `--debug` knob).
     ///
     /// `#[ignore]` because it mutates the process-global subscriber (a
     /// one-shot per process): run explicitly, alone, with
-    /// `--ignored --exact logging::tests::cluster_stack_debug_reaches_secondary_log_global`.
+    /// `--ignored --exact logging::tests::cluster_stack_trace_reaches_secondary_log_global`.
     #[test]
     #[ignore = "installs the process-global subscriber; run alone"]
-    fn cluster_stack_debug_reaches_secondary_log_global() {
+    fn cluster_stack_trace_reaches_secondary_log_global() {
         use tracing::level_filters::LevelFilter as CurrentLevel;
 
         let dir = tempfile::tempdir().unwrap();
         let node_dir = dir.path().join("secondary-0");
-        let config = LogConfig::new(true, None, Some(node_dir.display().to_string()), true);
+        // --debug OFF — the file sink must still admit DEBUG + TRACE.
+        let config = LogConfig::new(true, None, Some(node_dir.display().to_string()), false);
 
         // The REAL global install the cluster runs (`try_init`).
         init_with(&config);
 
-        // The process-wide ceiling now authoritatively reflects `--debug`
-        // (the global registry-level filter), not `tracing`'s TRACE default.
+        // The process-wide ceiling now reflects the MAX across all attached
+        // layers — the file layers carry TRACE, so the static hint is TRACE
+        // (call sites for `tracing::trace!(...)` are evaluated rather than
+        // pre-filtered).
         let hint = CurrentLevel::current();
         assert_eq!(
             hint,
-            CurrentLevel::DEBUG,
-            "process max-level hint should be DEBUG under --debug, got {hint:?}"
+            CurrentLevel::TRACE,
+            "process max-level hint should be TRACE under the file-sink \
+             forensic-complete contract, got {hint:?}"
         );
-        tracing::info_span!(SECONDARY_ROLE_SPAN, kind = "secondary")
-            .in_scope(|| tracing::debug!("cluster-debug-line-global"));
+        tracing::info_span!(SECONDARY_ROLE_SPAN, kind = "secondary").in_scope(|| {
+            tracing::debug!("cluster-debug-line-global");
+            tracing::trace!("cluster-trace-line-global");
+        });
 
         let secondary = std::fs::read_to_string(node_dir.join(SECONDARY_LOG_FILENAME))
             .expect("secondary.log should exist");
         assert!(
             secondary.contains("cluster-debug-line-global"),
             "DEBUG event did not reach secondary.log under the GLOBAL cluster \
-             install — process-wide max-level hint is {hint:?} (expected to \
-             admit DEBUG). secondary.log contents: {secondary:?}"
+             install with --debug OFF — process-wide max-level hint is \
+             {hint:?} (expected TRACE). secondary.log: {secondary:?}"
+        );
+        assert!(
+            secondary.contains("cluster-trace-line-global"),
+            "TRACE event did not reach secondary.log under the GLOBAL cluster \
+             install — the #585 violation: {secondary:?}"
         );
     }
 
-    /// SUBMITTER-STACK PROBE: the importance-mode submitter stack
-    /// (`important_stdio_only=true` + single-file `File` full sink, DEBUG
-    /// level) must let a DEBUG event reach the `File` full sink — the
-    /// `dynrunner-full.log` the submitter inspects. This stack nests
-    /// `full_layer` (single `.with_filter(level)`) alongside the
-    /// `stdio_layer` important branch (`.with_filter(level).with_filter(
-    /// important_stdio_filter)`); pins that the mixed nesting does not
-    /// collapse the global hint and suppress the submitter's own DEBUG.
+    /// SUBMITTER-STACK PROBE (#585): the importance-mode submitter stack
+    /// (`important_stdio_only=true` + single-file `File` full sink) must
+    /// let a DEBUG and TRACE event reach the `File` full sink — the
+    /// `dynrunner-full.log` the submitter inspects — even with `--debug`
+    /// OFF. The file sink is forensic-complete (TRACE) regardless of the
+    /// operator-facing `--debug` knob; the stdio sink stays operator-
+    /// relevant. This stack pairs `full_layer` (per-layer TRACE filter)
+    /// alongside the `stdio_layer` important branch (per-layer
+    /// `stdio_level`-AND-importance filter); pins that the per-layer
+    /// ceilings do not collide.
     #[test]
     #[ignore = "installs the process-global subscriber; run alone"]
-    fn submitter_importance_stack_debug_reaches_full_file_global() {
+    fn submitter_importance_stack_trace_reaches_full_file_global() {
         let dir = tempfile::tempdir().unwrap();
         let full_file = dir.path().join("dynrunner-full.log");
+        // --debug OFF — file sink must still record DEBUG + TRACE.
         let config = LogConfig::new(
             true,                                  // important_stdio_only
             Some(full_file.display().to_string()), // File full sink
             None,
-            true, // --debug
+            false, // --debug OFF
         );
         init_with(&config);
 
         tracing::debug!("submitter-debug-line");
+        tracing::trace!("submitter-trace-line");
 
         let full = std::fs::read_to_string(&full_file).expect("full log file should exist");
         assert!(
             full.contains("submitter-debug-line"),
             "DEBUG event did not reach the submitter's full-log file under the \
-             importance-mode stack: {full:?}"
+             importance-mode stack with --debug OFF — file-sink contract \
+             regressed: {full:?}"
+        );
+        assert!(
+            full.contains("submitter-trace-line"),
+            "TRACE event did not reach the submitter's full-log file — the \
+             #585 forensic-complete contract regressed: {full:?}"
         );
     }
 }

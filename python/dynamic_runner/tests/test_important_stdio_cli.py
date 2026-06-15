@@ -319,16 +319,20 @@ class InitLoggingParamPassthroughTests(_RootLoggerSandbox):
 
     def test_debug_flag_threads_into_init_logging(self) -> None:
         # `--debug` must reach the Rust subscriber via the init_logging
-        # `debug` param — not just the Python root logger. Without this the
-        # secondary's per-role `secondary.log` stayed INFO-only on a
-        # `--debug` run (the on-cluster bug).
+        # `debug` param — not just the Python root logger. The Rust side
+        # uses this to widen the STDIO sink's ceiling from INFO to DEBUG.
+        # The per-role file sinks (`primary.log` / `secondary.log` /
+        # `observer.log`) are forensic-complete at TRACE regardless of
+        # this flag (#585 contract).
         logging_setup.setup_logging(_parse(["--debug"]))
         self.assertEqual(len(self.init_calls), 1)
         self.assertTrue(self.init_calls[0]["debug"])
 
     def test_no_debug_flag_passes_debug_false(self) -> None:
-        # Absent `--debug`, the param defaults to False so the Rust sinks
-        # keep the historical INFO ceiling.
+        # Absent `--debug`, the param defaults to False so the Rust stdio
+        # sink keeps the historical INFO ceiling. The per-role file sinks
+        # still admit TRACE (file = forensic-complete, independent of the
+        # operator-facing `--debug` knob).
         logging_setup.setup_logging(_parse([]))
         self.assertEqual(len(self.init_calls), 1)
         self.assertFalse(self.init_calls[0]["debug"])

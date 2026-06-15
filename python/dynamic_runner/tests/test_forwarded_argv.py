@@ -135,10 +135,12 @@ class FilterFrameworkArgvTests(unittest.TestCase):
     def test_debug_forwarded_to_secondary(self) -> None:
         # `--debug` is a framework flag but NEITHER framework-regenerated NOR
         # submitter-local, so it must reach the secondary verbatim — that is
-        # what lets the secondary's `setup_logging` raise its own Rust sink
-        # (per-role `secondary.log`) to DEBUG. Pinned explicitly so a future
-        # reclassification that strips it can't regress on-cluster
-        # debuggability silently.
+        # what lets the secondary's `setup_logging` raise its own Rust STDIO
+        # sink to DEBUG. (The per-role file sinks already admit TRACE
+        # regardless of `--debug` — file is forensic-complete per the #585
+        # contract — but the operator-facing stdio stream needs the flag.)
+        # Pinned explicitly so a future reclassification that strips it
+        # can't regress on-cluster debuggability silently.
         argv = ["--debug", "--platform", "x64"]
         self.assertEqual(filter_framework_argv(argv), argv)
 
