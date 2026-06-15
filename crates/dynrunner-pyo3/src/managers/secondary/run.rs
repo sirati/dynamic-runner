@@ -2166,16 +2166,25 @@ fn finalize_cmd_args_under_gil(py: Python<'_>, captures: &FinalizeCaptures) -> R
 /// primary's `on_run_start` `output_dir` (D), so it is computed ONCE here and
 /// fed to both — no duplicated bind-mount logic.
 ///
-///   * Pre-staged mode (`args.source_already_staged` non-`None`): the
-///     secondary's filesystem-view of the gateway-side output dir lives at the
-///     wrapper-script's static bind-mount path `/app/out-network` → `Some`.
-///   * Non-pre-staged WITH `args.output`: `Path(args.output).resolve()` →
-///     `Some`.
-///   * Non-pre-staged WITHOUT `args.output`: `Ok(None)` — preserves the
-///     original discovery body's lenient "skip setting `resolved_output_root`"
-///     behaviour (the boot Namespace need not carry `--output`, which is NOT a
+/// The discriminator is "am I executing inside the wrapper container?" — NOT
+/// the staging mode. Both axes are now correct: an in-container primary that is
+/// NOT pre-staged still sees the bind-mount, and an in-process pre-staged
+/// primary on the host still sees its host path.
+///
+///   * In wrapper container (`crate::config::primary_secondary::in_wrapper_container`):
+///     the secondary's filesystem-view of the gateway-side output dir lives at
+///     the wrapper-script's static bind-mount path `WRAPPER_OUT_NETWORK` →
+///     `Some`, regardless of `args.output` (the host path is meaningless here).
+///   * On the host WITH `args.output`: `Path(args.output).resolve()` → `Some`.
+///   * On the host WITHOUT `args.output`: `Ok(None)` — preserves the original
+///     discovery body's lenient "skip setting `resolved_output_root`" behaviour
+///     (the boot Namespace need not carry `--output`, which is NOT a
 ///     framework-regenerated flag). A genuine resolve failure (pathlib raising)
 ///     is still an `Err`.
+///
+/// The container-vs-host decision and its bind-mount/host-path mapping are owned
+/// by `crate::config::primary_secondary` (the module that owns the `/app/*`
+/// bind-mount layout); this resolver is a thin shell over that owner.
 ///
 /// Returns a `String` error (the secondary aborts the run on it) so no `PyErr`
 /// crosses the `Send` boundary in the calling closures.
@@ -2183,32 +2192,35 @@ fn resolve_node_local_output_root(
     py: Python<'_>,
     args: &Bound<'_, PyAny>,
 ) -> Result<Option<String>, String> {
-    let pre_staged = args
-        .getattr("source_already_staged")
-        .ok()
-        .filter(|v| !v.is_none())
-        .is_some();
-    if pre_staged {
-        return Ok(Some("/app/out-network".to_string()));
-    }
-    let Ok(output_attr) = args.getattr("output") else {
+    let in_container = crate::config::primary_secondary::in_wrapper_container();
+    // In-container the bind-mount is the only readable view, so don't resolve a
+    // meaningless host path.
+    let host_path = if in_container {
+        None
+    } else if let Ok(output_attr) = args.getattr("output") {
+        let resolved = (|| -> PyResult<Bound<'_, PyAny>> {
+            let pathlib = py.import("pathlib")?;
+            pathlib
+                .getattr("Path")?
+                .call1((output_attr,))?
+                .call_method0("resolve")
+        })()
+        .map_err(|e| format!("failed to resolve output root: {e}"))?;
+        Some(
+            resolved
+                .str()
+                .map_err(|e| format!("failed to stringify resolved output root: {e}"))?
+                .extract::<String>()
+                .map_err(|e| format!("failed to extract resolved output root: {e}"))?,
+        )
+    } else {
         // No `output` attribute: lenient skip (original discovery behaviour).
-        return Ok(None);
+        None
     };
-    let resolved = (|| -> PyResult<Bound<'_, PyAny>> {
-        let pathlib = py.import("pathlib")?;
-        pathlib
-            .getattr("Path")?
-            .call1((output_attr,))?
-            .call_method0("resolve")
-    })()
-    .map_err(|e| format!("failed to resolve output root: {e}"))?;
-    resolved
-        .str()
-        .map_err(|e| format!("failed to stringify resolved output root: {e}"))?
-        .extract::<String>()
-        .map(Some)
-        .map_err(|e| format!("failed to extract resolved output root: {e}"))
+    Ok(crate::config::primary_secondary::node_local_output_root(
+        in_container,
+        host_path.as_deref(),
+    ))
 }
 
 /// The GIL-held body of one setup-discovery excursion: resolve the COMPLETE
@@ -2716,25 +2728,27 @@ task = Task()
         });
     }
 
-    /// G: a PRE-staged discovery namespace gets the bind-mount output root
-    /// (`/app/out-network`), the D↔G converged resolver's pre-staged branch.
+    /// G: the resolver is now keyed on the wrapper-container probe, not the
+    /// staging mode. In the test env (`/app/src-network` absent) we are NOT
+    /// in-container, so even a pre-staged namespace resolves to the HOST
+    /// `output` path — the bind-mount branch only fires inside the container.
+    /// (The pure container→bind-mount mapping is unit-tested in
+    /// `config::primary_secondary::tests::node_local_output_root`.)
     #[test]
-    fn discovery_pre_staged_output_root_is_bind_mount() {
+    fn discovery_host_output_root_is_resolved_path() {
         Python::attach(|py| {
             let source = "from types import SimpleNamespace\n\
-                 ns = SimpleNamespace(source_already_staged='/staged', output='/ignored')\n";
+                 ns = SimpleNamespace(source_already_staged='/staged', output='/run/out')\n";
             let m = PyModule::from_code(
                 py,
                 std::ffi::CString::new(source).unwrap().as_c_str(),
-                std::ffi::CString::new("prestaged_ns.py")
-                    .unwrap()
-                    .as_c_str(),
-                std::ffi::CString::new("prestaged_ns").unwrap().as_c_str(),
+                std::ffi::CString::new("host_ns.py").unwrap().as_c_str(),
+                std::ffi::CString::new("host_ns").unwrap().as_c_str(),
             )
             .unwrap();
             let ns = m.getattr("ns").unwrap();
             let resolved = resolve_node_local_output_root(py, &ns).unwrap();
-            assert_eq!(resolved.as_deref(), Some("/app/out-network"));
+            assert_eq!(resolved.as_deref(), Some("/run/out"));
         });
     }
 

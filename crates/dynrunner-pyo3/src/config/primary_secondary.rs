@@ -250,7 +250,7 @@ impl PySecondaryConfig {
         let max_resources = max_resources
             .unwrap_or_else(|| PyResourceMap::from_single("memory", detect_total_memory_bytes()));
 
-        let in_wrapper_container = std::path::Path::new(WRAPPER_SRC_NETWORK).exists();
+        let in_wrapper_container = in_wrapper_container();
         let src_network = src_network.or_else(|| {
             if in_wrapper_container {
                 Some(PathBuf::from(WRAPPER_SRC_NETWORK))
@@ -310,6 +310,37 @@ const WRAPPER_SRC_TMP: &str = "/app/src-tmp";
 /// Bind-mount path the SLURM wrapper attaches the gateway's
 /// durable output directory to inside the container.
 const WRAPPER_OUT_NETWORK: &str = "/app/out-network";
+
+/// True when executing inside the SLURM wrapper container — the `/app/*`
+/// bind-mount layout is present. Single source of truth for the
+/// "is my filesystem the container view" question (the presence of the
+/// gateway src-network bind-mount is the wrapper's runtime marker).
+pub(crate) fn in_wrapper_container() -> bool {
+    std::path::Path::new(WRAPPER_SRC_NETWORK).exists()
+}
+
+/// The node-local filesystem view of the run's output root.
+///
+/// Inside the wrapper container the gateway output dir is always reachable
+/// at the static bind-mount `WRAPPER_OUT_NETWORK`; the submitter-side host
+/// path is not. On the host (in-process / non-wrapper) the host path IS the
+/// readable root. `host_output` is the resolved submitter `--output`
+/// (`None` when the boot namespace carries no `--output`, which is not a
+/// framework-regenerated flag).
+///
+/// Returns `None` only when on the host AND no host path is available —
+/// preserving the resolver's lenient "skip setting resolved_output_root"
+/// behaviour. In-container it is always `Some` (the mount is unconditional).
+pub(crate) fn node_local_output_root(
+    in_wrapper_container: bool,
+    host_output: Option<&str>,
+) -> Option<String> {
+    if in_wrapper_container {
+        Some(WRAPPER_OUT_NETWORK.to_string())
+    } else {
+        host_output.map(|s| s.to_string())
+    }
+}
 
 /// Resolve a per-secondary scratch directory: the wrapper's bind
 /// mount when running under it, else a unique tempdir keyed by
@@ -422,5 +453,39 @@ impl PySecondaryConfig {
             // documented-but-unused one-step builder therefore stays empty.
             forwarded_argv: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{node_local_output_root, WRAPPER_OUT_NETWORK};
+
+    #[test]
+    fn in_container_ignores_host_path() {
+        assert_eq!(
+            node_local_output_root(true, Some("/home/x/out")).as_deref(),
+            Some(WRAPPER_OUT_NETWORK),
+        );
+    }
+
+    #[test]
+    fn in_container_without_host_path_is_bind_mount() {
+        assert_eq!(
+            node_local_output_root(true, None).as_deref(),
+            Some(WRAPPER_OUT_NETWORK),
+        );
+    }
+
+    #[test]
+    fn host_with_output_is_host_path() {
+        assert_eq!(
+            node_local_output_root(false, Some("/home/x/out")).as_deref(),
+            Some("/home/x/out"),
+        );
+    }
+
+    #[test]
+    fn host_without_output_is_none() {
+        assert_eq!(node_local_output_root(false, None), None);
     }
 }
