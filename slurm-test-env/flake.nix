@@ -58,6 +58,7 @@
           install -m 0755 ${./scripts/provision-user.sh} $out/bin/slurm-test-env-provision-user
           install -m 0755 ${./scripts/smoke-test.sh}     $out/bin/slurm-test-env-smoke-test
           install -m 0755 ${./scripts/test-543-no-scancel.sh} $out/bin/slurm-test-env-test-543-no-scancel
+          install -m 0755 ${./scripts/test-574-stats-skip.sh} $out/bin/slurm-test-env-test-574-stats-skip
 
           # PATH wrapping: include the system deps each script needs, plus
           # $out/bin itself so e.g. smoke-test can call the wrapped
@@ -124,6 +125,10 @@
           test-543-no-scancel = {
             type = "app";
             program = "${deploy}/bin/slurm-test-env-test-543-no-scancel";
+          };
+          test-574-stats-skip = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-test-574-stats-skip";
           };
         };
       }
