@@ -18,11 +18,29 @@ pub enum ProcessingPhase {
 }
 
 /// A worker's scheduling state (visible to the scheduler for decisions).
+///
+/// `actual_usage` carries the swap-INCLUSIVE memory charge (resident +
+/// swap; the same figure the kill-decision reads); `actual_swap_bytes`
+/// exposes the swap COMPONENT of that charge separately so the
+/// scheduler can distinguish "workers are over budget but still
+/// resident" (a benign descending-budget overshoot that must not
+/// auto-kill outside an explicit pressure phase) from "workers are
+/// genuinely swapping" (real RAM exhaustion — userland must preempt
+/// before the kernel thrashes). The two fields are PARALLEL views of
+/// the same per-worker `MemoryCharge` reading owned by
+/// `dynrunner-manager-local::monitor::measure_worker_charge`; the
+/// scheduler MUST NOT re-derive one from the other.
 #[derive(Debug, Clone)]
 pub struct WorkerBudgetInfo<I: Identifier> {
     pub worker_id: WorkerId,
     pub reserved_budgets: ResourceMap,
     pub actual_usage: ResourceMap,
+    /// Swap component of `actual_usage` (the resident component is
+    /// `actual_usage[memory] - actual_swap_bytes` on the memory kind).
+    /// `0` on hosts without swap accounting, or when the worker is
+    /// fully resident. The scheduler's main-phase swap-driven kill
+    /// branch is the only consumer today.
+    pub actual_swap_bytes: u64,
     pub is_idle: bool,
     pub is_opportunistic: bool,
     pub has_initial_assignment: bool,
@@ -79,6 +97,25 @@ pub enum KillReason {
     /// distinct so logging and metrics can tell the operator that no
     /// safer victim existed).
     OomLastResort,
+    /// Workers are genuinely swapping (`sum(actual_swap_bytes)` over
+    /// the scheduler's `swap_pressure_threshold`) and more than one
+    /// worker is active — the framework picks the heaviest swapper
+    /// and preempts it to return its pages to RAM, breaking the swap
+    /// thrash. Treated as no-fault because the userland kill is a
+    /// coordination action against host-wide RAM exhaustion rather
+    /// than a retribution for the picked worker overshooting its
+    /// budget: in the production trigger pattern (consumer's nested
+    /// rootless-podman with the outer container running
+    /// `--memory-swap=-1` so the per-worker `memory.swap.max=0`
+    /// best-effort cap fails silently) any worker can end up swapped
+    /// out regardless of who actually overshot. Distinct from
+    /// `NoFaultUnderBudget` because the selection criterion is
+    /// heaviest-swapper, not smallest-active, and the trigger is
+    /// swap usage, not `actual_usage > effective_max`. Fires in the
+    /// main multi-worker phase ONLY — the single-worker OOM-retry
+    /// phase is exempted by contract (one worker means no peer to
+    /// kill).
+    NoFaultSwapPreempt,
 }
 
 impl KillReason {
@@ -87,7 +124,9 @@ impl KillReason {
     pub fn is_no_fault(self) -> bool {
         matches!(
             self,
-            KillReason::NoFaultMemoryStealing | KillReason::NoFaultUnderBudget
+            KillReason::NoFaultMemoryStealing
+                | KillReason::NoFaultUnderBudget
+                | KillReason::NoFaultSwapPreempt
         )
     }
 
@@ -100,6 +139,7 @@ impl KillReason {
             KillReason::NoFaultUnderBudget => "no_fault_under_budget",
             KillReason::OomOverBudget => "oom_over_budget",
             KillReason::OomLastResort => "oom_last_resort",
+            KillReason::NoFaultSwapPreempt => "no_fault_swap_preempt",
         }
     }
 }

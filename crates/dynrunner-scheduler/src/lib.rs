@@ -25,6 +25,16 @@ pub struct ResourceStealingScheduler {
     /// is 1 GiB. Set to `0` to restore the pre-fix behaviour (preempt
     /// only AT the cgroup cap, racing kernel-OOM).
     pub cgroup_safety_margin: u64,
+    /// Aggregate swap-bytes threshold above which the multi-worker
+    /// main-phase swap-driven kill fires. Hysteresis band to avoid
+    /// flapping on trivial / transient swap usage (the kernel may
+    /// page out a handful of cold pages even on a healthy host); a
+    /// non-zero value also makes the trigger ignore the
+    /// "swap accounting disabled returns 0 forever" environments
+    /// without behaviour change. 64 MiB by default — large enough to
+    /// dismiss cold-page evictions, small enough to catch real
+    /// working-set spill long before the kernel thrashes.
+    pub swap_pressure_threshold: u64,
     /// Temporary-budget divisors used when an opportunistic worker requests
     /// a task in `assign_normal`. The slowest idle worker (rank 0) gets
     /// `available / temp_factors[0]`; rank 1 gets `available / temp_factors[1]`;
@@ -62,6 +72,7 @@ impl ResourceStealingScheduler {
             base_overhead,
             pressure_threshold,
             cgroup_safety_margin: 1024 * 1024 * 1024,
+            swap_pressure_threshold: 64 * 1024 * 1024,
             temp_factors: vec![1.5, 2.0, 3.0, 4.0],
         }
     }
@@ -203,18 +214,57 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
     ) -> ResourcePressureDecision {
         // The pressure-phase flag is the manager-side authority on
         // "the cluster has crossed an OOM-pressure boundary and active
-        // preempt is now warranted". Outside that phase no kill should
-        // fire — opportunistic-victim selection and smallest-active
-        // selection are both pressure-phase concerns. Pre-fix the flag
-        // was unused (underscore-prefixed dead parameter), so the
-        // descending-budget smallest-active branch fired
-        // unconditionally as soon as one worker's actual_usage
-        // overshot `effective_max`, producing the observed 100–400 ms
-        // `NoFaultUnderBudget` kill cadence on secondaries that never
-        // enter a pressure phase. The gate here restores the
-        // architectural intent: the SCHEDULER decides whether the
-        // system is in pressure; outside of pressure, return NoAction
-        // unconditionally.
+        // preempt is now warranted". Outside that phase the BUDGET-
+        // overshoot branches (opportunistic-victim and smallest-active)
+        // must NOT fire — they trigger on `actual_usage > effective_max`,
+        // which ResourceStealing's intentional descending per-worker
+        // budgets make easy to cross even while every worker is still
+        // resident in RAM; a pre-fix bug let them fire unconditionally
+        // and produced the observed 100–400 ms `NoFaultUnderBudget`
+        // kill cadence on secondaries that never enter a pressure
+        // phase. The gate below preserves that fix.
+        //
+        // SWAP-driven kill (the contract #535 owners specified — "a
+        // worker's swap counts as RAM demand; when swap is in use kill
+        // workers to free up RAM so that no swap is used; exception is
+        // the single-worker OOM-retry phase") is INDEPENDENT of the
+        // pressure-phase gate. The discriminator that makes a
+        // main-phase kill safe is genuine swap usage (real RAM
+        // exhaustion, not budget arithmetic drift): a non-zero
+        // aggregate swap signal is unambiguous — the kernel only
+        // pages out under memory pressure, so it cannot collide with
+        // the "all workers resident but summed actual_usage drifted
+        // past effective_max" regression the gate was added to
+        // prevent. Single-worker contract exception holds because
+        // there is no peer to kill (the worker itself is the only
+        // task in flight; killing it free()s every byte but loses the
+        // task, which the retry phase already handles).
+        let total_swap: u64 = workers.iter().map(|w| w.actual_swap_bytes).sum();
+        let active_workers: u64 = workers.iter().filter(|w| w.current_task.is_some()).count() as u64;
+        if active_workers > 1 && total_swap > self.swap_pressure_threshold {
+            // Heaviest-swapper selection: the goal is "free RAM so no
+            // swap is used", and the heaviest swapper is the worker
+            // whose working set most exceeds its physical RAM share —
+            // killing it returns the most pages to the free pool the
+            // fastest. Smallest-active would minimise wasted work but
+            // need not free what is actually IN swap (a tiny non-
+            // swapping worker exiting does not pull the OTHER worker's
+            // swapped-out pages back to RAM). Only workers with an
+            // assigned task are kill candidates; an idle worker holds
+            // no task to requeue and killing it is a no-op for the
+            // pressure goal.
+            if let Some(victim) = workers
+                .iter()
+                .filter(|w| w.current_task.is_some())
+                .max_by_key(|w| w.actual_swap_bytes)
+                && victim.actual_swap_bytes > 0
+            {
+                return ResourcePressureDecision::Kill {
+                    worker_id: victim.worker_id,
+                    reason: KillReason::NoFaultSwapPreempt,
+                };
+            }
+        }
         if !in_pressure_phase {
             return ResourcePressureDecision::NoAction;
         }

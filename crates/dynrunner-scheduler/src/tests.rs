@@ -57,6 +57,7 @@ fn make_worker(
         worker_id: id,
         reserved_budgets: mem(budget),
         actual_usage: mem(0),
+        actual_swap_bytes: 0,
         is_idle: idle,
         is_opportunistic: opportunistic,
         has_initial_assignment: false,
@@ -304,6 +305,7 @@ fn check_pressure_no_action_below_threshold() {
         worker_id: 0,
         reserved_budgets: mem(1000),
         actual_usage: mem(100),
+        actual_swap_bytes: 0,
         is_idle: false,
         is_opportunistic: false,
         has_initial_assignment: true,
@@ -328,6 +330,7 @@ fn check_pressure_kills_opportunistic_first() {
             worker_id: 0,
             reserved_budgets: mem(500),
             actual_usage: mem(400),
+            actual_swap_bytes: 0,
             is_idle: false,
             is_opportunistic: false,
             has_initial_assignment: true,
@@ -338,6 +341,7 @@ fn check_pressure_kills_opportunistic_first() {
             worker_id: 1,
             reserved_budgets: mem(500),
             actual_usage: mem(400),
+            actual_swap_bytes: 0,
             is_idle: false,
             is_opportunistic: true,
             has_initial_assignment: true,
@@ -366,6 +370,7 @@ fn check_pressure_kills_smallest_active_when_no_opportunistic() {
             worker_id: 0,
             reserved_budgets: mem(500),
             actual_usage: mem(600),
+            actual_swap_bytes: 0,
             is_idle: false,
             is_opportunistic: false,
             has_initial_assignment: true,
@@ -376,6 +381,7 @@ fn check_pressure_kills_smallest_active_when_no_opportunistic() {
             worker_id: 1,
             reserved_budgets: mem(500),
             actual_usage: mem(500),
+            actual_swap_bytes: 0,
             is_idle: false,
             is_opportunistic: false,
             has_initial_assignment: true,
@@ -403,6 +409,7 @@ fn check_pressure_kills_during_pressure_phase() {
         worker_id: 0,
         reserved_budgets: mem(500),
         actual_usage: mem(99999),
+        actual_swap_bytes: 0,
         is_idle: false,
         is_opportunistic: true,
         has_initial_assignment: true,
@@ -429,6 +436,7 @@ fn check_pressure_no_action_outside_pressure_phase_even_when_over_budget() {
         worker_id: 0,
         reserved_budgets: mem(500),
         actual_usage: mem(99999),
+        actual_swap_bytes: 0,
         is_idle: false,
         is_opportunistic: true,
         has_initial_assignment: true,
@@ -499,6 +507,7 @@ fn pressure_kill_fires_before_cgroup_oom() {
             worker_id: 0,
             reserved_budgets: mem(50),
             actual_usage: mem(46),
+            actual_swap_bytes: 0,
             is_idle: false,
             is_opportunistic: false,
             has_initial_assignment: true,
@@ -509,6 +518,7 @@ fn pressure_kill_fires_before_cgroup_oom() {
             worker_id: 1,
             reserved_budgets: mem(50),
             actual_usage: mem(46),
+            actual_swap_bytes: 0,
             is_idle: false,
             is_opportunistic: true,
             has_initial_assignment: true,
@@ -542,6 +552,7 @@ fn active_kill_fires_at_margin_not_at_cgroup_cap() {
         worker_id: 7,
         reserved_budgets: mem(100),
         actual_usage: mem(95),
+        actual_swap_bytes: 0,
         is_idle: false,
         is_opportunistic: false,
         has_initial_assignment: true,
@@ -575,6 +586,7 @@ fn safety_margin_zero_restores_pre_fix_behavior() {
         worker_id: 7,
         reserved_budgets: mem(100),
         actual_usage: mem(95),
+        actual_swap_bytes: 0,
         is_idle: false,
         is_opportunistic: false,
         has_initial_assignment: true,
@@ -619,6 +631,7 @@ fn worker_active(
         worker_id: id,
         reserved_budgets: mem(reserved),
         actual_usage: mem(actual),
+        actual_swap_bytes: 0,
         is_idle: false,
         is_opportunistic: opportunistic,
         has_initial_assignment: true,
@@ -669,6 +682,7 @@ fn kill_reason_no_fault_under_budget_when_smallest_active_is_below_reserved() {
             worker_id: 1,
             reserved_budgets: mem(500),
             actual_usage: mem(400),
+            actual_swap_bytes: 0,
             is_idle: false,
             is_opportunistic: false,
             has_initial_assignment: true,
@@ -700,6 +714,7 @@ fn kill_reason_oom_over_budget_when_smallest_active_is_over_reserved() {
             worker_id: 0,
             reserved_budgets: mem(500),
             actual_usage: mem(600),
+            actual_swap_bytes: 0,
             is_idle: false,
             is_opportunistic: false,
             has_initial_assignment: true,
@@ -710,6 +725,7 @@ fn kill_reason_oom_over_budget_when_smallest_active_is_over_reserved() {
             worker_id: 1,
             reserved_budgets: mem(500),
             actual_usage: mem(550),
+            actual_swap_bytes: 0,
             is_idle: false,
             is_opportunistic: false,
             has_initial_assignment: true,
@@ -739,6 +755,7 @@ fn kill_reason_oom_last_resort_when_single_active_over_budget() {
         worker_id: 7,
         reserved_budgets: mem(100),
         actual_usage: mem(200),
+        actual_swap_bytes: 0,
         is_idle: false,
         is_opportunistic: false,
         has_initial_assignment: true,
@@ -794,4 +811,279 @@ fn assign_normal_temp_factor_ordering() {
         false,
     );
     assert!(matches!(d2, AssignmentDecision::Assign { .. }));
+}
+
+// ── Swap-driven main-phase kill (#535 contract) ──
+//
+// Owner's spec: "a worker's swap counts as RAM demand, so that we kill
+// workers to free up RAM so that no swap is used. The only exception
+// is during OOM retry where we only run a single worker anyway."
+//
+// The pre-fix `check_resource_pressure` gated EVERY kill behind
+// `in_pressure_phase=true`, which is only set in the single-worker
+// OOM-retry phase — exactly inverted from the contract. These tests
+// pin the new swap-driven branch:
+//
+//   * Multi-worker, swap > threshold → Kill (heaviest swapper),
+//     no-fault classification (requeue, preserve retry budget).
+//   * Single active worker swapping → NoAction (contract exception).
+//   * Multi-worker, swap == 0 but summed actual_usage past
+//     effective_max (the descending-per-worker-budget regression
+//     shape) → NoAction (the budget-overshoot branches stay gated).
+
+fn worker_active_with_swap(
+    id: WorkerId,
+    reserved: u64,
+    actual_total: u64,
+    swap: u64,
+    opportunistic: bool,
+) -> WorkerBudgetInfo<TestId> {
+    WorkerBudgetInfo {
+        worker_id: id,
+        reserved_budgets: mem(reserved),
+        actual_usage: mem(actual_total),
+        actual_swap_bytes: swap,
+        is_idle: false,
+        is_opportunistic: opportunistic,
+        has_initial_assignment: true,
+        current_task: Some(make_binary("t", 10)),
+        estimated_usage: mem(actual_total),
+    }
+}
+
+#[test]
+fn swap_kill_fires_in_main_phase_multi_worker() {
+    // Production trigger pattern: two non-opportunistic workers in
+    // the MAIN multi-worker phase (no pressure-phase entry); one of
+    // them is swapping past the hysteresis threshold. The pre-fix
+    // gate would short-circuit to NoAction; the post-fix swap-
+    // driven branch must fire on the heaviest swapper with
+    // NoFaultSwapPreempt.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        swap_pressure_threshold: 64 * 1024 * 1024,
+        ..sched()
+    };
+    let swap = 128 * 1024 * 1024;
+    let workers = vec![
+        // Worker 0 fully resident — not the swap victim.
+        worker_active_with_swap(0, 1024 * 1024 * 1024, 512 * 1024 * 1024, 0, false),
+        // Worker 1 swapping — heaviest swapper, the victim.
+        worker_active_with_swap(
+            1,
+            1024 * 1024 * 1024,
+            (512 * 1024 * 1024) + swap,
+            swap,
+            false,
+        ),
+    ];
+    let decision = Scheduler::<TestId>::check_resource_pressure(
+        &s,
+        &workers,
+        // Cap well above usage so the budget-overshoot branches do
+        // NOT fire — isolate the swap signal.
+        &mem(8 * 1024 * 1024 * 1024),
+        // KEY: main phase, NOT pressure phase. Pre-fix gate would
+        // return NoAction here.
+        false,
+    );
+    match decision {
+        ResourcePressureDecision::Kill { worker_id, reason } => {
+            assert_eq!(worker_id, 1, "heaviest swapper should be the victim");
+            assert_eq!(reason, KillReason::NoFaultSwapPreempt);
+            assert!(reason.is_no_fault(), "swap preempt is no-fault → requeue");
+        }
+        _ => panic!("expected swap-driven Kill in main phase, got {decision:?}"),
+    }
+}
+
+#[test]
+fn swap_kill_suppressed_when_single_active_worker() {
+    // Contract exception: the OOM-retry phase runs one worker; "we
+    // only run a single worker anyway" — killing it would be the
+    // wrong move (no peer left). NoAction even when that one
+    // worker is deeply swapping.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        swap_pressure_threshold: 64 * 1024 * 1024,
+        ..sched()
+    };
+    let swap = 512 * 1024 * 1024;
+    let workers = vec![
+        // The single ACTIVE worker — swapping heavily.
+        worker_active_with_swap(0, 1024 * 1024 * 1024, swap, swap, false),
+        // An idle worker present in the pool — not a kill candidate
+        // (no task in flight) — pins that "single active" reads
+        // `current_task.is_some()`, not the raw len.
+        WorkerBudgetInfo {
+            worker_id: 1,
+            reserved_budgets: mem(1024 * 1024 * 1024),
+            actual_usage: mem(0),
+            actual_swap_bytes: 0,
+            is_idle: true,
+            is_opportunistic: false,
+            has_initial_assignment: false,
+            current_task: None,
+            estimated_usage: mem(0),
+        },
+    ];
+    let decision = Scheduler::<TestId>::check_resource_pressure(
+        &s,
+        &workers,
+        &mem(8 * 1024 * 1024 * 1024),
+        false,
+    );
+    assert!(
+        matches!(decision, ResourcePressureDecision::NoAction),
+        "single active worker swapping must NOT trigger a kill (contract exception), got {decision:?}"
+    );
+}
+
+#[test]
+fn swap_kill_no_regression_on_pure_budget_overshoot() {
+    // Regression guard: the historical 100–400 ms NoFaultUnderBudget
+    // kill cadence on secondaries that never enter a pressure phase
+    // was caused by the budget-overshoot branches firing
+    // unconditionally; the in_pressure_phase gate fixed it.
+    // The new swap branch must NOT reintroduce that regression:
+    // with summed actual_usage past effective_max but actual_swap == 0
+    // (all resident — the descending-per-worker-budget shape), the
+    // scheduler stays at NoAction outside a pressure phase.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        swap_pressure_threshold: 64 * 1024 * 1024,
+        ..sched()
+    };
+    let workers = vec![
+        // Both workers' actual_usage sums past the cap, but swap=0
+        // — purely resident. Exactly the pre-fix over-kill shape.
+        worker_active_with_swap(0, 500, 800, 0, false),
+        worker_active_with_swap(1, 500, 800, 0, false),
+    ];
+    let decision =
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), false);
+    assert!(
+        matches!(decision, ResourcePressureDecision::NoAction),
+        "pure budget overshoot (swap=0) outside pressure phase must stay NoAction, \
+         got {decision:?}"
+    );
+}
+
+#[test]
+fn swap_kill_threshold_dismisses_trivial_swap() {
+    // Hysteresis: a few cold pages migrated to swap is not a thrash
+    // signal. With aggregate swap of 16 KiB (well below the 64 MiB
+    // default threshold), no kill fires even though every other
+    // multi-worker swap precondition is met.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        swap_pressure_threshold: 64 * 1024 * 1024,
+        ..sched()
+    };
+    let workers = vec![
+        worker_active_with_swap(0, 1024 * 1024 * 1024, 512 * 1024 * 1024, 8192, false),
+        worker_active_with_swap(1, 1024 * 1024 * 1024, 512 * 1024 * 1024, 8192, false),
+    ];
+    let decision = Scheduler::<TestId>::check_resource_pressure(
+        &s,
+        &workers,
+        &mem(8 * 1024 * 1024 * 1024),
+        false,
+    );
+    assert!(
+        matches!(decision, ResourcePressureDecision::NoAction),
+        "trivial swap (<threshold) must not kill, got {decision:?}"
+    );
+}
+
+#[test]
+fn swap_kill_picks_heaviest_swapper_not_smallest_active() {
+    // Three workers; the smallest by estimated_usage is NOT the
+    // swap victim — selection is heaviest-swapper because the goal
+    // is to FREE the most pages back to RAM, not to minimise wasted
+    // work. Pins the selection contract.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        swap_pressure_threshold: 64 * 1024 * 1024,
+        ..sched()
+    };
+    let small_swap = 100 * 1024 * 1024;
+    let big_swap = 800 * 1024 * 1024;
+    let workers = vec![
+        // Worker 0: tiny estimated_usage but only modest swap.
+        WorkerBudgetInfo {
+            worker_id: 0,
+            reserved_budgets: mem(1024 * 1024 * 1024),
+            actual_usage: mem((256 * 1024 * 1024) + small_swap),
+            actual_swap_bytes: small_swap,
+            is_idle: false,
+            is_opportunistic: false,
+            has_initial_assignment: true,
+            current_task: Some(make_binary("a", 10)),
+            estimated_usage: mem(50),
+        },
+        // Worker 1: big estimated_usage AND the most swap — picked.
+        WorkerBudgetInfo {
+            worker_id: 1,
+            reserved_budgets: mem(1024 * 1024 * 1024),
+            actual_usage: mem((256 * 1024 * 1024) + big_swap),
+            actual_swap_bytes: big_swap,
+            is_idle: false,
+            is_opportunistic: false,
+            has_initial_assignment: true,
+            current_task: Some(make_binary("b", 10)),
+            estimated_usage: mem(10_000),
+        },
+    ];
+    let decision = Scheduler::<TestId>::check_resource_pressure(
+        &s,
+        &workers,
+        &mem(8 * 1024 * 1024 * 1024),
+        false,
+    );
+    match decision {
+        ResourcePressureDecision::Kill { worker_id, reason } => {
+            assert_eq!(worker_id, 1, "heaviest swapper, not smallest active");
+            assert_eq!(reason, KillReason::NoFaultSwapPreempt);
+        }
+        _ => panic!("expected heaviest-swapper Kill, got {decision:?}"),
+    }
+}
+
+#[test]
+fn swap_kill_still_fires_when_in_pressure_phase() {
+    // Symmetry pin: the swap branch is independent of the gate, so
+    // it must also fire in the pressure phase (not just the main
+    // phase). Otherwise a later refactor could accidentally move
+    // the swap branch BELOW the gate and silently regress the
+    // contract for the multi-worker-in-pressure-phase case.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        swap_pressure_threshold: 64 * 1024 * 1024,
+        ..sched()
+    };
+    let swap = 128 * 1024 * 1024;
+    let workers = vec![
+        worker_active_with_swap(0, 1024 * 1024 * 1024, 512 * 1024 * 1024, 0, false),
+        worker_active_with_swap(
+            1,
+            1024 * 1024 * 1024,
+            (512 * 1024 * 1024) + swap,
+            swap,
+            false,
+        ),
+    ];
+    let decision = Scheduler::<TestId>::check_resource_pressure(
+        &s,
+        &workers,
+        &mem(8 * 1024 * 1024 * 1024),
+        true,
+    );
+    match decision {
+        ResourcePressureDecision::Kill {
+            worker_id,
+            reason: KillReason::NoFaultSwapPreempt,
+        } => assert_eq!(worker_id, 1),
+        _ => panic!("expected swap-driven Kill regardless of phase, got {decision:?}"),
+    }
 }
