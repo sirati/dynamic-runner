@@ -451,6 +451,22 @@ pub(crate) fn run_remote_podman_pipeline<'py>(
             coord_kwargs.set_item("task_completed_listener", listener)?;
         }
 
+        // #336 P1 / #493 option-A upload callable (same shape as
+        // `drive_rust_primary`): consumer-supplied `task.upload_action`
+        // wins, otherwise fall back to the framework-default
+        // `job_manager.upload_task_file` bound method. Absent → no
+        // installer; any setup task asking for an upload fails loud.
+        let upload_action_obj: Option<Py<PyAny>> = match task.getattr("upload_action") {
+            Ok(v) if !v.is_none() => Some(v.unbind()),
+            _ => match job_manager.getattr("upload_task_file") {
+                Ok(m) if !m.is_none() => Some(m.unbind()),
+                _ => None,
+            },
+        };
+        if let Some(action) = upload_action_obj {
+            coord_kwargs.set_item("upload_action", action)?;
+        }
+
         // OOM preempt-margin knobs (scheduler_config).
         let sc_kwargs = PyDict::new(py);
         let mut sc_kwargs_populated = false;

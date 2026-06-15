@@ -332,6 +332,25 @@ impl PyDistributedManager {
             .take()
             .map(crate::affine_action_bridge::PyImportAction::new);
 
+        // Take the Python upload callable (#336 P1 / #493 option-A) out of
+        // `self` and wrap it as an `Arc<dyn UploadAction>` at the bridge
+        // boundary, once under the GIL before `py.detach`. UNLIKE the
+        // per-secondary `import_action`, the upload action is a PRIMARY-side
+        // executor concern (the source-owning member): it is installed ONCE
+        // on the in-process primary via `set_upload_action`, mirroring
+        // `PyPrimaryCoordinator::run`. The setup executor consults it when
+        // an upload setup task (derived by the #336 P2 attach from any
+        // TaskInfo's `files=`) runs in-process; on relocation
+        // `into_observer_handoff` carries the `Arc` onto the observer tail.
+        // `Send + Sync` (the trait-object contract) lets the `Arc` cross
+        // `py.detach`. Captured before the detached runtime so the
+        // `set_upload_action` install runs BEFORE `primary.run()` enters —
+        // the bridge must be live before the first setup task can dispatch.
+        let upload_action = self
+            .upload_action
+            .take()
+            .map(crate::upload_action_bridge::PyUploadAction::new);
+
         // Snapshot the cap, flip `run_started`, and consume the
         // receiver for the detached runtime in one step. The helper
         // owns the single-shot guard and the snapshot ordering; the
@@ -1061,6 +1080,17 @@ impl PyDistributedManager {
                 // registration contract.
                 if let Some(listener) = task_completed_listener {
                     primary.register_task_completed_listener(listener);
+                }
+
+                // Same boundary (#336 P1 / #493 option-A): install the Python
+                // upload action (if any) BEFORE `run()` enters. The setup
+                // executor reads it when an upload setup task — derived by the
+                // #336 P2 attach from any TaskInfo `files=` declaration — runs
+                // in-process, and `into_observer_handoff` carries it onto the
+                // observer tail at relocation (the submitter→observer is the
+                // upload affinity). Mirrors `PyPrimaryCoordinator::run`.
+                if let Some(action) = upload_action {
+                    primary.set_upload_action(action);
                 }
 
                 // The setup peer registers NO discovery policy: under

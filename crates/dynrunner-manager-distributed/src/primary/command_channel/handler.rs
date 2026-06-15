@@ -417,6 +417,21 @@ where
     /// operational loop's accounting matches the wire-side state —
     /// same shape `apply_fail_permanent` produces for worker-
     /// originated permanent failures.
+    ///
+    /// `files=` caveat (#336 P2 / #493 option-A): runtime-spawned
+    /// `TaskInfo`s must NOT carry `required_files` (the `files=` shape).
+    /// The runtime-spawn path here does NOT call
+    /// `augment_batch_for_staging` — only the initial cold seed
+    /// (`originate_cold_seed`) and the relocated discovery
+    /// (`discover_on_promotion`) do. A spawn-time task that lists a file
+    /// would dispatch WITHOUT a derived upload setup task or the
+    /// matching dep, racing against an absent file. Pre-flight (declare
+    /// `files=` on the submitter's `discover_items` batch) or
+    /// pre-upload from the spawner before the `spawn_tasks` call.
+    /// Adding augmentation here is its own seam decision (the runtime
+    /// spawn lacks the cold-seed's identifier-cloning anchor and the
+    /// dedup is per-batch rather than ledger-global), kept deliberately
+    /// out of scope for #493.
     pub(super) async fn apply_spawn_tasks(
         &mut self,
         tasks: Vec<TaskInfo<I>>,

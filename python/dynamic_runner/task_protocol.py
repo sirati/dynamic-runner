@@ -160,6 +160,34 @@ TaskCompletedListener = Callable[
 ]
 
 
+# Type alias for the optional ``upload_action`` task attribute (#336 P1 /
+# #493 option-A). The framework registers this callable on the in-process
+# primary's setup executor; when a TaskInfo declares ``files=[...]``, the
+# framework's #336 P2 attach derives one deduped upload setup task per
+# unique ``(source, dest)`` (executed on the source-owning member — the
+# submitter), and the executor invokes this callable for each.
+# Signature: ``(source, dest)`` where ``source`` is the on-disk path of
+# the local file to upload (as a ``str``) and ``dest`` is the cluster-side
+# destination relative to the framework's upload root (``None`` ⇒ derived
+# from the source basename). Raise ``OSError`` for a transient transport
+# fault (the framework retries a bounded number of times before falling
+# back to a permanent failure terminal) and anything else for a permanent
+# failure (NO retry — surfaces immediately as a non-recoverable setup
+# terminal whose cascade fails dependent work tasks). The Python callable
+# OWNS the per-blob transient retry (the shipped ``retry_transient``
+# helper the bulk walk uses); this seam classifies the FINAL outcome.
+#
+# The SLURM packaging pipeline defaults this to
+# ``SlurmJobManager.upload_task_file`` (which already does the right
+# gateway scp + retry); the in-process local/single-process/remote-podman
+# paths consult ``getattr(task, "upload_action", None)`` only.
+# Runtime-spawned TaskInfos must NOT carry ``files=``: the runtime-spawn
+# path (``primary_handle.spawn_tasks``) does NOT call
+# ``augment_batch_for_staging`` today — declare ``files=`` at submit-time
+# (initial cold seed) or pre-upload from the spawner.
+UploadAction = Callable[[str, Optional[str]], None]
+
+
 # Type alias for the optional ``custom_message_handler`` task attribute
 # (F5 -- secondary->primary custom messages). Fired ON THE PRIMARY only,
 # once per delivered message, with
@@ -394,6 +422,19 @@ class TaskDefinition(Protocol):
     # listener can never stall the apply path or tear the dispatcher
     # task down. Absent or ``None`` opts out.
     task_completed_listener: Optional[TaskCompletedListener]
+
+    # Optional upload-action attribute (#336 P1 / #493 option-A).
+    #
+    # When the task exposes ``upload_action`` as a callable matching
+    # :data:`UploadAction`, the framework registers it on the in-process
+    # primary's setup executor. Every TaskInfo that declares ``files=[...]``
+    # — submitter-PRODUCED local files needed on the cluster before the
+    # task runs — gets one deduped upload setup task per unique
+    # ``(source, dest)``, and this callable performs each upload.
+    # See the alias doc for the full retry/classification contract.
+    # Absent or ``None`` opts out (any setup task asking for an upload
+    # then fails loud with a wiring-error terminal).
+    upload_action: Optional[UploadAction]
 
     # Optional custom-message handler attribute (F5).
     #
