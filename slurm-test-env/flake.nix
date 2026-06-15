@@ -62,8 +62,8 @@
           # $out/bin itself so e.g. smoke-test can call the wrapped
           # provision-user (and any future sibling) by short name.
           # SLURM_TEST_ENV_LIB_SH points at the shared helper sourced by
-          # up.sh and reboot-node.sh — env-var-with-fallback so the same
-          # script works under `nix run` and `bash deploy/...sh`.
+          # up.sh, reboot-node.sh, and down.sh — env-var-with-fallback so
+          # the same script works under `nix run` and `bash deploy/...sh`.
           for bin in $out/bin/*; do
             wrapProgram "$bin" \
               --set SLURM_TEST_ENV_GATEWAY_IMAGE ${gatewayImage} \
