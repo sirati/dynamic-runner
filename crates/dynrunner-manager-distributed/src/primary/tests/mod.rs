@@ -22,6 +22,7 @@ mod already_held;
 mod assembly_beacon;
 mod backpressure_requeue;
 mod basic;
+mod bootstrap_tail_terminal_latch_563;
 mod bringup_composition_fatal;
 mod bringup_fatal;
 mod bringup_milestone;
