@@ -97,6 +97,7 @@ fn build_secondary(
         /* max_resources */ None,
         /* peer_lifecycle_listener */ None,
         /* import_action */ import_action,
+        /* affine_satisfied_probe */ None,
         /* log_dir */ None,
         /* scheduler_config */ None,
         /* panik_watcher_paths */ None,

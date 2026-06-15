@@ -181,6 +181,103 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
+    /// Consult the OPTIONAL per-(gate,node) satisfied probe (#537) and, on a
+    /// `Satisfied` verdict, SEED `affine_done` so this dependent (and every
+    /// subsequent dependent for the rest of the run) short-circuits the
+    /// run-once executor entirely. Returns `true` iff the caller should now
+    /// take the `AlreadyDone` path (no queue, no report, no spawn_local).
+    ///
+    /// Five-way decision (the only path that calls the consumer probe is the
+    /// cache-miss / cache-expired branch):
+    ///   * No probe handle registered (the default) ⇒ `false`. Today's
+    ///     behaviour bit-for-bit; the executor runs the unchanged
+    ///     `ImportAction` path.
+    ///   * Gate body NOT resolvable on this node (the #509 sync race —
+    ///     `TaskAdded` outran the assignment) ⇒ `false`. Probing an
+    ///     unresolved gate is meaningless; the unchanged path delivers
+    ///     today's Recoverable absent verdict from `drive_affine_import`.
+    ///   * Cache hit `ProbeOutcome::Satisfied` ⇒ seed `affine_done` +
+    ///     `true`. (Defensive: a `Satisfied` verdict ALSO populated
+    ///     `affine_done`, so the caller would have short-circuited on the
+    ///     outer `affine_done.contains` check; this branch is reached only
+    ///     if someone cleared `affine_done` between calls.)
+    ///   * Cache hit fresh `NotSatisfied` / `Errored` ⇒ `false`. The probe
+    ///     was consulted recently and said "not yet"; respect the TTL and
+    ///     skip the call to keep probe-call frequency bounded on a
+    ///     thousand-dependents-per-gate fleet.
+    ///   * Cache miss / expired ⇒ CALL the probe under `catch_unwind` (an
+    ///     `Errored` verdict on panic; the Python bridge converts an
+    ///     exception into `false` plus a warn log already, so a panic here
+    ///     is the rare native-bug case). Cache the verdict; a `Satisfied`
+    ///     also seeds `affine_done`.
+    ///
+    /// SYNC by design (the trait's `is_satisfied` is sync): the whole
+    /// short-circuit's value proposition is avoiding async / spawn_local
+    /// scaffolding, so the probe consult must stay on the operational loop
+    /// without a second seam. The probe contract caps the call cost at an
+    /// FS stat.
+    fn try_short_circuit_via_probe(&mut self, affine_hash: &str) -> bool {
+        // Cache hit on a fresh verdict — never call the probe.
+        let now = std::time::Instant::now();
+        if let Some(cached) = self
+            .lifecycle
+            .operational_ref()
+            .and_then(|op| op.affine_probe_cache.get(affine_hash))
+            .cloned()
+            && cached.is_fresh(now)
+        {
+            if matches!(cached, crate::affine_satisfied::ProbeOutcome::Satisfied) {
+                self.op_mut().affine_done.insert(affine_hash.to_string());
+                return true;
+            }
+            return false;
+        }
+        // No probe registered — the overwhelming case for consumers that
+        // never opted in; today's behaviour bit-for-bit.
+        let Some(probe) = self.affine_satisfied_probe.clone() else {
+            return false;
+        };
+        // Gate body NOT resolvable: do not probe. The #509 absent-gate
+        // verdict (delivered later by `drive_affine_import`) is the right
+        // re-route signal — probing an unresolved gate would have nothing
+        // to ask about.
+        let Some(task) = self.cluster_state.affine_gate_task(affine_hash) else {
+            return false;
+        };
+        // Call the probe under `catch_unwind` so a panicking native probe
+        // is classified `Errored` (cached briefly so a persistently-faulty
+        // probe is not hammered) rather than propagating up and tearing
+        // down the dispatch loop. `AssertUnwindSafe` is sound: the probe's
+        // `&self` (Arc) and the borrowed `&TaskInfo` are not mutated by
+        // the unwind.
+        let verdict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            probe.is_satisfied(&task)
+        }));
+        let outcome = match verdict {
+            Ok(true) => crate::affine_satisfied::ProbeOutcome::Satisfied,
+            Ok(false) => crate::affine_satisfied::ProbeOutcome::NotSatisfied { cached_at: now },
+            Err(_panic) => {
+                tracing::warn!(
+                    target: "dynrunner_affine",
+                    affine_hash = %affine_hash,
+                    "affine satisfied probe panicked; classified Errored and \
+                     falling through to the import path (probe cached briefly \
+                     to avoid hammering a persistently-faulty probe)"
+                );
+                crate::affine_satisfied::ProbeOutcome::Errored { cached_at: now }
+            }
+        };
+        let satisfied =
+            matches!(outcome, crate::affine_satisfied::ProbeOutcome::Satisfied);
+        self.op_mut()
+            .affine_probe_cache
+            .insert(affine_hash.to_string(), outcome);
+        if satisfied {
+            self.op_mut().affine_done.insert(affine_hash.to_string());
+        }
+        satisfied
+    }
+
     /// Gate a work task `B` on its locally-unmet SecondaryAffine dependency
     /// `I` (#497 P4 — the run-once entry point the dispatch router calls).
     ///
@@ -225,8 +322,27 @@ where
         dependent: PendingAffineDependent<I>,
     ) -> Result<AffineGateOutcome, String> {
         // Already locally imported: release straight to InFlight. No queue, no
-        // report — the caller (router) re-emits the standard assignment.
+        // report — the caller (router) re-emits the standard assignment. A
+        // `Satisfied` verdict from the #537 satisfied-probe ALSO populates
+        // this set, so the second..Nth dependent on a producer-resolved gate
+        // short-circuits HERE without re-consulting the probe (and the cache
+        // never even loads), exactly like a previously-imported gate.
         if self.op_mut().affine_done.contains(&affine_hash) {
+            return Ok(AffineGateOutcome::AlreadyDone);
+        }
+
+        // #537 — consult the OPTIONAL per-(gate,node) satisfied probe BEFORE
+        // touching the run-once latch. A `Satisfied` verdict means this node
+        // is the PRODUCER (the consumer's `build_common_dep` already left the
+        // closure valid in the local store): SEED `affine_done` so EVERY
+        // subsequent dependent — for the rest of the run — short-circuits on
+        // the `affine_done.contains` check above, AND return `AlreadyDone`
+        // for THIS dependent (no queue, no report, no spawn_local — zero
+        // executor scaffolding on the wire). Anything but `Satisfied`
+        // (no probe registered / probe says no / probe raised / gate body
+        // not yet resolvable for the #509 sync race) falls through to the
+        // unchanged run-once path below.
+        if self.try_short_circuit_via_probe(&affine_hash) {
             return Ok(AffineGateOutcome::AlreadyDone);
         }
 

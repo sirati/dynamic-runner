@@ -484,6 +484,19 @@ where
     /// [`crate::affine_action`].
     pub(super) import_action: crate::affine_action::ImportActionHandle<I>,
 
+    /// The OPTIONAL per-(gate,node) satisfied probe (#537). Consulted by
+    /// this secondary's run-once affine executor ([`affine_exec`]) BEFORE
+    /// the run-once latch — when the probe returns `true`, the gate's hash
+    /// enters `affine_done` immediately and the dependent dispatches on
+    /// the `AlreadyDone` path with no `QueuedAfterLocalDependency` /
+    /// `LocalDependencyReleased` frames and no [`tokio::task::spawn_local`].
+    /// `None` (the default) leaves the executor with today's behaviour
+    /// bit-for-bit. Set before `run` via
+    /// [`Self::set_affine_satisfied_probe`]. See
+    /// [`crate::affine_satisfied`].
+    pub(super) affine_satisfied_probe:
+        crate::affine_satisfied::AffineSatisfiedProbeHandle<I>,
+
     /// Handle to the task-completion dispatcher task. Mirrors
     /// `lifecycle_dispatcher_handle` — same Drop-vs-explicit cleanup
     /// rationale.

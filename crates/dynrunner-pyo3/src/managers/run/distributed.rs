@@ -42,6 +42,7 @@ use super::module;
     peer_lifecycle_listener = None,
     task_completed_listener = None,
     import_action = None,
+    affine_instance_satisfied = None,
     upload_action = None,
     unfulfillable_reinject_max_per_task = None,
     log_dir = None,
@@ -68,6 +69,7 @@ pub(crate) fn run_distributed<'py>(
     peer_lifecycle_listener: Option<Py<PyAny>>,
     task_completed_listener: Option<Py<PyAny>>,
     import_action: Option<Py<PyAny>>,
+    affine_instance_satisfied: Option<Py<PyAny>>,
     upload_action: Option<Py<PyAny>>,
     unfulfillable_reinject_max_per_task: Option<u32>,
     log_dir: Option<String>,
@@ -130,6 +132,16 @@ pub(crate) fn run_distributed<'py>(
     // secondary, not the in-process primary.
     if let Some(action) = import_action.as_ref() {
         kwargs.set_item("import_action", action)?;
+    }
+    // The consumer's OPTIONAL per-(gate,node) satisfied probe (#537).
+    // Forwarded into `RustDistributedManager`, which installs it on EVERY
+    // in-process secondary it spawns (its `set_affine_satisfied_probe`,
+    // mirroring the out-of-process secondary path). Same per-secondary
+    // affine-executor concern as `import_action`; the probe is consulted
+    // BEFORE the import action on each gate to short-circuit the producing
+    // node. Absent ⇒ today's behaviour bit-for-bit.
+    if let Some(probe) = affine_instance_satisfied.as_ref() {
+        kwargs.set_item("affine_satisfied_probe", probe)?;
     }
     // The consumer's #336 P1 / #493 option-A upload callable (e.g.
     // `SlurmJobManager.upload_task_file`). Forwarded into

@@ -172,6 +172,7 @@ where
             task_completed_listeners: Vec::new(),
             upload_action: None,
             import_action: None,
+            affine_satisfied_probe: None,
             task_completed_dispatcher_handle: None,
             worker_message_tx,
             worker_message_rx: Some(worker_message_rx),
@@ -506,6 +507,22 @@ where
         action: std::sync::Arc<dyn crate::affine_action::ImportAction<I>>,
     ) {
         self.import_action = Some(action);
+    }
+
+    /// Wire the OPTIONAL per-(gate,node) satisfied probe (#537) this
+    /// secondary's run-once affine executor consults BEFORE invoking the
+    /// `ImportAction`. A registered probe lets the PRODUCING node (the
+    /// member that built and published the gate's product) skip the
+    /// entire run-once scaffolding — no `tokio::task::spawn_local`, no
+    /// `QueuedAfterLocalDependency` / `LocalDependencyReleased` frames —
+    /// when it already holds the closure locally. Set before `run`;
+    /// absence (the default) leaves the executor with today's behaviour
+    /// bit-for-bit. See [`crate::affine_satisfied`].
+    pub fn set_affine_satisfied_probe(
+        &mut self,
+        probe: std::sync::Arc<dyn crate::affine_satisfied::AffineSatisfiedProbe<I>>,
+    ) {
+        self.affine_satisfied_probe = Some(probe);
     }
 
     /// Register a [`crate::worker_messages::WorkerMessageListener`]

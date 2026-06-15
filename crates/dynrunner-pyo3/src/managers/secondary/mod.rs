@@ -113,6 +113,18 @@ pub(crate) struct PySecondaryCoordinator {
     /// MUST register one; a secondary with no affine-dependent work leaves it
     /// `None` and is never asked to import.
     pub(super) import_action: Option<Py<PyAny>>,
+    /// Optional Python per-(gate,node) satisfied probe callable supplied at
+    /// `__init__` (#537). `Some` iff the caller passed
+    /// `affine_instance_satisfied=<callable>`; bridged through
+    /// [`crate::affine_satisfied_bridge::PyAffineSatisfiedProbe`] and
+    /// installed on the inner `SecondaryCoordinator` via
+    /// `set_affine_satisfied_probe` at `run()` start. A registered probe lets
+    /// the PRODUCING node short-circuit the run-once affine executor (no
+    /// `spawn_local`, no `QueuedAfterLocalDependency` frames) when it
+    /// already holds the gate's product locally. `None` (the default) leaves
+    /// the executor with today's behaviour bit-for-bit. Constructor-only,
+    /// mirroring `import_action`.
+    pub(super) affine_satisfied_probe: Option<Py<PyAny>>,
     /// Scheduler tuning forwarded into the `ResourceStealingScheduler`
     /// the coordinator constructs at `run()` start. Carries the
     /// `cgroup_safety_margin` / `pressure_threshold` knobs so the

@@ -1,4 +1,5 @@
 pub mod affine_action;
+pub mod affine_satisfied;
 pub mod anti_entropy;
 pub mod cluster_state;
 pub(crate) mod collection_stats;
@@ -79,3 +80,9 @@ pub use upload_action::{UploadAction, UploadActionHandle, UploadError};
 // Re-export the import-action port (#497 P4) for the PyO3 binding + consumer
 // wire-up — the per-secondary SecondaryAffine import seam.
 pub use affine_action::{ImportAction, ImportActionHandle, ImportError};
+// Re-export the per-(gate,node) satisfied probe (#537) for the PyO3 binding
+// + consumer wire-up — the optional short-circuit BEFORE `ImportAction`.
+pub use affine_satisfied::{
+    AffineSatisfiedProbe, AffineSatisfiedProbeHandle, PROBE_ERROR_CACHE_TTL,
+    PROBE_NEGATIVE_CACHE_TTL, ProbeOutcome,
+};
