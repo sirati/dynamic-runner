@@ -764,6 +764,7 @@ impl<I: Identifier> ClusterState<I> {
         // bucket fold nor its count, exactly as it leaves `tasks_hash`
         // unchanged (the term is XORed out of `tasks_hash_acc` above). No memo
         // touch. A subsequent dominating merge then swaps to the winning term.
+        debug_assert!(!matches!(record.state, TaskState::Blocked { .. }), "settle_eligible() should exclude Blocked — if this fires, the reverse-index at the set_task_state seam needs to be updated for this unsettle path");
         self.tasks.insert(hash.to_string(), record.state);
         true
     }
