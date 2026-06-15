@@ -103,16 +103,9 @@ pub(crate) struct PySecondaryCoordinator {
     /// start. Constructor-only — see the matching field on
     /// `PyPrimaryCoordinator` for the rationale.
     pub(super) peer_lifecycle_listener: Option<Py<PyAny>>,
-    /// Optional Python import callable supplied at `__init__`. `Some` iff the
-    /// caller passed `import_action=<callable>`; bridged through
-    /// [`crate::affine_action_bridge::PyImportAction`] and installed on the
-    /// inner `SecondaryCoordinator` via `set_import_action` at `run()` start
-    /// (#497 P6 — the secondary is the executor that holds the import-action
-    /// handle). Constructor-only, mirroring `peer_lifecycle_listener`. A
-    /// secondary whose dependent work tasks gate on a SecondaryAffine import
-    /// MUST register one; a secondary with no affine-dependent work leaves it
-    /// `None` and is never asked to import.
-    pub(super) import_action: Option<Py<PyAny>>,
+    /// (#577) The `import_action` field is GONE — gate bodies run in
+    /// worker subprocesses dispatched via the normal task-dispatch path.
+
     /// Optional Python per-(gate,node) satisfied probe callable supplied at
     /// `__init__` (#537). `Some` iff the caller passed
     /// `affine_instance_satisfied=<callable>`; bridged through
@@ -120,10 +113,9 @@ pub(crate) struct PySecondaryCoordinator {
     /// installed on the inner `SecondaryCoordinator` via
     /// `set_affine_satisfied_probe` at `run()` start. A registered probe lets
     /// the PRODUCING node short-circuit the run-once affine executor (no
-    /// `spawn_local`, no `QueuedAfterLocalDependency` frames) when it
+    /// worker dispatch, no `QueuedAfterLocalDependency` frames) when it
     /// already holds the gate's product locally. `None` (the default) leaves
-    /// the executor with today's behaviour bit-for-bit. Constructor-only,
-    /// mirroring `import_action`.
+    /// the executor with today's behaviour bit-for-bit. Constructor-only.
     pub(super) affine_satisfied_probe: Option<Py<PyAny>>,
     /// Scheduler tuning forwarded into the `ResourceStealingScheduler`
     /// the coordinator constructs at `run()` start. Carries the

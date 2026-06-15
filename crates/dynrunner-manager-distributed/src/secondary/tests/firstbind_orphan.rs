@@ -166,7 +166,7 @@ async fn post_ready_first_bind_disconnect_is_reported_terminal() {
                 matches!(ready, WorkerEvent::Ready { worker_id: 0, .. }),
                 "expected Ready for worker 0; got {ready:?}"
             );
-            secondary.handle_worker_event(ready, &oom).await.unwrap();
+            secondary.handle_worker_event(ready, &oom, &mut FakeWorkerFactory).await.unwrap();
 
             // Ready arm popped the stash and assigned: active_tasks now
             // holds the task ("pending first-bind assigned post-Ready").
@@ -194,6 +194,7 @@ async fn post_ready_first_bind_disconnect_is_reported_terminal() {
                         binary: Some(binary.clone()),
                     },
                     &oom,
+                    &mut FakeWorkerFactory,
                 )
                 .await
                 .unwrap();
@@ -310,7 +311,7 @@ async fn pending_first_bind_stranded_when_ready_is_stale_dropped() {
             // it — so the Ready arm never pops the stash.
             let oom = test_oom_watcher();
             secondary
-                .handle_worker_event(stale_ready, &oom)
+                .handle_worker_event(stale_ready, &oom, &mut FakeWorkerFactory)
                 .await
                 .unwrap();
             secondary.drain_egress().await;
@@ -470,7 +471,10 @@ pub(super) async fn drive_to_post_ready_assigned<P: PeerTransport<test_helpers::
         matches!(ready, WorkerEvent::Ready { worker_id: 0, .. }),
         "expected Ready for worker 0; got {ready:?}"
     );
-    secondary.handle_worker_event(ready, oom).await.unwrap();
+    secondary
+        .handle_worker_event(ready, oom, &mut FakeWorkerFactory)
+        .await
+        .unwrap();
 
     assert!(
         secondary.op_mut().active_tasks.contains_key(file_hash),
@@ -605,6 +609,7 @@ async fn post_ready_assigned_binaryless_pipe_eof_disconnect_is_reported_terminal
                         binary: None,
                     },
                     &oom,
+                    &mut FakeWorkerFactory,
                 )
                 .await
                 .unwrap();
@@ -790,6 +795,7 @@ async fn post_ready_assigned_swept_then_stale_terminal_is_dropped() {
                         estimated_resources: dynrunner_core::ResourceMap::new(),
                     },
                     &oom,
+                    &mut FakeWorkerFactory,
                 )
                 .await
                 .unwrap();
@@ -1372,7 +1378,7 @@ async fn pending_first_bind_reinjects_when_mesh_leg_unconfirmed_at_ready() {
                 matches!(ready, WorkerEvent::Ready { worker_id: 0, .. }),
                 "expected Ready for worker 0; got {ready:?}"
             );
-            secondary.handle_worker_event(ready, &oom).await.unwrap();
+            secondary.handle_worker_event(ready, &oom, &mut FakeWorkerFactory).await.unwrap();
             // MeshClient sends are QUEUED; flush them into the recorder's
             // log before reading it (the make_secondary_recording contract).
             secondary.drain_egress().await;

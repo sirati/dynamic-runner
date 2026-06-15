@@ -3,40 +3,38 @@
 //! ## The one concern
 //! ONE seam: "ask the consumer whether THIS node already holds the product of
 //! a [`TaskKind::SecondaryAffine`](dynrunner_core::TaskKind) gate, BEFORE
-//! invoking the heavy [`crate::affine_action::ImportAction`]". A `true`
-//! verdict short-circuits the entire run-once executor — no archive read, no
-//! [`tokio::task::spawn_local`], no `QueuedAfterLocalDependency` /
-//! `LocalDependencyReleased` frames on the wire — exactly as if the import
-//! had already run on this node (the gate's hash enters `affine_done`; the
-//! dispatch router's `AlreadyDone` branch releases the dependent work task on
-//! the unchanged path). A `false` verdict (or NO probe registered) falls
-//! through to today's behaviour bit-for-bit.
+//! dispatching the gate body to a worker subprocess (#577)". A `true`
+//! verdict short-circuits the entire run-once executor — no worker
+//! dispatch, no `QueuedAfterLocalDependency` / `LocalDependencyReleased`
+//! frames on the wire — exactly as if the gate body had already run on
+//! this node (the gate's hash enters `affine_done`; the dispatch router's
+//! `AlreadyDone` branch releases the dependent work task on the unchanged
+//! path). A `false` verdict (or NO probe registered) falls through to the
+//! gate-body-on-worker dispatch path bit-for-bit.
 //!
-//! ## Why a SEPARATE port (not a sentinel return on [`crate::affine_action::ImportAction`])
-//! The consumer can ALREADY mark a gate locally-done by returning cleanly
-//! from `import_action` without doing real work. What this port adds is "the
-//! framework SKIPS the import_action call entirely" — the import_action path
-//! today still threads a [`tokio::task::spawn_local`] off the operational
-//! loop, an [`tokio::sync::Notify`] release dance, and a pair of CRDT-visible
-//! frames per dependent. On the PRODUCING node (where the consumer's
-//! `build_common_dep` already left the closure valid in the local Nix store)
-//! that whole scaffolding is wasted on every dependent of every gate. A
-//! distinct PROBE port — consulted BEFORE `ensure_affine_import` touches the
-//! run-once latch — is the right level: the framework asks "do you already
-//! have this?", and on YES treats the gate exactly like a previously-imported
-//! one. A sentinel return on `import_action` cannot avoid the call, so the
-//! scaffolding still fires; it would only avoid the archive read (which the
-//! consumer already skips via `nix-store --import` idempotency).
+//! ## Why a SEPARATE port (not a sentinel return from the gate body)
+//! The consumer's gate-body worker handler can ALREADY mark a gate
+//! locally-done by returning success without doing real work. What this
+//! port adds is "the framework SKIPS the worker dispatch entirely" — the
+//! gate-body path today still threads a worker-subprocess dispatch (a
+//! per-type subprocess spawn + assignment frame), the run-once latch
+//! bookkeeping, and a pair of CRDT-visible frames per dependent. On the
+//! PRODUCING node (where the consumer's local logic already left the
+//! product valid in the local store) that whole scaffolding is wasted on
+//! every dependent of every gate. A distinct PROBE port — consulted BEFORE
+//! `ensure_affine_import` touches the run-once latch — is the right level:
+//! the framework asks "do you already have this?", and on YES treats the
+//! gate exactly like a previously-imported one. A sentinel return from the
+//! gate body cannot avoid the dispatch, so the scaffolding still fires.
 //!
-//! ## Why SYNC (not async like `ImportAction`)
+//! ## Why SYNC
 //! The probe is a "do I already have this path locally" check — a single
 //! local filesystem stat at most. An async probe would force a second
 //! off-loop seam ([`tokio::task::spawn_local`] + completion channel),
 //! defeating the whole point of the short-circuit (avoid scheduler work).
 //! The trait stays object-safe with the generic on the TRAIT (not the
-//! method), matching [`crate::affine_action::ImportAction`]'s reason. The
-//! probe is held as `Arc<dyn AffineSatisfiedProbe<I>>` so it survives the
-//! relocation handoff onto the observer tail.
+//! method). The probe is held as `Arc<dyn AffineSatisfiedProbe<I>>` so it
+//! survives the relocation handoff onto the observer tail.
 //!
 //! ## Failure semantics
 //! A probe that PANICS / RAISES (Python) is treated as
@@ -126,11 +124,11 @@ impl ProbeOutcome {
 /// dispatches on the `AlreadyDone` path).
 ///
 /// Single concern: "does THIS node already hold the product?". The
-/// implementation does NOT perform any import work — that remains the
-/// [`crate::affine_action::ImportAction`]'s job for nodes that answer
+/// implementation does NOT perform any import work — that is done by the
+/// gate body running in a worker subprocess (#577) for nodes that answer
 /// "not yet". A probe that PANICS / RAISES is classified
-/// [`ProbeOutcome::Errored`] (the dependent falls through to today's import
-/// path); the probe NEVER poisons `affine_done`.
+/// [`ProbeOutcome::Errored`] (the dependent falls through to the gate
+/// body's worker dispatch path); the probe NEVER poisons `affine_done`.
 pub trait AffineSatisfiedProbe<I: Identifier>: Send + Sync {
     /// Report whether `task`'s product is already locally present on THIS
     /// node. `true` ⇒ the executor inserts `task`'s hash into
@@ -143,7 +141,7 @@ pub trait AffineSatisfiedProbe<I: Identifier>: Send + Sync {
 
 /// A registered probe handle a secondary holds. `None` (the default ⇒ the
 /// overwhelming case for consumers that never register one) leaves the
-/// executor with today's behaviour bit-for-bit: every gate goes through
-/// `import_action` exactly as before. `Some` enables the per-node
-/// short-circuit.
+/// executor with today's behaviour bit-for-bit: every gate is dispatched
+/// to a worker subprocess (#577) for its body to run. `Some` enables the
+/// per-node short-circuit.
 pub type AffineSatisfiedProbeHandle<I> = Option<Arc<dyn AffineSatisfiedProbe<I>>>;

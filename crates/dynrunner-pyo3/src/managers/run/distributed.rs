@@ -41,7 +41,6 @@ use super::module;
     fulfillability_matcher = None,
     peer_lifecycle_listener = None,
     task_completed_listener = None,
-    import_action = None,
     affine_instance_satisfied = None,
     upload_action = None,
     unfulfillable_reinject_max_per_task = None,
@@ -68,7 +67,6 @@ pub(crate) fn run_distributed<'py>(
     fulfillability_matcher: Option<Py<PyAny>>,
     peer_lifecycle_listener: Option<Py<PyAny>>,
     task_completed_listener: Option<Py<PyAny>>,
-    import_action: Option<Py<PyAny>>,
     affine_instance_satisfied: Option<Py<PyAny>>,
     upload_action: Option<Py<PyAny>>,
     unfulfillable_reinject_max_per_task: Option<u32>,
@@ -123,22 +121,16 @@ pub(crate) fn run_distributed<'py>(
     if let Some(l) = task_completed_listener.as_ref() {
         kwargs.set_item("task_completed_listener", l)?;
     }
-    // The consumer's SecondaryAffine import callable (#497 / #501). Forwarded
-    // into `RustDistributedManager`, which installs it on EVERY in-process
-    // secondary it spawns (its `set_import_action`, mirroring the
-    // out-of-process secondary path). Unlike the peer-lifecycle / task-completed
-    // listeners (a single primary-side concern), the import action is a
-    // per-secondary affine-executor concern, so it reaches each spawned
-    // secondary, not the in-process primary.
-    if let Some(action) = import_action.as_ref() {
-        kwargs.set_item("import_action", action)?;
-    }
+    // (#577) `import_action` is GONE — gate bodies run in worker
+    // subprocesses dispatched via the normal task-dispatch path. The
+    // consumer registers a `TaskTypeSpec` whose `worker_module` holds the
+    // `@task_function` handler.
     // The consumer's OPTIONAL per-(gate,node) satisfied probe (#537).
     // Forwarded into `RustDistributedManager`, which installs it on EVERY
     // in-process secondary it spawns (its `set_affine_satisfied_probe`,
-    // mirroring the out-of-process secondary path). Same per-secondary
-    // affine-executor concern as `import_action`; the probe is consulted
-    // BEFORE the import action on each gate to short-circuit the producing
+    // mirroring the out-of-process secondary path). A per-secondary
+    // affine-executor concern; the probe is consulted BEFORE the gate body
+    // is dispatched to a worker subprocess, to short-circuit the producing
     // node. Absent ⇒ today's behaviour bit-for-bit.
     if let Some(probe) = affine_instance_satisfied.as_ref() {
         kwargs.set_item("affine_satisfied_probe", probe)?;

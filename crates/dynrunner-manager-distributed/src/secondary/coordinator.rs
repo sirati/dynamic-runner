@@ -71,12 +71,10 @@ where
         // must never block, and the volume is bounded by real
         // consumer replies (≤ 100 KiB each, API-capped).
         let (secondary_control_tx, secondary_control_rx) = tokio::sync::mpsc::unbounded_channel();
-        // Off-loop SecondaryAffine-import completion channel (#497 P5). Built
-        // at construction (like the dispatcher channels) so a `StartedRun`'s
-        // detached import task always has a sender; unbounded for the same
-        // never-block-the-producer reason. The receiver is taken into a
-        // loop-local at `process_tasks` entry.
-        let (affine_import_tx, affine_import_rx) = tokio::sync::mpsc::unbounded_channel();
+        // (#577) The off-loop SecondaryAffine-import completion channel is
+        // GONE — gate bodies now run in worker subprocesses dispatched via
+        // `assign_resolved_task`, and their terminals arrive through the
+        // existing pool-event arm.
         // Command channel for the PyO3 `PrimaryHandle` surface.
         // Mirrors `PrimaryCoordinator::new` exactly: bounded capacity
         // sized so a noisy caller can't OOM the secondary, but with
@@ -177,7 +175,6 @@ where
             task_completed_rx: Some(task_completed_rx),
             task_completed_listeners: Vec::new(),
             upload_action: None,
-            import_action: None,
             affine_satisfied_probe: None,
             task_completed_dispatcher_handle: None,
             worker_message_tx,
@@ -186,8 +183,6 @@ where
             worker_message_dispatcher_handle: None,
             secondary_control_tx,
             secondary_control_rx: Some(secondary_control_rx),
-            affine_import_tx,
-            affine_import_rx: Some(affine_import_rx),
             announcer_outbox_tx: None,
             announcer_outbox_rx: None,
             panik_signal_rx: None,
@@ -529,18 +524,12 @@ where
         self.upload_action = Some(action);
     }
 
-    /// Wire the import-action port (#497 P4) this secondary's run-once affine
-    /// executor uses to perform an assigned work task's gating SecondaryAffine
-    /// import. Set before `run`. Absence leaves the executor with no importer
-    /// — a work task that gates on a SecondaryAffine import then fails as a
-    /// wiring error (a work task with no affine dependency runs unchanged).
-    /// See [`crate::affine_action`].
-    pub fn set_import_action(
-        &mut self,
-        action: std::sync::Arc<dyn crate::affine_action::ImportAction<I>>,
-    ) {
-        self.import_action = Some(action);
-    }
+    // (#577) `set_import_action` is GONE. Affine gate bodies now run in
+    // worker subprocesses dispatched via the normal task-dispatch path; the
+    // consumer registers a `TaskTypeSpec(worker_module=...)` for the gate's
+    // `type_id` whose `@task_function` handler runs the import body
+    // (receives `task.payload` = the pre-#577 `payload_json` verbatim, and
+    // `task.relative_path` = the pre-#577 `task_id`).
 
     /// Wire the OPTIONAL per-(gate,node) satisfied probe (#537) this
     /// secondary's run-once affine executor consults BEFORE invoking the
@@ -1171,6 +1160,7 @@ where
     /// secondary the parallel test run constructs. `spill_path` (and its
     /// parent dir) must outlive every later settled read of these entries.
     #[cfg(test)]
+    #[allow(dead_code)] // retained for future spill-hole tests; the pre-#577 affine_exec test was removed.
     pub(in crate::secondary) fn force_settled_spill_for_test(
         &mut self,
         spill_path: &std::path::Path,

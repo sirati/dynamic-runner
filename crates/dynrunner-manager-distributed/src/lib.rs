@@ -1,4 +1,3 @@
-pub mod affine_action;
 pub mod affine_satisfied;
 pub mod anti_entropy;
 pub mod authority_snapshot;
@@ -81,11 +80,11 @@ pub use observer::{
 // Re-export the upload-action port (#336 P1) for the PyO3 binding + consumer
 // wire-up — same one-import-path convenience as `TunnelReconnector`.
 pub use upload_action::{UploadAction, UploadActionHandle, UploadError};
-// Re-export the import-action port (#497 P4) for the PyO3 binding + consumer
-// wire-up — the per-secondary SecondaryAffine import seam.
-pub use affine_action::{ImportAction, ImportActionHandle, ImportError};
 // Re-export the per-(gate,node) satisfied probe (#537) for the PyO3 binding
-// + consumer wire-up — the optional short-circuit BEFORE `ImportAction`.
+// + consumer wire-up — the optional short-circuit BEFORE the gate body's
+// worker dispatch (#577 — body runs in a worker subprocess, NOT inline on
+// the secondary; the probe still seeds `affine_done` cheaply on the
+// producing node so no worker is dispatched at all).
 pub use affine_satisfied::{
     AffineSatisfiedProbe, AffineSatisfiedProbeHandle, PROBE_ERROR_CACHE_TTL,
     PROBE_NEGATIVE_CACHE_TTL, ProbeOutcome,

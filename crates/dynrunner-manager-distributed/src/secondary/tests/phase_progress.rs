@@ -117,6 +117,7 @@ async fn secondary_phase_update_drives_stuck_worker_warn() {
                         phase_name: "ghidra-analysis".into(),
                     },
                     &oom,
+                    &mut FakeWorkerFactory,
                 )
                 .await
                 .unwrap();
@@ -187,6 +188,7 @@ async fn secondary_keepalive_refreshes_last_keepalive() {
                         generation: current_gen,
                     },
                     &oom,
+                    &mut FakeWorkerFactory,
                 )
                 .await
                 .unwrap();

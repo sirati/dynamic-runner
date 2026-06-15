@@ -328,18 +328,21 @@ where
                 }
                 let estimated = self.estimator.estimate(&binary);
 
-                // SecondaryAffine gate intercept (#497 P5). If `B` gates on a
-                // SecondaryAffine import this node has NOT yet run locally, the
-                // gate queues `B` behind the single per-secondary import (and
-                // drives that import OFF the coordinator loop) instead of
-                // binding a worker now — `B` is released + dispatched when the
-                // import completes. The whole run-once decision + queue +
-                // off-loop drive is owned by `try_gate_on_affine_import`; the
-                // router never learns the latch/queue/import. A work task with
-                // NO locally-unmet affine dep returns `false` and falls through
-                // to the UNCHANGED worker-dispatch path below (the regression
-                // guard). Placed AFTER the dup-held / run-aborted gates and
-                // path resolution, BEFORE worker selection / assign_task.
+                // SecondaryAffine gate intercept (#497 P5 + #577). If `B`
+                // gates on a SecondaryAffine gate this node has NOT yet run
+                // locally, the gate queues `B` behind the single per-
+                // secondary dispatch (and dispatches the gate body to
+                // `B`'s worker subprocess) instead of binding `B` to that
+                // worker now — `B` is released + dispatched when the gate
+                // body's worker terminal arrives. The whole run-once
+                // decision + queue + gate-body dispatch is owned by
+                // `try_gate_on_affine_import`; the router never learns the
+                // latch / queue / worker dispatch. A work task with NO
+                // locally-unmet affine dep returns `false` and falls
+                // through to the UNCHANGED worker-dispatch path below (the
+                // regression guard). Placed AFTER the dup-held / run-
+                // aborted gates and path resolution, BEFORE worker
+                // selection / assign_task.
                 if self
                     .try_gate_on_affine_import(
                         worker_id,
@@ -347,6 +350,7 @@ where
                         &estimated,
                         &predecessor_outputs,
                         &file_hash,
+                        factory,
                     )
                     .await?
                 {

@@ -140,6 +140,7 @@ async fn stale_generation_event_dropped_current_generation_processed() {
                         estimated_resources: ResourceMap::new(),
                     },
                     &oom,
+                    &mut FakeWorkerFactory,
                 )
                 .await
                 .unwrap();
@@ -167,6 +168,7 @@ async fn stale_generation_event_dropped_current_generation_processed() {
                         estimated_resources: ResourceMap::new(),
                     },
                     &oom,
+                    &mut FakeWorkerFactory,
                 )
                 .await
                 .unwrap();
@@ -298,6 +300,7 @@ async fn buffered_old_generation_terminal_does_not_consume_new_task() {
                         estimated_resources: ResourceMap::new(),
                     },
                     &oom,
+                    &mut FakeWorkerFactory,
                 )
                 .await
                 .unwrap();
