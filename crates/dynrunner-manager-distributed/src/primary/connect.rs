@@ -9,6 +9,25 @@ use crate::state::{SecondaryConnection, SecondaryConnectionState};
 
 use super::PrimaryCoordinator;
 
+/// True iff `msg` is an IMPORTANT [`DistributedMessage::CustomMessage`] —
+/// the F5 class whose pre-handler ack would open the ack-then-die-before-
+/// CRDT-commit wedge (#539). Used by `dispatch_message` to skip the
+/// pre-handler `ack_delivery_report` for this one class; the matching
+/// post-`CustomMessagePosted`-apply ack lives inside `handle_custom_message`.
+///
+/// Free function (not a method): it inspects only the variant + `important`
+/// bit, never coordinator state, so it stays generic-free and the
+/// `dispatch_message` call site reads as one boolean classifier.
+fn is_important_custom_message<I: Identifier>(msg: &DistributedMessage<I>) -> bool {
+    matches!(
+        msg,
+        DistributedMessage::CustomMessage {
+            important: true,
+            ..
+        }
+    )
+}
+
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Returns the structured [`RunError`] directly (not the helper-level
     /// `Result<(), String>` shape): the zero-welcome timeout is a KNOWN
@@ -301,12 +320,41 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
         // App-level delivery confirmation (#352): echo a `TerminalAck`
         // for EVERY `delivery_seq`-stamped confirmable landing (a
-        // terminal, or an important custom message — F5), BEFORE the
-        // handlers run — including landings their dedup gates will drop
-        // (a duplicate means the original ack was lost or the replay
-        // raced it; not re-acking would replay forever). A no-op for
-        // every other frame, so the handlers stay seq-oblivious.
-        self.ack_delivery_report(&msg).await;
+        // terminal, or a droppable consumer frame) BEFORE the handlers
+        // run — including landings their dedup gates will drop (a
+        // duplicate means the original ack was lost or the replay raced
+        // it; not re-acking would replay forever). A no-op for every
+        // other frame, so the handlers stay seq-oblivious.
+        //
+        // IMPORTANT custom messages (F5) are EXCLUDED from this
+        // pre-handler ack (#539 — the ack-then-die-before-CRDT-commit
+        // wedge): acking before `apply_and_broadcast(CustomMessagePosted)`
+        // lets the origin drop the message from its retain buffer the
+        // instant the ack lands, and a primary that dies between the ack
+        // and the wire fan-out strands the message — no peer's CRDT has
+        // the Unhandled entry, the origin can no longer replay, and any
+        // subsequent task terminal stamped at that origin with
+        // `msgs_posted_through >= seq` parks forever in the
+        // terminal-ordering gate (`terminal_gate.rs`). The ack for an
+        // important landing is sent below, AFTER `handle_custom_message`
+        // has run its `apply_and_broadcast(CustomMessagePosted)` — the
+        // post-ack retention drop is then safe under the CRDT's
+        // anti-entropy backstop (the local apply makes the entry
+        // available to any peer's snapshot pull).
+        let important_custom = is_important_custom_message(&msg);
+        let deferred_ack: Option<(u64, String)> = if important_custom {
+            // Snapshot the ack ingredients before `msg` is moved into the
+            // handler (the destructure consumes the variant). `None` for
+            // an unstamped / no-reporter landing — the same skip rule
+            // `ack_delivery_report` enforces internally.
+            match (msg.delivery_seq(), msg.delivery_reporter()) {
+                (Some(seq), Some(reporter)) => Some((seq, reporter.to_string())),
+                _ => None,
+            }
+        } else {
+            self.ack_delivery_report(&msg).await;
+            None
+        };
 
         match msg.msg_type() {
             MessageType::SecondaryWelcome => self.handle_welcome(msg).await,
@@ -331,11 +379,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `primary::setup_dispatch`.
             MessageType::SetupTerminal => self.handle_setup_terminal(msg, command_rx).await,
             // Consumer custom message (F5): droppable → direct handler
-            // dispatch; important → CRDT-post + the handler-dispatch
-            // decision. The ack echo for an important landing already
-            // ran above (`ack_delivery_report` — every
-            // `delivery_seq`-stamped landing, including dedup-dropped
-            // duplicates).
+            // dispatch; important → CRDT-post FIRST then ack + handler
+            // dispatch (the ack lives inside `handle_custom_message` for
+            // an important landing — see the pre-match `if` above for
+            // the #539 rationale).
             MessageType::CustomMessage => self.handle_custom_message(msg, command_rx).await,
             // Reconciliation-probe verdict arm (#308): a holder
             // secondary's answer to this primary's `TaskHoldQuery`.
@@ -430,7 +477,52 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 tracing::debug!(?other, "unhandled message type");
             }
         }
+        // Deferred ack for the IMPORTANT custom-message landing (#539):
+        // `handle_custom_message` has applied `CustomMessagePosted`
+        // locally + queued its wire fan-out, so the entry is now in the
+        // local CRDT and anti-entropy carries it to any peer's snapshot
+        // pull. Acking here lets the origin's retain buffer drop the
+        // message — safe by construction, because the cluster (this
+        // primary's `cluster_state` + the in-flight broadcast) is the
+        // durable record from this point on. A duplicate landing
+        // (replay racing the original) already NoOp'd inside the
+        // CustomMessagePosted apply, and we still re-ack so the
+        // origin's retention window can collapse.
+        if let Some((seq, reporter)) = deferred_ack {
+            self.send_terminal_ack_to(seq, &reporter).await;
+        }
         Ok(())
+    }
+
+    /// Send a `TerminalAck { seq }` to `reporter`. The shared egress used
+    /// by both [`Self::ack_delivery_report`] (the variant-agnostic ingest
+    /// echo) and the post-handler important-custom ack (#539). Best
+    /// effort: a failed send is logged at DEBUG and the reporter's
+    /// ack-timeout replay re-lands the report, which gets re-acked.
+    async fn send_terminal_ack_to(&mut self, seq: u64, reporter: &str) {
+        let ack = DistributedMessage::TerminalAck {
+            target: None,
+            sender_id: self.config.node_id.clone(),
+            timestamp: super::wire::timestamp_now(),
+            seq,
+        };
+        if let Err(e) = self
+            .send_to(
+                dynrunner_protocol_primary_secondary::Destination::Secondary(
+                    dynrunner_protocol_primary_secondary::PeerId::from(reporter),
+                ),
+                ack,
+            )
+            .await
+        {
+            tracing::debug!(
+                secondary = %reporter,
+                seq,
+                error = %e,
+                "TerminalAck send failed (best-effort; the reporter's \
+                 ack-timeout replay re-lands the report and gets re-acked)"
+            );
+        }
     }
 
     /// Echo the app-level delivery confirmation (#352) for one
@@ -463,30 +555,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let (Some(seq), Some(reporter)) = (msg.delivery_seq(), msg.delivery_reporter()) else {
             return;
         };
-        let reporter = reporter.to_string();
-        let ack = DistributedMessage::TerminalAck {
-            target: None,
-            sender_id: self.config.node_id.clone(),
-            timestamp: super::wire::timestamp_now(),
-            seq,
-        };
-        if let Err(e) = self
-            .send_to(
-                dynrunner_protocol_primary_secondary::Destination::Secondary(
-                    dynrunner_protocol_primary_secondary::PeerId::from(reporter.as_str()),
-                ),
-                ack,
-            )
-            .await
-        {
-            tracing::debug!(
-                secondary = %reporter,
-                seq,
-                error = %e,
-                "TerminalAck send failed (best-effort; the reporter's \
-                 ack-timeout replay re-lands the report and gets re-acked)"
-            );
-        }
+        self.send_terminal_ack_to(seq, reporter).await;
     }
 
     /// Record a secondary's `MeshReady` report. The
