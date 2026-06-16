@@ -624,6 +624,19 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     pub(super) spawn_continuation_queue: std::collections::VecDeque<
         crate::primary::command_channel::SpawnContinuation<I>,
     >,
+    /// Publication-ordering queue for runtime `spawn_tasks` (CL-A8). A
+    /// runtime-spawned task whose prerequisite is defined only in a LATER
+    /// `spawn_tasks` batch (a CROSS-batch forward-ref) parks here until the
+    /// prerequisite lands, then releases for publication. The common
+    /// topological case (deps spawned before dependents) passes through
+    /// transparently. Primary-LOCAL reconstructable state (it only ever
+    /// holds NOT-yet-published tasks); a promoted primary rebuilds it empty
+    /// — every published task is in the replicated ledger and the consumer
+    /// re-spawn replay re-feeds any unpublished one through the fresh queue.
+    /// Anything still parked at the run's drain edge has a never-defined
+    /// prerequisite and is surfaced LOUD (the spawn-rejection backstop),
+    /// never silently stranded. See [`crate::primary::spawn_queue`].
+    pub(super) spawn_queue: crate::primary::spawn_queue::PendingSpawnQueue<I>,
     pub(super) all_binaries: Vec<TaskInfo<I>>,
     /// Phase-aware pending pool. Lazily initialised at `run()` start so
     /// the constructor doesn't need the phase set / dependency graph;
@@ -1815,6 +1828,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             run_start_batch_fired: false,
             spawn_rejected_task_ids: Vec::new(),
             spawn_continuation_queue: std::collections::VecDeque::new(),
+            spawn_queue: crate::primary::spawn_queue::PendingSpawnQueue::new(),
             all_binaries: Vec::new(),
             pending: None,
             phase_deps: HashMap::new(),
@@ -4820,6 +4834,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // inherit a half-drained continuation pointing at a previous
         // run's (now-dropped) reply oneshot.
         self.spawn_continuation_queue.clear();
+        // Same per-run reset for the publication-ordering queue (CL-A8):
+        // only populated by `apply_spawn_tasks`'s admit gate while a run is
+        // live. A coordinator re-used across runs must not inherit a
+        // previous run's parked (never-published) tasks. A promotion likewise
+        // rebuilds it empty — no parked state is authoritative (see
+        // `spawn_queue`'s module doc).
+        self.spawn_queue.clear();
         // Same per-run reset for the worker-management run-should-fail
         // outcome: only written when the worker-management arm drains a
         // `RunShouldFail`; a coordinator re-used across runs must not
@@ -5711,6 +5732,34 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 current_primary: current,
                 epoch,
             });
+        }
+
+        // Publication-ordering drain-completeness sweep (CL-A8). A
+        // runtime-spawned task still parked in the `PendingSpawnQueue` at
+        // this drain edge has a prerequisite that was NEVER defined (a
+        // producer bug — the dependent was spawned but its prerequisite's
+        // `spawn_tasks` batch never arrived) or sits in a never-landing
+        // cross-batch dependency cycle. Either way it was never published,
+        // so it would otherwise sit PARKED forever and silently vanish from
+        // the run — the exact silent-strand class CL-A8 forbids. Surface it
+        // LOUD by folding its `task_id` into the SAME `spawn_rejected_task_ids`
+        // backstop a wholesale-rejected batch takes: the gate below turns a
+        // non-empty set into `RunError::SpawnRejected`, so the PyO3 boundary
+        // RAISES instead of returning a clean rc=0. Reached only past the
+        // deposition/abort gates above, so a deposed or cluster-aborted
+        // primary authors no spurious rejection. Idempotent on a happy run
+        // (the queue is empty — every spawned task published topologically).
+        for (task, undefined_deps) in self.spawn_queue.drain() {
+            tracing::error!(
+                task_id = %task.task_id,
+                phase_id = %task.phase_id,
+                undefined_deps = ?undefined_deps,
+                "runtime spawn_tasks task parked on a prerequisite that was \
+                 never defined — the dependent was spawned but its \
+                 prerequisite's spawn_tasks batch never arrived; surfacing \
+                 as a spawn rejection rather than silently dropping it"
+            );
+            self.spawn_rejected_task_ids.push(task.task_id);
         }
 
         // Final accounting: any task in `total_tasks` that is neither
