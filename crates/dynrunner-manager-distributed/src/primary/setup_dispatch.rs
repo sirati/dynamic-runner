@@ -216,6 +216,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 secondary_id: member.clone(),
                 local_worker_id: None,
                 task,
+                deferred: false,
             },
         );
         // CRDT `Pending → InFlight` via the single origination choke point

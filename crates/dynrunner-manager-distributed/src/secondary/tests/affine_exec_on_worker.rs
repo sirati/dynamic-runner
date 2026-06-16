@@ -47,7 +47,7 @@ use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
 
 use super::super::test_helpers::{FakeWorkerFactory, TestId, make_secondary_recording};
 use super::super::{AffineGateOutcome, PendingAffineDependent};
-use super::firstbind_orphan::{one_worker_config, test_oom_watcher};
+use super::firstbind_orphan::{drive_to_post_ready_assigned, one_worker_config, test_oom_watcher};
 use super::processing::make_binary;
 use crate::affine_satisfied::AffineSatisfiedProbe;
 
@@ -629,6 +629,108 @@ async fn t7_holding_worker_index_matches_scan_and_clears_on_drain() {
                     "the drain must remove {h:?} from the reverse index"
                 );
             }
+        })
+        .await;
+}
+
+// ── T8 (park guard) ─────────────────────────────────────────────────────────
+// SELF-BOUND BEFORE PARKING (#517 family): a dependent whose primary-assigned
+// target worker is NOT idle must be BOUNCED through the honor-or-bounce seam
+// (`IllegallyAssignedToNonidleWorker`, NOT a `TaskFailed`) rather than parked
+// into `affine_running`, so a park can never silently pile up onto a busy
+// worker. REVERT-CHECK: pre-fix `ensure_affine_import` parked unconditionally,
+// so `affine_running` would gain the dependent and NO bounce would be emitted.
+#[tokio::test(flavor = "current_thread")]
+async fn t8_park_onto_busy_worker_is_bounced_not_piled_up() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            let mut factory = FakeWorkerFactory;
+            let pool = sec.initialize_workers(&mut factory).await.unwrap();
+            sec.enter_operational_for_test();
+            *sec.pool_mut() = pool;
+
+            // Worker 0 BUSY running an incumbent.
+            let oom = test_oom_watcher();
+            let incumbent = make_binary("incumbent", 50);
+            let incumbent_hash = "111aaa".to_string();
+            drive_to_post_ready_assigned(&mut sec, &oom, &incumbent, &incumbent_hash).await;
+            assert!(
+                !sec.op_mut().pool.workers[0].is_idle_state(),
+                "fixture precondition: worker 0 is busy"
+            );
+
+            let affine_hash = "gate-hash-H";
+            seed_affine_task(&mut sec, affine_hash);
+            log.borrow_mut().clear();
+
+            // A dependent whose target worker (0) is busy: the run-once
+            // executor must BOUNCE it, not park it.
+            let dep = make_dependent("work-B", 0);
+            let outcome = sec
+                .ensure_affine_import(affine_hash.to_string(), dep)
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                AffineGateOutcome::Bounced,
+                "a park targeting a busy worker must be Bounced, not parked"
+            );
+
+            // NOT parked: no run-once latch, no reverse-index entry, and no
+            // QueuedAfterLocalDependency report (the park's CRDT half).
+            assert!(
+                !sec.op_mut().affine_running.contains_key(affine_hash),
+                "a bounced dependent must NOT enter affine_running (no pile-up)"
+            );
+            assert!(
+                !sec.op_mut().affine_dependent_worker.contains_key("work-B"),
+                "a bounced dependent must NOT enter the reverse index"
+            );
+            sec.drain_egress().await;
+            assert!(
+                queued_work_hashes(&log, affine_hash).is_empty(),
+                "a bounced dependent must NOT report QueuedAfterLocalDependency"
+            );
+
+            // The disposition IS the typed bounce naming worker 0 + the
+            // incumbent — and NOT a TaskFailed (no retry-budget burn).
+            let bounces: Vec<(u32, String, Option<String>)> = log
+                .borrow()
+                .iter()
+                .filter_map(|m| match m {
+                    DistributedMessage::IllegallyAssignedToNonidleWorker {
+                        worker_id,
+                        assigned,
+                        incumbent,
+                        ..
+                    } => Some((
+                        *worker_id,
+                        assigned.hash.clone(),
+                        incumbent.as_ref().map(|i| i.hash.clone()),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                bounces,
+                vec![(0, "work-B".to_string(), Some(incumbent_hash.clone()))],
+                "the busy-worker park must emit exactly one IllegallyAssignedToNonidleWorker"
+            );
+            assert_eq!(
+                log.borrow()
+                    .iter()
+                    .filter(|m| matches!(
+                        m,
+                        DistributedMessage::TaskFailed { task_hash, .. } if task_hash == "work-B"
+                    ))
+                    .count(),
+                0,
+                "the bounce must NOT be a TaskFailed (no failure accounting)"
+            );
         })
         .await;
 }

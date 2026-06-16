@@ -36,7 +36,7 @@ use crate::zip_extract::ExtractionCache;
 
 use self::lifecycle::{MeshFormation, SecondaryLifecycle};
 
-mod affine_exec;
+pub(crate) mod affine_exec;
 pub mod control;
 mod coordinator;
 pub(crate) mod custom_message;
@@ -180,6 +180,15 @@ pub(super) enum AffineGateOutcome {
     /// `B` is the FIRST dependent on `I`: it inserted the queue, reported
     /// `QueuedAfterLocalDependency`, and EXACTLY ONE import run was spawned.
     StartedRun,
+    /// `B`'s primary-assigned target worker is NOT idle, so it was NOT
+    /// parked behind the import: the secondary self-bounds (it holds no
+    /// scheduling authority — the dispatch-decoupling law) by bouncing a
+    /// typed `IllegallyAssignedToNonidleWorker` through the SAME honor-or-
+    /// bounce seam every dispatch uses, leaving the primary to reconcile
+    /// its diverged occupancy and requeue `B`. NOT a `TaskFailed` (no
+    /// retry-budget burn), NOT a park (so it can never silently pile up
+    /// onto a busy worker). The caller dispatches nothing.
+    Bounced,
 }
 
 /// The secondary coordinator: connects to primary, manages local workers.

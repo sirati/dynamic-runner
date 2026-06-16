@@ -72,6 +72,7 @@ fn seed_in_flight(
             secondary_id: secondary.to_string(),
             local_worker_id: Some(0),
             task,
+            deferred: false,
         },
     );
     hash
