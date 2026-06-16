@@ -326,6 +326,110 @@ async fn midrun_cert_edge_serves_trio_once_per_incarnation_and_bringup_stays_ros
         .await;
 }
 
+/// The asm-dataset-nix re-serve STORM, bounded.
+///
+/// Production shape: a secondary received its setup trio but is blocked
+/// downstream of delivery — its peer mesh never settles
+/// (`alive_secondaries=0 expected=N`), so its operational keepalive
+/// emitter never starts and it never earns `keepalive_proven`. It keeps
+/// re-welcoming on its handshake-retry cadence, and the wire re-injects
+/// those welcomes faster still (relay/redial fan-in), so the primary saw
+/// MANY duplicate welcomes per second — and pre-fix re-served the full
+/// trio on EVERY one, a CPU-burning livelock + log flood. Re-serving an
+/// already-delivered trio cannot unblock a settle-stuck member, so the
+/// re-serve must be BOUNDED regardless of why the member is stuck (the
+/// mesh-settle root is transport-quic's #599 domain — this gate is the
+/// independent storm bound).
+///
+/// Pinned:
+///   * N duplicate welcomes inside one backoff window from an UNPROVEN
+///     member yield exactly ONE re-serve (not N) — bounded.
+///   * After the backoff window elapses, a re-serve fires again — a
+///     GENUINELY-lost frame is still retransmitted (the happy path the
+///     bound must not break).
+///
+/// REVERT-CHECK: drop the `reserve_backoff` gate from
+/// `re_serve_setup_on_duplicate_welcome` and the first assertion goes RED
+/// the storm way — all N welcomes re-serve.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn duplicate_welcome_storm_from_unproven_member_is_bounded() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(1);
+            let (id0, mut rx0, _tx0) = ends.remove(0);
+
+            let config = PrimaryConfig {
+                num_secondaries: 1,
+                ..test_primary_config()
+            };
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Run started: a fresh incarnation cert-edge-serves the full
+            // trio once (this is NOT a re-serve, so it must not arm the
+            // backoff). The member is now served but UNPROVEN (no
+            // operational keepalive yet) — the storm precondition.
+            primary.run_start_batch_fired = true;
+            let mut welcome = welcome_frame(&id0);
+            welcome.clear_target();
+            primary.handle_welcome(welcome).await;
+            let mut cert = cert_frame(&id0, 5000);
+            cert.clear_target();
+            primary.handle_cert_exchange(cert).await;
+            settle().await;
+            let _ = drain(&mut rx0);
+
+            // ── A storm of duplicate welcomes within ONE backoff window
+            //    (no clock advance under start_paused). Exactly ONE must
+            //    re-serve the trio; the rest are suppressed. ──
+            const STORM: usize = 20;
+            let mut re_serves = 0usize;
+            for _ in 0..STORM {
+                let mut welcome = welcome_frame(&id0);
+                welcome.clear_target();
+                primary.handle_welcome(welcome).await;
+                settle().await;
+                let frames = drain(&mut rx0);
+                // A re-serve is the run-start halves landing (the
+                // mid-run trio remainder); count windows that produced one.
+                if run_start_halves(&frames) == (1, 1) {
+                    re_serves += 1;
+                }
+            }
+            assert_eq!(
+                re_serves, 1,
+                "{STORM} duplicate welcomes within one backoff window from \
+                 an unproven member must produce exactly ONE re-serve, not \
+                 {STORM} — the storm must be bounded"
+            );
+
+            // ── Past the backoff window, a re-serve fires again: a
+            //    genuinely-lost frame is still retransmitted (the bound
+            //    must not permanently silence re-serves). ──
+            tokio::time::advance(Duration::from_secs(6)).await;
+            let mut welcome = welcome_frame(&id0);
+            welcome.clear_target();
+            primary.handle_welcome(welcome).await;
+            settle().await;
+            let after_window = drain(&mut rx0);
+            assert_eq!(
+                run_start_halves(&after_window),
+                (1, 1),
+                "after the backoff window a duplicate welcome must re-serve \
+                 again (a genuinely-lost frame is still retransmitted) — got \
+                 frames {:?}",
+                after_window.iter().map(|m| m.msg_type()).collect::<Vec<_>>()
+            );
+        })
+        .await;
+}
+
 /// Test 1: the production zombie, replayed end-to-end at the manager
 /// level — the run_20260612_045106 shape verbatim: a member DIES
 /// mid-run, and its respawned REPLACEMENT (a real `SecondaryCoordinator`

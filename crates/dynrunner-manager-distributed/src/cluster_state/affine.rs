@@ -97,7 +97,7 @@ impl<I: Identifier> ClusterState<I> {
         let candidates: Vec<String> = self
             .tasks_iter()
             .filter_map(|(hash, state)| match state {
-                TaskState::Pending { task, .. } if task.kind.is_secondary_affine() => {
+                TaskState::Pending { .. } if state.def().kind.is_secondary_affine() => {
                     Some(hash.clone())
                 }
                 _ => None,
@@ -113,13 +113,14 @@ impl<I: Identifier> ClusterState<I> {
     /// per-dep terminality consults the full logical ledger via
     /// [`Self::task_view`] (fat or settled).
     fn is_pending_resolved_affine_gate(&self, hash: &str) -> bool {
-        let Some(TaskState::Pending { task, .. }) = self.task_state(hash) else {
+        let Some(state @ TaskState::Pending { .. }) = self.task_state(hash) else {
             return false;
         };
-        if !task.kind.is_secondary_affine() {
+        let def = state.def();
+        if !def.kind.is_secondary_affine() {
             return false;
         }
-        task.task_depends_on.iter().all(|dep| {
+        def.task_depends_on.iter().all(|dep| {
             self.task_hash_for_dep(&dep.phase_id, dep.task_id.as_str())
                 .and_then(|dep_hash| self.task_view(dep_hash))
                 .is_some_and(|view| view.is_terminal())

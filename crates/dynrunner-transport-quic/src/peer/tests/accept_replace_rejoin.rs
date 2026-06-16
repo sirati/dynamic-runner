@@ -239,16 +239,17 @@ async fn persistent_redial_past_grace_replaces_open_stale_entry() {
     local
         .run_until(async {
             let mut net: PeerNetwork<TestId> = PeerNetwork::start("peer-b", None).await.unwrap();
-            assert!(
-                !net.dials_outbound_to("peer-a"),
-                "peer-b must be the accept side for peer-a"
-            );
 
             // Stale entry whose writer stays OPEN (the test holds the rx) —
-            // the blackholed half-open whose disconnect never fires.
+            // the blackholed half-open whose disconnect never fires. Model
+            // it as the prior INBOUND accept of peer-a's dial (production:
+            // the stale entry was a real inbound), so the rejoiner's fresh
+            // inbounds are the SAME orientation and take the persistence
+            // (grace) path, not the mutual-dial collision tiebreak.
             let (stale_tx, _stale_rx) =
                 mpsc::unbounded_channel::<DistributedMessage<TestId>>();
             net.connections.insert("peer-a".to_string(), stale_tx.clone());
+            net.conn_inbound.insert("peer-a".to_string(), true);
 
             // Feed fresh inbounds one at a time (the peer re-dialing every
             // tick). The first `GRACE` are dropped; the entry stays the
@@ -262,6 +263,7 @@ async fn persistent_redial_past_grace_replaces_open_stale_entry() {
                     .send(super::super::AcceptedPeer {
                         peer_id: "peer-a".to_string(),
                         outgoing_tx: tx,
+                        inbound: true,
                     })
                     .expect("registration channel open");
                 net.drain_new_connections();
@@ -284,6 +286,7 @@ async fn persistent_redial_past_grace_replaces_open_stale_entry() {
                 .send(super::super::AcceptedPeer {
                     peer_id: "peer-a".to_string(),
                     outgoing_tx: fresh_tx.clone(),
+                    inbound: true,
                 })
                 .expect("registration channel open");
             net.drain_new_connections();
@@ -307,12 +310,15 @@ async fn persistent_redial_past_grace_replaces_open_stale_entry() {
         .await;
 }
 
-/// The grace gate PRESERVES the lower-id-dials / mesh-forming dedup: a
-/// one-shot duplicate inbound for a peer with a LIVE (open) entry — the
-/// establishment dial-race artefact, or a dial-owner's own racing redial
-/// — is DROPPED, leaving the canonical entry untouched. (Replacing it
-/// would collapse a healthy wire and trigger the fleet-wide replace
-/// storm.)
+/// The grace gate PRESERVES the SAME-orientation mesh-forming dedup: a
+/// one-shot duplicate of the SAME direction for a peer with a LIVE (open)
+/// entry — a dial-owner's own racing redial, or the peer re-dialing the
+/// same direction during establishment — is DROPPED, leaving the canonical
+/// entry untouched. (Replacing it would collapse a healthy wire and trigger
+/// the fleet-wide replace storm.) A duplicate of the OPPOSITE orientation
+/// is the mutual-dial collision, resolved by the symmetric tiebreak instead
+/// (covered by `mutual_dial_*`); here both wires are the SAME (outbound)
+/// orientation, so the persistence gate owns the decision.
 #[tokio::test(flavor = "current_thread")]
 async fn mesh_forming_duplicate_of_live_wire_is_deduped() {
     let local = tokio::task::LocalSet::new();
@@ -320,19 +326,25 @@ async fn mesh_forming_duplicate_of_live_wire_is_deduped() {
         .run_until(async {
             let mut net: PeerNetwork<TestId> = PeerNetwork::start("peer-a", None).await.unwrap();
 
-            // Canonical LIVE entry for peer-z (held rx ⇒ open writer).
+            // Canonical LIVE entry for peer-z (held rx ⇒ open writer),
+            // modelled as our OUTBOUND dial (peer-a < peer-z ⇒ outbound is
+            // the tiebreak winner here, so a same-orientation duplicate is a
+            // genuine racing redial, not a collision).
             let (canonical_tx, mut canonical_rx) =
                 mpsc::unbounded_channel::<DistributedMessage<TestId>>();
             net.connections
                 .insert("peer-z".to_string(), canonical_tx.clone());
+            net.conn_inbound.insert("peer-z".to_string(), false);
 
-            // A single racing-duplicate AcceptedPeer arrives.
+            // A single racing-duplicate AcceptedPeer of the SAME (outbound)
+            // orientation arrives.
             let (racing_tx, mut racing_rx) =
                 mpsc::unbounded_channel::<DistributedMessage<TestId>>();
             net.new_conn_tx
                 .send(super::super::AcceptedPeer {
                     peer_id: "peer-z".to_string(),
                     outgoing_tx: racing_tx,
+                    inbound: false,
                 })
                 .expect("registration channel open");
             net.drain_new_connections();
@@ -374,14 +386,10 @@ async fn replaced_stale_wire_disconnect_does_not_kill_fresh_entry() {
     local
         .run_until(async {
             let mut net: PeerNetwork<TestId> = PeerNetwork::start("peer-b", None).await.unwrap();
-            assert!(
-                !net.dials_outbound_to("peer-a"),
-                "peer-b must be the accept side for peer-a"
-            );
 
             // Stale entry whose wire is PROVABLY DEAD: dropping the rx
             // exits the (notional) writer, so the sender is_closed — the
-            // immediate-replace path (no grace needed).
+            // immediate-replace path (no grace, orientation-independent).
             let stale_tx = {
                 let (tx, rx) = mpsc::unbounded_channel::<DistributedMessage<TestId>>();
                 drop(rx);
@@ -389,6 +397,7 @@ async fn replaced_stale_wire_disconnect_does_not_kill_fresh_entry() {
             };
             assert!(stale_tx.is_closed(), "stale wire must be provably dead");
             net.connections.insert("peer-a".to_string(), stale_tx.clone());
+            net.conn_inbound.insert("peer-a".to_string(), true);
 
             // One fresh authenticated inbound replaces the dead entry at
             // once.
@@ -398,6 +407,7 @@ async fn replaced_stale_wire_disconnect_does_not_kill_fresh_entry() {
                 .send(super::super::AcceptedPeer {
                     peer_id: "peer-a".to_string(),
                     outgoing_tx: fresh_tx.clone(),
+                    inbound: true,
                 })
                 .expect("registration channel open");
             net.drain_new_connections();

@@ -969,6 +969,31 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// is gone).
     pub(super) keepalive_proven: HashSet<String>,
 
+    /// Per-member EXPIRY of the last duplicate-welcome re-serve (the
+    /// retransmission half of the incremental setup serve, owned by
+    /// `primary::peer_setup::re_serve_setup_on_duplicate_welcome`). A
+    /// member that received its setup trio but is BLOCKED downstream of
+    /// delivery — e.g. wedged on mesh-settle, so its keepalive emitter
+    /// never starts and it never earns `keepalive_proven` — keeps
+    /// re-welcoming on its capped handshake-retry cadence, and the wire
+    /// can re-inject those welcomes faster still (relay/redial fan-in).
+    /// The re-serve is receiver-idempotent but futile in that state:
+    /// re-sending an already-delivered trio cannot unblock a settle-stuck
+    /// member, so an unbounded re-serve per duplicate welcome is a pure
+    /// CPU-burning livelock + log flood (the asm-dataset-nix storm). This
+    /// timestamp gates the re-serve to at most one per
+    /// [`super::peer_setup::RESERVE_BACKOFF`] per member: a GENUINELY-lost
+    /// frame is still re-served (once, promptly), but the storm cannot
+    /// hot-loop. Mirrors `backpressured_secondaries` (expiry-timestamp
+    /// gate). Cleared per incarnation alongside `keepalive_proven`
+    /// (`seed_keepalive` on a fresh welcome; the requeue purge on death),
+    /// so a re-welcomed/respawned id re-serves immediately.
+    ///
+    /// Uses [`tokio::time::Instant`] (like `WarnThrottle`) so the gate
+    /// behaves correctly under `start_paused` test time — production
+    /// behaviour is identical to a wall clock.
+    pub(super) reserve_backoff: HashMap<String, tokio::time::Instant>,
+
     /// Per-secondary backoff timestamps. When a secondary returns
     /// "No idle worker available" Recoverable (its dispatch.rs
     /// `is_idle_state()` check found every worker non-idle —
@@ -1818,6 +1843,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             own_tick_health,
             silence_judged_marks: HashMap::new(),
             keepalive_proven: HashSet::new(),
+            reserve_backoff: HashMap::new(),
             ingest_gate: super::heartbeat::IngestEdgeGate::new(),
             collective_silence_gate: super::heartbeat::CollectiveSilenceGate::new(),
             silence_warn_stage: HashMap::new(),

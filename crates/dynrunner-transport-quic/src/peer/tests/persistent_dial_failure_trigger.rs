@@ -15,11 +15,11 @@
 //! (the local-forward registry) maps the id to its forward and rebuilds.
 //!
 //! These tests pin the transport contract ONLY (it stays ssh-agnostic):
-//! the id is emitted on the boundary for a dial-owner peer, NOT for a
-//! connected peer, NOT for a peer whose dial side this node does not own
-//! (lower-id-dials), and the emission rides the same throttle as the
-//! operator summary (once at the threshold, then once per recurrence —
-//! never per tick).
+//! under full-mesh dialing this node dials EVERY peer, so the id is
+//! emitted on the boundary for ANY persistently-failing peer (including a
+//! lower-id one), but NOT for a connected peer, and the emission rides the
+//! same throttle as the operator summary (once at the threshold, then once
+//! per recurrence — never per tick).
 
 use std::sync::{Arc, Mutex};
 
@@ -50,9 +50,10 @@ fn dialed_unreachable_peer() -> PeerConnectionInfo {
 }
 
 /// A peer whose dial side this node does NOT own (lower-id-dials:
-/// "peer-0" sorts below "peer-a" — `'0' < 'a'` — so "peer-0" dials US).
-/// Its leg is not a forward this node rebuilds; the trigger must never
-/// fire for it.
+/// A LOWER-id peer ("peer-0" sorts below "peer-a" — `'0' < 'a'`). Under
+/// the old lower-id-dials rule this node would NOT have dialed it; under
+/// full mesh it does, so a persistent dial failure to it is this node's own
+/// dead forward and DOES trigger a rebuild.
 fn non_dialed_peer() -> PeerConnectionInfo {
     PeerConnectionInfo {
         secondary_id: "peer-0".into(),
@@ -177,11 +178,11 @@ async fn trigger_silent_for_connected_peer() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn trigger_silent_for_non_dial_owned_peer() {
-    // The trigger must fire ONLY for a peer this node owns the dial to:
-    // a lower-id peer dials US (its leg is not a forward this node
-    // rebuilds), so its dial-failure summary is the "peer leg missing"
-    // narration, never a rebuild trigger.
+async fn trigger_fires_for_lower_id_peer_under_full_mesh() {
+    // Under full-mesh dialing this node dials EVERY peer, including a
+    // lower-id one ("peer-0" < "peer-a"), so a persistently-failing dial
+    // to it is now this node's own dead forward and MUST trigger a rebuild
+    // — the behavior the old lower-id-dials rule suppressed.
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -191,17 +192,17 @@ async fn trigger_silent_for_non_dial_owned_peer() {
             peer_a.notify_persistent_dial_failures(tx);
 
             let info = non_dialed_peer();
-            peer_a
-                .peer_dial_info
-                .insert(info.secondary_id.clone(), info);
+            let id = info.secondary_id.clone();
+            peer_a.peer_dial_info.insert(id.clone(), info);
 
             for _ in 0..(DIAL_SUMMARY_THRESHOLD + 2) {
                 peer_a.process_reconnect_tick();
             }
-            assert!(
-                rx.try_recv().is_err(),
-                "a peer whose dial side this node does NOT own must never \
-                 trigger a forward rebuild (its leg is not a forward here)"
+            assert_eq!(
+                rx.try_recv().ok().as_deref(),
+                Some(id.as_str()),
+                "full-mesh: a persistently-failing dial to a lower-id peer \
+                 must trigger a forward rebuild (this node dials it now)"
             );
         })
         .await;

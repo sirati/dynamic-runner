@@ -46,12 +46,20 @@ fn state_variants() -> Vec<(&'static str, TaskState<RunnerIdentifier>)> {
         primary_epoch: 1,
         seq,
     };
+    let (def0, routing0) = crate::cluster_state::split_task_def(t());
+    let (def1, routing1) = crate::cluster_state::split_task_def(t());
+    let (def2, routing2) = crate::cluster_state::split_task_def(t());
+    let (def3, routing3) = crate::cluster_state::split_task_def(t());
+    let (def4, routing4) = crate::cluster_state::split_task_def(t());
+    let (def5, routing5) = crate::cluster_state::split_task_def(t());
+    let (def6, routing6) = crate::cluster_state::split_task_def(t());
     vec![
         (
             "pending",
             TaskState::Pending {
                 attempt: 0,
-                task: t(),
+                def: def0,
+                routing: routing0,
                 version: v(1),
             },
         ),
@@ -59,7 +67,8 @@ fn state_variants() -> Vec<(&'static str, TaskState<RunnerIdentifier>)> {
             "inflight",
             TaskState::InFlight {
                 attempt: 0,
-                task: t(),
+                def: def1,
+                routing: routing1,
                 secondary: "s".into(),
                 worker: 0,
                 version: v(2),
@@ -69,14 +78,16 @@ fn state_variants() -> Vec<(&'static str, TaskState<RunnerIdentifier>)> {
             "blocked",
             TaskState::Blocked {
                 attempt: 0,
-                task: t(),
+                def: def2,
+                routing: routing2,
                 on: "p".into(),
             },
         ),
         (
             "completed",
             TaskState::Completed {
-                task: t(),
+                def: def3,
+                routing: routing3,
                 attempt: 0,
             },
         ),
@@ -84,7 +95,8 @@ fn state_variants() -> Vec<(&'static str, TaskState<RunnerIdentifier>)> {
             "failed",
             TaskState::Failed {
                 attempt: 0,
-                task: t(),
+                def: def4,
+                routing: routing4,
                 kind: ErrorType::Recoverable,
                 last_error: "e".into(),
                 version: v(1),
@@ -94,7 +106,8 @@ fn state_variants() -> Vec<(&'static str, TaskState<RunnerIdentifier>)> {
             "unfulfillable",
             TaskState::Unfulfillable {
                 attempt: 0,
-                task: t(),
+                def: def5,
+                routing: routing5,
                 reason: "r".into(),
                 last_error: "e".into(),
                 version: v(1),
@@ -104,7 +117,8 @@ fn state_variants() -> Vec<(&'static str, TaskState<RunnerIdentifier>)> {
             "invalid",
             TaskState::InvalidTask {
                 attempt: 0,
-                task: t(),
+                def: def6,
+                routing: routing6,
                 reason: "r".into(),
                 last_error: "e".into(),
                 version: v(1),
@@ -191,13 +205,17 @@ fn dominance_is_strict_and_antisymmetric() {
 #[test]
 fn completed_vs_invalidtask_invalidtask_wins() {
     // Merge-level: both orders → InvalidTask.
+    let (def0, routing0) = crate::cluster_state::split_task_def(mk_task("x"));
     let completed = TaskState::Completed {
-        task: mk_task("x"),
+        def: def0,
+        routing: routing0,
         attempt: 0,
     };
+    let (def1, routing1) = crate::cluster_state::split_task_def(mk_task("x"));
     let invalid = TaskState::InvalidTask {
         attempt: 0,
-        task: mk_task("x"),
+        def: def1,
+        routing: routing1,
         reason: "dup".into(),
         last_error: "invalid_task:dup".into(),
         version: Default::default(),
@@ -270,20 +288,26 @@ fn completed_vs_invalidtask_invalidtask_wins() {
 /// failure-likes; InvalidTask dominates Completed).
 #[test]
 fn terminal_total_order_holds() {
+    let (def0, routing0) = crate::cluster_state::split_task_def(mk_task("x"));
     let completed = TaskState::Completed {
-        task: mk_task("x"),
+        def: def0,
+        routing: routing0,
         attempt: 0,
     };
+    let (def1, routing1) = crate::cluster_state::split_task_def(mk_task("x"));
     let failed = TaskState::Failed {
         attempt: 0,
-        task: mk_task("x"),
+        def: def1,
+        routing: routing1,
         kind: ErrorType::Recoverable,
         last_error: "e".into(),
         version: Default::default(),
     };
+    let (def2, routing2) = crate::cluster_state::split_task_def(mk_task("x"));
     let unful = TaskState::Unfulfillable {
         attempt: 0,
-        task: mk_task("x"),
+        def: def2,
+        routing: routing2,
         reason: "r".into(),
         last_error: "e".into(),
         version: Default::default(),
@@ -312,9 +336,11 @@ fn terminal_total_order_holds() {
 #[test]
 fn failedlike_version_arbitrates_before_discriminant() {
     let task = mk_task("x");
+    let (def0, routing0) = crate::cluster_state::split_task_def(task.clone());
     let unful_s1 = TaskState::Unfulfillable {
         attempt: 0,
-        task: task.clone(),
+        def: def0,
+        routing: routing0,
         reason: "no-toolchain".into(),
         last_error: "unfulfillable".into(),
         version: TaskVersion {
@@ -322,9 +348,11 @@ fn failedlike_version_arbitrates_before_discriminant() {
             seq: 1,
         },
     };
+    let (def1, routing1) = crate::cluster_state::split_task_def(task.clone());
     let failed_s2 = TaskState::Failed {
         attempt: 0,
-        task: task.clone(),
+        def: def1,
+        routing: routing1,
         kind: ErrorType::NonRecoverable,
         last_error: "boom".into(),
         version: TaskVersion {
@@ -371,9 +399,11 @@ fn failedlike_version_arbitrates_before_discriminant() {
     // `Failed = 0 < Unfulfillable = 1`, and the join keeps the MAX key, so
     // `Unfulfillable` is the deterministic winner — and an incoming generic
     // `Failed` at equal version is a NoOp against a local `Unfulfillable`.
+    let (def2, routing2) = crate::cluster_state::split_task_def(task.clone());
     let failed_s1 = TaskState::Failed {
         attempt: 0,
-        task: task.clone(),
+        def: def2,
+        routing: routing2,
         kind: ErrorType::NonRecoverable,
         last_error: "boom".into(),
         version: TaskVersion {
@@ -409,17 +439,21 @@ fn failedlike_version_arbitrates_before_discriminant() {
 #[test]
 fn stale_assignment_after_requeue_does_not_resurrect() {
     let task = mk_task("x");
+    let (def0, routing0) = crate::cluster_state::split_task_def(task.clone());
     let pending_v0 = TaskState::Pending {
         attempt: 0,
-        task: task.clone(),
+        def: def0,
+        routing: routing0,
         version: TaskVersion {
             primary_epoch: 1,
             seq: 0,
         },
     };
+    let (def1, routing1) = crate::cluster_state::split_task_def(task.clone());
     let inflight_v1 = TaskState::InFlight {
         attempt: 0,
-        task: task.clone(),
+        def: def1,
+        routing: routing1,
         secondary: "dead-sec".into(),
         worker: 0,
         version: TaskVersion {
@@ -427,17 +461,21 @@ fn stale_assignment_after_requeue_does_not_resurrect() {
             seq: 1,
         },
     };
+    let (def2, routing2) = crate::cluster_state::split_task_def(task.clone());
     let reset_pending_v2 = TaskState::Pending {
         attempt: 0,
-        task: task.clone(),
+        def: def2,
+        routing: routing2,
         version: TaskVersion {
             primary_epoch: 1,
             seq: 2,
         },
     };
+    let (def3, routing3) = crate::cluster_state::split_task_def(task.clone());
     let reassign_inflight_v3 = TaskState::InFlight {
         attempt: 0,
-        task: task.clone(),
+        def: def3,
+        routing: routing3,
         secondary: "live-sec".into(),
         worker: 1,
         version: TaskVersion {

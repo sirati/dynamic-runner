@@ -1,35 +1,28 @@
-//! Joining-mode dial order: a rosterless late-joiner dials EVERY seed
-//! regardless of id order.
+//! Full-mesh dialing + symmetric duplicate-connection tiebreak.
 //!
-//! The latent gap (the lower-id-dials rule's blind spot): the rule is a
-//! SIMULTANEOUS-dial dedup for steady-state members who all already know
-//! each other — each pair agrees, by id order, who dials. A late joiner
-//! is UNKNOWN to the running fleet, so a seed whose id sorts BELOW the
-//! joiner would, under the rule, "await the joiner's inbound" — but it
-//! never learns the joiner exists to dial it, so that leg parks
-//! `awaiting_inbound` forever and the join hangs on relay luck.
-//! Production survived only because `observer-<uuid>` sorts below
-//! `secondary-*`, so observers dialed everyone; the gap bites the instant
-//! the ordering flips.
+//! Full-mesh: EVERY node dials EVERY peer regardless of id order, so the
+//! old lower-id-dials asymmetry (and the rosterless-joiner `dial_all_seeds`
+//! override that escaped it) is gone — `start_joining` now equals `start`.
+//! Both ends of a pair dial, so a pair can momentarily hold TWO connections
+//! at each end (our outbound dial + our inbound accept of the peer's dial).
+//! `register_accepted`'s SYMMETRIC tiebreak deterministically keeps the
+//! connection INITIATED BY THE LOWER-ID NODE on BOTH ends, so the two
+//! endpoints converge on the SAME physical wire (never each-keeps-its-own,
+//! which would disconnect them).
 //!
-//! `PeerNetwork::start_joining` sets `dial_all_seeds`, overriding the
-//! lower-id rule in the single `dials_outbound_to` predicate so the
-//! joiner owns the dial side of EVERY leg. These tests pin:
-//!   1. SWEEP — a joiner whose id sorts ABOVE a seed SPAWNS the dial
-//!      (steady-state `start` would have parked it `awaiting_inbound`).
-//!   2. REAL WIRE — that dial actually forms the leg in both directions
-//!      (the joiner sorts above the seed; without joining-mode neither
-//!      side would ever dial and the mesh would never form).
-//!   3. CROSSED DIAL — once a lower-id seed learns the joiner via the
-//!      roster and dials it too, the duplicate inbound is deduped against
-//!      the joiner's already-live wire (the accept-side grace window), so
-//!      the crossed dial converges to one leg.
-//!   4. STEADY STATE — a non-joining `start` node keeps the lower-id
-//!      dedup unchanged (the higher-id node parks `awaiting_inbound`).
+//! These tests pin:
+//!   1. SWEEP — a node whose id sorts ABOVE a peer DIALS it (the case the
+//!      old lower-id rule left parked awaiting-inbound).
+//!   2. REAL WIRE — a higher-id node dialing a lower-id peer forms the leg
+//!      in both directions (case the old rule could never form on its own).
+//!   3. start_joining == start — the joiner override is a no-op now.
+//!   4. MUTUAL-DIAL COLLISION — both ends dial; the symmetric tiebreak keeps
+//!      the lower-id node's connection on BOTH ends (convergence), and the
+//!      losing connection is dropped.
 
 use std::time::Duration;
 
-use super::super::{ACCEPT_REPLACE_GRACE, AcceptedPeer, PeerNetwork};
+use super::super::{AcceptedPeer, PeerNetwork};
 use super::TestId;
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage, KeepaliveRole, PeerConnectionInfo, PeerTransport,
@@ -63,82 +56,61 @@ fn keepalive(sender: &str, ts: f64) -> DistributedMessage<TestId> {
     }
 }
 
-/// SWEEP (RED before the fix): a joiner whose id sorts ABOVE every seed
-/// must SPAWN a dial per seed — the steady-state rule would have parked
-/// all of them `awaiting_inbound` (the parked-forever gap). The mirror of
-/// `dial_sweep::highest_id_sweep_spawns_zero_dials_and_names_awaiting_inbound`
-/// with joining-mode flipping the disposition.
+/// SWEEP: a node whose id sorts ABOVE every listed peer DIALS each one —
+/// the exact case the old lower-id-dials rule parked awaiting-inbound (the
+/// connection gap that only healed if the higher-id peer happened to dial).
 #[tokio::test(flavor = "current_thread")]
-async fn joining_highest_id_dials_every_lower_seed() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            // `peer-z` sorts ABOVE both seeds — the exact ordering that
-            // parks `awaiting_inbound` under the steady-state rule.
-            let mut net: PeerNetwork<TestId> =
-                PeerNetwork::start_joining("peer-z", None).await.unwrap();
-            let summary = net.connect_to_peers_inner(&[pinfo("peer-a"), pinfo("peer-b")]);
-            assert_eq!(
-                summary.listed, 2,
-                "both lower-id seeds are listed (self excluded)"
-            );
-            assert_eq!(
-                summary.spawned, 2,
-                "joining-mode must spawn a dial for EVERY seed regardless of \
-                 id order; got {summary:#?}"
-            );
-            assert!(
-                summary.awaiting_inbound.is_empty(),
-                "joining-mode parks NOTHING awaiting-inbound — that is the gap \
-                 it closes; got {:?}",
-                summary.awaiting_inbound
-            );
-        })
-        .await;
-}
-
-/// STEADY-STATE PIN: a non-joining `start` node with the SAME id ordering
-/// keeps the lower-id-dials dedup — the higher-id node spawns zero dials
-/// and parks both seeds awaiting-inbound. Guards against the joining-mode
-/// override leaking into steady-state members.
-#[tokio::test(flavor = "current_thread")]
-async fn steady_state_highest_id_keeps_lower_id_dedup() {
+async fn highest_id_dials_every_lower_peer() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let mut net: PeerNetwork<TestId> = PeerNetwork::start("peer-z", None).await.unwrap();
             let summary = net.connect_to_peers_inner(&[pinfo("peer-a"), pinfo("peer-b")]);
+            assert_eq!(summary.listed, 2, "both lower-id peers listed (self excluded)");
             assert_eq!(
-                summary.spawned, 0,
-                "steady-state highest-id node must spawn ZERO dials (rule unchanged)"
-            );
-            assert_eq!(
-                summary.awaiting_inbound,
-                vec!["peer-a".to_string(), "peer-b".to_string()],
-                "steady-state highest-id node awaits both lower-id peers' inbound dials"
+                summary.spawned, 2,
+                "full-mesh: a higher-id node must dial EVERY lower-id peer; got {summary:#?}"
             );
         })
         .await;
 }
 
-/// REAL WIRE (RED before the fix): a joiner that sorts ABOVE the seed
-/// forms the leg in BOTH directions, driven by the joiner's own dial.
-/// Under the steady-state rule the joiner (higher id) would never dial
-/// and the seed never knows the joiner to dial it — so neither side ever
-/// connects and the mesh never forms. With joining-mode the joiner dials
-/// the seed, the seed's accept loop registers it, and the seed's reply
-/// completes the round-trip.
+/// `start_joining` is now identical to `start`: both dial every peer. Pins
+/// that the retired joiner override did not change observable behaviour.
 #[tokio::test(flavor = "current_thread")]
-async fn joiner_above_seed_forms_real_leg() {
+async fn start_joining_dials_like_start() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            // The seed sorts BELOW the joiner: `seed-a` < `seed-z`. The
-            // seed is a STEADY-STATE member that does not know the joiner,
-            // so it will never dial it; the leg can come ONLY from the
-            // joiner's own dial (the gap, closed by joining-mode).
-            let mut joiner: PeerNetwork<TestId> =
-                PeerNetwork::start_joining("seed-z", None).await.unwrap();
+            let mut joining: PeerNetwork<TestId> =
+                PeerNetwork::start_joining("peer-z", None).await.unwrap();
+            let mut steady: PeerNetwork<TestId> =
+                PeerNetwork::start("peer-z", None).await.unwrap();
+            let s_join = joining.connect_to_peers_inner(&[pinfo("peer-a"), pinfo("peer-b")]);
+            let s_steady = steady.connect_to_peers_inner(&[pinfo("peer-a"), pinfo("peer-b")]);
+            assert_eq!(
+                s_join.spawned, s_steady.spawned,
+                "start_joining and start must spawn the same dials under full mesh"
+            );
+            assert_eq!(s_join.spawned, 2);
+        })
+        .await;
+}
+
+/// REAL WIRE (case a — a node dials a LOWER-id peer, which the old rule
+/// never did): a higher-id node dials a lower-id seed and the leg forms in
+/// BOTH directions. Here the seed has NO roster entry for the dialer, so the
+/// leg can come ONLY from the higher-id node's dial — the previously-broken
+/// direction.
+#[tokio::test(flavor = "current_thread")]
+async fn higher_id_dials_lower_id_peer_forms_real_leg() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // `seed-z` (higher id) dials `seed-a` (lower id) — the dial the
+            // old lower-id-dials rule suppressed.
+            let mut dialer: PeerNetwork<TestId> =
+                PeerNetwork::start("seed-z", None).await.unwrap();
             let mut seed: PeerNetwork<TestId> =
                 PeerNetwork::start("seed-a", None).await.unwrap();
 
@@ -153,126 +125,197 @@ async fn joiner_above_seed_forms_real_leg() {
                 slurm_job_id: None,
             };
 
-            // The joiner dials its seed (joining-mode: it dials a lower-id
-            // peer it never would under the steady-state rule). The seed
-            // is given NO roster entry for the joiner — it never dials.
-            joiner.connect_to_peers(std::slice::from_ref(&seed_info));
+            // The higher-id node dials the lower-id seed. The seed is given
+            // NO roster entry for the dialer — it never dials, so the only
+            // path to a leg is the higher-id node's dial.
+            dialer.connect_to_peers(std::slice::from_ref(&seed_info));
 
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
             let mut ka_ts = 1.0f64;
             loop {
-                let _ = tokio::time::timeout(Duration::from_millis(50), joiner.recv_peer()).await;
+                let _ = tokio::time::timeout(Duration::from_millis(50), dialer.recv_peer()).await;
                 ka_ts += 1.0;
-                // The joiner's broadcast drains its completed dial
-                // registration first, then writes the identifying first
-                // frame on the live wire so the seed's accept loop keys
-                // the leg under `seed-z`.
-                let _ = joiner.broadcast(keepalive("seed-z", ka_ts)).await;
+                let _ = dialer.broadcast(keepalive("seed-z", ka_ts)).await;
                 let _ = tokio::time::timeout(Duration::from_millis(50), seed.recv_peer()).await;
                 seed.drain_new_connections();
-                if joiner.connections.contains_key("seed-a")
+                if dialer.connections.contains_key("seed-a")
                     && seed.connections.contains_key("seed-z")
                 {
                     break;
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "the joiner-above-seed leg never formed within 15s — \
-                     joining-mode failed to dial a lower-id seed; \
-                     joiner_has_seed={} seed_has_joiner={}",
-                    joiner.connections.contains_key("seed-a"),
+                    "the higher-id→lower-id leg never formed within 15s — \
+                     full-mesh failed to dial a lower-id peer; \
+                     dialer_has_seed={} seed_has_dialer={}",
+                    dialer.connections.contains_key("seed-a"),
                     seed.connections.contains_key("seed-z"),
                 );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
-            // The leg is bidirectional: a seed→joiner frame reaches the
-            // joiner over the wire the joiner's dial built.
+            // The leg is bidirectional: a seed→dialer frame reaches the
+            // dialer over the wire the dial built.
             seed.send_to_peer("seed-z", keepalive("seed-a", 99.0))
                 .await
                 .unwrap();
-            let received = tokio::time::timeout(Duration::from_secs(5), joiner.recv_peer())
+            let received = tokio::time::timeout(Duration::from_secs(5), dialer.recv_peer())
                 .await
-                .expect("timeout on seed→joiner frame")
-                .expect("seed→joiner frame missing");
+                .expect("timeout on seed→dialer frame")
+                .expect("seed→dialer frame missing");
             assert_eq!(received.sender_id(), "seed-a");
         })
         .await;
 }
 
-/// CROSSED DIAL: a joining-mode joiner dialed a lower-id seed (its wire is
-/// LIVE). Later the seed learns the joiner via the primary's roster
-/// broadcast and — being the lower id — ALSO dials the joiner under its
-/// own steady-state rule. That second pipe surfaces as a fresh inbound at
-/// the joiner's accept loop while it already holds a healthy entry: the
-/// grace-window dedup MUST drop it, so the crossed dial converges to the
-/// one live leg (no replace-storm, no leg flap). This is the safety the
-/// joining-mode override relies on.
+/// MUTUAL-DIAL COLLISION — the load-bearing convergence property (cases b
+/// and c). Both ends dial each other, so each holds two candidate
+/// connections for the pair. The symmetric tiebreak keeps the connection
+/// INITIATED BY THE LOWER-ID NODE on BOTH ends, and DROPS the other.
+///
+/// Pair (seed-a < seed-z). The surviving wire is seed-a's dial of seed-z =
+/// seed-z's INBOUND = seed-a's OUTBOUND. We assert BOTH endpoints' local
+/// `register_accepted` decisions and that they agree on the same physical
+/// wire (no each-keeps-its-own ⇒ no disconnect), and that the loser is
+/// dropped.
 #[tokio::test(flavor = "current_thread")]
-async fn crossed_dial_from_lower_id_seed_is_deduped_against_live_wire() {
+async fn mutual_dial_collision_converges_on_lower_id_initiator() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            // The joiner sorts ABOVE the seed. Joining-mode made the joiner
-            // own the dial; the seed is the lower id, so once it learns the
-            // joiner it owns the dial too — the crossed-dial overlap.
-            let mut joiner: PeerNetwork<TestId> =
-                PeerNetwork::start_joining("seed-z", None).await.unwrap();
-
-            // The joiner's own dial already produced a LIVE wire to the
-            // seed (the test stands in for the completed dial registration
-            // by inserting the live sender directly — its rx is held so it
-            // never reads as closed).
-            let (live_tx, mut live_rx) = mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-            joiner.connections.insert("seed-a".to_string(), live_tx.clone());
-
-            // The seed's later dial lands as a fresh inbound at the
-            // joiner's accept loop. A crossed dial is a one-shot transient
-            // of a LIVE wire — the seed dials once on learning the joiner,
-            // and the joiner's own traffic then identifies the existing
-            // wire at the seed, so the inbound count never climbs past the
-            // grace window (the persistence test that distinguishes a
-            // crossed dial from a peer genuinely re-dialing a dead leg).
-            // Every inbound inside the grace window is dropped; the live
-            // wire stands.
-            let mut held = Vec::new();
-            for i in 0..ACCEPT_REPLACE_GRACE {
-                let (tx, rx) = mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-                held.push(rx);
-                joiner
-                    .new_conn_tx
-                    .send(AcceptedPeer {
-                        peer_id: "seed-a".to_string(),
-                        outgoing_tx: tx,
-                    })
-                    .expect("registration channel open");
-                joiner.drain_new_connections();
-                assert!(
-                    joiner
-                        .connections
-                        .get("seed-a")
-                        .unwrap()
-                        .same_channel(&live_tx),
-                    "crossed-dial inbound #{} must be deduped against the \
-                     joiner's live wire — the seed's dial cannot collapse a \
-                     healthy leg",
-                    i + 1
-                );
-            }
-
-            // The original live wire is still the registered one: a
-            // joiner→seed send reaches its held receiver, not a dropped
-            // crossed-dial pipe.
-            joiner
-                .connections
+            // ── seed-z's view (the HIGHER-id node) ──
+            // It first registers its own OUTBOUND dial of seed-a, then the
+            // INBOUND of seed-a's dial collides. Tiebreak: the lower-id
+            // initiator (seed-a) wins ⇒ on seed-z the INBOUND must SURVIVE,
+            // replacing its own outbound loser.
+            let mut hi: PeerNetwork<TestId> = PeerNetwork::start("seed-z", None).await.unwrap();
+            let (hi_out_tx, mut hi_out_rx) = mpsc::unbounded_channel();
+            hi.new_conn_tx
+                .send(AcceptedPeer {
+                    peer_id: "seed-a".to_string(),
+                    outgoing_tx: hi_out_tx.clone(),
+                    inbound: false, // seed-z's outbound dial of seed-a
+                })
+                .unwrap();
+            hi.drain_new_connections();
+            let (hi_in_tx, mut hi_in_rx) = mpsc::unbounded_channel();
+            hi.new_conn_tx
+                .send(AcceptedPeer {
+                    peer_id: "seed-a".to_string(),
+                    outgoing_tx: hi_in_tx.clone(),
+                    inbound: true, // seed-a's dial accepted at seed-z
+                })
+                .unwrap();
+            hi.drain_new_connections();
+            // The INBOUND (seed-a-initiated) wins on seed-z.
+            assert!(
+                hi.connections.get("seed-a").unwrap().same_channel(&hi_in_tx),
+                "seed-z must keep the INBOUND (lower-id seed-a's dial)"
+            );
+            // The loser (seed-z's own outbound) is dropped: its sender is no
+            // longer the registered one, and dropping it closes the wire —
+            // the held rx now observes the sender count drop.
+            hi.connections
                 .get("seed-a")
                 .unwrap()
                 .send(keepalive("seed-z", 1.0))
                 .unwrap();
+            assert!(hi_in_rx.try_recv().is_ok(), "the survivor is the inbound wire");
             assert!(
-                live_rx.try_recv().is_ok(),
-                "the converged leg must be the joiner's original live wire"
+                hi_out_rx.try_recv().is_err(),
+                "the dropped outbound loser carries no traffic"
             );
+
+            // ── seed-a's view (the LOWER-id node, the initiator) ──
+            // It first registers its own OUTBOUND dial of seed-z, then the
+            // INBOUND of seed-z's dial collides. Tiebreak: the lower-id
+            // initiator (seed-a itself) wins ⇒ on seed-a the OUTBOUND must
+            // SURVIVE and the inbound loser is DROPPED.
+            let mut lo: PeerNetwork<TestId> = PeerNetwork::start("seed-a", None).await.unwrap();
+            let (lo_out_tx, mut lo_out_rx) = mpsc::unbounded_channel();
+            lo.new_conn_tx
+                .send(AcceptedPeer {
+                    peer_id: "seed-z".to_string(),
+                    outgoing_tx: lo_out_tx.clone(),
+                    inbound: false, // seed-a's outbound dial of seed-z
+                })
+                .unwrap();
+            lo.drain_new_connections();
+            let (lo_in_tx, mut lo_in_rx) = mpsc::unbounded_channel();
+            lo.new_conn_tx
+                .send(AcceptedPeer {
+                    peer_id: "seed-z".to_string(),
+                    outgoing_tx: lo_in_tx.clone(),
+                    inbound: true, // seed-z's dial accepted at seed-a
+                })
+                .unwrap();
+            lo.drain_new_connections();
+            assert!(
+                lo.connections.get("seed-z").unwrap().same_channel(&lo_out_tx),
+                "seed-a must keep its OUTBOUND (it is the lower-id initiator)"
+            );
+            lo.connections
+                .get("seed-z")
+                .unwrap()
+                .send(keepalive("seed-a", 1.0))
+                .unwrap();
+            assert!(lo_out_rx.try_recv().is_ok(), "the survivor is the outbound wire");
+            assert!(
+                lo_in_rx.try_recv().is_err(),
+                "the dropped inbound loser carries no traffic"
+            );
+
+            // ── CONVERGENCE ── seed-z kept the INBOUND (seed-a's dial);
+            // seed-a kept its OUTBOUND (its own dial). Both are the SAME
+            // physical connection seed-a→seed-z, so the two endpoints agree
+            // and stay connected — exactly one wire survives the pair.
+            assert_eq!(PeerTransport::<TestId>::peer_count(&hi), 1);
+            assert_eq!(PeerTransport::<TestId>::peer_count(&lo), 1);
+        })
+        .await;
+}
+
+/// COLLISION ORDER-INDEPENDENCE: the tiebreak converges regardless of which
+/// orientation arrives FIRST. seed-z accepts seed-a's INBOUND first, then
+/// its own OUTBOUND collides — the inbound (lower-id winner) must still
+/// survive, and the late-arriving outbound loser is dropped on arrival.
+#[tokio::test(flavor = "current_thread")]
+async fn mutual_dial_collision_inbound_first_keeps_winner() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut hi: PeerNetwork<TestId> = PeerNetwork::start("seed-z", None).await.unwrap();
+            // INBOUND (seed-a's dial) arrives first and registers.
+            let (in_tx, mut in_rx) = mpsc::unbounded_channel();
+            hi.new_conn_tx
+                .send(AcceptedPeer {
+                    peer_id: "seed-a".to_string(),
+                    outgoing_tx: in_tx.clone(),
+                    inbound: true,
+                })
+                .unwrap();
+            hi.drain_new_connections();
+            // OUTBOUND (seed-z's own dial) arrives second — it LOSES.
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            hi.new_conn_tx
+                .send(AcceptedPeer {
+                    peer_id: "seed-a".to_string(),
+                    outgoing_tx: out_tx,
+                    inbound: false,
+                })
+                .unwrap();
+            hi.drain_new_connections();
+            assert!(
+                hi.connections.get("seed-a").unwrap().same_channel(&in_tx),
+                "the inbound winner must survive even when it arrived FIRST"
+            );
+            hi.connections
+                .get("seed-a")
+                .unwrap()
+                .send(keepalive("seed-z", 1.0))
+                .unwrap();
+            assert!(in_rx.try_recv().is_ok());
+            assert!(out_rx.try_recv().is_err(), "the late outbound loser is dropped");
         })
         .await;
 }

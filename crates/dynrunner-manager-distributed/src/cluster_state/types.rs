@@ -7,13 +7,47 @@
 //! ledger entry. The behavior (the `apply` rules, the snapshot/restore
 //! merge, the event emit) lives in sibling sub-modules.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use dynrunner_core::{ErrorType, TaskInfo, TaskVersion, TerminalOutcomeCounts, WorkerId};
+use dynrunner_core::{
+    ErrorType, SoftPreferredSecondaries, TaskInfo, TaskVersion, TerminalOutcomeCounts, WorkerId,
+};
 use dynrunner_protocol_primary_secondary::{RemovalCause, RoleTable};
 use serde::{Deserialize, Serialize};
 
+use super::task_def_store::FrozenTaskDef;
 use crate::task_completed::TaskCompletedEvent;
+
+/// The MUTABLE tail of a [`TaskInfo`] the runtime rewrites in place — the 3
+/// fields carved off the [`FrozenTaskDef`] frozen core. Stored per-
+/// `TaskState` alongside the shared `Arc<FrozenTaskDef>` so a task's
+/// dispatch recipe is deduplicated (the Arc) while its mutable routing tail
+/// stays per-entry.
+///
+/// Each field's `#[serde]` attrs MIRROR `TaskInfo`'s for the same three
+/// fields, so the routing SUB-STRUCT serializes the carved values with
+/// identical per-field semantics (`resolved_path` node-local-only,
+/// `preferred_*` replicated). NOTE: this carve does NOT keep the ENCLOSING
+/// `TaskState` variant's serialized SHAPE backward-compatible with the
+/// pre-cutover `{ "Pending": { "task": { …16 fields… }, … } }` encoding — a
+/// variant body now nests `{ "def": { …13… }, "routing": { … }, … }`. That
+/// is a deliberate STRUCTURAL change to the snapshot RPC + on-disk
+/// settled-spill format (no old↔new cross-version decode); the whole cluster
+/// runs one pinned commit, so it is the accepted cost of the cutover, not a
+/// rolling-upgrade-safe additive field change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskRouting {
+    /// Soft hint of preferred secondaries — mirrors `TaskInfo`'s attrs.
+    #[serde(default, skip_serializing_if = "SoftPreferredSecondaries::is_empty")]
+    pub preferred_secondaries: SoftPreferredSecondaries,
+    /// Monotone version of the preferred-secondaries metadata.
+    #[serde(default)]
+    pub preferred_version: TaskVersion,
+    /// Local-only on-disk resolved location — never crosses the wire.
+    #[serde(skip)]
+    pub resolved_path: Option<PathBuf>,
+}
 
 /// Per-task state in the replicated ledger.
 ///
@@ -29,7 +63,8 @@ use crate::task_completed::TaskCompletedEvent;
 #[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
 pub enum TaskState<I> {
     Pending {
-        task: TaskInfo<I>,
+        def: Arc<FrozenTaskDef<I>>,
+        routing: TaskRouting,
         /// Assignment-lifecycle version (C3). Carried so a reset's
         /// higher version beats a stale pre-reset `InFlight` within the
         /// non-terminal band even though `Pending`'s rank is lower.
@@ -43,7 +78,8 @@ pub enum TaskState<I> {
         attempt: u32,
     },
     InFlight {
-        task: TaskInfo<I>,
+        def: Arc<FrozenTaskDef<I>>,
+        routing: TaskRouting,
         secondary: String,
         worker: WorkerId,
         /// Assignment-lifecycle version (C3). Set from the stamped
@@ -58,7 +94,8 @@ pub enum TaskState<I> {
         attempt: u32,
     },
     Completed {
-        task: TaskInfo<I>,
+        def: Arc<FrozenTaskDef<I>>,
+        routing: TaskRouting,
         /// Retry-attempt generation (F2). See `Pending::attempt`. A
         /// completion preserves the attempt it completed under so a late
         /// stale attempt-n outcome cannot resurrect a higher-generation
@@ -66,7 +103,8 @@ pub enum TaskState<I> {
         attempt: u32,
     },
     Failed {
-        task: TaskInfo<I>,
+        def: Arc<FrozenTaskDef<I>>,
+        routing: TaskRouting,
         kind: ErrorType,
         last_error: String,
         /// Terminal-payload version (D-V / AE-2). Two divergent failure
@@ -96,7 +134,8 @@ pub enum TaskState<I> {
     /// counter / partition purposes (folded into `fail_final` by
     /// `outcome_counts` for operator-readable buckets).
     Unfulfillable {
-        task: TaskInfo<I>,
+        def: Arc<FrozenTaskDef<I>>,
+        routing: TaskRouting,
         reason: String,
         /// The wire `error` message body (TS-4). Stored ALONGSIDE the
         /// typed `reason` so a restore-path emit's `last_error` is
@@ -125,7 +164,8 @@ pub enum TaskState<I> {
     /// auto-resume mechanism needs to identify them by discriminant +
     /// `on` field rather than by parsing an error message.
     Blocked {
-        task: TaskInfo<I>,
+        def: Arc<FrozenTaskDef<I>>,
+        routing: TaskRouting,
         on: String,
         /// Retry-attempt generation (F2). See `Pending::attempt`. Carried
         /// for uniformity and preserved across the cascade-pause →
@@ -153,7 +193,8 @@ pub enum TaskState<I> {
     /// into `fail_final` by `outcome_counts` for operator-readable
     /// buckets, sibling to `Unfulfillable`.
     InvalidTask {
-        task: TaskInfo<I>,
+        def: Arc<FrozenTaskDef<I>>,
+        routing: TaskRouting,
         reason: String,
         /// The wire `error` message body (TS-4). See `Unfulfillable::last_error`.
         last_error: String,
@@ -183,7 +224,11 @@ pub enum TaskState<I> {
     /// (uniform with the F2 generation accessor). LOAD-BEARING: its
     /// `to_completed_event` is `None` so the skip stays silent on the
     /// completion channel.
-    SkippedAlreadyDone { task: TaskInfo<I>, attempt: u32 },
+    SkippedAlreadyDone {
+        def: Arc<FrozenTaskDef<I>>,
+        routing: TaskRouting,
+        attempt: u32,
+    },
     /// A `TaskKind::Setup` task that SUCCEEDED. Distinct terminal variant
     /// (rather than `Completed` carrying the kind) for the SAME reason as
     /// `SkippedAlreadyDone`: it is SUCCESS-LIKE — terminal, satisfies a
@@ -205,7 +250,11 @@ pub enum TaskState<I> {
     /// [`TerminalRank`]. The originating mutation (the in-process
     /// executor's success) is added by the executor phase; this variant +
     /// its terminal/dep/counter wiring is the primitive that consumes it.
-    SetupCompleted { task: TaskInfo<I>, attempt: u32 },
+    SetupCompleted {
+        def: Arc<FrozenTaskDef<I>>,
+        routing: TaskRouting,
+        attempt: u32,
+    },
     /// A `TaskKind::SecondaryAffine` gate `I` that became dependency-
     /// SATISFIED (all of ITS OWN deps resolved). READY-not-EXECUTED: it is
     /// terminal for DEPENDENCY-RESOLUTION + phase-completion purposes (so
@@ -231,7 +280,11 @@ pub enum TaskState<I> {
     /// `to_completed_event` is `None` so the gate stays silent on the
     /// completion channel (it is neither a success nor a failure
     /// observation a downstream Policy could fold).
-    AffineReady { task: TaskInfo<I>, attempt: u32 },
+    AffineReady {
+        def: Arc<FrozenTaskDef<I>>,
+        routing: TaskRouting,
+        attempt: u32,
+    },
     /// A work task `B` assigned to secondary `secondary` and WAITING on that
     /// secondary's LOCAL `TaskKind::SecondaryAffine` import (#497). A
     /// NON-TERMINAL state — `B` will run on `secondary` once the local
@@ -255,7 +308,8 @@ pub enum TaskState<I> {
     /// death the death seam requeues it back to `Pending` (re-routable per
     /// #495), like `InFlight`.
     QueuedAfterLocalDependency {
-        task: TaskInfo<I>,
+        def: Arc<FrozenTaskDef<I>>,
+        routing: TaskRouting,
         secondary: String,
         version: TaskVersion,
         attempt: u32,
@@ -263,44 +317,104 @@ pub enum TaskState<I> {
 }
 
 impl<I> TaskState<I> {
-    /// Mutable borrow of the carried `TaskInfo`, regardless of variant.
-    /// One canonical accessor so callers that need to mutate the task
-    /// payload (e.g. the snapshot migration shim filling phase-less
-    /// deps) do not each re-spell the all-variants match.
-    pub(crate) fn task_mut(&mut self) -> &mut TaskInfo<I> {
+    /// Shared borrow of the SHARED frozen definition, regardless of
+    /// variant. The cheap-to-clone `Arc` whose 13 immutable fields make
+    /// up the task's identity + dispatch recipe — callers reading a
+    /// frozen field (path/size/identifier/phase_id/type_id/kind/…) read
+    /// it here without re-spelling the all-variants match.
+    pub(crate) fn def(&self) -> &Arc<FrozenTaskDef<I>> {
         match self {
-            TaskState::Pending { task, .. }
-            | TaskState::InFlight { task, .. }
-            | TaskState::Completed { task, .. }
-            | TaskState::Failed { task, .. }
-            | TaskState::Unfulfillable { task, .. }
-            | TaskState::InvalidTask { task, .. }
-            | TaskState::SkippedAlreadyDone { task, .. }
-            | TaskState::SetupCompleted { task, .. }
-            | TaskState::AffineReady { task, .. }
-            | TaskState::QueuedAfterLocalDependency { task, .. }
-            | TaskState::Blocked { task, .. } => task,
+            TaskState::Pending { def, .. }
+            | TaskState::InFlight { def, .. }
+            | TaskState::Completed { def, .. }
+            | TaskState::Failed { def, .. }
+            | TaskState::Unfulfillable { def, .. }
+            | TaskState::InvalidTask { def, .. }
+            | TaskState::SkippedAlreadyDone { def, .. }
+            | TaskState::SetupCompleted { def, .. }
+            | TaskState::AffineReady { def, .. }
+            | TaskState::QueuedAfterLocalDependency { def, .. }
+            | TaskState::Blocked { def, .. } => def,
         }
     }
 
-    /// Shared (`&self`) borrow of the carried `TaskInfo`, regardless of
-    /// variant. The read-only twin of [`Self::task_mut`] — callers that
-    /// need the `task_id` (e.g. the terminal-event projection) read it
-    /// here without re-spelling the all-variants match.
-    pub(crate) fn task(&self) -> &TaskInfo<I> {
+    /// Mutable borrow of the frozen `def`, copy-on-write via
+    /// [`Arc::make_mut`]. The ONE legitimate writer is the snapshot-only
+    /// `migrate_unphased_deps` shim, which rewrites a legacy un-phased dep's
+    /// phase on a freshly-DECODED snapshot whose def `Arc`s are not yet
+    /// shared (refcount 1, so `make_mut` mutates in place rather than
+    /// cloning). NOT a steady-state mutation path — the frozen core is
+    /// immutable once interned; this exists solely for the pre-restore
+    /// migration of an already-owned snapshot entry.
+    pub(crate) fn def_mut(&mut self) -> &mut FrozenTaskDef<I>
+    where
+        I: Clone,
+    {
         match self {
-            TaskState::Pending { task, .. }
-            | TaskState::InFlight { task, .. }
-            | TaskState::Completed { task, .. }
-            | TaskState::Failed { task, .. }
-            | TaskState::Unfulfillable { task, .. }
-            | TaskState::InvalidTask { task, .. }
-            | TaskState::SkippedAlreadyDone { task, .. }
-            | TaskState::SetupCompleted { task, .. }
-            | TaskState::AffineReady { task, .. }
-            | TaskState::QueuedAfterLocalDependency { task, .. }
-            | TaskState::Blocked { task, .. } => task,
+            TaskState::Pending { def, .. }
+            | TaskState::InFlight { def, .. }
+            | TaskState::Completed { def, .. }
+            | TaskState::Failed { def, .. }
+            | TaskState::Unfulfillable { def, .. }
+            | TaskState::InvalidTask { def, .. }
+            | TaskState::SkippedAlreadyDone { def, .. }
+            | TaskState::SetupCompleted { def, .. }
+            | TaskState::AffineReady { def, .. }
+            | TaskState::QueuedAfterLocalDependency { def, .. }
+            | TaskState::Blocked { def, .. } => Arc::make_mut(def),
         }
+    }
+
+    /// Shared borrow of the per-entry MUTABLE routing tail, regardless of
+    /// variant. Callers reading a carved field
+    /// (preferred_secondaries/preferred_version/resolved_path) read it
+    /// here without re-spelling the all-variants match.
+    pub(crate) fn routing(&self) -> &TaskRouting {
+        match self {
+            TaskState::Pending { routing, .. }
+            | TaskState::InFlight { routing, .. }
+            | TaskState::Completed { routing, .. }
+            | TaskState::Failed { routing, .. }
+            | TaskState::Unfulfillable { routing, .. }
+            | TaskState::InvalidTask { routing, .. }
+            | TaskState::SkippedAlreadyDone { routing, .. }
+            | TaskState::SetupCompleted { routing, .. }
+            | TaskState::AffineReady { routing, .. }
+            | TaskState::QueuedAfterLocalDependency { routing, .. }
+            | TaskState::Blocked { routing, .. } => routing,
+        }
+    }
+
+    /// Mutable borrow of the per-entry routing tail, regardless of
+    /// variant. The in-place preferred-update writes
+    /// `routing_mut().preferred_secondaries` /
+    /// `routing_mut().preferred_version` here.
+    pub(crate) fn routing_mut(&mut self) -> &mut TaskRouting {
+        match self {
+            TaskState::Pending { routing, .. }
+            | TaskState::InFlight { routing, .. }
+            | TaskState::Completed { routing, .. }
+            | TaskState::Failed { routing, .. }
+            | TaskState::Unfulfillable { routing, .. }
+            | TaskState::InvalidTask { routing, .. }
+            | TaskState::SkippedAlreadyDone { routing, .. }
+            | TaskState::SetupCompleted { routing, .. }
+            | TaskState::AffineReady { routing, .. }
+            | TaskState::QueuedAfterLocalDependency { routing, .. }
+            | TaskState::Blocked { routing, .. } => routing,
+        }
+    }
+
+    /// Reconstruct a whole owned [`TaskInfo`] from this state's shared
+    /// `def` (its 13 frozen fields) + its `routing` (the 3 carved mutable
+    /// fields). A TRANSIENT allocation, NEVER retained — only for callers
+    /// that genuinely need a whole owned `TaskInfo` (building a wire
+    /// `TaskAssignment` or a `TaskInfo` for the pool).
+    pub(crate) fn to_task_info(&self) -> TaskInfo<I>
+    where
+        I: Clone,
+    {
+        self.def().to_task_info(self.routing())
     }
 
     /// The retry-attempt generation this state carries (F2). One canonical
@@ -385,7 +499,7 @@ impl<I> TaskState<I> {
     /// so consumer Policy bucketing (`starts_with("invalid_task:")`,
     /// `unfulfillable:` dedup) is byte-identical to the apply path.
     pub(crate) fn to_completed_event(&self, task_hash: &str) -> Option<TaskCompletedEvent> {
-        let task_id = self.task().task_id.clone();
+        let task_id = self.def().task_id.clone();
         match self {
             TaskState::Completed { .. } => Some(TaskCompletedEvent {
                 task_id,

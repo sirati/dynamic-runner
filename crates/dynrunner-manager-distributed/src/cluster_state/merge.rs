@@ -580,7 +580,7 @@ impl<I: Identifier> ClusterState<I> {
             } else {
                 PhaseTally::Failed
             };
-            let key = (incoming.task().phase_id.clone(), kind);
+            let key = (incoming.def().phase_id.clone(), kind);
             let next = self.phase_event_tally_for(&key) + 1;
             self.record_phase_event_tally(key, next);
         }
@@ -697,10 +697,16 @@ impl<I: Identifier> ClusterState<I> {
             .tasks
             .iter()
             .filter_map(|(h, s)| match s {
-                TaskState::Blocked { on, task, attempt } if on == failed_prereq_hash => Some((
+                TaskState::Blocked {
+                    on,
+                    def,
+                    routing,
+                    attempt,
+                } if on == failed_prereq_hash => Some((
                     h.clone(),
                     TaskState::Failed {
-                        task: task.clone(),
+                        def: def.clone(),
+                        routing: routing.clone(),
                         kind: dynrunner_core::ErrorType::NonRecoverable,
                         last_error: "upstream-failed".to_string(),
                         version: TaskVersion::default(),

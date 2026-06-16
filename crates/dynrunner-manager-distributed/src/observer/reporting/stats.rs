@@ -396,15 +396,16 @@ impl StatsSnapshot {
                         .entry(secondary.clone())
                         .or_insert(0) += 1;
                 }
-                TaskState::Pending { task, .. } => {
-                    let deps_satisfied = task
+                TaskState::Pending { .. } => {
+                    let def = st.def();
+                    let deps_satisfied = def
                         .task_depends_on
                         .iter()
                         .all(|d| terminal_task_ids.contains(d.task_id.as_str()));
                     if !deps_satisfied {
                         waiting_on_deps += 1;
                     } else if phase_rollups
-                        .get(&task.phase_id)
+                        .get(&def.phase_id)
                         .is_some_and(|r| r.dispatchable)
                     {
                         ready_in_queue += 1;
@@ -641,21 +642,5 @@ fn avg_u32_from_sum(sum: u128, n: u64) -> Option<u32> {
 // CRDT-projection feed (producer: `observer_late_joiner/run.rs`).
 
 fn task_id_of<I>(state: &TaskState<I>) -> &str {
-    task_of(state).task_id.as_str()
-}
-
-fn task_of<I>(state: &TaskState<I>) -> &dynrunner_core::TaskInfo<I> {
-    match state {
-        TaskState::Pending { task, .. }
-        | TaskState::InFlight { task, .. }
-        | TaskState::Completed { task, .. }
-        | TaskState::Failed { task, .. }
-        | TaskState::Unfulfillable { task, .. }
-        | TaskState::Blocked { task, .. }
-        | TaskState::InvalidTask { task, .. }
-        | TaskState::SkippedAlreadyDone { task, .. }
-        | TaskState::SetupCompleted { task, .. }
-        | TaskState::AffineReady { task, .. }
-        | TaskState::QueuedAfterLocalDependency { task, .. } => task,
-    }
+    state.def().task_id.as_str()
 }

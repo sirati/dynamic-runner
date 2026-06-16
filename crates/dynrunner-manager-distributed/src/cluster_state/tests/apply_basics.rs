@@ -308,8 +308,8 @@ fn invalid_task_counts_as_fail_final_and_is_terminal() {
 
     // iter_terminal includes the InvalidTask entry (it is terminal);
     // the Pending entry is excluded.
-    let terminal_ids: std::collections::HashSet<&str> =
-        s.iter_terminal().map(|(_, t)| t.task_id.as_str()).collect();
+    let terminal_ids: std::collections::HashSet<String> =
+        s.iter_terminal().map(|(_, t)| t.task_id.to_string()).collect();
     assert!(terminal_ids.contains("bad"), "InvalidTask is terminal");
     assert!(terminal_ids.contains("ok"));
     assert!(!terminal_ids.contains("pend"), "Pending is not terminal");
@@ -376,8 +376,8 @@ fn skipped_already_done_is_weakest_terminal_and_silent() {
     );
 
     // iter_terminal surfaces it (dependents resolve against it).
-    let terminal_ids: std::collections::HashSet<&str> =
-        s.iter_terminal().map(|(_, t)| t.task_id.as_str()).collect();
+    let terminal_ids: std::collections::HashSet<String> =
+        s.iter_terminal().map(|(_, t)| t.task_id.to_string()).collect();
     assert!(terminal_ids.contains("skip"));
 
     // Weakest-terminal lockout: a skip against a REAL terminal NoOps.
@@ -752,4 +752,117 @@ fn phase_deps_set_then_re_set_is_noop() {
         ApplyOutcome::NoOp
     );
     assert_eq!(s.phase_deps(), &deps);
+}
+
+#[test]
+fn def_arc_preserved_across_pending_inflight_completed_transitions() {
+    // L2 invariant: a state transition that rebuilds a variant from an
+    // existing one CARRIES FORWARD the shared `def` Arc (clones the Arc, never
+    // re-interns), so the frozen core is shared across the whole lifecycle —
+    // `Arc::ptr_eq` holds from the spawn `Pending` through `InFlight` to the
+    // terminal `Completed`.
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("a"),
+    });
+    let pending_def = s.task_state("h").unwrap().def().clone();
+
+    s.apply(ClusterMutation::TaskAssigned {
+        attempt: 0,
+        hash: "h".into(),
+        secondary: "s1".into(),
+        worker: 0,
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 1,
+        },
+    });
+    let inflight_def = s.task_state("h").unwrap().def().clone();
+    assert!(
+        Arc::ptr_eq(&pending_def, &inflight_def),
+        "InFlight must carry the Pending's def Arc forward, not re-intern"
+    );
+
+    s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "h".into(),
+        result_data: None,
+    });
+    let completed_def = s.task_state("h").unwrap().def().clone();
+    assert!(
+        Arc::ptr_eq(&pending_def, &completed_def),
+        "Completed must carry the def Arc forward across the whole lifecycle"
+    );
+}
+
+#[test]
+fn routing_preferred_fields_carried_forward_across_transition() {
+    // L2 invariant: the carved `routing` tail (preferred_secondaries /
+    // preferred_version) is preserved across a state transition. Set a
+    // preferred-update on the Pending entry, then assign it InFlight and assert
+    // the routing survived the rebuild.
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("a"),
+    });
+    let pv = TaskVersion {
+        primary_epoch: 1,
+        seq: 5,
+    };
+    assert_eq!(
+        s.apply(ClusterMutation::TaskPreferredSecondariesUpdated {
+            hash: "h".into(),
+            secondaries: vec!["pref-sec".into()],
+            version: pv,
+        }),
+        ApplyOutcome::Applied
+    );
+    s.apply(ClusterMutation::TaskAssigned {
+        attempt: 0,
+        hash: "h".into(),
+        secondary: "s1".into(),
+        worker: 0,
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 6,
+        },
+    });
+    let routing = s.task_state("h").unwrap().routing();
+    assert_eq!(routing.preferred_version, pv);
+    assert!(
+        routing
+            .preferred_secondaries
+            .as_slice()
+            .iter()
+            .any(|x| x == "pref-sec"),
+        "preferred_secondaries must carry forward into InFlight"
+    );
+}
+
+#[test]
+fn to_task_info_round_trips_a_constructed_state() {
+    // L2 invariant: `to_task_info()` reconstructs the ORIGINAL whole TaskInfo
+    // from the stored `def` + `routing`. A TaskAdded'd task, read back as a
+    // TaskInfo, equals the original (the 13 frozen + 3 carved fields).
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    let original = mk_task("rt");
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: original.clone(),
+    });
+    let round_tripped = s.task_state("h").unwrap().to_task_info();
+    assert_eq!(round_tripped.path, original.path);
+    assert_eq!(round_tripped.identifier, original.identifier);
+    assert_eq!(round_tripped.phase_id, original.phase_id);
+    assert_eq!(round_tripped.type_id, original.type_id);
+    assert_eq!(round_tripped.task_id, original.task_id);
+    assert_eq!(round_tripped.task_depends_on, original.task_depends_on);
+    assert_eq!(
+        round_tripped.preferred_secondaries,
+        original.preferred_secondaries
+    );
+    assert_eq!(round_tripped.preferred_version, original.preferred_version);
+    assert_eq!(round_tripped.resolved_path, original.resolved_path);
 }

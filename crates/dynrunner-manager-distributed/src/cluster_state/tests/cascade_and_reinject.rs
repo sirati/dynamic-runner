@@ -29,11 +29,11 @@ fn task_preferred_secondaries_updated_apply_writes_to_task() {
         }),
         ApplyOutcome::Applied
     );
-    let Some(TaskState::Pending { task, .. }) = s.task_state("h") else {
+    let Some(state @ TaskState::Pending { .. }) = s.task_state("h") else {
         panic!("expected Pending");
     };
     assert_eq!(
-        task.preferred_secondaries.as_slice(),
+        state.routing().preferred_secondaries.as_slice(),
         &["secondary-2", "secondary-5"]
     );
 }
@@ -81,11 +81,11 @@ fn task_preferred_secondaries_updated_apply_preserves_state() {
         }),
         ApplyOutcome::Applied
     );
-    let Some(TaskState::Unfulfillable { task, reason, .. }) = s.task_state("h") else {
+    let Some(state @ TaskState::Unfulfillable { reason, .. }) = s.task_state("h") else {
         panic!("state must stay Unfulfillable across preferred-secondaries update");
     };
     assert_eq!(reason, "missing");
-    assert_eq!(task.preferred_secondaries.as_slice(), &["secondary-7"]);
+    assert_eq!(state.routing().preferred_secondaries.as_slice(), &["secondary-7"]);
 }
 
 // ── Discrete Unfulfillable / Blocked state pins ──
@@ -439,11 +439,11 @@ fn task_requeued_transitions_in_flight_back_to_pending() {
         }),
         ApplyOutcome::Applied
     );
-    let Some(TaskState::Pending { task, .. }) = s.task_state("h") else {
+    let Some(state @ TaskState::Pending { .. }) = s.task_state("h") else {
         panic!("InFlight must requeue to Pending");
     };
     assert_eq!(
-        task.task_id, "h",
+        state.def().task_id, "h",
         "the preserved TaskInfo re-dispatches the same task"
     );
 }

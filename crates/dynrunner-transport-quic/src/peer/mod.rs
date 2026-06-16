@@ -92,12 +92,10 @@ pub(super) struct RedialNudge {
 
 /// What one `connect_to_peers` sweep decided, per disposition — the
 /// single source for the sweep-summary log line and the unit tests
-/// that pin the dispositions. A sweep that spawns ZERO dials is a
-/// legitimate, structural outcome (every listed peer has a lower id,
-/// so this node awaits their inbound dials), and before this summary
-/// existed it was INVISIBLE at operator level: the coordinator logged
-/// "kicking off peer dials peers=N" and then nothing, ever — the #362
-/// production shape.
+/// that pin the dispositions. Under full-mesh dialing every not-yet-
+/// connected peer is dialed, so a sweep that spawns ZERO dials means
+/// every listed peer is already connected (not, as before, that the
+/// peers had lower ids and were left to dial us).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct DialSweepSummary {
     /// Peers in the list excluding self.
@@ -106,10 +104,6 @@ pub(super) struct DialSweepSummary {
     pub(super) spawned: usize,
     /// Skipped: already in `connections` (accept loop or earlier dial).
     pub(super) already_connected: usize,
-    /// Skipped by the lower-id-dials rule: these peers' ids sort LOWER
-    /// than ours, so THEY dial US — this node never dials them and its
-    /// mesh leg to each depends entirely on their inbound succeeding.
-    pub(super) awaiting_inbound: Vec<String>,
     /// Peers that were in the previous authoritative dial list but are
     /// absent from this one: their cached dial info AND any redial
     /// tracking stop now (membership-replacement semantics).
@@ -157,10 +151,19 @@ impl Drop for DialTaskGuard {
     }
 }
 
-/// A peer connection accepted by this node's server.
+/// A peer connection handed to the owner for registration — from EITHER
+/// the accept loop (the peer dialed us) OR a completed outbound dial (we
+/// dialed the peer). `inbound` records which: under full-mesh dialing
+/// both ends dial, so a single pair can produce two connections (our
+/// inbound accept of their dial + our outbound dial of them); the
+/// orientation is what [`PeerNetwork::register_accepted`]'s symmetric
+/// tiebreak consults to converge both ends on the SAME surviving wire.
 pub(super) struct AcceptedPeer<I: Identifier> {
     pub(super) peer_id: String,
     pub(super) outgoing_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
+    /// `true` if this connection was ACCEPTED (the peer dialed us);
+    /// `false` if it is our own OUTBOUND dial that just completed.
+    pub(super) inbound: bool,
 }
 
 /// A peer connection whose reader/writer supervisor has exited — the
@@ -194,6 +197,16 @@ pub struct PeerNetwork<I: Identifier> {
     port: u16,
     /// Per-peer outgoing channels, keyed by peer_id.
     connections: HashMap<String, mpsc::UnboundedSender<DistributedMessage<I>>>,
+    /// Orientation of the connection currently registered in
+    /// `connections`, keyed by the same peer_id: `true` = the registered
+    /// wire is our INBOUND accept (the peer dialed us), `false` = our
+    /// OUTBOUND dial. Maintained in lockstep with `connections` (inserted
+    /// in [`Self::register_accepted`], removed wherever `connections` is
+    /// pruned) so the dedup tiebreak knows which orientation it is keeping
+    /// without changing the `connections` value type (which the Router and
+    /// send path borrow as a plain sender map). Used SOLELY by
+    /// [`Self::register_accepted`]'s collision tiebreak.
+    conn_inbound: HashMap<String, bool>,
     /// Incoming messages from all peers.
     incoming_rx: mpsc::UnboundedReceiver<DistributedMessage<I>>,
     /// Sender side (kept for spawning new connection handlers). The
@@ -363,33 +376,6 @@ pub struct PeerNetwork<I: Identifier> {
     /// Fired on the same `DIAL_SUMMARY_THRESHOLD`/recurrence boundary as
     /// the operator dial-failure summary, so it inherits that throttle.
     persistent_dial_failure_tx: Option<mpsc::UnboundedSender<String>>,
-
-    /// Bootstrap/joining-mode override for the lower-id-dials rule: when
-    /// `true` this node dials EVERY seed it owns dial info for, regardless
-    /// of id order (see [`Self::dials_outbound_to`]). Set ONLY by the
-    /// joining constructor ([`Self::start_joining`]) — the path a
-    /// rosterless late-joiner (a fresh observer, a respawned replacement)
-    /// takes through `join_running_cluster`.
-    ///
-    /// WHY a joiner cannot use the lexicographic rule: the rule is a
-    /// SIMULTANEOUS-dial dedup for steady-state members who all already
-    /// know each other (each pair agrees, by id order, who dials). A late
-    /// joiner is UNKNOWN to the existing fleet — a seed whose id sorts
-    /// BELOW the joiner's would, under the rule, "await the joiner's
-    /// inbound", but it never learns the joiner exists to dial it, so that
-    /// leg parks `awaiting_inbound` forever and the join hangs on relay
-    /// luck. Production happened to survive only because `observer-<uuid>`
-    /// sorts below `secondary-*`, so observers dialed everyone; the gap
-    /// bites the instant the ordering flips.
-    ///
-    /// Crossed-dial safety: once the joiner is admitted and the primary's
-    /// roster broadcast reaches a lower-id seed, THAT seed dials the joiner
-    /// too — a second pipe for an already-live pair. The accept side's
-    /// grace-window dedup ([`Self::register_accepted`] /
-    /// [`ACCEPT_REPLACE_GRACE`]) drops that duplicate against the healthy
-    /// existing wire, so the crossed dial converges to one leg. Steady-
-    /// state members keep `false` and the rule is unchanged for them.
-    dial_all_seeds: bool,
 }
 
 impl<I: Identifier> PeerNetwork<I> {
@@ -406,33 +392,11 @@ impl<I: Identifier> PeerNetwork<I> {
     /// secondary via `--secondary-quic-port`; binding anything else makes
     /// the recorded port a dead address for every peer that dials it.
     ///
-    /// Starts in STEADY-STATE mode: the lower-id-dials rule applies (this
-    /// node dials only higher-id peers; lower-id peers dial it). A
-    /// rosterless late-joiner must use [`Self::start_joining`] instead.
+    /// Full-mesh dialing: this node dials EVERY peer it is given dial info
+    /// for, regardless of id order, and accepts every peer's inbound dial;
+    /// a pair's two resulting connections are deduped to one by
+    /// [`Self::register_accepted`]'s symmetric tiebreak.
     pub async fn start(peer_id: &str, bind_port: Option<u16>) -> Result<Self, String> {
-        Self::start_with_mode(peer_id, bind_port, false).await
-    }
-
-    /// Create a peer network for a rosterless late-joiner (a fresh
-    /// observer, a respawned replacement) that bootstraps via
-    /// `join_running_cluster`. Identical to [`Self::start`] but starts in
-    /// JOINING mode: this node dials EVERY seed regardless of id order
-    /// (see [`Self::dial_all_seeds`]). The existing fleet does not yet know
-    /// this node exists, so a seed whose id sorts below it would never dial
-    /// it — the joiner must own every dial itself to form its mesh.
-    pub async fn start_joining(peer_id: &str, bind_port: Option<u16>) -> Result<Self, String> {
-        Self::start_with_mode(peer_id, bind_port, true).await
-    }
-
-    /// Shared constructor body for [`Self::start`] (steady-state) and
-    /// [`Self::start_joining`] (rosterless joiner). `dial_all_seeds` sets
-    /// the dial-direction mode; everything else — cert, listener pair,
-    /// accept loops, reconnect ticker — is identical.
-    async fn start_with_mode(
-        peer_id: &str,
-        bind_port: Option<u16>,
-        dial_all_seeds: bool,
-    ) -> Result<Self, String> {
         let cert = CertPair::generate(peer_id)?;
 
         // Acquire the QUIC(UDP)+WSS(TCP) pair on one port number.
@@ -521,6 +485,7 @@ impl<I: Identifier> PeerNetwork<I> {
             cert,
             port,
             connections: HashMap::new(),
+            conn_inbound: HashMap::new(),
             incoming_rx,
             incoming_tx,
             ingest_edges,
@@ -542,8 +507,19 @@ impl<I: Identifier> PeerNetwork<I> {
             bootstrap_redial_rx,
             bootstrap_redial_tx,
             persistent_dial_failure_tx: None,
-            dial_all_seeds,
         })
+    }
+
+    /// Create a peer network for a rosterless late-joiner (a fresh
+    /// observer, a respawned replacement) that bootstraps via
+    /// `join_running_cluster`. Now identical to [`Self::start`]: under
+    /// full-mesh dialing every node dials every peer, so the joiner dials
+    /// all its seeds without any special mode. Retained as a named entry
+    /// point for the joining call site (`transport_factory`); the former
+    /// `dial_all_seeds` override it set is no longer needed because the
+    /// lower-id-dials asymmetry it escaped no longer exists.
+    pub async fn start_joining(peer_id: &str, bind_port: Option<u16>) -> Result<Self, String> {
+        Self::start(peer_id, bind_port).await
     }
 
     /// Subscribe to the per-peer "persistently undialable" signal: each
@@ -762,17 +738,16 @@ impl<I: Identifier> PeerNetwork<I> {
         let summary = self.connect_to_peers_inner(peers);
         // Sweep-summary narration (#362): ONE operator line per sweep
         // naming every disposition, so a sweep that spawned zero dials
-        // names WHY (e.g. "awaiting_inbound=[a, b]" — the lower-id-dials
-        // rule made the dials structurally someone else's) instead of
+        // names WHY (every listed peer was already connected) instead of
         // going silent after the coordinator's "received peer list".
+        // Full-mesh: every not-yet-connected peer is dialed regardless of
+        // id; a duplicate from the peer's own dial is deduped on accept.
         tracing::info!(
             listed = summary.listed,
             spawned = summary.spawned,
             already_connected = summary.already_connected,
-            awaiting_inbound = ?summary.awaiting_inbound,
-            "peer-dial sweep: spawned dial tasks for the listed peers \
-             (awaiting_inbound peers have LOWER ids and dial us — this \
-             node never dials them)"
+            "peer-dial sweep: dialed every not-yet-connected peer \
+             (full-mesh; the peer dials us too, the duplicate is deduped)"
         );
         if !summary.dropped_from_list.is_empty() {
             // Membership shrink is operator-significant: every dropped
@@ -839,74 +814,46 @@ impl<I: Identifier> PeerNetwork<I> {
                 continue; // Already connected (from accept loop)
             }
 
-            // Lower-id-dials: only the secondary whose id sorts
-            // lexicographically lower than the peer's initiates the
-            // dial; the higher-id node relies on its accept loop to
-            // receive the inbound connection.
-            //
-            // Without this asymmetry, both sides race to dial each
-            // other on `connect_to_peers`. Each side then sees TWO
-            // candidate connections to the same peer in its
-            // `new_conn_rx` queue — one from its own outbound dial,
-            // one accepted from the peer's outbound dial. The
-            // existing `drain_new_connections` dedup keeps whichever
-            // arrives first and DROPS the duplicate's
-            // `AcceptedPeer.outgoing_tx`. Dropping that sender
-            // tears down the duplicate's WSS pipe via the
-            // writer/reader cleanup chain — which is the SAME WSS
-            // pipe the OTHER side may have chosen to KEEP. The peer
-            // then sees its kept-connection's writer die, and its
-            // `connections[us]` becomes a dead `outgoing_tx`. The
-            // failure surfaces as "peer disconnected during
-            // broadcast" warns at the next keepalive tick, on what
-            // is otherwise a healthy fleet — both consumer teams
-            // hit this on Krater (tokenizer cohort-5 dispatch lost
-            // its entire peer mesh ~10s after promotion; dataset's
-            // 8-secondary K=2 run had 3-of-8 secondaries lose all
-            // peers and sit idle while the others were saturated).
-            //
-            // Lower-id-dials makes the connection asymmetric and
-            // eliminates the duplicate scenario: there is at most
-            // one WSS pipe per pair. The accept loop on the
-            // higher-id side handles the inbound dial as before.
-            if !self.dials_outbound_to(&peer_info.secondary_id) {
-                tracing::debug!(
-                    self_id = %self.peer_id,
-                    peer = %peer_info.secondary_id,
-                    "skipping dial: peer has lower id, expecting them to initiate"
-                );
-                summary
-                    .awaiting_inbound
-                    .push(peer_info.secondary_id.clone());
-                continue;
-            }
-
+            // Full-mesh dialing: EVERY peer dials EVERY other peer,
+            // regardless of id ordering. The peer dials us too, so a pair
+            // can produce two connections (our outbound dial + our inbound
+            // accept of their dial); `register_accepted`'s symmetric
+            // tiebreak deterministically keeps the SAME one on both ends
+            // (the connection the lower-id node initiated) and drops the
+            // redundant one — so a slow / inbound-unreachable peer no
+            // longer leaves the leg unformed waiting for it to dial.
             summary.spawned += 1;
             self.spawn_dial_task(peer_info.clone(), dial::DialAttempt::Initial);
         }
-        summary.awaiting_inbound.sort();
         summary
     }
 
-    /// THE lower-id-dials predicate — the single owner of the dial-side
-    /// ownership rule: this node dials `peer_id` iff our id sorts
-    /// lexicographically LOWER than the peer's. The higher-id side
-    /// NEVER dials; its mesh leg to the peer exists only if the peer's
-    /// inbound dial lands on our accept loop. Consulted by the initial
-    /// sweep (`connect_to_peers`), the redial path (`spawn_redial`),
-    /// the redial-request honor gate (`handle_redial_request`), and the
-    /// reconnect-summary narration (`process_reconnect_tick`), so all
-    /// agree by construction.
+    /// THE symmetric duplicate-connection tiebreak — the single owner of
+    /// "which of two connections to the same peer survives", and the
+    /// load-bearing correctness primitive of full-mesh dialing.
     ///
-    /// JOINING-mode override: a rosterless joiner ([`Self::dial_all_seeds`])
-    /// owns the dial side of EVERY leg, because the existing fleet does not
-    /// yet know it exists — a lower-id seed would never dial it under the
-    /// lexicographic rule, so the leg would park forever. The joiner dialing
-    /// every seed cannot create a stuck duplicate: a later inbound from a
-    /// seed that learned the joiner via roster broadcast is deduped against
-    /// the joiner's already-live wire (`register_accepted`'s grace window).
-    fn dials_outbound_to(&self, peer_id: &str) -> bool {
-        self.dial_all_seeds || self.peer_id.as_str() < peer_id
+    /// Under full mesh both ends dial each other, so a pair `(self, peer)`
+    /// can momentarily hold TWO connections at each end: our OUTBOUND dial
+    /// of the peer, and our INBOUND accept of the peer's dial. The two
+    /// endpoints MUST converge on the SAME physical connection, or they
+    /// each tear down the other's kept wire and end up disconnected.
+    ///
+    /// The rule both ends compute IDENTICALLY: the surviving connection is
+    /// the one INITIATED BY THE LOWER-ID NODE (lexicographic) — exactly the
+    /// node the old lower-id-dials rule used to make the SOLE dialer. For a
+    /// pair A < B the survivor is A's dial of B, i.e. A's OUTBOUND = B's
+    /// INBOUND, so on A (`self < peer`) the survivor is our OUTBOUND
+    /// (inbound LOSES) and on B (`self > peer`) the survivor is our INBOUND
+    /// (inbound WINS). Both pick the one physical wire A→B. Returns whether,
+    /// on THIS node, the surviving connection of the pair is our INBOUND one.
+    ///
+    /// (`self.peer_id != peer_id` always holds — self is filtered out of
+    /// every dial/accept path; a `==` would tie on both branches as `false`
+    /// and is irrelevant.)
+    fn inbound_connection_wins(&self, peer_id: &str) -> bool {
+        // Our inbound is the peer's outbound dial; it wins iff the peer is
+        // the lower-id (initiating) node.
+        peer_id < self.peer_id.as_str()
     }
 
     /// THE single registration disposition for one accepted/dialed
@@ -936,20 +883,27 @@ impl<I: Identifier> PeerNetwork<I> {
     ///   severing the redial-request / nudge escapes — but NOT this
     ///   transport state) would otherwise be dropped here for the run.
     ///
-    /// - **Existing wire still open, fresh inbound within the grace
-    ///   window:** DROP the duplicate (the original lower-id-dials dedup —
-    ///   see the commentary on `connect_to_peers`). The early duplicate is
-    ///   most likely our own racing redial (dial-owner side) or a
-    ///   mesh-forming second inbound during the establishment dial race
-    ///   (accept side), where the existing wire is healthy and the peer is
-    ///   NOT re-dialing. REPLACING it would tear down the frames queued on
-    ///   its writer AND collapse the wire under the peer, whose reconnect
-    ///   ticker would then re-dial — a self-sustaining replace storm across
-    ///   the fleet (the arm-hunt burst regression shape). The grace window
-    ///   is the persistence test that tells a one-shot transient (count
-    ///   never advances) from a re-dialing peer (count climbs every ~5s
-    ///   tick) apart — the accept-side analog of
+    /// - **Existing wire still open, SAME orientation as the new one,
+    ///   within the grace window:** DROP the duplicate (the original dedup).
+    ///   The early duplicate is most likely our own racing redial (a second
+    ///   outbound) or the peer re-dialing the same direction during the
+    ///   establishment race, where the existing wire is healthy. REPLACING
+    ///   it would tear down the frames queued on its writer AND collapse the
+    ///   wire under the peer, whose reconnect ticker would then re-dial — a
+    ///   self-sustaining replace storm (the arm-hunt burst regression
+    ///   shape). The grace window is the persistence test that tells a
+    ///   one-shot transient (count never advances) from a re-dialing peer
+    ///   (count climbs every ~5s tick) apart — the accept-side analog of
     ///   [`REDIAL_REQUEST_PRUNE_AFTER`].
+    ///
+    /// - **Existing wire still open, OPPOSITE orientation to the new one
+    ///   (the full-mesh simultaneous-mutual-dial collision):** resolve
+    ///   DETERMINISTICALLY by [`Self::inbound_connection_wins`], NOT by the
+    ///   grace window — keep the orientation that BOTH ends agree wins (the
+    ///   connection the lower-id node initiated) and drop the other. No
+    ///   grace: a slow inbound vs a fast outbound (or vice-versa) must
+    ///   converge identically on both ends the instant the second arrives,
+    ///   or the two endpoints keep different wires and disconnect each other.
     ///
     /// Generation safety of a REPLACE: the `insert` overwrites the old
     /// `outgoing_tx`; a late [`DisconnectedPeer`] for the old wire then
@@ -957,39 +911,82 @@ impl<I: Identifier> PeerNetwork<I> {
     /// `same_channel` check against the freshly inserted sender and is a
     /// no-op. So a racing disconnect of the old wire cannot kill the new
     /// one (the same generation discipline the disconnect path enforces).
+    /// Dropping the LOSER (returning early) drops its `outgoing_tx`, whose
+    /// writer task then exits and closes that QUIC/WSS connection cleanly —
+    /// no leak, no half-open.
     pub(super) fn register_accepted(&mut self, accepted: AcceptedPeer<I>) {
         if let Some(existing) = self.connections.get(&accepted.peer_id) {
-            // Provably-dead wire ⇒ replace at once; otherwise gate on
-            // persistence so a mesh-forming transient does not collapse a
-            // healthy wire (the replace-storm guard).
+            // Provably-dead wire ⇒ replace at once; otherwise classify the
+            // duplicate.
             if !existing.is_closed() {
-                let seen = self
-                    .accept_replace_evidence
-                    .entry(accepted.peer_id.clone())
-                    .or_insert(0);
-                *seen += 1;
-                if *seen <= ACCEPT_REPLACE_GRACE {
-                    // Within the grace window: treat as a transient
-                    // duplicate of the live wire and DROP it (dedup). The
-                    // peer's next regular frame keeps the live wire
-                    // identified; if the peer is genuinely re-dialing a
-                    // dead leg, the next inbound advances the count.
-                    tracing::debug!(
-                        peer = %accepted.peer_id,
-                        fresh_inbounds_while_entry_live = *seen,
-                        "duplicate inbound inside the accept-replace grace \
-                         window; keeping the existing wire"
-                    );
-                    return;
+                let existing_inbound = self
+                    .conn_inbound
+                    .get(&accepted.peer_id)
+                    .copied()
+                    .unwrap_or(false);
+                if existing_inbound != accepted.inbound {
+                    // OPPOSITE-orientation collision (mutual dial): the two
+                    // endpoints MUST converge on the same physical wire.
+                    // Decide by the symmetric tiebreak — drop the orientation
+                    // that loses, keep the one that wins, NO grace window.
+                    let winner_inbound = self.inbound_connection_wins(&accepted.peer_id);
+                    if accepted.inbound == winner_inbound {
+                        // The fresh connection is the agreed survivor: the
+                        // existing (loser) orientation is replaced below.
+                        // Reset the same-orientation evidence; the collision
+                        // is resolved structurally, not by persistence.
+                        self.accept_replace_evidence.remove(&accepted.peer_id);
+                        tracing::debug!(
+                            peer = %accepted.peer_id,
+                            keeping_inbound = winner_inbound,
+                            "mutual-dial collision: replacing the losing wire \
+                             with the symmetric-tiebreak winner"
+                        );
+                        // Fall through to register the winner.
+                    } else {
+                        // The existing entry is the agreed survivor: DROP the
+                        // fresh loser (its writer exits and closes the wire).
+                        tracing::debug!(
+                            peer = %accepted.peer_id,
+                            keeping_inbound = winner_inbound,
+                            "mutual-dial collision: dropping the losing wire, \
+                             keeping the symmetric-tiebreak winner"
+                        );
+                        return;
+                    }
+                } else {
+                    // SAME orientation: persistence-gate so a mesh-forming
+                    // transient does not collapse a healthy wire (the
+                    // replace-storm guard / #416 rejoin-exile heal).
+                    let seen = self
+                        .accept_replace_evidence
+                        .entry(accepted.peer_id.clone())
+                        .or_insert(0);
+                    *seen += 1;
+                    if *seen <= ACCEPT_REPLACE_GRACE {
+                        // Within the grace window: treat as a transient
+                        // duplicate of the live wire and DROP it (dedup). The
+                        // peer's next regular frame keeps the live wire
+                        // identified; if the peer is genuinely re-dialing a
+                        // dead leg, the next inbound advances the count.
+                        tracing::debug!(
+                            peer = %accepted.peer_id,
+                            fresh_inbounds_while_entry_live = *seen,
+                            "duplicate inbound inside the accept-replace grace \
+                             window; keeping the existing wire"
+                        );
+                        return;
+                    }
+                    // Persistence past the grace window: the peer keeps
+                    // re-dialing, so the healthy-looking entry is a stale
+                    // half-open tombstone — fall through to replace it.
                 }
-                // Persistence past the grace window: the peer keeps
-                // re-dialing, so the healthy-looking entry is a stale
-                // half-open tombstone — fall through to replace it.
             }
         }
-        // Either no entry, or the existing entry is stale (dead wire, or
-        // persistently re-dialed past the grace window): register the fresh
-        // connection. A replace is a state transition worth narrating.
+        // Either no entry, or the existing entry is stale (dead wire,
+        // persistently re-dialed past the grace window, or the losing side
+        // of a mutual-dial collision): register the fresh connection. A
+        // replace is a state transition worth narrating.
         let replaced_stale = self.connections.contains_key(&accepted.peer_id);
         self.accept_replace_evidence.remove(&accepted.peer_id);
         // Clear reconnect-tracker state for this peer
@@ -1007,6 +1004,8 @@ impl<I: Identifier> PeerNetwork<I> {
             "incoming peer registered"
         );
         self.ever_connected.insert(accepted.peer_id.clone());
+        self.conn_inbound
+            .insert(accepted.peer_id.clone(), accepted.inbound);
         self.connections
             .insert(accepted.peer_id, accepted.outgoing_tx);
     }
@@ -1072,80 +1071,56 @@ impl<I: Identifier> PeerNetwork<I> {
                 // (membership churn) and not worth suppressing the WARN
                 // over — the count alone is still operator-useful.
                 .unwrap_or_else(|| "<unknown>".to_string());
-            // Dial-side truthfulness (#362): on the higher-id side this
-            // node NEVER dials (lower-id-dials rule), so "dialing
-            // address" would be a lie that sends the operator chasing
-            // local dial failures that do not exist. Name the real
-            // dependency instead: the missing leg can only come from
-            // the PEER's inbound dial — its logs hold the failure.
-            if self.dials_outbound_to(&summary.peer_id) {
-                tracing::warn!(
+            // Full-mesh: this node dials EVERY peer, so a missing leg is
+            // always a local dial failure worth surfacing with the dialed
+            // address an operator must sanity-check (a container-internal /
+            // bridge addr no peer can route to is the canonical
+            // mesh-never-forms cause).
+            tracing::warn!(
+                peer = %summary.peer_id,
+                addr = %dialed,
+                consecutive_failed_dials = summary.attempts,
+                "peer unreachable; dialing address — verify it is peer-routable"
+            );
+            // Per-leg recovery trigger: this node dials this peer and keeps
+            // failing past the summary boundary. Tell any subscriber (the
+            // late-joiner's local-forward registry) so a leg whose
+            // underlying path the 5s ticker can NEVER heal by re-dialing —
+            // a dead `ssh -L` child behind the unchanged
+            // `127.0.0.1:<local_port>` endpoint — is rebuilt out-of-band.
+            // The send rides the SAME throttle as the WARN above (the count
+            // boundary). Closed channel ⇒ the subscriber went away ⇒ drop
+            // the sink (no per-tick error spam); the once-on-removal log
+            // names it.
+            if let Some(tx) = &self.persistent_dial_failure_tx
+                && tx.send(summary.peer_id.clone()).is_err()
+            {
+                self.persistent_dial_failure_tx = None;
+                tracing::debug!(
                     peer = %summary.peer_id,
-                    addr = %dialed,
-                    consecutive_failed_dials = summary.attempts,
-                    "peer unreachable; dialing address — verify it is peer-routable"
-                );
-                // Per-leg recovery trigger: this node OWNS the dial to
-                // this peer and keeps failing past the summary boundary.
-                // Tell any subscriber (the late-joiner's local-forward
-                // registry) so a leg whose underlying path the 5s ticker
-                // can NEVER heal by re-dialing — a dead `ssh -L` child
-                // behind the unchanged `127.0.0.1:<local_port>` endpoint
-                // — is rebuilt out-of-band. The send rides the SAME
-                // throttle as the WARN above (the count boundary), so a
-                // persistently-dead leg nudges the subscriber once per
-                // episode + once per recurrence window, never per tick.
-                // Closed channel ⇒ the subscriber went away ⇒ drop the
-                // sink (no per-tick error spam); the once-on-removal log
-                // names it.
-                if let Some(tx) = &self.persistent_dial_failure_tx
-                    && tx.send(summary.peer_id.clone()).is_err()
-                {
-                    self.persistent_dial_failure_tx = None;
-                    tracing::debug!(
-                        peer = %summary.peer_id,
-                        "persistent-dial-failure subscriber dropped; \
-                         disabling the per-leg recovery trigger"
-                    );
-                }
-            } else {
-                tracing::warn!(
-                    peer = %summary.peer_id,
-                    peer_advertised_addr = %dialed,
-                    ticks_disconnected = summary.attempts,
-                    "peer leg missing; this node NEVER dials it (lower-id-dials \
-                     rule — the peer's id sorts lower, so IT dials US): check \
-                     THAT peer's logs for dial failures toward this node and \
-                     verify this node's advertised address is peer-routable"
+                    "persistent-dial-failure subscriber dropped; \
+                     disabling the per-leg recovery trigger"
                 );
             }
         }
 
         let mut nudges = Vec::new();
         for peer_id in outcome.to_dial {
-            if self.dials_outbound_to(&peer_id) {
-                self.spawn_redial(&peer_id);
-            } else if self.ever_connected.contains(&peer_id) {
-                // The peer owns the dial side of this leg, the leg
-                // EXISTED here and died (never-formed legs are the
-                // mesh-forming window — the owner is already dialing;
-                // see `ever_connected`): this node's only lever is
-                // asking the owner to re-dial. Collected for the async
-                // tick arm; the attempt count picks the log level there
-                // (first nudge INFO, later DEBUG).
+            // Full-mesh: this node re-dials EVERY disconnected peer itself.
+            self.spawn_redial(&peer_id);
+            // Belt-and-suspenders for asymmetric reachability: if a leg that
+            // ONCE formed has died, also nudge the peer to re-dial us, so
+            // the leg heals even when OUR dial direction is the blocked one
+            // (the failure mode full-mesh dialing is meant to eliminate —
+            // if our outbound to a peer is firewalled but its outbound to us
+            // is not, the nudge restores the leg from the other side). A
+            // never-formed leg (not in `ever_connected`) is left to our own
+            // dial above: the peer may not know us yet.
+            if self.ever_connected.contains(&peer_id) {
                 nudges.push(RedialNudge {
                     attempts: self.reconnect_tracker.attempts_for(&peer_id).unwrap_or(0),
                     peer_id,
                 });
-            } else {
-                // Never-formed leg this node doesn't dial: the
-                // throttled "peer leg missing" summary above is the
-                // operator narration; nothing to nudge.
-                tracing::debug!(
-                    peer = %peer_id,
-                    "no redial nudge: leg has never formed on this node \
-                     (mesh-forming window; the dial owner drives it)"
-                );
             }
         }
         nudges
@@ -1153,12 +1128,12 @@ impl<I: Identifier> PeerNetwork<I> {
 
     /// Honor an inbound [`DistributedMessage::RedialRequest`] from
     /// `from`: the OTHER end of the leg reports the wire dead from its
-    /// side. This node is the leg's dial owner (lower-id-dials), so:
-    /// force-prune any connection entry for `from` — the entry is stale
+    /// side. Under full-mesh dialing this node dials every peer, so it
+    /// force-prunes any connection entry for `from` — the entry is stale
     /// by the peer's authoritative evidence, even if it looks healthy
     /// here (the half-open shape), and leaving it would make
     /// `drain_new_connections`' dedup DROP the fresh dial's
-    /// registration — then track the disconnect and dial immediately.
+    /// registration — then tracks the disconnect and dials immediately.
     ///
     /// Restores the TRANSPORT PIPE only: no liveness/failover input is
     /// fed (the requester's own tracker narrates the outage); the prune
@@ -1167,22 +1142,10 @@ impl<I: Identifier> PeerNetwork<I> {
     /// to compare against.
     ///
     /// Guards:
-    /// - dial-direction: a request from a peer whose leg WE don't own
-    ///   is mis-addressed (the sender owns the dial) — WARN + ignore,
-    ///   never cross-dial.
     /// - roster: a request from a peer no longer in the authoritative
     ///   dial list is a genuine departure racing its own nudge — skip
     ///   (`spawn_redial` would no-op anyway; named here for the log).
     pub(super) fn handle_redial_request(&mut self, from: &str, attempts: u32) {
-        if !self.dials_outbound_to(from) {
-            tracing::warn!(
-                peer = %from,
-                "ignoring redial request from a peer whose leg this node \
-                 does not dial (lower-id-dials rule says THEY own the dial); \
-                 mis-addressed request"
-            );
-            return;
-        }
         if !self.peer_dial_info.contains_key(from) {
             tracing::debug!(
                 peer = %from,
@@ -1212,6 +1175,7 @@ impl<I: Identifier> PeerNetwork<I> {
             // dead from the requester's side despite our traffic — the
             // genuine half-open. State transition — log at INFO.
             self.connections.remove(from);
+            self.conn_inbound.remove(from);
             tracing::info!(
                 peer = %from,
                 requester_ticks = attempts,
@@ -1233,8 +1197,9 @@ impl<I: Identifier> PeerNetwork<I> {
         self.spawn_redial(from);
     }
 
-    /// Background-dial `peer_id` if we have its cached connection
-    /// info AND we own the dial-side of the lower-id-dials rule.
+    /// Background-dial `peer_id` if we have its cached connection info.
+    /// Under full-mesh dialing every node dials every peer, so the only
+    /// skips are "already connected" and "not in the dial roster".
     /// Called whenever the [`Router`] emits a redial signal — i.e. on
     /// the first observation of an active relay relationship with
     /// `peer_id` (or first re-observation past `REDIAL_COOLDOWN`) —
@@ -1264,16 +1229,6 @@ impl<I: Identifier> PeerNetwork<I> {
             );
             return;
         };
-        if !self.dials_outbound_to(peer_id) {
-            // higher-id side: lower-id-dials rule, accept loop handles
-            // inbound. The throttled `peer leg missing` summary names
-            // this structural fact at WARN level.
-            tracing::debug!(
-                peer = %peer_id,
-                "redial skipped: lower-id-dials rule (the peer dials us)"
-            );
-            return;
-        }
         let attempt = dial::DialAttempt::Redial {
             attempt: self.reconnect_tracker.attempts_for(peer_id).unwrap_or(0),
         };
@@ -1323,6 +1278,7 @@ impl<I: Identifier> PeerNetwork<I> {
                 .send(AcceptedPeer {
                     peer_id: peer_id.clone(),
                     outgoing_tx,
+                    inbound: false,
                 })
                 .is_err()
             {
@@ -1367,6 +1323,7 @@ impl<I: Identifier> PeerNetwork<I> {
             _ => return,
         }
         self.connections.remove(peer_id);
+        self.conn_inbound.remove(peer_id);
         let first_observation = self.reconnect_tracker.observe_disconnect(peer_id);
         if first_observation {
             self.spawn_redial(peer_id);
