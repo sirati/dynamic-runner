@@ -1718,6 +1718,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             config
                 .keepalive_interval
                 .saturating_mul(config.keepalive_miss_threshold),
+            config.task_inflight_stall_warn_after,
         );
         // Own-tick-health authority, built off the keepalive cadence before
         // `config` moves into `this.config` (mirroring the snapshots above).
