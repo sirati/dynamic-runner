@@ -10,6 +10,23 @@ use crate::state::SecondaryConnectionState;
 use super::PrimaryCoordinator;
 use super::wire::timestamp_now;
 
+/// Minimum spacing between two duplicate-welcome re-serves to the SAME
+/// member-incarnation (see
+/// [`PrimaryCoordinator::re_serve_setup_on_duplicate_welcome`] and the
+/// `reserve_backoff` field doc). A genuinely-lost trio frame is still
+/// re-served promptly (the first duplicate welcome after a fresh
+/// incarnation passes immediately — the map is cleared per incarnation),
+/// but a member blocked downstream of delivery (wedged on mesh-settle,
+/// never earning operational proof) cannot drive an unbounded re-serve
+/// storm: at most one re-serve per this interval per member, however
+/// fast its handshake retries (or wire-relayed duplicates) arrive.
+///
+/// Comfortably under the secondary's capped handshake-retry ceiling
+/// (`secondary::setup::HANDSHAKE_RETRY_MAX` = 30s) so a steady-state
+/// retry from a genuinely-lost-frame member is NEVER suppressed — the
+/// gate bites only on the pathological burst the wire fan-in produces.
+const RESERVE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Build the `PeerConnectionInfo` roster — the SOLE roster builder
     /// for the `PeerInfo` fan-out, shared by the incremental per-member
@@ -373,6 +390,33 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         if !servable {
             return;
         }
+        // Per-incarnation re-serve backoff: a member blocked downstream of
+        // delivery (wedged on mesh-settle, so it never earns operational
+        // proof) keeps re-welcoming, and the wire can re-inject those
+        // welcomes faster than its capped retry cadence. Re-serving an
+        // already-delivered trio cannot unblock it, so an unbounded
+        // re-serve per duplicate welcome is a CPU-burning livelock + log
+        // flood. Suppress until `RESERVE_BACKOFF` after the last re-serve;
+        // the map is cleared per incarnation (`seed_keepalive` / requeue
+        // purge), so a genuinely-lost frame on a fresh incarnation is
+        // still re-served at once. See the `reserve_backoff` field doc.
+        let now = tokio::time::Instant::now();
+        if self
+            .reserve_backoff
+            .get(secondary_id)
+            .is_some_and(|due| now < *due)
+        {
+            tracing::trace!(
+                secondary = %secondary_id,
+                "duplicate welcome from an unproven member within the \
+                 re-serve backoff window — the trio was already re-served \
+                 recently; suppressing this re-serve (the member is blocked \
+                 downstream of delivery, not missing a frame)"
+            );
+            return;
+        }
+        self.reserve_backoff
+            .insert(secondary_id.to_string(), now + RESERVE_BACKOFF);
         tracing::info!(
             secondary = %secondary_id,
             run_started = self.run_start_batch_fired,
