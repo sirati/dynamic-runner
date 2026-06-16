@@ -164,6 +164,7 @@ where
             mesh: super::lifecycle::MeshFormation::default(),
             fatal_exit: None,
             deposed_primary: false,
+            last_primary_change_at: None,
             cluster_state,
             settled_spill,
             snapshot_streams,

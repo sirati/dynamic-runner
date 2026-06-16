@@ -381,6 +381,29 @@ where
     /// through exactly that fast path.
     pub(super) deposed_primary: bool,
 
+    /// When the most recent `PrimaryChanged` was applied — the
+    /// post-failover SETTLE-WINDOW anchor. Written ONLY by the
+    /// primary-identity apply seam (`on_primary_identity_advanced`), on
+    /// EVERY genuinely-applied advance (self- or peer-named), so it stamps
+    /// the moment a new epoch's `MeshReady` reconfirmation begins.
+    ///
+    /// Read by the failover election (`run_election_tick`): while
+    /// `now - last_primary_change_at` is within
+    /// `ELECTION_SETTLE_KEEPALIVE_MULTIPLE × keepalive_interval`, election
+    /// arming is suppressed so each member's re-armed one-shot `MeshReady`
+    /// report can reach the new primary and lift its dispatch veto BEFORE
+    /// another election can fire. This is the cure for the amplifier that
+    /// turns one transient failover into a self-sustaining epoch cascade
+    /// (a primary flipping faster than reconfirmation completes — every
+    /// member stays permanently unconfirmed, zero dispatch, no progress,
+    /// another failover arms). The window is SHORT and gated only on a
+    /// RECENT change, so a genuinely-dead NEW primary still elects the
+    /// moment it expires — it suppresses RE-arming during reconfirmation,
+    /// never legitimate failover. `None` until the first applied
+    /// `PrimaryChanged` (the bootstrap-primary cold-start window has no
+    /// prior failover to settle).
+    pub(super) last_primary_change_at: Option<std::time::Instant>,
+
     /// "Peer mesh did not form" sentinel. Set true by
     /// `check_peer_mesh_watchdog` when the 30s deadline elapses with
     /// zero connected peers. The watchdog used to make this fatal,

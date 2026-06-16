@@ -925,8 +925,14 @@ async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
     // `primary_last_seen`. Backdate it well past the death deadline
     // (keepalive_interval * miss_threshold) — the next tick must enter
     // Suspecting and broadcast a `TimeoutQuery`. The genuinely-dead
-    // promoted primary IS detected, via `primary_silent`.
+    // promoted primary IS detected, via `primary_silent`. The promotion
+    // happened long ago (the run had stabilized through the 5 healthy
+    // beats), so push the post-failover settle-window anchor past its
+    // window — the death is a genuine LATER failover, not a re-arm during
+    // reconfirmation.
     sec.op_mut().primary_last_seen =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    sec.last_primary_change_at =
         Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
     let actions = sec.run_election_tick();
     assert!(
@@ -1500,8 +1506,13 @@ async fn deposed_lone_survivor_requires_positive_peer_agreement() {
     members.borrow_mut().clear();
     sec.publish_membership();
 
-    // Arm + gather + tally.
+    // Arm + gather + tally. The deposing advance happened long ago (the run
+    // had stabilized), so push the post-failover settle-window anchor past
+    // its window — secondary-1's death is a genuine LATER failover, not a
+    // re-arm during reconfirmation.
     sec.op_mut().primary_last_seen =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    sec.last_primary_change_at =
         Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
     sec.run_election_tick();
     assert!(matches!(

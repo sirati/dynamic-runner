@@ -17,6 +17,31 @@ use super::super::primary_link::PrimaryLink;
 use super::super::wire::timestamp_now;
 use super::{ElectionState, ElectionTickActions, failover_quorum, next_round, push_timeout_query};
 
+/// How many `keepalive_interval` cadences an election arming is suppressed
+/// after a `PrimaryChanged` is applied — the post-failover settle window.
+///
+/// THE AMPLIFIER it closes: every applied `PrimaryChanged` re-arms each
+/// member's one-shot `MeshReady` reporter
+/// (`rearm_mesh_ready_for_new_primary` → `mesh_ready_sent = false`) and the
+/// NEW primary starts with an EMPTY mesh-confirmation set (deliberately NOT
+/// CRDT-inherited), so proactive dispatch is VETOED until every member
+/// re-reports `MeshReady` AND the new primary processes it. If a transient
+/// disruption fires ONE failover and the primary then flips again FASTER
+/// than that reconfirmation completes, members stay permanently unconfirmed
+/// → zero dispatch → no progress → another failover arms → a self-sustaining
+/// epoch cascade with no settle window between elections.
+///
+/// 3× the keepalive interval (≈10–15s at the default cadence) is long enough
+/// for one full MeshReady reconfirmation round to complete (a member
+/// re-reports on the SAME keepalive tick the rearm rides), yet far below any
+/// genuine death backstop — so a transient flip gets a window to settle
+/// while a GENUINELY-dead NEW primary still elects the moment the window
+/// expires (the window only suppresses RE-arming DURING reconfirmation; it
+/// never disables failover). Chosen as a `keepalive_interval` multiple (not
+/// a fixed `Duration`) so it tracks the configured cadence exactly as the
+/// `keepalive_interval × keepalive_miss_threshold` death yardstick does.
+const ELECTION_SETTLE_KEEPALIVE_MULTIPLE: u32 = 3;
+
 impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
     M: ManagerEndpoint + 'static,
@@ -255,6 +280,25 @@ where
     /// missed beacons is the same "the node went silent" bound as for
     /// frames — a starved-but-alive node keeps its dedicated-thread
     /// beacon flowing well inside it.
+    ///
+    /// Own-tick-health re-base (#423-twin): the last-beacon anchor is
+    /// clamped UP to the shared trustworthy floor
+    /// (`own_tick_health.trustworthy_anchor`) before the staleness
+    /// comparison, EXACTLY as the leg-(B) backstop
+    /// [`Self::run_election_tick`] (`primary_silence_exceeded`) clamps
+    /// `primary_last_seen`. The earlier doc wrongly assumed THIS
+    /// receiver's runtime is always healthy enough to drain inbound
+    /// beacon datagrams — but the beacon LISTENER is an ordinary tokio
+    /// task (`liveness::listener`) that cannot drain when this node's
+    /// own runtime is CPU-starved, so a self-starved secondary reads
+    /// `now - last_beacon` inflated by ITS OWN stall and false-judges an
+    /// alive primary's faithfully-emitted (dedicated-thread,
+    /// starvation-immune) beacon as stale — the exact false-election leg
+    /// the sibling backstop was hardened against. With the clamp a
+    /// self-starved receiver measures beacon staleness only from fresh,
+    /// post-lag evidence; with no starvation the clamp is the identity,
+    /// so a genuinely-silent beacon is still judged stale one healthy
+    /// cadence window after the node recovers (correctness over speed).
     pub(in crate::secondary) fn node_beacon_fresh(&self, node_id: &str) -> bool {
         let deadline = self
             .config
@@ -262,7 +306,9 @@ where
             .saturating_mul(self.config.keepalive_miss_threshold);
         self.beacon_liveness
             .last_seen(node_id)
-            .map(|t| Instant::now().duration_since(t) <= deadline)
+            .map(|t| {
+                Instant::now().duration_since(self.own_tick_health.trustworthy_anchor(t)) <= deadline
+            })
             .unwrap_or(false)
     }
 
@@ -779,6 +825,35 @@ where
         let run_terminal_latched =
             self.cluster_state.run_aborted().is_some() || self.cluster_state.run_complete();
 
+        // Post-failover SETTLE WINDOW (THE AMPLIFIER cure). A
+        // `PrimaryChanged` re-arms every member's one-shot `MeshReady`
+        // reporter and resets the new primary's mesh-confirmation set to
+        // empty, so proactive dispatch is VETOED until each member
+        // re-reports `MeshReady` and the new primary processes it. If the
+        // primary flips again before that reconfirmation completes, members
+        // stay permanently unconfirmed → zero dispatch → no progress →
+        // another failover arms → an epoch cascade. Suppress arming for a
+        // SHORT window after the last applied advance so reconfirmation can
+        // complete. The window's elapsed is measured through the SAME
+        // own-tick-health clamp leg (B) uses (`trustworthy_anchor`): a
+        // self-starved node's inflated `now - anchor` would otherwise
+        // EXPIRE the window early (read the node's own stall as elapsed
+        // settle time) and re-arm during the very starvation that drives
+        // the cascade; clamping the anchor UP keeps the window open until
+        // post-lag time has genuinely elapsed. Snapshotted as a `&self`
+        // read alongside the others, before the `&mut op` borrow below.
+        let settle_window = self
+            .config
+            .keepalive_interval
+            .saturating_mul(ELECTION_SETTLE_KEEPALIVE_MULTIPLE);
+        let within_settle_window = self
+            .last_primary_change_at
+            .map(|t| {
+                Instant::now().duration_since(self.own_tick_health.trustworthy_anchor(t))
+                    < settle_window
+            })
+            .unwrap_or(false);
+
         // Honest liveness — by SOURCE, not by a bare receive-staleness
         // clock. The decision to suspect the primary and start a failover
         // election is the OR of three predicates, each honest about a
@@ -928,7 +1003,30 @@ where
                  mesh-death is the dying primary's tear-down"
             );
         }
-        let need_election = mesh_says_dead && !primary_beacon_fresh && !run_terminal_latched;
+        // Post-failover settle window suppresses arming (THE AMPLIFIER cure):
+        // a `PrimaryChanged` applied within the last
+        // `ELECTION_SETTLE_KEEPALIVE_MULTIPLE × keepalive_interval` means the
+        // new epoch's `MeshReady` reconfirmation is still in flight. Arming
+        // another election now — before members re-confirm and the new
+        // primary's dispatch veto lifts — is exactly what makes one transient
+        // failover self-sustain into an epoch cascade. The window is short and
+        // anchored on a RECENT change, so a genuinely-dead NEW primary still
+        // elects the moment it expires.
+        if mesh_says_dead && within_settle_window {
+            tracing::debug!(
+                secondary = %secondary_id,
+                link_dead,
+                primary_silence_exceeded,
+                primary_left_membership = primary_left_membership_after_seen,
+                "election arming suppressed: within the post-failover settle \
+                 window; a PrimaryChanged was applied recently and the new \
+                 primary's MeshReady reconfirmation is still in flight"
+            );
+        }
+        let need_election = mesh_says_dead
+            && !primary_beacon_fresh
+            && !run_terminal_latched
+            && !within_settle_window;
 
         // Bind the mutable election state with a PARTIAL borrow — only
         // `self.lifecycle` (operational regime) OR `self.setup_election` (the

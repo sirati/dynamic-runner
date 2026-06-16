@@ -143,13 +143,19 @@ async fn responder_answers_held_for_affine_running_parked_dependent() {
 
             // Park work task B (h-parked) behind a local import gate
             // (gate-I), bound to worker 0 — exactly what `ensure_affine_import`
-            // does on a defer.
+            // does on a defer: APPEND to `affine_running` AND maintain the O(1)
+            // `affine_dependent_worker` reverse index the probe responder reads
+            // (the two are kept in lockstep at the real park site).
             secondary
                 .op_mut()
                 .affine_running
                 .entry("gate-I".into())
                 .or_default()
                 .push(make_affine_dependent("h-parked", 0));
+            secondary
+                .op_mut()
+                .affine_dependent_worker
+                .insert("h-parked".into(), 0);
 
             probe(&mut secondary, "h-parked").await;
             probe(&mut secondary, "h-unknown").await;

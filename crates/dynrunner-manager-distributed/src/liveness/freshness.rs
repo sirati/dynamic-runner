@@ -68,6 +68,17 @@ impl BeaconLiveness {
             .insert(node_id.to_string(), Instant::now());
     }
 
+    /// Record `node_id`'s beacon receipt AT an explicit `Instant` — the
+    /// test affordance for backdating a beacon to a chosen age (the live
+    /// listener only ever records `Instant::now()` via [`Self::record`]).
+    #[cfg(test)]
+    pub fn record_at(&self, node_id: &str, at: Instant) {
+        self.inner
+            .lock()
+            .expect("beacon liveness poisoned")
+            .insert(node_id.to_string(), at);
+    }
+
     /// The most recent beacon-receipt `Instant` for `node_id`, or `None`
     /// if no beacon from it has ever been heard. The reader compares
     /// `now - last_seen` against its own staleness threshold.

@@ -53,14 +53,97 @@
 //! `self.in_flight` against the slot it never left.
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
+use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, MessageType};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::cluster_state::TaskState;
 use crate::primary::PrimaryCoordinator;
+use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::coordinator::InFlightEntry;
 
+/// Is `ty` an affine-deferral REPORT — a `TaskQueuedAfterLocalDependency`
+/// or a `LocalDependencyReleased`? These are the two message types whose
+/// per-report handler each originates ONE `Destination::All` broadcast via
+/// `apply_and_broadcast_cluster_mutations`; coalescing them is the concern
+/// this module owns (see `dispatch_inbox_batch_coalescing_deferrals`).
+fn is_deferral_report(ty: MessageType) -> bool {
+    matches!(
+        ty,
+        MessageType::TaskQueuedAfterLocalDependency | MessageType::LocalDependencyReleased
+    )
+}
+
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
+    /// Dispatch a heterogeneous inbox-drain batch, COALESCING the
+    /// `Destination::All` broadcasts of any contiguous run of affine-
+    /// deferral reports into ONE wire frame per run (#-cascade Commit 3).
+    ///
+    /// ## The concern
+    ///
+    /// A `build_compilers` affine burst lands as S secondaries × M
+    /// dependents of `TaskQueuedAfterLocalDependency` / `LocalDependency-
+    /// Released` reports back-to-back. Pre-fix each report's handler called
+    /// `apply_and_broadcast_cluster_mutations` directly — one un-coalesced
+    /// `Destination::All` broadcast PER report, serial on the oploop —
+    /// flooding ingest cluster-wide and tripping the self-starvation
+    /// false-election that seeds the failover cascade. (Before #497 these
+    /// reports were debug-dropped, i.e. free.)
+    ///
+    /// ## The seam reused (mirrors #547 / the F5 atomic batch)
+    ///
+    /// The mutation-capture primitive (`begin_mutation_capture` /
+    /// `take_mutation_capture` / `broadcast_applied_mutations`) DIVERTS
+    /// every `apply_and_broadcast_cluster_mutations` call off the wire into
+    /// a buffer while armed, and the owner flushes the accumulated batch as
+    /// ONE frame. This method opens ONE capture window around each MAXIMAL
+    /// CONTIGUOUS run of deferral reports, dispatches each report through
+    /// the canonical `dispatch_message` (so every report's LOCAL apply +
+    /// ledger drop happen identically), then flushes the run's accumulated
+    /// mutations once. A `build_compilers` burst = O(1) broadcasts per
+    /// inbox-drain run, not O(N).
+    ///
+    /// ## Why CONTIGUOUS runs, not a blanket window
+    ///
+    /// Order is preserved EXACTLY — the capture only defers the WIRE leg of
+    /// the deferral handlers to the end of their own contiguous run; a run
+    /// is broken at the first non-deferral frame, which is dispatched with
+    /// normal per-call broadcast semantics. No frame is reordered relative
+    /// to another, so causal ordering across types is untouched. A blanket
+    /// window would also wrongly capture other handlers' broadcasts (and
+    /// risk a nested capture from a handler that opens its own) — capture is
+    /// NOT re-entrant. Deferral handlers open no capture of their own, so a
+    /// run-scoped window is safe.
+    pub(crate) async fn dispatch_inbox_batch_coalescing_deferrals(
+        &mut self,
+        batch: Vec<DistributedMessage<I>>,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) -> Result<(), String> {
+        let mut iter = batch.into_iter().peekable();
+        while let Some(msg) = iter.next() {
+            if !is_deferral_report(msg.msg_type()) {
+                // Non-deferral frame: normal per-call broadcast semantics.
+                self.dispatch_message(msg, command_rx).await?;
+                continue;
+            }
+            // Start of a contiguous deferral run: open ONE capture window,
+            // dispatch this report and every immediately-following deferral
+            // report into it, then flush the run's mutations as ONE frame.
+            self.begin_mutation_capture();
+            self.dispatch_message(msg, command_rx).await?;
+            while iter
+                .peek()
+                .is_some_and(|next| is_deferral_report(next.msg_type()))
+            {
+                let next = iter.next().expect("peeked Some");
+                self.dispatch_message(next, command_rx).await?;
+            }
+            let coalesced = self.take_mutation_capture();
+            self.broadcast_applied_mutations(coalesced).await;
+        }
+        Ok(())
+    }
+
     /// A secondary reported that a work task `B` is now QUEUED behind its
     /// local SecondaryAffine import (#497). ORIGINATE
     /// `QueuedAfterLocalDependencySet` (the CRDT `InFlight | Pending →

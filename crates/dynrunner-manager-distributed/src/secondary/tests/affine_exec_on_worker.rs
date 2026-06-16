@@ -522,3 +522,113 @@ async fn failed_gate_body_does_not_poison_done_set() {
         })
         .await;
 }
+
+// ── T7 (Commit 4) ──────────────────────────────────────────────────────────
+// `holding_worker` resolves a PARKED affine dependent via the O(1)
+// `affine_dependent_worker` reverse index, and the index answer equals the
+// pre-fix O(parked) `affine_running.values().flatten()` scan's answer. The
+// index is maintained at the park (APPEND) site and the import-completion
+// DRAIN site, so it tracks `affine_running` exactly.
+#[tokio::test(flavor = "current_thread")]
+async fn t7_holding_worker_index_matches_scan_and_clears_on_drain() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, _log) = make_secondary_recording(one_worker_config("sec-2"), 1);
+            sec.set_bootstrap_primary_id("setup".to_string());
+            let mut factory = FakeWorkerFactory;
+            let pool = sec.initialize_workers(&mut factory).await.unwrap();
+            sec.enter_operational_for_test();
+            *sec.pool_mut() = pool;
+
+            let affine_hash = "gate-hash-G";
+            let gate_binary = seed_affine_task(&mut sec, affine_hash);
+
+            // Park TWO dependents behind the one gate body (both on worker 0 —
+            // the slot the gate body, then each released dependent, runs on).
+            let dep1 = make_dependent("work-B1", 0);
+            assert_eq!(
+                sec.ensure_affine_import(affine_hash.to_string(), dep1)
+                    .await
+                    .unwrap(),
+                AffineGateOutcome::StartedRun
+            );
+            let dep2 = make_dependent("work-B2", 0);
+            assert_eq!(
+                sec.ensure_affine_import(affine_hash.to_string(), dep2)
+                    .await
+                    .unwrap(),
+                AffineGateOutcome::QueuedBehindRun
+            );
+
+            // EQUIVALENCE: the index answer equals the old O(parked) scan for
+            // each parked dependent (and both miss an unparked hash).
+            for h in ["work-B1", "work-B2", "work-absent"] {
+                let scan = sec
+                    .op_mut()
+                    .affine_running
+                    .values()
+                    .flatten()
+                    .find_map(|dep| (dep.work_hash == h).then_some(dep.worker_id));
+                let index = sec.lifecycle.holding_worker(h);
+                assert_eq!(
+                    index, scan,
+                    "holding_worker (index) must equal the old scan for {h:?}: \
+                     index={index:?} scan={scan:?}"
+                );
+            }
+            // Each parked dependent resolves to worker 0 (positive control —
+            // not just both-None agreement).
+            assert_eq!(sec.lifecycle.holding_worker("work-B1"), Some(0));
+            assert_eq!(sec.lifecycle.holding_worker("work-B2"), Some(0));
+
+            // Drive the import to completion through the worker terminal arm
+            // (the DRAIN site): the gate body completes, the dependents are
+            // released, the run-once latch clears.
+            sec.op_mut()
+                .active_tasks
+                .insert(affine_hash.to_string(), 0);
+            sec.op_mut().pool.workers[0].loaded_type_id =
+                Some(gate_binary.type_id.clone());
+            let current_gen = sec.op_mut().pool.workers[0].generation;
+            let oom = test_oom_watcher();
+            sec.handle_worker_event(
+                WorkerEvent::TaskCompleted {
+                    worker_id: 0,
+                    generation: current_gen,
+                    result: TaskResult::ok(),
+                    result_data: None,
+                    binary: Some(gate_binary),
+                    estimated_resources: ResourceMap::new(),
+                },
+                &oom,
+                &mut factory,
+            )
+            .await
+            .unwrap();
+
+            // The drain cleared the reverse index in lockstep with
+            // `affine_running` — no parked-slot answer survives (each released
+            // dependent now resolves through `active_tasks` instead, the
+            // normal dispatch bookkeeping). Equivalence holds against the
+            // (now-empty) scan too.
+            assert!(
+                !sec.op_mut().affine_running.contains_key(affine_hash),
+                "the run-once latch must clear on completion"
+            );
+            for h in ["work-B1", "work-B2"] {
+                let scan = sec
+                    .op_mut()
+                    .affine_running
+                    .values()
+                    .flatten()
+                    .find_map(|dep| (dep.work_hash == h).then_some(dep.worker_id));
+                assert_eq!(scan, None, "fixture: the parked scan is now empty for {h:?}");
+                assert!(
+                    !sec.op_mut().affine_dependent_worker.contains_key(h),
+                    "the drain must remove {h:?} from the reverse index"
+                );
+            }
+        })
+        .await;
+}

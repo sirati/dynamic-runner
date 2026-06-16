@@ -311,6 +311,16 @@ where
         was_primary_before: bool,
         former_primary: Option<&str>,
     ) {
+        // Stamp the post-failover SETTLE-WINDOW anchor on EVERY genuinely-
+        // applied advance (self- or peer-named): this is the moment a new
+        // epoch's `MeshReady` reconfirmation begins, and `run_election_tick`
+        // suppresses election RE-arming for a short window after it so the
+        // reconfirmation can complete before another election can fire (the
+        // amplifier that turns one transient failover into a self-sustaining
+        // epoch cascade — see the field doc in `secondary/mod.rs`). Reached
+        // only on an `Applied` advance (the caller gates on it), so a
+        // stale-epoch NoOp never refreshes the window.
+        self.last_primary_change_at = Some(std::time::Instant::now());
         if new == self.config.secondary_id {
             // Named primary again through an applied advance: any earlier
             // deposition is superseded — this node holds the role
