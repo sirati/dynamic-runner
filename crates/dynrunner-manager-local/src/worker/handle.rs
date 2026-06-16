@@ -14,8 +14,8 @@ use dynrunner_core::{
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_manager_worker::state::{
-    AssignResult, Idle, PollResult, Processing, RunnerProtocol, RunnerProtocolState,
-    WaitReadyResult,
+    AssignResult, Idle, PollResult, Processing, RunnerProtocol, RunnerProtocolState, Stopped,
+    WaitReadyResult, WaitingForReady,
 };
 use dynrunner_scheduler_api::WorkerBudgetInfo;
 use tokio::sync::mpsc;
@@ -88,6 +88,70 @@ fn restart_kill_target(worker_pid: i32, resolved_pgid: Option<i32>) -> RestartKi
     match resolved_pgid {
         Some(pgid) if pgid == worker_pid => RestartKillTarget::Group(worker_pid),
         _ => RestartKillTarget::Process(worker_pid),
+    }
+}
+
+/// Cadence at which a `WaitingForReady` slot re-checks that its
+/// freshly-spawned worker process is still alive while it waits for the
+/// worker to connect + report `Ready`. Short enough that a phantom
+/// (never-connecting, dead) worker is detected promptly — far inside the
+/// 60s same-phase watchdog window — without busy-spinning the runtime.
+const PROCESS_LIVENESS_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Bare-PID liveness probe for a tracked worker subprocess: `kill(pid, 0)`
+/// returns `Ok` iff a process with that pid exists and the caller may
+/// signal it; `ESRCH` means it is gone (exited AND reaped). This is the
+/// exact condition the bug surfaces as ECHILD on `try_wait` — the worker
+/// child no longer exists.
+///
+/// Distinct from [`WorkerHandle::process_tree_alive`], which probes the
+/// worker's process GROUP (`kill(-pgid, 0)`) to decide grace-then-SIGKILL
+/// escalation. Here we probe the LEADER pid: the question is "is the
+/// worker we spawned still around to connect and say Ready?", not "has
+/// the whole build tree drained?".
+#[cfg(unix)]
+fn worker_process_alive(pid: u32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    match kill(Pid::from_raw(pid as i32), None) {
+        Ok(()) => true,
+        Err(nix::errno::Errno::ESRCH) => false,
+        // EPERM (or any other errno) means the process still EXISTS — the
+        // kernel only refuses the signal for a live target. Treat as alive
+        // so we never misclassify a live worker as dead.
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn worker_process_alive(_pid: u32) -> bool {
+    // No portable liveness probe off-unix; treat as alive so the wait
+    // falls back to transport-EOF detection exactly as before.
+    true
+}
+
+/// Result of a liveness-bounded ready-wait
+/// ([`WorkerHandle::wait_ready_or_process_dead`]): the protocol's own
+/// [`WaitReadyResult`] terminals plus a `ProcessDied` terminal the
+/// transport-level wait can never produce on its own (a worker that dies
+/// before it ever connects to a named socket leaves `accept()` blocked
+/// forever). `ProcessDied` carries no protocol state: the worker is gone,
+/// so the slot settles to `Unconnected` and the caller emits the same
+/// `Disconnected` recovery event it produces for transport EOF.
+enum ReadyWaitOutcome<M: ManagerEndpoint> {
+    Ready(RunnerProtocol<Idle, M>),
+    NotYet(RunnerProtocol<WaitingForReady, M>),
+    Disconnected(RunnerProtocol<Stopped, M>),
+    ProcessDied,
+}
+
+impl<M: ManagerEndpoint> From<WaitReadyResult<M>> for ReadyWaitOutcome<M> {
+    fn from(result: WaitReadyResult<M>) -> Self {
+        match result {
+            WaitReadyResult::Ready(idle) => ReadyWaitOutcome::Ready(idle),
+            WaitReadyResult::NotYet(waiting) => ReadyWaitOutcome::NotYet(waiting),
+            WaitReadyResult::Disconnected(stopped) => ReadyWaitOutcome::Disconnected(stopped),
+        }
     }
 }
 
@@ -524,6 +588,64 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         false
     }
 
+    /// Drive `WaitingForReady → Ready`, but TERMINATE the wait the moment
+    /// the freshly-spawned worker process is observably dead — even if no
+    /// transport EOF or connect ever arrives.
+    ///
+    /// # Why this exists (phantom-worker wedge)
+    ///
+    /// [`crate::worker::handle::WorkerHandle`]'s ready-wait is implemented
+    /// as `RunnerProtocol::<WaitingForReady>::wait_ready`, which awaits a
+    /// single `transport.recv()`. For the socketpair transport a dead
+    /// child closes its FD, so `recv()` returns `None` (→ `Disconnected`)
+    /// and recovery fires. But the NAMED-SOCKET transport binds a
+    /// *listening* socket and `recv()` first does a lazy
+    /// `listener.accept().await`: if the spawned worker dies before it
+    /// ever connects (the type-shift respawn whose subprocess never
+    /// execs / dies immediately — the ECHILD-on-`try_wait` shape), no
+    /// client connects, `accept()` blocks forever, `wait_ready` never
+    /// resolves, the ready-watcher emits neither `Ready` nor
+    /// `Disconnected`, the slot stays `Transitioning`, and the deferred
+    /// (respawn-HOLD) task is parked indefinitely.
+    ///
+    /// This wrapper races the protocol's `wait_ready` against a periodic
+    /// liveness probe of the worker's tracked pid. If the process is gone
+    /// (`kill(pid, 0)` → ESRCH) before `wait_ready` resolves, the wait
+    /// returns `ReadyWaitOutcome::ProcessDied` so the caller surfaces the
+    /// SAME terminal it already produces for transport-EOF — a
+    /// `Disconnected` event the existing restart / re-route machinery
+    /// recovers from — instead of waiting on a phantom forever.
+    ///
+    /// A worker with no tracked pid (`self.pid == None`: in-process
+    /// channel worker, manual-start named socket) has no liveness signal
+    /// to race against, so this degrades to the plain `wait_ready` await —
+    /// identical to the pre-fix behaviour for those transports.
+    async fn wait_ready_or_process_dead(
+        waiting: RunnerProtocol<WaitingForReady, M>,
+        pid: Option<u32>,
+    ) -> ReadyWaitOutcome<M> {
+        let Some(pid) = pid else {
+            // No liveness signal: fall back to the plain wait. The
+            // socketpair/channel transports surface a dead worker via
+            // EOF; manual-start named sockets have no framework-owned
+            // process to probe.
+            return ReadyWaitOutcome::from(waiting.wait_ready().await);
+        };
+        let liveness = async {
+            loop {
+                if !worker_process_alive(pid) {
+                    return;
+                }
+                tokio::time::sleep(PROCESS_LIVENESS_POLL).await;
+            }
+        };
+        tokio::select! {
+            biased;
+            result = waiting.wait_ready() => ReadyWaitOutcome::from(result),
+            () = liveness => ReadyWaitOutcome::ProcessDied,
+        }
+    }
+
     pub fn is_idle_state(&self) -> bool {
         self.protocol.is_idle()
     }
@@ -576,8 +698,9 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     /// Try to advance from WaitingForReady → Idle.
     pub async fn poll_ready(&mut self) -> Option<WorkerEvent<I>> {
         let waiting = self.protocol.take_waiting()?;
-        match waiting.wait_ready().await {
-            WaitReadyResult::Ready(idle) => {
+        let pid = self.pid;
+        match Self::wait_ready_or_process_dead(waiting, pid).await {
+            ReadyWaitOutcome::Ready(idle) => {
                 self.protocol = RunnerProtocolState::Idle(idle);
                 self.idle = true;
                 // This generation reached Ready: it is not a startup
@@ -589,11 +712,11 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                     generation: self.generation,
                 })
             }
-            WaitReadyResult::NotYet(w) => {
+            ReadyWaitOutcome::NotYet(w) => {
                 self.protocol = RunnerProtocolState::WaitingForReady(w);
                 None
             }
-            WaitReadyResult::Disconnected(s) => {
+            ReadyWaitOutcome::Disconnected(s) => {
                 self.protocol = RunnerProtocolState::Stopped(s);
                 Some(WorkerEvent::Disconnected {
                     worker_id: self.worker_id,
@@ -609,6 +732,27 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                     result: TaskResult::error(
                         ErrorType::Recoverable,
                         "Disconnected before Ready".into(),
+                    ),
+                    binary: None,
+                })
+            }
+            ReadyWaitOutcome::ProcessDied => {
+                // The spawned worker process is gone before it ever
+                // reported Ready (the phantom-worker shape: dies before
+                // connecting to its named socket, so no transport EOF
+                // would ever fire). Settle the slot to `Unconnected` —
+                // `is_startup_dead()` then reports true (never ready +
+                // Unconnected), so any synchronous ready-wait loop exits
+                // instead of spinning — and emit the standard
+                // `Disconnected` recovery event so the restart / re-route
+                // machinery owns recovery exactly as it does for EOF.
+                self.protocol = RunnerProtocolState::Unconnected;
+                Some(WorkerEvent::Disconnected {
+                    worker_id: self.worker_id,
+                    generation: self.generation,
+                    result: TaskResult::error(
+                        ErrorType::Recoverable,
+                        "Worker process died before reporting Ready".into(),
                     ),
                     binary: None,
                 })
@@ -666,10 +810,15 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         // for the task's lifetime, so every event it emits carries the
         // generation of the subprocess it is watching.
         let generation = self.generation;
+        // Capture the tracked pid so the watcher can detect a worker that
+        // dies before it ever connects (the phantom-worker shape: a
+        // named-socket `accept()` would otherwise block forever with no
+        // transport EOF to wake it). See `wait_ready_or_process_dead`.
+        let pid = self.pid;
         let tx = self.event_tx.clone();
         let handle = tokio::task::spawn_local(async move {
-            let state = match waiting.wait_ready().await {
-                WaitReadyResult::Ready(idle) => {
+            let state = match Self::wait_ready_or_process_dead(waiting, pid).await {
+                ReadyWaitOutcome::Ready(idle) => {
                     // Send first so the operational loop can react
                     // immediately on the next select! iteration even
                     // before `reclaim_protocol` runs. The returned
@@ -681,7 +830,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                     });
                     RunnerProtocolState::Idle(idle)
                 }
-                WaitReadyResult::NotYet(_) => {
+                ReadyWaitOutcome::NotYet(_) => {
                     // `wait_ready` is documented to return Ready,
                     // Disconnected, or NotYet (the latter only on a
                     // non-Ready response — e.g. the worker sent a
@@ -710,7 +859,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                     });
                     RunnerProtocolState::Unconnected
                 }
-                WaitReadyResult::Disconnected(stopped) => {
+                ReadyWaitOutcome::Disconnected(stopped) => {
                     let _ = tx.send(WorkerEvent::Disconnected {
                         worker_id,
                         generation,
@@ -721,6 +870,29 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                         binary: None,
                     });
                     RunnerProtocolState::Stopped(stopped)
+                }
+                ReadyWaitOutcome::ProcessDied => {
+                    // The spawned worker process is gone before it ever
+                    // reported Ready (phantom-worker shape: dies before
+                    // connecting to its named socket, so `accept()` would
+                    // otherwise block forever and emit neither Ready nor
+                    // Disconnected — the slot would sit `Transitioning`
+                    // and the respawn-HOLD task park indefinitely). Emit
+                    // the SAME Disconnected recovery event the EOF path
+                    // emits so the operational loop's restart / re-route
+                    // machinery (`report_deferred_task_lost`) recovers,
+                    // and settle the slot to `Unconnected` (no live
+                    // transport remains).
+                    let _ = tx.send(WorkerEvent::Disconnected {
+                        worker_id,
+                        generation,
+                        result: TaskResult::error(
+                            ErrorType::Recoverable,
+                            "Worker process died before reporting Ready".into(),
+                        ),
+                        binary: None,
+                    });
+                    RunnerProtocolState::Unconnected
                 }
             };
             // The ready-watcher never borrows the custom outbox.
@@ -1338,5 +1510,203 @@ mod restart_kill_tests {
                 Err(e) => panic!("pipe read failed: {e}"),
             }
         }
+    }
+}
+
+/// Phantom-worker regression: a freshly-spawned worker whose PROCESS is
+/// gone before it ever connected must NOT park the ready-wait forever.
+///
+/// Replays the live wedge (asm-dataset-nix, named-socket transport): the
+/// type-shift respawn's subprocess dies immediately (the
+/// ECHILD-on-`try_wait` shape), so it never connects — a named socket's
+/// `recv()`/`accept()` would block forever with no transport EOF to wake
+/// it. We model "transport that never EOFs and never sends" with a
+/// channel transport whose runner end is held alive but silent, and
+/// model "process is gone" with the pid of an already-reaped child
+/// (`kill(pid, 0)` → ESRCH). Both ready-wait drivers — the synchronous
+/// `poll_ready` loop and the background `spawn_ready_watcher` — must
+/// surface `Disconnected` within a bounded time so the restart /
+/// re-route machinery recovers instead of holding the task indefinitely.
+#[cfg(all(test, unix))]
+mod phantom_worker_tests {
+    use super::WorkerHandle;
+    use crate::worker::event::WorkerEvent;
+    use dynrunner_core::WorkerId;
+    use dynrunner_transport_channel::{ChannelManagerEnd, ChannelRunnerEnd, channel_pair};
+    use nix::sys::wait::waitpid;
+    use nix::unistd::{ForkResult, Pid};
+    use serde::{Deserialize, Serialize};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    struct TestId(String);
+
+    /// Build a handle in `WaitingForReady` over a SILENT transport (the
+    /// returned runner end is alive but never sends → `recv()` pends
+    /// forever, mirroring a named socket whose worker never connected).
+    /// Returns the handle, its event receiver, and the runner end the
+    /// caller must keep alive (dropping it would inject the EOF this
+    /// test exists to PROVE we no longer depend on).
+    fn silent_handle() -> (
+        WorkerHandle<ChannelManagerEnd, TestId>,
+        mpsc::UnboundedReceiver<WorkerEvent<TestId>>,
+        ChannelRunnerEnd,
+    ) {
+        let (manager_end, runner_end) = channel_pair();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let handle = WorkerHandle::new(0 as WorkerId, 0, manager_end, event_tx);
+        (handle, event_rx, runner_end)
+    }
+
+    /// Fork a child that exits immediately, reap it, and return its
+    /// now-dead pid. After the `waitpid` the kernel slot is freed, so
+    /// `kill(pid, 0)` → ESRCH — exactly the "no worker process exists"
+    /// condition the bug logs as ECHILD on `try_wait`. Uses `fork`/
+    /// `_exit` (async-signal-safe in the child) rather than an absolute
+    /// binary path, so the test is portable to environments without
+    /// `/bin/true` (e.g. NixOS sandboxes).
+    fn reaped_dead_pid() -> u32 {
+        // SAFETY: the child runs only async-signal-safe `_exit` between
+        // fork and termination; no heap allocation, no locks.
+        let child = match unsafe { nix::unistd::fork() }.expect("fork dead child") {
+            ForkResult::Child => unsafe { nix::libc::_exit(0) },
+            ForkResult::Parent { child } => child,
+        };
+        waitpid(child, None).expect("reap dead child");
+        let pid = child.as_raw() as u32;
+        // Confirm the precondition: the pid is gone.
+        assert!(
+            !super::worker_process_alive(pid),
+            "reaped pid must probe as dead before the test runs"
+        );
+        pid
+    }
+
+    /// Fork a child that blocks indefinitely (`pause`) and return its
+    /// pid; the returned `Pid` must be killed + reaped by the caller.
+    /// Models a LIVE worker that is simply slow to report Ready.
+    fn live_blocked_child() -> Pid {
+        // SAFETY: the child runs only async-signal-safe `pause`/`_exit`
+        // between fork and termination.
+        match unsafe { nix::unistd::fork() }.expect("fork live child") {
+            ForkResult::Child => unsafe {
+                loop {
+                    nix::libc::pause();
+                }
+            },
+            ForkResult::Parent { child } => child,
+        }
+    }
+
+    /// Synchronous `poll_ready` driver: a dead-process slot over a silent
+    /// transport must settle to `Disconnected` + `is_startup_dead()`,
+    /// NOT spin/hang. Pre-fix this hangs — `wait_ready` blocks on the
+    /// transport that never produces a frame.
+    #[tokio::test(flavor = "current_thread")]
+    async fn poll_ready_settles_when_process_dead_no_eof() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut handle, _event_rx, _runner) = silent_handle();
+                handle.pid = Some(reaped_dead_pid());
+
+                let ev = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Some(ev) = handle.poll_ready().await {
+                            return ev;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect(
+                    "poll_ready must SETTLE on a dead-process worker even \
+                     with no transport EOF — not hang on the phantom",
+                );
+
+                assert!(
+                    matches!(ev, WorkerEvent::Disconnected { worker_id: 0, .. }),
+                    "dead-process ready-wait must surface Disconnected; got {ev:?}"
+                );
+                assert!(
+                    handle.is_startup_dead(),
+                    "the settled slot must report startup-dead so any \
+                     ready-wait loop exits instead of spinning",
+                );
+            })
+            .await;
+    }
+
+    /// Background `spawn_ready_watcher` driver: a dead-process slot over a
+    /// silent transport must emit `Disconnected` on the event channel
+    /// within a bounded time, so the operational loop's recovery fires.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ready_watcher_emits_disconnect_when_process_dead_no_eof() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut handle, mut event_rx, _runner) = silent_handle();
+                handle.pid = Some(reaped_dead_pid());
+                handle
+                    .spawn_ready_watcher()
+                    .expect("watcher spawns from WaitingForReady");
+
+                let ev = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                    .await
+                    .expect(
+                        "the ready-watcher must emit a terminal for a \
+                         dead-process worker — not park on the phantom",
+                    )
+                    .expect("event channel open");
+                assert!(
+                    matches!(ev, WorkerEvent::Disconnected { worker_id: 0, .. }),
+                    "dead-process watcher must emit Disconnected; got {ev:?}"
+                );
+            })
+            .await;
+    }
+
+    /// Liveness guard (no false positive): a LIVE worker that is simply
+    /// slow to report Ready (transport silent, process alive) must NOT
+    /// be misclassified as dead. `poll_ready` keeps pending; no terminal
+    /// is produced. This pins that the fix detects ONLY genuine
+    /// process death, never a live-but-slow startup.
+    #[tokio::test(flavor = "current_thread")]
+    async fn poll_ready_does_not_kill_live_slow_worker() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut handle, _event_rx, _runner) = silent_handle();
+                // A long-lived child whose pid stays alive for the test.
+                let child = live_blocked_child();
+                handle.pid = Some(child.as_raw() as u32);
+
+                // The wait must NOT resolve within the window — the
+                // worker is alive, just silent. A premature terminal
+                // would be the false-positive regression.
+                let outcome = tokio::time::timeout(
+                    Duration::from_millis(800),
+                    async {
+                        loop {
+                            if let Some(ev) = handle.poll_ready().await {
+                                return ev;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    },
+                )
+                .await;
+                assert!(
+                    outcome.is_err(),
+                    "a live-but-slow worker must NOT be reported dead; \
+                     got premature terminal {outcome:?}",
+                );
+
+                use nix::sys::signal::{Signal, kill};
+                let _ = kill(child, Signal::SIGKILL);
+                let _ = waitpid(child, None);
+            })
+            .await;
     }
 }
