@@ -442,33 +442,13 @@ class KeyedOutputsTests(unittest.TestCase):
             {"result": {"kind": "file", "value": "/network/out/x.csv"}},
         )
 
-    def test_publish_with_key_no_explicit_dst_records_resolved_path(self):
-        # Regression for the `dst=None` bug: when the caller omits
-        # `dst`, `publish.publish` derives it from src_root/dst_root
-        # and returns the resolved path. `Task.publish` must record
-        # *that* resolved path in the accumulator — not `str(None)`,
-        # the literal user input. Mock the underlying publish to
-        # return a known resolved path and assert the accumulator
-        # captures it.
-        from pathlib import Path
-        resolved = Path("/network/out/auto/derived.csv")
-        with patch("dynamic_runner.worker.publish.publish") as mock_pub:
-            mock_pub.return_value = resolved
-            t = Task(relative_path="/x")
-            t.publish("/staging/auto/derived.csv", key="auto")
-            # Underlying call still receives the original (None) dst —
-            # destination resolution is publish.py's concern.
-            mock_pub.assert_called_once_with("/staging/auto/derived.csv", None)
-        self.assertEqual(
-            t._outputs_accumulator,
-            {"auto": {"kind": "file", "value": "/network/out/auto/derived.csv"}},
-        )
-        # The pre-fix code stored str(dst) == "None"; pin that the bug
-        # cannot regress by asserting the value is not the literal
-        # string the bug produced.
-        self.assertNotEqual(
-            t._outputs_accumulator["auto"]["value"], "None"
-        )
+    def test_publish_requires_explicit_dst(self):
+        # The auto-mirror footgun is GONE: `dst` is a required
+        # positional on Task.publish. Omitting it is a hard TypeError,
+        # not a silent src_root→dst_root mirror.
+        t = Task(relative_path="/x")
+        with self.assertRaises(TypeError):
+            t.publish("/staging/auto/derived.csv", key="auto")  # type: ignore[call-arg]
 
     def test_publish_without_key_leaves_accumulator_empty(self):
         # The keyed-outputs side-effect is opt-in: a caller that
