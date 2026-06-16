@@ -862,7 +862,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             "pool: reinject freshly-Pending task from \
                              wire-received TasksSpawned"
                         );
-                        self.pool_mut().reinject(task);
+                        self.pool_mut().reinject(std::sync::Arc::new(task));
                     }
                     if reinjected_any {
                         self.cluster_state

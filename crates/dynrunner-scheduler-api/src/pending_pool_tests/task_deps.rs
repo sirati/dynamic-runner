@@ -504,7 +504,7 @@ fn seeded_soft_failed_root_revived_by_reinject_keeps_dependent_blocked() {
         .expect("dependent blocks on the seeded soft root");
     // Revival (the retry bucket's seam): reinject clears the soft marker;
     // the dependent stays blocked until the root actually completes.
-    p.reinject(t_with_id("P", "T", "", 1, "root", &[]));
+    p.reinject(std::sync::Arc::new(t_with_id("P", "T", "", 1, "root", &[])));
     assert_eq!(p.blocked_len(), 1, "child still waits for the retry");
     let root = p.pop_for_worker(1).expect("revived root dispatches");
     assert_eq!(root.task_id, "root");
@@ -537,7 +537,7 @@ fn seeded_dormant_id_resolves_dep_and_blocks_dependent_until_revival() {
     );
     assert!(p.finalize_soft_failures(&phase("P")).is_empty());
     // Revival: reinject the root; complete it; the dependent unblocks.
-    p.reinject(t_with_id("P", "T", "", 1, "root", &[]));
+    p.reinject(std::sync::Arc::new(t_with_id("P", "T", "", 1, "root", &[])));
     let root = p.pop_for_worker(1).expect("revived root dispatches");
     assert_eq!(root.task_id, "root");
     p.on_item_finished(&phase("P"), Some("root"));

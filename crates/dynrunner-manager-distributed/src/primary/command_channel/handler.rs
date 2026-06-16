@@ -313,7 +313,7 @@ where
         // Active for this binary's phase, putting the item back into
         // the bucket head so the next dispatch tick picks it up.
         self.failed_tasks.remove(&hash);
-        self.pool_mut().reinject(binary);
+        self.pool_mut().reinject(std::sync::Arc::new(binary));
 
         // Originate the bumped used count (P3) ONLY when a cap is set —
         // an unbounded `None` cap has no budget to enforce, so skip the
@@ -937,7 +937,7 @@ where
             match self.cluster_state.task_state(&hash) {
                 Some(state @ TaskState::Pending { .. }) => {
                     let task = state.to_task_info();
-                    self.pool_mut().reinject(task);
+                    self.pool_mut().reinject(std::sync::Arc::new(task));
                     pool_grew = true;
                 }
                 Some(TaskState::Failed { kind, .. }) => {

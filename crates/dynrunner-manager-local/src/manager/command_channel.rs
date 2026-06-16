@@ -190,7 +190,7 @@ pub(crate) async fn handle_local_command<M, S, E, I>(
                 .on_item_failed_permanent(&task.phase_id, task.task_id.as_str());
             for cascaded_task in cascaded {
                 mgr.failed_tasks.push(FailedTask {
-                    binary: cascaded_task,
+                    binary: crate::manager::own_task(cascaded_task),
                     error_type: error.clone(),
                     error_message: format!("cascade-fail from {hash} (root: {reason})"),
                     retry_count: 0,
@@ -253,7 +253,7 @@ pub(crate) async fn handle_local_command<M, S, E, I>(
             };
             match found {
                 Some(task) => {
-                    mgr.pool_mut().reinject(task);
+                    mgr.pool_mut().reinject(std::sync::Arc::new(task));
                     let _ = reply.send(Ok(()));
                 }
                 None => {

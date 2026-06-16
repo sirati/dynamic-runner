@@ -10,7 +10,7 @@ fn make_remote_worker(worker_id: u32, secondary_id: &str, busy: bool) -> RemoteW
         let task_hash = crate::primary::wire::compute_task_hash(&task);
         crate::primary::SlotState::Assigned {
             task_hash,
-            task,
+            task: std::sync::Arc::new(task),
             estimated: dynrunner_core::ResourceMap::new(),
             // A live-busy worker for the dispatch-ordering tests; provenance
             // is irrelevant to ordering, so the realistic live default.

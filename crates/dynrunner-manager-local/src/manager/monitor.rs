@@ -148,7 +148,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 if reason.is_no_fault() {
                     // Pool's `requeue` decrements in-flight (set by
                     // `take_selected`) and pushes to the bucket front.
-                    self.pool_mut().requeue(*binary);
+                    self.pool_mut().requeue(std::sync::Arc::new(*binary));
                     return;
                 }
                 // At-fault kill (OomOverBudget / OomLastResort).

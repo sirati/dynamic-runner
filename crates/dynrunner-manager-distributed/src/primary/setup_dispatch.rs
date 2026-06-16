@@ -174,7 +174,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// drain mid-exec, then settled by [`Self::settle_setup_terminal`].
     async fn execute_setup_locally(
         &mut self,
-        task: dynrunner_core::TaskInfo<I>,
+        task: std::sync::Arc<dynrunner_core::TaskInfo<I>>,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
         let hash = compute_task_hash(&task);
@@ -200,7 +200,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// so a failed send never strands the task.
     async fn assign_setup_off_primary(
         &mut self,
-        task: dynrunner_core::TaskInfo<I>,
+        task: std::sync::Arc<dynrunner_core::TaskInfo<I>>,
         member: String,
     ) {
         let hash = compute_task_hash(&task);
@@ -314,7 +314,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // the symmetric drop keeps the invariant that the side-map is
         // strictly bounded by the in-flight ledger lifecycle.
         self.drop_supplanted_holder(&task_hash);
-        let (phase, task_id) = (entry.phase, entry.task.task_id);
+        let (phase, task_id) = (entry.phase, entry.task.task_id.clone());
         self.settle_setup_terminal(&task_hash, &phase, &task_id, outcome, command_rx)
             .await;
     }

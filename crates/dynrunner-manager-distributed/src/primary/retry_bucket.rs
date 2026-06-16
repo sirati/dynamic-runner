@@ -183,7 +183,7 @@ pub(crate) fn try_phase_retry_bucket_core<I: Identifier>(
     for binary in candidates {
         let h = compute_task_hash(&binary);
         on_remove_from_failed(&h);
-        pool.reinject(binary);
+        pool.reinject(std::sync::Arc::new(binary));
         reinjected_hashes.push(h);
     }
 

@@ -153,7 +153,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// so the builds are picked up by the standard dispatch recheck.
     async fn resolve_affine_gate(
         &mut self,
-        gate: dynrunner_core::TaskInfo<I>,
+        gate: std::sync::Arc<dynrunner_core::TaskInfo<I>>,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
         let hash = compute_task_hash(&gate);

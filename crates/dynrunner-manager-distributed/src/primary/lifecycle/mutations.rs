@@ -91,7 +91,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 task_id = ?binary.task_id,
                 "pool: re-inject auto-resumed Blocked dependent"
             );
-            self.pool_mut().reinject(binary);
+            self.pool_mut().reinject(std::sync::Arc::new(binary));
         }
         // Auto-resumed Blocked dependents are a pool-entry edge: their
         // prereq just completed and they became dispatchable, but the
@@ -172,7 +172,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     task_id = ?binary.task_id,
                     "pool: re-inject auto-resumed Blocked dependent (affine chain)"
                 );
-                self.pool_mut().reinject(binary);
+                self.pool_mut().reinject(std::sync::Arc::new(binary));
             }
             if chain_resumed_any {
                 self.cluster_state

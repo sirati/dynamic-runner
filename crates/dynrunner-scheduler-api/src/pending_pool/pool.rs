@@ -12,6 +12,7 @@
 //! lifecycle path; both freely operate on the same private state.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use dynrunner_core::{Identifier, PhaseId, TaskInfo};
 
@@ -48,7 +49,7 @@ pub struct PendingPool<I: Identifier> {
     /// `view_for_worker` / `take_first_match`. On final-prereq
     /// resolution an item moves to the FRONT of its bucket (matching
     /// `requeue` semantics).
-    pub(super) blocked: HashMap<String, TaskInfo<I>>,
+    pub(super) blocked: HashMap<String, Arc<TaskInfo<I>>>,
     /// Reverse index: `dep_task_id → list of dependent task_ids`.
     /// Lets `on_item_finished` and `on_item_failed_permanent` walk
     /// dependents in O(deps_per_task) instead of an O(N) scan of

@@ -17,6 +17,8 @@
 //! * [`PendingPool::active_phases`] / [`PendingPool::phase_state`] /
 //!   [`PendingPool::in_flight`] — phase-state accessors.
 
+use std::sync::Arc;
+
 use dynrunner_core::{Identifier, PhaseId, TaskInfo};
 
 use super::pool::PendingPool;
@@ -54,7 +56,10 @@ impl<I: Identifier> PendingPool<I> {
     /// Iterate over all queued items (does not include in-flight).
     /// Used for diagnostic logging in the managers.
     pub fn iter(&self) -> impl Iterator<Item = &TaskInfo<I>> {
-        self.buckets.values().flat_map(|b| b.items.iter())
+        self.buckets
+            .values()
+            .flat_map(|b| b.items.iter())
+            .map(|item| item.as_ref())
     }
 
     /// Drop every queued item for which `pred` returns `false`. Iterates
@@ -102,15 +107,21 @@ impl<I: Identifier> PendingPool<I> {
         F: Fn(&TaskInfo<I>) -> bool,
         U: FnMut(&mut TaskInfo<I>),
     {
+        // The pool uniquely owns every QUEUED / BLOCKED item's `Arc`
+        // (only a DISPATCHED item's Arc is shared, into the in-flight
+        // ledger / slot — and those are not visited here), so
+        // `Arc::make_mut` mutates the inner `TaskInfo` in place with no
+        // copy-on-write clone: the original in-place semantics are
+        // preserved exactly.
         for bucket in self.buckets.values_mut() {
-            if let Some(item) = bucket.items.iter_mut().find(|t| pred(t)) {
-                update(item);
+            if let Some(item) = bucket.items.iter_mut().find(|t| pred(t.as_ref())) {
+                update(Arc::make_mut(item));
                 return true;
             }
         }
         for item in self.blocked.values_mut() {
-            if pred(item) {
-                update(item);
+            if pred(item.as_ref()) {
+                update(Arc::make_mut(item));
                 return true;
             }
         }
@@ -137,7 +148,7 @@ impl<I: Identifier> PendingPool<I> {
     /// If a matched item leaves its bucket empty, the bucket's pinned
     /// workers are unpinned (mirroring `take_from_bucket`'s behaviour),
     /// so soft-pin invariants stay correct for any later dispatch.
-    pub fn take_first_match<F>(&mut self, mut pred: F) -> Option<TaskInfo<I>>
+    pub fn take_first_match<F>(&mut self, mut pred: F) -> Option<Arc<TaskInfo<I>>>
     where
         F: FnMut(&TaskInfo<I>) -> bool,
     {
@@ -155,7 +166,7 @@ impl<I: Identifier> PendingPool<I> {
             ) {
                 continue;
             }
-            if let Some(idx) = bucket.items.iter().position(&mut pred) {
+            if let Some(idx) = bucket.items.iter().position(|item| pred(item.as_ref())) {
                 hit_key = Some(key.clone());
                 hit_idx = idx;
                 break;
@@ -512,7 +523,7 @@ impl<I: Identifier> PendingPool<I> {
     /// shared by the dependent-rank walk.
     fn task_by_id(&self, task_id: &str) -> Option<&TaskInfo<I>> {
         if let Some(item) = self.blocked.get(task_id) {
-            return Some(item);
+            return Some(item.as_ref());
         }
         self.iter().find(|t| t.task_id == task_id)
     }

@@ -183,7 +183,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // Both terminal-shaped paths in this function
             // (backpressure-requeue, terminal TaskFailed) share this
             // one resolution.
-            let recovered_binary: Option<TaskInfo<I>> = self
+            let recovered_binary: Option<std::sync::Arc<TaskInfo<I>>> = self
                 .free_slot_on_terminal(&secondary_id, worker_id, &task_hash)
                 .map(|entry| entry.task);
 

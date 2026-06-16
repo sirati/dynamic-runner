@@ -30,6 +30,7 @@
 //!   across all buckets of a phase.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 
 use dynrunner_core::{Identifier, PhaseId, TaskInfo, WorkerId};
 
@@ -232,7 +233,7 @@ impl<I: Identifier> PendingPool<I> {
             .values()
             .flat_map(|b| b.items.iter())
             .chain(self.blocked.values())
-            .filter(|item| names_id(item))
+            .filter(|item| names_id(item.as_ref()))
             .map(|item| item.task_id.clone())
             .collect();
         if reroute_ids.is_empty() {
@@ -276,7 +277,7 @@ impl<I: Identifier> PendingPool<I> {
     /// named helper so the extract-then-rebuild symmetry with
     /// `commit_item` is explicit and the borrow of `self.blocked` is
     /// scoped away from the recommit.
-    fn extract_live_dependent(&mut self, dep_id: &str) -> Option<TaskInfo<I>> {
+    fn extract_live_dependent(&mut self, dep_id: &str) -> Option<Arc<TaskInfo<I>>> {
         // Queued: a plain removal — queued items hold no blocked-edges.
         if let Some(item) = self.take_first_match(|it| it.task_id == dep_id) {
             return Some(item);
@@ -325,7 +326,7 @@ impl<I: Identifier> PendingPool<I> {
         &mut self,
         phase_id: &PhaseId,
         task_id: &str,
-    ) -> Vec<TaskInfo<I>> {
+    ) -> Vec<Arc<TaskInfo<I>>> {
         if let Some(c) = self.in_flight_per_phase.get_mut(phase_id) {
             *c = c.saturating_sub(1);
         }
@@ -365,8 +366,8 @@ impl<I: Identifier> PendingPool<I> {
         &mut self,
         task_id: &str,
         affected_phases: &mut HashSet<PhaseId>,
-    ) -> Vec<TaskInfo<I>> {
-        let mut cascaded: Vec<TaskInfo<I>> = Vec::new();
+    ) -> Vec<Arc<TaskInfo<I>>> {
+        let mut cascaded: Vec<Arc<TaskInfo<I>>> = Vec::new();
         let mut frontier: VecDeque<String> = VecDeque::new();
         frontier.push_back(task_id.to_string());
         while let Some(failed_id) = frontier.pop_front() {
@@ -457,7 +458,7 @@ impl<I: Identifier> PendingPool<I> {
     pub fn finalize_soft_failures(
         &mut self,
         phase_id: &PhaseId,
-    ) -> Vec<(String, Vec<TaskInfo<I>>)> {
+    ) -> Vec<(String, Vec<Arc<TaskInfo<I>>>)> {
         let roots: Vec<String> = self
             .soft_failed
             .iter()
@@ -468,7 +469,7 @@ impl<I: Identifier> PendingPool<I> {
             return Vec::new();
         }
         let mut affected_phases: HashSet<PhaseId> = HashSet::new();
-        let mut out: Vec<(String, Vec<TaskInfo<I>>)> = Vec::with_capacity(roots.len());
+        let mut out: Vec<(String, Vec<Arc<TaskInfo<I>>>)> = Vec::with_capacity(roots.len());
         for root in roots {
             self.soft_failed.remove(&root);
             self.failed_tasks.insert(root.clone());
@@ -516,7 +517,7 @@ impl<I: Identifier> PendingPool<I> {
     /// dispatch-ELIGIBLE until its exponential window expires, so a
     /// bounce loop (assign → backpressure → requeue → re-assign)
     /// cannot hot-spin.
-    pub fn requeue(&mut self, item: TaskInfo<I>) {
+    pub fn requeue(&mut self, item: Arc<TaskInfo<I>>) {
         if let Some(delay) = self
             .dispatch_backoff
             .note_requeued(&item.task_id, std::time::Instant::now())
@@ -586,7 +587,7 @@ impl<I: Identifier> PendingPool<I> {
     /// un-run and is left alone — the documented boundary. A reinject of
     /// a NEVER-completed task (the soft-failed / dormant revival cases)
     /// had no unblock to invert, so the inverse is a no-op for it.
-    pub fn reinject(&mut self, item: TaskInfo<I>) {
+    pub fn reinject(&mut self, item: Arc<TaskInfo<I>>) {
         // A reinject follows a FAILED attempt (retry bucket / operator
         // revival), so it stamps the same re-dispatch backoff a
         // requeue does: counted retries must not hot-spin either.
@@ -644,7 +645,7 @@ impl<I: Identifier> PendingPool<I> {
     /// move leftover queued items into a side queue between manager-
     /// internal phase transitions (e.g. moving NoFit items from the
     /// main phase queue into an "unassigned" bucket).
-    pub fn drain_queued(&mut self) -> Vec<TaskInfo<I>> {
+    pub fn drain_queued(&mut self) -> Vec<Arc<TaskInfo<I>>> {
         let mut out = Vec::new();
         for bucket in self.buckets.values_mut() {
             while let Some(item) = bucket.items.pop_front() {
