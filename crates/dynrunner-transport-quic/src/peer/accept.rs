@@ -141,6 +141,7 @@ async fn handle_accepted_quic<I: Identifier>(
         .send(AcceptedPeer {
             peer_id: peer_id.clone(),
             outgoing_tx,
+            inbound: true,
         })
         .is_err()
     {
@@ -214,6 +215,7 @@ async fn handle_accepted_wss<I: Identifier>(
         .send(AcceptedPeer {
             peer_id: peer_id.clone(),
             outgoing_tx,
+            inbound: true,
         })
         .is_err()
     {
