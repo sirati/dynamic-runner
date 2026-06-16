@@ -185,12 +185,12 @@ impl From<String> for AffinityId {
 /// `binary_name`, `platform`, `compiler`, etc.) is defined by the
 /// task-specific crate (e.g. `dynrunner_pyo3`).
 pub trait Identifier:
-    Clone + Debug + Hash + Eq + Serialize + for<'de> Deserialize<'de> + Send + 'static
+    Clone + Debug + Hash + Eq + Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static
 {
 }
 
 impl<T> Identifier for T where
-    T: Clone + Debug + Hash + Eq + Serialize + for<'de> Deserialize<'de> + Send + 'static
+    T: Clone + Debug + Hash + Eq + Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static
 {
 }
 

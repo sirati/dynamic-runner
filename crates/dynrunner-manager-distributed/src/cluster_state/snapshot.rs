@@ -652,6 +652,13 @@ impl<I: Identifier> ClusterState<I> {
             // only — its production caller (the promotion signal) pairs
             // it with the settled-base handover (`settled_base_clone`).
             settled: _settled,
+            // Frozen task-def registry — REPLICATED, but NOT carried in the
+            // snapshot HEAD in L1: a restoring replica rebuilds it (empty,
+            // re-populated as it interns defs it observes); the full
+            // def-transfer over the stream is a later leaf. `_`-dropped here
+            // exactly like `settled` (a task-batch / file-served concern,
+            // not a head field) and bound for the exhaustive guard.
+            definitions: _definitions,
             // node-local: slurm-authoritative life-state snapshot consumed
             // by the apply-path sticky-removal reversibility tiebreak
             // (#546) — a pure runtime handle the restoring replica re-wires

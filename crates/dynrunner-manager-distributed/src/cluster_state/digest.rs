@@ -247,6 +247,11 @@ impl<I: Identifier> ClusterState<I> {
             // accumulator and adding the settled count keeps the digest
             // BYTE-IDENTICAL to a full fold of the logical state.
             settled,
+            // REPLICATED but NON-contributing to the digest — def content is
+            // already implied by the tasks fold via the content-based join-key;
+            // folding the index would diverge anti-entropy. Bound for the
+            // exhaustive guard.
+            definitions: _definitions,
             // node-local: slurm-authoritative life-state snapshot consumed
             // by the apply-path sticky-removal reversibility tiebreak
             // (#546). A pure runtime handle (no replicated content), so it
