@@ -66,6 +66,7 @@ mod producer_backstop;
 mod promotion;
 mod quorum_pending_signal;
 mod reconciliation_probe;
+mod reconciliation_requeue_cap;
 mod relocate_staging;
 mod requeue_terminal_race;
 mod result_data_plumbing;

@@ -316,6 +316,21 @@ pub(crate) struct ReconciliationProber {
     /// `None` until the first poll (the first poll is always due).
     next_poll: Option<Instant>,
     tracked: HashMap<String, TrackedTask>,
+    /// Per-task CONSECUTIVE reconciliation-LOSS requeue counter (#497
+    /// backstop). Incremented each time a task's holder denies it
+    /// (`held = false`) and it is requeued; CLEARED on any genuine
+    /// terminal/progress for the hash ([`Self::clear_requeues`], called
+    /// from the `TaskComplete`/`TaskFailed` genuine-terminal records). A
+    /// task that crosses [`PrimaryConfig::max_reconciliation_requeues`]
+    /// with no genuine progress in between can NEVER register a holder
+    /// (a never-wired report / an affine dependent unfulfillable on every
+    /// secondary), so it is routed to a NonRecoverable terminal instead of
+    /// requeued — bounding the otherwise-unbounded loop + coordinator leak.
+    /// Survives the requeue's own untrack (the entry leaves the in-flight
+    /// view between requeue and re-dispatch); a genuine terminal is what
+    /// clears it, NOT the view-sync drop — so a merely-slow task that DOES
+    /// land a terminal is never poisoned.
+    loss_requeues: HashMap<String, u32>,
     /// The most recent sweep's cohort, while it is still collecting
     /// verdicts toward its one summary line. LOG BOOKKEEPING ONLY —
     /// never consulted by the probe-timing or verdict logic.
@@ -334,8 +349,34 @@ impl ReconciliationProber {
             stall_warn_after,
             next_poll: None,
             tracked: HashMap::new(),
+            loss_requeues: HashMap::new(),
             cohort: None,
         }
+    }
+
+    /// Record ONE reconciliation-loss requeue for `task_hash` and report
+    /// whether the per-task consecutive-loss count has now reached `cap`
+    /// (`max_reconciliation_requeues`). `true` ⇒ the caller routes the task
+    /// to a NonRecoverable terminal instead of requeueing it (the task can
+    /// never register a holder). The count is consecutive: it survives the
+    /// requeue's own view-sync untrack and is cleared only by
+    /// [`Self::clear_requeues`] on a genuine terminal — so only fruitless
+    /// LOST cycles count, never a merely-slow task that eventually settles.
+    /// A `cap` of 0 disables the backstop (every loss requeues, forever).
+    pub(crate) fn note_loss_requeue(&mut self, task_hash: &str, cap: u32) -> bool {
+        if cap == 0 {
+            return false;
+        }
+        let count = self.loss_requeues.entry(task_hash.to_string()).or_insert(0);
+        *count += 1;
+        *count >= cap
+    }
+
+    /// Clear `task_hash`'s consecutive reconciliation-loss count on genuine
+    /// progress (a real `TaskComplete`/`TaskFailed` terminal for the hash).
+    /// Idempotent — a hash that never lost is absent and this no-ops.
+    pub(crate) fn clear_requeues(&mut self, task_hash: &str) {
+        self.loss_requeues.remove(task_hash);
     }
 
     /// Cheap pre-check the caller runs BEFORE building the in-flight
@@ -766,16 +807,58 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 }
                 let worker_id = entry.local_worker_id.unwrap_or(0);
                 let secondary_id = entry.secondary_id.clone();
-                tracing::debug!(
-                    task_hash = %task_hash,
-                    holder = %secondary_id,
-                    worker_id,
-                    late_after_sweep_summary = outcome.late,
-                    "reconciliation probe verdict: NOT HELD — the holder \
-                     denies holding the task; its terminal will never come \
-                     (lost terminal / sweep bug / stranded bookkeeping). \
-                     Failing + requeueing via the backpressure-shaped path"
-                );
+                // Backstop (#497): bound the per-task consecutive loss
+                // requeues. A task whose holder keeps denying it with NO
+                // genuine progress in between can never register a holder (a
+                // never-wired report, an affine dependent unfulfillable on
+                // every secondary). Past the cap, route it to a CLEAR
+                // NonRecoverable terminal instead of requeueing — the run
+                // fails fast with a diagnostic rather than looping every
+                // `task_reconciliation_timeout` forever (re-originating
+                // `InFlight` + leaking the coordinator). Below the cap, the
+                // unchanged backpressure-shaped requeue (no retry-budget
+                // burn). The counter is cleared on any genuine terminal for
+                // the hash (`handle_task_complete` / the terminal arm of
+                // `handle_task_failed`), so a merely-slow task is never
+                // poisoned — only fruitless LOST cycles count.
+                let cap_reached = self
+                    .recon_prober
+                    .note_loss_requeue(&task_hash, self.config.max_reconciliation_requeues);
+                let (error_type, error_message) = if cap_reached {
+                    tracing::error!(
+                        task_hash = %task_hash,
+                        holder = %secondary_id,
+                        worker_id,
+                        max_reconciliation_requeues = self.config.max_reconciliation_requeues,
+                        "reconciliation probe verdict: NOT HELD for the cap \
+                         number of consecutive cycles with no progress — the \
+                         task can never register a holder; failing it \
+                         NonRecoverable instead of looping unbounded"
+                    );
+                    (
+                        ErrorType::NonRecoverable,
+                        format!(
+                            "unfulfillable: {} reconciliation cycles with no \
+                             holder registration",
+                            self.config.max_reconciliation_requeues
+                        ),
+                    )
+                } else {
+                    tracing::debug!(
+                        task_hash = %task_hash,
+                        holder = %secondary_id,
+                        worker_id,
+                        late_after_sweep_summary = outcome.late,
+                        "reconciliation probe verdict: NOT HELD — the holder \
+                         denies holding the task; its terminal will never come \
+                         (lost terminal / sweep bug / stranded bookkeeping). \
+                         Failing + requeueing via the backpressure-shaped path"
+                    );
+                    (
+                        ErrorType::Recoverable,
+                        RECONCILIATION_LOST_WIRE_MESSAGE.to_string(),
+                    )
+                };
                 let synthetic = DistributedMessage::TaskFailed {
                     target: None,
                     // The verdict is the primary's own adjudication; the
@@ -786,8 +869,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     secondary_id,
                     worker_id,
                     task_hash,
-                    error_type: ErrorType::Recoverable,
-                    error_message: RECONCILIATION_LOST_WIRE_MESSAGE.into(),
+                    error_type,
+                    error_message,
                     delivery_seq: None,
                     // Stamped at the send_to_primary chokepoint (ordering gate).
                     msgs_posted_through: None,
