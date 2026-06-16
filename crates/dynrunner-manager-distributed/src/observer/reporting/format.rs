@@ -394,7 +394,7 @@ pub fn render_report_full(cur: &StatsSnapshot) -> String {
     }
     if let Some(v) = cur.avg_cpu_utilization_milli {
         lines.push(format!(
-            "host CPU utilization (avg per secondary): {}",
+            "host CPU utilization excl. framework (avg per secondary): {}",
             format_milli_percent(v as u64)
         ));
     }
@@ -648,7 +648,7 @@ pub fn render_report(
         ),
         (
             MetricLine {
-                label: "host CPU utilization (avg per secondary)",
+                label: "host CPU utilization excl. framework (avg per secondary)",
                 shape: MetricShape::ResourceAvg {
                     value: cur.avg_cpu_utilization_milli.map(|v| v as u64),
                     prev_printed: resource_prev.cpu_utilization_milli.map(|v| v as u64),

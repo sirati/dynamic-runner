@@ -58,6 +58,17 @@ pub struct HostMemoryReading {
     /// "every core at 100%" — the natural normalisation the #575
     /// observer aggregation wants.
     pub cpu_stat: Option<CpuStat>,
+    /// Cumulative CPU ticks consumed by THIS process (utime + stime,
+    /// fields 14 + 15 of `/proc/self/stat`, in USER_HZ — the same
+    /// clock-tick unit the `/proc/stat` aggregate counts). Process-wide:
+    /// the kernel sums every thread, so the in-process peer-mesh tasks
+    /// are already included. `None` on parse failure / non-Linux. The
+    /// watcher diffs this across sweeps over the SAME interval as
+    /// `cpu_stat` and subtracts the framework's own share from the host
+    /// busy fraction, so the reported host CPU reflects the WORKLOAD
+    /// (worker subprocesses are CHILDREN — NOT counted here — so they
+    /// stay in the reported figure).
+    pub self_cpu_ticks: Option<u64>,
 }
 
 /// Cumulative tick counts from the aggregate `cpu` line of
@@ -208,6 +219,7 @@ impl SystemProbe for ProcSysProbe {
                 .as_deref()
                 .and_then(read_memory_events_oom_kill),
             cpu_stat: read_proc_stat_cpu(),
+            self_cpu_ticks: read_proc_self_cpu(),
         }
     }
 }
@@ -288,6 +300,83 @@ pub(crate) fn cpu_busy_milli(prev: CpuStat, cur: CpuStat) -> Option<u32> {
     // many orders of magnitude).
     let milli = (busy as u128).saturating_mul(100_000) / dtotal as u128;
     Some(milli.min(100_000) as u32)
+}
+
+/// Host busy fraction (milli-percent) with THIS process's own CPU
+/// share subtracted — the #575 "host CPU of the WORKLOAD, not the
+/// framework" figure.
+///
+/// Both fractions are taken over the SAME denominator `Δtotal` (the
+/// sum-across-all-cpus aggregate `/proc/stat` delta), so they are
+/// directly comparable and subtractable in the same unit:
+/// `own_milli = Δself_ticks / Δtotal * 100_000`. `/proc/self`
+/// utime+stime are in USER_HZ ticks, the `/proc/stat` aggregate total
+/// is the same USER_HZ ticks summed across cpus, so the ratio matches
+/// the host busy fraction's normalisation (100_000 = every core at
+/// 100%).
+///
+/// `prev_self` / `cur_self` are `None` when `/proc/self/stat` was
+/// unreadable on either sweep (or the first sweep has no prior) — the
+/// fallback is to NOT subtract, reporting the host fraction as-is
+/// rather than erroring. The net is clamped at 0 (the own share can
+/// never legitimately exceed the host total, but a tick-boundary race
+/// could momentarily; clamp keeps the field non-negative).
+pub(crate) fn cpu_busy_milli_excl_self(
+    prev: CpuStat,
+    cur: CpuStat,
+    prev_self: Option<u64>,
+    cur_self: Option<u64>,
+) -> Option<u32> {
+    let host = cpu_busy_milli(prev, cur)?;
+    let (Some(prev_self), Some(cur_self)) = (prev_self, cur_self) else {
+        // No self readout on one of the two sweeps → report host as-is.
+        return Some(host);
+    };
+    let dtotal = cur.total.saturating_sub(prev.total);
+    if dtotal == 0 {
+        // `cpu_busy_milli` already returned `None` for a zero host
+        // delta, so this is unreachable; guard anyway against a /0.
+        return Some(host);
+    }
+    let dself = cur_self.saturating_sub(prev_self);
+    let own_milli = ((dself as u128).saturating_mul(100_000) / dtotal as u128).min(100_000) as u32;
+    Some(host.saturating_sub(own_milli))
+}
+
+/// Read THIS process's cumulative CPU ticks (utime + stime) from
+/// `/proc/self/stat`. `None` on missing file, IO error, or unparseable
+/// shape / non-Linux.
+pub(crate) fn read_proc_self_cpu() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let contents = std::fs::read_to_string("/proc/self/stat").ok()?;
+        parse_proc_self_cpu(&contents)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Parse utime + stime (fields 14 + 15, 1-based) out of a
+/// `/proc/self/stat`-shaped line and return their sum in clock ticks.
+///
+/// Field 2 (`comm`) is wrapped in parentheses and MAY contain spaces
+/// and even close-parens, so a naive whitespace split mis-indexes every
+/// later field. The robust parse: split on the LAST `)` — everything
+/// after it is the space-separated tail starting at field 3 (`state`).
+/// utime is the 12th token of that tail (field 14), stime the 13th
+/// (field 15). Returns `None` if the line is malformed.
+pub(crate) fn parse_proc_self_cpu(contents: &str) -> Option<u64> {
+    let line = contents.lines().next()?;
+    // Everything after the final ')' is field 3 onward, space-separated.
+    let tail = &line[line.rfind(')')? + 1..];
+    let mut cols = tail.split_ascii_whitespace();
+    // Tail token 1 = field 3 (state). utime = field 14 = tail token 12;
+    // stime = field 15 = tail token 13.
+    let utime: u64 = cols.nth(11)?.parse().ok()?;
+    let stime: u64 = cols.next()?.parse().ok()?;
+    Some(utime.saturating_add(stime))
 }
 
 /// Read `<cgroup>/memory.events` and extract the cumulative `oom_kill`
@@ -518,5 +607,102 @@ mod tests {
             idle: 0,
         };
         assert_eq!(cpu_busy_milli(prev, cur), Some(100_000));
+    }
+
+    #[test]
+    fn parse_proc_self_cpu_sums_utime_and_stime() {
+        // Real `/proc/self/stat` shape: pid (comm) state ppid ... where
+        // utime is field 14 and stime field 15. comm here is "(cat)".
+        // Fields after ')': 3=state .. 14=utime .. 15=stime.
+        // 1   2     3 4 5 6 7 8  9  10 11 12 13 14 15 ...
+        let contents =
+            "1234 (cat) R 1 1234 1234 0 -1 4194304 100 0 0 0 42 17 0 0 20 0 1 0 999 0 0\n";
+        // utime = 42, stime = 17 → sum 59.
+        assert_eq!(parse_proc_self_cpu(contents), Some(59));
+    }
+
+    #[test]
+    fn parse_proc_self_cpu_handles_comm_with_spaces_and_parens() {
+        // comm can contain spaces and even close-parens — splitting on
+        // the LAST ')' is what keeps the field index correct.
+        let contents =
+            "77 (weird ) name) S 1 77 77 0 -1 0 5 0 0 0 8 3 0 0 20 0 1 0 0 0 0\n";
+        // After the final ')': "S 1 77 77 0 -1 0 5 0 0 0 8 3 ..."
+        // token1=S(field3) ... token12=8(field14=utime) token13=3(stime)
+        assert_eq!(parse_proc_self_cpu(contents), Some(11));
+    }
+
+    #[test]
+    fn parse_proc_self_cpu_rejects_malformed() {
+        assert!(parse_proc_self_cpu("no parens here").is_none());
+        assert!(parse_proc_self_cpu("1 (c) R 1 2 3").is_none()); // too few fields
+    }
+
+    #[test]
+    fn cpu_busy_milli_excl_self_subtracts_own_share() {
+        // Host: 100 ticks total, all busy → host 100_000 milli.
+        // Self consumed 30 of those 100 ticks → own = 30_000 milli.
+        // Reported = 100_000 - 30_000 = 70_000.
+        let prev = CpuStat { total: 0, idle: 0 };
+        let cur = CpuStat { total: 100, idle: 0 };
+        assert_eq!(
+            cpu_busy_milli_excl_self(prev, cur, Some(0), Some(30)),
+            Some(70_000)
+        );
+    }
+
+    #[test]
+    fn cpu_busy_milli_excl_self_matches_denominator_unit() {
+        // 4-core box, 1s at 100 Hz → 400 total ticks. Host 50% busy
+        // across all cores: busy 200 → host 50_000 milli. Self used 40
+        // ticks over the SAME 400-tick denominator → own = 10_000.
+        // Net = 40_000. Confirms own and host share the summed-across-
+        // cpus Δtotal denominator.
+        let prev = CpuStat { total: 0, idle: 0 };
+        let cur = CpuStat {
+            total: 400,
+            idle: 200,
+        };
+        assert_eq!(
+            cpu_busy_milli_excl_self(prev, cur, Some(100), Some(140)),
+            Some(40_000)
+        );
+    }
+
+    #[test]
+    fn cpu_busy_milli_excl_self_clamps_at_zero() {
+        // Pathological tick-boundary race: own delta exceeds host busy
+        // delta. The net must clamp at 0, never go negative.
+        let prev = CpuStat { total: 0, idle: 0 };
+        let cur = CpuStat { total: 100, idle: 60 }; // host busy 40 → 40_000
+        // self consumed 80 ticks → own 80_000 > 40_000.
+        assert_eq!(
+            cpu_busy_milli_excl_self(prev, cur, Some(0), Some(80)),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn cpu_busy_milli_excl_self_falls_back_to_host_when_self_unreadable() {
+        // /proc/self unreadable on one of the two sweeps → report the
+        // host fraction as-is (do not subtract, do not error).
+        let prev = CpuStat { total: 0, idle: 0 };
+        let cur = CpuStat { total: 100, idle: 0 }; // host 100_000
+        assert_eq!(
+            cpu_busy_milli_excl_self(prev, cur, None, Some(30)),
+            Some(100_000)
+        );
+        assert_eq!(
+            cpu_busy_milli_excl_self(prev, cur, Some(0), None),
+            Some(100_000)
+        );
+    }
+
+    #[test]
+    fn cpu_busy_milli_excl_self_none_on_zero_host_delta() {
+        // No host time elapsed → None (first-sweep / same-tick contract),
+        // regardless of the self readings.
+        let cur = CpuStat { total: 100, idle: 50 };
+        assert_eq!(cpu_busy_milli_excl_self(cur, cur, Some(0), Some(10)), None);
     }
 }
