@@ -80,6 +80,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // terminal — the fence is over for this hash. Symmetric with
             // the in-flight ledger drop in `free_slot_on_terminal` below.
             self.drop_supplanted_holder(task_hash);
+            // Genuine progress (#497): a real terminal clears the per-task
+            // reconciliation-loss requeue counter so a hash that completes
+            // after one or two lost cycles is never poisoned by the cap.
+            self.recon_prober.clear_requeues(task_hash);
             // Replicated-ledger update: every node mirrors the
             // post-completion state by applying this mutation. CRDT
             // semantics make duplicate applies (e.g. on a re-broadcast

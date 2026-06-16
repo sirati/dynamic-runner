@@ -17,6 +17,7 @@
 //!   `WorkerMgmtSignal::TasksAdded`; positive + negative-control +
 //!   is_idle-advisory + coalesce.
 
+mod affine_deferral;
 mod affine_seed;
 mod already_held;
 mod assembly_beacon;
@@ -65,6 +66,7 @@ mod producer_backstop;
 mod promotion;
 mod quorum_pending_signal;
 mod reconciliation_probe;
+mod reconciliation_requeue_cap;
 mod relocate_staging;
 mod requeue_terminal_race;
 mod result_data_plumbing;

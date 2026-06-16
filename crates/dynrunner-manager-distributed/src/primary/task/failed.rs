@@ -310,6 +310,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // so the next dispatch must still be fenced) and NOT done on
             // the already-held arm (the task stays in flight on the holder).
             self.drop_supplanted_holder(&task_hash);
+            // Genuine terminal (#497): a real `TaskFailed` settles the hash,
+            // so clear its per-task reconciliation-loss requeue counter. NOT
+            // done on the backpressure-requeue arm above (the reconciliation-
+            // LOST requeue is exactly what the counter exists to count) —
+            // only this terminal arm clears it. A cap-driven NonRecoverable
+            // terminal also lands here, harmlessly clearing its own count.
+            self.recon_prober.clear_requeues(&task_hash);
             // Replicated-ledger update: every node mirrors the
             // post-failure state. The wire `error_type` is now the
             // typed `ErrorType` enum (Phase D), so the CRDT mutation

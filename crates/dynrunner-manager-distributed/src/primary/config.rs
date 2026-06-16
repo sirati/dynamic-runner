@@ -160,6 +160,20 @@ pub const DEFAULT_TASK_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(60
 /// diagnostic fires — purely observability, never a verdict.
 pub const DEFAULT_TASK_INFLIGHT_STALL_WARN_AFTER: Duration = Duration::from_secs(3600);
 
+/// Default for [`PrimaryConfig::max_reconciliation_requeues`].
+///
+/// Six fruitless reconciliation cycles is generous: each cycle is a full
+/// `task_reconciliation_timeout` (default 600s) of in-flight time, so the
+/// cap only trips after ~1h of a task being requeued onto holders that
+/// repeatedly deny it with NO genuine progress in between — far past any
+/// transient sweep-bug / stranded-bookkeeping shape that legitimately
+/// recovers in one or two cycles. A task that EVER lands a real terminal
+/// resets the counter, so a merely-slow task is never poisoned; the cap is
+/// the structural backstop against a task that can never register a holder
+/// (a never-wired report, an affine dependent unfulfillable on every
+/// secondary) looping + leaking the coordinator unbounded.
+pub const DEFAULT_MAX_RECONCILIATION_REQUEUES: u32 = 6;
+
 /// Configuration for the primary coordinator.
 pub struct PrimaryConfig {
     pub node_id: String,
@@ -467,6 +481,23 @@ pub struct PrimaryConfig {
     /// (fresh progress), never on a same-holder re-arm.
     pub task_inflight_stall_warn_after: Duration,
 
+    /// How many consecutive reconciliation-probe LOSS requeues a single
+    /// task may accumulate — with NO genuine progress in between — before
+    /// the prober stops requeueing it and routes it to a NonRecoverable
+    /// terminal instead (#497 backstop). A task whose holder repeatedly
+    /// denies it (`held = false`) is requeued through the backpressure-
+    /// shaped path, which burns NO retry budget; absent a cap, a task that
+    /// can NEVER register a holder (a never-wired report, an
+    /// unfulfillable-on-every-secondary affine dependent) loops every
+    /// `task_reconciliation_timeout` forever, re-originating `InFlight` and
+    /// leaking the coordinator. After this many fruitless cycles the task
+    /// fails fast with a diagnostic instead of looping. The counter is
+    /// per-task and RESET on any genuine terminal/progress (a real
+    /// `TaskComplete`/`TaskFailed` for the hash), so a task whose terminal
+    /// is merely slow is never poisoned — only reconciliation-LOST requeues
+    /// count. Default [`DEFAULT_MAX_RECONCILIATION_REQUEUES`].
+    pub max_reconciliation_requeues: u32,
+
     /// The SLURM partition this run's secondaries were submitted to, or
     /// `None` for non-SLURM deployments. Carried opaquely — this crate
     /// has no SLURM dependency; the SLURM pipeline layer sets the field
@@ -507,6 +538,7 @@ impl Default for PrimaryConfig {
             peer_credentials_path: None,
             task_reconciliation_timeout: DEFAULT_TASK_RECONCILIATION_TIMEOUT,
             task_inflight_stall_warn_after: DEFAULT_TASK_INFLIGHT_STALL_WARN_AFTER,
+            max_reconciliation_requeues: DEFAULT_MAX_RECONCILIATION_REQUEUES,
             slurm_partition: None,
         }
     }
