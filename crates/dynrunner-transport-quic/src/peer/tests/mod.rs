@@ -25,9 +25,9 @@
 //!   (`peer_dial_info`) but unconnected peer that misses a broadcast
 //!   is named by a WARN, once per peer per outage.
 //! - [`dial_sweep`]: the `connect_to_peers` sweep-summary dispositions
-//!   (#362) — spawned / already-connected / awaiting-inbound (lower-id
-//!   rule) / dropped-from-list — plus the higher-id side's truthful
-//!   "peer leg missing, this node never dials it" summary WARN.
+//!   (#362) under full-mesh dialing — every node spawns a dial per
+//!   listed peer, already-connected / self skips, dropped-from-list,
+//!   plus the dial-failure summary now always naming this node as dialer.
 //! - [`formation_retry`]: mesh-formation retry — a leg whose INITIAL
 //!   dial never landed (peer unreachable during a startup-load window)
 //!   stays tracked by the reconnect reconciliation and establishes the
@@ -36,13 +36,12 @@
 //! - [`ingest_edges`]: ingest-edge clock recording over a real wire —
 //!   the read loop stamps ARRIVAL without anyone driving `recv_peer`
 //!   (the starved-pump honesty), DRAINED only on the actual pull.
-//! - [`joiner_dial_order`]: joining-mode dial order — a rosterless
-//!   late-joiner (`start_joining` → `dial_all_seeds`) dials EVERY seed
-//!   regardless of id order, so a leg to a lower-id seed (which never
-//!   learns the joiner to dial it) forms instead of parking
-//!   `awaiting_inbound` forever; the crossed dial from a seed that later
-//!   learns the joiner is deduped against the live wire; steady-state
-//!   members keep the lower-id dedup unchanged.
+//! - [`joiner_dial_order`]: full-mesh dialing + the symmetric
+//!   duplicate-connection tiebreak — every node dials every peer
+//!   regardless of id order (a higher-id node forms a leg to a lower-id
+//!   peer the old rule never dialed), and a mutual dial's two connections
+//!   converge on the lower-id initiator's wire on BOTH ends (no
+//!   disconnect), with the loser dropped.
 //! - [`late_joiner_forward`]: desktop-shaped late-joiner bootstrap —
 //!   the RED repro (compute-internal address unreachable from this
 //!   host ⇒ loud bounded `NoReachablePeer`), the GREEN contract

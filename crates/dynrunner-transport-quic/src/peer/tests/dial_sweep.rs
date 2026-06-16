@@ -1,14 +1,13 @@
-//! `connect_to_peers` sweep-summary dispositions (#362).
+//! `connect_to_peers` sweep-summary dispositions (#362) under full-mesh
+//! dialing.
 //!
-//! The production silence: a member logged "received peer list,
-//! kicking off peer dials peers=2" and then NOTHING, ever — because it
-//! was the lexicographically-HIGHEST id in the fleet, so the
-//! lower-id-dials rule made it spawn ZERO dials (each skip logged only
-//! at DEBUG) and its entire mesh depended on the siblings' inbound
-//! dials. These tests pin the [`DialSweepSummary`] dispositions that
-//! now narrate that shape at operator level, the dropped-peer
-//! detection on authoritative-list replacement, and the higher-id
-//! side's truthful "this node never dials it" reconnect summary.
+//! Full-mesh: EVERY node dials EVERY not-yet-connected peer, regardless
+//! of id ordering — the lower-id-dials asymmetry (and the silent-zero-
+//! dial #362 shape it produced on the highest-id node) is gone. These
+//! tests pin that every node spawns a dial per listed peer, the
+//! already-connected / self skips, the dropped-peer detection on
+//! authoritative-list replacement, and that the reconnect dial-failure
+//! summary now always names this node as the dialer.
 
 use std::sync::{Arc, Mutex};
 
@@ -36,12 +35,13 @@ fn pinfo(id: &str) -> PeerConnectionInfo {
     }
 }
 
-/// HIGHEST-id node: every listed peer sorts lower, so the sweep spawns
-/// ZERO dials and names every peer as awaiting-inbound — the exact
-/// structural shape behind the #362 "dials die 4-for-4 with zero
-/// trace" member. Pre-summary, this outcome was invisible.
+/// HIGHEST-id node under full mesh: it now DIALS every listed peer
+/// (regardless of id ordering) — the previously-broken case where the
+/// highest-id node spawned ZERO dials and its mesh hung on the siblings'
+/// inbound dials (the #362 shape). A lower-id peer is dialed, where
+/// before it would have parked awaiting-inbound.
 #[tokio::test(flavor = "current_thread")]
-async fn highest_id_sweep_spawns_zero_dials_and_names_awaiting_inbound() {
+async fn highest_id_sweep_dials_every_lower_id_peer() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -51,22 +51,19 @@ async fn highest_id_sweep_spawns_zero_dials_and_names_awaiting_inbound() {
                 summary,
                 DialSweepSummary {
                     listed: 2,
-                    spawned: 0,
+                    spawned: 2,
                     already_connected: 0,
-                    awaiting_inbound: vec!["peer-a".into(), "peer-b".into()],
                     dropped_from_list: vec![],
                 },
-                "the highest-id node must spawn no dials and name both \
-                 peers as awaiting-inbound"
+                "full-mesh: the highest-id node must dial BOTH lower-id peers"
             );
-            // The dial info is still cached for both (redial signals +
-            // reconnect tracking need it even on the non-dialing side).
             assert_eq!(net.peer_dial_info.len(), 2);
         })
         .await;
 }
 
-/// LOWEST-id node: it owns the dial side for every listed peer.
+/// LOWEST-id node: it dials every listed peer too (always did, and still
+/// does under full mesh).
 #[tokio::test(flavor = "current_thread")]
 async fn lowest_id_sweep_spawns_a_dial_per_peer() {
     let local = tokio::task::LocalSet::new();
@@ -76,7 +73,6 @@ async fn lowest_id_sweep_spawns_a_dial_per_peer() {
             let summary = net.connect_to_peers_inner(&[pinfo("peer-b"), pinfo("peer-z")]);
             assert_eq!(summary.listed, 2);
             assert_eq!(summary.spawned, 2);
-            assert!(summary.awaiting_inbound.is_empty());
         })
         .await;
 }
@@ -125,13 +121,12 @@ async fn sweep_names_peers_dropped_from_the_authoritative_list() {
         .await;
 }
 
-/// Higher-id side's reconnect summary must NOT claim to be dialing
-/// (it never does — lower-id-dials rule); it must instead point the
-/// operator at the peer's own dial logs / this node's advertised
-/// address. Mirror of `dial_failure_summary_fires_at_threshold_with_addr`,
-/// with self ABOVE the tracked peer.
+/// Full-mesh: a higher-id node's reconnect dial-failure summary now names
+/// THIS node as the dialer ("peer unreachable; dialing address") even for
+/// a lower-id peer — because under full mesh it dials everyone. The old
+/// "this node NEVER dials it" awaiting-inbound summary is gone.
 #[tokio::test(flavor = "current_thread")]
-async fn higher_id_summary_names_awaiting_inbound_not_dialing() {
+async fn higher_id_summary_names_self_as_dialer() {
     let records: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let layer = CaptureLayer {
         records: records.clone(),
@@ -142,8 +137,8 @@ async fn higher_id_summary_names_awaiting_inbound_not_dialing() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            // Self sorts HIGHER than the tracked peer ⇒ this node never
-            // dials it.
+            // Self sorts HIGHER than the tracked peer — under full mesh it
+            // STILL dials it.
             let mut net: PeerNetwork<TestId> = PeerNetwork::start("peer-z", None).await.unwrap();
             let info = pinfo("peer-a");
             net.peer_dial_info.insert(info.secondary_id.clone(), info);
@@ -155,26 +150,19 @@ async fn higher_id_summary_names_awaiting_inbound_not_dialing() {
             let captured = records.lock().unwrap().clone();
             let summaries: Vec<&CapturedEvent> = captured
                 .iter()
-                .filter(|e| e.message.contains("peer leg missing"))
+                .filter(|e| e.message.contains("peer unreachable; dialing address"))
                 .collect();
             assert_eq!(
                 summaries.len(),
                 1,
-                "exactly one awaiting-inbound summary at the threshold; got {captured:#?}"
+                "exactly one dialing-side summary at the threshold; got {captured:#?}"
             );
-            assert!(
-                summaries[0].message.contains("NEVER dials"),
-                "the summary must say this node never dials the peer; got {:?}",
-                summaries[0].message
-            );
-            // And no event may claim this node is DIALING the peer —
-            // that was the pre-fix lie ("peer unreachable; dialing
-            // address") on the higher-id side.
+            // The old higher-id-only awaiting-inbound summary must NOT fire.
             assert!(
                 !captured
                     .iter()
-                    .any(|e| e.message.contains("peer unreachable; dialing address")),
-                "higher-id side must not emit the dialing-side summary; got {captured:#?}"
+                    .any(|e| e.message.contains("peer leg missing")),
+                "full-mesh: no awaiting-inbound summary may fire; got {captured:#?}"
             );
         })
         .await;
