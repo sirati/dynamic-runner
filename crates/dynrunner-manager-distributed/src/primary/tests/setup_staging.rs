@@ -87,8 +87,8 @@ fn flag_on_seeds_setup_completed_and_dependent_is_dispatchable() {
     // executed) and carries the framework stage id.
     let (setup_hash, setup_task_id) = cs
         .tasks_iter()
-        .find(|(_, s)| s.task().kind.is_setup())
-        .map(|(h, s)| (h.clone(), s.task().task_id.clone()))
+        .find(|(_, s)| s.def().kind.is_setup())
+        .map(|(h, s)| (h.clone(), s.def().task_id.clone()))
         .expect("an injected setup task in the ledger");
     assert!(
         setup_task_id.starts_with(STAGE_PREFIX),
@@ -177,7 +177,7 @@ fn relocated_primary_reads_ledger_and_dep_is_satisfied() {
     // task dispatchable — entirely from the inherited ledger.
     let cs = promoted.cluster_state_for_test();
     assert!(
-        cs.tasks_iter().any(|(_, s)| s.task().kind.is_setup()
+        cs.tasks_iter().any(|(_, s)| s.def().kind.is_setup()
             && matches!(s, crate::cluster_state::TaskState::SetupCompleted { .. })),
         "the inherited ledger carries the pre-succeeded stage setup task"
     );
@@ -251,7 +251,7 @@ async fn flag_on_discovery_path_seeds_setup_completed_and_dependent_dispatchable
                 "discovered work task + its injected stage setup task"
             );
             assert!(
-                cs.tasks_iter().any(|(_, s)| s.task().kind.is_setup()
+                cs.tasks_iter().any(|(_, s)| s.def().kind.is_setup()
                     && matches!(s, crate::cluster_state::TaskState::SetupCompleted { .. })),
                 "the discovery path seeds the stage setup task pre-succeeded too"
             );
@@ -304,7 +304,7 @@ fn flag_off_old_path_is_unchanged() {
     );
     assert!(
         cs.tasks_iter()
-            .all(|(_, s)| s.task().kind.is_worker_assignable()),
+            .all(|(_, s)| s.def().kind.is_worker_assignable()),
         "flag off: no Setup-kind task exists in the ledger"
     );
     // No SetupCompleted state anywhere.
@@ -324,7 +324,7 @@ fn flag_off_old_path_is_unchanged() {
     );
     let work_deps = cs
         .task_state(&work_hash)
-        .map(|s| s.task().task_depends_on.clone())
+        .map(|s| s.def().task_depends_on.clone())
         .expect("the work task entry");
     assert!(
         work_deps.is_empty(),
@@ -377,8 +377,8 @@ fn required_files_seed_uploads_pending_and_work_blocked_until_completed() {
     // and the framework upload id.
     let uploads: Vec<_> = cs
         .tasks_iter()
-        .filter(|(_, s)| s.task().kind.is_setup())
-        .map(|(h, s)| (h.clone(), s.task().clone()))
+        .filter(|(_, s)| s.def().kind.is_setup())
+        .map(|(h, s)| (h.clone(), s.to_task_info()))
         .collect();
     assert_eq!(uploads.len(), 2, "two upload setup tasks");
     for (hash, task) in &uploads {
@@ -490,8 +490,8 @@ fn required_files_dedup_one_upload_shared_by_all_sharers() {
     );
     let uploads: Vec<_> = cs
         .tasks_iter()
-        .filter(|(_, s)| s.task().kind.is_setup())
-        .map(|(_, s)| s.task().clone())
+        .filter(|(_, s)| s.def().kind.is_setup())
+        .map(|(_, s)| s.to_task_info())
         .collect();
     assert_eq!(uploads.len(), 2, "exactly one upload per unique file");
 
@@ -509,8 +509,8 @@ fn required_files_dedup_one_upload_shared_by_all_sharers() {
     for name in ["b1", "b2", "b3"] {
         let deps = cs
             .tasks_iter()
-            .find(|(_, s)| s.task().task_id == name)
-            .map(|(_, s)| s.task().task_depends_on.clone())
+            .find(|(_, s)| s.def().task_id == name)
+            .map(|(_, s)| s.def().task_depends_on.clone())
             .unwrap_or_else(|| panic!("{name} in ledger"));
         assert!(
             deps.iter().any(|d| d.task_id == common_upload_id),
@@ -520,15 +520,15 @@ fn required_files_dedup_one_upload_shared_by_all_sharers() {
     // b1 additionally gates on its delta upload; b2/b3 do not.
     let b1_dep_count = cs
         .tasks_iter()
-        .find(|(_, s)| s.task().task_id == "b1")
-        .map(|(_, s)| s.task().task_depends_on.len())
+        .find(|(_, s)| s.def().task_id == "b1")
+        .map(|(_, s)| s.def().task_depends_on.len())
         .unwrap();
     assert_eq!(b1_dep_count, 2, "b1 gates on common + its own delta1");
     for name in ["b2", "b3"] {
         let n = cs
             .tasks_iter()
-            .find(|(_, s)| s.task().task_id == name)
-            .map(|(_, s)| s.task().task_depends_on.len())
+            .find(|(_, s)| s.def().task_id == name)
+            .map(|(_, s)| s.def().task_depends_on.len())
             .unwrap();
         assert_eq!(n, 1, "{name} gates on common only");
     }

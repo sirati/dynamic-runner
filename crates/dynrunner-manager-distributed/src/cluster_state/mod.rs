@@ -80,6 +80,8 @@ pub(crate) use settled::{SettledClass, SpillReceipt, write_spill_batch};
 // store is owned by `ClusterState`, like `settled`); additive in L1.
 #[allow(unused_imports)]
 pub(crate) use task_def_store::{FrozenTaskDef, TaskDefId, TaskDefStore};
+#[cfg(test)]
+pub(crate) use task_def_store::split_task_def;
 pub use snapshot::ClusterStateSnapshot;
 pub use state::ClusterState;
 // Snapshot-stream partition policy + payload codec: the plan iterates a

@@ -60,12 +60,12 @@ where
         // Resolve the task from the local CRDT mirror by hash, CLONING it out
         // so the `cluster_state` borrow ends before the (async) upload path
         // runs against `&self.upload_action`. The `task_state` accessor
-        // returns the live `TaskState` whose `.task()` is the `TaskInfo` we
+        // returns the live `TaskState` we reconstruct a `TaskInfo` from to
         // execute against.
         let task = self
             .cluster_state
             .task_state(&task_hash)
-            .map(|state| state.task().clone());
+            .map(|state| state.to_task_info());
         let outcome = match task {
             // The shared executor path (#336 P1): an upload-ref task uploads
             // via the registered action; a no-ref task keeps the #489 no-op.

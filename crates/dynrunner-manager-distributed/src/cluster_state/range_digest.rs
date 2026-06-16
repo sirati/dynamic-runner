@@ -199,7 +199,7 @@ impl<I: Identifier> ClusterState<I> {
         }
         if let Some(state) = self.tasks.get(hash) {
             let event = crate::task_state_change::TaskStateChangeEvent {
-                task_id: state.task().task_id.clone(),
+                task_id: state.def().task_id.clone(),
                 change: state.to_state_change(),
                 holder: state.holder().or(fallback_holder),
             };

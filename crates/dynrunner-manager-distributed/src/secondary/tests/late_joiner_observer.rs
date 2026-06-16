@@ -36,9 +36,8 @@ fn make_zero_worker_late_joiner(node_id: &str) -> SecondaryHarness<NoPeers> {
 fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestId> {
     use crate::cluster_state::TaskState;
     let mut tasks = HashMap::new();
-    let mk_pending = |path: &str, ident: &str| TaskState::Pending {
-        attempt: 0,
-        task: TaskInfo {
+    let mk_pending = |path: &str, ident: &str| {
+        let (def, routing) = crate::cluster_state::split_task_def(TaskInfo {
             path: PathBuf::from(path),
             size: 100,
             identifier: TestId(ident.into()),
@@ -55,8 +54,13 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
             upload_file: None,
             required_files: None,
             resolved_path: None,
-        },
-        version: Default::default(),
+        });
+        TaskState::Pending {
+            attempt: 0,
+            def,
+            routing,
+            version: Default::default(),
+        }
     };
     tasks.insert("task-1".to_string(), mk_pending("/tmp/task-1", "task-1"));
     tasks.insert("task-2".to_string(), mk_pending("/tmp/task-2", "task-2"));

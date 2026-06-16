@@ -451,11 +451,14 @@ pub struct ClusterStateSnapshot<I> {
 /// this is a no-op for non-legacy snapshots. Operates in place on the
 /// decoded snapshot before the lattice merge so the restored ledger
 /// carries fully-explicit `(phase_id, task_id)` deps.
-fn migrate_unphased_deps<I>(snap: &mut ClusterStateSnapshot<I>) {
+fn migrate_unphased_deps<I: Clone>(snap: &mut ClusterStateSnapshot<I>) {
     for state in snap.tasks.values_mut() {
-        let task = state.task_mut();
-        let enclosing = task.phase_id.clone();
-        for dep in &mut task.task_depends_on {
+        // `def_mut` copy-on-writes via `Arc::make_mut`; on a freshly-decoded
+        // snapshot each def `Arc` is unshared (refcount 1), so this rewrites
+        // the legacy un-phased deps in place rather than cloning.
+        let def = state.def_mut();
+        let enclosing = def.phase_id.clone();
+        for dep in &mut def.task_depends_on {
             dep.fill_phase(&enclosing);
         }
     }
