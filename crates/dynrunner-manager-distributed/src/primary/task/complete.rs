@@ -10,6 +10,19 @@ use crate::primary::command_channel::PrimaryCommand;
 use crate::worker_signal::WorkerMgmtSignal;
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
+    /// How often the per-completion aggregate INFO line ("task complete" +
+    /// the moving succeeded/fail_retry/fail_oom/fail_final counts) is
+    /// emitted: once every `COMPLETION_LOG_INTERVAL` completions, rather than
+    /// on every one. At 46k scale the unthrottled emit (each computing
+    /// `outcome_summary()`) was a dominant driver of the multi-GB TRACE
+    /// firehose that wedged the runtime. Sampling keeps the moving aggregate
+    /// operator-greppable at O(completions / interval) emission while the
+    /// per-task identity DEBUG sibling stays per-completion (it is cheap and
+    /// the e2e ordering checks key on it). The first completion of every
+    /// `interval` window emits, so the aggregate appears promptly at run
+    /// start and tracks throughout — never silently absent on a short run.
+    const COMPLETION_LOG_INTERVAL: u64 = 64;
+
     /// `command_rx` threads the operational-loop's command-channel
     /// receiver into the cascade so a callback-issued `spawn_tasks`
     /// applies inline before the next `drain_empty_active_phases`
@@ -140,17 +153,38 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // are diagnostic noise on the routine path — they go to
             // the DEBUG sibling below so debugging keeps the info
             // but the operator log stays terse.
-            let outcome = self.outcome_summary();
-            tracing::info!(
-                secondary = %secondary_id,
-                worker_id,
-                task_hash = %task_hash,
-                succeeded = outcome.succeeded,
-                fail_retry = outcome.fail_retry,
-                fail_oom = outcome.fail_oom,
-                fail_final = outcome.fail_final,
-                "task complete"
-            );
+            //
+            // THROTTLED (#scaling): emit the moving aggregate once every
+            // `COMPLETION_LOG_INTERVAL` completions instead of on every one.
+            // At 46k scale the per-completion emit — each computing
+            // `outcome_summary()` — drove the multi-GB TRACE firehose that
+            // wedged the runtime on the NFS log write. The aggregate is the
+            // SAME moving counts on whichever completion samples them, so a
+            // sampled line is operator-sufficient; the per-task identity
+            // DEBUG sibling stays per-completion below. The counter is
+            // post-incremented so the FIRST completion (counter 0) emits,
+            // surfacing the aggregate promptly. The line stays on the
+            // NORMAL tracing target/level it used today (so the
+            // `--important-stdio-only` gate still excludes it — the
+            // important-stdio e2e NEGATIVE assertion is preserved) and
+            // `outcome_summary()` is computed ONLY when the line is emitted.
+            let emit_aggregate = self
+                .completion_log_counter
+                .is_multiple_of(Self::COMPLETION_LOG_INTERVAL);
+            self.completion_log_counter = self.completion_log_counter.wrapping_add(1);
+            if emit_aggregate {
+                let outcome = self.outcome_summary();
+                tracing::info!(
+                    secondary = %secondary_id,
+                    worker_id,
+                    task_hash = %task_hash,
+                    succeeded = outcome.succeeded,
+                    fail_retry = outcome.fail_retry,
+                    fail_oom = outcome.fail_oom,
+                    fail_final = outcome.fail_final,
+                    "task complete"
+                );
+            }
             tracing::debug!(
                 secondary = %secondary_id,
                 worker_id,

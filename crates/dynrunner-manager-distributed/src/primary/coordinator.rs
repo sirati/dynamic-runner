@@ -641,6 +641,19 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// runs and on the common strict-barrier run.
     pub(super) phase_no_barrier_decl: std::collections::HashSet<PhaseId>,
     pub(super) completed_tasks: HashSet<String>,
+    /// Monotonic count of completions handled since process start, used
+    /// SOLELY to throttle the per-completion aggregate INFO line
+    /// ("task complete" + the moving succeeded/fail_* counts) to one line
+    /// every [`PrimaryCoordinator::COMPLETION_LOG_INTERVAL`] completions.
+    /// At 46k scale an unthrottled aggregate emit (each computing
+    /// `outcome_summary()`) was a dominant driver of the multi-GB TRACE
+    /// firehose; sampling it keeps the moving-aggregate operator-greppable
+    /// without O(completions) emission. Counts every completion (never reset
+    /// mid-run) so the modulo is stable; the per-task identity DEBUG sibling
+    /// is left per-completion (it is cheap and the e2e ordering checks key on
+    /// it). Owned here because it is per-coordinator-incarnation throttle
+    /// state, not replicated cluster fact.
+    pub(super) completion_log_counter: u64,
     /// THE single hash-keyed in-flight ledger. Records every task the
     /// primary believes is executing in the cluster, keyed by its
     /// canonical `compute_task_hash`. Populated identically at dispatch
@@ -1764,6 +1777,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             phase_may_be_empty_decl: std::collections::HashSet::new(),
             phase_no_barrier_decl: std::collections::HashSet::new(),
             completed_tasks: HashSet::new(),
+            completion_log_counter: 0,
             in_flight: HashMap::new(),
             supplanted_holders: HashMap::new(),
             failed_tasks: HashMap::new(),
