@@ -146,6 +146,20 @@ impl Default for PhaseHookRaiseLatch {
 /// `PrimaryConfig` exhaustively, name the same default.
 pub const DEFAULT_TASK_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Default for [`PrimaryConfig::task_inflight_stall_warn_after`].
+///
+/// Deliberately a LARGE multiple (6×) of
+/// [`DEFAULT_TASK_RECONCILIATION_TIMEOUT`]: this is the
+/// OPERATOR-VISIBILITY threshold for a task that has stayed continuously
+/// in flight on ONE holder well past any single re-probe window. The
+/// probe re-arms forever while the holder keeps answering `held = true`
+/// (a 20-minute nix build is healthy and survives every probe), so a
+/// short threshold here would WARN on perfectly healthy long builds. At
+/// 6× the re-probe window the task has confirmed `held = true` through
+/// several full probe cycles, far past any single build, before the
+/// diagnostic fires — purely observability, never a verdict.
+pub const DEFAULT_TASK_INFLIGHT_STALL_WARN_AFTER: Duration = Duration::from_secs(3600);
+
 /// Configuration for the primary coordinator.
 pub struct PrimaryConfig {
     pub node_id: String,
@@ -437,6 +451,22 @@ pub struct PrimaryConfig {
     /// the keepalive/connect families.
     pub task_reconciliation_timeout: Duration,
 
+    /// How long a task may stay CONTINUOUSLY in flight on ONE holder —
+    /// confirming `held = true` across re-probe after re-probe — before
+    /// the prober surfaces an OPERATOR WARN that the run is wedged on it.
+    /// PURE OBSERVABILITY: crossing this threshold never fails, requeues,
+    /// or otherwise touches the task's fate (only the holder's own
+    /// `held = false` does that — see [`crate::primary::reconciliation_probe`]).
+    /// A holder stuck in uninterruptible I/O keeps answering `held = true`,
+    /// so the probe re-arms forever with no operator-visible signal; this
+    /// is that signal, and nothing more. Default
+    /// [`DEFAULT_TASK_INFLIGHT_STALL_WARN_AFTER`] (3600s) — a large
+    /// multiple of `task_reconciliation_timeout` so it only fires well
+    /// past any single re-probe window (no false WARN on healthy long
+    /// builds). The reset clock restarts on a re-dispatch to a NEW holder
+    /// (fresh progress), never on a same-holder re-arm.
+    pub task_inflight_stall_warn_after: Duration,
+
     /// The SLURM partition this run's secondaries were submitted to, or
     /// `None` for non-SLURM deployments. Carried opaquely — this crate
     /// has no SLURM dependency; the SLURM pipeline layer sets the field
@@ -476,6 +506,7 @@ impl Default for PrimaryConfig {
             forwarded_argv: Vec::new(),
             peer_credentials_path: None,
             task_reconciliation_timeout: DEFAULT_TASK_RECONCILIATION_TIMEOUT,
+            task_inflight_stall_warn_after: DEFAULT_TASK_INFLIGHT_STALL_WARN_AFTER,
             slurm_partition: None,
         }
     }

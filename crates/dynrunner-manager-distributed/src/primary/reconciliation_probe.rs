@@ -181,6 +181,21 @@ pub(crate) struct SweepTick {
     pub(crate) flushed: Option<SweepSummary>,
 }
 
+/// A task that has stayed CONTINUOUSLY in flight on ONE holder past the
+/// stall-warn threshold — the holder still answers `held = true` (NOT
+/// silent/dead), so the run will NOT auto-fail, but it is wedged on this
+/// task with no other operator-visible signal. PURE OBSERVABILITY data
+/// for the caller to WARN on; carrying it changes NO task fate (the task
+/// stays tracked and surviving exactly as before).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StallSignal {
+    pub(crate) task_hash: String,
+    pub(crate) holder: String,
+    /// Total continuous in-flight time on the current holder at the
+    /// crossing.
+    pub(crate) in_flight: Duration,
+}
+
 /// One adjudicated `TaskHoldResponse`, plus its sweep-cohort log
 /// bookkeeping (aggregation only — never probe semantics).
 #[derive(Debug)]
@@ -194,6 +209,13 @@ pub(crate) struct VerdictOutcome {
     /// of the live cohort — the caller emits the summary now instead
     /// of waiting for the next tick's flush.
     pub(crate) completed: Option<SweepSummary>,
+    /// `Some` when this held-confirmation re-arm just crossed the
+    /// stall-warn threshold on the current holder (first crossing of
+    /// this continuous span) — the caller emits the operator WARN.
+    /// PURE OBSERVABILITY: the task is NOT failed or requeued; it stays
+    /// tracked and surviving. `None` on every other outcome (below
+    /// threshold, already warned this span, not a held re-arm).
+    pub(crate) stalled: Option<StallSignal>,
 }
 
 impl VerdictOutcome {
@@ -202,6 +224,7 @@ impl VerdictOutcome {
             verdict: ProbeVerdict::Ignored,
             late: false,
             completed: None,
+            stalled: None,
         }
     }
 }
@@ -247,6 +270,21 @@ struct TrackedTask {
     /// re-arms `deadline` (the no-response case takes NO action — the
     /// silent-holder concern is owned by the keepalive machinery).
     outstanding: Option<Instant>,
+    /// When this task FIRST entered flight on its CURRENT holder. Stamped
+    /// at first sight and re-stamped only on a holder CHANGE (a
+    /// re-dispatch to a new holder is fresh progress, so the stall clock
+    /// restarts). Same-holder re-arms — held-confirmations and
+    /// no-response expiries — deliberately do NOT touch it: the whole
+    /// point of the stall diagnostic is to accumulate total continuous
+    /// in-flight time on ONE holder. PURELY informational — never
+    /// consulted by probe timing or verdict adjudication.
+    first_seen: Instant,
+    /// `true` once the stall diagnostic has already been surfaced for the
+    /// CURRENT holder's continuous in-flight span (rate-limit: one WARN
+    /// per crossing). Cleared on a holder change (a fresh span may stall
+    /// again). LOG BOOKKEEPING ONLY — never consulted by probe timing or
+    /// verdict adjudication.
+    stall_warned: bool,
 }
 
 /// Persistent per-task reconciliation deadlines. Owns ALL probe timing
@@ -266,6 +304,14 @@ pub(crate) struct ReconciliationProber {
     /// — the cluster's established "should have heard back by now"
     /// quantum).
     response_window: Duration,
+    /// How long a task may stay CONTINUOUSLY in flight on ONE holder
+    /// before a held-confirmation re-arm surfaces the operator stall
+    /// WARN (`PrimaryConfig::task_inflight_stall_warn_after`). PURE
+    /// OBSERVABILITY: crossing this NEVER changes a task's fate — it only
+    /// flags a [`StallSignal`] in the verdict for the caller to log. A
+    /// large multiple of `timeout` so it fires only well past any single
+    /// re-probe window.
+    stall_warn_after: Duration,
     /// Next instant a full poll is due ([`POLL_CADENCE`] throttle).
     /// `None` until the first poll (the first poll is always due).
     next_poll: Option<Instant>,
@@ -277,10 +323,15 @@ pub(crate) struct ReconciliationProber {
 }
 
 impl ReconciliationProber {
-    pub(crate) fn new(timeout: Duration, response_window: Duration) -> Self {
+    pub(crate) fn new(
+        timeout: Duration,
+        response_window: Duration,
+        stall_warn_after: Duration,
+    ) -> Self {
         Self {
             timeout,
             response_window,
+            stall_warn_after,
             next_poll: None,
             tracked: HashMap::new(),
             cohort: None,
@@ -346,6 +397,10 @@ impl ReconciliationProber {
                             holder: holder.to_string(),
                             deadline: now + self.timeout,
                             outstanding: None,
+                            // Total-in-flight stall clock starts now and
+                            // accumulates across same-holder re-arms.
+                            first_seen: now,
+                            stall_warned: false,
                         },
                     );
                 }
@@ -353,10 +408,15 @@ impl ReconciliationProber {
                     if entry.holder != holder {
                         // Re-dispatched to a different holder since the
                         // last poll: fresh deadline, and any probe
-                        // outstanding against the OLD holder is void.
+                        // outstanding against the OLD holder is void. A
+                        // new holder is fresh progress, so the stall
+                        // clock restarts and a prior stall WARN is cleared
+                        // (the fresh span may stall again on its own).
                         entry.holder = holder.to_string();
                         entry.deadline = now + self.timeout;
                         entry.outstanding = None;
+                        entry.first_seen = now;
+                        entry.stall_warned = false;
                         continue;
                     }
                     match entry.outstanding {
@@ -424,11 +484,30 @@ impl ReconciliationProber {
         if entry.outstanding.is_none() || entry.holder != responder {
             return VerdictOutcome::ignored();
         }
+        let mut stalled = None;
         let verdict = if held {
             // Long build: confirmed alive-and-held. Re-arm a full
             // window; the task survives any number of these.
             entry.outstanding = None;
             entry.deadline = now + self.timeout;
+            // Stall diagnostic (PURE OBSERVABILITY — never a verdict).
+            // The holder is alive and STILL HOLDS the task, yet it has
+            // stayed continuously in flight on this one holder past the
+            // threshold. The probe re-arms exactly as before — the task
+            // is NOT failed or requeued — but on the FIRST crossing of
+            // this continuous span we hand the caller a one-shot signal
+            // to WARN the operator (a wedged holder answers `held = true`
+            // forever, so this is the only signal). `stall_warned`
+            // rate-limits to one per span; a holder change clears it.
+            let in_flight = now.saturating_duration_since(entry.first_seen);
+            if !entry.stall_warned && in_flight >= self.stall_warn_after {
+                entry.stall_warned = true;
+                stalled = Some(StallSignal {
+                    task_hash: task_hash.to_string(),
+                    holder: entry.holder.clone(),
+                    in_flight,
+                });
+            }
             ProbeVerdict::Rearmed
         } else {
             // The holder denies holding it: LOST. Drop tracking — the
@@ -461,6 +540,7 @@ impl ReconciliationProber {
             verdict,
             late,
             completed,
+            stalled,
         }
     }
 }
@@ -618,6 +698,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         if let Some(summary) = outcome.completed {
             log_sweep_summary(&summary);
         }
+        // Stall diagnostic (#308 follow-up) — PURE OBSERVABILITY. The
+        // holder just confirmed `held = true`, so the verdict below is a
+        // plain re-arm and the task survives indefinitely exactly as
+        // before; this WARN changes NOTHING about its fate. It only tells
+        // the operator the run has been wedged on one task on one live
+        // holder for an unusually long total time (a holder stuck in
+        // uninterruptible I/O keeps answering `held = true`, so the probe
+        // re-arms forever with no other visible signal).
+        if let Some(stall) = outcome.stalled {
+            let in_flight_secs = stall.in_flight.as_secs_f64();
+            tracing::warn!(
+                task_hash = %stall.task_hash,
+                holder = %stall.holder,
+                in_flight_secs,
+                "in-flight task has been held without a terminal for \
+                 {in_flight_secs}s — the holder still answers held=true \
+                 (NOT silent/dead), so the run will NOT auto-fail; if no \
+                 task legitimately runs this long the worker body may be \
+                 wedged (stuck I/O / dead external dependency / unreachable \
+                 substituter). Diagnostic only."
+            );
+        }
         match outcome.verdict {
             ProbeVerdict::Rearmed => {
                 tracing::debug!(
@@ -702,9 +804,13 @@ mod tests {
 
     const TIMEOUT: Duration = Duration::from_secs(600);
     const RESPONSE_WINDOW: Duration = Duration::from_secs(15);
+    /// 6× TIMEOUT — mirrors the production default's "large multiple of
+    /// the re-probe window so it only fires well past any single window"
+    /// shape (see `DEFAULT_TASK_INFLIGHT_STALL_WARN_AFTER`).
+    const STALL_WARN_AFTER: Duration = Duration::from_secs(3600);
 
     fn prober() -> ReconciliationProber {
-        ReconciliationProber::new(TIMEOUT, RESPONSE_WINDOW)
+        ReconciliationProber::new(TIMEOUT, RESPONSE_WINDOW, STALL_WARN_AFTER)
     }
 
     /// THE regression the old `tokio::time::sleep` arm lacked: constant
@@ -805,6 +911,113 @@ mod tests {
             );
             probe_at = answered + TIMEOUT;
         }
+    }
+
+    /// Drive one probe→held=true round on `view` and return the
+    /// re-arm verdict's outcome. `probe_at` is the (already-elapsed)
+    /// deadline; the held confirmation lands 5s later. Returns the
+    /// `VerdictOutcome` (carrying any `stalled` signal) and the instant
+    /// of the next deadline.
+    fn held_round(
+        p: &mut ReconciliationProber,
+        view: &[(&str, &str)],
+        holder: &str,
+        probe_at: Instant,
+    ) -> (VerdictOutcome, Instant) {
+        let fired = p.poll(probe_at, view).probes;
+        assert_eq!(fired.len(), 1, "one probe at the deadline");
+        let answered = probe_at + Duration::from_secs(5);
+        let outcome = p.on_response("hash-a", holder, true, answered);
+        assert_eq!(
+            outcome.verdict,
+            ProbeVerdict::Rearmed,
+            "held => re-arm, never a verdict"
+        );
+        (outcome, answered + TIMEOUT)
+    }
+
+    /// THE stall diagnostic: a holder that stays continuously in flight
+    /// on ONE assignment, answering `held = true` across MANY re-probe
+    /// windows, must (a) NOT report a stall before `stall_warn_after`,
+    /// (b) report it EXACTLY ONCE at the first crossing, (c) NOT report
+    /// it again on the next held re-arm (rate-limited per span), and
+    /// (d) keep the task TRACKED + SURVIVING throughout — the diagnostic
+    /// never fails or removes the task. A holder CHANGE restarts the
+    /// stall clock so a fresh wedged span can warn again.
+    #[test]
+    fn long_held_task_warns_once_then_survives() {
+        let start = Instant::now();
+        let mut p = prober();
+        let view = [("hash-a", "sec-0")];
+        assert!(p.poll(start, &view).probes.is_empty());
+
+        // Drive held re-arms while the total in-flight span is still
+        // BELOW the threshold: no stall signal yet.
+        let mut probe_at = start + TIMEOUT;
+        let crossed_at;
+        loop {
+            let in_flight_at_answer =
+                (probe_at + Duration::from_secs(5)).duration_since(start);
+            let (outcome, next) = held_round(&mut p, &view, "sec-0", probe_at);
+            if in_flight_at_answer < STALL_WARN_AFTER {
+                assert!(
+                    outcome.stalled.is_none(),
+                    "must NOT report a stall before stall_warn_after \
+                     (in_flight {in_flight_at_answer:?})"
+                );
+                probe_at = next;
+            } else {
+                // First held re-arm at/after the threshold: stall fires.
+                let stall = outcome
+                    .stalled
+                    .expect("first crossing of stall_warn_after must report a stall");
+                assert_eq!(stall.task_hash, "hash-a");
+                assert_eq!(stall.holder, "sec-0");
+                assert!(
+                    stall.in_flight >= STALL_WARN_AFTER,
+                    "reported in_flight must be past the threshold"
+                );
+                crossed_at = next;
+                break;
+            }
+        }
+        let probe_at = crossed_at;
+
+        // The NEXT held re-arm (still the same holder, span only grown)
+        // must NOT fire a second WARN — rate-limited to one per span.
+        let (outcome, probe_at) = held_round(&mut p, &view, "sec-0", probe_at);
+        assert!(
+            outcome.stalled.is_none(),
+            "a second held re-arm on the same span must not warn again"
+        );
+
+        // The task is STILL tracked and surviving — the diagnostic
+        // removed/failed nothing. It is still probed on schedule.
+        assert_eq!(
+            p.poll(probe_at, &view).probes.len(),
+            1,
+            "the stalled task is still tracked + probed (not removed/failed)"
+        );
+        // And it still answers held => still re-arms (survives).
+        assert_eq!(
+            p.on_response("hash-a", "sec-0", true, probe_at + Duration::from_secs(5))
+                .verdict,
+            ProbeVerdict::Rearmed,
+            "the stalled task survives indefinitely — no fate change"
+        );
+
+        // A holder CHANGE restarts the stall clock: a fresh span on the
+        // new holder warns again only after a fresh stall_warn_after.
+        let moved_at = probe_at + Duration::from_secs(10);
+        assert!(p.poll(moved_at, &[("hash-a", "sec-1")]).probes.is_empty());
+        // One held re-arm just past the new holder's first deadline is
+        // far below stall_warn_after measured from the move: no stall.
+        let (outcome, _) = held_round(&mut p, &[("hash-a", "sec-1")], "sec-1", moved_at + TIMEOUT);
+        assert!(
+            outcome.stalled.is_none(),
+            "holder change reset the stall clock — fresh span must not \
+             instantly re-warn"
+        );
     }
 
     /// `held = false` from the probed holder is the LOST verdict, and
