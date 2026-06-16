@@ -622,6 +622,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.silence_warn_stage.remove(&secondary_id);
         self.silence_judged_marks.remove(&secondary_id);
         self.keepalive_proven.remove(&secondary_id);
+        // The incarnation is gone; drop its re-serve-backoff expiry so a
+        // respawn reusing the id re-serves immediately. See `reserve_backoff`.
+        self.reserve_backoff.remove(&secondary_id);
 
         // Authoritative origination, one batch: the dead secondary's
         // in-flight tasks transition `InFlight → Pending` in the CRDT

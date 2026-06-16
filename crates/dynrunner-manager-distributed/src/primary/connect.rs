@@ -881,6 +881,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     SecondaryConnectionState::Handshaking(conn),
                 );
                 self.seed_keepalive(&secondary_id);
+                // A fresh incarnation re-earns a prompt re-serve: drop any
+                // stale duplicate-welcome re-serve-backoff expiry left by a
+                // prior incarnation reusing this id, so the new
+                // incarnation's first genuinely-lost-frame re-serve is not
+                // suppressed. The reset lives at THIS incarnation boundary
+                // (fresh welcome), NOT in `seed_keepalive` — which the
+                // re-serve's own `mark_member_operational` walk also calls,
+                // so resetting there would let a re-serve wipe its own
+                // backoff stamp and defeat the bound. See `reserve_backoff`.
+                self.reserve_backoff.remove(&secondary_id);
             }
 
             // Explicit `PeerJoined` origination on accept.
