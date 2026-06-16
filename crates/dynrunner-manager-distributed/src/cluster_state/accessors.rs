@@ -890,15 +890,18 @@ impl<I: Identifier> ClusterState<I> {
     ///
     /// Resolution is phase-aware: the dep's `(phase_id, task_id)` is
     /// resolved to the unique ledger hash (so the same `task_id` in two
-    /// phases reads two distinct output entries), then the hash-keyed
-    /// cache is read. The dispatch-time predecessor-outputs assembler
-    /// reads this accessor to attach each dependent's predecessor
-    /// outputs to its `TaskAssignment`. The borrow is invalidated by
-    /// the next `&mut self` apply call; callers that need ownership
-    /// across an apply boundary must `.clone()` the returned reference.
-    pub fn outputs_for(&self, phase_id: &PhaseId, task_id: &str) -> Option<&TaskOutputs> {
-        let hash = self.task_hash_for_dep(phase_id, task_id)?;
-        self.task_outputs.get(hash)
+    /// phases reads two distinct output entries), then the outputs are
+    /// read STORAGE-AGNOSTICALLY via [`Self::outputs_for_hash`] (resident
+    /// map → settled-disk fallback), so a predecessor that has SETTLED
+    /// (its output payload evicted to the spill file) still resolves. The
+    /// dispatch-time predecessor-outputs assembler reads this accessor to
+    /// attach each dependent's predecessor outputs to its
+    /// `TaskAssignment`. Returns an OWNED clone — a settled read decodes a
+    /// transient copy off disk, so no borrow can be handed out, and every
+    /// caller needs ownership across an apply / dispatch boundary anyway.
+    pub fn outputs_for(&self, phase_id: &PhaseId, task_id: &str) -> Option<TaskOutputs> {
+        let hash = self.task_hash_for_dep(phase_id, task_id)?.to_string();
+        self.outputs_for_hash(&hash)
     }
 
     /// Gather every recorded [`TaskOutputs`] for the tasks of `phase_id`,
@@ -946,15 +949,16 @@ impl<I: Identifier> ClusterState<I> {
                 Some((task.task_id.clone(), outputs.clone()))
             })
             // Settled (spilled) entries of the phase: their identity comes
-            // off the slim index; the output VALUES never left the
-            // `task_outputs` map (it is the hot output index — not
-            // evicted), so the same hash-keyed read serves them.
+            // off the slim index; the output payload was EVICTED from the
+            // resident map at commit-spill (it rides the spill record), so
+            // the storage-agnostic `outputs_for_hash` reads it back off
+            // disk — the SAME projection a fat entry gets, source-blind.
             .chain(self.settled_entries().filter_map(|(hash, entry)| {
                 if &entry.phase_id != phase_id {
                     return None;
                 }
-                let outputs = self.task_outputs.get(hash)?;
-                Some((entry.task_id.clone(), outputs.clone()))
+                let outputs = self.outputs_for_hash(hash)?;
+                Some((entry.task_id.clone(), outputs))
             }))
             .collect()
     }

@@ -148,11 +148,17 @@ pub(crate) enum SettledClass {
 /// * `segment` / `offset` / `len` — the record's location for the
 ///   stream-from-file responder and the rehydrate escape hatch.
 ///
-/// The small output VALUES dep-resolution / keyed-output /
-/// skip-existing lookups need stay in the existing `task_outputs` map
-/// (it already IS the hot hash-keyed index for them and is NOT evicted
-/// — the fat cost was the per-task `TaskInfo` payload, not the
-/// consumer-published key/value outputs).
+/// The co-keyed output VALUES dep-resolution / keyed-output /
+/// skip-existing lookups need are EVICTED from the resident
+/// `task_outputs` map at commit-spill (their authoritative copy rides
+/// the spill record): an inline `ResultValue` is up to 16 MiB, so at
+/// scale the keyed outputs — not just the per-task `TaskInfo` body —
+/// are a dominant resident cost that must not accumulate O(completed
+/// tasks). Their digest term moves into `task_outputs_hash_acc` (the
+/// output twin of `tasks_hash_acc`), and every reader resolves them
+/// through [`super::ClusterState::outputs_for_hash`] (resident map →
+/// settled-disk fallback), so callers never know where the payload
+/// physically lives.
 #[derive(Debug, Clone)]
 pub(crate) struct SettledEntry {
     pub(crate) task_id: String,
@@ -161,6 +167,14 @@ pub(crate) struct SettledEntry {
     pub(crate) class: SettledClass,
     pub(super) join_key: TaskJoinKey,
     digest_contribution: u64,
+    /// The `(key, TaskOutputs)` digest term this entry's EVICTED output
+    /// payload contributed to `task_outputs_hash_acc` at commit-spill,
+    /// or `None` when the entry had no resident output payload (it
+    /// published nothing, so it never sat in `task_outputs` and
+    /// contributes to neither the count nor the fold). Stored so unsettle
+    /// subtracts exactly what commit added (XOR is self-inverse) and
+    /// decrements the settled-outputs count by exactly one when present.
+    outputs_digest_contribution: Option<u64>,
     pub(crate) segment: u32,
     pub(crate) offset: u64,
     pub(crate) len: u32,
@@ -221,6 +235,21 @@ pub struct SettledStore {
     /// XOR accumulator over settled `(key, hashable_join_key)` terms —
     /// `digest()` folds `acc ⊕ fold(fat)`.
     tasks_hash_acc: u64,
+    /// XOR accumulator over settled `(key, TaskOutputs)` terms — the
+    /// output twin of `tasks_hash_acc`. A settled task's output payload
+    /// leaves the resident `task_outputs` map (it lives in the spill
+    /// record), so its `task_outputs_hash` term moves here at
+    /// commit-spill and `digest()` folds `acc ⊕ fold(resident)` exactly
+    /// as it does for the task fold. Only entries that actually had a
+    /// resident output payload contribute (a settled task that published
+    /// nothing adds nothing — the resident map held no entry, so neither
+    /// the count nor the fold moves).
+    task_outputs_hash_acc: u64,
+    /// Count of settled entries whose evicted output payload is folded
+    /// into `task_outputs_hash_acc` — the settled half of
+    /// `task_outputs_count`. Equal to the number of settled keys that
+    /// had a resident `task_outputs` entry at commit time.
+    settled_outputs_count: u64,
     /// The segment THIS instance's writer appends to; `None` on a
     /// read-only adopted base (a clone, or before a writer attaches).
     own_segment: Option<u32>,
@@ -272,6 +301,8 @@ impl SettledStore {
             index: self.index.clone(),
             segments: self.segments.clone(),
             tasks_hash_acc: self.tasks_hash_acc,
+            task_outputs_hash_acc: self.task_outputs_hash_acc,
+            settled_outputs_count: self.settled_outputs_count,
             own_segment: None,
             records_committed: self.records_committed,
             approx_index_bytes: self.approx_index_bytes,
@@ -300,6 +331,21 @@ impl SettledStore {
 
     pub(super) fn tasks_hash_acc(&self) -> u64 {
         self.tasks_hash_acc
+    }
+
+    /// The settled half of the `task_outputs_hash` fold — `digest()`
+    /// seeds the resident fold with this (XOR associativity makes
+    /// `acc ⊕ fold(resident)` equal the full logical fold), the output
+    /// twin of [`Self::tasks_hash_acc`].
+    pub(super) fn task_outputs_hash_acc(&self) -> u64 {
+        self.task_outputs_hash_acc
+    }
+
+    /// Count of settled entries whose evicted output payload the digest
+    /// must add to `task_outputs_count` (the settled half of the output
+    /// cache count).
+    pub(super) fn settled_outputs_count(&self) -> u64 {
+        self.settled_outputs_count
     }
 
     /// Per-settled-entry `(key, digest_contribution)` pairs — the persisted
@@ -687,6 +733,19 @@ impl<I: Identifier> ClusterState<I> {
                 continue;
             };
             let task = state.task();
+            // Evict the resident output payload: its co-keyed copy already
+            // rode the spill record (`collect_spill_batch` cloned it into
+            // the `SettledRecord`), so the disk copy is authoritative and
+            // the resident one is pure accumulation. Its `task_outputs_hash`
+            // term moves into the settled accumulator at the SAME instant it
+            // leaves the resident fold (XOR associativity keeps `digest()`
+            // byte-identical — the output twin of the `tasks_hash_acc`
+            // move). A task that published nothing held no resident entry,
+            // so it contributes nothing to either the count or the fold.
+            let outputs_digest_contribution = self
+                .task_outputs
+                .remove(&rec.hash)
+                .map(|outputs| hash_one((&rec.hash, &outputs)));
             let entry = SettledEntry {
                 task_id: task.task_id.clone(),
                 phase_id: task.phase_id.clone(),
@@ -694,11 +753,16 @@ impl<I: Identifier> ClusterState<I> {
                 class,
                 join_key: rec.join_key,
                 digest_contribution: hash_one((&rec.hash, hashable_join_key(state))),
+                outputs_digest_contribution,
                 segment: receipt.segment,
                 offset: rec.offset,
                 len: rec.len,
             };
             self.settled.tasks_hash_acc ^= entry.digest_contribution;
+            if let Some(term) = entry.outputs_digest_contribution {
+                self.settled.task_outputs_hash_acc ^= term;
+                self.settled.settled_outputs_count += 1;
+            }
             self.settled.approx_index_bytes += entry.approx_bytes();
             self.settled.records_committed += 1;
             self.settled.index.insert(rec.hash.clone(), entry);
@@ -750,13 +814,29 @@ impl<I: Identifier> ClusterState<I> {
             .remove(hash)
             .expect("checked present above");
         self.settled.tasks_hash_acc ^= entry.digest_contribution;
+        // Reverse the output eviction: the payload left the resident map at
+        // commit-spill (its term moved into `task_outputs_hash_acc`), so
+        // un-settling must XOR that term back out, drop the settled-outputs
+        // count, and REHYDRATE the payload from the spill record into the
+        // resident map — otherwise the outputs are silently dropped. The
+        // record's embedded `outputs` is the authoritative copy
+        // (`collect_spill_batch` wrote it; equal-by-construction to what was
+        // evicted, so the XOR-out is the exact inverse of the commit XOR-in).
+        // First-write-wins (`or_insert`) matches the resident map's CRDT
+        // discipline: a concurrent live broadcast may have already
+        // re-populated the slot.
+        if let Some(term) = entry.outputs_digest_contribution {
+            self.settled.task_outputs_hash_acc ^= term;
+            self.settled.settled_outputs_count =
+                self.settled.settled_outputs_count.saturating_sub(1);
+            if let Some(outputs) = record.outputs.clone() {
+                self.task_outputs.entry(hash.to_string()).or_insert(outputs);
+            }
+        }
         self.settled.approx_index_bytes = self
             .settled
             .approx_index_bytes
             .saturating_sub(entry.approx_bytes());
-        // The outputs never left the in-memory map, so only the task
-        // state is reinstated.
-        //
         // Range-fold memo: an unsettle is memo-NEUTRAL — the inverse of a
         // spill. The entry was already a LOGICAL ledger entry counted in the
         // memo (as the settled term, which equals the rehydrated fat term);
@@ -767,6 +847,30 @@ impl<I: Identifier> ClusterState<I> {
         debug_assert!(!matches!(record.state, TaskState::Blocked { .. }), "settle_eligible() should exclude Blocked — if this fires, the reverse-index at the set_task_state seam needs to be updated for this unsettle path");
         self.tasks.insert(hash.to_string(), record.state);
         true
+    }
+
+    /// Storage-agnostic keyed-output read: a completed task's
+    /// [`TaskOutputs`] for `hash`, WHEREVER its payload lives — the
+    /// resident `task_outputs` map (a fat / not-yet-spilled entry) takes
+    /// precedence, falling back to the settled spill record's embedded
+    /// copy (a SETTLED entry whose payload was evicted at commit-spill).
+    /// `None` when the task published no outputs, or when a settled
+    /// record is unreadable (logged at the read seam; the caller treats
+    /// it as no-output, exactly as a vanished key). This is the ONE seam
+    /// every output reader routes through, so no caller knows whether a
+    /// completed task's outputs are in RAM or on disk.
+    ///
+    /// Owned clone (the resident borrow could not outlive the transient
+    /// disk decode, and callers — dispatch assembler, `on_phase_end`,
+    /// the stream builder — all need an owned value across an apply or a
+    /// callback boundary anyway).
+    pub(crate) fn outputs_for_hash(&self, hash: &str) -> Option<TaskOutputs> {
+        if let Some(outputs) = self.task_outputs.get(hash) {
+            return Some(outputs.clone());
+        }
+        // Not resident: a settled entry's payload lives in the spill
+        // record (or the hash is simply unknown / output-less).
+        self.settled_record(hash).and_then(|(_, outputs)| outputs)
     }
 
     /// Read + decode `hash`'s settled record from the spill file — the
@@ -794,6 +898,16 @@ impl<I: Identifier> ClusterState<I> {
             self.unsettle_if_dominated(hash, incoming_key);
         }
         self.tasks.get(hash)
+    }
+
+    /// Test-only: the number of output payloads RESIDENT in the
+    /// `task_outputs` map (the memory-pin seam for the zero-accumulation
+    /// claim — a settled task's payload must have left it for the spill
+    /// file). Distinct from the LOGICAL output count (resident ∪ settled),
+    /// which the digest's `task_outputs_count` reports.
+    #[cfg(test)]
+    pub(crate) fn task_outputs_resident_len(&self) -> usize {
+        self.task_outputs.len()
     }
 
     /// Test-only: drop any attached spill writer by replacing the settled
