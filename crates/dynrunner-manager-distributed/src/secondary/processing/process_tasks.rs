@@ -81,8 +81,8 @@ const INBOX_BATCH_DRAIN_CAP: usize = 256;
 
 /// Arm names, index-aligned with the `ARM_*` ids above (render order of the
 /// compact stats line). The single `oom_sweep` arm counts SWEEPS (one
-/// self-paced read-all-workers + decide pass per ~50ms), NOT the former
-/// per-worker sample / decision fires.
+/// self-paced read-all-workers + decide pass per SAMPLE_SWEEP_INTERVAL),
+/// NOT the former per-worker sample / decision fires.
 const PROCESS_TASKS_ARM_NAMES: &[&str] = &[
     "pool_event",
     "inbox",
@@ -260,8 +260,8 @@ where
             .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Suppress the immediate first tick — a freshly-started loop has
         // no samples to aggregate yet, so the first emit lands one full
-        // interval in (≥5 minutes, well after the buffer has filled with
-        // ~6_000 samples at the 50ms sweep cadence).
+        // interval in (≥5 minutes, well after the buffer has filled at
+        // the SAMPLE_SWEEP_INTERVAL (250ms) sweep cadence).
         resource_stats_interval.reset();
 
         // Tell the primary the peer-mesh has settled so it can release

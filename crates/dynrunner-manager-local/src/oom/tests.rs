@@ -571,9 +571,156 @@ async fn sweep_cadence_awaits_before_resleeping() {
     assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), sweeps);
 }
 
-/// `SAMPLE_SWEEP_INTERVAL` is the historical 20Hz sample cadence —
-/// pinned so an accidental retune is a visible diff.
+/// The OOM-sweep cadence must sit between two hard bounds (see
+/// `SAMPLE_SWEEP_INTERVAL`'s doc):
+///
+///   - Upper: comfortably below the kernel-OOM correlation window
+///     (500ms in both `manager::events` and the secondary's
+///     `worker_event`). A sweep slower than that window would let an
+///     `oom_kill`-then-pipe-EOF pair fall out of correlation, mis-
+///     classifying a real OOM disconnect as `Recoverable`. We require a
+///     2× margin (≤ 250ms) so two sweeps always land inside the window.
+///   - Lower: not so tight that the sweep arm dominates the operational
+///     `select!`. The former 50ms (20Hz) value fired the arm ~18.5×/sec
+///     and starved the control plane. We require ≥ 100ms so the sweep is
+///     a periodic-background arm, not a hot one.
+///
+/// Pinned so an accidental retune that re-enters the starvation regime
+/// (too tight) or the mis-correlation regime (too loose) is a hard
+/// failure, not a silent diff.
 #[test]
-fn sample_sweep_interval_is_50ms() {
-    assert_eq!(SAMPLE_SWEEP_INTERVAL, Duration::from_millis(50));
+fn sample_sweep_interval_within_cadence_bounds() {
+    // Mirror of the private `KERNEL_OOM_CORRELATION_WINDOW` in
+    // `manager::events` / the secondary `worker_event`. If that window
+    // ever changes, this literal — and the cadence — must be revisited
+    // together.
+    const KERNEL_OOM_CORRELATION_WINDOW: Duration = Duration::from_millis(500);
+    let half_window = KERNEL_OOM_CORRELATION_WINDOW / 2;
+
+    assert!(
+        SAMPLE_SWEEP_INTERVAL <= half_window,
+        "sweep cadence {SAMPLE_SWEEP_INTERVAL:?} must be <= half the \
+         {KERNEL_OOM_CORRELATION_WINDOW:?} correlation window so an oom_kill \
+         is always recorded within the window of a correlated pipe-EOF",
+    );
+    assert!(
+        SAMPLE_SWEEP_INTERVAL >= Duration::from_millis(100),
+        "sweep cadence {SAMPLE_SWEEP_INTERVAL:?} must be >= 100ms so the \
+         sweep arm stays a periodic-background arm and does not dominate \
+         the operational select! (the 50ms/20Hz starvation regression)",
+    );
+}
+
+/// Cadence-regression: over a busy run of K oploop iterations driven
+/// faster than the sweep interval, the self-paced sweep arm fires at
+/// most ONCE — it is NOT selected every iteration — while a co-ready,
+/// higher-priority data arm wins every iteration. This is the inverse
+/// of the live forensics where the 50ms arm dominated ~86% of arm
+/// executions: with the production interval and `biased;` data-first
+/// ordering, the sweep is bounded by its cadence, not the loop tick
+/// rate. Real-time test (mirrors the existing oom cadence tests, which
+/// also use wall-clock `current_thread` without `tokio/test-util`).
+#[tokio::test(flavor = "current_thread")]
+async fn oom_sweep_arm_not_selected_every_iteration() {
+    use tokio::sync::mpsc;
+
+    // A data arm that is ALWAYS ready (mirrors a busy inbox / pool
+    // event): pre-fill K frames so it wins every biased race.
+    let (tx, mut rx) = mpsc::unbounded_channel::<u32>();
+    const K: usize = 5000;
+    for i in 0..K as u32 {
+        tx.send(i).expect("send");
+    }
+    drop(tx);
+
+    // Sweep deadline seeded NOW; re-armed `SAMPLE_SWEEP_INTERVAL` after
+    // each fire — the exact `next_sweep_due` idiom of the real loops.
+    let interval = SAMPLE_SWEEP_INTERVAL;
+    let mut next_sweep_due = tokio::time::Instant::now();
+
+    let start = tokio::time::Instant::now();
+    let mut data_hits = 0usize;
+    let mut sweep_hits = 0usize;
+    // The K pre-filled frames drain in well under one `interval` of
+    // wall-clock, so the sweep deadline (already-due on iteration 0,
+    // then re-armed a full interval out) can be reached at most once.
+    // The data arm wins every other iteration under `biased;` + data-
+    // first. This proves the sweep is NOT selected per loop tick.
+    while data_hits < K {
+        tokio::select! {
+            biased;
+            msg = rx.recv() => {
+                match msg {
+                    Some(_) => data_hits += 1,
+                    None => break,
+                }
+            }
+            _ = tokio::time::sleep_until(next_sweep_due) => {
+                sweep_hits += 1;
+                next_sweep_due = tokio::time::Instant::now() + interval;
+            }
+        }
+    }
+    let elapsed = start.elapsed();
+
+    assert_eq!(data_hits, K, "data arm should win every iteration");
+    // Guard the test's own premise: draining K frames must take less
+    // than one sweep interval, else the bound below is meaningless.
+    assert!(
+        elapsed < interval,
+        "test premise broken: draining {K} frames took {elapsed:?} >= \
+         one sweep interval {interval:?}; raise K's drain speed",
+    );
+    // The structural invariant: the sweep is bounded by its cadence, not
+    // the loop tick rate (the 86%-domination regression). Over K ticks
+    // inside one interval, it fires at most once — NOT K times.
+    assert!(
+        sweep_hits <= 1,
+        "sweep fired {sweep_hits} times over {K} iterations in \
+         {elapsed:?}; it must be bounded by its cadence, not the loop \
+         tick rate (the oom_sweep starvation regression)",
+    );
+}
+
+/// The dual of the cadence-regression: the sweep STILL fires within its
+/// interval when the data arm is idle — OOM-detection latency is
+/// preserved. Over a window of N intervals with an empty inbox, the
+/// sweep fires ~N times, so a real memory-pressure event is detected
+/// within one `SAMPLE_SWEEP_INTERVAL`. Real-time test.
+#[tokio::test(flavor = "current_thread")]
+async fn oom_sweep_still_fires_within_its_interval_when_idle() {
+    use tokio::sync::mpsc;
+
+    // Inbox idle: the single kept sender makes recv() pend forever, so
+    // only the sweep arm can fire.
+    let (_tx, mut rx) = mpsc::unbounded_channel::<u32>();
+    let interval = SAMPLE_SWEEP_INTERVAL;
+    let intervals = 4u32;
+    let window = interval * intervals;
+
+    let mut next_sweep_due = tokio::time::Instant::now();
+    let start = tokio::time::Instant::now();
+    let mut sweeps = 0usize;
+    while start.elapsed() < window {
+        tokio::select! {
+            biased;
+            _msg = rx.recv() => unreachable!("inbox is idle"),
+            _ = tokio::time::sleep_until(next_sweep_due) => {
+                sweeps += 1;
+                next_sweep_due = tokio::time::Instant::now() + interval;
+            }
+        }
+    }
+
+    // await-before-resleep over `intervals` worth of time fires ≈
+    // `intervals` sweeps; allow generous slack for real-time scheduling
+    // jitter. Critically: the sweep MUST fire at least ~once per interval
+    // (detection preserved) and MUST NOT fire wildly more (cadence held).
+    let lo = (intervals as usize).saturating_sub(1).max(1);
+    let hi = intervals as usize + 2;
+    assert!(
+        (lo..=hi).contains(&sweeps),
+        "sweep should fire ~{intervals} times over {intervals} intervals \
+         when idle (OOM-detection latency preserved), got {sweeps}",
+    );
 }
