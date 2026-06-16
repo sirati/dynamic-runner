@@ -745,22 +745,30 @@ where
     }
 
     /// Drop every `AwaitingCrdtConvergence` retention whose
-    /// `delivery_seq` is named by `observed_seqs` — the #541 drop
+    /// `msg_seq` is named by `observed_seqs` — the #541 drop
     /// trigger fired from the post-apply hook in
     /// [`Self::apply_cluster_mutations`] when the local CRDT mirror
     /// received an own-originated `CustomMessagePosted` via a
     /// `ClusterMutation` broadcast.
     ///
-    /// `delivery_seq` is the IMPORTANT-custom retention's primary key
-    /// (the SAME stamp that ID's the message at the primary), and the
-    /// origin-id pre-filter at the call site ensures we only consider
-    /// the SEQUENCES we ourselves stamped — so a `delivery_seq` match
-    /// against an `AwaitingCrdtConvergence` entry uniquely identifies
-    /// the retained important-custom. The state-tag gate is the same
-    /// shape `ack_delivery` uses (precision against the shared
-    /// monotonic counter): we never drop a terminal here, only the
-    /// important-custom that was actually waiting for this CRDT
-    /// observation.
+    /// `observed_seqs` are the `msg_seq` values the `CustomMessagePosted`
+    /// mutations carry (the harvest at the call site collects each
+    /// mutation's `seq`, which the primary stamps `= msg_seq`). An
+    /// important custom's CANONICAL cluster identity is `(origin,
+    /// msg_seq)` — the SAME key the primary IDs the message by — so the
+    /// retention drop MUST match on `msg_seq`, NOT on `delivery_seq`.
+    /// `delivery_seq` is the originator-local retention/ack counter
+    /// (#352) that bumps for ALL confirmable reports (task terminals AND
+    /// important customs); it DESYNCS from `msg_seq` whenever the origin
+    /// also emits terminals (which advance `delivery_seq` but not
+    /// `msg_seq`), so a `delivery_seq` match would orphan a custom's
+    /// retention and replay it forever. The origin-id pre-filter at the
+    /// call site guarantees same-origin, so within the own-origin
+    /// retentions a `msg_seq` match alone is a COMPLETE `(origin,
+    /// msg_seq)` identity. The state-tag gate is the same shape
+    /// `ack_delivery` uses: we never drop a terminal here (a terminal
+    /// has no `msg_seq`), only the important-custom that was actually
+    /// waiting for this CRDT observation.
     ///
     /// Idempotent: a duplicate broadcast carrying the same
     /// CustomMessagePosted finds no matching entry on the second
@@ -781,7 +789,7 @@ where
             }
             !entry
                 .frame
-                .delivery_seq()
+                .msg_seq()
                 .is_some_and(|s| observed.contains(&s))
         });
         let dropped = before - self.pending_report_replays.len();
