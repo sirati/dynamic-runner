@@ -104,6 +104,7 @@ mod consensus_wiring;
 mod custom_messages;
 mod dead_worker_spin;
 mod deferrer_membership_death;
+mod election_settle_window;
 mod election_terminal_latch_563;
 mod duplicate_assignment;
 mod failover_beacon_union;
