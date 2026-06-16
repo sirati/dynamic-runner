@@ -44,6 +44,7 @@ mod grow_max;
 mod keyspace;
 mod merge;
 mod outcome_tally;
+mod output_store;
 mod range_digest;
 mod range_fold_memo;
 mod settled;

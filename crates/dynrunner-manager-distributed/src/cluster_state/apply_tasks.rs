@@ -95,7 +95,20 @@ impl<I: Identifier> ClusterState<I> {
         if !self.tasks.contains_key(hash) {
             return;
         }
-        self.task_outputs.entry(hash.to_string()).or_insert(outputs);
+        // Route through the always-on output store (the owner's
+        // zero-residence requirement): it folds the digest term on EVERY
+        // node, then write-through-then-DROPs the payload to disk on a
+        // reader and fold-only-drops it on a non-reader (secondary) — so
+        // the payload never enters the resident map. It returns `false`
+        // ONLY when this node is a reader with no usable disk home (a bare
+        // test state / a degraded writer): the resident map is then the
+        // correctness fallback (reads still work; the store reversed its
+        // accumulator fold so the resident `digest()` leg counts the term
+        // exactly once). First-write-wins (`or_insert`) on the fallback
+        // matches the store's own first-fold-wins.
+        if !self.output_store_record(hash, &outputs) {
+            self.task_outputs.entry(hash.to_string()).or_insert(outputs);
+        }
     }
 
     /// Decode a `TaskCompleted` mutation's wire `result_data` payload into
