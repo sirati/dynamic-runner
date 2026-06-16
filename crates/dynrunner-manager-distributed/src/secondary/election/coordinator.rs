@@ -255,6 +255,25 @@ where
     /// missed beacons is the same "the node went silent" bound as for
     /// frames — a starved-but-alive node keeps its dedicated-thread
     /// beacon flowing well inside it.
+    ///
+    /// Own-tick-health re-base (#423-twin): the last-beacon anchor is
+    /// clamped UP to the shared trustworthy floor
+    /// (`own_tick_health.trustworthy_anchor`) before the staleness
+    /// comparison, EXACTLY as the leg-(B) backstop
+    /// [`Self::run_election_tick`] (`primary_silence_exceeded`) clamps
+    /// `primary_last_seen`. The earlier doc wrongly assumed THIS
+    /// receiver's runtime is always healthy enough to drain inbound
+    /// beacon datagrams — but the beacon LISTENER is an ordinary tokio
+    /// task (`liveness::listener`) that cannot drain when this node's
+    /// own runtime is CPU-starved, so a self-starved secondary reads
+    /// `now - last_beacon` inflated by ITS OWN stall and false-judges an
+    /// alive primary's faithfully-emitted (dedicated-thread,
+    /// starvation-immune) beacon as stale — the exact false-election leg
+    /// the sibling backstop was hardened against. With the clamp a
+    /// self-starved receiver measures beacon staleness only from fresh,
+    /// post-lag evidence; with no starvation the clamp is the identity,
+    /// so a genuinely-silent beacon is still judged stale one healthy
+    /// cadence window after the node recovers (correctness over speed).
     pub(in crate::secondary) fn node_beacon_fresh(&self, node_id: &str) -> bool {
         let deadline = self
             .config
@@ -262,7 +281,9 @@ where
             .saturating_mul(self.config.keepalive_miss_threshold);
         self.beacon_liveness
             .last_seen(node_id)
-            .map(|t| Instant::now().duration_since(t) <= deadline)
+            .map(|t| {
+                Instant::now().duration_since(self.own_tick_health.trustworthy_anchor(t)) <= deadline
+            })
             .unwrap_or(false)
     }
 
