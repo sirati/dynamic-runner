@@ -528,6 +528,39 @@ where
             return;
         }
 
+        // Publication-ordering gate (CL-A8). Admit the batch through the
+        // primary-local `PendingSpawnQueue`: a task whose prerequisite is
+        // defined only in a LATER `spawn_tasks` batch (a CROSS-batch
+        // forward-ref) PARKS until that prerequisite lands; the rest are
+        // released for publication NOW. A task whose deps are all defined
+        // releases immediately (the common topological case — the queue is a
+        // transparent pass-through). Re-admitting on each batch also releases
+        // any previously-parked task whose missing prerequisite this batch
+        // (or a prior off-band publish, e.g. the cold seed) just defined.
+        //
+        // The "defined?" probe is `task_hash_for_dep(..).is_some()` — the
+        // SAME predicate the spawn validator's `is_known_task_id` closure
+        // uses below, so the queue's release notion and the validator's
+        // known-dep notion agree (a released task never fails the forward-ref
+        // class; only a GENUINELY-unknown dep — caught by the run-end drain —
+        // remains). Borrow split: the queue is a disjoint field, so the probe
+        // closure borrows `&self.cluster_state` while `admit` borrows
+        // `&mut self.spawn_queue` — both held via the `&*` reborrow below.
+        let tasks = {
+            let cluster_state = &self.cluster_state;
+            self.spawn_queue.admit(tasks, |phase_id, task_id| {
+                cluster_state.task_hash_for_dep(phase_id, task_id).is_some()
+            })
+        };
+        // The whole batch parked (every task is an early cross-batch
+        // forward-ref): nothing to publish this pass. Reply Ok(empty) — the
+        // parked tasks ride a later batch's release (or the run-end loud
+        // drain). A dropped receiver is non-fatal (shared reply contract).
+        if tasks.is_empty() {
+            let _ = reply.send(Ok(Vec::new()));
+            return;
+        }
+
         // ALWAYS route through the continuation queue, even for a single-
         // chunk input (#582). The pre-#582 single-shot fast path
         // (`tasks.len() <= APPLY_SPAWN_CHUNK_SIZE` AND queue empty) drained
