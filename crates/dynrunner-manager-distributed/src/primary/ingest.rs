@@ -735,13 +735,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .cluster_state
             .tasks_iter()
             .filter_map(|(hash, state)| match state {
-                TaskState::Pending { task, .. }
-                | TaskState::InFlight { task, .. }
+                TaskState::Pending { .. }
+                | TaskState::InFlight { .. }
                 // A queued-behind-local-import task is not-yet-terminal work
                 // (an active assignment), so a #3b run-wide invalidation
                 // wipes it exactly like an `InFlight`/`Pending`/`Blocked`.
-                | TaskState::QueuedAfterLocalDependency { task, .. }
-                | TaskState::Blocked { task, .. } => Some((hash.clone(), task.clone())),
+                | TaskState::QueuedAfterLocalDependency { .. }
+                | TaskState::Blocked { .. } => Some((hash.clone(), state.to_task_info())),
                 TaskState::Completed { .. }
                 | TaskState::Failed { .. }
                 | TaskState::Unfulfillable { .. }

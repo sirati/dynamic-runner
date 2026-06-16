@@ -125,9 +125,9 @@ async fn terminally_failed_dep_cascades_dependents_and_run_exits() {
             let mut saw_upstream_failed = false;
             for (_hash, state) in cs.tasks_iter() {
                 if let crate::cluster_state::TaskState::Failed {
-                    task, last_error, ..
+                    last_error, ..
                 } = state
-                    && task.task_id == "missing/dependent"
+                    && state.def().task_id == "missing/dependent"
                 {
                     assert!(
                         last_error.contains("upstream-failed"),

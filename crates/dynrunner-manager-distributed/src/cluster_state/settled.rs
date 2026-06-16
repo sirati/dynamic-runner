@@ -732,7 +732,7 @@ impl<I: Identifier> ClusterState<I> {
             let Some(class) = settled_class_of(state) else {
                 continue;
             };
-            let task = state.task();
+            let def = state.def();
             // Evict the resident output payload: its co-keyed copy already
             // rode the spill record (`collect_spill_batch` cloned it into
             // the `SettledRecord`), so the disk copy is authoritative and
@@ -747,9 +747,9 @@ impl<I: Identifier> ClusterState<I> {
                 .remove(&rec.hash)
                 .map(|outputs| hash_one((&rec.hash, &outputs)));
             let entry = SettledEntry {
-                task_id: task.task_id.clone(),
-                phase_id: task.phase_id.clone(),
-                task_depends_on: task.task_depends_on.clone(),
+                task_id: def.task_id.clone(),
+                phase_id: def.phase_id.clone(),
+                task_depends_on: def.task_depends_on.clone(),
                 class,
                 join_key: rec.join_key,
                 digest_contribution: hash_one((&rec.hash, hashable_join_key(state))),
