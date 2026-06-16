@@ -875,3 +875,129 @@ fn snapshot_restore_readmits_lower_generation_dead_entry() {
         "a lower-generation snapshot never regresses the incarnation"
     );
 }
+
+// ── L4.5: self-describing def store survives snapshot/restore ──
+
+/// A def interned at a primary-allocated id, snapshotted, and restored onto
+/// a FRESH replica REBUILDS the def store from the self-describing inline
+/// def: `resolve(def_id)` yields the SAME id + content, and the hash↔id
+/// bijection is re-established (`id_for_hash` round-trips). The snapshot
+/// drops the def store as a wire field, so without the self-describing
+/// rebuild the restored replica would hold the def CONTENT (inline in the
+/// `TaskState`) but no id↔def / hash↔id binding — a dangling def_id ref.
+#[test]
+fn snapshot_restore_rebuilds_self_describing_def_store() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("the-task"),
+        def_id: Some(7),
+    });
+    // Sanity: the originator bound id 7 and the def carries it (stamped at
+    // intern time).
+    assert_eq!(s.def_id_for_hash_for_test("h"), Some(TaskDefId(7)));
+    assert_eq!(
+        s.resolve_def_for_test(TaskDefId(7)).map(|d| d.def_id),
+        Some(TaskDefId(7)),
+        "the originator's def is self-describing"
+    );
+
+    let snap = s.snapshot();
+    let mut joiner = ClusterState::<RunnerIdentifier>::new();
+    // The fresh joiner starts with an EMPTY def store — nothing resolves.
+    assert!(joiner.resolve_def_for_test(TaskDefId(7)).is_none());
+    joiner.restore(snap);
+
+    // id→def REBUILT: resolve(7) yields the same def + content.
+    let restored = joiner
+        .resolve_def_for_test(TaskDefId(7))
+        .expect("restore rebuilds the id→def binding from the inline def");
+    assert_eq!(restored.def_id, TaskDefId(7));
+    assert_eq!(restored.task_id, "the-task");
+    // hash↔id BIJECTION rebuilt: the content hash resolves back to the SAME
+    // id (the `intern_at` on restore re-recorded the binding).
+    assert_eq!(joiner.def_id_for_hash_for_test("h"), Some(TaskDefId(7)));
+}
+
+/// A bijection collision on restore is the loud-but-SAFE graceful degrade:
+/// a snapshot whose def carries an id ALREADY bound to a DIFFERENT hash on
+/// the joiner cannot rebind it (a converged registry never produces one;
+/// a failover cross-epoch transient can). The restore logs LOUD, KEEPS the
+/// existing id binding, and re-anchors the conflicting def by CONTENT so it
+/// still resolves by hash — the def is never lost (its content round-trips
+/// via the inline `TaskState`).
+#[test]
+fn snapshot_restore_def_id_collision_keeps_local_and_reanchors_by_content() {
+    // Joiner already bound id 5 to hash "local".
+    let mut joiner = ClusterState::<RunnerIdentifier>::new();
+    joiner.apply(ClusterMutation::TaskAdded {
+        hash: "local".into(),
+        task: mk_task("local-task"),
+        def_id: Some(5),
+    });
+
+    // A peer snapshot binds the SAME id 5 to a DIFFERENT hash — the
+    // bijection-violating restore.
+    let mut peer = ClusterState::<RunnerIdentifier>::new();
+    peer.apply(ClusterMutation::TaskAdded {
+        hash: "other".into(),
+        task: mk_task("other-task"),
+        def_id: Some(5),
+    });
+    joiner.restore(peer.snapshot());
+
+    // id 5 stays bound to the LOCAL def; the collision never rebound it.
+    assert_eq!(joiner.def_id_for_hash_for_test("local"), Some(TaskDefId(5)));
+    assert_eq!(
+        joiner
+            .resolve_def_for_test(TaskDefId(5))
+            .map(|d| d.task_id.clone()),
+        Some("local-task".into()),
+        "the colliding restore never rebound id 5 to the peer's def"
+    );
+    // The conflicting def is NOT lost — re-anchored by content under a
+    // fresh local id, so it still resolves by hash.
+    let other_id = joiner
+        .def_id_for_hash_for_test("other")
+        .expect("the colliding def is re-anchored by content, not dropped");
+    assert_ne!(other_id, TaskDefId(5), "it took a fresh local id, not 5");
+    assert_eq!(
+        joiner.resolve_def_for_test(other_id).map(|d| d.task_id.clone()),
+        Some("other-task".into()),
+    );
+}
+
+/// Adding the self-describing `def_id` field must NOT make the def store
+/// contribute to the convergence digest (CL-A2): two replicas that bound
+/// the SAME content to DIFFERENT def ids still produce the SAME digest,
+/// because the digest folds the `tasks` join-key projection (which never
+/// reads the def content), not the def store. A def's presence / its id is
+/// implied by the tasks fold via the content-based join key — folding the
+/// id would double-count and diverge anti-entropy.
+#[test]
+fn def_id_does_not_contribute_to_digest() {
+    let mut a = ClusterState::<RunnerIdentifier>::new();
+    a.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("same-content"),
+        def_id: Some(3),
+    });
+    let mut b = ClusterState::<RunnerIdentifier>::new();
+    // SAME content (same hash + task), DIFFERENT def id.
+    b.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("same-content"),
+        def_id: Some(99),
+    });
+
+    assert_ne!(
+        a.def_id_for_hash_for_test("h"),
+        b.def_id_for_hash_for_test("h"),
+        "the two replicas bound the same content to different ids"
+    );
+    assert_eq!(
+        a.digest(),
+        b.digest(),
+        "the def id must not perturb the convergence digest"
+    );
+}

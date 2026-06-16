@@ -311,6 +311,19 @@ impl<I: Identifier> ClusterState<I> {
         self.definitions.id_for_hash(hash)
     }
 
+    /// Test-only seam: resolve a [`TaskDefId`] to its shared frozen def via
+    /// the def store — the snapshot-portability read that asserts a restored
+    /// replica REBUILT its id↔def binding (a self-describing def re-interned
+    /// at its carried id on restore). `None` for an id this replica never
+    /// placed.
+    #[cfg(test)]
+    pub(crate) fn resolve_def_for_test(
+        &self,
+        id: super::TaskDefId,
+    ) -> Option<&std::sync::Arc<super::FrozenTaskDef<I>>> {
+        self.definitions.resolve(id)
+    }
+
     pub fn iter_pending(&self) -> impl Iterator<Item = (&String, TaskInfo<I>)> {
         self.tasks.iter().filter_map(|(h, s)| match s {
             TaskState::Pending { .. } => Some((h, s.to_task_info())),

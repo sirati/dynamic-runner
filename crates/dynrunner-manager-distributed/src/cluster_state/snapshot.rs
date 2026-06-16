@@ -897,6 +897,18 @@ impl<I: Identifier> ClusterState<I> {
         // live one. This loop emits only the terminal-completion event the
         // join pre-builds for the (separate) task-completed channel.
         for (hash, incoming) in tasks {
+            // Rebuild the def-store maps from the self-describing inline def
+            // BEFORE the merge: the snapshot ships each def by value inside
+            // its `TaskState` but DROPS the def store, so the restoring
+            // replica regains its id↔def + hash↔id bindings here (the L5
+            // prerequisite — `resolve(def_id)` must work post-restore). A
+            // bijection conflict is the existing loud-but-safe drop; the def
+            // content still round-trips via the inline state. Registering
+            // unconditionally (not just on a winning merge) is correct: a
+            // restored state carries its def regardless of whether its join
+            // key dominates the local one, and the registration is
+            // idempotent / content-addressed.
+            self.register_restored_def(&hash, incoming.def());
             let co_present_outputs = task_outputs.get(&hash).cloned();
             if let super::merge::MergeOutcome::Applied { event: Some(ev), .. } =
                 self.merge_task_state(&hash, incoming, co_present_outputs, resumed)

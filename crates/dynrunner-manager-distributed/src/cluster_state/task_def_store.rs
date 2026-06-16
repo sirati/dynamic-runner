@@ -42,6 +42,18 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct TaskDefId(pub u32);
 
+impl TaskDefId {
+    /// Sentinel for an UN-interned [`FrozenTaskDef`] (the one produced by
+    /// [`FrozenTaskDef::from_task_info`] before it reaches a store): the
+    /// intern step ([`TaskDefStore::intern`] / [`TaskDefStore::intern_at`])
+    /// STAMPS the real id over this before the def is stored, so a stored
+    /// or observed def never carries it. `u32::MAX` is safe: the
+    /// monotone allocator never mints it in any realistic run, and the
+    /// bijection-enforced `intern_at` would reject it as an id-rebind if a
+    /// wire ever carried it as a real slot.
+    pub(crate) const UNBOUND: TaskDefId = TaskDefId(u32::MAX);
+}
+
 /// The FROZEN core of a [`TaskInfo`]: the 13 immutable fields that make
 /// up a task's identity + dispatch recipe, EXCLUDING the 3 mutable tail
 /// fields the runtime rewrites in place (`preferred_secondaries`,
@@ -50,9 +62,28 @@ pub(crate) struct TaskDefId(pub u32);
 /// Generic over the identifier type `I` for the same reason `TaskInfo`
 /// is. The serde bound mirrors `TaskInfo`'s so the def round-trips on a
 /// future def-transfer wire.
+///
+/// SELF-DESCRIBING id: the `def_id` field carries this def's store id so
+/// the inline serialization (a `TaskState` ships its `Arc<FrozenTaskDef>`
+/// by value in the snapshot) PERSISTS the assigned id. A restoring replica
+/// rebuilds the store's id↔def + hash↔id maps from the carried id
+/// ([`TaskDefStore::intern_at`]) — the snapshot ships no separate def-store
+/// wire field. The id is STAMPED at intern time (the single slot-write both
+/// fill paths share), never set by the un-interned [`Self::from_task_info`]
+/// splitter; a pre-intern value is a sentinel ([`TaskDefId::UNBOUND`]) the
+/// intern step always overwrites before the def is stored or observed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
 pub struct FrozenTaskDef<I> {
+    /// This def's store id, STAMPED at intern time so the inline
+    /// serialization is self-describing (see the type doc). [`TaskDefId::UNBOUND`]
+    /// on an un-interned def produced by [`Self::from_task_info`]; the
+    /// intern step overwrites it before storage, so a stored/observed def
+    /// always carries its real id. `pub(crate)` (not `pub` like the content
+    /// fields): the id is a crate-internal store handle, while the content
+    /// fields are `pub` for the def-transfer wire — and [`TaskDefId`] is
+    /// itself crate-private, so a `pub` field would leak a private type.
+    pub(crate) def_id: TaskDefId,
     pub path: PathBuf,
     pub size: u64,
     pub identifier: I,
@@ -103,6 +134,9 @@ impl<I> FrozenTaskDef<I> {
         } = t;
         (
             FrozenTaskDef {
+                // UN-interned: the intern step stamps the real id over this
+                // sentinel before the def is stored or observed.
+                def_id: TaskDefId::UNBOUND,
                 path,
                 size,
                 identifier,
@@ -300,6 +334,14 @@ impl<I> TaskDefStore<I> {
     /// Place `frozen` into the `defs` slot at `id`, growing the sparse
     /// vector with empty slots as needed. The single slot-write the two
     /// fill paths share; the caller owns the bijection/dedup decision.
+    ///
+    /// Does NOT stamp the self-describing `def_id`: only the WIRE-AGREED
+    /// [`Self::intern_at`] path stamps it (a primary-allocated, CRDT-agreed
+    /// id is portable), while the node-local [`Self::intern`] fallback leaves
+    /// the [`TaskDefId::UNBOUND`] sentinel — a node-local id is intra-node
+    /// only and legitimately differs across replicas, so persisting it would
+    /// make a restoring replica assert a binding that was never agreed
+    /// (a spurious bijection conflict). See [`Self::intern_at`].
     fn put_slot(&mut self, id: TaskDefId, frozen: Arc<FrozenTaskDef<I>>) {
         let idx = id.0 as usize;
         if idx >= self.defs.len() {
@@ -366,6 +408,13 @@ impl<I> TaskDefStore<I> {
     /// bound to `id` reuses it (and fills the slot if a prior
     /// [`Self::alloc_for_hash`] reservation left it empty), exactly as the
     /// node-local [`Self::intern`] re-add mints nothing.
+    ///
+    /// SELF-DESCRIBING: this is the WIRE-AGREED intern path, so it STAMPS the
+    /// established id onto the def's `def_id` before storing it — a
+    /// primary-allocated, CRDT-agreed id IS portable, so persisting it inline
+    /// lets a restoring replica re-anchor the def at the SAME id. (The
+    /// node-local [`Self::intern`] fallback deliberately does NOT stamp: a
+    /// node-local id is intra-node only.)
     pub(crate) fn intern_at(
         &mut self,
         id: TaskDefId,
@@ -386,6 +435,7 @@ impl<I> TaskDefStore<I> {
             // slot mints nothing.
             if self.resolve(existing).is_none() {
                 self.canonicalize_strs(&mut frozen);
+                frozen.def_id = existing;
                 self.put_slot(existing, Arc::new(frozen));
             }
             return Ok(existing);
@@ -397,6 +447,7 @@ impl<I> TaskDefStore<I> {
             return Err(DefBijectionError::IdRebound { id });
         }
         self.canonicalize_strs(&mut frozen);
+        frozen.def_id = id;
         self.put_slot(id, Arc::new(frozen));
         self.hash_to_id.insert(hash, id);
         Ok(id)
@@ -529,6 +580,74 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
             },
         ))
     }
+
+    /// REBUILD the def-store maps from a self-describing restored def: the
+    /// snapshot/AE/merge restore seam (`restore_collecting_resumed`) calls
+    /// this for every restored `TaskState` so the local store regains the
+    /// id↔def + hash↔id bindings the snapshot dropped (it ships defs INLINE
+    /// by value, not the store). The decode rebuilt the def CONTENT inside
+    /// the state's `Arc<FrozenTaskDef>`; this re-interns it at the id the def
+    /// CARRIES so `resolve(def_id)` works on the restoring replica
+    /// (late-joiner / promoted-primary / AE), the prerequisite for L5's
+    /// def_id-based dep refs.
+    ///
+    ///   * a def carrying a real id (a wire-agreed id stamped at
+    ///     [`TaskDefStore::intern_at`]) is placed at EXACTLY that id —
+    ///     bijection-enforced, so on the CONVERGED happy path a fresh replica
+    ///     re-anchors the def at the SAME id (the L5 prerequisite).
+    ///   * a legacy/un-agreed def carrying [`TaskDefId::UNBOUND`] (a
+    ///     node-local intern, or a pre-self-describing snapshot) falls back to
+    ///     node-local [`TaskDefStore::intern`] (the L2 by-content-hash
+    ///     convergence) — the same fallback `intern_task_def_at`'s `None` arm
+    ///     uses. A node-local id is intra-node only, so it is NOT asserted as
+    ///     portable.
+    ///
+    /// COLLISION (the carried id contradicts a binding this replica already
+    /// holds) is logged LOUD but is NOT a crash: unlike the LIVE wire — where
+    /// the whole `TaskAdded` NoOps and is redelivered — a restore has ALREADY
+    /// merged the authoritative `TaskState`, so the def must not be lost. It
+    /// can legitimately arise as a TRANSIENT across a failover (two primary
+    /// epochs each minting from their own allocator before the
+    /// `resume_alloc_floor` reconciliation observes the other's ids), so the
+    /// restore DEGRADES gracefully: re-anchor the def by CONTENT
+    /// ([`TaskDefStore::intern`]) so it still resolves by hash (under this
+    /// replica's local id), the existing binding untouched. The def content
+    /// always round-trips via the inline state, so nothing is lost.
+    ///
+    /// Idempotent: a re-restore re-presents the same `(id, hash)` and the
+    /// bijection's same-id re-add mints nothing.
+    pub(crate) fn register_restored_def(&mut self, hash: &str, def: &Arc<FrozenTaskDef<I>>)
+    where
+        I: Clone,
+    {
+        let carried = def.def_id;
+        if carried == TaskDefId::UNBOUND {
+            // Un-agreed / legacy def: no self-describing portable id —
+            // re-anchor by content hash, exactly like the un-allocated apply
+            // fallback.
+            self.definitions.intern(hash.to_string(), (**def).clone());
+            return;
+        }
+        if let Err(err) =
+            self.definitions
+                .intern_at(carried, hash.to_string(), (**def).clone())
+        {
+            tracing::error!(
+                target: "dynrunner_cluster_state",
+                ?err,
+                hash,
+                "snapshot-restore def-id collision — a restored def's \
+                 self-describing (def_id, hash) contradicts an established \
+                 binding (a converged registry never produces one; a failover \
+                 cross-epoch transient can). Re-anchoring the def by content; \
+                 the existing id binding is kept and the def content round-trips \
+                 via the inline task state."
+            );
+            // Degrade to content-addressed: the def still resolves by hash on
+            // this replica (under its local id), never lost.
+            self.definitions.intern(hash.to_string(), (**def).clone());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -541,6 +660,8 @@ mod tests {
     /// mutable tail fields the frozen core excludes).
     fn mk_frozen(name: &str, phase: &str) -> FrozenTaskDef<RunnerIdentifier> {
         FrozenTaskDef {
+            // UN-interned literal: intern stamps the real id on store.
+            def_id: TaskDefId::UNBOUND,
             path: PathBuf::from(format!("/tasks/{name}")),
             size: 0,
             identifier: RunnerIdentifier::from(name),
