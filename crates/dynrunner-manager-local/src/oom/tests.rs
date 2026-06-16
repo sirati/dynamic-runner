@@ -145,6 +145,7 @@ fn reading_with_pressure(host_used: u64, host_total: u64) -> HostMemoryReading {
         container_swap_max: Some(0),
         kernel_oom_kill_count: None,
         cpu_stat: None,
+        self_cpu_ticks: None,
     }
 }
 
@@ -186,6 +187,7 @@ fn cgroup_unavailable_yields_none_or_zero() {
         container_swap_max: None,
         kernel_oom_kill_count: None,
         cpu_stat: None,
+        self_cpu_ticks: None,
     };
     let (probe, _) = MockProbe::new(reading);
     let mut watcher = OomWatcher::with_probe(

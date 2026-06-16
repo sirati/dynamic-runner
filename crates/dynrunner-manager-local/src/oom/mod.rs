@@ -59,7 +59,7 @@ use dynrunner_scheduler_api::Scheduler;
 use crate::monitor::{MemoryCharge, measure_worker_charge};
 use crate::pool::{ResourcePressureResult, WorkerPool};
 
-use self::probe::{CpuStat, HostMemoryReading, ProcSysProbe, SystemProbe, cpu_busy_milli};
+use self::probe::{CpuStat, HostMemoryReading, ProcSysProbe, SystemProbe, cpu_busy_milli_excl_self};
 
 /// Default cadence of the self-paced charge sweep: the sweep task
 /// `sleep`s this long after EACH sweep completes (await-before-resleep
@@ -326,6 +326,16 @@ pub struct OomWatcher {
     /// intact (so a transient parse hiccup doesn't reset the diff
     /// chain across subsequent good reads).
     last_cpu_stat: Option<CpuStat>,
+    /// Previous sweep's cumulative `/proc/self/stat` CPU ticks (utime +
+    /// stime). Diffed against the next sweep over the SAME interval as
+    /// `last_cpu_stat` to subtract THIS process's own CPU from the host
+    /// busy fraction (#575 "workload, not framework"). `None` before
+    /// the first sweep or when `/proc/self/stat` was unreadable; a
+    /// sweep that itself returns no self readout keeps the stored prev
+    /// intact, mirroring `last_cpu_stat`. When either side is `None`
+    /// the subtraction is skipped and the host fraction is reported
+    /// as-is.
+    last_self_cpu_ticks: Option<u64>,
 }
 
 /// The three fields the delta trigger compares against their value
@@ -376,6 +386,7 @@ impl OomWatcher {
             last_kernel_oom_count: None,
             recent_kernel_oom_at: None,
             last_cpu_stat: None,
+            last_self_cpu_ticks: None,
         }
     }
 
@@ -501,16 +512,31 @@ impl OomWatcher {
         let (charged_sum, swap_sum) = sum_worker_charge(pool);
         let tracked_workers_count = pool.workers.len() as u32;
         // Derive the host CPU busy fraction over the interval between
-        // THIS sweep and the prior one (#575). The prior cumulative
-        // reading lives on `last_cpu_stat`; we update it ONLY when the
-        // probe surfaced a fresh reading, so a transient parse hiccup
-        // does not reset the diff chain across subsequent good reads.
+        // THIS sweep and the prior one (#575), with THIS process's own
+        // CPU subtracted so the figure reflects the WORKLOAD rather
+        // than framework overhead. The prior cumulative host reading
+        // lives on `last_cpu_stat` and the prior own-process ticks on
+        // `last_self_cpu_ticks`; both are diffed over the SAME interval
+        // (so the own share is in the same unit as the host fraction
+        // and is directly subtractable). We update each prev ONLY when
+        // the probe surfaced a fresh reading, so a transient parse
+        // hiccup does not reset the diff chain across subsequent good
+        // reads. A missing self readout falls back to NOT subtracting
+        // (host as-is) rather than erroring.
         let cpu_busy = match (self.last_cpu_stat, host.cpu_stat) {
-            (Some(prev), Some(cur)) => cpu_busy_milli(prev, cur),
+            (Some(prev), Some(cur)) => cpu_busy_milli_excl_self(
+                prev,
+                cur,
+                self.last_self_cpu_ticks,
+                host.self_cpu_ticks,
+            ),
             _ => None,
         };
         if let Some(cur) = host.cpu_stat {
             self.last_cpu_stat = Some(cur);
+        }
+        if let Some(cur_self) = host.self_cpu_ticks {
+            self.last_self_cpu_ticks = Some(cur_self);
         }
         self.last_snapshot = OomWatcherSnapshot {
             host,
