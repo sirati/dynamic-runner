@@ -1,13 +1,12 @@
 use dynrunner_core::{Identifier, ResourceMap};
-use dynrunner_protocol_primary_secondary::{Destination, DistributedMessage, PeerId};
+use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler_api::{AssignmentDecision, ResourceEstimator, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::PrimaryCoordinator;
 use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::coordinator::InheritedSlotReconcile;
-use crate::primary::task::predecessor_outputs::gather_predecessor_outputs;
-use crate::primary::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
+use crate::primary::lifecycle::dispatch::DispatchOutcome;
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// `command_rx` threads the operational-loop's command-channel
@@ -175,129 +174,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         // releasing the pool borrow for the take below.
                         let selection = view.select(binary_index);
                         let binary = self.pool_mut().take_selected(selection);
-                        let sec_id = self.workers[idx].secondary_id.clone();
-
-                        let task_hash = compute_task_hash(&binary);
-                        // Type-slot reserve + slot `Idle ->
-                        // Assigned{task_hash}` + ledger insert, committed
-                        // together. The slot is idle here: the outer arm
-                        // gated on `is_idle()`, so assignment is reachable
-                        // only from an idle slot. The enforced idle-guard
-                        // (#517) refuses only if that invariant ever broke:
-                        // requeue the taken binary + return (the requester
-                        // re-polls) rather than dispatch a task the model
-                        // can't track (the silent-overwrite backstop).
-                        if !self.commit_assignment(
-                            idx,
-                            binary.clone(),
-                            task_hash.clone(),
-                            estimated_usage.clone(),
-                        ) {
-                            self.pool_mut().requeue(binary);
-                            return Ok(());
-                        }
-                        // Resolve the per-edge predecessor-output map from the
-                        // replicated `cluster_state.task_outputs` cache. The
-                        // helper handles both the direct-dep present-but-empty
-                        // contract and the `inherit_outputs` transitive walk;
-                        // an empty map results when the task has no deps. The
-                        // same helper is consumed by the sibling dispatch site
-                        // in `primary/lifecycle/dispatch.rs` so the wire shape
-                        // is identical regardless of which path fires.
-                        let predecessor_outputs =
-                            gather_predecessor_outputs(&self.cluster_state, &binary);
-                        // Pre-start fences (#530):
-                        //   A) supplanted_holder — Some IFF this hash is a
-                        //      dead-secondary-requeue redirect; the entry is
-                        //      LEFT in place across the assignment-failure
-                        //      rollback path below so a re-dispatch stays
-                        //      fenced, and is dropped only on terminal.
-                        //   B) secondary_id_member_gen — always Some, the
-                        //      addressee's current `peer_member_gen` per this
-                        //      coordinator's CRDT view (the receiver compares
-                        //      it against its own to catch a stale-incarnation
-                        //      lease that crossed a re-removal-and-re-admission
-                        //      in flight). Symmetric to the secondary→primary
-                        //      InFlightRoster gen-staleness gate (#518).
-                        let supplanted_holder = self.supplanted_holders.get(&task_hash).cloned();
-                        let secondary_id_member_gen =
-                            Some(self.cluster_state.peer_member_gen(&sec_id));
-                        let assignment_msg = DistributedMessage::TaskAssignment {
-                            target: None,
-                            sender_id: self.config.node_id.clone(),
-                            timestamp: timestamp_now(),
-                            secondary_id: sec_id.clone(),
-                            worker_id,
-                            zip_file: None,
-                            binary_info: binary_to_distributed(&binary),
-                            local_path: self.config.wire_local_path(&binary),
-                            file_hash: task_hash.clone(),
-                            predecessor_outputs,
-                            supplanted_holder,
-                            secondary_id_member_gen,
-                        };
-
-                        // Same partial-commit-leak rollback as
-                        // `dispatch_to_idle_workers`: a send_to
-                        // failure here pre-fix left the slot Assigned +
-                        // pool in_flight bumped. dispatch_order then
-                        // skipped the slot forever; the leaked
-                        // in_flight never decremented because no
-                        // TaskComplete/TaskFailed could arrive for
-                        // a task that wasn't sent. asm-tokenizer's
-                        // 33-in_flight/active=0 jam at 84f669c is
-                        // the operator-facing symptom of cumulative
-                        // leaks from this and the sibling path.
-                        if let Err(send_err) = self
-                            .send_to(
-                                Destination::Secondary(PeerId::from(sec_id.clone())),
-                                assignment_msg,
-                            )
+                        // The single-task dispatch transaction (commit →
+                        // gather → build → send → originate, with the
+                        // in-flight-bookkeeping triple + rollback) lives in
+                        // `dispatch_one_assignment`, shared with the pool-fed
+                        // + affine-fed sites so the wire shape + leak-safe
+                        // rollback are identical regardless of which path
+                        // fires. A non-committed outcome hands the binary
+                        // back: this is the POOL-fed source, so it requeues to
+                        // the pool and returns (the requester re-polls on its
+                        // backoff tick — the slot is open again).
+                        match self
+                            .dispatch_one_assignment(idx, binary, estimated_usage.clone())
                             .await
                         {
-                            tracing::warn!(
-                                secondary = %sec_id,
-                                worker_id,
-                                task_hash = %task_hash,
-                                error = %send_err,
-                                "task-assignment send failed; rolling back worker state and requeuing binary"
-                            );
-                            // Undo the `commit_assignment` triple (type
-                            // slot + slot state + ledger) for the unsent
-                            // task, then requeue the binary.
-                            self.rollback_assignment(idx, &task_hash, &binary.type_id);
-                            self.pool_mut().requeue(binary);
-                            // Return early without setting
-                            // `assigned`: the binary is back in
-                            // the pool, the slot is open again,
-                            // and the requesting secondary will
-                            // retry the TaskRequest on its next
-                            // tick.
-                            return Ok(());
+                            DispatchOutcome::Committed => {
+                                assigned = true;
+                            }
+                            DispatchOutcome::CommitRefused(binary)
+                            | DispatchOutcome::SendFailed(binary) => {
+                                self.pool_mut().requeue(binary);
+                                return Ok(());
+                            }
                         }
-
-                        // Send succeeded: originate the CRDT `Pending →
-                        // InFlight` transition (the single origination
-                        // point). After the send so a failure needs no
-                        // CRDT compensation (the rollback above runs
-                        // before we reach here).
-                        self.originate_task_assigned(task_hash.clone(), sec_id.clone(), worker_id)
-                            .await;
-
-                        // Operator-facing INFO: which secondary/
-                        // worker just took the task, with enough
-                        // human-readable identity to correlate
-                        // without grepping by hash.
-                        tracing::info!(
-                            secondary = %sec_id,
-                            worker_id,
-                            task_id = ?binary.task_id,
-                            phase = %binary.phase_id,
-                            task_type = %binary.type_id,
-                            task_hash = %task_hash,
-                            "task assigned"
-                        );
-                        assigned = true;
                     }
                 }
             }
