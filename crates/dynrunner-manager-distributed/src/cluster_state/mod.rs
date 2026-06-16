@@ -50,6 +50,7 @@ mod settled;
 mod snapshot;
 mod state;
 mod stream;
+mod task_def_store;
 mod types;
 
 // Re-export the public-facing value types and the `ClusterState`
@@ -74,6 +75,11 @@ pub(crate) use accessors::TaskView;
 // fat-body-free readers + the spill driver are all this crate).
 pub use settled::SettledStore;
 pub(crate) use settled::{SettledClass, SpillReceipt, write_spill_batch};
+// Frozen task-def registry: the immutable core of a `TaskInfo` + the
+// content-addressed replicated store of those cores. Crate-internal (the
+// store is owned by `ClusterState`, like `settled`); additive in L1.
+#[allow(unused_imports)]
+pub(crate) use task_def_store::{FrozenTaskDef, TaskDefId, TaskDefStore};
 pub use snapshot::ClusterStateSnapshot;
 pub use state::ClusterState;
 // Snapshot-stream partition policy + payload codec: the plan iterates a

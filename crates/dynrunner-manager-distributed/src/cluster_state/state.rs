@@ -650,6 +650,23 @@ pub struct ClusterState<I> {
     /// converges through the `merge_task_state` settled consult; the
     /// digest folds the accumulator (`tasks_hash_acc`).
     pub(super) settled: super::settled::SettledStore,
+    /// Frozen task-definition registry: the content-addressed,
+    /// REPLICATED store of the IMMUTABLE core of every task's
+    /// `TaskInfo` (`super::task_def_store::TaskDefStore`). A def is
+    /// deduplicated by the same content hash the `tasks` ledger keys on,
+    /// so the registry converges by construction (equal content ⇒ equal
+    /// hash ⇒ same id on every node).
+    ///
+    /// Classification: REPLICATED state like `tasks` — Clone carries it
+    /// FULLY (a content-addressed registry is the same on every node, and
+    /// the `Arc` clones are cheap). NOT folded into the anti-entropy
+    /// digest: a def's content is already implied by the `tasks` fold
+    /// through the content-based join key, so folding the index would
+    /// double-count and diverge (see `digest.rs`). Empty until an
+    /// originator interns its first def; rebuilt (empty) on restore in
+    /// L1 — the full def-transfer over the snapshot stream is a later
+    /// leaf.
+    pub(super) definitions: super::task_def_store::TaskDefStore<I>,
     /// Slurm-authoritative life-state snapshot consulted by the apply-path
     /// sticky-removal reversibility tiebreak (#546): an apply of
     /// `PeerJoined` for a peer this node already marked `Dead` at a
@@ -755,6 +772,10 @@ where
             // Settled store: carried READ-ONLY (index + shared read fds;
             // the writer affiliation is dropped — one-writer rule).
             settled,
+            // Frozen task-def registry — carried FULLY (REPLICATED state
+            // like `tasks`; the content-addressed registry is the same on
+            // every node and the `Arc` clones are cheap).
+            definitions,
             // Node-local runtime handle (slurm-authoritative life-state
             // snapshot for #546) — NOT cloned. A cloned replica is bound
             // to the same snapshot later via `set_authority_snapshot` if
@@ -856,6 +877,9 @@ where
             // serving settled reads through the shared `Arc<File>`
             // segments but never writes the source's file.
             settled: settled.clone_read_only(),
+            // Frozen task-def registry — REPLICATED, full clone (like
+            // `tasks`; `Arc` clones are cheap).
+            definitions: definitions.clone(),
             // Node-local runtime handle — see field doc.
             authority_snapshot: None,
         }
@@ -915,6 +939,7 @@ where
             blocked_by,
             outcome_tally: _outcome_tally,
             settled,
+            definitions,
             authority_snapshot,
         } = self;
         f.debug_struct("ClusterState")
@@ -964,6 +989,7 @@ where
             .field("digest_fold_count", &digest_fold_count.get())
             .field("blocked_by", &blocked_by.len())
             .field("settled", settled)
+            .field("definitions", definitions)
             .field("authority_snapshot", &authority_snapshot.is_some())
             .finish()
     }
@@ -1015,6 +1041,7 @@ impl<I> Default for ClusterState<I> {
             blocked_by: HashMap::new(),
             outcome_tally: super::outcome_tally::OutcomeTally::default(),
             settled: super::settled::SettledStore::default(),
+            definitions: super::task_def_store::TaskDefStore::default(),
             authority_snapshot: None,
         }
     }
