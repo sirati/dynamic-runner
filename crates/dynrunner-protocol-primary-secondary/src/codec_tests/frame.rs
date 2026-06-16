@@ -192,6 +192,8 @@ fn roundtrip_all_message_types() {
                 custom_messages_hash: 0xDD,
                 custom_terminal_watermarks_count: 1,
                 custom_terminal_watermarks_hash: 0xEE,
+                affine_count: 4,
+                affine_hash: 0xFA,
             },
             sender_is_observer: true,
         },

@@ -299,6 +299,15 @@ impl<I: Identifier> ClusterState<I> {
                 // cold-start aliasing CL-A2 forbids). Monotone — a
                 // non-promoting adopter's call is a harmless no-op.
                 self.resume_def_alloc_floor();
+                // Failover-safe AFFINE resume (AF-id): co-located with the
+                // SAME epoch advance. Re-anchor the affine cell-generation
+                // stamp counter PAST every inherited cell generation (and the
+                // affine-id allocator past every observed affine-id), so a
+                // promoted primary never re-mints a live affine-id NOR a live
+                // cell generation — the LWW total order survives the epoch
+                // boundary. Monotone — a non-promoting adopter's call is a
+                // harmless no-op, same as the def-id resume above.
+                self.resume_affine_cell_gen_floor();
                 // Keep the lock-free epoch mirror in lockstep with the
                 // field so off-`apply` readers (the observer
                 // resource-holdings announcer) see the post-mutation
@@ -932,6 +941,50 @@ impl<I: Identifier> ClusterState<I> {
                 seq,
                 reason,
             } => self.apply_custom_message_failed(origin, seq, reason),
+            // ── AF-id: affine-id agreement + the per-secondary bitvector ──
+            ClusterMutation::SecondaryAffineRegistered { hash, affine_id } => {
+                self.apply_secondary_affine_registered(&hash, affine_id)
+            }
+            ClusterMutation::SecondaryAffineFinished {
+                secondary,
+                affine_id,
+                generation,
+            } => self.apply_secondary_affine_cell(
+                &secondary,
+                affine_id,
+                dynrunner_protocol_primary_secondary::AffineCell::Done,
+                generation,
+            ),
+            ClusterMutation::SecondaryAffineQueued {
+                secondary,
+                affine_id,
+                generation,
+            } => self.apply_secondary_affine_cell(
+                &secondary,
+                affine_id,
+                dynrunner_protocol_primary_secondary::AffineCell::Queued,
+                generation,
+            ),
+            ClusterMutation::SecondaryAffineFailed {
+                secondary,
+                affine_id,
+                generation,
+            } => self.apply_secondary_affine_cell(
+                &secondary,
+                affine_id,
+                dynrunner_protocol_primary_secondary::AffineCell::Failed,
+                generation,
+            ),
+            ClusterMutation::SecondaryAffineUnqueued {
+                secondary,
+                affine_id,
+                generation,
+            } => self.apply_secondary_affine_cell(
+                &secondary,
+                affine_id,
+                dynrunner_protocol_primary_secondary::AffineCell::NotDone,
+                generation,
+            ),
         }
     }
 

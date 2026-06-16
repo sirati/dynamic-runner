@@ -232,7 +232,23 @@ fn stamp_versions<I: Identifier>(
             // and the latch join is order-free.
             | ClusterMutation::CustomMessagePosted { .. }
             | ClusterMutation::CustomMessageHandled { .. }
-            | ClusterMutation::CustomMessageFailed { .. } => {}
+            | ClusterMutation::CustomMessageFailed { .. }
+            // `SecondaryAffineRegistered` (AF-id) is generation-LESS: the
+            // affine-id binding is set-once / content-addressed (bijection-
+            // enforced on apply), like the def-id stamp — no LWW arbitration.
+            | ClusterMutation::SecondaryAffineRegistered { .. } => {}
+            // The affine bitvector CELL mutations (AF-id) carry a per-cell LWW
+            // `generation`: stamp it here from the originator's global monotone
+            // counter (a strictly-increasing source, so a later write — incl.
+            // the steal's `Unqueued` reset — always out-stamps the write it
+            // supersedes), the affine twin of the `TaskVersion` stamp above.
+            // One arm for all four cell variants — no per-variant duplication.
+            ClusterMutation::SecondaryAffineFinished { generation, .. }
+            | ClusterMutation::SecondaryAffineQueued { generation, .. }
+            | ClusterMutation::SecondaryAffineFailed { generation, .. }
+            | ClusterMutation::SecondaryAffineUnqueued { generation, .. } => {
+                *generation = state.next_affine_cell_generation();
+            }
         }
     }
 }
@@ -300,6 +316,32 @@ fn stamp_def_ids<I: Identifier>(
             }
         }
     }
+}
+
+/// Reserve the CRDT-agreed dense affine-id for every originated
+/// `TaskKind::SecondaryAffine` `TaskAdded` and INJECT a paired
+/// `SecondaryAffineRegistered` mutation (AF-id) — the affine analogue of the
+/// def-id stamp, but its own pass on the OWNED `Vec` (it GROWS the batch, so
+/// it cannot ride the in-place `&mut [_]` stamp). Reservation is idempotent on
+/// hash (a re-added affine def reuses its affine-id and injects a registration
+/// the receiver NoOps), so the pass is safe under at-least-once re-origination.
+fn inject_affine_registrations<I: Identifier>(
+    state: &mut ClusterState<I>,
+    mutations: &mut Vec<ClusterMutation<I>>,
+) {
+    let mut registrations: Vec<ClusterMutation<I>> = Vec::new();
+    for m in mutations.iter() {
+        if let ClusterMutation::TaskAdded { hash, task, .. } = m
+            && task.kind.is_secondary_affine()
+        {
+            let affine_id = state.allocate_affine_id(hash).0;
+            registrations.push(ClusterMutation::SecondaryAffineRegistered {
+                hash: hash.clone(),
+                affine_id,
+            });
+        }
+    }
+    mutations.extend(registrations);
 }
 
 /// `ClusterState` is the authoritative role-table owner; transports
@@ -376,6 +418,13 @@ pub(crate) fn apply_locally_for_broadcast<I: Identifier>(
     // the def under the SAME id. Its own pass — a distinct concern from the
     // version/attempt stamp above.
     stamp_def_ids(state, &mut mutations);
+    // Affine-id registration pass (AF-id): for every originated SecondaryAffine
+    // `TaskAdded`, reserve its CRDT-agreed dense affine-id and INJECT a paired
+    // `SecondaryAffineRegistered` so every replica binds the affine def's
+    // content to the SAME affine-id (the per-secondary bitvector cell index).
+    // Its own pass — a distinct concern from the def-id stamp above (a sibling
+    // id space, minted only for the affine subset).
+    inject_affine_registrations(state, &mut mutations);
     let mut applied: Vec<ClusterMutation<I>> = Vec::with_capacity(mutations.len());
     let mut resumed_for_dispatch: Vec<TaskInfo<I>> = Vec::new();
     // The spawn-classified `newly_pending_from_spawn` surface is consumed by

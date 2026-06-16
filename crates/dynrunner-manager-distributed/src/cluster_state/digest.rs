@@ -263,6 +263,19 @@ impl<I: Identifier> ClusterState<I> {
             // folding the index would diverge anti-entropy. Bound for the
             // exhaustive guard.
             definitions: _definitions,
+            // REPLICATED, INDEPENDENTLY SUMMARISED: the per-secondary affine
+            // bitvector is genuinely independent replicated mutation state (it
+            // is NOT implied by the tasks fold, unlike `definitions`), so it IS
+            // folded — count of written cells + per-cell LWW value+generation
+            // fold, so a same-count divergence (a cell at a different
+            // value/generation) is detected and the snapshot pull's per-cell
+            // LWW restore heals it.
+            // The BOXED `AffineState`: its REPLICATED bitvector half is folded
+            // below (the genuinely-independent replicated mutation state — NOT
+            // implied by the tasks fold); its node-local gen-counter half
+            // carries no convergence signal and is excluded by reading only
+            // `.bitvector()` here.
+            affine,
             // node-local: slurm-authoritative life-state snapshot consumed
             // by the apply-path sticky-removal reversibility tiebreak
             // (#546). A pure runtime handle (no replicated content), so it
@@ -413,6 +426,17 @@ impl<I: Identifier> ClusterState<I> {
         let custom_terminal_watermarks_hash =
             super::grow_max::fold_grow_max(custom_terminal_watermarks);
 
+        // Per-secondary affine bitvector: count of WRITTEN cells + KEY+VALUE
+        // XOR-fold of each `(secondary, affine_id, cell-bits, generation)`. The
+        // value+generation are folded (not just the key) because the cell can
+        // diverge at an equal count (a same cell at a different value or LWW
+        // generation), so the fold must see them — the per-cell LWW restore
+        // then heals the lagging side (detect-WITH-heal).
+        let mut affine_hash = 0u64;
+        for entry in affine.bitvector().digest_entries() {
+            affine_hash ^= hash_one(entry);
+        }
+
         StateDigest {
             tasks_count: (tasks.len() + settled.len()) as u64,
             tasks_hash,
@@ -466,6 +490,8 @@ impl<I: Identifier> ClusterState<I> {
             custom_messages_hash,
             custom_terminal_watermarks_count: custom_terminal_watermarks.len() as u64,
             custom_terminal_watermarks_hash,
+            affine_count: affine.bitvector().written_cell_count(),
+            affine_hash,
         }
     }
 

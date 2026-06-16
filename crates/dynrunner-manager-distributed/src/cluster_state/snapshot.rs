@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::{Identifier, PhaseId, TaskInfo, TaskOutputs, TerminalOutcomeCounts};
 use dynrunner_protocol_primary_secondary::{
-    DiscoveryDebt, SecondaryCapacityRecord, SecondaryResourceSampleRecord,
+    AffineCell, DiscoveryDebt, SecondaryCapacityRecord, SecondaryResourceSampleRecord,
 };
 use serde::{Deserialize, Serialize};
 
@@ -443,6 +443,19 @@ pub struct ClusterStateSnapshot<I> {
     /// `#[serde(default)]` keeps wire compat with a pre-field sender.
     #[serde(default)]
     pub custom_terminal_watermarks: HashMap<String, u64>,
+    /// Replicated per-secondary AFFINE bitvector (the AF-id state layer) —
+    /// `secondary_id → [(affine_id, cell, generation)]`. Carried so a
+    /// failover-promoted primary INHERITS every affine cell + its LWW
+    /// generation (it rebuilds the per-secondary queues from these cells), and
+    /// a late-joiner converges. Merge rule on `restore`: per-cell LWW on
+    /// `generation` (the SAME join the live apply uses), so it is idempotent +
+    /// order-insensitive across (live, snapshot) arrival. `#[serde(default)]`
+    /// keeps wire compat with a pre-field sender (missing field decodes as an
+    /// empty map — no affine state, the conservative shape). The wire shape is
+    /// the owned `(affine_id, cell, generation)` tuple list so the snapshot
+    /// carries no in-crate type.
+    #[serde(default)]
+    pub affine: HashMap<String, Vec<(u32, AffineCell, u64)>>,
 }
 
 impl<I> Default for ClusterStateSnapshot<I> {
@@ -484,6 +497,7 @@ impl<I> Default for ClusterStateSnapshot<I> {
             phases_ended: HashSet::new(),
             custom_messages: HashMap::new(),
             custom_terminal_watermarks: HashMap::new(),
+            affine: HashMap::new(),
         }
     }
 }
@@ -663,6 +677,16 @@ impl<I: Identifier> ClusterState<I> {
             // exactly like `settled` (a task-batch / file-served concern,
             // not a head field) and bound for the exhaustive guard.
             definitions: _definitions,
+            // ── head partition: REPLICATED CRDT, head-safe ──: the
+            // per-secondary affine bitvector is per-cell LWW (never join-bumped
+            // by the task merge, unlike the F4 grow-max tally), so import order
+            // vs the task batch is free and it rides the head.
+            // The BOXED `AffineState`: its REPLICATED bitvector half is carried
+            // below (head-safe — per-cell LWW, never join-bumped); its
+            // node-local gen-counter half never crosses the wire (a restoring
+            // replica cold-starts it and re-anchors via the gen-floor resume),
+            // excluded by reading only `.bitvector()` here.
+            affine,
             // node-local: slurm-authoritative life-state snapshot consumed
             // by the apply-path sticky-removal reversibility tiebreak
             // (#546) — a pure runtime handle the restoring replica re-wires
@@ -774,6 +798,11 @@ impl<I: Identifier> ClusterState<I> {
             // the hydrate replay, and the compaction state converges.
             custom_messages: custom_messages.clone(),
             custom_terminal_watermarks: custom_terminal_watermarks.clone(),
+            // Per-secondary affine bitvector — carried so a promoted primary
+            // inherits every affine cell + its LWW generation (it rebuilds the
+            // per-secondary queues from these) and a late-joiner converges.
+            // Per-cell LWW-merged on restore; head-safe.
+            affine: affine.bitvector().to_wire(),
         }
     }
 
@@ -875,6 +904,7 @@ impl<I: Identifier> ClusterState<I> {
             phases_ended,
             custom_messages,
             custom_terminal_watermarks,
+            affine,
         } = snap;
         // Per-task restore now routes through the SHARED `merge_task_state`
         // join — the SAME order apply uses, so apply == restore by
@@ -1280,5 +1310,18 @@ impl<I: Identifier> ClusterState<I> {
         for origin in &touched_origins {
             self.compact_custom_watermark(origin);
         }
+        // Per-secondary affine bitvector (AF-id): per-cell LWW merge — the
+        // SAME convergent join the live apply arms use, so apply == restore by
+        // construction. Rebuild the incoming wire form into a bitvector and
+        // merge it: a strictly-greater per-cell generation wins (incl. the
+        // steal's `Queued → NotDone` reset), so a promoted primary inherits the
+        // converged cell state across the epoch boundary, and a late-joiner
+        // converges regardless of (live, snapshot) arrival order. The gen-floor
+        // resume (`resume_affine_cell_gen_floor`, fired at the `PrimaryChanged`
+        // epoch advance like the def-id floor) then re-anchors this replica's
+        // stamp counter past every inherited cell generation.
+        self.affine
+            .bitvector_mut()
+            .merge(&super::affine_state::AffineBitvector::from_wire(affine));
     }
 }

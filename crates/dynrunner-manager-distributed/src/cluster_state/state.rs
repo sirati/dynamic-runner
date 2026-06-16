@@ -682,6 +682,26 @@ pub struct ClusterState<I> {
     /// L1 — the full def-transfer over the snapshot stream is a later
     /// leaf.
     pub(super) definitions: super::task_def_store::TaskDefStore<I>,
+    /// The AF-id affine state sub-store (BOXED — one heap allocation, one
+    /// pointer inline): the REPLICATED per-secondary bitvector — per
+    /// `(secondary_id, affine_id)` a 2-bit completion cell
+    /// (`NotDone/Queued/Failed/Done`) modelling a `SecondaryAffine` def's
+    /// per-secondary state (the layer the affine SCHEDULER reads) — PLUS the
+    /// node-local per-cell LWW generation stamp counter. See
+    /// `cluster_state::affine_state`.
+    ///
+    /// BOXED because `ClusterState` is held by value across `.await` in the
+    /// operational futures, so any inline growth costs stack on the (large,
+    /// near-2MB) current-thread-runtime futures — the box keeps the AF-id
+    /// concern's footprint to one pointer.
+    ///
+    /// Classification: the box carries BOTH a replicated half and a node-local
+    /// half, so the destructure guards classify it as MIXED (treated replicated
+    /// for Clone/snapshot/digest of its bitvector; the gen counter is reset on
+    /// Clone, not snapshotted, not digest-folded — handled inside
+    /// `AffineState`'s own `Clone` and the seam methods). Carried in Clone /
+    /// snapshot (bitvector) / digest (bitvector) / restore (bitvector merge).
+    pub(super) affine: Box<super::affine_state::AffineState>,
     /// Slurm-authoritative life-state snapshot consulted by the apply-path
     /// sticky-removal reversibility tiebreak (#546): an apply of
     /// `PeerJoined` for a peer this node already marked `Dead` at a
@@ -795,6 +815,9 @@ where
             // like `tasks`; the content-addressed registry is the same on
             // every node and the `Arc` clones are cheap).
             definitions,
+            // AF-id affine state — carried via `AffineState`'s own Clone (the
+            // bitvector is cloned, the node-local gen counter reset).
+            affine,
             // Node-local runtime handle (slurm-authoritative life-state
             // snapshot for #546) — NOT cloned. A cloned replica is bound
             // to the same snapshot later via `set_authority_snapshot` if
@@ -904,6 +927,9 @@ where
             // Frozen task-def registry — REPLICATED, full clone (like
             // `tasks`; `Arc` clones are cheap).
             definitions: definitions.clone(),
+            // AF-id affine state — `Box<AffineState>`; the inner `Clone`
+            // carries the replicated bitvector and resets the node-local gen.
+            affine: affine.clone(),
             // Node-local runtime handle — see field doc.
             authority_snapshot: None,
         }
@@ -965,6 +991,7 @@ where
             settled,
             output_store,
             definitions,
+            affine,
             authority_snapshot,
         } = self;
         f.debug_struct("ClusterState")
@@ -1016,6 +1043,7 @@ where
             .field("settled", settled)
             .field("output_store", output_store)
             .field("definitions", definitions)
+            .field("affine", affine)
             .field("authority_snapshot", &authority_snapshot.is_some())
             .finish()
     }
@@ -1069,6 +1097,7 @@ impl<I> Default for ClusterState<I> {
             settled: super::settled::SettledStore::default(),
             output_store: super::output_store::OutputStore::default(),
             definitions: super::task_def_store::TaskDefStore::default(),
+            affine: Box::new(super::affine_state::AffineState::default()),
             authority_snapshot: None,
         }
     }
