@@ -74,7 +74,7 @@ fn task_completed_populates_task_outputs_cache() {
     assert_eq!(outcome, ApplyOutcome::Applied);
     assert_eq!(
         s.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a"),
-        Some(&outputs)
+        Some(outputs)
     );
 }
 
@@ -121,7 +121,7 @@ fn task_completed_malformed_result_data_stores_empty_outputs() {
     assert_eq!(outcome, ApplyOutcome::Applied);
     assert_eq!(
         s.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a"),
-        Some(&TaskOutputs::default())
+        Some(TaskOutputs::default())
     );
 }
 
@@ -149,7 +149,7 @@ fn task_outputs_round_trip_via_snapshot() {
     joiner.restore(snap);
     assert_eq!(
         joiner.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a"),
-        Some(&outputs)
+        Some(outputs)
     );
 }
 
@@ -191,7 +191,7 @@ fn restore_first_write_wins_on_task_outputs_collision() {
     // Local's entry survives; snapshot's same-key entry is ignored.
     assert_eq!(
         local.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a"),
-        Some(&local_outputs)
+        Some(local_outputs)
     );
 }
 

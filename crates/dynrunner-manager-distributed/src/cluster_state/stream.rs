@@ -300,10 +300,14 @@ impl SnapshotStreamPlan {
                 raw_bytes += scratch.len() + key.len() + 16;
                 batch.tasks.insert(key.clone(), task_state);
                 // The co-keyed output entry rides the SAME package so
-                // the restore join reads it co-present (TS-3). The
-                // in-memory map is the one hot source; the record's
-                // embedded copy is the fallback shape (equal by
-                // construction — first-write-wins on both ends).
+                // the restore join reads it co-present (TS-3). Storage-
+                // agnostic precedence (the `outputs_for_hash` rule, inlined
+                // here to reuse the `settled_outputs` already decoded from
+                // this key's record — no second disk read): the resident
+                // map wins for a fat / not-yet-spilled entry, falling back
+                // to the SETTLED record's embedded copy (the payload was
+                // evicted from the resident map at commit-spill). Equal by
+                // construction — first-write-wins on both ends.
                 if let Some(outputs) = state
                     .task_outputs
                     .get(key)

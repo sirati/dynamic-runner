@@ -33,8 +33,11 @@ pub(crate) fn gather_predecessor_outputs<I: Identifier>(
         &task.task_depends_on,
         // Cached outputs lookup, phase-aware: resolve the dep's full
         // `(phase_id, task_id)` identity to its hash and read the
-        // hash-keyed CRDT output cache.
-        |phase_id, task_id| state.outputs_for(phase_id, task_id).cloned(),
+        // hash-keyed CRDT output cache STORAGE-AGNOSTICALLY (resident map
+        // → settled-disk fallback). A predecessor here is typically a
+        // COMPLETED (and often SETTLED/spilled) task, so the read may
+        // decode the payload off the spill file — owned by construction.
+        |phase_id, task_id| state.outputs_for(phase_id, task_id),
         // Deps-of lookup: the settled-aware identity scan owned by
         // `cluster_state` (`task_deps_for_identity`) — a dep target here
         // is typically a COMPLETED (and often SETTLED/spilled)
@@ -145,6 +148,44 @@ mod tests {
         let assembled = gather_predecessor_outputs(&state, &b);
         assert_eq!(assembled.len(), 1);
         assert_eq!(assembled.get("A"), Some(&a_outputs));
+    }
+
+    #[test]
+    fn direct_dep_outputs_resolve_when_predecessor_has_spilled() {
+        // A → B, no inheritance, but A has COMPLETED and its fat body +
+        // output payload have SETTLED to the spill file (the common case:
+        // a predecessor is a long-done task whose outputs were evicted
+        // from the resident map). The dispatch-time gather for B must
+        // still see {"A": A's outputs}, read STORAGE-AGNOSTICALLY off disk.
+        //
+        // FAIL-on-trunk: pre-fix the resident map kept every output, so a
+        // disk read was never needed and this would pass trivially; with
+        // eviction it pins that the accessor's disk fallback works on the
+        // dispatch path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = ClusterState::<RunnerIdentifier>::new();
+        let a = mk_task("A", Vec::new());
+        let b = mk_task(
+            "B",
+            vec![TaskDep {
+                task_id: "A".into(),
+                phase_id: PhaseId::from("p0"),
+                inherit_outputs: false,
+            }],
+        );
+        let a_outputs = outputs_with("nonce", "xyz");
+        seed(&mut state, a, Some(a_outputs.clone()));
+        // Settle A: its output payload leaves the resident map for disk.
+        let evicted = state.test_spill_all(&dir.path().join("spill.cbor"));
+        assert_eq!(evicted, 1, "the completed predecessor settles");
+
+        let assembled = gather_predecessor_outputs(&state, &b);
+        assert_eq!(assembled.len(), 1);
+        assert_eq!(
+            assembled.get("A"),
+            Some(&a_outputs),
+            "a SPILLED predecessor's outputs resolve via the disk fallback"
+        );
     }
 
     #[test]

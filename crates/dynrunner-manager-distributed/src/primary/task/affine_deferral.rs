@@ -17,18 +17,32 @@
 //! `B` was assigned through the normal dispatch path
 //! (`commit_assignment` → `originate_task_assigned`), so on the primary it
 //! is `InFlight` in the CRDT AND tracked in `self.in_flight` (the hash-keyed
-//! ledger) with its holding worker slot `Assigned`. The reconciliation
-//! probe builds its view EXCLUSIVELY from `self.in_flight`
-//! (`reconciliation_probe.rs`): a task that stays in the ledger past the
-//! reconciliation deadline is probed at its holder, and the holder's
-//! `holds_task` reads only `active_tasks` + `pending_first_bind` — a parked
-//! dependent lives in NEITHER, so the holder denies it, the probe returns
-//! `Lost`, and the task is requeued onto the same affine secondary, which
-//! defers it again: an unbounded ~600s requeue+re-park loop that re-
-//! originates `InFlight` and leaks the coordinator. The deferral handler
-//! REMOVES `B` from `self.in_flight` (a deferred dependent is genuinely NOT
-//! awaiting a terminal — it is parked behind a local import), so the probe
-//! never sees it and the loop cannot start.
+//! ledger) with its holding worker slot `Assigned`. The deferral handler
+//! KEEPS `B` in the ledger and flips its `InFlightEntry::deferred` flag to
+//! `true` (the slot stays `Assigned`, its type slot reserved), so EVERY
+//! terminal/recovery path that resolves BY HASH stays symmetric across the
+//! defer:
+//!   * an affine-import FAILURE terminal (`TaskFailed`) flows through the
+//!     normal `free_slot_on_terminal` → frees the slot, releases the type
+//!     slot, removes the ledger entry, and runs `note_item_failed` — the
+//!     phase in-flight counter stays correct;
+//!   * a DEAD holder is recovered by `recover_inflight_for_dead_secondary`,
+//!     which iterates the ledger by secondary and requeues `B` (not
+//!     stranded in `QueuedAfterLocalDependency`).
+//!
+//! The ONE consumer that must NOT see a deferred entry is the
+//! reconciliation probe, whose view is built EXCLUSIVELY from
+//! `self.in_flight` (`reconciliation_probe.rs`) and whose verdict means
+//! "the holder is not running this": a deferred dependent is genuinely NOT
+//! awaiting a terminal — it is parked behind a local import the holder
+//! intends to run — so the holder's `holds_task` (reading only
+//! `active_tasks` + `pending_first_bind`) would deny it, the probe would
+//! return `Lost`, and the task would requeue onto the same affine
+//! secondary, which defers it again: an unbounded ~600s requeue+re-park
+//! loop that re-originates `InFlight` and leaks the coordinator. The probe
+//! therefore EXCLUDES `deferred = true` entries from its view (the only
+//! behaviour the pre-symmetry `in_flight.remove` was protecting), so the
+//! loop cannot start without blinding the other paths.
 //!
 //! The holding worker slot is deliberately LEFT `Assigned` to `B` (and its
 //! per-type concurrency slot LEFT reserved) across the defer: the
@@ -49,8 +63,9 @@
 //! primary to move the CRDT/ledger state back to `InFlight`; it must NOT
 //! re-send a `TaskAssignment` (that would double-dispatch). The handler
 //! re-originates the EXISTING `TaskAssigned` (the standard `→ InFlight`
-//! choke point, `originate_task_assigned`) and re-enters `B` into
-//! `self.in_flight` against the slot it never left.
+//! choke point, `originate_task_assigned`) and clears `B`'s `deferred`
+//! flag — `B` never left `self.in_flight`, so the probe simply sees it
+//! again against the slot it always held.
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, MessageType};
@@ -60,7 +75,6 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::cluster_state::TaskState;
 use crate::primary::PrimaryCoordinator;
 use crate::primary::command_channel::PrimaryCommand;
-use crate::primary::coordinator::InFlightEntry;
 
 /// Is `ty` an affine-deferral REPORT — a `TaskQueuedAfterLocalDependency`
 /// or a `LocalDependencyReleased`? These are the two message types whose
@@ -147,16 +161,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// A secondary reported that a work task `B` is now QUEUED behind its
     /// local SecondaryAffine import (#497). ORIGINATE
     /// `QueuedAfterLocalDependencySet` (the CRDT `InFlight | Pending →
-    /// QueuedAfterLocalDependency` rank-drop) AND remove `B` from
-    /// `self.in_flight` so the reconciliation probe — which views ONLY the
-    /// ledger — stops treating the parked dependent as a task awaiting a
-    /// terminal (the never-wired-handler loop the brief pins).
+    /// QueuedAfterLocalDependency` rank-drop) AND mark `B`'s ledger entry
+    /// `deferred = true` so the reconciliation probe — the ONE consumer
+    /// whose verdict would be wrong for a parked dependent — excludes it
+    /// from its view (the never-wired-handler loop the brief pins).
     ///
-    /// The holding worker slot + its per-type concurrency reservation are
-    /// LEFT intact: the secondary's worker is occupied (gate body, then
-    /// `B`), so the slot must stay `Assigned` to avoid over-dispatch; the
-    /// release half re-enters the ledger against that same slot, and the
-    /// eventual terminal frees both through `free_slot_on_terminal`.
+    /// `B` STAYS in `self.in_flight`: its holding worker slot + per-type
+    /// concurrency reservation are LEFT intact (the secondary's worker is
+    /// occupied — gate body, then `B`), and the entry remains resolvable
+    /// BY HASH so the terminal path (`free_slot_on_terminal` on an affine-
+    /// import failure) and the dead-holder recovery
+    /// (`recover_inflight_for_dead_secondary`) stay symmetric across the
+    /// defer. The release half clears the flag against that same slot; the
+    /// eventual terminal frees slot + type slot + ledger entry through
+    /// `free_slot_on_terminal`.
     pub(crate) async fn handle_task_queued_after_local_dependency(
         &mut self,
         msg: DistributedMessage<I>,
@@ -176,7 +194,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             affine_hash = %affine_hash,
             "affine-deferral report: work task queued behind a secondary's \
              local import; parking it as QueuedAfterLocalDependency and \
-             dropping it from the in-flight ledger (probe no longer sees it)"
+             marking its ledger entry deferred (probe excludes it; terminal \
+             + dead-holder recovery still resolve it by hash)"
         );
         // ORIGINATE the rank-drop (the secondary reported; we originate —
         // the work-split law). The apply gates on `InFlight | Pending`; any
@@ -189,24 +208,30 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             },
         ])
         .await;
-        // Drop `B` from the in-flight ledger: the reconciliation probe's
-        // view is built solely from `self.in_flight`, so this is THE step
-        // that stops the probe looping on a parked dependent. The slot stays
-        // `Assigned` and its type slot stays reserved (see the module doc) —
-        // the release re-enters the ledger, the terminal frees the slot.
-        self.in_flight.remove(&task_hash);
+        // Mark `B`'s ledger entry deferred: the reconciliation probe
+        // EXCLUDES `deferred = true` from its view, so this is THE step that
+        // stops the probe looping on a parked dependent — without dropping
+        // the entry, which would blind the terminal + dead-holder-recovery
+        // paths (the slot↔ledger symmetry the SecondaryAffine deferral broke).
+        // The slot stays `Assigned` and its type slot stays reserved (see the
+        // module doc). A miss (the entry already settled / was recovered) is a
+        // safe no-op — there is nothing parked to mark.
+        if let Some(entry) = self.in_flight.get_mut(&task_hash) {
+            entry.deferred = true;
+        }
     }
 
     /// A secondary reported that its local SecondaryAffine import for a
     /// queued work task `B` is DONE — release it (#497). RE-ORIGINATE the
     /// EXISTING `TaskAssigned` (the standard `→ InFlight` choke point) so
-    /// `B` transitions `QueuedAfterLocalDependency → InFlight`, and re-enter
-    /// it into `self.in_flight` against the worker slot it never left.
+    /// `B` transitions `QueuedAfterLocalDependency → InFlight`, and CLEAR
+    /// `B`'s `deferred` flag against the ledger entry it never left.
     ///
     /// Does NOT re-push a `TaskAssignment`: the secondary already self-
     /// dispatched `B` onto its worker the moment its import completed (see
-    /// the module doc). The handler only re-establishes the CRDT/ledger
-    /// `InFlight` fact so the task is tracked + death-seam-covered again.
+    /// the module doc). The handler only re-establishes the CRDT `InFlight`
+    /// fact and un-defers the ledger entry so the reconciliation probe (and
+    /// the death seam) cover `B` again.
     pub(crate) async fn handle_local_dependency_released(
         &mut self,
         msg: DistributedMessage<I>,
@@ -220,14 +245,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         else {
             return;
         };
-        // Read `B`'s carried `TaskInfo` + phase from the CRDT BEFORE the
-        // origination (the queued entry holds it). A miss means `B` already
-        // settled / was recovered — nothing to re-establish.
-        let Some((task, phase)) = self
-            .cluster_state
-            .task_state(&task_hash)
-            .map(|s| (s.task().clone(), s.task().phase_id.clone()))
-        else {
+        // A CRDT miss means `B` already settled / was recovered — nothing to
+        // re-establish (the ledger entry is gone too, freed in lockstep).
+        if self.cluster_state.task_state(&task_hash).is_none() {
             tracing::debug!(
                 secondary = %secondary_id,
                 task_hash = %task_hash,
@@ -235,14 +255,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                  (already settled / recovered); no-op"
             );
             return;
-        };
+        }
         tracing::debug!(
             secondary = %secondary_id,
             task_hash = %task_hash,
             worker_id,
             "affine-release report: secondary's local import done and it self-\
-             dispatched the dependent; re-originating TaskAssigned and re-\
-             entering the in-flight ledger"
+             dispatched the dependent; re-originating TaskAssigned and \
+             un-deferring the in-flight ledger entry"
         );
         // Re-originate the EXISTING `TaskAssigned` (QueuedAfterLocalDependency
         // → InFlight; a freshly-minted higher version dominates the queued
@@ -250,9 +270,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // second InFlight originator.
         self.originate_task_assigned(task_hash.clone(), secondary_id.clone(), worker_id)
             .await;
-        // Only re-enter the ledger if the transition actually took (a raced
-        // terminal that landed first leaves `B` non-InFlight — the
-        // `TaskAssigned` apply NoOps and there is nothing in flight to track).
+        // Only un-defer if the transition actually took (a raced terminal that
+        // landed first leaves `B` non-InFlight — the `TaskAssigned` apply NoOps
+        // and the terminal already freed the ledger entry).
         if !matches!(
             self.cluster_state.task_state(&task_hash),
             Some(TaskState::InFlight { .. })
@@ -261,22 +281,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 secondary = %secondary_id,
                 task_hash = %task_hash,
                 "affine-release re-origination did not land InFlight (a \
-                 terminal raced it); not re-entering the ledger"
+                 terminal raced it); leaving the ledger as the terminal left it"
             );
             return;
         }
-        // Re-enter the in-flight ledger against the slot `B` never left: the
-        // slot is still `Assigned` to this hash and its type slot is still
-        // reserved (the defer left both intact), so this is a pure ledger
-        // re-entry — NO `reserve_type_slot`, which would double-count.
-        self.in_flight.insert(
-            task_hash,
-            InFlightEntry {
-                phase,
-                secondary_id,
-                local_worker_id: Some(worker_id),
-                task,
-            },
-        );
+        // Clear the `deferred` flag against the slot `B` never left: the slot
+        // is still `Assigned` to this hash and its type slot still reserved
+        // (the defer left both intact, and `B` never left the ledger), so the
+        // reconciliation probe and the death seam cover `B` again — a pure
+        // flag flip, NO `reserve_type_slot` (which would double-count).
+        if let Some(entry) = self.in_flight.get_mut(&task_hash) {
+            entry.deferred = false;
+        }
     }
 }

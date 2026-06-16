@@ -51,11 +51,27 @@
 
 use dynrunner_core::{Identifier, TaskInfo};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::DistributedMessage;
+use dynrunner_protocol_primary_secondary::{AssignedTaskRef, DistributedMessage};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::wire::timestamp_now;
 use super::{AffineGateOutcome, PendingAffineDependent, SecondaryCoordinator};
+
+/// Wire marker for the #509 gate-absent RE-ROUTE: a SecondaryAffine gate
+/// body that cannot be resolved on this node at import time because the
+/// build's ASSIGNMENT frame outran the gate's `TaskAdded` CRDT propagation
+/// (a transient SYNC RACE, not a fault). The primary recognises this exact
+/// string in `is_backpressure_shaped` and RE-ROUTES each queued dependent —
+/// requeue at the pool, NO retry-budget burn — so on re-assignment, once the
+/// gate's `TaskAdded` has synced, the build is gated behind the import and
+/// runs. A genuine gate-BODY failure carries a different reason and IS
+/// charged. The string is the public contract between secondary and primary;
+/// do not change it without updating the primary's `is_backpressure_shaped`
+/// predicate in the same commit.
+pub(crate) const AFFINE_GATE_ABSENT_WIRE_MESSAGE: &str =
+    "SecondaryAffine gate not yet synced to the local ledger (assignment \
+     outran its TaskAdded); re-routing its queued dependents so they retry \
+     once the gate's TaskAdded arrives";
 
 /// The classified result of the SecondaryAffine gate body finishing in its
 /// dispatched worker subprocess (#577). Derived from the worker's terminal
@@ -267,6 +283,31 @@ where
             return Ok(AffineGateOutcome::AlreadyDone);
         }
 
+        // Self-bound BEFORE parking (the slot↔ledger symmetry concern, #517
+        // family): the secondary holds NO scheduling authority, so it must
+        // never park a dependent onto a worker the primary's slot ceiling
+        // does not actually have free. Route the dependent's target worker
+        // through the SAME honor-or-bounce seam every dispatch uses — idle ⇒
+        // proceed to park; NOT idle (busy incumbent / out-of-range /
+        // mid-respawn) ⇒ the seam bounces a typed
+        // `IllegallyAssignedToNonidleWorker` (NOT a `TaskFailed`) and we return
+        // `Bounced` WITHOUT parking, so a park can never silently pile up onto
+        // a busy worker. The FIRST dependent's gate-body dispatch and every
+        // release dispatch re-cross this same seam later — this gate is the
+        // pre-park half that the queue-only (2nd..Nth) dependents otherwise
+        // never reached.
+        let assigned_ref = AssignedTaskRef {
+            hash: dependent.work_hash.clone(),
+            task_id: dependent.binary.identifier.clone(),
+        };
+        if self
+            .select_honored_target_or_bounce(dependent.worker_id, assigned_ref)
+            .await?
+            .is_none()
+        {
+            return Ok(AffineGateOutcome::Bounced);
+        }
+
         // Whether THIS call is the first dependent (it must drive the single
         // import) or a 2nd..Nth (it only queues). The vacancy of the
         // `affine_running` key is the discriminator — checked + claimed under
@@ -338,14 +379,16 @@ where
     /// Used by [`Self::dispatch_affine_gate_to_worker`] when the gate body
     /// cannot be resolved at dispatch time (#509 sync race).
     pub(in crate::secondary) fn affine_gate_absent_failure(affine_hash: &str) -> AffineOutcome {
+        // The diagnostic hash rides the warn log at the call site
+        // (`looking_for_gate_content_hash`); the wire `reason` is the STABLE
+        // re-route marker the primary's `is_backpressure_shaped` matches on
+        // (an equality test, so it cannot carry the per-gate hash). Bind the
+        // hash so the signature is unchanged for the caller; it is intentionally
+        // not embedded in the marker.
+        let _ = affine_hash;
         AffineOutcome::Failure {
             error_type: dynrunner_core::ErrorType::Recoverable,
-            reason: format!(
-                "SecondaryAffine gate '{affine_hash}' not yet synced to the \
-                 local ledger (assignment outran its TaskAdded) — re-routing \
-                 its queued dependents (Recoverable) so they retry once the \
-                 gate's TaskAdded arrives",
-            ),
+            reason: AFFINE_GATE_ABSENT_WIRE_MESSAGE.to_string(),
         }
     }
 
@@ -600,6 +643,11 @@ where
             AffineGateOutcome::AlreadyDone => Ok(false),
             // `B` queued behind the in-flight gate body — no second dispatch.
             AffineGateOutcome::QueuedBehindRun => Ok(true),
+            // `B`'s target worker was NOT idle: the run-once executor bounced
+            // it through the honor-or-bounce seam (the primary reconciles +
+            // requeues) and did NOT park it. The caller dispatches nothing —
+            // the bounce is the disposition, exactly like a gated dependent.
+            AffineGateOutcome::Bounced => Ok(true),
             // `B` is the FIRST dependent: dispatch the gate body to `B`'s
             // worker subprocess (#577).
             AffineGateOutcome::StartedRun => {
