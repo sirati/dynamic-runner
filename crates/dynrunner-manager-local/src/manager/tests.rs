@@ -366,7 +366,11 @@ async fn default_restart_respawns_after_success() {
                     }
                 }
             });
-            Ok((manager_end, Some(42)))
+            // In-process channel worker: no OS process, so the pid is
+            // honestly `None` (a synthetic non-existent pid would make
+            // the ready-wait's liveness probe misclassify this live
+            // in-process worker as dead).
+            Ok((manager_end, None))
         }
     }
 
@@ -461,7 +465,11 @@ async fn reuse_workers_keeps_slot_across_successes() {
                     }
                 }
             });
-            Ok((manager_end, Some(42)))
+            // In-process channel worker: no OS process, so the pid is
+            // honestly `None` (a synthetic non-existent pid would make
+            // the ready-wait's liveness probe misclassify this live
+            // in-process worker as dead).
+            Ok((manager_end, None))
         }
     }
 
@@ -759,7 +767,6 @@ async fn multiple_workers_with_mixed_results() {
 #[tokio::test(flavor = "current_thread")]
 async fn ensure_worker_for_type_respawns_on_type_shift_and_is_idempotent_on_match() {
     use dynrunner_core::TypeId;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// Spawn-history entry: `None` means `spawn_worker` (no type),
@@ -768,7 +775,6 @@ async fn ensure_worker_for_type_respawns_on_type_shift_and_is_idempotent_on_matc
 
     struct TrackingFactory {
         spawns: Arc<Mutex<Vec<SpawnEntry>>>,
-        next_pid: Arc<AtomicU32>,
     }
 
     impl WorkerFactory<ChannelManagerEnd> for TrackingFactory {
@@ -778,10 +784,14 @@ async fn ensure_worker_for_type_respawns_on_type_shift_and_is_idempotent_on_matc
             _subcgroup: Option<&crate::cgroup::SubcgroupHandle>,
         ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
             self.spawns.lock().unwrap().push(None);
-            let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
             let (manager_end, runner_end) = channel_pair();
             tokio::task::spawn_local(fake_worker_loop_succeeds(runner_end));
-            Ok((manager_end, Some(pid)))
+            // In-process channel worker: there is NO OS process, so the
+            // pid is honestly `None`. (A synthetic non-existent pid would
+            // make the ready-wait's process-liveness probe — which races
+            // a dead worker to `Disconnected` — misclassify this live
+            // in-process worker as dead.)
+            Ok((manager_end, None))
         }
 
         fn spawn_worker_for_type(
@@ -791,10 +801,10 @@ async fn ensure_worker_for_type_respawns_on_type_shift_and_is_idempotent_on_matc
             _subcgroup: Option<&crate::cgroup::SubcgroupHandle>,
         ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
             self.spawns.lock().unwrap().push(Some(type_id.clone()));
-            let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
             let (manager_end, runner_end) = channel_pair();
             tokio::task::spawn_local(fake_worker_loop_succeeds(runner_end));
-            Ok((manager_end, Some(pid)))
+            // No OS process — pid is honestly `None`. See `spawn_worker`.
+            Ok((manager_end, None))
         }
     }
 
@@ -841,10 +851,8 @@ async fn ensure_worker_for_type_respawns_on_type_shift_and_is_idempotent_on_matc
     local
         .run_until(async {
             let spawns: Arc<Mutex<Vec<SpawnEntry>>> = Arc::new(Mutex::new(Vec::new()));
-            let next_pid = Arc::new(AtomicU32::new(1000));
             let mut factory = TrackingFactory {
                 spawns: spawns.clone(),
-                next_pid,
             };
 
             // Two tokenize binaries followed by two unify_vocab
