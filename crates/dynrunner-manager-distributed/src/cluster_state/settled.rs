@@ -99,7 +99,7 @@ use crate::primary::retry_bucket::BucketKind;
 
 use super::merge::{hashable_join_key, task_join_key, task_join_key_dominates};
 use super::types::TaskJoinKey;
-use super::{ClusterState, TaskState};
+use super::{ClusterState, TaskDefId, TaskState};
 
 /// Hash one hashable value — the same default-hasher fold `digest.rs` /
 /// `merge.rs` use (process-stable; cross-build stability not required).
@@ -166,6 +166,19 @@ pub(crate) struct SettledEntry {
     pub(crate) task_depends_on: Vec<TaskDep>,
     pub(crate) class: SettledClass,
     pub(super) join_key: TaskJoinKey,
+    /// The self-describing [`TaskDefId`] this settled record's def carries,
+    /// captured at commit-spill from `state.def().def_id` (the def is in
+    /// hand there — no disk read). Surfaced in-memory so a promoted
+    /// primary's failover def-id resume floor includes the ids of tasks
+    /// that have already SETTLED (their defs left `definitions` only by
+    /// content-Arc, but the snapshot ships them by value separately, so the
+    /// in-memory store's `next_id` alone does NOT cover a settled id once
+    /// the base is installed over a fresh store). A wire-agreed id (the
+    /// production path) is a real slot; a node-local intern carries
+    /// [`TaskDefId::UNBOUND`] and is excluded from the resume max (a
+    /// node-local id is intra-node only — it never aliases across the
+    /// failover seam). See [`SettledStore::max_def_id`].
+    def_id: TaskDefId,
     digest_contribution: u64,
     /// The `(key, TaskOutputs)` digest term this entry's EVICTED output
     /// payload contributed to `task_outputs_hash_acc` at commit-spill,
@@ -346,6 +359,29 @@ impl SettledStore {
     /// cache count).
     pub(super) fn settled_outputs_count(&self) -> u64 {
         self.settled_outputs_count
+    }
+
+    /// The maximum WIRE-AGREED [`TaskDefId`] held by any settled record,
+    /// or `None` when no settled record carries one. The settled half of a
+    /// promoted primary's failover def-id resume floor: a settled record's
+    /// def left the in-memory `definitions` store (the snapshot ships defs
+    /// by value separately from the settled base, so a fresh store seeded
+    /// by `install_settled_base` + snapshot-restore does NOT re-anchor a
+    /// settled id), yet a promoted primary must still resume its allocator
+    /// PAST it so a new task never re-mints a settled task's id (the
+    /// failover-aliasing CL-A2 forbids — the L5 def-id dep-ref prerequisite).
+    ///
+    /// [`TaskDefId::UNBOUND`] entries (node-local interns — intra-node only,
+    /// legitimately divergent across replicas) are EXCLUDED: a node-local id
+    /// never aliases across the failover seam, and folding the sentinel
+    /// `u32::MAX` would wrongly slam the allocator to the top of the space.
+    pub(crate) fn max_def_id(&self) -> Option<u32> {
+        self.index
+            .values()
+            .map(|e| e.def_id)
+            .filter(|&id| id != TaskDefId::UNBOUND)
+            .map(|id| id.0)
+            .max()
     }
 
     /// Per-settled-entry `(key, digest_contribution)` pairs — the persisted
@@ -752,6 +788,10 @@ impl<I: Identifier> ClusterState<I> {
                 task_depends_on: def.task_depends_on.clone(),
                 class,
                 join_key: rec.join_key,
+                // Self-describing def-id captured here (the def is in hand —
+                // no disk read) so the failover resume floor can include
+                // settled ids without re-reading every spill record.
+                def_id: def.def_id,
                 digest_contribution: hash_one((&rec.hash, hashable_join_key(state))),
                 outputs_digest_contribution,
                 segment: receipt.segment,
