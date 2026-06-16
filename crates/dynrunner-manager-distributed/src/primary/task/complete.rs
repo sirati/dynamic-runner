@@ -98,6 +98,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }])
             .await;
 
+            // AF-sched terminal→bitvector seam (design point 7): a secondary
+            // runs an affine task like ANY other and reports its terminal here.
+            // If this hash binds to an affine-id, mark that secondary's cell
+            // Done. `None` for an ordinary work task — no affine reaction. The
+            // ONE affine-specific effect of a terminal; the cell generation is
+            // stamped at the broadcast choke point.
+            if let Some(m) = self.affine_terminal_mutation(&secondary_id, task_hash, true) {
+                self.apply_and_broadcast_cluster_mutations(vec![m]).await;
+            }
+
             // A successful TaskComplete from this secondary proves
             // it's healthy — clear any backpressure backoff. The
             // backoff window is short (500ms by default) so this

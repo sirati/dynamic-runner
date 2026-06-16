@@ -333,6 +333,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }])
             .await;
 
+            // AF-sched terminal→bitvector seam (design point 7, Q1 non-sticky):
+            // an affine build that failed on this secondary marks its cell
+            // Failed (10). `None` for an ordinary work task. Failed is NOT
+            // sticky under the AF-id LWW lattice — a later re-route/retry's
+            // Queued/Done overrides it — so a dependent re-routes to another
+            // secondary via the ordinary cascade/re-placement, never a new
+            // affine-specific wedge.
+            if let Some(m) = self.affine_terminal_mutation(&secondary_id, &task_hash, false) {
+                self.apply_and_broadcast_cluster_mutations(vec![m]).await;
+            }
+
             // Operator-facing WARN: per-class for retry/policy
             // decisions (error_type discriminates retry/oom/final);
             // the error message itself is essential for debugging

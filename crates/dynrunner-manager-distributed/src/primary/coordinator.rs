@@ -1101,6 +1101,17 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// happens-before constraint) live in `cluster_state.rs`.
     pub(super) cluster_state: ClusterState<I>,
 
+    /// Primary-LOCAL per-secondary affine queues plus the placement/steal
+    /// policy (the AF-sched locality layer over the replicated AF-id
+    /// bitvector). NOT replicated — a promoted primary rebuilds it from the
+    /// inherited bitvector and the pending work pool
+    /// (`AffineScheduler::rebuild`); see `primary::affine_scheduler`. Read by
+    /// the dispatch leaf (per-secondary pop, idle-steal, placement) and the
+    /// failover rebuild; `#[allow(dead_code)]` until that leaf wires it (the
+    /// AF-id staging pattern — the field and its policy are real + unit-tested).
+    #[allow(dead_code)]
+    pub(super) affine_scheduler: super::affine_scheduler::AffineScheduler,
+
     /// Outbound snapshot-stream driver: serves `RequestSnapshotStream`
     /// pulls (late joiners, behind peers) one bounded package per
     /// operational-loop wakeup — see `crate::snapshot_stream`. The
@@ -1882,6 +1893,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             pending_observer: None,
             pending_stage_files: Vec::new(),
             cluster_state,
+            affine_scheduler: super::affine_scheduler::AffineScheduler::default(),
             snapshot_streams,
             settled_spill,
             inbound_snapshots,

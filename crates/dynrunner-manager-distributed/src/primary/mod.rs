@@ -23,6 +23,7 @@
 //! [`peer_setup`], [`preferred_secondaries`], [`respawn`], [`staging`],
 //! [`task`], [`wire`].
 
+mod affine_scheduler;
 mod assignment;
 mod bringup_reservation;
 mod command_channel;
