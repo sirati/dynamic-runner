@@ -1011,6 +1011,28 @@ impl<I: Identifier> ClusterState<I> {
         self.tasks.len()
     }
 
+    /// Split the fat (in-memory, un-spilled) task map by settle-eligibility —
+    /// the honest decomposition of [`Self::tasks_in_memory`] for the spill
+    /// stats line. `.0` = settle-ELIGIBLE entries still in memory (terminal
+    /// join fixed-points awaiting/lagging spill — a spill-degrade signal when
+    /// it grows or persists); `.1` = NOT-settle-eligible entries (Pending/
+    /// InFlight/Blocked/Queued/Unfulfillable — live work in flight, a liveness
+    /// backlog, normally the bulk). Their sum is [`Self::tasks_in_memory`].
+    pub fn fat_task_breakdown(&self) -> (usize, usize) {
+        let mut eligible = 0usize;
+        let mut not_eligible = 0usize;
+        // `self.tasks` is `HashMap<String, TaskState<I>>`; its values ARE the
+        // `&TaskState<I>` that `settle_eligible` classifies (no record wrapper).
+        for state in self.tasks.values() {
+            if crate::cluster_state::settled::settle_eligible(state) {
+                eligible += 1;
+            } else {
+                not_eligible += 1;
+            }
+        }
+        (eligible, not_eligible)
+    }
+
     /// Clear the node-local [`digest`](Self::digest) memo. Called at every
     /// `&mut self` API entry that can change a digest-folded field (see the
     /// `digest_cache` field doc for the exhaustive seam inventory and the

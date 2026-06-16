@@ -352,6 +352,7 @@ impl SettledSpillDriver {
         if store.is_empty() && self.degraded {
             return;
         }
+        let (unsettled_eligible, unsettled_live) = state.fat_task_breakdown();
         tracing::info!(
             role = self.role,
             spill_file_bytes = store.committed_bytes(),
@@ -359,6 +360,8 @@ impl SettledSpillDriver {
             index_entries = store.len(),
             index_bytes_approx = store.approx_index_bytes(),
             in_memory_unsettled = state.tasks_in_memory(),
+            unsettled_settle_eligible = unsettled_eligible,
+            unsettled_not_terminal = unsettled_live,
             degraded = self.degraded,
             "settled-CRDT spill stats"
         );
