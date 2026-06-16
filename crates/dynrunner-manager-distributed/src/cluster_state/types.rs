@@ -23,8 +23,19 @@ use crate::task_completed::TaskCompletedEvent;
 /// fields carved off the [`FrozenTaskDef`] frozen core. Stored per-
 /// `TaskState` alongside the shared `Arc<FrozenTaskDef>` so a task's
 /// dispatch recipe is deduplicated (the Arc) while its mutable routing tail
-/// stays per-entry. The `#[serde]` attrs MIRROR `TaskInfo`'s for the same
-/// three fields so a `TaskState` round-trips byte-identically.
+/// stays per-entry.
+///
+/// Each field's `#[serde]` attrs MIRROR `TaskInfo`'s for the same three
+/// fields, so the routing SUB-STRUCT serializes the carved values with
+/// identical per-field semantics (`resolved_path` node-local-only,
+/// `preferred_*` replicated). NOTE: this carve does NOT keep the ENCLOSING
+/// `TaskState` variant's serialized SHAPE backward-compatible with the
+/// pre-cutover `{ "Pending": { "task": { …16 fields… }, … } }` encoding — a
+/// variant body now nests `{ "def": { …13… }, "routing": { … }, … }`. That
+/// is a deliberate STRUCTURAL change to the snapshot RPC + on-disk
+/// settled-spill format (no old↔new cross-version decode); the whole cluster
+/// runs one pinned commit, so it is the accepted cost of the cutover, not a
+/// rolling-upgrade-safe additive field change.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskRouting {
     /// Soft hint of preferred secondaries — mirrors `TaskInfo`'s attrs.
