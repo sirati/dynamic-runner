@@ -460,6 +460,26 @@ impl<I> DistributedMessage<I> {
         }
     }
 
+    /// The per-origin custom-message sequence id that, paired with the
+    /// originator's `origin_secondary_id`, forms the message's
+    /// cluster-wide IDEMPOTENCY KEY `(origin, msg_seq)` — the SAME stamp
+    /// the primary IDs an important custom by (carried on the
+    /// `CustomMessagePosted` CRDT mutation). `None` for every
+    /// non-`CustomMessage` variant.
+    ///
+    /// Distinct from [`Self::delivery_seq`]: `msg_seq` identifies the
+    /// MESSAGE across the cluster (bumps for customs only), whereas
+    /// `delivery_seq` is the originator-local retention/ack counter that
+    /// bumps for ALL confirmable reports (terminals + important customs)
+    /// and therefore DESYNCS from `msg_seq` whenever terminals interleave.
+    /// CRDT-convergence retention drops MUST key on `msg_seq`.
+    pub fn msg_seq(&self) -> Option<u64> {
+        match self {
+            Self::CustomMessage { msg_seq, .. } => Some(*msg_seq),
+            _ => None,
+        }
+    }
+
     /// Stamp the app-level delivery-confirmation `seq` (#352) on a
     /// confirmable frame IN PLACE. A no-op on every other variant — the
     /// stamping chokepoint gates on [`Self::requires_delivery_ack`]

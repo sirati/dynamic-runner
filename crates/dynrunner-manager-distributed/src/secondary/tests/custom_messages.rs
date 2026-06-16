@@ -424,6 +424,155 @@ async fn important_custom_retention_not_dropped_by_other_origin_or_other_seq() {
         .await;
 }
 
+/// THE production-divergence repro (the canonical-key fix): on a node
+/// that runs a worker pool AND is its own message origin (a relocated
+/// primary-is-origin), task terminals and important customs share the
+/// originator-local `delivery_seq` counter but NOT the cluster-wide
+/// `msg_seq` counter — terminals bump `delivery_seq` only. So once the
+/// node emits N terminals FIRST, `delivery_seq` is offset N above
+/// `msg_seq`: the first important custom gets `msg_seq = 1` but
+/// `delivery_seq = N + 1`.
+///
+/// The CRDT-convergence drop trigger keys on the message's CANONICAL
+/// cluster identity `(origin, msg_seq)` — the SAME stamp the primary's
+/// `CustomMessagePosted` carries. The observation therefore names
+/// `msg_seq = 1`, NOT `delivery_seq = N + 1`. A drop matched on
+/// `delivery_seq` (the pre-fix bug) would look for `delivery_seq == 1`,
+/// never find the custom (whose `delivery_seq` is `N + 1`), and orphan
+/// its retention → forever-replay → the run wedges.
+///
+/// This test replays exactly that offset: N terminals through the same
+/// `send_to_primary` chokepoint first, THEN the custom, THEN the
+/// convergence observation carrying `msg_seq`. It ASSERTS the custom
+/// retention IS released — proving the `msg_seq` match works despite
+/// the `delivery_seq` offset. Pre-fix (drop matched on `delivery_seq`)
+/// this assertion FAILS: the observation's `msg_seq = 1` does not equal
+/// the custom's `delivery_seq = N + 1`, so the retention is never
+/// dropped.
+#[tokio::test(flavor = "current_thread")]
+async fn important_custom_released_by_msg_seq_despite_delivery_seq_offset() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut secondary, log, _membership) =
+                make_secondary_recording_with_membership(election_config("sec-2"), 1);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+            let mut factory = FakeWorkerFactory;
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
+
+            // (1) Drive N task terminals FIRST through the SAME
+            // send_to_primary chokepoint. Each is a confirmable TaskFailed
+            // → bumps `next_delivery_seq` (delivery_seq 1..=N) but NOT
+            // `next_custom_msg_seq`. They retain as AwaitingAck (no ack
+            // ever arrives in this test). This offsets delivery_seq above
+            // msg_seq — the production divergence.
+            const N: usize = 4;
+            for i in 0..N {
+                secondary
+                    .report_deferred_task_lost(0, &format!("terminal-hash-{i}"))
+                    .await
+                    .unwrap();
+            }
+            secondary.drain_egress().await;
+            assert_eq!(
+                secondary.pending_report_replays.len(),
+                N,
+                "the N terminals are each retained AwaitingAck"
+            );
+
+            // (2) THEN send an important custom → it gets msg_seq = 1 but
+            // delivery_seq = N + 1 (the offset). Its Ok-side retention is
+            // AwaitingCrdtConvergence.
+            secondary
+                .send_custom_to_primary("phase4-batch".into(), b"batch-1".to_vec(), true, false)
+                .await
+                .unwrap();
+            secondary.drain_egress().await;
+            assert_eq!(
+                secondary.pending_report_replays.len(),
+                N + 1,
+                "the important custom is retained on top of the N terminals"
+            );
+            // The custom's seqs PROVE the offset: msg_seq = 1 (first
+            // custom), delivery_seq = N + 1 (terminals consumed 1..=N).
+            assert_eq!(
+                sent_customs(&log),
+                vec![(
+                    "sec-2".to_string(),
+                    1,
+                    true,
+                    Some((N + 1) as u64),
+                )],
+                "the custom carries msg_seq = 1 but delivery_seq = N + 1 — \
+                 the delivery_seq IS offset above the msg_seq"
+            );
+            assert!(
+                secondary
+                    .pending_report_replays
+                    .iter()
+                    .find(|e| e.frame.msg_seq() == Some(1))
+                    .expect("the custom retention is present")
+                    .state
+                    .is_awaiting_crdt_convergence(),
+                "the important-custom retention is AwaitingCrdtConvergence"
+            );
+
+            // (3) Feed the convergence observation via the SAME
+            // apply_cluster_mutations path production uses. The
+            // CustomMessagePosted carries `seq = msg_seq = 1` (what the
+            // primary stamps), NOT delivery_seq.
+            secondary.apply_cluster_mutations(vec![
+                ClusterMutation::<super::super::test_helpers::TestId>::CustomMessagePosted {
+                    origin: "sec-2".into(),
+                    seq: 1,
+                    topic: "phase4-batch".into(),
+                    data: b"batch-1".to_vec(),
+                    is_high_volume: false,
+                },
+            ]);
+
+            // (4) ASSERT the custom retention IS dropped — the msg_seq
+            // match released it despite delivery_seq = N + 1. Pre-fix
+            // (drop matched on delivery_seq) the observation's msg_seq = 1
+            // ≠ delivery_seq = N + 1, so the custom would orphan here and
+            // this assertion would FAIL.
+            assert!(
+                secondary
+                    .pending_report_replays
+                    .iter()
+                    .all(|e| e.frame.msg_seq() != Some(1)),
+                "observing the own CustomMessagePosted (seq = msg_seq = 1) \
+                 releases the AwaitingCrdtConvergence retention — keyed on \
+                 msg_seq, not delivery_seq"
+            );
+            // (5) INVERSE safety: the N unrelated terminal retentions —
+            // whose delivery_seqs are 1..=N (one of them == 1, COLLIDING
+            // with the observed msg_seq) — are NOT dropped. The msg_seq
+            // key never matches a terminal (a terminal has no msg_seq),
+            // AND the state-tag gate keeps AwaitingAck entries. No
+            // false-positive drop.
+            assert_eq!(
+                secondary.pending_report_replays.len(),
+                N,
+                "only the custom dropped; all N terminals survive — the \
+                 msg_seq observation must not drop an unrelated terminal \
+                 even though one terminal's delivery_seq == 1 == the \
+                 observed msg_seq"
+            );
+            assert!(
+                secondary
+                    .pending_report_replays
+                    .iter()
+                    .all(|e| e.state.is_awaiting_ack()),
+                "every surviving retention is a terminal AwaitingAck"
+            );
+        })
+        .await;
+}
+
 /// The droppable NEGATIVE: a droppable custom is never retained — sent
 /// through the same no-route window it is simply LOST (at-most-once by
 /// contract; lost on failover by design) — and on the healthy path it
