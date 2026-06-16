@@ -186,6 +186,32 @@ impl SettledSpillDriver {
                 );
             }
         }
+        // The ALWAYS-ON output store rides the SAME construction seam (the
+        // driver is the per-coordinator place a node-local scratch file is
+        // opened), but is INDEPENDENT of the settle sweep: a completed
+        // task's output is write-through-then-dropped to this file at
+        // apply, not on the settle cadence. Every role persists the payload
+        // to disk (`retains_payload = true`) — zero MEMORY residence on
+        // every node, and promotion-safe (a node never loses an output from
+        // memory because it never held it). On any open failure the store
+        // stays in resident-fallback (a WARN names it; the run proceeds
+        // fat-but-correct — the spill is an optimization, never a gate).
+        match Self::open_output_file(role) {
+            Ok((path, write_fd, read_fd)) => {
+                let committed = Arc::new(AtomicU64::new(0));
+                state.attach_output_segment(write_fd, Arc::new(read_fd), committed, true);
+                tracing::info!(role, path = %path.display(), "always-on output store enabled");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    role,
+                    error = %e,
+                    "always-on output store disabled (work dir / file \
+                     unavailable); completed outputs retained in memory \
+                     (fat-but-correct)"
+                );
+            }
+        }
         driver
     }
 
@@ -205,17 +231,31 @@ impl SettledSpillDriver {
     }
 
     fn open_spill_file(role: &str) -> std::io::Result<(PathBuf, File, File)> {
+        Self::open_scratch_file(&format!("settled_CRDT.{role}.cbor"))
+    }
+
+    /// Open the always-on output store's scratch file (`outputs.<role>.cbor`),
+    /// a SEPARATE file from the settled spill — the two are orthogonal
+    /// backends (state fixed-points vs output payloads).
+    fn open_output_file(role: &str) -> std::io::Result<(PathBuf, File, File)> {
+        Self::open_scratch_file(&format!("outputs.{role}.cbor"))
+    }
+
+    /// Open one scratch file under the resolved work dir, returning its
+    /// path + an append write fd + a separate read fd (the one-writer /
+    /// lock-free-readers protocol). Truncate on open: the file is scratch,
+    /// never reused across respawns (crash/restart rebuilds via the
+    /// bootstrap stream). Shared by both the settled spill and the output
+    /// store so the open shape is spelled once.
+    fn open_scratch_file(name: &str) -> std::io::Result<(PathBuf, File, File)> {
         let dir = resolve_work_dir()?;
-        let path = dir.join(format!("settled_CRDT.{role}.cbor"));
-        // Truncate on open: the file is scratch, never reused across
-        // respawns (crash/restart rebuilds via the bootstrap stream).
+        let path = dir.join(name);
         let write_fd = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&path)?;
-        // Readers hold their OWN fd (positionless pread) — the
-        // one-writer / lock-free-readers protocol.
+        // Readers hold their OWN fd (positionless pread).
         let read_fd = File::open(&path)?;
         Ok((path, write_fd, read_fd))
     }
@@ -353,6 +393,7 @@ impl SettledSpillDriver {
             return;
         }
         let (unsettled_eligible, unsettled_live) = state.fat_task_breakdown();
+        let outputs = state.output_store();
         tracing::info!(
             role = self.role,
             spill_file_bytes = store.committed_bytes(),
@@ -362,6 +403,8 @@ impl SettledSpillDriver {
             in_memory_unsettled = state.tasks_in_memory(),
             unsettled_settle_eligible = unsettled_eligible,
             unsettled_not_terminal = unsettled_live,
+            output_store_file_bytes = outputs.committed_bytes(),
+            output_store_records = outputs.index_len(),
             degraded = self.degraded,
             "settled-CRDT spill stats"
         );

@@ -247,6 +247,17 @@ impl<I: Identifier> ClusterState<I> {
             // accumulator and adding the settled count keeps the digest
             // BYTE-IDENTICAL to a full fold of the logical state.
             settled,
+            // Always-on output store: the ALWAYS-ON half of the
+            // `task_outputs_hash` fold. Every node folds each completed
+            // task's `(hash, outputs)` term into `outputs_hash_acc` AT
+            // APPLY (the value is in hand on every node), then a reader
+            // persists the payload to disk and a non-reader drops it — so a
+            // plain secondary that STORES NOTHING contributes the SAME term
+            // as the primary. Seeding the fold below with this accumulator
+            // (and adding `outputs_count`) keeps the digest BYTE-IDENTICAL
+            // to a full fold of the logical outputs, across every role and
+            // whether or not the payload is resident.
+            output_store,
             // REPLICATED but NON-contributing to the digest — def content is
             // already implied by the tasks fold via the content-based join-key;
             // folding the index would diverge anti-entropy. Bound for the
@@ -334,7 +345,18 @@ impl<I: Identifier> ClusterState<I> {
         // twin of the `tasks_hash` settled-seed above. A spill therefore
         // leaves `task_outputs_hash` and `task_outputs_count` unchanged, so
         // a node that has spilled and one that has not still converge.
-        let mut task_outputs_hash = settled.task_outputs_hash_acc();
+        // Three value-preserving accumulators + the resident fold, each
+        // owning a DISJOINT set of outputs (every completed task's output
+        // term lives in exactly one): the always-on `output_store` (folded
+        // at apply, the steady-state home — disk on readers, fold-only on
+        // secondaries), the `settled` accumulator (the legacy evict-at-
+        // settle path, only ever populated when a payload went resident
+        // first — i.e. the no-disk-home fallback), and the resident
+        // `task_outputs` map (the no-disk-home reader fallback). XOR
+        // associativity makes the three seeds ⊕ the resident fold equal
+        // the full logical fold.
+        let mut task_outputs_hash =
+            settled.task_outputs_hash_acc() ^ output_store.outputs_hash_acc();
         for (key, value) in task_outputs {
             task_outputs_hash ^= hash_one((key, value));
         }
@@ -398,7 +420,9 @@ impl<I: Identifier> ClusterState<I> {
             secondary_capacities_hash,
             latest_resource_samples_count: latest_resource_samples.len() as u64,
             latest_resource_samples_hash,
-            task_outputs_count: (task_outputs.len() as u64) + settled.settled_outputs_count(),
+            task_outputs_count: (task_outputs.len() as u64)
+                + settled.settled_outputs_count()
+                + output_store.outputs_count(),
             task_outputs_hash,
             phase_deps_count: phase_deps.len() as u64,
             // CRD-3/D-G: the canonical order-independent content hash of

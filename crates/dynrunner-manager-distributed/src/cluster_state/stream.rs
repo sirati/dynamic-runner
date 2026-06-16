@@ -299,21 +299,19 @@ impl SnapshotStreamPlan {
                 }
                 raw_bytes += scratch.len() + key.len() + 16;
                 batch.tasks.insert(key.clone(), task_state);
-                // The co-keyed output entry rides the SAME package so
-                // the restore join reads it co-present (TS-3). Storage-
-                // agnostic precedence (the `outputs_for_hash` rule, inlined
-                // here to reuse the `settled_outputs` already decoded from
-                // this key's record — no second disk read): the resident
-                // map wins for a fat / not-yet-spilled entry, falling back
-                // to the SETTLED record's embedded copy (the payload was
-                // evicted from the resident map at commit-spill). Equal by
-                // construction — first-write-wins on both ends.
-                if let Some(outputs) = state
-                    .task_outputs
-                    .get(key)
-                    .cloned()
-                    .or(settled_outputs)
-                {
+                // The co-keyed output entry rides the SAME package so the
+                // restore join reads it co-present (TS-3). Storage-agnostic:
+                // a SETTLED task's payload was already decoded into
+                // `settled_outputs` from its record above (reuse it — no
+                // second disk read); a FAT task's payload lives in the
+                // ALWAYS-ON output store (a reader persisted it to disk at
+                // completion) or, on the no-disk-home fallback, the resident
+                // map — `outputs_for_hash` resolves both, source-blind. A
+                // NON-reader (secondary) stored nothing, so this is `None`
+                // and the package omits the output exactly like a vanished
+                // key (the receiver converges via the primary's stream / the
+                // live `TaskCompleted` broadcast / anti-entropy).
+                if let Some(outputs) = settled_outputs.or_else(|| state.outputs_for_hash(key)) {
                     raw_bytes += key.len() + 64;
                     batch.task_outputs.insert(key.clone(), outputs);
                 }

@@ -30,6 +30,7 @@ mod graceful_abort;
 mod grow_max;
 mod non_task_convergence;
 mod outcome_tally;
+mod output_store;
 mod panik;
 mod peer_lifecycle;
 mod peer_resources;

@@ -650,6 +650,21 @@ pub struct ClusterState<I> {
     /// converges through the `merge_task_state` settled consult; the
     /// digest folds the accumulator (`tasks_hash_acc`).
     pub(super) settled: super::settled::SettledStore,
+    /// Always-on node-local OUTPUT store: the durable disk home a
+    /// completed task's `TaskOutputs` payload lands in AT COMPLETION, so
+    /// the payload is never even transiently kept in the resident
+    /// `task_outputs` map (the owner's zero-residence requirement). Opened
+    /// at construction by the spill driver (decoupled from the lazy settle
+    /// sweep); the `TaskCompleted` apply writes through-then-drops on a
+    /// reader node and fold-only-drops on a non-reader (secondary).
+    ///
+    /// Classification: the index/accumulator are pure DERIVATIONS of the
+    /// replicated `TaskCompleted` stream (like `settled`), the fds
+    /// node-local runtime handles. Clone carries it READ-ONLY (matches
+    /// `settled`); the digest folds the accumulator (`outputs_hash_acc`);
+    /// reads route through `outputs_for_hash`. Node-local in every
+    /// exhaustive-destructure guard.
+    pub(super) output_store: super::output_store::OutputStore,
     /// Frozen task-definition registry: the content-addressed,
     /// REPLICATED store of the IMMUTABLE core of every task's
     /// `TaskInfo` (`super::task_def_store::TaskDefStore`). A def is
@@ -772,6 +787,10 @@ where
             // Settled store: carried READ-ONLY (index + shared read fds;
             // the writer affiliation is dropped — one-writer rule).
             settled,
+            // Always-on output store: carried READ-ONLY (index + shared
+            // read fd + accumulator; the append affiliation is dropped —
+            // one-writer rule, same as `settled`).
+            output_store,
             // Frozen task-def registry — carried FULLY (REPLICATED state
             // like `tasks`; the content-addressed registry is the same on
             // every node and the `Arc` clones are cheap).
@@ -877,6 +896,11 @@ where
             // serving settled reads through the shared `Arc<File>`
             // segments but never writes the source's file.
             settled: settled.clone_read_only(),
+            // Output store: read-only carry (its `Clone` drops the append
+            // half and marks the clone degraded — one-writer rule), so the
+            // cloned replica keeps serving output reads through the shared
+            // read fd but never appends to the source's file.
+            output_store: output_store.clone(),
             // Frozen task-def registry — REPLICATED, full clone (like
             // `tasks`; `Arc` clones are cheap).
             definitions: definitions.clone(),
@@ -939,6 +963,7 @@ where
             blocked_by,
             outcome_tally: _outcome_tally,
             settled,
+            output_store,
             definitions,
             authority_snapshot,
         } = self;
@@ -989,6 +1014,7 @@ where
             .field("digest_fold_count", &digest_fold_count.get())
             .field("blocked_by", &blocked_by.len())
             .field("settled", settled)
+            .field("output_store", output_store)
             .field("definitions", definitions)
             .field("authority_snapshot", &authority_snapshot.is_some())
             .finish()
@@ -1041,6 +1067,7 @@ impl<I> Default for ClusterState<I> {
             blocked_by: HashMap::new(),
             outcome_tally: super::outcome_tally::OutcomeTally::default(),
             settled: super::settled::SettledStore::default(),
+            output_store: super::output_store::OutputStore::default(),
             definitions: super::task_def_store::TaskDefStore::default(),
             authority_snapshot: None,
         }

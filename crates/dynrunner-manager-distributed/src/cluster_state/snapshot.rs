@@ -508,7 +508,20 @@ impl<I: Identifier> ClusterState<I> {
     pub fn snapshot(&self) -> ClusterStateSnapshot<I> {
         let mut snap = self.stream_head();
         snap.tasks = self.tasks.clone();
-        snap.task_outputs = self.task_outputs.clone();
+        // Outputs are served storage-agnostically: under zero-residence the
+        // resident `task_outputs` map is (near-)empty — the payload was
+        // write-through-then-dropped to the always-on output store at
+        // completion. Gather each FAT task's outputs through the same
+        // `outputs_for_hash` the stream uses (resident → output store →
+        // settled record), so the in-memory capture carries the full output
+        // set source-blind. A task that published nothing contributes no
+        // entry (mirrors the resident-map shape). Settled entries are
+        // file-served by the stream, not part of this fat capture.
+        snap.task_outputs = self
+            .tasks
+            .keys()
+            .filter_map(|hash| self.outputs_for_hash(hash).map(|o| (hash.clone(), o)))
+            .collect();
         snap.phase_event_tallies = self.phase_event_tallies.clone();
         snap
     }
@@ -636,6 +649,13 @@ impl<I: Identifier> ClusterState<I> {
             // only — its production caller (the promotion signal) pairs
             // it with the settled-base handover (`settled_base_clone`).
             settled: _settled,
+            // ── task-batch partition, file-served ──: the always-on
+            // output store is a node-local disk backend (like `settled`);
+            // its payloads are served per-key through `outputs_for_hash`
+            // (which the stream output-serve and `snapshot()`'s output
+            // gather route through), NOT shipped as a head field.
+            // `_`-dropped exactly like `settled`.
+            output_store: _output_store,
             // Frozen task-def registry — REPLICATED, but NOT carried in the
             // snapshot HEAD in L1: a restoring replica rebuilds it (empty,
             // re-populated as it interns defs it observes); the full
@@ -1019,19 +1039,27 @@ impl<I: Identifier> ClusterState<I> {
         //
         // SETTLED-aware: a hash whose fat body has SETTLED on this replica
         // already holds its output payload on disk (the spill record) and
-        // its digest term in `task_outputs_hash_acc`. Re-inserting the
-        // snapshot's (equal-by-construction) copy into the resident map
-        // would both re-bloat the very residence the eviction removed AND
-        // double-count the term in the digest (resident fold + settled
-        // accumulator), so a settled key is skipped — its output already
-        // converged. The companion `tasks` restore loop above is already
-        // settled-safe: `merge_task_state` NoOps a dominating settled key
-        // and never reaches `record_task_outputs_value` for it.
+        // its digest term in `task_outputs_hash_acc`. Re-recording the
+        // snapshot's (equal-by-construction) copy would double-count the
+        // term in the digest, so a settled key is skipped — its output
+        // already converged. The companion `tasks` restore loop above is
+        // already settled-safe: `merge_task_state` NoOps a dominating
+        // settled key and never reaches `record_task_outputs_value` for it.
+        //
+        // ZERO-RESIDENCE: route through `record_task_outputs_value` (NOT a
+        // direct resident insert) so the snapshot-delivered output takes
+        // the SAME write-through-then-drop path as a live `TaskCompleted` —
+        // folded into the always-on accumulator (first-FOLD-wins dedups a
+        // hash the `tasks` loop above already recorded, so no double-count),
+        // persisted on a reader, dropped on a non-reader. A hash with no
+        // local `tasks` anchor is skipped inside the helper (the original
+        // contract). `record_task_outputs_value` takes `Option` and only
+        // acts on `Some`, so wrap the snapshot value.
         for (hash, outputs) in task_outputs {
             if self.settled_contains(&hash) {
                 continue;
             }
-            self.task_outputs.entry(hash).or_insert(outputs);
+            self.record_task_outputs_value(&hash, Some(outputs));
         }
         // Per-secondary capacity merge: per-secondary first-write-wins,
         // identical shape to `task_outputs`. The `SecondaryCapacity`

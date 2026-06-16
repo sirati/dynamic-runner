@@ -924,8 +924,14 @@ impl<I: Identifier> ClusterState<I> {
         if let Some(outputs) = self.task_outputs.get(hash) {
             return Some(outputs.clone());
         }
-        // Not resident: a settled entry's payload lives in the spill
-        // record (or the hash is simply unknown / output-less).
+        // Not resident. Steady state: the payload was write-through-then-
+        // dropped to the ALWAYS-ON output store at completion (the
+        // zero-residence home a reader persists). Fall back to the legacy
+        // settled spill record (the no-disk-home path that went resident
+        // then spilled at settle), then to unknown / output-less.
+        if let Some(outputs) = self.output_store_read(hash) {
+            return Some(outputs);
+        }
         self.settled_record(hash).and_then(|(_, outputs)| outputs)
     }
 
