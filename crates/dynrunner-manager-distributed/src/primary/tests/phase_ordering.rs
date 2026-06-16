@@ -197,6 +197,7 @@ fn phased_binary_dep(name: &str, phase: &str, depends_on: &[&str]) -> TaskInfo<T
                 task_id: (*d).into(),
                 phase_id: PhaseId::from(phase),
                 inherit_outputs: false,
+                def_id: None,
             })
             .collect(),
         ..phased_binary(name, phase, 50)
@@ -215,6 +216,7 @@ fn phased_binary_xdep(name: &str, phase: &str, cross_deps: &[(&str, &str)]) -> T
                 task_id: (*dep_id).into(),
                 phase_id: PhaseId::from(*dep_phase),
                 inherit_outputs: false,
+                def_id: None,
             })
             .collect(),
         ..phased_binary(name, phase, 50)

@@ -209,7 +209,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let mut phases_with_live_work: HashSet<PhaseId> = HashSet::new();
 
         for (hash, state) in self.cluster_state.tasks_iter() {
-            all_binaries.push(state.to_task_info());
+            // L5: resolve dep refs via the store (two shared borrows of
+            // `self.cluster_state` — the iter + the resolve — is fine).
+            all_binaries.push(self.cluster_state.task_to_info(state));
             let def = state.def();
             match state {
                 // A FAILED terminal must NOT satisfy dependents' deps: it
@@ -345,7 +347,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // dep machine rather than a parallel "Blocked" set.
                 TaskState::Blocked { .. } => {
                     phases_with_live_work.insert(def.phase_id.clone());
-                    items.push(state.to_task_info());
+                    // L5: resolve dep refs via the store.
+                    items.push(self.cluster_state.task_to_info(state));
                 }
                 // Unlike the secondary's hydration, the
                 // `PrimaryCoordinator` owns no local `active_tasks`
@@ -355,7 +358,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // therefore always genuinely pending: into the pool.
                 TaskState::Pending { .. } => {
                     phases_with_live_work.insert(def.phase_id.clone());
-                    items.push(state.to_task_info());
+                    // L5: resolve dep refs via the store.
+                    items.push(self.cluster_state.task_to_info(state));
                 }
                 TaskState::InFlight {
                     secondary, worker, ..
@@ -401,7 +405,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         def.phase_id.clone(),
                         secondary.clone(),
                         *worker,
-                        state.to_task_info(),
+                        // L5: resolve dep refs via the store.
+                        self.cluster_state.task_to_info(state),
                     ));
                 }
                 // A resolved SecondaryAffine gate (#497): a terminal that was
@@ -438,7 +443,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // per #495 rather than wedging on an un-observable import.)
                 TaskState::QueuedAfterLocalDependency { .. } => {
                     phases_with_live_work.insert(def.phase_id.clone());
-                    items.push(state.to_task_info());
+                    // L5: resolve dep refs via the store.
+                    items.push(self.cluster_state.task_to_info(state));
                 }
             }
         }
@@ -861,7 +867,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     hash.clone(),
                     secondary.clone(),
                     *worker,
-                    state.to_task_info(),
+                    // L5: resolve dep refs via the store.
+                    self.cluster_state.task_to_info(state),
                 )),
                 _ => None,
             })

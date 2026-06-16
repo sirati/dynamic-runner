@@ -378,7 +378,7 @@ fn required_files_seed_uploads_pending_and_work_blocked_until_completed() {
     let uploads: Vec<_> = cs
         .tasks_iter()
         .filter(|(_, s)| s.def().kind.is_setup())
-        .map(|(h, s)| (h.clone(), s.to_task_info()))
+        .map(|(h, s)| (h.clone(), cs.task_to_info(s)))
         .collect();
     assert_eq!(uploads.len(), 2, "two upload setup tasks");
     for (hash, task) in &uploads {
@@ -491,7 +491,7 @@ fn required_files_dedup_one_upload_shared_by_all_sharers() {
     let uploads: Vec<_> = cs
         .tasks_iter()
         .filter(|(_, s)| s.def().kind.is_setup())
-        .map(|(_, s)| s.to_task_info())
+        .map(|(_, s)| cs.task_to_info(s))
         .collect();
     assert_eq!(uploads.len(), 2, "exactly one upload per unique file");
 
@@ -507,11 +507,12 @@ fn required_files_dedup_one_upload_shared_by_all_sharers() {
 
     // Each of b1/b2/b3 depends on the SAME common upload id.
     for name in ["b1", "b2", "b3"] {
-        let deps = cs
+        let dep_refs = cs
             .tasks_iter()
             .find(|(_, s)| s.def().task_id == name)
             .map(|(_, s)| s.def().task_depends_on.clone())
             .unwrap_or_else(|| panic!("{name} in ledger"));
+        let deps = cs.resolve_dep_refs(&dep_refs);
         assert!(
             deps.iter().any(|d| d.task_id == common_upload_id),
             "{name} must gate on the SINGLE shared /tc/common upload"
@@ -567,6 +568,7 @@ fn manual_spawned_file_setup_task_gates_a_dependent_work_task() {
         task_id: "shared-closure".into(),
         phase_id: dynrunner_core::PhaseId::from("default"),
         inherit_outputs: false,
+        def_id: None,
     }];
 
     primary

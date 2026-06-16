@@ -27,6 +27,7 @@ fn with_dep(mut task: TaskInfo<RunnerIdentifier>, dep_task_id: &str) -> TaskInfo
         task_id: dep_task_id.into(),
         phase_id: PhaseId::from("p0"),
         inherit_outputs: false,
+        def_id: None,
     });
     task
 }
@@ -41,11 +42,14 @@ fn with_dep(mut task: TaskInfo<RunnerIdentifier>, dep_task_id: &str) -> TaskInfo
 fn affine_ready_resolves_dependents_without_execution() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
 
-    // The upload setup task, in flight (about to succeed).
+    // The upload setup task, in flight (about to succeed). Intern its def
+    // through the STORE (not the store-less `split_task_def`) so its
+    // `(phase_id, task_id)` identity registers — the L5 dep refs of the gate
+    // that depends on it resolve against the store's identity index.
     let mut upload = mk_task("upload");
     upload.kind = TaskKind::Setup;
     let upload_hash = crate::primary::wire::compute_task_hash(&upload);
-    let (def, routing) = crate::cluster_state::split_task_def(upload);
+    let (def, routing) = s.intern_task_def(&upload_hash, upload);
     s.tasks.insert(
         upload_hash.clone(),
         TaskState::InFlight {

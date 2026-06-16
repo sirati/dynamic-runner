@@ -437,6 +437,7 @@ async fn fail_permanent_unfulfillable_blocks_dependents() {
                 task_id: "prereq_id".into(),
                 phase_id: PhaseId::from("default"),
                 inherit_outputs: false,
+                def_id: None,
             }];
             let dep_hash = compute_task_hash(&dep);
 
@@ -534,6 +535,7 @@ async fn unfulfillable_reinject_root_complete_resumes_blocked_dependents_in_pool
                 task_id: "prereq_id".into(),
                 phase_id: PhaseId::from("default"),
                 inherit_outputs: false,
+                def_id: None,
             }];
             let dep_hash = compute_task_hash(&dep);
 
@@ -666,6 +668,7 @@ async fn reinject_resets_blocked_dependents_pool_state() {
                 task_id: "prereq_id".into(),
                 phase_id: PhaseId::from("default"),
                 inherit_outputs: false,
+                def_id: None,
             }];
             let dep_hash = compute_task_hash(&dep);
 
@@ -797,7 +800,9 @@ async fn update_preferred_secondaries_propagates_to_live_pool() {
 
             // CRDT mirror updated.
             let crdt_task = match coordinator.cluster_state.task_state(&hash) {
-                Some(state @ TaskState::Pending { .. }) => state.to_task_info(),
+                Some(state @ TaskState::Pending { .. }) => {
+                    coordinator.cluster_state.task_to_info(state)
+                }
                 other => panic!("expected Pending, got {other:?}"),
             };
             let expected: Vec<&str> = vec!["sec-a", "sec-b"];
@@ -971,6 +976,7 @@ async fn spawn_tasks_with_pending_dep_lands_blocked() {
                 task_id: "b_id".into(),
                 phase_id: PhaseId::from("default"),
                 inherit_outputs: false,
+                def_id: None,
             }];
 
             let errors = spawn_via_handler(&mut coordinator, vec![a.clone()])
@@ -1027,6 +1033,7 @@ async fn spawn_tasks_with_completed_dep_lands_pending() {
                 task_id: "b_id".into(),
                 phase_id: PhaseId::from("default"),
                 inherit_outputs: false,
+                def_id: None,
             }];
 
             let errors = spawn_via_handler(&mut coordinator, vec![a.clone()])
@@ -1090,6 +1097,7 @@ async fn spawn_tasks_with_unfulfillable_dep_lands_blocked() {
                 task_id: "b_id".into(),
                 phase_id: PhaseId::from("default"),
                 inherit_outputs: false,
+                def_id: None,
             }];
 
             let errors = spawn_via_handler(&mut coordinator, vec![a.clone()])
@@ -1383,6 +1391,7 @@ async fn spawn_tasks_unknown_dependency_returns_per_index_error() {
                 task_id: "nope".into(),
                 phase_id: PhaseId::from("default"),
                 inherit_outputs: false,
+                def_id: None,
             }];
             let mut c = make_binary("c", 100);
             c.task_id = "c_id".into();
@@ -1600,6 +1609,7 @@ async fn spawn_tasks_cross_phase_missing_dep_is_invalid_not_silent_pending() {
                 task_id: "foo".into(),
                 phase_id: PhaseId::from("B"),
                 inherit_outputs: false,
+                def_id: None,
             }];
 
             let errors = spawn_via_handler(&mut coordinator, vec![child.clone()])
@@ -1657,6 +1667,7 @@ async fn spawn_tasks_cross_phase_dep_naming_right_phase_resolves() {
                 task_id: "foo".into(),
                 phase_id: PhaseId::from("A"),
                 inherit_outputs: false,
+                def_id: None,
             }];
 
             let errors = spawn_via_handler(&mut coordinator, vec![child.clone()])
@@ -1687,6 +1698,7 @@ fn tasks_spawned_mutation_round_trips_through_serde() {
         task_id: "a_id".into(),
         phase_id: PhaseId::from("default"),
         inherit_outputs: false,
+        def_id: None,
     }];
     let m: ClusterMutation<TestId> = ClusterMutation::TasksSpawned {
         tasks: vec![a.clone(), b.clone()],
@@ -1703,7 +1715,8 @@ fn tasks_spawned_mutation_round_trips_through_serde() {
                 vec![TaskDep {
                     task_id: "a_id".to_string(),
                     phase_id: PhaseId::from("default"),
-                    inherit_outputs: false
+                    inherit_outputs: false,
+                    def_id: None,
                 }]
             );
         }
@@ -2203,6 +2216,7 @@ async fn spawn_tasks_chunked_absolute_index_translation() {
                         task_id: "does_not_exist".into(),
                         phase_id: t.phase_id.clone(),
                         inherit_outputs: false,
+                        def_id: None,
                     }];
                 }
                 tasks.push(t);

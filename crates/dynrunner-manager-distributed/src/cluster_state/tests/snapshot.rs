@@ -412,68 +412,100 @@ fn pending_pool_unfulfillable_state_round_trips_via_snapshot() {
     }
 }
 
-/// Migration shim (snapshot-only): a legacy snapshot carries deps that
-/// predate the `(phase_id, task_id)` identity, so they decode with the
-/// sentinel (empty) phase. On `restore`, the shim must inject the
-/// enclosing task's phase into every sentinel dep — and leave any dep
-/// that already names its phase (a new, explicit cross-phase dep)
-/// untouched.
+/// L5 snapshot-restore dep resolution: a task's deps are stored on the
+/// frozen def as compact, snapshot-PORTABLE `TaskDefId` refs. After a
+/// `snapshot()` on the source and a `restore()` on a FRESH replica (the
+/// late-joiner / promoted-primary path), each dep must resolve to the SAME
+/// prereq def the source resolved — its `(phase_id, task_id)` identity
+/// rebuilt verbatim, and the per-edge `inherit_outputs` preserved. This is
+/// the #603/L6a portability guarantee L5 leans on: `resolve(def_id)` works
+/// on every replica across snapshot/restore.
 #[test]
-fn restore_migrates_unphased_deps_to_enclosing_phase() {
+fn restore_resolves_dep_refs_to_stable_prereq_defs() {
     use dynrunner_core::TaskDep;
 
-    // Build a task in phase "p0" (mk_task's phase) whose dep list mixes
-    // a legacy un-phased dep (sentinel phase) and an explicit
-    // cross-phase dep.
-    let mut task = mk_task("dependent");
-    task.task_depends_on = vec![
-        // Legacy un-phased dep: sentinel phase, to be migrated.
+    // Two prereqs in DISTINCT phases (so the rebuilt identity must carry the
+    // right phase, not the dependent's), plus a dependent that gates on both
+    // — one with inherit_outputs=true (drives the transitive walk), one
+    // false.
+    let mut prereq_a = mk_task("prereq_a");
+    prereq_a.phase_id = PhaseId::from("phase-A");
+    let mut prereq_b = mk_task("prereq_b");
+    prereq_b.phase_id = PhaseId::from("phase-B");
+
+    let mut dependent = mk_task("dependent");
+    dependent.phase_id = PhaseId::from("phase-A");
+    dependent.task_depends_on = vec![
         TaskDep {
-            task_id: "legacy_prereq".into(),
-            phase_id: PhaseId::default(),
+            task_id: "prereq_a".into(),
+            phase_id: PhaseId::from("phase-A"),
             inherit_outputs: false,
+            def_id: None,
         },
-        // New explicit cross-phase dep: must NOT be rewritten.
         TaskDep {
-            task_id: "explicit_prereq".into(),
-            phase_id: PhaseId::from("other-phase"),
+            task_id: "prereq_b".into(),
+            phase_id: PhaseId::from("phase-B"),
             inherit_outputs: true,
+            def_id: None,
         },
     ];
 
+    // Originate the batch through the stamp pass (production path) so each
+    // dep's prereq def id is resolved + stamped over the whole batch — the
+    // prereqs come AFTER the dependent here to also pin intra-batch
+    // forward-ref resolution survives the snapshot round-trip.
     let mut source = ClusterState::<RunnerIdentifier>::new();
-    source.apply(ClusterMutation::TaskAdded {
-        hash: "h".into(),
-        task,
-        def_id: None,
-    });
+    let batch = vec![
+        ClusterMutation::TaskAdded {
+            hash: "dependent".into(),
+            task: dependent,
+            def_id: None,
+        },
+        ClusterMutation::TaskAdded {
+            hash: "prereq_a".into(),
+            task: prereq_a,
+            def_id: None,
+        },
+        ClusterMutation::TaskAdded {
+            hash: "prereq_b".into(),
+            task: prereq_b,
+            def_id: None,
+        },
+    ];
+    crate::cluster_state::apply_locally_for_broadcast(&mut source, batch);
+
     let snap = source.snapshot();
 
+    // Restore on a FRESH replica (the L5 portability target).
     let mut joiner = ClusterState::<RunnerIdentifier>::new();
     joiner.restore(snap);
 
-    let restored = match joiner.task_state("h") {
-        Some(state @ TaskState::Pending { .. }) => state.to_task_info(),
+    let restored = match joiner.task_state("dependent") {
+        Some(state @ TaskState::Pending { .. }) => joiner.task_to_info(state),
         other => panic!("expected Pending, got {other:?}"),
     };
     let deps = &restored.task_depends_on;
     assert_eq!(deps.len(), 2);
-    // Legacy dep took the enclosing task's phase ("p0").
-    assert_eq!(deps[0].task_id, "legacy_prereq");
-    assert_eq!(
-        deps[0].phase_id,
-        PhaseId::from("p0"),
-        "sentinel migrated to enclosing phase"
-    );
-    assert!(!deps[0].is_unphased());
-    // Explicit cross-phase dep is unaffected by the shim.
-    assert_eq!(deps[1].task_id, "explicit_prereq");
+    // Each dep rebuilt the PREREQ's real `(phase_id, task_id)` identity from
+    // its portable def id, on the fresh replica.
+    assert_eq!(deps[0].task_id, "prereq_a");
+    assert_eq!(deps[0].phase_id, PhaseId::from("phase-A"));
+    assert!(!deps[0].inherit_outputs, "inherit_outputs preserved (false)");
+    assert_eq!(deps[1].task_id, "prereq_b");
     assert_eq!(
         deps[1].phase_id,
-        PhaseId::from("other-phase"),
-        "explicit dep untouched"
+        PhaseId::from("phase-B"),
+        "the cross-phase prereq's REAL phase, not the dependent's"
     );
-    assert!(deps[1].inherit_outputs);
+    assert!(deps[1].inherit_outputs, "inherit_outputs preserved (true)");
+
+    // The portable def id is STABLE across the snapshot/restore: the prereq
+    // identities resolve to the SAME def id on source and joiner.
+    assert_eq!(
+        source.def_id_for_identity_for_test(&PhaseId::from("phase-B"), "prereq_b"),
+        joiner.def_id_for_identity_for_test(&PhaseId::from("phase-B"), "prereq_b"),
+        "a prereq's def id is the same on every replica after restore"
+    );
 }
 
 /// Consumer-invariant round-trip — the regression test for the

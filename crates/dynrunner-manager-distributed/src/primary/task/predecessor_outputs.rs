@@ -141,6 +141,7 @@ mod tests {
                 task_id: "A".into(),
                 phase_id: PhaseId::from("p0"),
                 inherit_outputs: false,
+                def_id: None,
             }],
         );
         let a_outputs = outputs_with("nonce", "xyz");
@@ -172,6 +173,7 @@ mod tests {
                 task_id: "A".into(),
                 phase_id: PhaseId::from("p0"),
                 inherit_outputs: false,
+                def_id: None,
             }],
         );
         let a_outputs = outputs_with("nonce", "xyz");
@@ -203,6 +205,7 @@ mod tests {
                 task_id: "A".into(),
                 phase_id: PhaseId::from("p0"),
                 inherit_outputs: false,
+                def_id: None,
             }],
         );
         seed(&mut state, a, None);
@@ -225,6 +228,7 @@ mod tests {
                 task_id: "A".into(),
                 phase_id: PhaseId::from("p0"),
                 inherit_outputs: false,
+                def_id: None,
             }],
         );
         let c = mk_task(
@@ -233,6 +237,7 @@ mod tests {
                 task_id: "B".into(),
                 phase_id: PhaseId::from("p0"),
                 inherit_outputs: true,
+                def_id: None,
             }],
         );
         let a_outputs = outputs_with("x", "1");
@@ -259,6 +264,7 @@ mod tests {
                 task_id: "A".into(),
                 phase_id: PhaseId::from("p0"),
                 inherit_outputs: false,
+                def_id: None,
             }],
         );
         let c = mk_task(
@@ -267,6 +273,7 @@ mod tests {
                 task_id: "B".into(),
                 phase_id: PhaseId::from("p0"),
                 inherit_outputs: false,
+                def_id: None,
             }],
         );
         seed(&mut state, a, Some(outputs_with("x", "1")));
@@ -293,6 +300,7 @@ mod tests {
                 task_id: "A".into(),
                 phase_id: PhaseId::from("p0"),
                 inherit_outputs: true,
+                def_id: None,
             }],
         );
         let a_outputs = outputs_with("k", "v");
@@ -335,6 +343,7 @@ mod tests {
                 task_id: "A".into(),
                 phase_id: PhaseId::from("p0"),
                 inherit_outputs: false,
+                def_id: None,
             }],
         );
         let c = mk_task(
@@ -344,11 +353,13 @@ mod tests {
                     task_id: "B".into(),
                     phase_id: PhaseId::from("p0"),
                     inherit_outputs: true,
+                    def_id: None,
                 },
                 TaskDep {
                     task_id: "missing".into(),
                     phase_id: PhaseId::from("p0"),
                     inherit_outputs: false,
+                    def_id: None,
                 },
             ],
         );

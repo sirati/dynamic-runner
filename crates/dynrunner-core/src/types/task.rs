@@ -425,6 +425,23 @@ pub struct UploadFileRef {
 /// `inherit_outputs = false` (the default, and the only shape legacy
 /// `Vec<String>` payloads decode to) means "wait for this task; read
 /// only its own outputs".
+///
+/// RESOLVED def-id ([`Self::def_id`], L5): the compact, CRDT-agreed
+/// store index of the PREREQUISITE task's content. The originating
+/// primary resolves each dep's `(phase_id, task_id)` identity to the
+/// prereq's `TaskDefId` at `TaskAdded` origination — AFTER the whole
+/// batch's defs are reserved, so an intra-batch forward-ref resolves —
+/// and stamps it here. The receiver's def-store fill reads this directly
+/// (no `(phase_id, task_id)` re-resolution needed, so it is forward-ref-
+/// safe regardless of in-batch delivery order) and stores the compact
+/// `TaskDepRef` on the frozen def, dropping the heap `(phase_id, task_id)`
+/// strings. The string identity stays on this `TaskDep` for the consumers
+/// that key by it (the dispatch wire, the secondary affine gate, the
+/// predecessor-outputs walk); the def-store rebuilds it from the ref via
+/// `resolve(def_id)` for the frozen-def read seams. `None` is the
+/// un-resolved shape: a legacy/un-stamped dep, or any local-apply path
+/// that does not route through the broadcast stamp — the def-store fill
+/// then falls back to identity resolution.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TaskDep {
     pub task_id: String,
@@ -437,6 +454,17 @@ pub struct TaskDep {
     pub phase_id: PhaseId,
     #[serde(default)]
     pub inherit_outputs: bool,
+    /// The PREREQUISITE's resolved, CRDT-agreed def-store id (L5). Stamped
+    /// by the originating primary at `TaskAdded` origination (the receiver
+    /// stores it as the compact `TaskDepRef` on the frozen def). `None` for
+    /// a legacy/un-stamped dep or a non-broadcast local-apply dep; the
+    /// def-store fill falls back to `(phase_id, task_id)` identity
+    /// resolution in that case. `#[serde(default)]` decodes a pre-field
+    /// sender's frame to `None` (wire-safe), and `skip_serializing_if`
+    /// keeps the un-resolved shape off the wire so a legacy/dispatch frame
+    /// is byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub def_id: Option<u32>,
 }
 
 impl TaskDep {
@@ -492,6 +520,8 @@ enum TaskDepWire {
         phase_id: PhaseId,
         #[serde(default)]
         inherit_outputs: bool,
+        #[serde(default)]
+        def_id: Option<u32>,
     },
 }
 
@@ -502,15 +532,18 @@ impl<'de> Deserialize<'de> for TaskDep {
                 task_id,
                 phase_id: PhaseId::default(),
                 inherit_outputs: false,
+                def_id: None,
             },
             TaskDepWire::Full {
                 task_id,
                 phase_id,
                 inherit_outputs,
+                def_id,
             } => TaskDep {
                 task_id,
                 phase_id,
                 inherit_outputs,
+                def_id,
             },
         })
     }
@@ -531,6 +564,7 @@ mod task_dep_tests {
                 task_id: "foo".to_string(),
                 phase_id: PhaseId::default(),
                 inherit_outputs: false,
+                def_id: None,
             }
         );
         assert!(dep.is_unphased());
@@ -544,6 +578,7 @@ mod task_dep_tests {
             task_id: "foo".to_string(),
             phase_id: PhaseId::from("phase-A"),
             inherit_outputs: true,
+            def_id: None,
         };
         let json = serde_json::to_value(&dep).expect("to_value");
         assert_eq!(json["task_id"], "foo");
@@ -566,6 +601,7 @@ mod task_dep_tests {
                 task_id: "foo".to_string(),
                 phase_id: PhaseId::default(),
                 inherit_outputs: true,
+                def_id: None,
             }
         );
         assert!(dep.is_unphased());
@@ -582,6 +618,7 @@ mod task_dep_tests {
                 task_id: "foo".to_string(),
                 phase_id: PhaseId::from("p"),
                 inherit_outputs: false,
+                def_id: None,
             }
         );
     }
@@ -602,6 +639,38 @@ mod task_dep_tests {
     }
 
     #[test]
+    fn task_dep_resolved_def_id_round_trips_and_is_skipped_when_none() {
+        // L5: a stamped dep carries the prereq's resolved def-id on the
+        // wire; an un-stamped dep keeps it off the wire (legacy-compatible).
+        let stamped = TaskDep {
+            task_id: "foo".to_string(),
+            phase_id: PhaseId::from("p"),
+            inherit_outputs: true,
+            def_id: Some(7),
+        };
+        let json = serde_json::to_value(&stamped).expect("to_value");
+        assert_eq!(json["def_id"], 7);
+        let back: TaskDep = serde_json::from_value(json).expect("round-trip");
+        assert_eq!(back, stamped);
+
+        let unstamped = TaskDep {
+            task_id: "foo".to_string(),
+            phase_id: PhaseId::from("p"),
+            inherit_outputs: false,
+            def_id: None,
+        };
+        let json = serde_json::to_value(&unstamped).expect("to_value");
+        assert!(
+            json.get("def_id").is_none(),
+            "an un-stamped dep keeps def_id off the wire"
+        );
+        // A legacy frame (def_id absent) decodes to None.
+        let legacy: TaskDep =
+            serde_json::from_str("{\"task_id\":\"foo\",\"phase_id\":\"p\"}").expect("legacy");
+        assert_eq!(legacy.def_id, None);
+    }
+
+    #[test]
     fn fill_phase_migrates_sentinel_but_leaves_new_dep_untouched() {
         // The migration shim primitive: a sentinel dep takes the
         // enclosing phase; an explicit dep is unaffected.
@@ -609,6 +678,7 @@ mod task_dep_tests {
             task_id: "x".into(),
             phase_id: PhaseId::default(),
             inherit_outputs: false,
+            def_id: None,
         };
         legacy.fill_phase(&PhaseId::from("enclosing"));
         assert_eq!(legacy.phase_id, PhaseId::from("enclosing"));
@@ -617,6 +687,7 @@ mod task_dep_tests {
             task_id: "y".into(),
             phase_id: PhaseId::from("other"),
             inherit_outputs: false,
+            def_id: None,
         };
         explicit.fill_phase(&PhaseId::from("enclosing"));
         assert_eq!(

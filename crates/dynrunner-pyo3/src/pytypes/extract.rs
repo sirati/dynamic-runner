@@ -114,6 +114,9 @@ fn extract_task_dep(obj: &Bound<'_, PyAny>, enclosing_phase: &PhaseId) -> PyResu
             task_id: s,
             phase_id: enclosing_phase.clone(),
             inherit_outputs: false,
+            // Un-resolved at the consumer boundary: the originating primary
+            // stamps the prereq's resolved def-id at TaskAdded origination.
+            def_id: None,
         });
     }
     let task_id: String = obj.getattr("task_id")?.extract()?;
@@ -135,6 +138,8 @@ fn extract_task_dep(obj: &Bound<'_, PyAny>, enclosing_phase: &PhaseId) -> PyResu
         task_id,
         phase_id,
         inherit_outputs,
+        // Un-resolved at the consumer boundary; the originator stamps it.
+        def_id: None,
     })
 }
 

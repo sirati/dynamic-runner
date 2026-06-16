@@ -266,6 +266,7 @@ impl From<&PyTaskInfo> for TaskInfo<RunnerIdentifier> {
                     task_id: task_id.clone(),
                     phase_id: phase_id.clone(),
                     inherit_outputs: false,
+                    def_id: None,
                 })
                 .collect(),
             preferred_secondaries: SoftPreferredSecondaries::new(py.preferred_secondaries.clone()),

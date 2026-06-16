@@ -261,7 +261,8 @@ where
         // hash, and the discrete-variant gate has to read the
         // authoritative ledger.
         let binary = match self.cluster_state.task_state(&hash) {
-            Some(state @ TaskState::Unfulfillable { .. }) => state.to_task_info(),
+            // L5: resolve dep refs via the store.
+            Some(state @ TaskState::Unfulfillable { .. }) => self.cluster_state.task_to_info(state),
             Some(_) => {
                 return Err(format!(
                     "reinject_task: hash {hash} not in Unfulfillable state"
@@ -936,7 +937,8 @@ where
         for hash in valid_hashes {
             match self.cluster_state.task_state(&hash) {
                 Some(state @ TaskState::Pending { .. }) => {
-                    let task = state.to_task_info();
+                    // L5: resolve dep refs via the store.
+                    let task = self.cluster_state.task_to_info(state);
                     self.pool_mut().reinject(std::sync::Arc::new(task));
                     pool_grew = true;
                 }

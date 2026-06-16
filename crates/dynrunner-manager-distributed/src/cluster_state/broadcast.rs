@@ -271,14 +271,48 @@ fn stamp_def_ids<I: Identifier>(
     state: &mut ClusterState<I>,
     mutations: &mut [ClusterMutation<I>],
 ) {
+    // PASS 1 — reserve every originated `TaskAdded`'s own def id, recording
+    // each task's `(phase_id, task_id)` → def_id into a batch-local map. This
+    // reserves ids for EVERY task in the batch BEFORE any dep is resolved, so
+    // an INTRA-batch forward-ref (a dependent listed before its prerequisite)
+    // resolves against the map even though the prereq's `TaskAdded` has not
+    // been applied yet (CL-A8). A re-broadcast (`def_id` already `Some`) is
+    // left untouched but its identity is still recorded so deps that point at
+    // it resolve.
+    let mut batch_ids: std::collections::HashMap<(dynrunner_core::PhaseId, String), u32> =
+        std::collections::HashMap::new();
     for m in mutations.iter_mut() {
-        if let ClusterMutation::TaskAdded {
-            hash,
-            def_id: def_id @ None,
-            ..
-        } = m
-        {
-            *def_id = Some(state.allocate_def_id(hash).0);
+        if let ClusterMutation::TaskAdded { hash, task, def_id } = m {
+            let id = match def_id {
+                Some(existing) => *existing,
+                None => {
+                    let allocated = state.allocate_def_id(hash).0;
+                    *def_id = Some(allocated);
+                    allocated
+                }
+            };
+            batch_ids.insert((task.phase_id.clone(), task.task_id.clone()), id);
+        }
+    }
+    // PASS 2 — resolve each dep's `(phase_id, task_id)` identity to the
+    // PREREQUISITE's def id and stamp it onto the wire `TaskDep` (point 2/4):
+    // batch-local reservations first (the intra-batch forward-ref), else the
+    // store's identity reverse-index (a prereq added in a PRIOR batch). An
+    // already-stamped dep is left untouched (idempotent re-broadcast), and an
+    // unresolvable dep is left `None` — the loud-unknown-dep failure is the
+    // scheduler's concern (spawn validation / `PendingPool::extend` over the
+    // string deps), not silently fabricated here.
+    for m in mutations.iter_mut() {
+        if let ClusterMutation::TaskAdded { task, .. } = m {
+            for dep in task.task_depends_on.iter_mut() {
+                if dep.def_id.is_some() {
+                    continue;
+                }
+                dep.def_id = batch_ids
+                    .get(&(dep.phase_id.clone(), dep.task_id.clone()))
+                    .copied()
+                    .or_else(|| state.definitions.id_for_identity_pub(&dep.phase_id, &dep.task_id));
+            }
         }
     }
 }

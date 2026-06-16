@@ -68,6 +68,7 @@ fn dependent_of_succeeded_setup_task_is_dispatchable() {
         task_id: "setup".into(),
         phase_id: PhaseId::from("p0"),
         inherit_outputs: false,
+        def_id: None,
     }];
     let build_hash = crate::primary::wire::compute_task_hash(&build);
     s.apply(ClusterMutation::TasksSpawned { tasks: vec![build] });

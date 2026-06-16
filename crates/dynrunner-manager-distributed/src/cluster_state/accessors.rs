@@ -231,8 +231,10 @@ impl<I: Identifier> ClusterState<I> {
     /// `is_ready_gate`): a #509-rerouted import re-runs once its `TaskAdded`
     /// lands the gate `Pending`, before it reaches `AffineReady`.
     pub(crate) fn affine_gate_task(&self, hash: &str) -> Option<TaskInfo<I>> {
-        self.resolve_affine_ready_gate(hash)
-            .map(|gate| gate.def.to_task_info(&gate.routing))
+        self.resolve_affine_ready_gate(hash).map(|gate| {
+            let deps = self.resolve_dep_refs(&gate.def.task_depends_on);
+            gate.def.to_task_info(&gate.routing, deps)
+        })
     }
 
     /// Iterator over `(&hash, &TaskState)` for every FAT (in-memory)
@@ -333,9 +335,22 @@ impl<I: Identifier> ClusterState<I> {
         self.definitions.next_id_floor()
     }
 
+    /// The def id a `(phase_id, task_id)` identity resolves to in this
+    /// replica's store (L5) — the test seam pinning that a prereq's def id is
+    /// the SAME across replicas after a snapshot/restore (the #603/L6a
+    /// portability the def-id dep refs lean on).
+    #[cfg(test)]
+    pub(crate) fn def_id_for_identity_for_test(
+        &self,
+        phase_id: &PhaseId,
+        task_id: &str,
+    ) -> Option<u32> {
+        self.definitions.id_for_identity_pub(phase_id, task_id)
+    }
+
     pub fn iter_pending(&self) -> impl Iterator<Item = (&String, TaskInfo<I>)> {
         self.tasks.iter().filter_map(|(h, s)| match s {
-            TaskState::Pending { .. } => Some((h, s.to_task_info())),
+            TaskState::Pending { .. } => Some((h, self.task_to_info(s))),
             _ => None,
         })
     }
@@ -492,7 +507,7 @@ impl<I: Identifier> ClusterState<I> {
     /// [`Self::task_deps_for_identity`] / [`Self::task_hash_for_dep`],
     /// which DO consult the settled index.
     pub fn iter_all(&self) -> impl Iterator<Item = (&String, TaskInfo<I>)> {
-        self.tasks.iter().map(|(h, s)| (h, s.to_task_info()))
+        self.tasks.iter().map(|(h, s)| (h, self.task_to_info(s)))
     }
 
     /// Iterator over `(task_hash, &TaskInfo)` for FAT (in-memory)
@@ -516,7 +531,7 @@ impl<I: Identifier> ClusterState<I> {
             // `AffineReady` IS terminal for dependency-resolution: a build
             // gated on the gate resolves its dep against it exactly as
             // against a `Completed`/`SetupCompleted` prereq.
-            | TaskState::AffineReady { .. } => Some((h, s.to_task_info())),
+            | TaskState::AffineReady { .. } => Some((h, self.task_to_info(s))),
             _ => None,
         })
     }
@@ -871,11 +886,17 @@ impl<I: Identifier> ClusterState<I> {
             .values()
             .find_map(|s| {
                 let def = s.def();
+                // L5: the fat def stores compact `TaskDepRef`s — rebuild the
+                // string-identity `TaskDep` list the walk keys by via the
+                // def store.
                 (def.task_id == task_id && &def.phase_id == phase_id)
-                    .then(|| def.task_depends_on.clone())
+                    .then(|| self.resolve_dep_refs(&def.task_depends_on))
             })
             .or_else(|| {
                 self.settled_entries().find_map(|(_, entry)| {
+                    // The settled (slim) index keeps the resolved string deps
+                    // captured at commit-spill, so no def-store round-trip is
+                    // needed here.
                     (entry.task_id == task_id && &entry.phase_id == phase_id)
                         .then(|| entry.task_depends_on.clone())
                 })

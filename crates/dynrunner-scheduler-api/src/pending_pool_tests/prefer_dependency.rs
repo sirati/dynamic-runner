@@ -28,6 +28,7 @@ fn t_id(phase: &str, size: u64, id: &str, deps: &[&str]) -> TaskInfo<()> {
             task_id: d.to_string(),
             phase_id: PhaseId::from(phase),
             inherit_outputs: false,
+            def_id: None,
         })
         .collect();
     item
@@ -277,6 +278,7 @@ fn prereq_resolves_through_kinds_via_direct_dependents_only() {
         task_id: "a".into(),
         phase_id: phase("P"),
         inherit_outputs: false,
+        def_id: None,
     }];
     let mut leaf = t_id("P", 1, "leaf", &["mid"]);
     leaf.kind = TaskKind::Work;

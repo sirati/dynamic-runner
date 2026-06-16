@@ -1372,6 +1372,7 @@ fn hydrate_does_not_seed_blocked_only_phase_as_started() {
             task_id: "build-1".into(),
             phase_id: dynrunner_core::PhaseId::from("build"),
             inherit_outputs: false,
+            def_id: None,
         }];
         cs.apply(ClusterMutation::TaskAdded {
             hash: compute_task_hash(&st),

@@ -214,6 +214,7 @@ async fn missing_dep_marks_invalid_task_and_run_continues() {
                 task_id: "ghost".into(),
                 phase_id: PhaseId::from("default"),
                 inherit_outputs: false,
+                def_id: None,
             }];
 
             manager

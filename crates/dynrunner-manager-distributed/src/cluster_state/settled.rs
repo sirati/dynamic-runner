@@ -769,6 +769,16 @@ impl<I: Identifier> ClusterState<I> {
                 continue;
             };
             let def = state.def();
+            // Capture every value that borrows `state`/`def` (the `self.tasks`
+            // borrow) UP FRONT, so the whole-`self` `resolve_dep_refs` call
+            // below does not overlap that borrow. The dep REFS are cheap
+            // `Copy` clones; resolving them to string deps needs the def store
+            // (`&self`), done AFTER the `state` borrow ends.
+            let task_id = def.task_id.clone();
+            let phase_id = def.phase_id.clone();
+            let captured_def_id = def.def_id;
+            let dep_refs = def.task_depends_on.clone();
+            let digest_contribution = hash_one((&rec.hash, hashable_join_key(state)));
             // Evict the resident output payload: its co-keyed copy already
             // rode the spill record (`collect_spill_batch` cloned it into
             // the `SettledRecord`), so the disk copy is authoritative and
@@ -782,17 +792,23 @@ impl<I: Identifier> ClusterState<I> {
                 .task_outputs
                 .remove(&rec.hash)
                 .map(|outputs| hash_one((&rec.hash, &outputs)));
+            // L5: resolve the fat def's compact `TaskDepRef`s → string deps
+            // at commit-spill (the def store is in hand here), so the slim
+            // settled index keeps the resolved identity its `task_deps_for_identity`
+            // reader hands the transitive-ancestor walk — no def-store
+            // round-trip on the (common) spilled-predecessor read path.
+            let task_depends_on = self.resolve_dep_refs(&dep_refs);
             let entry = SettledEntry {
-                task_id: def.task_id.clone(),
-                phase_id: def.phase_id.clone(),
-                task_depends_on: def.task_depends_on.clone(),
+                task_id,
+                phase_id,
+                task_depends_on,
                 class,
                 join_key: rec.join_key,
                 // Self-describing def-id captured here (the def is in hand —
                 // no disk read) so the failover resume floor can include
                 // settled ids without re-reading every spill record.
-                def_id: def.def_id,
-                digest_contribution: hash_one((&rec.hash, hashable_join_key(state))),
+                def_id: captured_def_id,
+                digest_contribution,
                 outputs_digest_contribution,
                 segment: receipt.segment,
                 offset: rec.offset,

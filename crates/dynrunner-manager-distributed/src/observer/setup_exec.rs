@@ -49,7 +49,9 @@ impl<I: Identifier> ObserverCoordinator<I> {
         let task = self
             .cluster_state()
             .task_state(&task_hash)
-            .map(|state| state.to_task_info());
+            // L5: resolve dep refs via the store (two shared `cluster_state`
+            // borrows — the `task_state` read + the resolve — is fine).
+            .map(|state| self.cluster_state().task_to_info(state));
         let outcome = match task {
             // The shared executor path (#336 P1): an upload-ref task uploads
             // via the registered action; a no-ref task keeps the #489 no-op.

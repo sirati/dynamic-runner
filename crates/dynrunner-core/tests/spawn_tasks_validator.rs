@@ -35,6 +35,7 @@ fn task(task_id: &str, deps: Vec<&str>) -> TaskInfo<Arc<str>> {
                 task_id: d.to_string(),
                 phase_id: PhaseId::from("p"),
                 inherit_outputs: false,
+                def_id: None,
             })
             .collect(),
         preferred_secondaries: SoftPreferredSecondaries::default(),
@@ -59,6 +60,7 @@ fn task_in(phase: &str, task_id: &str, deps: &[(&str, &str)]) -> TaskInfo<Arc<st
             task_id: (*dt).to_string(),
             phase_id: PhaseId::from(*dp),
             inherit_outputs: false,
+            def_id: None,
         })
         .collect();
     t

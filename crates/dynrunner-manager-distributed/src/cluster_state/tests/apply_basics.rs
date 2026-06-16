@@ -879,7 +879,7 @@ fn to_task_info_round_trips_a_constructed_state() {
         task: original.clone(),
         def_id: None,
     });
-    let round_tripped = s.task_state("h").unwrap().to_task_info();
+    let round_tripped = s.task_to_info(s.task_state("h").unwrap());
     assert_eq!(round_tripped.path, original.path);
     assert_eq!(round_tripped.identifier, original.identifier);
     assert_eq!(round_tripped.phase_id, original.phase_id);
@@ -1056,4 +1056,69 @@ fn state_mutation_before_task_added_is_noop() {
         s.def_id_for_hash_for_test("h"),
         Some(crate::cluster_state::TaskDefId(2))
     );
+}
+
+/// L5 intra-batch FORWARD-REF dep resolution: the originator stamps each
+/// dep's prereq def id over the WHOLE batch before any apply, so a dependent
+/// listed BEFORE its prerequisite still resolves — and a fresh replica that
+/// receives the stamped batch agrees on the SAME prereq def id, with the
+/// per-edge `inherit_outputs` preserved.
+#[test]
+fn intra_batch_forward_ref_resolves_and_converges() {
+    use dynrunner_core::TaskDep;
+
+    let mut dependent = mk_task("dependent");
+    let prereq = mk_task("prereq");
+    // The dependent gates on the prereq with inherit_outputs=true, and is
+    // listed FIRST (the forward-ref the batch stamp must resolve).
+    dependent.task_depends_on = vec![TaskDep {
+        task_id: "prereq".into(),
+        phase_id: dependent.phase_id.clone(),
+        inherit_outputs: true,
+        def_id: None,
+    }];
+
+    let mut a = ClusterState::<RunnerIdentifier>::new();
+    let batch = vec![
+        ClusterMutation::TaskAdded {
+            hash: "h-dep".into(),
+            task: dependent,
+            def_id: None,
+        },
+        ClusterMutation::TaskAdded {
+            hash: "h-prereq".into(),
+            task: prereq,
+            def_id: None,
+        },
+    ];
+    let applied = crate::cluster_state::apply_locally_for_broadcast(&mut a, batch);
+    assert_eq!(applied.applied.len(), 2);
+    let prereq_id = a.def_id_for_hash_for_test("h-prereq").unwrap();
+
+    // The originator's own ledger: the dependent's dep rebuilds the prereq's
+    // identity and preserves inherit_outputs.
+    let deps_a = a
+        .task_deps_for_identity(&PhaseId::from("p0"), "dependent")
+        .expect("dependent's deps");
+    assert_eq!(deps_a.len(), 1);
+    assert_eq!(deps_a[0].task_id, "prereq");
+    assert!(deps_a[0].inherit_outputs, "per-edge inherit_outputs preserved");
+
+    // A fresh replica receives the stamped batch in REVERSE order (prereq
+    // last); the stamped dep def_id resolves regardless of arrival order.
+    let mut b = ClusterState::<RunnerIdentifier>::new();
+    for m in applied.applied.into_iter().rev() {
+        b.apply(m);
+    }
+    assert_eq!(
+        b.def_id_for_hash_for_test("h-prereq"),
+        Some(prereq_id),
+        "the replica agrees on the prereq's def id"
+    );
+    let deps_b = b
+        .task_deps_for_identity(&PhaseId::from("p0"), "dependent")
+        .expect("dependent's deps on the replica");
+    assert_eq!(deps_b.len(), 1);
+    assert_eq!(deps_b[0].task_id, "prereq");
+    assert!(deps_b[0].inherit_outputs);
 }

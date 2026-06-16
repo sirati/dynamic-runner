@@ -48,6 +48,7 @@ fn build_depending_on(name: &str, dep: &str) -> TaskInfo<TestId> {
         task_id: dep.into(),
         phase_id: t.phase_id.clone(),
         inherit_outputs: false,
+        def_id: None,
     }];
     t
 }
@@ -509,6 +510,7 @@ fn affine_gate_depending_on(name: &str, dep: &str) -> TaskInfo<TestId> {
         task_id: dep.into(),
         phase_id: t.phase_id.clone(),
         inherit_outputs: false,
+        def_id: None,
     }];
     t
 }

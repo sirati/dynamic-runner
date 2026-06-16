@@ -49,6 +49,7 @@ fn task(task_id: &str, phase: &str, deps: &[&str]) -> TaskInfo<()> {
                 task_id: d.to_string(),
                 phase_id: PhaseId::from(phase),
                 inherit_outputs: false,
+                def_id: None,
             })
             .collect(),
         preferred_secondaries: Default::default(),

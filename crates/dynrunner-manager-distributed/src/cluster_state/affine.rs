@@ -120,7 +120,10 @@ impl<I: Identifier> ClusterState<I> {
         if !def.kind.is_secondary_affine() {
             return false;
         }
-        def.task_depends_on.iter().all(|dep| {
+        // L5: the fat def stores compact `TaskDepRef`s — rebuild the
+        // string-identity deps the `(phase_id, task_id)` resolution keys by.
+        let deps = self.resolve_dep_refs(&def.task_depends_on);
+        deps.iter().all(|dep| {
             self.task_hash_for_dep(&dep.phase_id, dep.task_id.as_str())
                 .and_then(|dep_hash| self.task_view(dep_hash))
                 .is_some_and(|view| view.is_terminal())

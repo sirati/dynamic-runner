@@ -445,25 +445,6 @@ pub struct ClusterStateSnapshot<I> {
     pub custom_terminal_watermarks: HashMap<String, u64>,
 }
 
-/// Migration shim (snapshot-ONLY): fill the enclosing task's phase into
-/// every legacy un-phased dep in the snapshot. A dep that already names
-/// its phase (every dep a current binary emits) is left untouched, so
-/// this is a no-op for non-legacy snapshots. Operates in place on the
-/// decoded snapshot before the lattice merge so the restored ledger
-/// carries fully-explicit `(phase_id, task_id)` deps.
-fn migrate_unphased_deps<I: Clone>(snap: &mut ClusterStateSnapshot<I>) {
-    for state in snap.tasks.values_mut() {
-        // `def_mut` copy-on-writes via `Arc::make_mut`; on a freshly-decoded
-        // snapshot each def `Arc` is unshared (refcount 1), so this rewrites
-        // the legacy un-phased deps in place rather than cloning.
-        let def = state.def_mut();
-        let enclosing = def.phase_id.clone();
-        for dep in &mut def.task_depends_on {
-            dep.fill_phase(&enclosing);
-        }
-    }
-}
-
 impl<I> Default for ClusterStateSnapshot<I> {
     /// The EMPTY partial snapshot — every field at its merge-neutral
     /// value, so `restore()` of a default is a complete no-op. The
@@ -816,7 +797,7 @@ impl<I: Identifier> ClusterState<I> {
     /// (TS-3), and resumes blocked dependents (TS-2).
     pub fn restore_collecting_resumed(
         &mut self,
-        mut snap: ClusterStateSnapshot<I>,
+        snap: ClusterStateSnapshot<I>,
         resumed: &mut Vec<TaskInfo<I>>,
     ) {
         // The restore chokepoint: this entry (and the per-task
@@ -824,17 +805,17 @@ impl<I: Identifier> ClusterState<I> {
         // the only path a snapshot merge changes a digest-folded field, so
         // clear the memo once here. See `invalidate_digest_cache`.
         self.invalidate_digest_cache();
-        // Migration shim (snapshot-ONLY): a legacy snapshot predates the
-        // `(phase_id, task_id)` dep identity, so its deps decode with the
-        // migration sentinel (empty `PhaseId`). Inject the enclosing
-        // task's phase into every un-phased dep before merging. A new
-        // dep always names its phase, so this is a no-op for any
-        // snapshot produced by a current binary — the shim touches only
-        // legacy entries and is never a runtime default. The enclosing
-        // task's phase is the unambiguous source for a legacy dep
-        // because a legacy snapshot only ever expressed same-phase deps
-        // implicitly.
-        migrate_unphased_deps(&mut snap);
+        // L5: the frozen def now stores dep edges as compact `TaskDepRef`s
+        // (the prereq's stable, snapshot-portable `TaskDefId`), NOT string
+        // `(phase_id, task_id)` identities — so the legacy un-phased-dep
+        // migration that used to fill the enclosing phase into a phase-less
+        // string dep is structurally MOOT here: a ref carries no phase
+        // string, and `register_restored_def` + `resolve(def_id)` rebuild
+        // the prereq's real `(phase_id, task_id)` on demand. The string-side
+        // enclosing-phase normalization that DOES remain lives at the
+        // consumer boundary (the pyo3 `extract_task_dep` resolves a bare
+        // string dep to its enclosing phase BEFORE the def is frozen), never
+        // via `Arc::make_mut` on a frozen def (CL-A6).
         // Exhaustive destructure (NO `..` rest pattern) — the SYMMETRIC
         // structural completeness guard, mirroring `snapshot()`. Every
         // `ClusterStateSnapshot` field is NAMED here, so adding a future

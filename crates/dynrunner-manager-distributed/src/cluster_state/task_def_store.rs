@@ -54,6 +54,39 @@ impl TaskDefId {
     pub(crate) const UNBOUND: TaskDefId = TaskDefId(u32::MAX);
 }
 
+/// One dep-graph edge on a [`FrozenTaskDef`] (L5): the compact
+/// `TaskDefId` of the PREREQUISITE task's def, plus the per-edge
+/// `inherit_outputs` opt-in carried verbatim from the source
+/// [`dynrunner_core::TaskDep`].
+///
+/// The COMPACT replacement for the string-identity [`dynrunner_core::TaskDep`]
+/// on the frozen core: a `TaskDep` carries `task_id: String` + `phase_id:
+/// PhaseId` (≈ 2 heap allocations per edge), whereas a `TaskDepRef` is a
+/// `u32` + a `bool`. The string `(phase_id, task_id)` identity the dep
+/// CONSUMERS key by (the dispatch wire, the secondary affine gate, the
+/// predecessor-outputs walk) is rebuilt on demand from the prereq's def via
+/// [`TaskDefStore::resolve`] — sound post-#603/L6a, where a def_id is
+/// globally-numerically-stable AND snapshot-portable, so `resolve(def_id)`
+/// works on every replica across snapshot / restore / failover.
+///
+/// `inherit_outputs` is NOT dropped (the bare-`u32` shape would be lossy —
+/// it is the per-edge flag that drives the transitive-ancestor output walk
+/// in `predecessor_outputs`): it rides on every ref so the rebuilt
+/// `TaskDep` reproduces the source edge faithfully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TaskDepRef {
+    /// The prerequisite task's def-store id. Resolves to the prereq def via
+    /// [`TaskDefStore::resolve`] on every replica (the #603/L6a portability
+    /// guarantee), from which the `(phase_id, task_id)` identity the dep
+    /// consumers key by is rebuilt.
+    pub(crate) def_id: TaskDefId,
+    /// The per-edge transitive-ancestor output opt-in, carried verbatim
+    /// from the source [`dynrunner_core::TaskDep::inherit_outputs`] so the
+    /// rebuilt dep reproduces the edge faithfully (CL-A3 — the ref is not
+    /// lossy).
+    pub(crate) inherit_outputs: bool,
+}
+
 /// The FROZEN core of a [`TaskInfo`]: the 13 immutable fields that make
 /// up a task's identity + dispatch recipe, EXCLUDING the 3 mutable tail
 /// fields the runtime rewrites in place (`preferred_secondaries`,
@@ -96,15 +129,34 @@ pub struct FrozenTaskDef<I> {
     pub affinity_id: Option<AffinityId>,
     pub payload: serde_json::Value,
     pub task_id: String,
-    pub task_depends_on: Vec<TaskDep>,
+    /// Dep-graph edges as COMPACT def-id refs (L5), NOT the string-identity
+    /// [`TaskDep`]. Each ref names the prerequisite's stable def_id +
+    /// the per-edge `inherit_outputs`; the `(phase_id, task_id)` identity
+    /// the consumers key by is rebuilt on demand via the def store
+    /// ([`super::ClusterState::resolve_dep_refs`] / the read seams). Filled
+    /// at intern from the incoming [`TaskInfo::task_depends_on`] — the
+    /// un-interned [`Self::from_task_info`] splitter carves the string deps
+    /// OUT (it has no store to resolve against), and the intern step
+    /// resolves them in. So a def produced by `from_task_info` carries an
+    /// EMPTY `task_depends_on` until the store fills it; a stored/observed
+    /// def always carries its resolved refs.
+    pub(crate) task_depends_on: Vec<TaskDepRef>,
 }
 
 impl<I> FrozenTaskDef<I> {
     /// Split a [`TaskInfo`] into its frozen core + the 3 mutable tail
-    /// values the runtime owns. The destructure names EVERY `TaskInfo`
-    /// field with NO `..` rest, so a future `TaskInfo` field is a
-    /// COMPILE ERROR here until the developer classifies it
-    /// frozen-vs-mutable.
+    /// values the runtime owns + the string-identity dep list (L5). The
+    /// destructure names EVERY `TaskInfo` field with NO `..` rest, so a
+    /// future `TaskInfo` field is a COMPILE ERROR here until the developer
+    /// classifies it frozen-vs-mutable.
+    ///
+    /// The frozen core's `task_depends_on` (now `Vec<TaskDepRef>`) is left
+    /// EMPTY: the splitter has no store to resolve `(phase_id, task_id)` →
+    /// `TaskDefId` against, so it carves the string `Vec<TaskDep>` OUT as a
+    /// fourth return value. The intern step ([`super::ClusterState`]'s
+    /// `intern_task_def*`) resolves them into the def's refs against its
+    /// store. Mirrors how the mutable tail is carved out — the splitter
+    /// owns the structural split, the store owns the dep resolution.
     pub(crate) fn from_task_info(
         t: TaskInfo<I>,
     ) -> (
@@ -112,6 +164,7 @@ impl<I> FrozenTaskDef<I> {
         SoftPreferredSecondaries,
         TaskVersion,
         Option<PathBuf>,
+        Vec<TaskDep>,
     ) {
         let TaskInfo {
             path,
@@ -149,22 +202,38 @@ impl<I> FrozenTaskDef<I> {
                 affinity_id,
                 payload,
                 task_id,
-                task_depends_on,
+                // EMPTY: the store resolves the carved-out string deps into
+                // refs at intern (the splitter has no store to resolve
+                // against).
+                task_depends_on: Vec::new(),
             },
             preferred_secondaries,
             preferred_version,
             resolved_path,
+            task_depends_on,
         )
     }
 
     /// Reconstruct a whole owned [`TaskInfo`] from this frozen core (its 13
     /// immutable fields, cloned) + a [`TaskRouting`] tail (the 3 mutable
-    /// fields). The inverse of [`Self::from_task_info`] and the SINGLE place
-    /// the 16-field rebuild lives — both `TaskState::to_task_info` and the
-    /// affine-gate resolver delegate here so no caller re-spells it. A
-    /// TRANSIENT allocation: only for callers that genuinely need a whole
-    /// owned `TaskInfo` (a wire `TaskAssignment`, a pool insert).
-    pub(crate) fn to_task_info(&self, routing: &super::types::TaskRouting) -> TaskInfo<I>
+    /// fields) + the ALREADY-RESOLVED string deps. The inverse of
+    /// [`Self::from_task_info`] and the SINGLE place the 16-field rebuild
+    /// lives — both `TaskState::to_task_info` and the affine-gate resolver
+    /// delegate here so no caller re-spells it. A TRANSIENT allocation: only
+    /// for callers that genuinely need a whole owned `TaskInfo` (a wire
+    /// `TaskAssignment`, a pool insert).
+    ///
+    /// `deps` is the `Vec<TaskDep>` the def store rebuilds from this def's
+    /// `task_depends_on: Vec<TaskDepRef>` ([`super::ClusterState::resolve_dep_refs`]):
+    /// the rebuild needs the store (a ref → its prereq's `(phase_id,
+    /// task_id)`), which a `&FrozenTaskDef` does not hold, so the resolved
+    /// list is passed IN. The store-owning `TaskState::to_task_info` does
+    /// the resolution at the seam where it holds the store.
+    pub(crate) fn to_task_info(
+        &self,
+        routing: &super::types::TaskRouting,
+        deps: Vec<TaskDep>,
+    ) -> TaskInfo<I>
     where
         I: Clone,
     {
@@ -181,7 +250,7 @@ impl<I> FrozenTaskDef<I> {
             affinity_id: self.affinity_id.clone(),
             payload: self.payload.clone(),
             task_id: self.task_id.clone(),
-            task_depends_on: self.task_depends_on.clone(),
+            task_depends_on: deps,
             preferred_secondaries: routing.preferred_secondaries.clone(),
             preferred_version: routing.preferred_version,
             resolved_path: routing.resolved_path.clone(),
@@ -199,8 +268,19 @@ impl<I> FrozenTaskDef<I> {
 /// is exclusively the unit tests, so it is `#[cfg(test)]`.
 #[cfg(test)]
 pub(crate) fn split_task_def<I>(task: TaskInfo<I>) -> (Arc<FrozenTaskDef<I>>, super::types::TaskRouting) {
-    let (frozen, preferred_secondaries, preferred_version, resolved_path) =
+    let (mut frozen, preferred_secondaries, preferred_version, resolved_path, deps) =
         FrozenTaskDef::from_task_info(task);
+    // No store to resolve `(phase_id, task_id)` against (this is the
+    // store-less unit-test splitter): carry the deps' originator-stamped
+    // `def_id` when present, else the UNBOUND sentinel. The tests that need
+    // resolvable deps route through a real `ClusterState` store instead.
+    frozen.task_depends_on = deps
+        .iter()
+        .map(|dep| TaskDepRef {
+            def_id: dep.def_id.map(TaskDefId).unwrap_or(TaskDefId::UNBOUND),
+            inherit_outputs: dep.inherit_outputs,
+        })
+        .collect();
     (
         Arc::new(frozen),
         super::types::TaskRouting {
@@ -249,6 +329,27 @@ pub(crate) struct TaskDefStore<I> {
     /// Keyed and valued by the same `Arc<str>` (a get-or-insert returns
     /// the canonical clone).
     str_intern: HashMap<Arc<str>, Arc<str>>,
+    /// `(phase_id, task_id)` IDENTITY → the def's id (L5). The reverse of
+    /// `resolve(def_id) → (phase_id, task_id)`: the FALLBACK a dep
+    /// resolution uses when the incoming [`TaskDep`] carries no
+    /// originator-stamped `def_id` (a node-local / direct-apply dep — the
+    /// L2 by-content path). Populated at [`Self::put_slot`] from the def's
+    /// own `(phase_id, task_id)`, so a prereq's identity is resolvable the
+    /// moment its def is interned. A new def for an already-present identity
+    /// (a re-intern under the same hash NoOps before reaching `put_slot`, so
+    /// this only ever observes the first placement per identity) keeps the
+    /// first binding.
+    identity_to_id: HashMap<(PhaseId, String), TaskDefId>,
+    /// `task_id` (PHASE-LESS) → the def's id (L5). The phaseless dep-
+    /// resolution fallback, mirroring `PendingPool::extend`'s
+    /// `known_ids_phaseless`: a dep whose stored `phase_id` does NOT match
+    /// the prereq's real phase (the common case for a bare-string
+    /// cross-phase dep, which the consumer boundary resolves to the
+    /// ENCLOSING phase, not the prereq's) still resolves by task_id alone —
+    /// exactly the tolerance the pre-L5 string-identity path had. First
+    /// binding wins; the phased `identity_to_id` is consulted FIRST so an
+    /// exact match always dominates a phaseless one.
+    task_id_to_id: HashMap<String, TaskDefId>,
 }
 
 /// A hash↔id BIJECTION violation observed by [`TaskDefStore::intern_at`]:
@@ -280,6 +381,8 @@ impl<I> Default for TaskDefStore<I> {
             hash_to_id: HashMap::new(),
             next_id: 0,
             str_intern: HashMap::new(),
+            identity_to_id: HashMap::new(),
+            task_id_to_id: HashMap::new(),
         }
     }
 }
@@ -291,6 +394,8 @@ impl<I> Clone for TaskDefStore<I> {
             hash_to_id: self.hash_to_id.clone(),
             next_id: self.next_id,
             str_intern: self.str_intern.clone(),
+            identity_to_id: self.identity_to_id.clone(),
+            task_id_to_id: self.task_id_to_id.clone(),
         }
     }
 }
@@ -344,6 +449,18 @@ impl<I> TaskDefStore<I> {
     /// (a spurious bijection conflict). See [`Self::intern_at`].
     fn put_slot(&mut self, id: TaskDefId, frozen: Arc<FrozenTaskDef<I>>) {
         let idx = id.0 as usize;
+        // Register the `(phase_id, task_id)` → id identity reverse-index
+        // (L5) so a later dep with no originator-stamped def_id resolves to
+        // this prereq by identity. Keep the FIRST binding for an identity
+        // (a re-intern under the same hash NoOps before reaching here, so a
+        // second placement for one identity only arises across a genuine
+        // content/identity collision — the existing binding is authoritative).
+        self.identity_to_id
+            .entry((frozen.phase_id.clone(), frozen.task_id.clone()))
+            .or_insert(id);
+        self.task_id_to_id
+            .entry(frozen.task_id.clone())
+            .or_insert(id);
         if idx >= self.defs.len() {
             self.defs.resize(idx + 1, None);
         }
@@ -353,21 +470,61 @@ impl<I> TaskDefStore<I> {
         self.next_id = self.next_id.max(id.0 + 1);
     }
 
+    /// The def id for a `(phase_id, task_id)` IDENTITY, if a def with that
+    /// identity has been interned. The L5 dep-resolution fallback for an
+    /// incoming [`TaskDep`] that carries no originator-stamped def_id.
+    ///
+    /// Tries the EXACT `(phase_id, task_id)` first, then falls back to a
+    /// PHASE-LESS `task_id` match — mirroring `PendingPool::extend`'s
+    /// `known_ids_phaseless` tolerance, so a bare-string cross-phase dep
+    /// (resolved to the ENCLOSING phase at the consumer boundary, which need
+    /// not be the prereq's phase) still resolves by task_id, exactly as it
+    /// did pre-L5 when the string identity was stored verbatim. The exact
+    /// match dominates so a genuine same-task_id-in-two-phases dep with the
+    /// right phase always wins.
+    fn id_for_identity(&self, phase_id: &PhaseId, task_id: &str) -> Option<TaskDefId> {
+        // Borrow-free lookup keyed by the owned tuple shape.
+        self.identity_to_id
+            .get(&(phase_id.clone(), task_id.to_string()))
+            .copied()
+            .or_else(|| self.task_id_to_id.get(task_id).copied())
+    }
+
     /// NODE-LOCAL allocate-and-intern: the un-agreed L2 fallback used when
     /// no primary-allocated id rides the wire (a `def_id: None` `TaskAdded`,
     /// the in-process direct-apply / unit-test path). If the hash is already
     /// known, returns the existing id and mints NOTHING (the
     /// content-addressed dedup gate). Otherwise mints the next node-local
     /// id, canonicalizes the def's `Arc<str>` ids, and records it.
-    pub(crate) fn intern(&mut self, hash: String, mut frozen: FrozenTaskDef<I>) -> TaskDefId {
+    ///
+    /// The def's `task_depends_on` is taken AS-IS (already the resolved
+    /// [`TaskDepRef`] list): the caller — `intern_task_def`'s apply path
+    /// (resolving string deps via [`Self::dep_refs_from_deps`]) or
+    /// `register_restored_def`'s restore path (the refs already decoded
+    /// inline) — owns dep resolution, so the store's place-step stays a
+    /// single concern.
+    pub(crate) fn intern(&mut self, hash: String, frozen: FrozenTaskDef<I>) -> TaskDefId {
+        self.intern_reporting_placement(hash, frozen).0
+    }
+
+    /// As [`Self::intern`], but also reports whether this call NEWLY PLACED
+    /// the def (`true`) or hit the content-addressed dedup gate and minted
+    /// nothing (`false`). The L5 two-step intern reads the flag so it only
+    /// fills dep refs on a fresh placement — never re-writing (and thus
+    /// never `Arc::make_mut`-forking) an already-resolved shared def.
+    fn intern_reporting_placement(
+        &mut self,
+        hash: String,
+        mut frozen: FrozenTaskDef<I>,
+    ) -> (TaskDefId, bool) {
         if let Some(&existing) = self.hash_to_id.get(&hash) {
-            return existing;
+            return (existing, false);
         }
         self.canonicalize_strs(&mut frozen);
         let id = self.alloc();
         self.put_slot(id, Arc::new(frozen));
         self.hash_to_id.insert(hash, id);
-        id
+        (id, true)
     }
 
     /// Mint the next node-local [`TaskDefId`] from the epoch-safe `next_id`
@@ -415,6 +572,10 @@ impl<I> TaskDefStore<I> {
     /// lets a restoring replica re-anchor the def at the SAME id. (The
     /// node-local [`Self::intern`] fallback deliberately does NOT stamp: a
     /// node-local id is intra-node only.)
+    ///
+    /// The def's `task_depends_on` is taken AS-IS (already the resolved
+    /// [`TaskDepRef`] list): the caller owns dep resolution (see
+    /// [`Self::intern`]).
     pub(crate) fn intern_at(
         &mut self,
         id: TaskDefId,
@@ -460,10 +621,102 @@ impl<I> TaskDefStore<I> {
         self.defs.get(id.0 as usize).and_then(|slot| slot.as_ref())
     }
 
+    /// Fill the dep refs of an ALREADY-PLACED def (L5) — the second step of
+    /// the two-step intern the apply path uses: place the def FIRST (so its
+    /// own `(phase_id, task_id)` identity is registered), THEN resolve its
+    /// deps and write them here. This makes a SELF-referential dep resolve to
+    /// the def's own id rather than the UNBOUND sentinel, and keeps the
+    /// resolution consulting the def's own just-registered identity. A no-op
+    /// if the slot is unexpectedly empty (the caller just placed it, so this
+    /// is defensive). `Arc::make_mut` copy-on-writes; right after placement
+    /// the store holds the sole strong ref, so it mutates in place.
+    fn fill_dep_refs(&mut self, id: TaskDefId, refs: Vec<TaskDepRef>)
+    where
+        I: Clone,
+    {
+        if let Some(Some(arc)) = self.defs.get_mut(id.0 as usize) {
+            Arc::make_mut(arc).task_depends_on = refs;
+        }
+    }
+
+    /// Translate a string-identity [`TaskDep`] list into the compact
+    /// [`TaskDepRef`] list a [`FrozenTaskDef`] stores (L5) — the
+    /// intern-side conversion. For each edge the prereq's def id is taken
+    /// from the originator-stamped `dep.def_id` when present (the
+    /// production replicated path — forward-ref-safe, the originator
+    /// resolved over the whole batch); else from the `(phase_id, task_id)`
+    /// identity reverse-index (the node-local / direct-apply fallback). An
+    /// edge that resolves to NEITHER is preserved with the
+    /// [`TaskDefId::UNBOUND`] sentinel rather than dropped: the
+    /// loud-unknown-dep failure is the SCHEDULER's concern
+    /// (`PendingPool::extend` / spawn validation over the string deps) — the
+    /// def-store layer is additive and never silently mutates the dep SET,
+    /// so an unresolvable ref round-trips back to an unresolvable
+    /// `(phase_id, task_id)` at read and still fails loud there. The
+    /// `inherit_outputs` flag rides every ref (CL-A3 — not lossy).
+    fn dep_refs_from_deps(&self, deps: &[TaskDep]) -> Vec<TaskDepRef> {
+        deps.iter()
+            .map(|dep| TaskDepRef {
+                def_id: dep
+                    .def_id
+                    .map(TaskDefId)
+                    .or_else(|| self.id_for_identity(&dep.phase_id, &dep.task_id))
+                    .unwrap_or(TaskDefId::UNBOUND),
+                inherit_outputs: dep.inherit_outputs,
+            })
+            .collect()
+    }
+
+    /// Rebuild the string-identity [`TaskDep`] list from a
+    /// [`FrozenTaskDef`]'s compact [`TaskDepRef`] list (L5) — the read-side
+    /// conversion every frozen-def dep CONSUMER (the dispatch `to_task_info`,
+    /// `task_deps_for_identity`, the affine gate, the settled-spill capture)
+    /// routes through. Each ref's `def_id` resolves to its prereq def, whose
+    /// `(phase_id, task_id)` becomes the rebuilt edge; `inherit_outputs`
+    /// rides verbatim. A ref that resolves to no def (an
+    /// [`TaskDefId::UNBOUND`] sentinel, or a not-yet-observed wire id)
+    /// rebuilds an edge whose `(phase_id, task_id)` is the EMPTY-phase
+    /// migration sentinel — it carries no false identity, and the
+    /// downstream loud-unknown-dep failure (the scheduler / the dispatch
+    /// gate) surfaces it exactly as a missing string dep would. The rebuilt
+    /// `TaskDep` carries `def_id: None` (the wire re-stamps it at the next
+    /// origination if needed). Owned: callers need a whole list.
+    pub(crate) fn resolve_dep_refs(&self, refs: &[TaskDepRef]) -> Vec<TaskDep> {
+        refs.iter()
+            .map(|r| match self.resolve(r.def_id) {
+                Some(def) => TaskDep {
+                    task_id: def.task_id.clone(),
+                    phase_id: def.phase_id.clone(),
+                    inherit_outputs: r.inherit_outputs,
+                    def_id: None,
+                },
+                None => TaskDep {
+                    // No resolvable prereq: rebuild the migration-sentinel
+                    // shape (empty phase, empty id) so the edge carries no
+                    // false identity and the loud-unknown-dep failure fires
+                    // downstream, exactly as a missing string dep would.
+                    task_id: String::new(),
+                    phase_id: PhaseId::default(),
+                    inherit_outputs: r.inherit_outputs,
+                    def_id: None,
+                },
+            })
+            .collect()
+    }
+
     /// The id a content `hash` resolves to, if this store has bound it.
     #[allow(dead_code)]
     pub(crate) fn id_for_hash(&self, hash: &str) -> Option<TaskDefId> {
         self.hash_to_id.get(hash).copied()
+    }
+
+    /// The def id for a `(phase_id, task_id)` IDENTITY, if a def with that
+    /// identity has been interned — the public read of the L5 reverse-index,
+    /// used by the originator's dep-stamp pass to resolve a dep already in a
+    /// PRIOR batch (the in-batch forward-refs come from the batch-local map
+    /// the stamp pass builds).
+    pub(crate) fn id_for_identity_pub(&self, phase_id: &PhaseId, task_id: &str) -> Option<u32> {
+        self.id_for_identity(phase_id, task_id).map(|id| id.0)
     }
 
     /// The next id the node-local allocator would mint — the failover-resume
@@ -514,6 +767,31 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
         self.definitions.resume_alloc_floor(floor);
     }
 
+    /// Rebuild the string-identity [`TaskDep`] list from a frozen def's
+    /// compact [`TaskDepRef`] list (L5) — the [`ClusterState`]-level seam the
+    /// frozen-def dep CONSUMERS route through (the dispatch `to_task_info`,
+    /// `task_deps_for_identity`, the affine gate, the settled-spill capture):
+    /// they hold `&self` (the store), a `&FrozenTaskDef` does not, so the
+    /// resolution lives here and delegates to [`TaskDefStore::resolve_dep_refs`].
+    pub(crate) fn resolve_dep_refs(&self, refs: &[TaskDepRef]) -> Vec<TaskDep> {
+        self.definitions.resolve_dep_refs(refs)
+    }
+
+    /// Reconstruct a whole owned [`TaskInfo`] from a [`TaskState`] (L5) —
+    /// the store-resolving wrapper every `to_task_info` consumer that holds
+    /// a `&ClusterState` routes through: it resolves the state's def
+    /// `task_depends_on` refs to string deps via [`Self::resolve_dep_refs`]
+    /// (a `TaskState` has no store) and delegates to
+    /// [`TaskState::to_task_info`]. The SINGLE seam, so no consumer re-spells
+    /// the resolve + rebuild.
+    pub(crate) fn task_to_info(&self, state: &super::types::TaskState<I>) -> TaskInfo<I>
+    where
+        I: Clone,
+    {
+        let deps = self.resolve_dep_refs(&state.def().task_depends_on);
+        state.to_task_info(deps)
+    }
+
     /// Split a whole owned [`TaskInfo`] into the shared frozen `def` (interned
     /// under `hash` in `self.definitions`, deduplicated by content) + the
     /// per-entry mutable [`TaskRouting`] tail. The single construction-site
@@ -527,9 +805,23 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
         hash: &str,
         task: TaskInfo<I>,
     ) -> (Arc<FrozenTaskDef<I>>, super::types::TaskRouting) {
-        let (frozen, preferred_secondaries, preferred_version, resolved_path) =
+        let (frozen, preferred_secondaries, preferred_version, resolved_path, deps) =
             FrozenTaskDef::from_task_info(task);
-        let id = self.definitions.intern(hash.to_string(), frozen);
+        // TWO-STEP intern (L5): place the def with EMPTY refs FIRST so its own
+        // `(phase_id, task_id)` identity is registered, THEN resolve its
+        // carved-out string deps into compact refs (originator-stamped def_id
+        // first, else the identity reverse-index — which now includes this
+        // def, so a self-referential dep resolves to the def's own id) and
+        // fill them. A re-intern under a known hash hits the dedup gate
+        // (placed=false) and leaves the existing (already-resolved) def
+        // untouched.
+        let (id, placed) = self
+            .definitions
+            .intern_reporting_placement(hash.to_string(), frozen);
+        if placed {
+            let refs = self.definitions.dep_refs_from_deps(&deps);
+            self.definitions.fill_dep_refs(id, refs);
+        }
         let def = self
             .definitions
             .resolve(id)
@@ -572,8 +864,16 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
         let Some(wire) = def_id else {
             return Some(self.intern_task_def(hash, task));
         };
-        let (frozen, preferred_secondaries, preferred_version, resolved_path) =
+        let (frozen, preferred_secondaries, preferred_version, resolved_path, deps) =
             FrozenTaskDef::from_task_info(task);
+        // TWO-STEP intern at the wire id (L5, mirrors `intern_task_def`):
+        // place the def with EMPTY refs FIRST so its `(phase_id, task_id)`
+        // identity is registered, THEN resolve its deps (so a self-ref
+        // resolves to the just-placed id) and fill. The bijection check lives
+        // in `intern_at`; an idempotent re-add against an already-filled slot
+        // leaves its refs untouched (the resolve+fill runs only on a fresh
+        // placement, detected by the slot being empty before `intern_at`).
+        let fresh = self.definitions.resolve(TaskDefId(wire)).is_none();
         let id = match self
             .definitions
             .intern_at(TaskDefId(wire), hash.to_string(), frozen)
@@ -593,6 +893,10 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
                 return None;
             }
         };
+        if fresh {
+            let refs = self.definitions.dep_refs_from_deps(&deps);
+            self.definitions.fill_dep_refs(id, refs);
+        }
         let def = self
             .definitions
             .resolve(id)
@@ -790,7 +1094,12 @@ mod tests {
     fn from_task_info_round_trips() {
         let original = mk_task("rt");
         let expected = original.clone();
-        let (frozen, prefs, version, resolved) = FrozenTaskDef::from_task_info(original);
+        let (frozen, prefs, version, resolved, deps) = FrozenTaskDef::from_task_info(original);
+        // L5: the splitter carves the string deps OUT and leaves the frozen
+        // core's `task_depends_on` (now `Vec<TaskDepRef>`) EMPTY — the store
+        // fills it at intern. `mk_task` carries no deps, so both the carved
+        // list and the empty ref list round-trip the original's empty deps.
+        assert!(frozen.task_depends_on.is_empty());
         let rebuilt = TaskInfo {
             path: frozen.path,
             size: frozen.size,
@@ -804,7 +1113,7 @@ mod tests {
             affinity_id: frozen.affinity_id,
             payload: frozen.payload,
             task_id: frozen.task_id,
-            task_depends_on: frozen.task_depends_on,
+            task_depends_on: deps,
             preferred_secondaries: prefs,
             preferred_version: version,
             resolved_path: resolved,
@@ -949,5 +1258,105 @@ mod tests {
         // The next node-local mint respects the resumed floor (no live-id reuse).
         let id = store.intern("h-new".into(), mk_frozen("y", "p0"));
         assert_eq!(id, TaskDefId(10));
+    }
+
+    // ── L5: compact def-id dep refs ──
+
+    use dynrunner_core::TaskDep;
+
+    /// A string `TaskDep` resolves to a compact `TaskDepRef` at intern (via
+    /// the store's identity index), and the read-side `resolve_dep_refs`
+    /// rebuilds the prereq's `(phase_id, task_id)` — with the per-edge
+    /// `inherit_outputs` PRESERVED across both directions (CL-A3: the ref is
+    /// not lossy).
+    #[test]
+    fn dep_ref_round_trips_and_preserves_inherit_outputs() {
+        let mut store: TaskDefStore<RunnerIdentifier> = TaskDefStore::default();
+        // Intern the prereq first so its identity is known.
+        let prereq_id = store.intern("h-prereq".into(), mk_frozen("prereq", "phase-A"));
+        // A dep on the prereq with inherit_outputs=true and no stamped def_id
+        // (resolves via the identity index).
+        let deps = vec![TaskDep {
+            task_id: "prereq".into(),
+            phase_id: PhaseId::from("phase-A"),
+            inherit_outputs: true,
+            def_id: None,
+        }];
+        let refs = store.dep_refs_from_deps(&deps);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].def_id, prereq_id, "resolved to the prereq's def id");
+        assert!(refs[0].inherit_outputs, "per-edge flag carried onto the ref");
+
+        let rebuilt = store.resolve_dep_refs(&refs);
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].task_id, "prereq");
+        assert_eq!(rebuilt[0].phase_id, PhaseId::from("phase-A"));
+        assert!(rebuilt[0].inherit_outputs, "inherit_outputs preserved on rebuild");
+    }
+
+    /// An ORIGINATOR-stamped dep `def_id` is used directly — no identity
+    /// lookup needed, so it resolves even when the prereq's def is NOT yet in
+    /// this store (the receive-side forward-ref-safety the wire stamp buys).
+    #[test]
+    fn dep_ref_uses_stamped_def_id_without_identity_lookup() {
+        let store: TaskDefStore<RunnerIdentifier> = TaskDefStore::default();
+        let deps = vec![TaskDep {
+            task_id: "prereq".into(),
+            phase_id: PhaseId::from("phase-A"),
+            inherit_outputs: false,
+            def_id: Some(42),
+        }];
+        let refs = store.dep_refs_from_deps(&deps);
+        assert_eq!(refs[0].def_id, TaskDefId(42), "stamped def_id used verbatim");
+    }
+
+    /// The PHASE-LESS fallback: a dep whose stored phase does NOT match the
+    /// prereq's real phase (a bare-string cross-phase dep resolved to the
+    /// enclosing phase) still resolves by task_id alone — the pre-L5
+    /// tolerance `PendingPool::extend`'s phaseless set carried.
+    #[test]
+    fn dep_ref_phaseless_fallback_resolves_cross_phase() {
+        let mut store: TaskDefStore<RunnerIdentifier> = TaskDefStore::default();
+        let prereq_id = store.intern("h-prereq".into(), mk_frozen("prereq", "build"));
+        // The dep names the WRONG (enclosing) phase "compile" — phaseless
+        // fallback still finds the prereq, and the rebuild yields its REAL
+        // phase.
+        let deps = vec![TaskDep {
+            task_id: "prereq".into(),
+            phase_id: PhaseId::from("compile"),
+            inherit_outputs: false,
+            def_id: None,
+        }];
+        let refs = store.dep_refs_from_deps(&deps);
+        assert_eq!(refs[0].def_id, prereq_id);
+        let rebuilt = store.resolve_dep_refs(&refs);
+        assert_eq!(
+            rebuilt[0].phase_id,
+            PhaseId::from("build"),
+            "rebuild yields the prereq's REAL phase, not the dep's stored one"
+        );
+    }
+
+    /// An UNRESOLVABLE dep (no stamped def_id, no known identity) maps to the
+    /// UNBOUND sentinel ref, and the read-side rebuild yields the empty
+    /// identity — carrying NO false `(phase_id, task_id)` so the downstream
+    /// loud-unknown-dep failure fires exactly as a missing string dep would
+    /// (the def-id layer never silently fabricates a real identity).
+    #[test]
+    fn unresolvable_dep_maps_to_unbound_then_empty_identity() {
+        let store: TaskDefStore<RunnerIdentifier> = TaskDefStore::default();
+        let deps = vec![TaskDep {
+            task_id: "ghost".into(),
+            phase_id: PhaseId::from("phase-A"),
+            inherit_outputs: true,
+            def_id: None,
+        }];
+        let refs = store.dep_refs_from_deps(&deps);
+        assert_eq!(refs[0].def_id, TaskDefId::UNBOUND);
+        assert!(refs[0].inherit_outputs, "flag still carried on the sentinel ref");
+        let rebuilt = store.resolve_dep_refs(&refs);
+        assert!(rebuilt[0].task_id.is_empty(), "no false identity fabricated");
+        assert!(rebuilt[0].phase_id.as_str().is_empty());
+        assert!(rebuilt[0].inherit_outputs, "flag preserved through the sentinel");
     }
 }
