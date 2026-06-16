@@ -45,6 +45,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Non-blocking file-log appender (same tokio-rs/tracing family as
+# `tracing-subscriber`). Wraps the high-volume per-role/setup TRACE file
+# sinks in a dedicated drain thread + bounded buffer so a slow NFS sink
+# DROPS lines (lossy) rather than stalling the runtime threads that emit
+# them — the `folio_wait_bit_common` / `fdget_pos` wedge at 46k scale.
+tracing-appender = "0.2"
 # Local-timezone clock for the important-stdio log timestamp. chrono's
 # `Local` reads the local offset via libc `localtime_r`, which is
 # thread-safe — unlike the `time` crate's `UtcOffset::current_local_offset`,
