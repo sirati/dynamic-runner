@@ -84,11 +84,13 @@ mod debounce;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use chrono::Local;
 use compact_format::{CompactRoleFormat, RoleTagLayer};
 use pyo3::prelude::*;
 use tracing::{Event, Metadata};
+use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::{FilterExt, FilterFn, LevelFilter};
 use tracing_subscriber::fmt::MakeWriter;
@@ -543,6 +545,53 @@ fn open_append_create(path: &std::path::Path) -> std::fs::File {
         .unwrap_or_else(|e| panic!("failed to open full-log file {}: {e}", path.display()))
 }
 
+/// Bounded buffer depth (in lines) for the non-blocking file appender. Once
+/// the drain thread falls this far behind a slow sink, the LOSSY policy
+/// DROPS further lines (and `tracing-appender` emits its own dropped-count
+/// line) rather than blocking the emitter. Generous so the forensic-complete
+/// TRACE record stays best-effort-whole under a transient NFS stall, yet
+/// bounded so a sustained stall cannot grow memory without limit — the whole
+/// point is that runtime threads NEVER block on the high-volume sink.
+const FILE_APPENDER_BUFFERED_LINES: usize = 100_000;
+
+/// Wrap a file in the NON-BLOCKING appender: a dedicated drain thread owns the
+/// write behind a bounded ([`FILE_APPENDER_BUFFERED_LINES`]) buffer, so the
+/// runtime threads that emit a TRACE line hand it off and return instead of
+/// stalling on the (NFS) write — and only the SINGLE drain thread touches the
+/// fd, so the `fdget_pos`/`f_pos` serialization across N emitter threads
+/// disappears.
+///
+/// LOSSY by design: under a slow sink the appender DROPS lines past the
+/// buffer (emitting its own dropped-count marker) rather than applying
+/// backpressure to the emitters. The forensic-complete TRACE record is thus
+/// best-effort — whole under normal sink throughput, sampled under a sustained
+/// stall — which is the correct tradeoff against wedging the runtime (the
+/// 46k-scale `folio_wait_bit_common` freeze). The faulthandler frame dump is
+/// a SEPARATE fd, so a hard crash's stack is preserved regardless of what the
+/// appender buffer held.
+///
+/// The returned [`WorkerGuard`] MUST be held for the process lifetime: its
+/// `Drop` flushes the buffer, which is what preserves the fatal-flush
+/// guarantee on a CLEAN exit (see [`init_with`]).
+fn non_blocking_file(file: std::fs::File) -> (NonBlocking, WorkerGuard) {
+    NonBlockingBuilder::default()
+        .lossy(true)
+        .buffered_lines_limit(FILE_APPENDER_BUFFERED_LINES)
+        .finish(file)
+}
+
+/// Process-lifetime parking lot for the file appenders' [`WorkerGuard`]s.
+///
+/// A non-blocking appender's drain thread is kept alive — and its buffer
+/// flushed on a clean exit — only while its `WorkerGuard` is held. The guards
+/// are a process-lifetime concern (the subscriber is installed once globally),
+/// so they live in this `OnceLock`, mirroring the module's other
+/// process-global ([`debounce`]'s `GLOBAL`). [`init_with`] parks them here at
+/// the install seam; the `OnceLock` is never dropped before process exit, so a
+/// clean exit runs each guard's `Drop` (flush) while a hard abort/panic may
+/// lose the buffer's last lines — the documented, accepted tradeoff.
+static FILE_APPENDER_GUARDS: OnceLock<Vec<WorkerGuard>> = OnceLock::new();
+
 /// Assemble the layer set for `config`.
 ///
 /// The full sink composes per `FullSink`: `Stdout` adds no file layer (the
@@ -566,27 +615,41 @@ fn open_append_create(path: &std::path::Path) -> std::fs::File {
 /// record are different concerns — so they are NOT collapsed into a global
 /// subscriber filter; the process-wide `max_level_hint` is therefore the
 /// max across attached layers (TRACE whenever any file sink is attached).
-fn build_layers<S>(config: &LogConfig) -> Vec<Box<dyn Layer<S> + Send + Sync>>
+fn build_layers<S>(config: &LogConfig) -> (Vec<Box<dyn Layer<S> + Send + Sync>>, Vec<WorkerGuard>)
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
     let mut layers: Vec<Box<dyn Layer<S> + Send + Sync>> = Vec::new();
+    // The non-blocking file appenders' drain-thread guards, returned to the
+    // install seam ([`init_with`]) which owns their process-lifetime parking.
+    // Each `WorkerGuard` keeps its file's single drain thread alive and
+    // flushes its buffer on `Drop`.
+    let mut guards: Vec<WorkerGuard> = Vec::new();
+    // Open a file append-create AND wrap it non-blocking, stashing the guard.
+    // ONE helper so every high-volume file sink (the submitter's single file
+    // AND every per-node role/setup file) goes through the same drain-thread
+    // path — no per-sink special-casing of the writer.
+    let mut nb = |path: PathBuf| -> NonBlocking {
+        let (writer, guard) = non_blocking_file(open_append_create(&path));
+        guards.push(guard);
+        writer
+    };
     match &config.full_sink {
         FullSink::Stdout => {}
         FullSink::File(path) => {
-            layers.push(full_layer(open_append_create(path)));
+            layers.push(full_layer(nb(path.clone())));
         }
         FullSink::PerNodeDir(dir) => {
             layers.push(role_full_layer(
-                open_append_create(&dir.join(PRIMARY_LOG_FILENAME)),
+                nb(dir.join(PRIMARY_LOG_FILENAME)),
                 PRIMARY_ROLE_SPAN,
             ));
             layers.push(role_full_layer(
-                open_append_create(&dir.join(SECONDARY_LOG_FILENAME)),
+                nb(dir.join(SECONDARY_LOG_FILENAME)),
                 SECONDARY_ROLE_SPAN,
             ));
             layers.push(role_full_layer(
-                open_append_create(&dir.join(OBSERVER_LOG_FILENAME)),
+                nb(dir.join(OBSERVER_LOG_FILENAME)),
                 OBSERVER_ROLE_SPAN,
             ));
             // The complement: events under NO role span (the submitter's
@@ -594,9 +657,7 @@ where
             // binary staging — plus any other pre-/un-attributed emit).
             // Without it the role-gated trio silently DROPPED those from
             // the durable record (see SETUP_LOG_FILENAME).
-            layers.push(unattributed_full_layer(open_append_create(
-                &dir.join(SETUP_LOG_FILENAME),
-            )));
+            layers.push(unattributed_full_layer(nb(dir.join(SETUP_LOG_FILENAME))));
         }
     }
     // The stdio sink's writer differs by mode. In importance mode each flush
@@ -605,6 +666,15 @@ where
     // flush (500ms quiet edge / 5s max delay) — the gate filter and emit sites
     // stay unaware; only the `MakeWriter` changes. Normal mode keeps the
     // historical unbuffered, line-buffered `io::stdout`.
+    //
+    // The stdio sink stays SYNCHRONOUS (no non-blocking wrap): it is the
+    // LOW-VOLUME operator-relevant stream (`config.level`, INFO/DEBUG — not
+    // the TRACE firehose), so it neither drives the NFS write wall nor needs a
+    // drain thread, and keeping it synchronous preserves immediate operator
+    // visibility AND a synchronous fatal line on the `--important-stdio-only`
+    // path (the debounced buffer there is flushed explicitly by
+    // [`py_flush_important_stdio`] on the fatal path). Only the high-volume
+    // FILE sinks above are made non-blocking.
     if config.important_stdio_only {
         layers.push(stdio_layer(
             debounce::install_debounced_stdout(),
@@ -614,7 +684,7 @@ where
     } else {
         layers.push(stdio_layer(io::stdout, false, config.level));
     }
-    layers
+    (layers, guards)
 }
 
 /// Install the process-wide subscriber for `config`. Idempotent and
@@ -640,10 +710,35 @@ pub(crate) fn init_with(config: &LogConfig) {
     // the tag lands in the shared per-span extensions every sink layer can
     // read. Harmless when the full sink is stdout-only (no compact-format
     // layer reads the tag), so it is unconditional.
-    let _ = tracing_subscriber::registry()
+    let (layers, guards) = build_layers(config);
+    let installed = tracing_subscriber::registry()
         .with(RoleTagLayer)
-        .with(build_layers(config))
-        .try_init();
+        .with(layers)
+        .try_init()
+        .is_ok();
+    // Park the non-blocking file appenders' drain-thread guards for the
+    // process lifetime ONLY when THIS call installed the subscriber. Holding
+    // each `WorkerGuard` keeps its drain thread alive and — crucially —
+    // flushes its buffer on `Drop`, so a CLEAN process exit (which runs the
+    // `OnceLock`'s drop) preserves the fatal-flush guarantee for the file
+    // sinks. A hard abort/panic may lose the buffer's last lines, but the
+    // separate faulthandler frame dump still preserves the stack — the
+    // documented, accepted tradeoff.
+    //
+    // If `try_init` was a no-op (a second `init_with`, or a pre-existing
+    // global subscriber — the idempotency contract), the layers were NOT
+    // attached, so their appenders will never receive an event; we DROP the
+    // guards here, flush-and-joining their freshly-spawned drain threads
+    // rather than leaking them. `OnceLock::set` is therefore reached at most
+    // once (the first successful install), matching the single global
+    // subscriber.
+    if installed {
+        // First successful install: park. `set` cannot already be occupied
+        // (only this branch ever sets it, and `try_init` succeeds once).
+        let _ = FILE_APPENDER_GUARDS.set(guards);
+    } else {
+        drop(guards);
+    }
 }
 
 /// Install the process-wide tracing subscriber from EXPLICIT parameters the
@@ -748,10 +843,18 @@ pub(crate) fn py_log(level: &str, record_target: &str, message: &str) {
 /// (`logging_setup.surface_fatal_errors`) is the only caller, on the
 /// exit-non-zero path.
 ///
-/// The `fmt` layers write synchronously to their (unbuffered `std::fs::File`
-/// or line-buffered `io::stdout`) writers, so a single newline-terminated
-/// emit is durable before the process exits — no separate Rust-side flush is
-/// needed.
+/// Durability of the fatal line: the STDIO sink is synchronous (unbuffered
+/// `std::fs::File` for the single-file full sink's stdout-fallback, or
+/// line-buffered `io::stdout`), so the operator-facing fatal line is on the
+/// wire immediately — the `--important-stdio-only` debounced buffer is flushed
+/// explicitly by [`py_flush_important_stdio`] on the fatal path. The FILE
+/// sinks are now NON-BLOCKING (a drain thread behind a bounded buffer, see
+/// [`non_blocking_file`]), so the file copy of this fatal line is flushed on a
+/// CLEAN exit by the [`WorkerGuard`]s' `Drop` ([`init_with`] / the
+/// [`FILE_APPENDER_GUARDS`] parking lot). Under a hard abort/panic the file
+/// buffer's last lines may be lost — but the operator stdio copy is already on
+/// the wire and the separate faulthandler frame dump preserves the stack, so
+/// the fatal error stays diagnosable regardless.
 ///
 /// `level` selects the tracing level the event is emitted at. It defaults to
 /// `"ERROR"` so the existing fatal-surfacing caller
@@ -1241,7 +1344,7 @@ mod tests {
         // Default config (no file, gate off) must produce exactly one
         // layer — the historical single stdout stream, no duplication.
         let config = LogConfig::new(false, None, None, false);
-        let layers = build_layers::<Registry>(&config);
+        let (layers, _guards) = build_layers::<Registry>(&config);
         assert_eq!(
             layers.len(),
             1,
@@ -1261,7 +1364,7 @@ mod tests {
             None,
             false,
         );
-        let layers = build_layers::<Registry>(&config);
+        let (layers, _guards) = build_layers::<Registry>(&config);
         assert_eq!(layers.len(), 2, "expected full-file layer + stdio layer");
     }
 
@@ -1276,7 +1379,7 @@ mod tests {
         let node_dir = dir.path().join("sec-0");
         assert!(!node_dir.exists(), "precondition: per-node dir absent");
         let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false);
-        let layers = build_layers::<Registry>(&config);
+        let (layers, _guards) = build_layers::<Registry>(&config);
         assert_eq!(
             layers.len(),
             5,
@@ -1321,7 +1424,7 @@ mod tests {
             Some(node_dir.display().to_string()),
             false,
         );
-        let layers = build_layers::<Registry>(&config);
+        let (layers, guards) = build_layers::<Registry>(&config);
         // No global level gate — each layer in `build_layers` carries its
         // own (file = TRACE, stdio = `config.level`).
         let subscriber = Registry::default().with(layers);
@@ -1333,6 +1436,11 @@ mod tests {
             tracing::info_span!(PRIMARY_ROLE_SPAN, kind = "primary")
                 .in_scope(|| tracing::info!("primary-scoped-event"));
         });
+
+        // The file sinks are non-blocking: dropping the guards flushes their
+        // buffers AND joins the drain threads, so the on-disk files are
+        // complete before we read them back.
+        drop(guards);
 
         let setup = std::fs::read_to_string(node_dir.join(SETUP_LOG_FILENAME))
             .expect("setup.log should exist");
@@ -1507,7 +1615,8 @@ mod tests {
         );
         // Compose EXACTLY as `init_with`: per-layer ceilings, no global
         // registry-level filter.
-        let subscriber = Registry::default().with(build_layers(&config));
+        let (layers, guards) = build_layers(&config);
+        let subscriber = Registry::default().with(layers);
 
         with_default(subscriber, || {
             // The process max-level hint is the max across attached layers;
@@ -1525,21 +1634,25 @@ mod tests {
                 tracing::debug!("cluster-debug-line");
                 tracing::trace!("cluster-trace-line");
             });
-
-            let secondary = std::fs::read_to_string(node_dir.join(SECONDARY_LOG_FILENAME))
-                .expect("secondary.log should exist");
-            assert!(
-                secondary.contains("cluster-debug-line"),
-                "DEBUG event did not reach secondary.log under the cluster \
-                 stack with --debug OFF — file-sink forensic-complete \
-                 contract regressed (#585). secondary.log: {secondary:?}"
-            );
-            assert!(
-                secondary.contains("cluster-trace-line"),
-                "TRACE event did not reach secondary.log under the cluster \
-                 stack — the #585 violation: {secondary:?}"
-            );
         });
+
+        // Non-blocking file sinks: flush + join the drain threads before
+        // reading the on-disk file.
+        drop(guards);
+
+        let secondary = std::fs::read_to_string(node_dir.join(SECONDARY_LOG_FILENAME))
+            .expect("secondary.log should exist");
+        assert!(
+            secondary.contains("cluster-debug-line"),
+            "DEBUG event did not reach secondary.log under the cluster \
+             stack with --debug OFF — file-sink forensic-complete \
+             contract regressed (#585). secondary.log: {secondary:?}"
+        );
+        assert!(
+            secondary.contains("cluster-trace-line"),
+            "TRACE event did not reach secondary.log under the cluster \
+             stack — the #585 violation: {secondary:?}"
+        );
     }
 
     /// SMELL E (the bridge): a consumer Python record forwarded through
@@ -1640,7 +1753,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node_dir = dir.path().join("compute-0");
         let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false);
-        let layers = build_layers::<Registry>(&config);
+        let (layers, guards) = build_layers::<Registry>(&config);
         // No global level filter — per-layer ceilings.
         let subscriber = Registry::default().with(layers);
 
@@ -1649,6 +1762,9 @@ mod tests {
             // no role scope to route by.
             py_log("INFO", "consumer.task", "orphan-bridge-record");
         });
+
+        // Non-blocking file sinks: flush + join before reading the files.
+        drop(guards);
 
         for role_file in [
             PRIMARY_LOG_FILENAME,
@@ -1840,6 +1956,24 @@ mod tests {
         );
     }
 
+    /// Poll a file until it contains `needle` or the timeout elapses, then
+    /// return its full contents. The GLOBAL-install tests below install via
+    /// [`init_with`], which parks the non-blocking file appenders' guards in
+    /// the process-global [`FILE_APPENDER_GUARDS`] — they are never dropped
+    /// during the test, so the drain thread's flush is asynchronous. Polling
+    /// (rather than dropping a guard the test does not own) is the honest
+    /// assertion: the event DOES land, just on the drain thread's schedule.
+    fn read_until_contains(path: &std::path::Path, needle: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let contents = std::fs::read_to_string(path).unwrap_or_default();
+            if contents.contains(needle) || std::time::Instant::now() >= deadline {
+                return contents;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     /// GLOBAL-INSTALL REPRODUCTION (#585): the cluster installs the
     /// subscriber process-globally via `init_with` (`try_init` →
     /// `set_global_default`), NOT the scoped `with_default` the other tests
@@ -1882,8 +2016,10 @@ mod tests {
             tracing::trace!("cluster-trace-line-global");
         });
 
-        let secondary = std::fs::read_to_string(node_dir.join(SECONDARY_LOG_FILENAME))
-            .expect("secondary.log should exist");
+        let secondary = read_until_contains(
+            &node_dir.join(SECONDARY_LOG_FILENAME),
+            "cluster-trace-line-global",
+        );
         assert!(
             secondary.contains("cluster-debug-line-global"),
             "DEBUG event did not reach secondary.log under the GLOBAL cluster \
@@ -1924,7 +2060,7 @@ mod tests {
         tracing::debug!("submitter-debug-line");
         tracing::trace!("submitter-trace-line");
 
-        let full = std::fs::read_to_string(&full_file).expect("full log file should exist");
+        let full = read_until_contains(&full_file, "submitter-trace-line");
         assert!(
             full.contains("submitter-debug-line"),
             "DEBUG event did not reach the submitter's full-log file under the \

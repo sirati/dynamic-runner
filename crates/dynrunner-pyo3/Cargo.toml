@@ -55,6 +55,7 @@ pyo3 = { workspace = true, features = ["multiple-pymethods"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 chrono = { workspace = true }
 nix = { workspace = true }
 # `libc::atexit` registers the importance-mode debounced-stdio flush so the
