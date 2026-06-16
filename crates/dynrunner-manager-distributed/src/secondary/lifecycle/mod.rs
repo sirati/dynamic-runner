@@ -872,8 +872,13 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     /// (generation-aware, post-#341-truthful) `active_tasks` map in
     /// whichever state carries it, PLUS the `Operational`-only
     /// `pending_first_bind` deferrals (a respawn-HOLD task is genuinely
-    /// held — its dispatch is parked, not lost). Any state with no such
-    /// bookkeeping (pre-`Configuring`, terminal) holds nothing.
+    /// held — its dispatch is parked, not lost) AND the `Operational`-only
+    /// `affine_running` deferrals (#497 — a work task parked behind this
+    /// node's local SecondaryAffine import is ALSO genuinely held: it was
+    /// assigned to this node, its dispatch is withheld until the import
+    /// releases, and the release self-dispatches it locally). Any state
+    /// with no such bookkeeping (pre-`Configuring`, terminal) holds
+    /// nothing.
     ///
     /// `false` is a POSITIVE denial the primary acts on (fail +
     /// requeue), which is exactly right in every reachable case: a node
@@ -895,11 +900,25 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
         match self {
             SecondaryLifecycle::Configuring(cfg) => cfg.active_tasks.get(task_hash).copied(),
             SecondaryLifecycle::Operational(op) => {
-                op.active_tasks.get(task_hash).copied().or_else(|| {
-                    op.pending_first_bind
-                        .iter()
-                        .find_map(|(wid, pending)| (pending.file_hash == task_hash).then_some(*wid))
-                })
+                op.active_tasks
+                    .get(task_hash)
+                    .copied()
+                    .or_else(|| {
+                        op.pending_first_bind.iter().find_map(|(wid, pending)| {
+                            (pending.file_hash == task_hash).then_some(*wid)
+                        })
+                    })
+                    .or_else(|| {
+                        // #497: a work task parked behind this node's local
+                        // SecondaryAffine import is held on the worker the
+                        // first dependent reserved (the same slot the gate
+                        // body runs on, then the released work task). Keyed
+                        // by the affine gate hash, the dependents carry their
+                        // own `work_hash`, so scan the parked vecs for it.
+                        op.affine_running.values().flatten().find_map(|dep| {
+                            (dep.work_hash == task_hash).then_some(dep.worker_id)
+                        })
+                    })
             }
             _ => None,
         }
