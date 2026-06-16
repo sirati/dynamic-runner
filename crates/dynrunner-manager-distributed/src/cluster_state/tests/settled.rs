@@ -75,7 +75,8 @@ fn settlement_evicts_fat_body_but_lookups_serve_via_index() {
     assert_eq!(s.outcome_counts().succeeded, 1);
 
     // Dep resolution + keyed-output lookups serve via the index + the
-    // (never-evicted) output map.
+    // settled-disk fallback (the output payload was EVICTED from the
+    // resident map at commit-spill — `outputs_for` reads it off disk).
     let p0 = PhaseId::from("p0");
     assert_eq!(s.task_hash_for_dep(&p0, "done"), Some("done"));
     let outs = s.outputs_for(&p0, "done").expect("output served via index");
@@ -541,6 +542,230 @@ fn concurrent_reader_never_sees_torn_record() {
     // The reader observed many committed records and decoded every one —
     // never a torn read.
     assert!(reads > 0, "reader must have observed committed records");
+}
+
+/// The owner's hard requirement, pinned: after N completed tasks with
+/// inline outputs settle/spill, the RESIDENT output map is EMPTY (the
+/// O(completed-tasks) accumulation is gone), yet every output is still
+/// readable via the storage-agnostic accessor (decoded off disk).
+///
+/// FAIL-on-trunk: pre-fix `commit_spill` never evicted `task_outputs`, so
+/// the resident map held all N payloads forever.
+#[test]
+fn settled_outputs_leave_resident_map_but_stay_readable_via_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    const N: usize = 64;
+    for i in 0..N {
+        let name = format!("t{i:03}");
+        s.apply(ClusterMutation::TaskAdded {
+            hash: name.clone(),
+            task: mk_task(&name),
+        });
+        s.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
+            hash: name.clone(),
+            result_data: Some(done_with_output("k", &format!("v{i}"))),
+        });
+    }
+    // Pre-spill: every payload is resident.
+    assert_eq!(s.task_outputs_resident_len(), N, "all N outputs resident pre-spill");
+
+    let evicted = s.test_spill_all(&dir.path().join("spill.cbor"));
+    assert_eq!(evicted, N, "all N completed tasks settle");
+
+    // The hard requirement: ZERO resident output payloads — the
+    // accumulation the bug created is gone.
+    assert_eq!(
+        s.task_outputs_resident_len(),
+        0,
+        "settled outputs must leave the resident map (zero accumulation)"
+    );
+    // …yet the LOGICAL output count is intact (resident ∪ settled) and
+    // every output reads back via the accessor (decoded off disk).
+    assert_eq!(s.digest().task_outputs_count, N as u64, "logical count unchanged");
+    let p0 = PhaseId::from("p0");
+    for i in 0..N {
+        let outs = s
+            .outputs_for(&p0, &format!("t{i:03}"))
+            .expect("settled output readable from disk");
+        assert_eq!(
+            outs.0.get("k"),
+            Some(&dynrunner_core::ResultValue::Inline(format!("v{i}")))
+        );
+    }
+}
+
+/// `phase_task_outputs` (the `on_phase_end` hook's reader) serves a
+/// SPILLED phase's outputs from disk after eviction — the brief's test
+/// #3.
+///
+/// FAIL-on-trunk: pre-fix the settled branch read the resident map, which
+/// would be fine pre-eviction; post-eviction it would return an empty map
+/// without the disk fallback.
+#[test]
+fn phase_task_outputs_serves_spilled_phase_from_disk() {
+    let (s, _dir) = spilled_completed_state();
+    let p0 = PhaseId::from("p0");
+    // Resident map evicted, but the phase gather still finds the output.
+    assert_eq!(s.task_outputs_resident_len(), 0, "evicted at settle");
+    let gathered = s.phase_task_outputs(&p0);
+    let outs = gathered.get("done").expect("phase output present (from disk)");
+    assert_eq!(
+        outs.0.get("k"),
+        Some(&dynrunner_core::ResultValue::Inline("v".to_string()))
+    );
+}
+
+/// `unsettle_if_dominated` REHYDRATES a settled entry's outputs from the
+/// spill record — they are NOT silently dropped — the brief's test #4.
+/// A dominating `InvalidTask` over a settled `Completed { outputs }`
+/// un-settles; the rehydrated entry's output must be retrievable, and the
+/// digest's logical output term stays coherent across the round-trip.
+///
+/// FAIL-on-trunk is N/A (the eviction is new); this pins that the new
+/// eviction's INVERSE faithfully restores the evicted payload — a fix
+/// that evicted but forgot to rehydrate would drop the output here.
+#[test]
+fn unsettle_rehydrates_evicted_outputs() {
+    let (mut s, _dir) = spilled_completed_state();
+    let p0 = PhaseId::from("p0");
+    assert_eq!(s.task_outputs_resident_len(), 0, "evicted at settle");
+    // Logical output present (settled half).
+    assert_eq!(s.digest().task_outputs_count, 1);
+
+    // A dominating mutation that does NOT itself carry the prior output:
+    // a same-attempt completion is a NoOp, so drive the lattice escape
+    // with an InvalidTask (the unique terminal TOP, D-T flip) — it
+    // rehydrates the settled Completed first. The rehydrated state then
+    // loses the dominance compare? No: InvalidTask dominates Completed, so
+    // after rehydrate the slot becomes InvalidTask. The OUTPUT, however,
+    // was reinstated into the resident map by the rehydrate BEFORE the
+    // overwrite — so it must survive the rehydrate moment. We assert the
+    // rehydrate-time reinstatement directly via the lower-level path: a
+    // RECOVERABLE-failure dominator would keep it fat without erasing
+    // outputs, but Completed→Recoverable does not dominate. Use the
+    // public observable: after the InvalidTask flip, the resident map
+    // re-held the output during rehydrate, then the slot flipped; the
+    // output entry (first-write-wins, never cleared) remains resident.
+    let out = s.apply(ClusterMutation::TaskFailed {
+        hash: "done".into(),
+        kind: dynrunner_core::ErrorType::InvalidTask {
+            reason: dynrunner_core::BoundedString::from("bad".to_string()),
+        },
+        error: "invalid".into(),
+        version: Default::default(),
+        attempt: 0,
+    });
+    assert_eq!(out, crate::cluster_state::ApplyOutcome::Applied);
+    assert!(!s.settled_contains("done"), "dominator un-settled the entry");
+    // The evicted output was rehydrated into the resident map (NOT dropped).
+    assert_eq!(
+        s.task_outputs_resident_len(),
+        1,
+        "unsettle must rehydrate the evicted output payload"
+    );
+    let outs = s.outputs_for(&p0, "done").expect("rehydrated output readable");
+    assert_eq!(
+        outs.0.get("k"),
+        Some(&dynrunner_core::ResultValue::Inline("v".to_string()))
+    );
+    // Digest output term stays coherent (one logical output, now resident).
+    assert_eq!(s.digest().task_outputs_count, 1);
+    assert_eq!(s.digest(), s.fresh_digest_fold());
+}
+
+/// Replication round-trips a SPILLED responder's evicted outputs into a
+/// joiner (per-key off the spill file, via the snapshot-stream packages
+/// — the production bootstrap path; `snapshot()` carries FAT entries
+/// only), and a re-stream onto a replica that has ALREADY settled the
+/// same keys does NOT re-bloat the resident map or double-count the
+/// digest — the brief's test #5.
+#[test]
+fn stream_round_trips_spilled_outputs_no_rebloat() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Donor: two completed-with-output tasks, both spilled (outputs on disk).
+    let mut donor = ClusterState::<RunnerIdentifier>::new();
+    for (h, v) in [("a", "va"), ("b", "vb")] {
+        donor.apply(ClusterMutation::TaskAdded {
+            hash: h.into(),
+            task: mk_task(h),
+        });
+        donor.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
+            hash: h.into(),
+            result_data: Some(done_with_output("k", v)),
+        });
+    }
+    let n = donor.test_spill_all(&dir.path().join("donor.cbor"));
+    assert_eq!(n, 2);
+    assert_eq!(donor.task_outputs_resident_len(), 0, "donor evicted");
+
+    // Bootstrap a fresh joiner from the donor via the snapshot-stream
+    // package sequence — the settled outputs are decoded per-key off the
+    // donor's spill file and ride each task batch (the production path).
+    let stream_into = |joiner: &mut ClusterState<RunnerIdentifier>| {
+        for frame in crate::snapshot_stream::stream_frames_for_test(&donor, "donor", "s1") {
+            if let dynrunner_protocol_primary_secondary::DistributedMessage::SnapshotStreamPackage {
+                payload,
+                ..
+            } = frame
+            {
+                let snap = crate::cluster_state::decode_stream_payload::<RunnerIdentifier>(&payload)
+                    .expect("decode package");
+                joiner.restore(snap);
+            }
+        }
+    };
+
+    let mut joiner = ClusterState::<RunnerIdentifier>::new();
+    stream_into(&mut joiner);
+    let p0 = PhaseId::from("p0");
+    for (h, v) in [("a", "va"), ("b", "vb")] {
+        let outs = joiner.outputs_for(&p0, h).expect("output round-tripped");
+        assert_eq!(
+            outs.0.get("k"),
+            Some(&dynrunner_core::ResultValue::Inline(v.to_string()))
+        );
+    }
+    assert_eq!(joiner.digest(), donor.digest(), "joiner converges to donor");
+
+    // No-rebloat: stream the donor onto a replica that has ALREADY settled
+    // the same keys (its outputs are on its OWN disk). The restore
+    // output-merge must SKIP the settled keys — no resident re-bloat, no
+    // digest double-count.
+    let mut already_settled = ClusterState::<RunnerIdentifier>::new();
+    for (h, v) in [("a", "va"), ("b", "vb")] {
+        already_settled.apply(ClusterMutation::TaskAdded {
+            hash: h.into(),
+            task: mk_task(h),
+        });
+        already_settled.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
+            hash: h.into(),
+            result_data: Some(done_with_output("k", v)),
+        });
+    }
+    let n2 = already_settled.test_spill_all(&dir.path().join("settled.cbor"));
+    assert_eq!(n2, 2);
+    assert_eq!(already_settled.task_outputs_resident_len(), 0);
+    let before = already_settled.digest();
+    stream_into(&mut already_settled);
+    assert_eq!(
+        already_settled.task_outputs_resident_len(),
+        0,
+        "restore must NOT re-bloat the resident map for already-settled keys"
+    );
+    assert_eq!(
+        already_settled.digest().task_outputs_count,
+        2,
+        "no output double-count after restoring onto a settled replica"
+    );
+    assert_eq!(
+        before, already_settled.digest(),
+        "restoring an equal stream onto a settled replica is digest-neutral"
+    );
 }
 
 /// A minimal length-prefixed CBOR record mirroring the spill framing,

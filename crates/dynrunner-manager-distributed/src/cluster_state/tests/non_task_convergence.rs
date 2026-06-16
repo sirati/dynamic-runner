@@ -381,9 +381,9 @@ fn task_outputs_value_divergence_detected() {
 
     // First-write-wins on restore: `a` already holds "alpha"; restoring
     // `b`'s snapshot (carrying "beta") must NOT clobber the local entry.
-    let before = a.outputs_for(&PhaseId::from("p0"), "t").cloned();
+    let before = a.outputs_for(&PhaseId::from("p0"), "t");
     a.restore(b.snapshot());
-    let after = a.outputs_for(&PhaseId::from("p0"), "t").cloned();
+    let after = a.outputs_for(&PhaseId::from("p0"), "t");
     assert_eq!(
         before, after,
         "restore must NOT clobber a locally-populated output entry (first-write-wins, C7)"

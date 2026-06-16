@@ -320,7 +320,16 @@ impl<I: Identifier> ClusterState<I> {
         // first-write-wins makes the value equal-by-construction once
         // converged, but a genuine pre-convergence value split is now
         // visible). `TaskOutputs` is `Hash`-able by its content.
-        let mut task_outputs_hash = 0u64;
+        //
+        // Seeded with the SETTLED-outputs accumulator: a settled task's
+        // output payload was EVICTED from the resident map at
+        // commit-spill, its term moved into `task_outputs_hash_acc`
+        // (value-preserving — see `commit_spill`), so `acc ⊕ fold(resident)`
+        // equals the full logical fold by XOR associativity — the OUTPUT
+        // twin of the `tasks_hash` settled-seed above. A spill therefore
+        // leaves `task_outputs_hash` and `task_outputs_count` unchanged, so
+        // a node that has spilled and one that has not still converge.
+        let mut task_outputs_hash = settled.task_outputs_hash_acc();
         for (key, value) in task_outputs {
             task_outputs_hash ^= hash_one((key, value));
         }
@@ -384,7 +393,7 @@ impl<I: Identifier> ClusterState<I> {
             secondary_capacities_hash,
             latest_resource_samples_count: latest_resource_samples.len() as u64,
             latest_resource_samples_hash,
-            task_outputs_count: task_outputs.len() as u64,
+            task_outputs_count: (task_outputs.len() as u64) + settled.settled_outputs_count(),
             task_outputs_hash,
             phase_deps_count: phase_deps.len() as u64,
             // CRD-3/D-G: the canonical order-independent content hash of

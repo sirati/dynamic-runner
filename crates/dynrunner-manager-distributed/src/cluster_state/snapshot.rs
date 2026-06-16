@@ -1013,7 +1013,21 @@ impl<I: Identifier> ClusterState<I> {
         // `entry().or_insert(_)` shape is the CRDT-coherent choice;
         // a blanket replace would clobber legitimately-applied local
         // entries when the snapshot interleaves with live broadcasts.
+        //
+        // SETTLED-aware: a hash whose fat body has SETTLED on this replica
+        // already holds its output payload on disk (the spill record) and
+        // its digest term in `task_outputs_hash_acc`. Re-inserting the
+        // snapshot's (equal-by-construction) copy into the resident map
+        // would both re-bloat the very residence the eviction removed AND
+        // double-count the term in the digest (resident fold + settled
+        // accumulator), so a settled key is skipped — its output already
+        // converged. The companion `tasks` restore loop above is already
+        // settled-safe: `merge_task_state` NoOps a dominating settled key
+        // and never reaches `record_task_outputs_value` for it.
         for (hash, outputs) in task_outputs {
+            if self.settled_contains(&hash) {
+                continue;
+            }
             self.task_outputs.entry(hash).or_insert(outputs);
         }
         // Per-secondary capacity merge: per-secondary first-write-wins,
