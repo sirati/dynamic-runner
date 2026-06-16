@@ -349,6 +349,22 @@ pub(crate) struct InFlightEntry<I: Identifier> {
     /// The full task — its `task_id` resolves dep edges, its `type_id`
     /// releases the per-type concurrency slot.
     pub(super) task: TaskInfo<I>,
+    /// `true` while this entry is PARKED behind a secondary's local
+    /// SecondaryAffine import (#497): the holder reported
+    /// `TaskQueuedAfterLocalDependency`, so `B` is genuinely waiting on a
+    /// local gate body — NOT awaiting a terminal. The entry STAYS in the
+    /// ledger (its worker slot stays `Assigned`, its type slot reserved) so
+    /// every terminal/recovery path that resolves BY HASH —
+    /// [`PrimaryCoordinator::free_slot_on_terminal`] on an affine-import
+    /// failure, [`PrimaryCoordinator::recover_inflight_for_dead_secondary`]
+    /// on a dead holder — still finds and frees/requeues it, restoring the
+    /// slot↔ledger symmetry. The ONLY consumer that must NOT see a deferred
+    /// entry is the reconciliation probe (whose verdict is "the holder is
+    /// not running this") — it builds its view excluding `deferred = true`.
+    /// Flipped back to `false` in `handle_local_dependency_released` when
+    /// the import completes (`B` never left the ledger). Defaults `false` on
+    /// every other origination (live dispatch, failover seed, setup).
+    pub(super) deferred: bool,
 }
 
 /// The outcome surfaced by [`PrimaryCoordinator::run_consuming`].
@@ -3358,6 +3374,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 secondary_id,
                 local_worker_id: Some(local_worker_id),
                 task,
+                deferred: false,
             },
         );
         true
@@ -3418,6 +3435,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 secondary_id,
                 local_worker_id: Some(local_worker_id),
                 task,
+                deferred: false,
             },
         );
         self.reserve_type_slot(&type_id);

@@ -652,9 +652,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             return;
         }
         let tick = {
+            // EXCLUDE deferred entries (#497): a task parked behind a
+            // secondary's local SecondaryAffine import is genuinely NOT
+            // awaiting a terminal — its holder intends to run it once the
+            // import completes, so the holder's `holds_task` would deny it and
+            // a probe verdict would be a false `Lost`, looping it back onto the
+            // same affine secondary forever. The deferred dependent stays in
+            // `self.in_flight` (so the terminal + dead-holder-recovery paths
+            // resolve it BY HASH), but it is hidden from the probe's view.
             let view: Vec<(&str, &str)> = self
                 .in_flight
                 .iter()
+                .filter(|(_, entry)| !entry.deferred)
                 .map(|(hash, entry)| (hash.as_str(), entry.secondary_id.as_str()))
                 .collect();
             self.recon_prober.poll(now, &view)
