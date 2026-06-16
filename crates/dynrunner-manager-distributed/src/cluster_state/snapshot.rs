@@ -637,6 +637,13 @@ impl<I: Identifier> ClusterState<I> {
             // the wire — a restoring replica re-builds it through the same
             // per-entry `set_task_state` seam every merge routes through.
             blocked_by: _blocked_by,
+            // node-local: the outcome tally (#…) is a pure derivation of the
+            // replicated `tasks` ∪ `settled` terminal partition (it IS the
+            // outcome partition of this snapshot's content), so it carries no
+            // signal of its own and never crosses the wire — a restoring
+            // replica re-builds it through the same per-entry `set_task_state`
+            // seam every merge routes through.
+            outcome_tally: _outcome_tally,
             // ── task-batch partition, file-served ──: a settled entry is
             // a `tasks` ledger entry whose fat body lives in the spill
             // file; the snapshot STREAM serves it per-key from the file

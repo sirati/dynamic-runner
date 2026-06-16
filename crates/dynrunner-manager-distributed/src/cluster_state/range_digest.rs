@@ -118,6 +118,15 @@ impl<I: Identifier> ClusterState<I> {
             .tasks
             .get(hash)
             .map(|old| task_digest_term(hash, old));
+        // Capture the OLD slot's outcome bucket (if it held a terminal) under
+        // the same immutable borrow, before the move-in overwrites it. The
+        // post-insert `outcome_tally.swap` decrements it and increments the
+        // new state's bucket — the SOLE incremental maintenance of the
+        // outcome partition `outcome_counts()` reads in O(1).
+        let old_outcome_bucket = self
+            .tasks
+            .get(hash)
+            .and_then(super::outcome_tally::outcome_bucket_of);
         // Capture the OLD slot's `Blocked.on` (if any) so the post-insert
         // `blocked_by` reverse-index maintenance below removes `hash` from
         // the old prereq's dependent set. Read here under the immutable
@@ -136,11 +145,22 @@ impl<I: Identifier> ClusterState<I> {
             _ => None,
         };
         let new_term = task_digest_term(hash, &new);
+        // Capture the NEW slot's outcome bucket (if terminal) under the
+        // move-in's borrow so the post-insert tally swap needs no re-read.
+        let new_outcome_bucket = super::outcome_tally::outcome_bucket_of(&new);
         self.tasks.insert(hash.to_string(), new);
         match old_term {
             Some(old) => self.range_fold_memo.swap(hash, old, new_term),
             None => self.range_fold_memo.add(hash, new_term),
         }
+        // Outcome tally: decrement the OLD terminal bucket (if any) and
+        // increment the NEW (if any). A CREATE (old `None`) increments; a
+        // terminal→non-terminal (reinject / reset) decrements; a terminal→
+        // different-terminal adjusts both. Pure scalar adjust on the partition
+        // keyed by nothing but the buckets, so doing it after the insert is
+        // bit-identical to doing it before (it never reads `self.tasks`).
+        self.outcome_tally
+            .swap(old_outcome_bucket, new_outcome_bucket);
         // `blocked_by` reverse-index maintenance (#547). REMOVE first, ADD
         // second — both ops keyed by the prereq hash the dependent waits on,
         // so a Blocked→Blocked rewrite onto a DIFFERENT prereq correctly

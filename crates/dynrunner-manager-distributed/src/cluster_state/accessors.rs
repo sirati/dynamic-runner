@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dynrunner_core::{
-    ErrorType, Identifier, PhaseId, TaskInfo, TaskOutputs, TerminalOutcomeCounts, WorkerId,
+    Identifier, PhaseId, TaskInfo, TaskOutputs, TerminalOutcomeCounts, WorkerId,
 };
 use dynrunner_protocol_primary_secondary::{
     DiscoveryDebt, RoleTable, SecondaryCapacityRecord, SecondaryResourceSampleRecord,
@@ -278,6 +278,18 @@ impl<I: Identifier> ClusterState<I> {
         );
     }
 
+    /// Test-only seam: seed `hash` to `state` through the universal
+    /// `set_task_state` write path, so every node-local derived index (the
+    /// range-fold memo, the `blocked_by` reverse-index, AND the outcome
+    /// tally) is maintained exactly as a production mutation would. A test
+    /// that instead `s.tasks.insert`-ed a terminal directly bypassed those
+    /// derivations and silently desynced the memoized reads (e.g. the
+    /// O(1) `outcome_counts()`). Seeds via this seam stay coherent.
+    #[cfg(test)]
+    pub(crate) fn seed_task_state_for_test(&mut self, hash: &str, state: TaskState<I>) {
+        self.set_task_state(hash, state, None);
+    }
+
     pub fn iter_pending(&self) -> impl Iterator<Item = (&String, &TaskInfo<I>)> {
         self.tasks.iter().filter_map(|(h, s)| match s {
             TaskState::Pending { task, .. } => Some((h, task)),
@@ -361,8 +373,16 @@ impl<I: Identifier> ClusterState<I> {
 
     /// Per-ErrorType partition of terminal-state tasks, in the shape
     /// the operator-facing log lines consume (`succeeded` / `fail_retry`
-    /// / `fail_oom` / `fail_final`). Iterates the CRDT-replicated
-    /// `tasks` map once; `O(n)` over the ledger.
+    /// / `fail_oom` / `fail_final`). Served from the node-local
+    /// [`super::outcome_tally::OutcomeTally`], maintained INCREMENTALLY at
+    /// the SOLE [`Self::set_task_state`] write seam (each transition
+    /// decrements the old terminal bucket and increments the new), so this
+    /// read is `O(1)` — NOT the per-call O(ledger) double-walk over the fat
+    /// `tasks` map + the settled index that, at 46k-affine scale, made the
+    /// per-completion call site (`outcome_summary()`, once per worker-task
+    /// completion) an O(N²) build-phase wall. The `#[cfg(test)]`
+    /// [`Self::outcome_counts_by_scan`] full-walk oracle pins the tally to
+    /// the partition (the invariant test asserts tally == scan).
     ///
     /// Distinguished from [`Self::counts`] by the failure-class
     /// breakdown: `counts().failed` collapses every `Failed { kind, .. }`
@@ -381,78 +401,43 @@ impl<I: Identifier> ClusterState<I> {
     /// CRDT but not the local mirror (the asm-tokenizer "0/0/0/0/0"
     /// post-Step-6 cosmetic).
     pub fn outcome_counts(&self) -> OutcomeSummary {
-        let mut o = OutcomeSummary::default();
+        // O(1): the partition is maintained incrementally at the
+        // `set_task_state` write seam (see `outcome_tally.rs`). A terminal is
+        // counted ONCE, at the transition that made it terminal, and STAYS
+        // counted across a spill (fat→settled moves the body, not the class),
+        // so the maintained tally already equals the fat+settled double-walk
+        // the `#[cfg(test)]` `outcome_counts_by_scan` oracle still runs.
+        self.outcome_tally.summary()
+    }
+
+    /// Test-only un-incremented ORACLE: the original O(ledger) double-walk
+    /// over the fat `tasks` map + the settled index, folding through the SAME
+    /// [`super::outcome_tally::outcome_bucket_of`] /
+    /// [`super::outcome_tally::settled_bucket_of`] classification the
+    /// incremental tally uses (so a classification change moves both in
+    /// lockstep — they cannot drift on the mapping, only on a missed
+    /// maintenance site). The `outcome_tally_matches_scan` invariant asserts
+    /// the maintained [`Self::outcome_counts`] equals this fresh scan after
+    /// every mutation; a missed increment/decrement at any write path makes
+    /// them diverge.
+    ///
+    /// Walks the LOGICAL terminal ledger (fat `tasks` ∪ spilled `settled`) —
+    /// the same universe the pre-incremental `outcome_counts()` partitioned;
+    /// a settled entry is always terminal (only terminals settle), so its
+    /// class folds unconditionally via `settled_bucket_of`.
+    #[cfg(test)]
+    pub(crate) fn outcome_counts_by_scan(&self) -> OutcomeSummary {
+        let mut tally = super::outcome_tally::OutcomeTally::default();
         for s in self.tasks.values() {
-            match s {
-                TaskState::Completed { .. } => o.succeeded += 1,
-                TaskState::Failed { kind, .. } => fold_failed_kind(kind, &mut o),
-                // Discrete `Unfulfillable` state: reinjectable resource-
-                // availability failure. Tallied as `fail_final` for the
-                // operator-readable buckets until the dedicated
-                // reinject/blocked bucket lands; same mapping as the
-                // legacy `Failed { Unfulfillable, .. }` arm above so the
-                // total partition stays stable across the variant cutover.
-                TaskState::Unfulfillable { .. } => o.fail_final += 1,
-                // Discrete `InvalidTask` state: terminal, non-
-                // reinjectable structural failure. Tallied as
-                // `fail_final` (sibling to `Unfulfillable`) until the
-                // dedicated invalid_task stat line lands in Part C; the
-                // mapping keeps the operator-readable partition stable.
-                TaskState::InvalidTask { .. } => o.fail_final += 1,
-                // Discovery-time skip: a SUCCESS-LIKE terminal kept in its
-                // OWN accounting bucket (`skipped`), NOT folded into
-                // `succeeded` (the run-complete summary / narrator success
-                // count must report only work this run performed) and NOT
-                // any failure bucket. It IS a terminal, fully-accounted
-                // outcome, so `total_terminal()` counts it — otherwise the
-                // finalize accounting (`stranded = total - total_terminal()`)
-                // would mis-classify every skip as STRANDED and false-abort
-                // a clean skip-bearing run as `ClusterCollapsed`.
-                TaskState::SkippedAlreadyDone { .. } => o.skipped += 1,
-                // Succeeded setup-kind task: a SUCCESS-LIKE terminal in its
-                // OWN bucket (`setup_succeeded`), NEVER `succeeded` (the
-                // run-complete success count reports only worker WORK). Like
-                // `skipped`, it IS a terminal outcome so `total_terminal()`
-                // counts it.
-                TaskState::SetupCompleted { .. } => o.setup_succeeded += 1,
-                // SecondaryAffine gate (READY-not-EXECUTED): an INERT
-                // terminal in its OWN bucket (`affine_ready`), NEVER
-                // `succeeded`/`setup_succeeded`/any failure class (the
-                // primary never executed it). Like `skipped`/`setup_succeeded`
-                // it IS a terminal outcome so `total_terminal()` counts it
-                // (no STRANDED false-abort at finalize).
-                TaskState::AffineReady { .. } => o.affine_ready += 1,
-                // Non-terminal: Pending, InFlight, QueuedAfterLocalDependency,
-                // and Blocked all contribute to neither bucket.
-                // `QueuedAfterLocalDependency` is a live work task awaiting
-                // its secondary's local import — counting it would double-
-                // tally on the eventual run. Blocked tasks are cascade-paused
-                // dependents that will auto-resume to Pending when their
-                // prereq completes; they're not a terminal outcome and
-                // counting them as one would double-tally on the eventual
-                // resumed run.
-                TaskState::Pending { .. }
-                | TaskState::InFlight { .. }
-                | TaskState::QueuedAfterLocalDependency { .. }
-                | TaskState::Blocked { .. } => {}
-            }
+            tally.swap(None, super::outcome_tally::outcome_bucket_of(s));
         }
-        // Settled (spilled) entries: the same per-class mapping, off the
-        // slim index. `FailedFinal` routes through the ONE shared
-        // `fold_failed_kind` so the kind partition cannot drift from the
-        // fat arm's. (`QueuedAfterLocalDependency` is non-terminal and never
-        // settles, so it has no `SettledClass` arm.)
         for (_, entry) in self.settled_entries() {
-            match &entry.class {
-                SettledClass::Completed => o.succeeded += 1,
-                SettledClass::FailedFinal(kind) => fold_failed_kind(kind, &mut o),
-                SettledClass::InvalidTask => o.fail_final += 1,
-                SettledClass::SkippedAlreadyDone => o.skipped += 1,
-                SettledClass::SetupCompleted => o.setup_succeeded += 1,
-                SettledClass::AffineReady => o.affine_ready += 1,
-            }
+            tally.swap(
+                None,
+                Some(super::outcome_tally::settled_bucket_of(&entry.class)),
+            );
         }
-        o
+        tally.summary()
     }
 
     /// Iterator over `(task_hash, &TaskInfo)` for every FAT (in-memory)
@@ -1332,25 +1317,6 @@ impl<I: Identifier> ClusterState<I> {
             .values()
             .map(|c| u64::from(c.worker_count))
             .sum()
-    }
-}
-
-/// The ONE `Failed { kind }` → outcome-bucket partition, shared by the
-/// fat-state arm and the settled-index arm of [`ClusterState::
-/// outcome_counts`] so the two cannot drift:
-///   - `Recoverable`                 → `fail_retry`
-///   - `ResourceExhausted("memory")` → `fail_oom`
-///   - everything else (incl. the defensively-unreachable
-///     `Unfulfillable`/`InvalidTask` kinds a legacy wire path could
-///     land inside a `Failed`) → `fail_final`.
-fn fold_failed_kind(kind: &ErrorType, o: &mut OutcomeSummary) {
-    match kind {
-        ErrorType::Recoverable => o.fail_retry += 1,
-        ErrorType::ResourceExhausted(k) if k.as_str() == "memory" => o.fail_oom += 1,
-        ErrorType::ResourceExhausted(_)
-        | ErrorType::NonRecoverable
-        | ErrorType::Unfulfillable { .. }
-        | ErrorType::InvalidTask { .. } => o.fail_final += 1,
     }
 }
 
