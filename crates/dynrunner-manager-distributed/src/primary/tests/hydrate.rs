@@ -58,6 +58,7 @@ fn dep_binary(name: &str, phase: &str, depends_on: &[&str]) -> TaskInfo<TestId> 
             task_id: (*d).to_string(),
             phase_id: PhaseId::from(phase),
             inherit_outputs: false,
+            def_id: None,
         })
         .collect();
     t
@@ -1204,6 +1205,7 @@ fn hydrate_seeds_completed_phases_as_done_not_rerun() {
         task_id: "z-task".into(),
         phase_id: PhaseId::from("Z"),
         inherit_outputs: false,
+        def_id: None,
     }];
 
     {

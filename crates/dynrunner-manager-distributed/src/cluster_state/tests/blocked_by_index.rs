@@ -70,6 +70,7 @@ fn spawn_with_pending_dep_indexes_blocked() {
         task_id: "p".into(),
         phase_id: PhaseId::from("p0"),
         inherit_outputs: false,
+        def_id: None,
     }];
     let dep_hash = crate::primary::wire::compute_task_hash(&dep);
     s.apply(ClusterMutation::TasksSpawned { tasks: vec![dep] });
@@ -108,6 +109,7 @@ fn complete_cascade_drains_index_entry() {
             task_id: "p".into(),
             phase_id: PhaseId::from("p0"),
             inherit_outputs: false,
+            def_id: None,
         }];
         s.apply(ClusterMutation::TasksSpawned { tasks: vec![dep] });
     }
@@ -138,6 +140,7 @@ fn complete_cascade_drains_index_entry() {
             task_id: "p".into(),
             phase_id: PhaseId::from("p0"),
             inherit_outputs: false,
+            def_id: None,
         }];
         let h = crate::primary::wire::compute_task_hash(&dep);
         assert!(matches!(s.task_state(&h), Some(TaskState::Pending { .. })));
@@ -164,6 +167,7 @@ fn blocked_idempotent_apply_leaves_index_unchanged() {
         task_id: "p1".into(),
         phase_id: PhaseId::from("p0"),
         inherit_outputs: false,
+        def_id: None,
     }];
     let dep_hash = crate::primary::wire::compute_task_hash(&dep);
     s.apply(ClusterMutation::TasksSpawned { tasks: vec![dep] });
@@ -217,6 +221,7 @@ fn set_task_state_blocked_to_blocked_different_on_rebuckets() {
         task_id: "p1".into(),
         phase_id: PhaseId::from("p0"),
         inherit_outputs: false,
+        def_id: None,
     }];
     let dep_hash = crate::primary::wire::compute_task_hash(&dep);
     s.apply(ClusterMutation::TasksSpawned {

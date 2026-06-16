@@ -86,6 +86,7 @@ fn dependent_work(name: &str, dep_setup_id: &str) -> TaskInfo<TestId> {
         task_id: dep_setup_id.into(),
         phase_id: PhaseId::from("work"),
         inherit_outputs: false,
+        def_id: None,
     }];
     t
 }
@@ -617,6 +618,7 @@ fn dependent_build(name: &str, phase: &str, affinity: Option<&str>, dep: &str) -
         task_id: dep.into(),
         phase_id: PhaseId::from(phase),
         inherit_outputs: false,
+        def_id: None,
     }];
     t
 }
@@ -631,6 +633,7 @@ fn affine_import(name: &str, phase: &str, dep: &str) -> TaskInfo<TestId> {
         task_id: dep.into(),
         phase_id: PhaseId::from(phase),
         inherit_outputs: false,
+        def_id: None,
     }];
     t
 }

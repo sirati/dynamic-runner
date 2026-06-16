@@ -156,7 +156,10 @@ impl<I: Identifier> ClusterState<I> {
             let attempt = blocked.attempt();
             // The resumed surface needs a whole owned `TaskInfo` (the caller
             // re-injects it into the live pool) — a transient reconstruction.
-            resumed.push(blocked.to_task_info());
+            // Resolve the def's dep refs → string deps (L5) before the push;
+            // both borrows of `self` here are immutable.
+            let deps = self.resolve_dep_refs(&blocked.def().task_depends_on);
+            resumed.push(blocked.to_task_info(deps));
             // Auto-resume is an authoritative cross-task transition (Blocked →
             // Pending), not an assignment; the fresh `Pending` starts at the
             // default version and a later genuine assignment mints a higher

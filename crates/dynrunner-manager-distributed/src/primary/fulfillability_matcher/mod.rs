@@ -106,7 +106,8 @@ where
                 };
                 // The matcher takes a `&TaskInfo`; reconstruct a transient one
                 // from the frozen def + routing for the borrowed call.
-                let task = &state.to_task_info();
+                // L5: resolve dep refs via the store.
+                let task = &self.cluster_state.task_to_info(state);
                 // Per-task panic isolation: a Rust matcher that
                 // panics on one task must NOT take down the loop;
                 // other Unfulfillable tasks in the same batch still

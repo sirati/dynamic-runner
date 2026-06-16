@@ -196,6 +196,7 @@ mod tests {
             task_id: task_id.into(),
             phase_id: PhaseId::from("p"),
             inherit_outputs,
+            def_id: None,
         }
     }
 

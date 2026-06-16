@@ -745,7 +745,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // (an active assignment), so a #3b run-wide invalidation
                 // wipes it exactly like an `InFlight`/`Pending`/`Blocked`.
                 | TaskState::QueuedAfterLocalDependency { .. }
-                | TaskState::Blocked { .. } => Some((hash.clone(), state.to_task_info())),
+                // L5: resolve dep refs via the store.
+                | TaskState::Blocked { .. } => Some((hash.clone(), self.cluster_state.task_to_info(state))),
                 TaskState::Completed { .. }
                 | TaskState::Failed { .. }
                 | TaskState::Unfulfillable { .. }

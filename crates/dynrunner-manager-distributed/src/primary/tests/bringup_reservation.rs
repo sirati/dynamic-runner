@@ -414,6 +414,7 @@ fn dep_task(name: &str, phase: &str, depends_on: &[(&str, &str)]) -> TaskInfo<Te
             task_id: (*dep_id).to_string(),
             phase_id: PhaseId::from(*dep_phase),
             inherit_outputs: false,
+            def_id: None,
         })
         .collect();
     t

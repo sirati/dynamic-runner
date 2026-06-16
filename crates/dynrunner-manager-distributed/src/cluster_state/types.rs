@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use dynrunner_core::{
-    ErrorType, SoftPreferredSecondaries, TaskInfo, TaskVersion, TerminalOutcomeCounts, WorkerId,
+    ErrorType, SoftPreferredSecondaries, TaskDep, TaskInfo, TaskVersion, TerminalOutcomeCounts,
+    WorkerId,
 };
 use dynrunner_protocol_primary_secondary::{RemovalCause, RoleTable};
 use serde::{Deserialize, Serialize};
@@ -338,32 +339,6 @@ impl<I> TaskState<I> {
         }
     }
 
-    /// Mutable borrow of the frozen `def`, copy-on-write via
-    /// [`Arc::make_mut`]. The ONE legitimate writer is the snapshot-only
-    /// `migrate_unphased_deps` shim, which rewrites a legacy un-phased dep's
-    /// phase on a freshly-DECODED snapshot whose def `Arc`s are not yet
-    /// shared (refcount 1, so `make_mut` mutates in place rather than
-    /// cloning). NOT a steady-state mutation path — the frozen core is
-    /// immutable once interned; this exists solely for the pre-restore
-    /// migration of an already-owned snapshot entry.
-    pub(crate) fn def_mut(&mut self) -> &mut FrozenTaskDef<I>
-    where
-        I: Clone,
-    {
-        match self {
-            TaskState::Pending { def, .. }
-            | TaskState::InFlight { def, .. }
-            | TaskState::Completed { def, .. }
-            | TaskState::Failed { def, .. }
-            | TaskState::Unfulfillable { def, .. }
-            | TaskState::InvalidTask { def, .. }
-            | TaskState::SkippedAlreadyDone { def, .. }
-            | TaskState::SetupCompleted { def, .. }
-            | TaskState::AffineReady { def, .. }
-            | TaskState::QueuedAfterLocalDependency { def, .. }
-            | TaskState::Blocked { def, .. } => Arc::make_mut(def),
-        }
-    }
 
     /// Shared borrow of the per-entry MUTABLE routing tail, regardless of
     /// variant. Callers reading a carved field
@@ -407,14 +382,23 @@ impl<I> TaskState<I> {
 
     /// Reconstruct a whole owned [`TaskInfo`] from this state's shared
     /// `def` (its 13 frozen fields) + its `routing` (the 3 carved mutable
-    /// fields). A TRANSIENT allocation, NEVER retained — only for callers
-    /// that genuinely need a whole owned `TaskInfo` (building a wire
-    /// `TaskAssignment` or a `TaskInfo` for the pool).
-    pub(crate) fn to_task_info(&self) -> TaskInfo<I>
+    /// fields) + the ALREADY-RESOLVED string `deps`. A TRANSIENT
+    /// allocation, NEVER retained — only for callers that genuinely need a
+    /// whole owned `TaskInfo` (building a wire `TaskAssignment` or a
+    /// `TaskInfo` for the pool).
+    ///
+    /// `deps` is the `Vec<TaskDep>` the def store rebuilds from this state's
+    /// def `task_depends_on: Vec<TaskDepRef>` (L5). A `TaskState` holds no
+    /// store, so the store-owning caller (every `to_task_info` site holds a
+    /// `&ClusterState`) resolves the refs via
+    /// [`super::ClusterState::resolve_dep_refs`] and passes them in. See
+    /// [`super::ClusterState::task_to_info`] for the resolving wrapper most
+    /// callers use.
+    pub(crate) fn to_task_info(&self, deps: Vec<TaskDep>) -> TaskInfo<I>
     where
         I: Clone,
     {
-        self.def().to_task_info(self.routing())
+        self.def().to_task_info(self.routing(), deps)
     }
 
     /// The retry-attempt generation this state carries (F2). One canonical

@@ -28,6 +28,7 @@ fn t_with_id(
             task_id: d.to_string(),
             phase_id: PhaseId::from(phase),
             inherit_outputs: false,
+            def_id: None,
         })
         .collect();
     item
@@ -247,6 +248,7 @@ fn t_cross(phase: &str, id: &str, deps: &[(&str, &str)]) -> TaskInfo<()> {
             task_id: dt.to_string(),
             phase_id: PhaseId::from(*dp),
             inherit_outputs: false,
+            def_id: None,
         })
         .collect();
     item

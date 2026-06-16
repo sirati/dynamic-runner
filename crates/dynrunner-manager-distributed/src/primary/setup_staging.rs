@@ -204,6 +204,9 @@ fn stage_dep<I: Identifier>(stage: &TaskInfo<I>) -> TaskDep {
         // reads the staged FILE (on disk / in the bind-mount). The dep is a
         // pure ordering/readiness gate, so no output inheritance.
         inherit_outputs: false,
+        // Resolved at TaskAdded origination (the broadcast stamp); the
+        // augmentation builds the un-resolved dep here.
+        def_id: None,
     }
 }
 
@@ -362,6 +365,8 @@ fn upload_dep<I: Identifier>(upload: &TaskInfo<I>) -> TaskDep {
         task_id: upload.task_id.clone(),
         phase_id: upload.phase_id.clone(),
         inherit_outputs: false,
+        // Resolved at TaskAdded origination (the broadcast stamp).
+        def_id: None,
     }
 }
 

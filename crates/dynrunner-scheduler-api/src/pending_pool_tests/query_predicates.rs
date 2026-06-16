@@ -19,6 +19,7 @@ fn t_with_id(phase: &str, ty: &str, size: u64, id: &str, deps: &[&str]) -> TaskI
             task_id: d.to_string(),
             phase_id: PhaseId::from(phase),
             inherit_outputs: false,
+            def_id: None,
         })
         .collect();
     item

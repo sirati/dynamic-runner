@@ -187,6 +187,7 @@ fn task(label: &str, depends_on: &[(&str, &str)]) -> TaskInfo<TestId> {
                 task_id: (*id).to_string(),
                 phase_id: PhaseId::from(*p),
                 inherit_outputs: false,
+                def_id: None,
             })
             .collect(),
         preferred_secondaries: SoftPreferredSecondaries::default(),

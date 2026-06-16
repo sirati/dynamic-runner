@@ -520,6 +520,7 @@ async fn wholesale_spawn_rejection_broadcasts_run_aborted_not_run_complete() {
                     task_id: "no_such_task".into(),
                     phase_id: PhaseId::from("default"),
                     inherit_outputs: false,
+                    def_id: None,
                 }];
                 let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
                 let _ = command_sender.try_send(PrimaryCommand::SpawnTasks {

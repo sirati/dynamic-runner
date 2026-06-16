@@ -262,6 +262,7 @@ fn spawned_dep_on_existing_invalid_task_cascades_as_non_recoverable() {
         task_id: "x".into(),
         phase_id: PhaseId::from("p0"),
         inherit_outputs: false,
+        def_id: None,
     }];
     let v_hash = crate::primary::wire::compute_task_hash(&v);
     s.apply(ClusterMutation::TasksSpawned { tasks: vec![v] });

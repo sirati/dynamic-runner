@@ -33,6 +33,7 @@ fn dep_task(id: &str, phase: &str, size: u64, deps: &[(&str, &str)]) -> TaskInfo
             task_id: (*di).to_string(),
             phase_id: PhaseId::from(*dp),
             inherit_outputs: false,
+            def_id: None,
         })
         .collect();
     t
@@ -68,13 +69,22 @@ fn primary_with_dag(
             );
         }
         cs.apply(ClusterMutation::PhaseDepsSet { deps: deps_map });
-        for t in tasks {
-            cs.apply(ClusterMutation::TaskAdded {
+        // Route the TaskAdded batch through the ORIGINATOR stamp pass (as
+        // production does) so each task's def id AND each dep's resolved
+        // prereq def id are stamped over the WHOLE batch BEFORE apply —
+        // making an intra-batch forward-ref (a dependent listed before its
+        // prerequisite, e.g. `cons` before `prod0`) resolve, exactly as the
+        // live wire does (L5/CL-A8). A raw per-task `cs.apply` would leave
+        // every dep unstamped and lose a forward-ref.
+        let batch: Vec<ClusterMutation<TestId>> = tasks
+            .into_iter()
+            .map(|t| ClusterMutation::TaskAdded {
                 hash: compute_task_hash(&t),
                 task: t,
                 def_id: None,
-            });
-        }
+            })
+            .collect();
+        crate::cluster_state::apply_locally_for_broadcast(cs, batch);
     }
     primary
         .hydrate_from_cluster_state()

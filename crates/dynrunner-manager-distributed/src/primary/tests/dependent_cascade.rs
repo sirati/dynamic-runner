@@ -92,6 +92,7 @@ async fn terminally_failed_dep_cascades_dependents_and_run_exits() {
                 task_id: a.task_id.clone(),
                 phase_id: PhaseId::from("default"),
                 inherit_outputs: false,
+                def_id: None,
             }];
             let binaries = vec![a, b];
 

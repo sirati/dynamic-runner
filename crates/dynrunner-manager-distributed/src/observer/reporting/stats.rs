@@ -398,8 +398,11 @@ impl StatsSnapshot {
                 }
                 TaskState::Pending { .. } => {
                     let def = st.def();
-                    let deps_satisfied = def
-                        .task_depends_on
+                    // L5: the fat def stores compact `TaskDepRef`s — rebuild the
+                    // string-identity deps so the satisfied check keys by the
+                    // prereq's task_id.
+                    let resolved_deps = state.resolve_dep_refs(&def.task_depends_on);
+                    let deps_satisfied = resolved_deps
                         .iter()
                         .all(|d| terminal_task_ids.contains(d.task_id.as_str()));
                     if !deps_satisfied {
