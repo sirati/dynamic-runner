@@ -887,7 +887,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 let tasks: Vec<TaskInfo<I>> = self
                     .cluster_state
                     .iter_all()
-                    .map(|(_, t)| t.clone())
+                    .map(|(_, t)| t)
                     .collect();
                 self.preferred_secondaries_validator
                     .validate(tasks.iter(), &known);

@@ -438,7 +438,7 @@ fn restore_migrates_unphased_deps_to_enclosing_phase() {
     joiner.restore(snap);
 
     let restored = match joiner.task_state("h") {
-        Some(TaskState::Pending { task, .. }) => task,
+        Some(state @ TaskState::Pending { .. }) => state.to_task_info(),
         other => panic!("expected Pending, got {other:?}"),
     };
     let deps = &restored.task_depends_on;

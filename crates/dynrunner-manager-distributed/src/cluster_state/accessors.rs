@@ -18,6 +18,8 @@ use dynrunner_protocol_primary_secondary::{
 };
 
 use super::settled::{SettledClass, SettledEntry};
+use super::task_def_store::FrozenTaskDef;
+use super::types::TaskRouting;
 use super::{
     ClusterState, OutcomeSummary, PeerReadmission, PhaseRollup, PhaseTaskPartition, SetupProgress,
     StateCounts, TaskState,
@@ -47,14 +49,14 @@ impl<I> TaskView<'_, I> {
 
     pub(crate) fn task_id(&self) -> &str {
         match self {
-            TaskView::Live(state) => &state.task().task_id,
+            TaskView::Live(state) => &state.def().task_id,
             TaskView::Settled(entry) => &entry.task_id,
         }
     }
 
     pub(crate) fn phase_id(&self) -> &PhaseId {
         match self {
-            TaskView::Live(state) => &state.task().phase_id,
+            TaskView::Live(state) => &state.def().phase_id,
             TaskView::Settled(entry) => &entry.phase_id,
         }
     }
@@ -87,8 +89,8 @@ impl<I> TaskView<'_, I> {
     /// "AffineReady SecondaryAffine gate" fact.
     pub(crate) fn is_affine_ready_gate(&self) -> bool {
         match self {
-            TaskView::Live(TaskState::AffineReady { task, .. }) => {
-                task.kind.is_secondary_affine()
+            TaskView::Live(state @ TaskState::AffineReady { .. }) => {
+                state.def().kind.is_secondary_affine()
             }
             TaskView::Live(_) => false,
             TaskView::Settled(entry) => matches!(entry.class, SettledClass::AffineReady),
@@ -113,10 +115,13 @@ impl<I> TaskView<'_, I> {
 /// lookup, one hit, both fields off the same entry.
 #[derive(Debug)]
 pub(crate) struct ResolvedAffineGate<I> {
-    /// The gate's body — the OWNED [`TaskInfo`] the import drives, cloned so
-    /// the `cluster_state` borrow ends at the call site (the body crosses into
-    /// the off-loop import task).
-    pub(crate) task: TaskInfo<I>,
+    /// The gate's body, carried as the SHARED frozen `def` (cheap `Arc`
+    /// clone — never the whole owned [`TaskInfo`]) + its per-entry `routing`
+    /// tail, so the `cluster_state` borrow ends at the call site. A consumer
+    /// that needs a whole owned `TaskInfo` reconstructs one (a transient
+    /// alloc); the gate itself retains only the Arc.
+    pub(crate) def: Arc<FrozenTaskDef<I>>,
+    pub(crate) routing: TaskRouting,
     /// Whether the resolved entry IS a `AffineReady` SecondaryAffine gate (the
     /// `unmet_local_affine_dep` recognition predicate). The body resolves for
     /// ANY state/class (an import re-routed by the #509 sync race re-runs once
@@ -181,18 +186,22 @@ impl<I: Identifier> ClusterState<I> {
         // longer key different ledger universes: there is one `task_view`.
         let view = self.task_view(hash)?;
         let is_ready_gate = view.is_affine_ready_gate();
-        let task = match view {
-            // Fat: the body is the live state's TaskInfo, already in memory.
-            TaskView::Live(state) => state.task().clone(),
+        let (def, routing) = match view {
+            // Fat: the body is the live state's shared def + routing, in memory.
+            TaskView::Live(state) => (state.def().clone(), state.routing().clone()),
             // Settled: read the fat body back from the spill file (the same
             // per-key pread the snapshot-stream responder uses). `None` here
             // would mean a settled index entry whose record is unreadable —
             // the SAME absent outcome `affine_gate_task` returned before, so
             // the resolver returns `None` and the drive re-routes (#509).
-            TaskView::Settled(_) => self.settled_record(hash)?.0.task().clone(),
+            TaskView::Settled(_) => {
+                let rec = self.settled_record(hash)?;
+                (rec.0.def().clone(), rec.0.routing().clone())
+            }
         };
         Some(ResolvedAffineGate {
-            task,
+            def,
+            routing,
             is_ready_gate,
         })
     }
@@ -222,7 +231,8 @@ impl<I: Identifier> ClusterState<I> {
     /// `is_ready_gate`): a #509-rerouted import re-runs once its `TaskAdded`
     /// lands the gate `Pending`, before it reaches `AffineReady`.
     pub(crate) fn affine_gate_task(&self, hash: &str) -> Option<TaskInfo<I>> {
-        self.resolve_affine_ready_gate(hash).map(|gate| gate.task)
+        self.resolve_affine_ready_gate(hash)
+            .map(|gate| gate.def.to_task_info(&gate.routing))
     }
 
     /// Iterator over `(&hash, &TaskState)` for every FAT (in-memory)
@@ -267,10 +277,12 @@ impl<I: Identifier> ClusterState<I> {
         task: TaskInfo<I>,
         attempt: u32,
     ) {
+        let (def, routing) = self.intern_task_def(hash, task);
         self.set_task_state(
             hash,
             TaskState::Blocked {
-                task,
+                def,
+                routing,
                 on: new_on,
                 attempt,
             },
@@ -290,9 +302,9 @@ impl<I: Identifier> ClusterState<I> {
         self.set_task_state(hash, state, None);
     }
 
-    pub fn iter_pending(&self) -> impl Iterator<Item = (&String, &TaskInfo<I>)> {
+    pub fn iter_pending(&self) -> impl Iterator<Item = (&String, TaskInfo<I>)> {
         self.tasks.iter().filter_map(|(h, s)| match s {
-            TaskState::Pending { task, .. } => Some((h, task)),
+            TaskState::Pending { .. } => Some((h, s.to_task_info())),
             _ => None,
         })
     }
@@ -448,23 +460,8 @@ impl<I: Identifier> ClusterState<I> {
     /// list is operationally dead); identity-shaped lookups go through
     /// [`Self::task_deps_for_identity`] / [`Self::task_hash_for_dep`],
     /// which DO consult the settled index.
-    pub fn iter_all(&self) -> impl Iterator<Item = (&String, &TaskInfo<I>)> {
-        self.tasks.iter().map(|(h, s)| {
-            let t = match s {
-                TaskState::Pending { task, .. }
-                | TaskState::InFlight { task, .. }
-                | TaskState::Completed { task, .. }
-                | TaskState::Failed { task, .. }
-                | TaskState::Unfulfillable { task, .. }
-                | TaskState::InvalidTask { task, .. }
-                | TaskState::SkippedAlreadyDone { task, .. }
-                | TaskState::SetupCompleted { task, .. }
-                | TaskState::AffineReady { task, .. }
-                | TaskState::QueuedAfterLocalDependency { task, .. }
-                | TaskState::Blocked { task, .. } => task,
-            };
-            (h, t)
-        })
+    pub fn iter_all(&self) -> impl Iterator<Item = (&String, TaskInfo<I>)> {
+        self.tasks.iter().map(|(h, s)| (h, s.to_task_info()))
     }
 
     /// Iterator over `(task_hash, &TaskInfo)` for FAT (in-memory)
@@ -477,18 +474,18 @@ impl<I: Identifier> ClusterState<I> {
     /// against a `Completed` prereq. SETTLED terminals are not yielded
     /// (no in-memory `TaskInfo`); pair with [`Self::settled_entries`]
     /// for the full terminal set.
-    pub fn iter_terminal(&self) -> impl Iterator<Item = (&String, &TaskInfo<I>)> {
+    pub fn iter_terminal(&self) -> impl Iterator<Item = (&String, TaskInfo<I>)> {
         self.tasks.iter().filter_map(|(h, s)| match s {
-            TaskState::Completed { task, .. }
-            | TaskState::Failed { task, .. }
-            | TaskState::Unfulfillable { task, .. }
-            | TaskState::InvalidTask { task, .. }
-            | TaskState::SkippedAlreadyDone { task, .. }
-            | TaskState::SetupCompleted { task, .. }
+            TaskState::Completed { .. }
+            | TaskState::Failed { .. }
+            | TaskState::Unfulfillable { .. }
+            | TaskState::InvalidTask { .. }
+            | TaskState::SkippedAlreadyDone { .. }
+            | TaskState::SetupCompleted { .. }
             // `AffineReady` IS terminal for dependency-resolution: a build
             // gated on the gate resolves its dep against it exactly as
             // against a `Completed`/`SetupCompleted` prereq.
-            | TaskState::AffineReady { task, .. } => Some((h, task)),
+            | TaskState::AffineReady { .. } => Some((h, s.to_task_info())),
             _ => None,
         })
     }
@@ -718,20 +715,7 @@ impl<I: Identifier> ClusterState<I> {
         // (vacuously not-live / not-present).
         let mut base: HashMap<&PhaseId, (bool, bool)> = HashMap::new();
         for st in self.tasks.values() {
-            let task = match st {
-                TaskState::Pending { task, .. }
-                | TaskState::InFlight { task, .. }
-                | TaskState::Completed { task, .. }
-                | TaskState::Failed { task, .. }
-                | TaskState::Unfulfillable { task, .. }
-                | TaskState::InvalidTask { task, .. }
-                | TaskState::SkippedAlreadyDone { task, .. }
-                | TaskState::SetupCompleted { task, .. }
-                | TaskState::AffineReady { task, .. }
-                | TaskState::QueuedAfterLocalDependency { task, .. }
-                | TaskState::Blocked { task, .. } => task,
-            };
-            let entry = base.entry(&task.phase_id).or_insert((false, false));
+            let entry = base.entry(&st.def().phase_id).or_insert((false, false));
             entry.0 = true;
             if !st.is_terminal() {
                 entry.1 = true;
@@ -828,20 +812,8 @@ impl<I: Identifier> ClusterState<I> {
         self.tasks
             .iter()
             .find_map(|(h, s)| {
-                let task = match s {
-                    TaskState::Pending { task, .. }
-                    | TaskState::InFlight { task, .. }
-                    | TaskState::Completed { task, .. }
-                    | TaskState::Failed { task, .. }
-                    | TaskState::Unfulfillable { task, .. }
-                    | TaskState::InvalidTask { task, .. }
-                    | TaskState::SkippedAlreadyDone { task, .. }
-                    | TaskState::SetupCompleted { task, .. }
-                    | TaskState::AffineReady { task, .. }
-                    | TaskState::QueuedAfterLocalDependency { task, .. }
-                    | TaskState::Blocked { task, .. } => task,
-                };
-                (task.task_id == task_id && &task.phase_id == phase_id).then_some(h.as_str())
+                let def = s.def();
+                (def.task_id == task_id && &def.phase_id == phase_id).then_some(h.as_str())
             })
             // Settled (spilled) entries resolve deps too — a completed
             // prereq is the COMMON dep target and is exactly what spills.
@@ -867,9 +839,9 @@ impl<I: Identifier> ClusterState<I> {
         self.tasks
             .values()
             .find_map(|s| {
-                let task = s.task();
-                (task.task_id == task_id && &task.phase_id == phase_id)
-                    .then(|| task.task_depends_on.clone())
+                let def = s.def();
+                (def.task_id == task_id && &def.phase_id == phase_id)
+                    .then(|| def.task_depends_on.clone())
             })
             .or_else(|| {
                 self.settled_entries().find_map(|(_, entry)| {
@@ -929,24 +901,12 @@ impl<I: Identifier> ClusterState<I> {
         self.tasks
             .iter()
             .filter_map(|(hash, state)| {
-                let task = match state {
-                    TaskState::Pending { task, .. }
-                    | TaskState::InFlight { task, .. }
-                    | TaskState::Completed { task, .. }
-                    | TaskState::Failed { task, .. }
-                    | TaskState::Unfulfillable { task, .. }
-                    | TaskState::InvalidTask { task, .. }
-                    | TaskState::SkippedAlreadyDone { task, .. }
-                    | TaskState::SetupCompleted { task, .. }
-                    | TaskState::AffineReady { task, .. }
-                    | TaskState::QueuedAfterLocalDependency { task, .. }
-                    | TaskState::Blocked { task, .. } => task,
-                };
-                if &task.phase_id != phase_id {
+                let def = state.def();
+                if &def.phase_id != phase_id {
                     return None;
                 }
                 let outputs = self.task_outputs.get(hash)?;
-                Some((task.task_id.clone(), outputs.clone()))
+                Some((def.task_id.clone(), outputs.clone()))
             })
             // Settled (spilled) entries of the phase: their identity comes
             // off the slim index; the output payload was EVICTED from the
@@ -982,7 +942,7 @@ impl<I: Identifier> ClusterState<I> {
     pub fn phase_task_partition(&self, phase: &PhaseId) -> PhaseTaskPartition {
         let mut p = PhaseTaskPartition::default();
         for state in self.tasks.values() {
-            if &state.task().phase_id != phase {
+            if &state.def().phase_id != phase {
                 continue;
             }
             match state {
@@ -1059,7 +1019,7 @@ impl<I: Identifier> ClusterState<I> {
     pub fn setup_progress(&self) -> SetupProgress {
         let mut s = SetupProgress::default();
         for state in self.tasks.values() {
-            if !state.task().kind.is_setup() {
+            if !state.def().kind.is_setup() {
                 continue;
             }
             s.total += 1;

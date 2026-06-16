@@ -104,8 +104,10 @@ impl<I: Identifier> ClusterState<I> {
                     // from the post-write state (holder `None` — a spawn-time
                     // Pending names none). No `fallback_holder` (this arm never
                     // supersedes an `InFlight`).
+                    let (def, routing) = self.intern_task_def(&hash, task);
                     let state = TaskState::Pending {
-                        task,
+                        def,
+                        routing,
                         version: Default::default(),
                         // Brand-new task: the cold generation (F2).
                         attempt: 0,
@@ -144,9 +146,11 @@ impl<I: Identifier> ClusterState<I> {
                 let Some(state) = self.task_entry_unsettling(&hash, &probe) else {
                     return ApplyOutcome::NoOp;
                 };
-                let task = state.task().clone();
+                let def = state.def().clone();
+                let routing = state.routing().clone();
                 let incoming = TaskState::InFlight {
-                    task,
+                    def,
+                    routing,
                     secondary,
                     worker,
                     version,
@@ -180,9 +184,14 @@ impl<I: Identifier> ClusterState<I> {
                 let Some(state) = self.task_entry_unsettling(&hash, &probe) else {
                     return ApplyOutcome::NoOp;
                 };
-                let task = state.task().clone();
+                let def = state.def().clone();
+                let routing = state.routing().clone();
                 let outputs = Self::decode_done_payload_outputs(result_data);
-                let incoming = TaskState::Completed { task, attempt };
+                let incoming = TaskState::Completed {
+                    def,
+                    routing,
+                    attempt,
+                };
                 self.apply_merge(&hash, incoming, outputs, resumed)
             }
             ClusterMutation::TaskFailed {
@@ -219,24 +228,28 @@ impl<I: Identifier> ClusterState<I> {
                 let Some(state) = self.task_entry_unsettling(&hash, &probe) else {
                     return ApplyOutcome::NoOp;
                 };
-                let task = state.task().clone();
+                let def = state.def().clone();
+                let routing = state.routing().clone();
                 let incoming = match kind {
                     ErrorType::Unfulfillable { reason } => TaskState::Unfulfillable {
-                        task,
+                        def,
+                        routing,
                         reason: reason.to_string(),
                         last_error: error,
                         version,
                         attempt,
                     },
                     ErrorType::InvalidTask { reason } => TaskState::InvalidTask {
-                        task,
+                        def,
+                        routing,
                         reason: reason.to_string(),
                         last_error: error,
                         version,
                         attempt,
                     },
                     other => TaskState::Failed {
-                        task,
+                        def,
+                        routing,
                         kind: other,
                         last_error: error,
                         version,
@@ -513,8 +526,13 @@ impl<I: Identifier> ClusterState<I> {
                 // the attempt is unchanged — the same generation continues
                 // (mirrors `TaskRequeued`). `attempt` is read BEFORE the
                 // `task.clone()` move so both come off the same borrow.
-                let (task, attempt) = match state {
-                    TaskState::Unfulfillable { task, attempt, .. } => (task.clone(), *attempt),
+                let (def, routing, attempt) = match state {
+                    TaskState::Unfulfillable {
+                        def,
+                        routing,
+                        attempt,
+                        ..
+                    } => (def.clone(), routing.clone(), *attempt),
                     _ => return ApplyOutcome::NoOp,
                 };
                 // Memo-maintaining in-place rewrite (XOR old term out, new in;
@@ -522,7 +540,8 @@ impl<I: Identifier> ClusterState<I> {
                 self.rewrite_task_state(
                     &hash,
                     TaskState::Pending {
-                        task,
+                        def,
+                        routing,
                         version,
                         attempt,
                     },
@@ -570,18 +589,27 @@ impl<I: Identifier> ClusterState<I> {
                 // pins this — a requeue does NOT bump attempt; the same
                 // dispatch generation re-dispatches, so version still
                 // arbitrates a redelivered stale `TaskAssigned`).
-                let (task, attempt) = match state {
-                    TaskState::InFlight { task, attempt, .. }
-                    | TaskState::QueuedAfterLocalDependency { task, attempt, .. } => {
-                        (task.clone(), *attempt)
+                let (def, routing, attempt) = match state {
+                    TaskState::InFlight {
+                        def,
+                        routing,
+                        attempt,
+                        ..
                     }
+                    | TaskState::QueuedAfterLocalDependency {
+                        def,
+                        routing,
+                        attempt,
+                        ..
+                    } => (def.clone(), routing.clone(), *attempt),
                     _ => return ApplyOutcome::NoOp,
                 };
                 // Memo-maintaining in-place rewrite (XOR old term out, new in).
                 self.rewrite_task_state(
                     &hash,
                     TaskState::Pending {
-                        task,
+                        def,
+                        routing,
                         version,
                         attempt,
                     },
@@ -629,8 +657,8 @@ impl<I: Identifier> ClusterState<I> {
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                let task = match state {
-                    TaskState::Failed { task, .. } => task.clone(),
+                let (def, routing) = match state {
+                    TaskState::Failed { def, routing, .. } => (def.clone(), routing.clone()),
                     _ => return ApplyOutcome::NoOp,
                 };
                 // Memo-maintaining in-place rewrite. After the rehydrate above
@@ -639,7 +667,8 @@ impl<I: Identifier> ClusterState<I> {
                 self.rewrite_task_state(
                     &hash,
                     TaskState::Pending {
-                        task,
+                        def,
+                        routing,
                         version,
                         attempt,
                     },
@@ -690,13 +719,24 @@ impl<I: Identifier> ClusterState<I> {
                         // dependent is silent either way.
                         None
                     }
-                    TaskState::Pending { task, attempt, .. } => {
+                    TaskState::Pending {
+                        def,
+                        routing,
+                        attempt,
+                        ..
+                    } => {
                         // Preserve the generation across the cascade-pause
                         // (F2): a Blocked dependent re-dispatches at the
                         // same attempt it was Pending under.
                         let attempt = *attempt;
-                        let task = task.clone();
-                        Some(TaskState::Blocked { task, on, attempt })
+                        let def = def.clone();
+                        let routing = routing.clone();
+                        Some(TaskState::Blocked {
+                            def,
+                            routing,
+                            on,
+                            attempt,
+                        })
                     }
                 };
                 match new_state {
@@ -736,9 +776,18 @@ impl<I: Identifier> ClusterState<I> {
                     return ApplyOutcome::NoOp;
                 };
                 let new_state = match state {
-                    TaskState::Pending { task, attempt, .. } => {
-                        let (task, attempt) = (task.clone(), *attempt);
-                        Some(TaskState::SkippedAlreadyDone { task, attempt })
+                    TaskState::Pending {
+                        def,
+                        routing,
+                        attempt,
+                        ..
+                    } => {
+                        let (def, routing, attempt) = (def.clone(), routing.clone(), *attempt);
+                        Some(TaskState::SkippedAlreadyDone {
+                            def,
+                            routing,
+                            attempt,
+                        })
                     }
                     _ => None,
                 };
@@ -779,10 +828,24 @@ impl<I: Identifier> ClusterState<I> {
                     return ApplyOutcome::NoOp;
                 };
                 let new_state = match state {
-                    TaskState::InFlight { task, attempt, .. }
-                    | TaskState::Pending { task, attempt, .. } => {
-                        let (task, attempt) = (task.clone(), *attempt);
-                        Some(TaskState::SetupCompleted { task, attempt })
+                    TaskState::InFlight {
+                        def,
+                        routing,
+                        attempt,
+                        ..
+                    }
+                    | TaskState::Pending {
+                        def,
+                        routing,
+                        attempt,
+                        ..
+                    } => {
+                        let (def, routing, attempt) = (def.clone(), routing.clone(), *attempt);
+                        Some(TaskState::SetupCompleted {
+                            def,
+                            routing,
+                            attempt,
+                        })
                     }
                     _ => None,
                 };
@@ -826,7 +889,12 @@ impl<I: Identifier> ClusterState<I> {
                     return ApplyOutcome::NoOp;
                 };
                 let new_state = match state {
-                    TaskState::Pending { task, attempt, .. } => {
+                    TaskState::Pending {
+                        def,
+                        routing,
+                        attempt,
+                        ..
+                    } => {
                         // Diagnosability (#514): on the ACTUAL `Pending →
                         // AffineReady` transition (this `Pending` arm) — the one
                         // edge every emission surface (seed / live delta /
@@ -843,13 +911,17 @@ impl<I: Identifier> ClusterState<I> {
                         // need different remediation.
                         tracing::info!(
                             gate_content_hash = %hash,
-                            phase = %task.phase_id,
-                            task_id = %task.task_id,
+                            phase = %def.phase_id,
+                            task_id = %def.task_id,
                             "SecondaryAffine gate EMITTED AffineReady (resolved \
                              to READY-not-EXECUTED)"
                         );
-                        let (task, attempt) = (task.clone(), *attempt);
-                        Some(TaskState::AffineReady { task, attempt })
+                        let (def, routing, attempt) = (def.clone(), routing.clone(), *attempt);
+                        Some(TaskState::AffineReady {
+                            def,
+                            routing,
+                            attempt,
+                        })
                     }
                     _ => None,
                 };
@@ -890,26 +962,29 @@ impl<I: Identifier> ClusterState<I> {
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                let (task, version, attempt) = match state {
+                let (def, routing, version, attempt) = match state {
                     TaskState::InFlight {
-                        task,
+                        def,
+                        routing,
                         version,
                         attempt,
                         ..
                     }
                     | TaskState::Pending {
-                        task,
+                        def,
+                        routing,
                         version,
                         attempt,
                         ..
-                    } => (task.clone(), *version, *attempt),
+                    } => (def.clone(), routing.clone(), *version, *attempt),
                     _ => return ApplyOutcome::NoOp,
                 };
                 // Memo-maintaining in-place rewrite (the borrow ended).
                 self.rewrite_task_state(
                     &hash,
                     TaskState::QueuedAfterLocalDependency {
-                        task,
+                        def,
+                        routing,
                         secondary,
                         version,
                         attempt,
@@ -932,14 +1007,14 @@ impl<I: Identifier> ClusterState<I> {
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                let task = state.task_mut();
-                if version <= task.preferred_version {
+                let routing = state.routing_mut();
+                if version <= routing.preferred_version {
                     // A stale (or idempotent re-delivered) update loses to
                     // the already-recorded higher-or-equal version.
                     return ApplyOutcome::NoOp;
                 }
-                task.preferred_secondaries = SoftPreferredSecondaries::new(secondaries);
-                task.preferred_version = version;
+                routing.preferred_secondaries = SoftPreferredSecondaries::new(secondaries);
+                routing.preferred_version = version;
                 ApplyOutcome::Applied
             }
             ClusterMutation::PeerJoined {

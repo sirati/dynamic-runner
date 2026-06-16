@@ -209,7 +209,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let mut phases_with_live_work: HashSet<PhaseId> = HashSet::new();
 
         for (hash, state) in self.cluster_state.tasks_iter() {
-            all_binaries.push(state.task().clone());
+            all_binaries.push(state.to_task_info());
+            let def = state.def();
             match state {
                 // A FAILED terminal must NOT satisfy dependents' deps: it
                 // never produced its outputs. Its task_id seeds the pool's
@@ -236,21 +237,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // dedup in `task::failed.rs` ORs
                 // `failed_tasks.contains_key`, so it still dedupes without
                 // the `completed_tasks` membership.
-                TaskState::Failed { task, kind, .. } => {
-                    started_phases.insert(task.phase_id.clone());
-                    phases_with_terminal.insert(task.phase_id.clone());
-                    soft_failed_seed.push((task.task_id.clone(), task.phase_id.clone()));
+                TaskState::Failed { kind, .. } => {
+                    started_phases.insert(def.phase_id.clone());
+                    phases_with_terminal.insert(def.phase_id.clone());
+                    soft_failed_seed.push((def.task_id.clone(), def.phase_id.clone()));
                     failed_tasks.insert(hash.clone(), kind.clone());
                 }
                 // The ONLY dispatch-observed terminal that satisfies
                 // dependents' deps: a completed prereq produced its
                 // outputs, so its task_id enters the dep-resolution
                 // completed seed and dependents pre-resolve in `extend()`.
-                TaskState::Completed { task, .. } => {
-                    started_phases.insert(task.phase_id.clone());
-                    phases_with_terminal.insert(task.phase_id.clone());
+                TaskState::Completed { .. } => {
+                    started_phases.insert(def.phase_id.clone());
+                    phases_with_terminal.insert(def.phase_id.clone());
                     primary_completed.insert(hash.clone());
-                    completed_task_ids.insert(task.task_id.clone());
+                    completed_task_ids.insert(def.task_id.clone());
                 }
                 // Operator-reinjectable dormancy: the entry stays
                 // `Unfulfillable` in the CRDT (revivable via the command
@@ -262,11 +263,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // run-completion counter (the historical accounting slot
                 // for the non-`Failed`-state terminals; the entry is in
                 // neither bucket-kind ledger, so no retry path touches it).
-                TaskState::Unfulfillable { task, .. } => {
-                    started_phases.insert(task.phase_id.clone());
-                    phases_with_terminal.insert(task.phase_id.clone());
+                TaskState::Unfulfillable { .. } => {
+                    started_phases.insert(def.phase_id.clone());
+                    phases_with_terminal.insert(def.phase_id.clone());
                     primary_completed.insert(hash.clone());
-                    dormant_seed.push(task.task_id.clone());
+                    dormant_seed.push(def.task_id.clone());
                 }
                 // Structurally-dead root (non-reinjectable): dependents can
                 // NEVER run, the same doom a `Failed { NonRecoverable }`
@@ -277,11 +278,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // the dependents with the accounted, broadcast
                 // `upstream-failed` terminal. Hash into `primary_completed`
                 // for the run-completion counter, as before.
-                TaskState::InvalidTask { task, .. } => {
-                    started_phases.insert(task.phase_id.clone());
-                    phases_with_terminal.insert(task.phase_id.clone());
+                TaskState::InvalidTask { .. } => {
+                    started_phases.insert(def.phase_id.clone());
+                    phases_with_terminal.insert(def.phase_id.clone());
                     primary_completed.insert(hash.clone());
-                    soft_failed_seed.push((task.task_id.clone(), task.phase_id.clone()));
+                    soft_failed_seed.push((def.task_id.clone(), def.phase_id.clone()));
                 }
                 // `SkippedAlreadyDone` is a terminal that was NEVER
                 // dispatched, so it is seeded like the other terminal-ish
@@ -309,10 +310,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // hook re-fires. A mixed phase (skips + dispatched work) is
                 // marked started by its non-skip entries, exactly as the
                 // original primary observed it.
-                TaskState::SkippedAlreadyDone { task, .. } => {
-                    phases_with_terminal.insert(task.phase_id.clone());
+                TaskState::SkippedAlreadyDone { .. } => {
+                    phases_with_terminal.insert(def.phase_id.clone());
                     primary_completed.insert(hash.clone());
-                    completed_task_ids.insert(task.task_id.clone());
+                    completed_task_ids.insert(def.task_id.clone());
                 }
                 // A succeeded setup task: a success-like terminal that
                 // satisfies dependents' deps (its task_id enters the
@@ -326,11 +327,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // `SetupCompleted`. It enters `primary_completed` for the
                 // run-completion counter slot, like the other non-`Failed`
                 // terminals.
-                TaskState::SetupCompleted { task, .. } => {
-                    started_phases.insert(task.phase_id.clone());
-                    phases_with_terminal.insert(task.phase_id.clone());
+                TaskState::SetupCompleted { .. } => {
+                    started_phases.insert(def.phase_id.clone());
+                    phases_with_terminal.insert(def.phase_id.clone());
                     primary_completed.insert(hash.clone());
-                    completed_task_ids.insert(task.task_id.clone());
+                    completed_task_ids.insert(def.task_id.clone());
                 }
                 // Cascade-paused dependent. Re-seed as Pending into the
                 // new primary's pool: the prereq's TaskCompleted apply
@@ -342,9 +343,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // will surface the unresolved dep as a normal blocked
                 // state — same dormancy, owned by the pool's existing
                 // dep machine rather than a parallel "Blocked" set.
-                TaskState::Blocked { task, .. } => {
-                    phases_with_live_work.insert(task.phase_id.clone());
-                    items.push(task.clone());
+                TaskState::Blocked { .. } => {
+                    phases_with_live_work.insert(def.phase_id.clone());
+                    items.push(state.to_task_info());
                 }
                 // Unlike the secondary's hydration, the
                 // `PrimaryCoordinator` owns no local `active_tasks`
@@ -352,15 +353,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // entries and any work it itself dispatched is tracked
                 // as `InFlight` in cluster_state. A `Pending` entry is
                 // therefore always genuinely pending: into the pool.
-                TaskState::Pending { task, .. } => {
-                    phases_with_live_work.insert(task.phase_id.clone());
-                    items.push(task.clone());
+                TaskState::Pending { .. } => {
+                    phases_with_live_work.insert(def.phase_id.clone());
+                    items.push(state.to_task_info());
                 }
                 TaskState::InFlight {
-                    task,
-                    secondary,
-                    worker,
-                    ..
+                    secondary, worker, ..
                 } => {
                     // The originating dispatcher dispatched the work; this
                     // coordinator inherits it on promotion and will observe
@@ -395,15 +393,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     // (1) and (2) are owned by the pool via
                     // `mark_tasks_in_flight` below; (3) is the ledger
                     // seed performed after `extend` succeeds.
-                    started_phases.insert(task.phase_id.clone());
-                    phases_with_live_work.insert(task.phase_id.clone());
-                    in_flight_pairs.push((task.task_id.clone(), task.phase_id.clone()));
+                    started_phases.insert(def.phase_id.clone());
+                    phases_with_live_work.insert(def.phase_id.clone());
+                    in_flight_pairs.push((def.task_id.clone(), def.phase_id.clone()));
                     in_flight_seed.push((
                         hash.clone(),
-                        task.phase_id.clone(),
+                        def.phase_id.clone(),
                         secondary.clone(),
                         *worker,
-                        task.clone(),
+                        state.to_task_info(),
                     ));
                 }
                 // A resolved SecondaryAffine gate (#497): a terminal that was
@@ -422,10 +420,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // count reads the CRDT's `succeeded` (which excludes
                 // `affine_ready`), so this counter slot never inflates the
                 // operator success report.
-                TaskState::AffineReady { task, .. } => {
-                    phases_with_terminal.insert(task.phase_id.clone());
+                TaskState::AffineReady { .. } => {
+                    phases_with_terminal.insert(def.phase_id.clone());
                     primary_completed.insert(hash.clone());
-                    completed_task_ids.insert(task.task_id.clone());
+                    completed_task_ids.insert(def.task_id.clone());
                 }
                 // A work task queued behind a secondary's LOCAL SecondaryAffine
                 // import (#497). The per-secondary import progress is
@@ -438,9 +436,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // the join. (Mirrors the death-seam's requeue philosophy: a
                 // queued task whose holder's local state is unknown re-routes
                 // per #495 rather than wedging on an un-observable import.)
-                TaskState::QueuedAfterLocalDependency { task, .. } => {
-                    phases_with_live_work.insert(task.phase_id.clone());
-                    items.push(task.clone());
+                TaskState::QueuedAfterLocalDependency { .. } => {
+                    phases_with_live_work.insert(def.phase_id.clone());
+                    items.push(state.to_task_info());
                 }
             }
         }
@@ -858,11 +856,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .tasks_iter()
             .filter_map(|(hash, state)| match state {
                 TaskState::InFlight {
-                    task,
-                    secondary,
-                    worker,
-                    ..
-                } => Some((hash.clone(), secondary.clone(), *worker, task.clone())),
+                    secondary, worker, ..
+                } => Some((
+                    hash.clone(),
+                    secondary.clone(),
+                    *worker,
+                    state.to_task_info(),
+                )),
                 _ => None,
             })
             .collect();

@@ -785,7 +785,7 @@ async fn update_preferred_secondaries_propagates_to_live_pool() {
 
             // CRDT mirror updated.
             let crdt_task = match coordinator.cluster_state.task_state(&hash) {
-                Some(TaskState::Pending { task, .. }) => task.clone(),
+                Some(state @ TaskState::Pending { .. }) => state.to_task_info(),
                 other => panic!("expected Pending, got {other:?}"),
             };
             let expected: Vec<&str> = vec!["sec-a", "sec-b"];
