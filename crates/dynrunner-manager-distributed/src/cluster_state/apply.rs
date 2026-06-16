@@ -290,18 +290,15 @@ impl<I: Identifier> ClusterState<I> {
                 }
                 self.current_primary = Some(new.clone());
                 self.primary_epoch = epoch;
-                // Failover-safe def-id resume (L3a / CL-A2): co-located with
+                // Failover-safe def-id resume (L6a / CL-A2): co-located with
                 // the `primary_epoch` advance — the SAME seam a promotion
-                // crosses. Re-anchor the def allocator PAST every observed
-                // id so a promoted primary never re-mints a live id (the
-                // node-local cold-start aliasing CL-A2 forbids). The
-                // in-memory store's max already feeds `next_id` (every
-                // `intern_at`/`put_slot` advances it), so `next_id_floor()`
-                // IS the in-memory resume floor here; the full settled-scan
-                // over spilled entries is a later leaf (L6). Monotone — a
+                // crosses. Re-anchor the def allocator PAST every inherited
+                // id over BOTH halves of the ledger — the in-memory store
+                // AND the settled records — so a promoted primary never
+                // re-mints a live OR a settled task's id (the node-local
+                // cold-start aliasing CL-A2 forbids). Monotone — a
                 // non-promoting adopter's call is a harmless no-op.
-                let floor = self.definitions.next_id_floor();
-                self.definitions.resume_alloc_floor(floor);
+                self.resume_def_alloc_floor();
                 // Keep the lock-free epoch mirror in lockstep with the
                 // field so off-`apply` readers (the observer
                 // resource-holdings announcer) see the post-mutation

@@ -324,6 +324,15 @@ impl<I: Identifier> ClusterState<I> {
         self.definitions.resolve(id)
     }
 
+    /// Test-only seam: the def allocator's current resume floor — the id the
+    /// node-local allocator would mint NEXT (L6a). The failover-resume test
+    /// reads it to assert a promoted primary re-anchored its allocator PAST
+    /// the max of the in-memory ∪ settled inherited def-ids.
+    #[cfg(test)]
+    pub(crate) fn def_alloc_floor_for_test(&self) -> u32 {
+        self.definitions.next_id_floor()
+    }
+
     pub fn iter_pending(&self) -> impl Iterator<Item = (&String, TaskInfo<I>)> {
         self.tasks.iter().filter_map(|(h, s)| match s {
             TaskState::Pending { .. } => Some((h, s.to_task_info())),

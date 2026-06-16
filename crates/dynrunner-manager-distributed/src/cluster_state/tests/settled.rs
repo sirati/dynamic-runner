@@ -34,6 +34,16 @@ fn done_with_output(key: &str, value: &str) -> Vec<u8> {
     serde_json::to_vec(&payload).expect("encode DonePayload")
 }
 
+/// Apply a `PrimaryChanged { new, epoch }` — the failover/promotion seam
+/// that fires the def-id resume floor (L6a). `reason` is apply-blind.
+fn apply_primary_changed(s: &mut ClusterState<RunnerIdentifier>, new: &str, epoch: u64) {
+    s.apply(ClusterMutation::PrimaryChanged {
+        new: new.into(),
+        epoch,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::default(),
+    });
+}
+
 /// Build a state with one completed task carrying an output, spill it,
 /// and return the state + the spill-file tempdir (kept alive).
 fn spilled_completed_state() -> (ClusterState<RunnerIdentifier>, tempfile::TempDir) {
@@ -906,5 +916,187 @@ fn fat_task_breakdown_splits_eligible_from_live() {
         eligible + not_eligible,
         s.tasks_in_memory(),
         "the split must sum to the fat total"
+    );
+}
+
+// ── L6a: failover-stable def-ids over (in-memory ∪ settled) ──
+
+/// Build a donor with one task carrying the WIRE def-id `def_id`, complete
+/// + spill it so its SETTLED record carries that real id. Returns the donor
+/// + the spill-file tempdir (kept alive for the shared read fd).
+fn donor_with_settled_wire_def(
+    hash: &str,
+    def_id: u32,
+) -> (ClusterState<RunnerIdentifier>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut donor = ClusterState::<RunnerIdentifier>::new();
+    // A WIRE-AGREED def-id (`Some`) routes through `intern_at`, which STAMPS
+    // it onto the def — so the settled record (and its slim index entry)
+    // carries the real id, not the node-local `UNBOUND` sentinel.
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: hash.into(),
+        task: mk_task(hash),
+        def_id: Some(def_id),
+    });
+    donor.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: hash.into(),
+        result_data: Some(done_with_output("k", "v")),
+    });
+    let evicted = donor.test_spill_all(&dir.path().join("spill.cbor"));
+    assert_eq!(evicted, 1, "the completed task must settle + evict");
+    (donor, dir)
+}
+
+/// A settled record's WIRE def-id is captured into its slim index entry at
+/// commit-spill (no disk read) and surfaced by `SettledStore::max_def_id`;
+/// a node-local (`UNBOUND`) settled def is EXCLUDED from the max.
+#[test]
+fn settled_store_surfaces_wire_def_id_and_excludes_unbound() {
+    // Wire id 7 → counted.
+    let (donor, _dir) = donor_with_settled_wire_def("done", 7);
+    assert_eq!(
+        donor.settled_store().max_def_id(),
+        Some(7),
+        "the settled record's stamped wire def-id is surfaced"
+    );
+
+    // A node-local (`def_id: None`) settled def carries `UNBOUND` and is
+    // excluded — folding the `u32::MAX` sentinel would slam the allocator
+    // to the top of the id space.
+    let (node_local, _dir2) = spilled_completed_state();
+    assert_eq!(
+        node_local.settled_store().max_def_id(),
+        None,
+        "an UNBOUND (node-local) settled def is excluded from the max"
+    );
+}
+
+/// THE leaf invariant: a promoted primary that inherits tasks — some
+/// IN-MEMORY (snapshot-restored, so their def-ids re-anchor the in-memory
+/// store) and some SETTLED (inherited via the settled base, NOT in the
+/// snapshot's def store) — resumes its def-id allocator PAST the max of
+/// BOTH halves, so a newly-minted def-id collides with NEITHER.
+#[test]
+fn promotion_resumes_def_alloc_past_settled_and_in_memory_max() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Donor: a SETTLED task at wire id 7 (the high inherited id lives only
+    // on the settled side) + an IN-MEMORY task at wire id 3 (a smaller id
+    // that re-anchors the in-memory store on restore).
+    let mut donor = ClusterState::<RunnerIdentifier>::new();
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: "settled".into(),
+        task: mk_task("settled"),
+        def_id: Some(7),
+    });
+    donor.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "settled".into(),
+        result_data: Some(done_with_output("k", "v")),
+    });
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: "live".into(),
+        task: mk_task("live"),
+        def_id: Some(3),
+    });
+    let evicted = donor.test_spill_all(&dir.path().join("spill.cbor"));
+    assert_eq!(evicted, 1, "only the completed 'settled' task spills");
+    assert_eq!(donor.settled_store().max_def_id(), Some(7));
+
+    // Promote: install the settled base, then restore the disjoint fat
+    // snapshot over it (the live 'live' task at id 3).
+    let base = donor.settled_base_clone();
+    let mut promoted = ClusterState::<RunnerIdentifier>::new();
+    promoted.install_settled_base(base);
+    promoted.restore(donor.snapshot());
+
+    // BEFORE the promotion seam: the in-memory store re-anchored only the
+    // RESTORED def (id 3 → floor 4); the SETTLED id 7 is INVISIBLE to the
+    // in-memory store (the snapshot ships defs by value, but a settled
+    // entry's fat body — and its def — is NOT in the snapshot's task
+    // batch). This is the exact gap L6a closes.
+    assert_eq!(
+        promoted.def_alloc_floor_for_test(),
+        4,
+        "pre-resume floor reflects only the restored in-memory max"
+    );
+    assert!(
+        promoted
+            .resolve_def_for_test(crate::cluster_state::TaskDefId(7))
+            .is_none(),
+        "the settled def-id is not in the in-memory store — the gap"
+    );
+
+    // The promotion seam: a freshly-promoted primary originates
+    // `PrimaryChanged { new = self, epoch + 1 }`, whose apply fires the
+    // def-id resume floor over (in-memory ∪ settled).
+    apply_primary_changed(&mut promoted, "promoted-self", 1);
+
+    // AFTER: the allocator resumed PAST max(in-memory 3, settled 7) ⇒ 8.
+    assert_eq!(
+        promoted.def_alloc_floor_for_test(),
+        8,
+        "the resume floor includes the settled id (7) + 1"
+    );
+
+    // A newly-allocated def-id does NOT collide with the settled id 7 nor
+    // the in-memory id 3 — it mints 8.
+    let fresh = promoted.allocate_def_id("brand-new");
+    assert_eq!(
+        fresh,
+        crate::cluster_state::TaskDefId(8),
+        "the next def-id is past every inherited id (in-memory AND settled)"
+    );
+}
+
+/// Cross-epoch (producer_backstop shape): two primary epochs minting from
+/// INDEPENDENT allocators must not produce a LIVE collision. Epoch-1
+/// settled id 5 is inherited by an epoch-2 promoted primary, whose resume
+/// floor re-anchors past it — so the epoch-2 allocator never re-mints id 5
+/// for a different task, and the would-be cross-epoch collision is gone.
+#[test]
+fn cross_epoch_promotion_does_not_reuse_settled_def_id() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Epoch-1 primary: settles a task at wire id 5, then a separate epoch-2
+    // primary is promoted off its inherited state.
+    let mut epoch1 = ClusterState::<RunnerIdentifier>::new();
+    apply_primary_changed(&mut epoch1, "epoch1-primary", 1);
+    epoch1.apply(ClusterMutation::TaskAdded {
+        hash: "e1-settled".into(),
+        task: mk_task("e1-settled"),
+        def_id: Some(5),
+    });
+    epoch1.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "e1-settled".into(),
+        result_data: Some(done_with_output("k", "v")),
+    });
+    let evicted = epoch1.test_spill_all(&dir.path().join("spill.cbor"));
+    assert_eq!(evicted, 1);
+    assert_eq!(epoch1.settled_store().max_def_id(), Some(5));
+
+    // Epoch-2 promoted primary inherits the settled base + snapshot, then
+    // asserts authority at epoch 2 — the resume floor re-anchors past the
+    // inherited settled id 5.
+    let mut epoch2 = ClusterState::<RunnerIdentifier>::new();
+    epoch2.install_settled_base(epoch1.settled_base_clone());
+    epoch2.restore(epoch1.snapshot());
+    apply_primary_changed(&mut epoch2, "epoch2-primary", 2);
+
+    // The epoch-2 allocator mints id 6 next — it does NOT alias the epoch-1
+    // settled id 5. So even though the two epochs minted from independent
+    // allocators, the inherited-max resume forecloses the live collision.
+    let fresh = epoch2.allocate_def_id("e2-new");
+    assert_eq!(
+        fresh,
+        crate::cluster_state::TaskDefId(6),
+        "epoch-2's allocator resumed past the epoch-1 settled id (no reuse)"
+    );
+    assert_ne!(
+        fresh,
+        crate::cluster_state::TaskDefId(5),
+        "the cross-epoch collision on the settled id is foreclosed"
     );
 }

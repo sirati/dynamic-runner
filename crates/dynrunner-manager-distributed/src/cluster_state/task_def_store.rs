@@ -487,6 +487,33 @@ impl<I> TaskDefStore<I> {
 }
 
 impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
+    /// FAILOVER def-id resume (L6a / CL-A2): re-anchor the def allocator PAST
+    /// every def-id this replica has inherited — both halves of the ledger:
+    ///
+    ///   * the IN-MEMORY def store ([`TaskDefStore::next_id_floor`], which
+    ///     every `intern_at`/`put_slot` already advanced past its slots); and
+    ///   * the SETTLED records ([`super::settled::SettledStore::max_def_id`]):
+    ///     a settled task's def left `definitions` (the snapshot ships defs by
+    ///     value separately from the settled base, so a fresh store seeded by
+    ///     `install_settled_base` + restore does NOT re-anchor a settled id),
+    ///     yet a promoted primary must resume PAST it or it re-mints a settled
+    ///     task's id for a DIFFERENT new task — the cross-epoch aliasing a raw
+    ///     def-id dep ref (L5) would resolve to the WRONG def.
+    ///
+    /// The single seam the `PrimaryChanged` apply arm fires at the
+    /// `primary_epoch` advance (the same seam a promotion crosses). Monotone
+    /// (`resume_alloc_floor` never lowers) — a non-promoting adopter's call is
+    /// a harmless no-op. Mirrors the `next_secondary_id` failover re-derive:
+    /// scan the UNFILTERED inherited fact sources for `max + 1`.
+    pub(crate) fn resume_def_alloc_floor(&mut self) {
+        let settled_floor = self
+            .settled
+            .max_def_id()
+            .map_or(0, |m| m.saturating_add(1));
+        let floor = self.definitions.next_id_floor().max(settled_floor);
+        self.definitions.resume_alloc_floor(floor);
+    }
+
     /// Split a whole owned [`TaskInfo`] into the shared frozen `def` (interned
     /// under `hash` in `self.definitions`, deduplicated by content) + the
     /// per-entry mutable [`TaskRouting`] tail. The single construction-site
