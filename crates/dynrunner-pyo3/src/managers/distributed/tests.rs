@@ -122,7 +122,6 @@ fn build_manager_with(
         /* stage_via_setup_tasks */ false,
         /* peer_lifecycle_listener */ None,
         /* task_completed_listener */ None,
-        /* affine_satisfied_probe */ None,
         /* upload_action */ upload_action,
         /* unfulfillable_reinject_max_per_task */ cap,
         /* log_dir */ None,

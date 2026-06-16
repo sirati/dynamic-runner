@@ -120,12 +120,6 @@ pub(crate) enum SettledClass {
     Completed,
     SkippedAlreadyDone,
     SetupCompleted,
-    /// A SecondaryAffine gate that became dependency-satisfied (the
-    /// READY-not-EXECUTED terminal). Like `SetupCompleted` it RESOLVES a
-    /// dependent's `TaskDep` (a build gated on the gate unblocks) but, like
-    /// the skip, it is an INERT terminal counted in neither the success nor
-    /// any failure bucket — its own `affine_ready` slot.
-    AffineReady,
     InvalidTask,
     FailedFinal(ErrorType),
 }
@@ -615,22 +609,12 @@ pub(crate) fn settle_eligible<I>(state: &TaskState<I>) -> bool {
         TaskState::Completed { .. }
         | TaskState::SkippedAlreadyDone { .. }
         | TaskState::SetupCompleted { .. }
-        // `AffineReady` is a join fixed-point: a SecondaryAffine gate's
-        // terminal is originated once by the primary's ready-resolution hook
-        // and is never retried or re-failed (no retry bucket targets it, no
-        // reset resurrects it), so it is settle-eligible exactly like the
-        // other success-like terminals.
-        | TaskState::AffineReady { .. }
         | TaskState::InvalidTask { .. } => true,
         TaskState::Failed { kind, .. } => {
             !BucketKind::Recoverable.matches(kind) && !BucketKind::Oom.matches(kind)
         }
-        // `QueuedAfterLocalDependency` is non-terminal (an active assignment
-        // awaiting its secondary's local import), so it is NOT settle-eligible
-        // exactly like `InFlight`.
         TaskState::Pending { .. }
         | TaskState::InFlight { .. }
-        | TaskState::QueuedAfterLocalDependency { .. }
         | TaskState::Blocked { .. }
         | TaskState::Unfulfillable { .. } => false,
     }
@@ -643,7 +627,6 @@ fn settled_class_of<I>(state: &TaskState<I>) -> Option<SettledClass> {
         TaskState::Completed { .. } => Some(SettledClass::Completed),
         TaskState::SkippedAlreadyDone { .. } => Some(SettledClass::SkippedAlreadyDone),
         TaskState::SetupCompleted { .. } => Some(SettledClass::SetupCompleted),
-        TaskState::AffineReady { .. } => Some(SettledClass::AffineReady),
         TaskState::InvalidTask { .. } => Some(SettledClass::InvalidTask),
         TaskState::Failed { kind, .. } if settle_eligible(state) => {
             Some(SettledClass::FailedFinal(kind.clone()))

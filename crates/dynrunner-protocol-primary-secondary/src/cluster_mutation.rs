@@ -828,85 +828,6 @@ pub enum ClusterMutation<I> {
     SetupCompleted {
         hash: String,
     },
-    /// A `TaskKind::SecondaryAffine` task `I` became dependency-SATISFIED:
-    /// all of ITS OWN deps resolved while it was `Pending`, so it
-    /// transitions to the terminal `TaskState::AffineReady` and its
-    /// dependents (the build tasks gated on it) unblock — WITHOUT the
-    /// primary ever executing it. A SecondaryAffine task is a primary-side
-    /// dependency GATE: the per-secondary IMPORT it represents runs
-    /// once-per-secondary, locally, OFF the CRDT graph (Phase 4); the
-    /// primary's only concern is "can this gate's dependents be scheduled
-    /// yet", and the answer is yes the moment the gate's own deps are done.
-    ///
-    /// READY-not-EXECUTED (the load-bearing distinction from
-    /// [`Self::SetupCompleted`]): a setup task is EXECUTED in-process by its
-    /// affinity member and counts in `setup_succeeded`; an affine gate is
-    /// NEVER executed by the primary and is NEVER counted in
-    /// success/fail/setup_succeeded — it is a schedulability gate only (its
-    /// own inert `affine_ready` bucket keeps `total_terminal()` exact so a
-    /// resolved gate is not mis-classified STRANDED at finalize, while it
-    /// stays out of every outcome class).
-    ///
-    /// Originated by the primary's originator hook (the apply-and-broadcast
-    /// choke point) for a `kind.is_secondary_affine()` task that became
-    /// `Pending` with all deps resolved — fired BOTH when its upload dep
-    /// resolves (`resume_blocked_on` surfaces the `Blocked → Pending`
-    /// transition) AND at SPAWN for a zero-dep SecondaryAffine (born
-    /// `Pending` all-resolved → ready immediately, dependents unblocked from
-    /// t=0). Carries only `hash` (mirroring [`Self::SetupCompleted`] /
-    /// [`Self::TaskSkippedAlreadyDone`]): the `TaskInfo` lives on the ledger
-    /// entry a prior `TaskAdded`/`TasksSpawned` seeded.
-    ///
-    /// Apply rule (see `cluster_state/apply.rs`): an AUTHORITATIVE
-    /// spawn-time transition (like `TaskSkippedAlreadyDone`/`SetupCompleted`,
-    /// NOT a monotone join), so it keeps an explicit precondition arm:
-    /// `Pending → AffineReady` (Applied; the `attempt` preserved from the
-    /// `Pending` source), then `resume_blocked_on(&hash)` so the gate's
-    /// dependents unblock; any non-`Pending` state (an in-flight assignment
-    /// — which a gate never gets — or a real terminal, or an idempotent
-    /// re-application against an already-`AffineReady` entry) is a NoOp.
-    ///
-    /// Wire-safe under rolling upgrade exactly like `SetupCompleted` /
-    /// `TaskSkippedAlreadyDone`: the originator is always the newest primary;
-    /// a deployment with no SecondaryAffine tasks never originates it, so
-    /// non-adopters see zero new wire.
-    AffineReady {
-        hash: String,
-    },
-    /// A work task `B` assigned to secondary `S` is now WAITING on `S`'s
-    /// LOCAL SecondaryAffine import: `S` received `B`, found `B` depends on
-    /// a SecondaryAffine gate whose import is not yet locally done on `S`,
-    /// scheduled that import once, and QUEUED `B` behind it. The ledger
-    /// entry transitions `InFlight | Pending → TaskState::QueuedAfterLocalDependency
-    /// { secondary: S, .. }` — a CRDT-replicated, observable NON-TERMINAL
-    /// state so primary/observer SEE `B` waiting on a local dep (not lost,
-    /// not silently stuck mid-`InFlight`).
-    ///
-    /// Originated by the primary on receipt of `S`'s
-    /// [`crate::DistributedMessage::TaskQueuedAfterLocalDependency`] report
-    /// (the secondary REPORTS, the primary ORIGINATES — the work-split law):
-    /// the first such report for `B` moves it off the just-assigned
-    /// `InFlight` (or off `Pending`, on a deferred-assignment race) into the
-    /// queued state. The RELEASE half reuses the EXISTING `TaskAssigned`
-    /// originator (the standard `→ InFlight` choke point) on `S`'s
-    /// `LocalDependencyReleased` report — NOT a second InFlight originator.
-    ///
-    /// Carries `hash` + `secondary` (the queueing member, so the observable
-    /// projection and the death-seam recovery name S). The `TaskInfo`,
-    /// `version`, and `attempt` are PRESERVED from the source state onto the
-    /// resulting `QueuedAfterLocalDependency` (an authoritative rank-DROP,
-    /// like the requeue resets — it does NOT route through the monotone
-    /// join; the subsequent release `TaskAssigned` mints a strictly-higher
-    /// version that dominates the queued entry).
-    ///
-    /// Apply rule (see `cluster_state/apply.rs`): explicit precondition arm
-    /// `InFlight | Pending → QueuedAfterLocalDependency`; any other state (a
-    /// terminal that already settled `B`, or an idempotent re-application
-    /// against an already-queued entry) is a NoOp.
-    QueuedAfterLocalDependencySet {
-        hash: String,
-        secondary: String,
-    },
     /// External-control update of the per-task preferred-secondaries
     /// list. The future dispatch policy consults this field when
     /// picking a worker; this mutation lets external control planes
@@ -1288,8 +1209,7 @@ pub enum ClusterMutation<I> {
     /// see zero new wire bytes. A receiver that doesn't recognise the
     /// variant cannot occur — JSON-tag dispatch fails the whole frame,
     /// and serde flags the closed enum; rolling upgrade is therefore
-    /// release-gated (matching the
-    /// `QueuedAfterLocalDependencySet` / `AffineReady` discipline).
+    /// release-gated.
     SecondaryResourceSample {
         secondary: String,
         record: SecondaryResourceSampleRecord,

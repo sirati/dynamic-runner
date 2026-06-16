@@ -28,10 +28,9 @@ use serde::{Deserialize, Serialize};
 /// Bucket meanings mirror the manager crate's `OutcomeSummary` one-for-one
 /// (`succeeded` = worker work that completed; `fail_retry` / `fail_oom` /
 /// `fail_final` = the failure-class partition; `skipped` = discovery-time
-/// already-done terminals; `setup_succeeded` = succeeded setup-kind tasks;
-/// `affine_ready` = resolved SecondaryAffine gates). `u64` for wire
-/// stability (the manager-side counts are `usize`; widening to `u64` on the
-/// wire avoids a platform-dependent width).
+/// already-done terminals; `setup_succeeded` = succeeded setup-kind tasks).
+/// `u64` for wire stability (the manager-side counts are `usize`; widening to
+/// `u64` on the wire avoids a platform-dependent width).
 ///
 /// `Default` is all-zero — the honest partition for a PRE-DISPATCH abort
 /// (e.g. a bring-up / pre-phase-duplicate `RunAborted` broadcast before any
@@ -47,5 +46,4 @@ pub struct TerminalOutcomeCounts {
     pub fail_final: u64,
     pub skipped: u64,
     pub setup_succeeded: u64,
-    pub affine_ready: u64,
 }

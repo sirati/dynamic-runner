@@ -759,18 +759,6 @@ where
                         }
                     }
                 }
-                // #577 — the pre-existing SecondaryAffine off-loop
-                // completion arm is GONE. Affine gate bodies now run in
-                // worker subprocesses dispatched via the normal
-                // worker-dispatch path (`assign_resolved_task`); their
-                // terminal `WorkerEvent::TaskCompleted` / `TaskFailed`
-                // arrives through the existing pool-event arm above and is
-                // recognized by `binary.kind.is_secondary_affine()` in
-                // `handle_worker_event`, which routes the outcome through
-                // `on_affine_gate_worker_terminal` → the same
-                // `complete_affine_import` release body. One event channel
-                // for ALL worker terminals — no separate affine seam.
-
                 // #575 aggregated-resource-sample emit arm: every 5
                 // minutes, build the wire-shape aggregate over the
                 // current 10-min rolling buffer (~12_000 samples at

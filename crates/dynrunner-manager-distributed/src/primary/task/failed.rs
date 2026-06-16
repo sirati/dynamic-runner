@@ -32,14 +32,6 @@ use crate::worker_signal::WorkerMgmtSignal;
 ///     incarnation of the addressee secondary. The lease was wholly
 ///     invalid; the task never ran, so it requeues for re-dispatch
 ///     under the live incarnation without burning retry budget.
-///   * [`crate::secondary::affine_exec::AFFINE_GATE_ABSENT_WIRE_MESSAGE`]
-///     — the #509 gate-absent SYNC RACE: a deferred dependent's
-///     SecondaryAffine gate body was not yet synced to the holder's
-///     ledger (its assignment outran the gate's `TaskAdded`). The
-///     dependent never ran, so it RE-ROUTES (requeue, no retry-budget
-///     burn) and runs once the gate's `TaskAdded` arrives — NOT a fault.
-///     A genuine gate-BODY failure carries a different reason and IS
-///     charged.
 ///
 /// Deliberately NOT in this set:
 /// [`crate::secondary::TASK_ALREADY_HELD_WIRE_MESSAGE`] — the
@@ -56,7 +48,6 @@ fn is_backpressure_shaped(error_message: &str) -> bool {
         || error_message == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE
         || error_message == crate::primary::reconciliation_probe::RECONCILIATION_LOST_WIRE_MESSAGE
         || error_message == crate::secondary::TASK_STALE_ADDRESSEE_GEN_WIRE_MESSAGE
-        || error_message == crate::secondary::affine_exec::AFFINE_GATE_ABSENT_WIRE_MESSAGE
 }
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {

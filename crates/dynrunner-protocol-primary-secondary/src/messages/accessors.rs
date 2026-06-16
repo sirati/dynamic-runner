@@ -61,8 +61,6 @@ impl<I> DistributedMessage<I> {
             | Self::FrameChunk { target, .. }
             | Self::SetupAssignment { target, .. }
             | Self::SetupTerminal { target, .. }
-            | Self::TaskQueuedAfterLocalDependency { target, .. }
-            | Self::LocalDependencyReleased { target, .. }
             | Self::IllegallyAssignedToNonidleWorker { target, .. }
             | Self::RequestInFlightRoster { target, .. }
             | Self::InFlightRoster { target, .. }
@@ -127,8 +125,6 @@ impl<I> DistributedMessage<I> {
             | Self::FrameChunk { target, .. }
             | Self::SetupAssignment { target, .. }
             | Self::SetupTerminal { target, .. }
-            | Self::TaskQueuedAfterLocalDependency { target, .. }
-            | Self::LocalDependencyReleased { target, .. }
             | Self::IllegallyAssignedToNonidleWorker { target, .. }
             | Self::RequestInFlightRoster { target, .. }
             | Self::InFlightRoster { target, .. }
@@ -207,8 +203,6 @@ impl<I> DistributedMessage<I> {
             | Self::FrameChunk { target, .. }
             | Self::SetupAssignment { target, .. }
             | Self::SetupTerminal { target, .. }
-            | Self::TaskQueuedAfterLocalDependency { target, .. }
-            | Self::LocalDependencyReleased { target, .. }
             | Self::IllegallyAssignedToNonidleWorker { target, .. }
             | Self::RequestInFlightRoster { target, .. }
             | Self::InFlightRoster { target, .. }
@@ -268,8 +262,6 @@ impl<I> DistributedMessage<I> {
             | Self::FrameChunk { sender_id, .. }
             | Self::SetupAssignment { sender_id, .. }
             | Self::SetupTerminal { sender_id, .. }
-            | Self::TaskQueuedAfterLocalDependency { sender_id, .. }
-            | Self::LocalDependencyReleased { sender_id, .. }
             | Self::IllegallyAssignedToNonidleWorker { sender_id, .. }
             | Self::RequestInFlightRoster { sender_id, .. }
             | Self::InFlightRoster { sender_id, .. }
@@ -328,8 +320,6 @@ impl<I> DistributedMessage<I> {
             | Self::FrameChunk { timestamp, .. }
             | Self::SetupAssignment { timestamp, .. }
             | Self::SetupTerminal { timestamp, .. }
-            | Self::TaskQueuedAfterLocalDependency { timestamp, .. }
-            | Self::LocalDependencyReleased { timestamp, .. }
             | Self::IllegallyAssignedToNonidleWorker { timestamp, .. }
             | Self::RequestInFlightRoster { timestamp, .. }
             | Self::InFlightRoster { timestamp, .. }
@@ -637,10 +627,6 @@ impl<I> DistributedMessage<I> {
             Self::FrameChunk { .. } => MessageType::FrameChunk,
             Self::SetupAssignment { .. } => MessageType::SetupAssignment,
             Self::SetupTerminal { .. } => MessageType::SetupTerminal,
-            Self::TaskQueuedAfterLocalDependency { .. } => {
-                MessageType::TaskQueuedAfterLocalDependency
-            }
-            Self::LocalDependencyReleased { .. } => MessageType::LocalDependencyReleased,
             Self::IllegallyAssignedToNonidleWorker { .. } => {
                 MessageType::IllegallyAssignedToNonidleWorker
             }

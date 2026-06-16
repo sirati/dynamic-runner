@@ -156,9 +156,6 @@ fn outcome_tally_matches_scan() {
     s.apply(ClusterMutation::SetupCompleted { hash: "t07".into() });
     assert_tally_matches_scan(&s);
     assert_eq!(s.outcome_counts().setup_succeeded, 1);
-    s.apply(ClusterMutation::AffineReady { hash: "t08".into() });
-    assert_tally_matches_scan(&s);
-    assert_eq!(s.outcome_counts().affine_ready, 1);
 
     // Complete a spread of the remaining Pending tasks so the spill has a
     // representative slice of settle-eligible terminals to move.

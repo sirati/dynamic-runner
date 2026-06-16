@@ -944,22 +944,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             // secondary's inbox arm. `arm_stats` counts ONE
                             // selection regardless of batch size (it measures
                             // select! wins, not frames).
-                            // Dispatch the follow-on batch through the
-                            // deferral-coalescing path: a contiguous run of
-                            // affine-deferral reports (the build_compilers
-                            // burst — S secondaries × M dependents) collapses
-                            // to ONE Destination::All broadcast per run instead
-                            // of one per report, so the burst no longer floods
-                            // ingest cluster-wide and trips the self-starvation
-                            // false-election. Every other frame keeps normal
-                            // per-call broadcast semantics; order is preserved.
                             let follow_on =
                                 self.inbox.drain_ready(INBOX_BATCH_DRAIN_CAP);
-                            self.dispatch_inbox_batch_coalescing_deferrals(
-                                follow_on,
-                                &mut command_rx,
-                            )
-                            .await?;
+                            for m in follow_on {
+                                self.dispatch_message(m, &mut command_rx).await?;
+                            }
                         }
                         None => {
                             // The operational inbox closed: every sender —

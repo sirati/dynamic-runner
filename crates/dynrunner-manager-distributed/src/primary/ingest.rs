@@ -411,48 +411,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // applied frames for the post-connection broadcast. The resumed /
         // re-inject surfaces are empty for a fresh seed (no `Blocked`
         // dependents exist before the first dispatch), so we discard them.
-        let mut staged = apply_locally_for_broadcast(&mut self.cluster_state, seed).applied;
-
-        // SecondaryAffine ready-resolution over the SEED surface (#502). The
-        // `TaskAdded` fan-out above seeds each gate `Pending` WITHOUT riding
-        // the apply-pass delta surface the live AffineReady originator fires
-        // on (`TaskAdded`'s apply arm deliberately does not feed
-        // `newly_pending_from_spawn`), so a no-dep gate — or one whose deps
-        // are pre-succeeded staging setup tasks, already terminal in the same
-        // seed — is born `Pending`-all-resolved yet never transitions to the
-        // terminal `AffineReady`. Resolve them off the just-applied ledger
-        // and APPLY+STAGE the `AffineReady` frames alongside the seed: the
-        // LOCAL apply makes the pre-connection `hydrate_from_cluster_state`
-        // (run before `wait_for_connections`) seed each resolved gate terminal
-        // and OUT of the pool (its `task_id` resolving dependents in
-        // `extend()`), and the staged frames ride the same post-connection
-        // `broadcast_cold_seed` drain so every secondary — and the relocate
-        // target's promotion snapshot — mirrors the resolved gate. The
-        // gate-resolution rides the SAME `apply_locally_for_broadcast`
-        // stamp+apply+filter the seed used, so a no-op when the corpus
-        // carries no resolvable gate (an empty `affine_ready` set short-
-        // circuits the apply to an empty `applied`).
-        let affine_ready = self.cluster_state.affine_ready_mutations_for_ledger();
-        if !affine_ready.is_empty() {
-            // Bucket the per-gate "EMITTED AffineReady" INFO lines so an
-            // operator reading the log can attribute them to the cold-seed
-            // local-apply pass (this surface) rather than the live-delta
-            // surface (`apply_and_broadcast_cluster_mutations`'s
-            // `became_pending`) or the post-seed dispatch surface
-            // (`affine_dispatch::resolve_dependency_satisfied_affine_gates`).
-            // Without this bucket, the per-gate lines time-cluster with
-            // later cold-seed pipeline steps (handshake, relocation) and read
-            // as causally adjacent — the #548 false-causal report. Cheap one-
-            // line marker; the per-gate lines remain at their original site.
-            tracing::info!(
-                count = affine_ready.len(),
-                "cold-seed local apply: emitting AffineReady for no-dep / \
-                 pre-resolved SecondaryAffine gates"
-            );
-            let mut applied =
-                apply_locally_for_broadcast(&mut self.cluster_state, affine_ready).applied;
-            staged.append(&mut applied);
-        }
+        let staged = apply_locally_for_broadcast(&mut self.cluster_state, seed).applied;
 
         self.pending_cold_seed_broadcast = staged;
         Ok(())
@@ -741,10 +700,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .filter_map(|(hash, state)| match state {
                 TaskState::Pending { .. }
                 | TaskState::InFlight { .. }
-                // A queued-behind-local-import task is not-yet-terminal work
-                // (an active assignment), so a #3b run-wide invalidation
-                // wipes it exactly like an `InFlight`/`Pending`/`Blocked`.
-                | TaskState::QueuedAfterLocalDependency { .. }
                 // L5: resolve dep refs via the store.
                 | TaskState::Blocked { .. } => Some((hash.clone(), self.cluster_state.task_to_info(state))),
                 TaskState::Completed { .. }
@@ -752,13 +707,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 | TaskState::Unfulfillable { .. }
                 | TaskState::InvalidTask { .. }
                 // Already terminal: a #3b run-wide invalidation must not
-                // overwrite a skip, a succeeded setup task, or a resolved
-                // SecondaryAffine gate (the apply rule's weakest-terminal
-                // lockout would NoOp it anyway; skipping it here keeps the
-                // broadcast minimal).
+                // overwrite a skip or a succeeded setup task (the apply rule's
+                // weakest-terminal lockout would NoOp it anyway; skipping it
+                // here keeps the broadcast minimal).
                 | TaskState::SkippedAlreadyDone { .. }
-                | TaskState::SetupCompleted { .. }
-                | TaskState::AffineReady { .. } => None,
+                | TaskState::SetupCompleted { .. } => None,
             })
             .collect();
         if targets.is_empty() {
