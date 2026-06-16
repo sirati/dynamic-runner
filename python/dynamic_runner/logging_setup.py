@@ -323,6 +323,13 @@ def setup_logging(args: argparse.Namespace) -> logging.Logger:
         important_stdio_only, getattr(args, "full_log_file", None), full_log_dir
     )
     debug = bool(getattr(args, "debug", False))
+    # Per-role-file on-disk cap for the forensic-complete file sinks. Passed
+    # THROUGH unchanged (incl. `None`): the native side owns the bounded
+    # default (`None` → its ~2 GiB `DEFAULT_FULL_LOG_MAX_BYTES`, `0` → the
+    # unbounded #585 opt-out), so the default magnitude is NOT duplicated here.
+    # A fleet-wide policy value, so it forwards verbatim to secondaries (it is
+    # neither submitter-local nor framework-regenerated — see _framework_flags).
+    full_log_max_bytes = getattr(args, "full_log_max_bytes", None)
 
     # Deferred native subscriber install — explicit params, after argparse.
     # Local import: the native function lives on the package's re-exported
@@ -343,6 +350,7 @@ def setup_logging(args: argparse.Namespace) -> logging.Logger:
         full_log_file=full_log_file,
         full_log_dir=full_log_dir,
         debug=debug,
+        full_log_max_bytes=full_log_max_bytes,
     )
 
     if getattr(args, "secondary", None):

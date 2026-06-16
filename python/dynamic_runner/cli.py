@@ -164,6 +164,26 @@ def add_framework_arguments(
             "`init_logging(...)` parameter after argparse — no env var."
         ),
     )
+    parser.add_argument(
+        "--full-log-max-bytes",
+        type=int,
+        default=None,
+        metavar="BYTES",
+        help=(
+            "Per-role-file on-disk byte cap for the forensic-complete TRACE "
+            "file sinks (setup.log / primary.log / secondary.log / "
+            "observer.log). Bounds #585's forensic-complete file log to a "
+            "size-capped TAIL (the live segment plus a small ring of older "
+            "segments) so a long/large run cannot fill the disk; a normal "
+            "run's role files stay well under the default ~2 GiB cap and never "
+            "rotate. `0` opts back out to the unbounded #585 behaviour. Default "
+            "(unset) applies the native ~2 GiB cap. Threaded as an explicit "
+            "`init_logging(...)` parameter after argparse — no env var. A "
+            "fleet-wide policy cap (same value on every node), so it forwards "
+            "VERBATIM to secondaries (unlike the per-node --full-log-dir path "
+            "which is regenerated per job)."
+        ),
+    )
 
     add_selection_arguments(parser)
 

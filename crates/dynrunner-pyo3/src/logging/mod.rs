@@ -80,9 +80,11 @@
 
 mod compact_format;
 mod debounce;
+mod ring_writer;
 
 use std::fs::OpenOptions;
 use std::io;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -208,6 +210,15 @@ pub(crate) struct LogConfig {
     /// so the field name reflects the only knob `--debug` actually drives —
     /// the operator-facing stream.
     pub(crate) level: LevelFilter,
+    /// Per-role-file on-disk byte cap for the forensic-complete file sinks.
+    /// `0` means UNBOUNDED — the exact prior (#585) behaviour: each file sink
+    /// is a bare append-create file with no rotation. When non-zero each file
+    /// sink's inner writer is a [`ring_writer::RingWriter`] that bounds the
+    /// file's on-disk volume to roughly this many bytes while retaining the
+    /// failure-proximate TAIL (the live segment plus a fixed ring of older
+    /// segments). Default [`DEFAULT_FULL_LOG_MAX_BYTES`]; `--full-log-max-bytes`
+    /// overrides, `0` opts back out to unbounded.
+    pub(crate) full_log_max_bytes: u64,
 }
 
 impl LogConfig {
@@ -232,6 +243,7 @@ impl LogConfig {
         full_log_file: Option<String>,
         full_log_dir: Option<String>,
         debug: bool,
+        full_log_max_bytes: u64,
     ) -> Self {
         let trimmed = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
         let full_sink = match trimmed(full_log_dir) {
@@ -245,9 +257,21 @@ impl LogConfig {
             important_stdio_only,
             full_sink,
             level: level_filter(debug),
+            full_log_max_bytes,
         }
     }
 }
+
+/// Default per-role-file on-disk cap for the forensic-complete TRACE file
+/// sinks: ~2 GiB. Bounds #585's forensic-complete file log to a bounded TAIL
+/// (the live segment plus a small ring of older segments) by default, so a
+/// long/large run cannot fill the disk — at 46k-task×15-node scale #585 wrote
+/// 118 GB/38 min (21 GB on one node's `setup.log`) and filled the 477 GB quota
+/// → exit-126 fleet death; at this cap that `setup.log` rings at ~2 GiB
+/// instead. A NORMAL run's role files are well under 2 GiB, so they never
+/// rotate and read identically to today. Opt back out to the exact unbounded
+/// #585 behaviour with `--full-log-max-bytes 0`.
+const DEFAULT_FULL_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The STDIO-sink verbosity ceiling, resolved from the explicit `--debug`
 /// flag: `DEBUG` when on, else the historical `INFO`. This is the single
@@ -573,11 +597,19 @@ const FILE_APPENDER_BUFFERED_LINES: usize = 100_000;
 /// The returned [`WorkerGuard`] MUST be held for the process lifetime: its
 /// `Drop` flushes the buffer, which is what preserves the fatal-flush
 /// guarantee on a CLEAN exit (see [`init_with`]).
-fn non_blocking_file(file: std::fs::File) -> (NonBlocking, WorkerGuard) {
+///
+/// Generic over the inner writer (`W: Write + Send + 'static`, which is all
+/// `NonBlockingBuilder::finish` requires) so the high-volume file sink can be
+/// EITHER a bare append-create `std::fs::File` (the unbounded `max_bytes == 0`
+/// opt-out — exact prior behaviour) OR a size-bounded [`ring_writer::RingWriter`]
+/// (the default bounded TAIL). The ring slots HERE, under the non-blocking
+/// appender, so its rotate `rename`/`unlink` syscalls run on the SAME single
+/// drain thread that owns the write — off the async runtime, no fd contention.
+fn non_blocking_file<W: Write + Send + 'static>(writer: W) -> (NonBlocking, WorkerGuard) {
     NonBlockingBuilder::default()
         .lossy(true)
         .buffered_lines_limit(FILE_APPENDER_BUFFERED_LINES)
-        .finish(file)
+        .finish(writer)
 }
 
 /// Process-lifetime parking lot for the file appenders' [`WorkerGuard`]s.
@@ -625,12 +657,29 @@ where
     // Each `WorkerGuard` keeps its file's single drain thread alive and
     // flushes its buffer on `Drop`.
     let mut guards: Vec<WorkerGuard> = Vec::new();
-    // Open a file append-create AND wrap it non-blocking, stashing the guard.
-    // ONE helper so every high-volume file sink (the submitter's single file
-    // AND every per-node role/setup file) goes through the same drain-thread
-    // path — no per-sink special-casing of the writer.
+    // Open the high-volume sink's inner writer AND wrap it non-blocking,
+    // stashing the guard. ONE helper so every file sink (the submitter's single
+    // file AND every per-node role/setup file) goes through the same
+    // drain-thread path — no per-sink special-casing.
+    //
+    // The inner writer is chosen ONCE by the cap, not per-sink: when
+    // `full_log_max_bytes == 0` it is the bare append-create file (the exact
+    // unbounded #585 behaviour — opt-out); otherwise it is a size-bounded
+    // [`ring_writer::RingWriter`] that caps each file's on-disk volume to
+    // roughly the cap while keeping the failure-proximate TAIL. The ring's
+    // rotate syscalls run on the appender's single drain thread (see
+    // [`non_blocking_file`]). A RingWriter open failure is fatal the same way
+    // `open_append_create` is (the durable record must exist), so it panics
+    // with the path for a diagnosable bring-up failure.
+    let max_bytes = config.full_log_max_bytes;
     let mut nb = |path: PathBuf| -> NonBlocking {
-        let (writer, guard) = non_blocking_file(open_append_create(&path));
+        let (writer, guard) = if max_bytes == 0 {
+            non_blocking_file(open_append_create(&path))
+        } else {
+            let ring = ring_writer::RingWriter::new(path.clone(), max_bytes)
+                .unwrap_or_else(|e| panic!("failed to open ring log file {}: {e}", path.display()));
+            non_blocking_file(ring)
+        };
         guards.push(guard);
         writer
     };
@@ -753,20 +802,32 @@ pub(crate) fn init_with(config: &LogConfig) {
 /// [`LogConfig::new`]); `debug` raises every sink's verbosity ceiling to
 /// `DEBUG` (the parsed `--debug` flag), so a `--debug` run produces DEBUG
 /// lines in the per-role/full sinks — not just at the Python root logger.
+/// `full_log_max_bytes` caps each forensic-complete file sink's on-disk volume
+/// (the bounded TAIL); `None` applies the native [`DEFAULT_FULL_LOG_MAX_BYTES`]
+/// default, `Some(0)` opts out to the unbounded #585 behaviour — so the bounded
+/// default is owned in ONE place (this crate), not duplicated on the Python side.
 #[pyfunction]
 #[pyo3(name = "init_logging", signature = (
     important_stdio_only = false,
     full_log_file = None,
     full_log_dir = None,
     debug = false,
+    full_log_max_bytes = None,
 ))]
 pub(crate) fn py_init_logging(
     important_stdio_only: bool,
     full_log_file: Option<String>,
     full_log_dir: Option<String>,
     debug: bool,
+    full_log_max_bytes: Option<u64>,
 ) {
-    let config = LogConfig::new(important_stdio_only, full_log_file, full_log_dir, debug);
+    let config = LogConfig::new(
+        important_stdio_only,
+        full_log_file,
+        full_log_dir,
+        debug,
+        full_log_max_bytes.unwrap_or(DEFAULT_FULL_LOG_MAX_BYTES),
+    );
     init_with(&config);
 }
 
@@ -1228,9 +1289,9 @@ mod tests {
         assert_eq!(level_filter(false), LevelFilter::INFO);
 
         // And it lands on the config the stdio layer reads its level from.
-        let cfg = LogConfig::new(false, None, None, true);
+        let cfg = LogConfig::new(false, None, None, true, 0);
         assert_eq!(cfg.level, LevelFilter::DEBUG);
-        let cfg = LogConfig::new(false, None, None, false);
+        let cfg = LogConfig::new(false, None, None, false, 0);
         assert_eq!(cfg.level, LevelFilter::INFO);
 
         // The file ceiling is fixed at TRACE — not parametric.
@@ -1325,14 +1386,15 @@ mod tests {
             Some("/x/full.log".into()),
             Some("/x/dir".into()),
             false,
+            0,
         );
         assert!(matches!(cfg.full_sink, FullSink::PerNodeDir(_)));
         assert!(cfg.important_stdio_only);
 
-        let cfg = LogConfig::new(false, Some("/x/full.log".into()), None, false);
+        let cfg = LogConfig::new(false, Some("/x/full.log".into()), None, false, 0);
         assert!(matches!(cfg.full_sink, FullSink::File(_)));
 
-        let cfg = LogConfig::new(false, Some("   ".into()), Some("\t".into()), false);
+        let cfg = LogConfig::new(false, Some("   ".into()), Some("\t".into()), false, 0);
         assert!(
             matches!(cfg.full_sink, FullSink::Stdout),
             "whitespace-only knobs must collapse to the stdout single-stream"
@@ -1343,7 +1405,7 @@ mod tests {
     fn no_full_log_file_yields_a_single_stdout_stream() {
         // Default config (no file, gate off) must produce exactly one
         // layer — the historical single stdout stream, no duplication.
-        let config = LogConfig::new(false, None, None, false);
+        let config = LogConfig::new(false, None, None, false, 0);
         let (layers, _guards) = build_layers::<Registry>(&config);
         assert_eq!(
             layers.len(),
@@ -1363,6 +1425,7 @@ mod tests {
             Some(dir.path().join("full.log").display().to_string()),
             None,
             false,
+            0,
         );
         let (layers, _guards) = build_layers::<Registry>(&config);
         assert_eq!(layers.len(), 2, "expected full-file layer + stdio layer");
@@ -1378,7 +1441,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node_dir = dir.path().join("sec-0");
         assert!(!node_dir.exists(), "precondition: per-node dir absent");
-        let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false);
+        let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false, 0);
         let (layers, _guards) = build_layers::<Registry>(&config);
         assert_eq!(
             layers.len(),
@@ -1423,6 +1486,7 @@ mod tests {
             None,
             Some(node_dir.display().to_string()),
             false,
+            0,
         );
         let (layers, guards) = build_layers::<Registry>(&config);
         // No global level gate — each layer in `build_layers` carries its
@@ -1612,6 +1676,11 @@ mod tests {
             None,
             Some(node_dir.display().to_string()), // PerNodeDir → role_full_layers
             false,                                // --debug OFF
+            // DEFAULT bounded cap (not 0): exercises the RingWriter inner-writer
+            // path under the non-blocking appender end-to-end — the tiny writes
+            // here never rotate, so forensic-completeness/routing through the
+            // ring is what this asserts (the ring is transparent under the cap).
+            DEFAULT_FULL_LOG_MAX_BYTES,
         );
         // Compose EXACTLY as `init_with`: per-layer ceilings, no global
         // registry-level filter.
@@ -1674,7 +1743,7 @@ mod tests {
         let node_dir = dir.path().join("compute-0");
         // The compute-node relocated-primary config: per-node-dir full sink,
         // importance OFF (it is NOT forwarded to non-submitter roles).
-        let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false);
+        let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false, 0);
 
         let stdio_buf = BufWriter::default();
         // Mirror production `build_layers` for PerNodeDir (the three role files)
@@ -1752,7 +1821,7 @@ mod tests {
     fn py_log_outside_role_span_reaches_no_role_file() {
         let dir = tempfile::tempdir().unwrap();
         let node_dir = dir.path().join("compute-0");
-        let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false);
+        let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false, 0);
         let (layers, guards) = build_layers::<Registry>(&config);
         // No global level filter — per-layer ceilings.
         let subscriber = Registry::default().with(layers);
@@ -1803,7 +1872,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node_dir = dir.path().join("compute-0");
         // Stdio at INFO (debug off); file at TRACE (forensic contract).
-        let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false);
+        let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false, 0);
 
         // We need to observe stdio too — substitute an in-memory writer for
         // the always-present stdio layer so the bridge-exclusion + level
@@ -1995,7 +2064,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node_dir = dir.path().join("secondary-0");
         // --debug OFF — the file sink must still admit DEBUG + TRACE.
-        let config = LogConfig::new(true, None, Some(node_dir.display().to_string()), false);
+        let config = LogConfig::new(true, None, Some(node_dir.display().to_string()), false, 0);
 
         // The REAL global install the cluster runs (`try_init`).
         init_with(&config);
@@ -2054,6 +2123,7 @@ mod tests {
             Some(full_file.display().to_string()), // File full sink
             None,
             false, // --debug OFF
+            0,
         );
         init_with(&config);
 
