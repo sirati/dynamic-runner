@@ -480,7 +480,7 @@ impl<I> TaskState<I> {
     /// SINGLE place the discriminant + the fail-class fold map onto the
     /// operator-narration level/wording, so apply and restore narrate
     /// byte-identically. The fail classes fold `kind` the SAME way
-    /// [`ClusterState::outcome_counts`]'s `fold_failed_kind` does
+    /// the outcome partition's `outcome_tally::bucket_for_failed_kind` does
     /// (`Recoverable` → recoverable/WARN, `ResourceExhausted("memory")` →
     /// oom/WARN, everything else terminal → terminal/ERROR), so the level
     /// is the CRDT's own authoritative bucketing.

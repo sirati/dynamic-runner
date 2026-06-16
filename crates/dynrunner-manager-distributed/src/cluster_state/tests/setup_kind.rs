@@ -131,8 +131,8 @@ fn setup_succeeded_counter_disjoint_from_succeeded() {
     // One ordinary completed WORK task ...
     let work = mk_task("work");
     let work_hash = crate::primary::wire::compute_task_hash(&work);
-    s.tasks.insert(
-        work_hash,
+    s.seed_task_state_for_test(
+        &work_hash,
         TaskState::Completed {
             task: work,
             attempt: 0,
@@ -141,8 +141,8 @@ fn setup_succeeded_counter_disjoint_from_succeeded() {
     // ... and one succeeded SETUP task.
     let setup = mk_setup_task("setup");
     let setup_hash = crate::primary::wire::compute_task_hash(&setup);
-    s.tasks.insert(
-        setup_hash,
+    s.seed_task_state_for_test(
+        &setup_hash,
         TaskState::SetupCompleted {
             task: setup,
             attempt: 0,
