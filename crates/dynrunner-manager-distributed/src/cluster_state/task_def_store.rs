@@ -25,7 +25,6 @@
 //! leaf). The constructor-, intern-, and resolve-surfaces are therefore
 //! `#[allow(dead_code)]` until that leaf lands — the methods are real and
 //! tested, just not yet called outside `#[cfg(test)]`.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -53,7 +52,7 @@ pub(crate) struct TaskDefId(pub u32);
 /// future def-transfer wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
-pub(crate) struct FrozenTaskDef<I> {
+pub struct FrozenTaskDef<I> {
     pub path: PathBuf,
     pub size: u64,
     pub identifier: I,
@@ -123,6 +122,59 @@ impl<I> FrozenTaskDef<I> {
             resolved_path,
         )
     }
+
+    /// Reconstruct a whole owned [`TaskInfo`] from this frozen core (its 13
+    /// immutable fields, cloned) + a [`TaskRouting`] tail (the 3 mutable
+    /// fields). The inverse of [`Self::from_task_info`] and the SINGLE place
+    /// the 16-field rebuild lives — both `TaskState::to_task_info` and the
+    /// affine-gate resolver delegate here so no caller re-spells it. A
+    /// TRANSIENT allocation: only for callers that genuinely need a whole
+    /// owned `TaskInfo` (a wire `TaskAssignment`, a pool insert).
+    pub(crate) fn to_task_info(&self, routing: &super::types::TaskRouting) -> TaskInfo<I>
+    where
+        I: Clone,
+    {
+        TaskInfo {
+            path: self.path.clone(),
+            size: self.size,
+            identifier: self.identifier.clone(),
+            phase_id: self.phase_id.clone(),
+            type_id: self.type_id.clone(),
+            kind: self.kind,
+            setup_affinity: self.setup_affinity.clone(),
+            upload_file: self.upload_file.clone(),
+            required_files: self.required_files.clone(),
+            affinity_id: self.affinity_id.clone(),
+            payload: self.payload.clone(),
+            task_id: self.task_id.clone(),
+            task_depends_on: self.task_depends_on.clone(),
+            preferred_secondaries: routing.preferred_secondaries.clone(),
+            preferred_version: routing.preferred_version,
+            resolved_path: routing.resolved_path.clone(),
+        }
+    }
+}
+
+/// Split a whole owned [`TaskInfo`] into a STANDALONE shared `def` (a fresh
+/// `Arc`, NOT interned in any store) + its [`TaskRouting`] tail. The
+/// un-interned sibling of [`super::ClusterState::intern_task_def`]: for
+/// callers that build a `TaskState` WITHOUT a store to intern into (the
+/// cluster_state unit tests construct states directly). Production
+/// construction routes through `intern_task_def` so equal defs dedup; this
+/// helper exists only where there is no store to dedup against — today that
+/// is exclusively the unit tests, so it is `#[cfg(test)]`.
+#[cfg(test)]
+pub(crate) fn split_task_def<I>(task: TaskInfo<I>) -> (Arc<FrozenTaskDef<I>>, super::types::TaskRouting) {
+    let (frozen, preferred_secondaries, preferred_version, resolved_path) =
+        FrozenTaskDef::from_task_info(task);
+    (
+        Arc::new(frozen),
+        super::types::TaskRouting {
+            preferred_secondaries,
+            preferred_version,
+            resolved_path,
+        },
+    )
 }
 
 /// The replicated frozen-def registry: a dense def vector indexed by
@@ -225,15 +277,54 @@ impl<I> TaskDefStore<I> {
     }
 
     /// The id a content `hash` resolves to, if this store has interned it.
+    /// L1-tested but with no production caller until the primary-allocated
+    /// wire-agreed-id leaf lands (L2 interns LOCALLY per node); kept as the
+    /// real, tested surface that leaf consumes.
+    #[allow(dead_code)]
     pub(crate) fn id_for_hash(&self, hash: &str) -> Option<TaskDefId> {
         self.hash_to_id.get(hash).copied()
     }
 
     /// The next id this store would mint (`max id + 1`, i.e. the def
     /// count) — the resume helper that re-anchors id minting after a
-    /// restore so a respawned originator never re-uses a live id.
+    /// restore so a respawned originator never re-uses a live id. No
+    /// production caller until the resume/originate id leaf lands.
+    #[allow(dead_code)]
     pub(crate) fn next_id_floor(&self) -> u32 {
         self.defs.len() as u32
+    }
+}
+
+impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
+    /// Split a whole owned [`TaskInfo`] into the shared frozen `def` (interned
+    /// under `hash` in `self.definitions`, deduplicated by content) + the
+    /// per-entry mutable [`TaskRouting`] tail. The single construction-site
+    /// helper a `TaskState` builder calls when it holds a whole `TaskInfo`
+    /// and `&mut self` (the apply / merge / hydrate paths): it owns the
+    /// `from_task_info` split + `intern` + `resolve` sequence so no caller
+    /// re-spells it. Local interning per node is fine — the in-memory `Arc`
+    /// is what dedups; wire-agreed ids are a later leaf.
+    pub(crate) fn intern_task_def(
+        &mut self,
+        hash: &str,
+        task: TaskInfo<I>,
+    ) -> (Arc<FrozenTaskDef<I>>, super::types::TaskRouting) {
+        let (frozen, preferred_secondaries, preferred_version, resolved_path) =
+            FrozenTaskDef::from_task_info(task);
+        let id = self.definitions.intern(hash.to_string(), frozen);
+        let def = self
+            .definitions
+            .resolve(id)
+            .expect("freshly interned def resolves")
+            .clone();
+        (
+            def,
+            super::types::TaskRouting {
+                preferred_secondaries,
+                preferred_version,
+                resolved_path,
+            },
+        )
     }
 }
 

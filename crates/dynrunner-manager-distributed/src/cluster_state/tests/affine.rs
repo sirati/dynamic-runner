@@ -45,10 +45,12 @@ fn affine_ready_resolves_dependents_without_execution() {
     let mut upload = mk_task("upload");
     upload.kind = TaskKind::Setup;
     let upload_hash = crate::primary::wire::compute_task_hash(&upload);
+    let (def, routing) = crate::cluster_state::split_task_def(upload);
     s.tasks.insert(
         upload_hash.clone(),
         TaskState::InFlight {
-            task: upload,
+            def,
+            routing,
             secondary: "member-1".into(),
             worker: 0,
             version: Default::default(),
@@ -183,10 +185,12 @@ fn blocked_dependent_born_pending_when_i_already_affine_ready() {
     // The gate is already AffineReady.
     let gate = mk_affine_task("import");
     let gate_hash = crate::primary::wire::compute_task_hash(&gate);
+    let (def, routing) = crate::cluster_state::split_task_def(gate);
     s.tasks.insert(
         gate_hash,
         TaskState::AffineReady {
-            task: gate,
+            def,
+            routing,
             attempt: 0,
         },
     );
@@ -213,29 +217,35 @@ fn affine_ready_never_counted_in_success_fail_total() {
     // One completed WORK task, one succeeded SETUP task, one AffineReady gate.
     let work = mk_task("work");
     let work_hash = crate::primary::wire::compute_task_hash(&work);
+    let (def, routing) = crate::cluster_state::split_task_def(work);
     s.seed_task_state_for_test(
         &work_hash,
         TaskState::Completed {
-            task: work,
+            def,
+            routing,
             attempt: 0,
         },
     );
     let mut setup = mk_task("setup");
     setup.kind = TaskKind::Setup;
     let setup_hash = crate::primary::wire::compute_task_hash(&setup);
+    let (def, routing) = crate::cluster_state::split_task_def(setup);
     s.seed_task_state_for_test(
         &setup_hash,
         TaskState::SetupCompleted {
-            task: setup,
+            def,
+            routing,
             attempt: 0,
         },
     );
     let gate = mk_affine_task("import");
     let gate_hash = crate::primary::wire::compute_task_hash(&gate);
+    let (def, routing) = crate::cluster_state::split_task_def(gate);
     s.seed_task_state_for_test(
         &gate_hash,
         TaskState::AffineReady {
-            task: gate,
+            def,
+            routing,
             attempt: 0,
         },
     );
@@ -279,10 +289,12 @@ fn affine_ready_apply_idempotent_and_gated() {
     let gate_hash = crate::primary::wire::compute_task_hash(&gate);
 
     // Pending (attempt 7 to prove it is preserved) → AffineReady Applied.
+    let (def, routing) = crate::cluster_state::split_task_def(gate);
     s.tasks.insert(
         gate_hash.clone(),
         TaskState::Pending {
-            task: gate,
+            def,
+            routing,
             version: Default::default(),
             attempt: 7,
         },
@@ -305,10 +317,12 @@ fn affine_ready_apply_idempotent_and_gated() {
     // Gated: a real terminal locks out a late AffineReady.
     let other = mk_affine_task("other");
     let other_hash = crate::primary::wire::compute_task_hash(&other);
+    let (def, routing) = crate::cluster_state::split_task_def(other);
     s.tasks.insert(
         other_hash.clone(),
         TaskState::Failed {
-            task: other,
+            def,
+            routing,
             kind: ErrorType::NonRecoverable,
             last_error: "x".into(),
             version: Default::default(),
@@ -331,10 +345,12 @@ fn affine_ready_apply_idempotent_and_gated() {
     // valid AffineReady source — only Pending is.
     let inflight = mk_affine_task("inflight");
     let inflight_hash = crate::primary::wire::compute_task_hash(&inflight);
+    let (def, routing) = crate::cluster_state::split_task_def(inflight);
     s.tasks.insert(
         inflight_hash.clone(),
         TaskState::InFlight {
-            task: inflight,
+            def,
+            routing,
             secondary: "m".into(),
             worker: 0,
             version: Default::default(),
@@ -368,20 +384,24 @@ fn affine_ready_originator_requires_all_deps_resolved() {
     let mut up_done = mk_task("up_done");
     up_done.kind = TaskKind::Setup;
     let up_done_hash = crate::primary::wire::compute_task_hash(&up_done);
+    let (def, routing) = crate::cluster_state::split_task_def(up_done);
     s.tasks.insert(
         up_done_hash,
         TaskState::SetupCompleted {
-            task: up_done,
+            def,
+            routing,
             attempt: 0,
         },
     );
     let mut up_live = mk_task("up_live");
     up_live.kind = TaskKind::Setup;
     let up_live_hash = crate::primary::wire::compute_task_hash(&up_live);
+    let (def, routing) = crate::cluster_state::split_task_def(up_live);
     s.tasks.insert(
         up_live_hash,
         TaskState::InFlight {
-            task: up_live,
+            def,
+            routing,
             secondary: "m".into(),
             worker: 0,
             version: Default::default(),
@@ -393,10 +413,12 @@ fn affine_ready_originator_requires_all_deps_resolved() {
     // already flipped it Blocked→Pending) but `up_live` is NOT terminal.
     let gate = with_dep(with_dep(mk_affine_task("import"), "up_done"), "up_live");
     let gate_hash = crate::primary::wire::compute_task_hash(&gate);
+    let (def, routing) = crate::cluster_state::split_task_def(gate);
     s.tasks.insert(
         gate_hash.clone(),
         TaskState::Pending {
-            task: gate,
+            def,
+            routing,
             version: Default::default(),
             attempt: 0,
         },
@@ -421,10 +443,12 @@ fn affine_ready_round_trips_snapshot() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
     let gate = mk_affine_task("import");
     let gate_hash = crate::primary::wire::compute_task_hash(&gate);
+    let (def, routing) = crate::cluster_state::split_task_def(gate);
     s.tasks.insert(
         gate_hash.clone(),
         TaskState::AffineReady {
-            task: gate,
+            def,
+            routing,
             attempt: 0,
         },
     );
@@ -443,10 +467,12 @@ fn affine_ready_round_trips_snapshot() {
 
     // A stale Pending snapshot must NOT overwrite the terminal gate.
     let mut stale = ClusterState::<RunnerIdentifier>::new();
+    let (def, routing) = crate::cluster_state::split_task_def(mk_affine_task("import"));
     stale.tasks.insert(
         gate_hash.clone(),
         TaskState::Pending {
-            task: mk_affine_task("import"),
+            def,
+            routing,
             version: Default::default(),
             attempt: 0,
         },
@@ -472,10 +498,12 @@ fn queued_after_local_dependency_round_trips_the_wire() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
     let build = mk_task("build");
     let build_hash = crate::primary::wire::compute_task_hash(&build);
+    let (def, routing) = crate::cluster_state::split_task_def(build);
     s.tasks.insert(
         build_hash.clone(),
         TaskState::QueuedAfterLocalDependency {
-            task: build,
+            def,
+            routing,
             secondary: "sec-3".into(),
             version: TaskVersion {
                 primary_epoch: 2,
@@ -534,10 +562,12 @@ fn queued_after_local_dependency_is_observable() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
     let build = mk_task("build");
     let build_hash = crate::primary::wire::compute_task_hash(&build);
+    let (def, routing) = crate::cluster_state::split_task_def(build);
     s.tasks.insert(
         build_hash,
         TaskState::QueuedAfterLocalDependency {
-            task: build,
+            def,
+            routing,
             secondary: "sec-7".into(),
             version: Default::default(),
             attempt: 0,
@@ -570,10 +600,12 @@ fn queued_then_released_transitions_to_inflight() {
 
     // B starts Pending (e.g. just assigned but the report outran the local
     // TaskAssigned apply — the deferred-assignment race the arm accepts).
+    let (def, routing) = crate::cluster_state::split_task_def(build);
     s.tasks.insert(
         build_hash.clone(),
         TaskState::Pending {
-            task: build,
+            def,
+            routing,
             version: Default::default(),
             attempt: 0,
         },
@@ -629,10 +661,12 @@ fn queued_after_local_dependency_set_gated_and_preserves_version() {
     let build_hash = crate::primary::wire::compute_task_hash(&build);
 
     // InFlight source (attempt 9, version (3,4)) → Queued, preserving both.
+    let (def, routing) = crate::cluster_state::split_task_def(build);
     s.tasks.insert(
         build_hash.clone(),
         TaskState::InFlight {
-            task: build,
+            def,
+            routing,
             secondary: "sec-1".into(),
             worker: 2,
             version: TaskVersion {
@@ -674,10 +708,12 @@ fn queued_after_local_dependency_set_gated_and_preserves_version() {
     // Gated: a terminal locks it out.
     let done = mk_task("done");
     let done_hash = crate::primary::wire::compute_task_hash(&done);
+    let (def, routing) = crate::cluster_state::split_task_def(done);
     s.tasks.insert(
         done_hash.clone(),
         TaskState::Completed {
-            task: done,
+            def,
+            routing,
             attempt: 0,
         },
     );
@@ -708,10 +744,12 @@ fn queued_after_local_dependency_requeues_on_secondary_death() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
     let build = mk_task("build");
     let build_hash = crate::primary::wire::compute_task_hash(&build);
+    let (def, routing) = crate::cluster_state::split_task_def(build);
     s.tasks.insert(
         build_hash.clone(),
         TaskState::QueuedAfterLocalDependency {
-            task: build,
+            def,
+            routing,
             secondary: "dead-sec".into(),
             version: TaskVersion {
                 primary_epoch: 1,

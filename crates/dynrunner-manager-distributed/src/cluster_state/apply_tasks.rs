@@ -148,12 +148,15 @@ impl<I: Identifier> ClusterState<I> {
             // shared `set_task_state` write path below re-captures the OLD term
             // and runs the count-conserving SWAP (Blocked → Pending under a
             // FIXED key is a state CHANGE, not a logical create/remove).
-            let Some(TaskState::Blocked { task, attempt, .. }) = self.tasks.get(&h) else {
+            let Some(blocked @ TaskState::Blocked { .. }) = self.tasks.get(&h) else {
                 continue;
             };
-            let task = task.clone();
-            let attempt = *attempt;
-            resumed.push(task.clone());
+            let def = blocked.def().clone();
+            let routing = blocked.routing().clone();
+            let attempt = blocked.attempt();
+            // The resumed surface needs a whole owned `TaskInfo` (the caller
+            // re-injects it into the live pool) — a transient reconstruction.
+            resumed.push(blocked.to_task_info());
             // Auto-resume is an authoritative cross-task transition (Blocked →
             // Pending), not an assignment; the fresh `Pending` starts at the
             // default version and a later genuine assignment mints a higher
@@ -163,7 +166,8 @@ impl<I: Identifier> ClusterState<I> {
             // pending" narration event (holder `None` — a resumed Pending names
             // none, so no `fallback_holder`).
             let resumed_state = TaskState::Pending {
-                task,
+                def,
+                routing,
                 version: Default::default(),
                 attempt,
             };
@@ -392,12 +396,26 @@ impl<I: Identifier> ClusterState<I> {
                     }
                 }
             }
+            // Surface a clone of the freshly-Pending task BEFORE interning
+            // consumes the owned `TaskInfo` (interning splits it into the
+            // shared `def` + the `routing` tail) so a receive-side caller can
+            // grow its local dispatch pool. The clone is independent of the
+            // CRDT entry — callers may move it into a pool via `reinject`
+            // without disturbing the ledger.
+            let pending_surface = (!cascade_fail
+                && blocked_on_unfulfillable.is_none()
+                && blocked_on_pending.is_none())
+            .then(|| task.clone());
+            // Split the brand-new task into the shared frozen `def` (interned
+            // under `hash`, deduplicated) + its per-entry mutable `routing`.
+            let (def, routing) = self.intern_task_def(&hash, task);
             // Every TasksSpawned entry is a BRAND-NEW task, so it enters at
             // the cold retry generation (F2 attempt 0) regardless of which
             // initial state it classifies into.
             let initial = if cascade_fail {
                 TaskState::Failed {
-                    task,
+                    def,
+                    routing,
                     kind: ErrorType::NonRecoverable,
                     last_error: "upstream-failed".to_string(),
                     version: Default::default(),
@@ -405,25 +423,25 @@ impl<I: Identifier> ClusterState<I> {
                 }
             } else if let Some(on) = blocked_on_unfulfillable {
                 TaskState::Blocked {
-                    task,
+                    def,
+                    routing,
                     on,
                     attempt: 0,
                 }
             } else if let Some(on) = blocked_on_pending {
                 TaskState::Blocked {
-                    task,
+                    def,
+                    routing,
                     on,
                     attempt: 0,
                 }
             } else {
-                // Surface a clone of the freshly-Pending task so a
-                // receive-side caller can grow its local dispatch
-                // pool. The clone is independent of the CRDT entry —
-                // callers may move it into a pool via `reinject`
-                // without disturbing the ledger.
-                newly_pending_from_spawn.push(task.clone());
+                if let Some(t) = pending_surface {
+                    newly_pending_from_spawn.push(t);
+                }
                 TaskState::Pending {
-                    task,
+                    def,
+                    routing,
                     version: Default::default(),
                     attempt: 0,
                 }

@@ -29,8 +29,10 @@ fn mk_setup_task(name: &str) -> TaskInfo<RunnerIdentifier> {
 /// every dep walk and phase rollup shares.
 #[test]
 fn setup_completed_is_terminal() {
+    let (def, routing) = crate::cluster_state::split_task_def(mk_setup_task("s"));
     let state = TaskState::<RunnerIdentifier>::SetupCompleted {
-        task: mk_setup_task("s"),
+        def,
+        routing,
         attempt: 0,
     };
     assert!(
@@ -50,10 +52,12 @@ fn dependent_of_succeeded_setup_task_is_dispatchable() {
     // The setup task succeeded (set DIRECTLY — P1 has no executor).
     let setup = mk_setup_task("setup");
     let setup_hash = crate::primary::wire::compute_task_hash(&setup);
+    let (def, routing) = crate::cluster_state::split_task_def(setup);
     s.tasks.insert(
         setup_hash.clone(),
         TaskState::SetupCompleted {
-            task: setup,
+            def,
+            routing,
             attempt: 0,
         },
     );
@@ -89,10 +93,12 @@ fn blocked_dependent_resumes_when_setup_succeeds() {
     // Setup task pending; a dependent Blocked on it.
     let setup = mk_setup_task("setup");
     let setup_hash = crate::primary::wire::compute_task_hash(&setup);
+    let (def, routing) = crate::cluster_state::split_task_def(setup);
     s.tasks.insert(
         setup_hash.clone(),
         TaskState::Pending {
-            task: setup,
+            def,
+            routing,
             version: Default::default(),
             attempt: 0,
         },
@@ -103,10 +109,12 @@ fn blocked_dependent_resumes_when_setup_succeeds() {
 
     // The setup task succeeds (set directly), then the cascade-resume
     // runs for its hash — exactly what the executor (P2) will drive.
+    let (def0, routing0) = crate::cluster_state::split_task_def(mk_setup_task("setup"));
     s.tasks.insert(
         setup_hash.clone(),
         TaskState::SetupCompleted {
-            task: mk_setup_task("setup"),
+            def: def0,
+            routing: routing0,
             attempt: 0,
         },
     );
@@ -131,20 +139,24 @@ fn setup_succeeded_counter_disjoint_from_succeeded() {
     // One ordinary completed WORK task ...
     let work = mk_task("work");
     let work_hash = crate::primary::wire::compute_task_hash(&work);
+    let (def, routing) = crate::cluster_state::split_task_def(work);
     s.seed_task_state_for_test(
         &work_hash,
         TaskState::Completed {
-            task: work,
+            def,
+            routing,
             attempt: 0,
         },
     );
     // ... and one succeeded SETUP task.
     let setup = mk_setup_task("setup");
     let setup_hash = crate::primary::wire::compute_task_hash(&setup);
+    let (def0, routing0) = crate::cluster_state::split_task_def(setup);
     s.seed_task_state_for_test(
         &setup_hash,
         TaskState::SetupCompleted {
-            task: setup,
+            def: def0,
+            routing: routing0,
             attempt: 0,
         },
     );
@@ -185,10 +197,12 @@ fn setup_completed_mutation_writes_terminal_from_inflight() {
     let setup_hash = crate::primary::wire::compute_task_hash(&setup);
     // The executor was assigned: the task is InFlight (attempt 3 to prove
     // the attempt is preserved verbatim).
+    let (def, routing) = crate::cluster_state::split_task_def(setup);
     s.tasks.insert(
         setup_hash.clone(),
         TaskState::InFlight {
-            task: setup,
+            def,
+            routing,
             secondary: "member-1".into(),
             worker: 0,
             version: Default::default(),
@@ -218,10 +232,12 @@ fn setup_completed_mutation_resumes_blocked_dependent() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
     let setup = mk_setup_task("setup");
     let setup_hash = crate::primary::wire::compute_task_hash(&setup);
+    let (def, routing) = crate::cluster_state::split_task_def(setup);
     s.tasks.insert(
         setup_hash.clone(),
         TaskState::InFlight {
-            task: setup,
+            def,
+            routing,
             secondary: "member-1".into(),
             worker: 0,
             version: Default::default(),
@@ -262,10 +278,12 @@ fn setup_completed_mutation_noops_against_real_terminal_and_is_idempotent() {
     let setup = mk_setup_task("setup");
     let setup_hash = crate::primary::wire::compute_task_hash(&setup);
     // A non-recoverable FAILURE already settled it (e.g. the executor died).
+    let (def, routing) = crate::cluster_state::split_task_def(setup);
     s.tasks.insert(
         setup_hash.clone(),
         TaskState::Failed {
-            task: setup,
+            def,
+            routing,
             kind: ErrorType::NonRecoverable,
             last_error: "executor died".into(),
             version: Default::default(),
@@ -285,10 +303,12 @@ fn setup_completed_mutation_noops_against_real_terminal_and_is_idempotent() {
     );
 
     // Idempotent against an already-succeeded entry.
+    let (def1, routing1) = crate::cluster_state::split_task_def(mk_setup_task("setup"));
     s.tasks.insert(
         setup_hash.clone(),
         TaskState::SetupCompleted {
-            task: mk_setup_task("setup"),
+            def: def1,
+            routing: routing1,
             attempt: 0,
         },
     );
