@@ -17,6 +17,7 @@
 //!   `WorkerMgmtSignal::TasksAdded`; positive + negative-control +
 //!   is_idle-advisory + coalesce.
 
+mod affine_deferral;
 mod affine_seed;
 mod already_held;
 mod assembly_beacon;

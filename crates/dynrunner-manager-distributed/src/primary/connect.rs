@@ -406,6 +406,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `handle_task_failed` path. See
             // `primary::reconciliation_probe`.
             MessageType::TaskHoldResponse => self.handle_task_hold_response(msg, command_rx).await,
+            // Affine-deferral reports (#497): a secondary parks a work task
+            // behind its local SecondaryAffine import and REPORTS the queued
+            // state; on import completion it self-dispatches the task and
+            // REPORTS the release. The secondary reports, the PRIMARY
+            // originates the CRDT transitions (the work-split law) — and,
+            // critically, the queued handler DROPS the parked dependent from
+            // `self.in_flight` so the reconciliation probe (which views only
+            // the ledger) stops looping on a task no holder will report a
+            // terminal for. Without these arms both reports hit the
+            // catch-all below, stranding the task InFlight forever and
+            // re-originating it every ~600s reconciliation cycle (the
+            // unbounded coordinator leak). See `primary::task::affine_deferral`.
+            MessageType::TaskQueuedAfterLocalDependency => {
+                self.handle_task_queued_after_local_dependency(msg).await
+            }
+            MessageType::LocalDependencyReleased => {
+                self.handle_local_dependency_released(msg).await
+            }
             // Remote respawn-execution outcomes: the provider-host
             // observer's answer to this primary's RespawnSpawnRequest /
             // RespawnRevokeRequest. Completes the matching waiter inside
