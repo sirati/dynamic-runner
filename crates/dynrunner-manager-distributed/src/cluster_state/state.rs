@@ -606,6 +606,34 @@ pub struct ClusterState<I> {
     /// same per-entry `set_task_state` seam every merge routes through.
     /// Bound to a `_`-name in every exhaustive-destructure guard.
     pub(super) blocked_by: HashMap<String, HashSet<String>>,
+    /// Node-local incremental tally of the per-outcome terminal partition,
+    /// the O(1)-read twin of the O(ledger) [`Self::outcome_counts`] double-
+    /// walk (#…). Maintained INCREMENTALLY by the SINGLE
+    /// [`Self::set_task_state`] write seam (see `outcome_tally.rs` +
+    /// `range_digest.rs`): on a transition old→new it DECREMENTS the old
+    /// state's outcome bucket (if terminal) and INCREMENTS the new state's
+    /// (if terminal), via the SOLE `outcome_tally::outcome_bucket_of`
+    /// classification, so the maintained tally and the `#[cfg(test)]`
+    /// `outcome_counts_by_scan` full-walk oracle cannot drift.
+    ///
+    /// Tracks the LOGICAL terminal ledger (fat `tasks` ∪ spilled `settled`):
+    /// a terminal is counted ONCE, at the `set_task_state` that made it
+    /// terminal. A spill / unsettle MOVES the fat body between the two halves
+    /// WITHOUT routing through `set_task_state` (it touches `self.tasks`
+    /// directly), so the already-counted terminal STAYS counted while settled
+    /// (its outcome class is unchanged) — tally-NEUTRAL by construction,
+    /// exactly as a spill is `tasks_hash`-neutral and `range_fold_memo` /
+    /// `blocked_by` are spill-neutral.
+    ///
+    /// Classification: a pure DERIVATION of `self.tasks` ∪ `self.settled`
+    /// (like `range_fold_memo` / `blocked_by` / `digest_cache`) — NOT
+    /// replicated, NOT folded into the digest, NOT crossed over the wire.
+    /// Clone copies it verbatim (the source's logical ledger is the clone's,
+    /// so the source's maintained tally is exactly correct for the clone);
+    /// snapshot/restore re-build it through the same per-entry
+    /// `set_task_state` seam every merge routes through. Bound to a `_`-name
+    /// in every exhaustive-destructure guard.
+    pub(super) outcome_tally: super::outcome_tally::OutcomeTally,
     /// Settled-entry disk spill: the node-local STORAGE BACKEND for the
     /// join-fixed-point slice of `tasks` (see `cluster_state::settled`).
     /// A settled entry's fat body lives in the append-only spill file;
@@ -718,6 +746,12 @@ where
             // for the same reason as `range_fold_memo`: a direct map clone is
             // cheaper than re-walking `tasks` to rebuild the index.
             blocked_by,
+            // Node-local outcome tally — a pure derivation of the cloned
+            // logical ledger, so it is copied through verbatim below for the
+            // same reason as `range_fold_memo` / `blocked_by`: the clone's
+            // `tasks` ∪ `settled` is the source's, so the source's maintained
+            // partition is exactly correct for the clone.
+            outcome_tally,
             // Settled store: carried READ-ONLY (index + shared read fds;
             // the writer affiliation is dropped — one-writer rule).
             settled,
@@ -813,6 +847,11 @@ where
             // clone's, so the source's maintained index already satisfies
             // the invariant for the clone).
             blocked_by: blocked_by.clone(),
+            // Node-local outcome tally — copied verbatim (same rationale as
+            // `range_fold_memo` / `blocked_by`: the source's logical ledger
+            // is the clone's, so the source's maintained partition already
+            // satisfies the invariant for the clone).
+            outcome_tally: outcome_tally.clone(),
             // Settled store: read-only carry — the cloned replica keeps
             // serving settled reads through the shared `Arc<File>`
             // segments but never writes the source's file.
@@ -874,6 +913,7 @@ where
             digest_fold_count,
             range_fold_memo: _range_fold_memo,
             blocked_by,
+            outcome_tally: _outcome_tally,
             settled,
             authority_snapshot,
         } = self;
@@ -973,6 +1013,7 @@ impl<I> Default for ClusterState<I> {
             digest_fold_count: std::cell::Cell::new(0),
             range_fold_memo: super::range_fold_memo::RangeFoldMemo::default(),
             blocked_by: HashMap::new(),
+            outcome_tally: super::outcome_tally::OutcomeTally::default(),
             settled: super::settled::SettledStore::default(),
             authority_snapshot: None,
         }

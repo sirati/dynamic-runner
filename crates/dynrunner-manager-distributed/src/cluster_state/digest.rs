@@ -234,6 +234,12 @@ impl<I: Identifier> ClusterState<I> {
             // it carries no INDEPENDENT convergence signal — the `tasks_hash`
             // fold above already covers them. Bound for the exhaustive guard.
             blocked_by: _blocked_by,
+            // node-local: the outcome tally (#…) is a pure derivation of the
+            // terminal partition of `tasks` ∪ `settled` — the same entries the
+            // `tasks_hash` fold above already covers — so it carries no
+            // INDEPENDENT convergence signal and is excluded from the digest
+            // exactly like the range-fold memo. Bound for the exhaustive guard.
+            outcome_tally: _outcome_tally,
             // Settled spill store: the settled half of the tasks fold.
             // Each settled entry's XOR term was moved from the live fold
             // into `tasks_hash_acc` at spill-commit time (value-preserving

@@ -213,8 +213,8 @@ fn affine_ready_never_counted_in_success_fail_total() {
     // One completed WORK task, one succeeded SETUP task, one AffineReady gate.
     let work = mk_task("work");
     let work_hash = crate::primary::wire::compute_task_hash(&work);
-    s.tasks.insert(
-        work_hash,
+    s.seed_task_state_for_test(
+        &work_hash,
         TaskState::Completed {
             task: work,
             attempt: 0,
@@ -223,8 +223,8 @@ fn affine_ready_never_counted_in_success_fail_total() {
     let mut setup = mk_task("setup");
     setup.kind = TaskKind::Setup;
     let setup_hash = crate::primary::wire::compute_task_hash(&setup);
-    s.tasks.insert(
-        setup_hash,
+    s.seed_task_state_for_test(
+        &setup_hash,
         TaskState::SetupCompleted {
             task: setup,
             attempt: 0,
@@ -232,8 +232,8 @@ fn affine_ready_never_counted_in_success_fail_total() {
     );
     let gate = mk_affine_task("import");
     let gate_hash = crate::primary::wire::compute_task_hash(&gate);
-    s.tasks.insert(
-        gate_hash,
+    s.seed_task_state_for_test(
+        &gate_hash,
         TaskState::AffineReady {
             task: gate,
             attempt: 0,
