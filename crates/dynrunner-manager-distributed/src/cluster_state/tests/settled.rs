@@ -603,3 +603,68 @@ fn writer_failure_keeps_entries_fat() {
     assert!(!s.settled_contains("c"));
     assert_eq!(s.counts().completed, 1);
 }
+
+/// `fat_task_breakdown` honestly splits the fat (in-memory, un-spilled)
+/// task map by the SAME `settle_eligible` predicate the spiller gates on:
+/// settle-eligible terminals (a Completed held in memory — spill-lag) vs.
+/// non-terminal live work (Pending + InFlight — a liveness backlog). The
+/// two parts must sum to `tasks_in_memory()`.
+#[test]
+fn fat_task_breakdown_splits_eligible_from_live() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+
+    // One settle-ELIGIBLE entry held FAT: Completed but never spilled, so
+    // its fat body is still resident in `self.tasks`.
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "done".into(),
+        task: mk_task("done"),
+    });
+    s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "done".into(),
+        result_data: None,
+    });
+
+    // One NON-terminal Pending entry (TaskAdded leaves it Pending).
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "pending".into(),
+        task: mk_task("pending"),
+    });
+
+    // One NON-terminal InFlight entry (TaskAssigned drives Pending -> InFlight).
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "inflight".into(),
+        task: mk_task("inflight"),
+    });
+    s.apply(ClusterMutation::TaskAssigned {
+        attempt: 0,
+        hash: "inflight".into(),
+        secondary: "s1".into(),
+        worker: 0,
+        version: Default::default(),
+    });
+
+    // Sanity: all three are resident fat (no spill ran).
+    assert_eq!(s.tasks_in_memory(), 3, "all three entries are fat");
+    assert!(matches!(
+        s.task_state("done"),
+        Some(TaskState::Completed { .. })
+    ));
+    assert!(matches!(
+        s.task_state("pending"),
+        Some(TaskState::Pending { .. })
+    ));
+    assert!(matches!(
+        s.task_state("inflight"),
+        Some(TaskState::InFlight { .. })
+    ));
+
+    let (eligible, not_eligible) = s.fat_task_breakdown();
+    assert_eq!(eligible, 1, "only the Completed terminal is settle-eligible");
+    assert_eq!(not_eligible, 2, "Pending + InFlight are the live backlog");
+    assert_eq!(
+        eligible + not_eligible,
+        s.tasks_in_memory(),
+        "the split must sum to the fat total"
+    );
+}
