@@ -12,6 +12,12 @@ use crate::state::SecondaryConnectionState;
 use super::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 use super::PrimaryCoordinator;
 
+/// One initial-assignment entry built per dispatched task: the
+/// secondary-local worker id, the shared `Arc<TaskInfo>` (the SAME
+/// allocation held by the in-flight ledger / worker slot — the L4
+/// no-doubling flow), and the estimated resource footprint.
+type AssignmentEntry<I> = (u32, std::sync::Arc<TaskInfo<I>>, ResourceMap);
+
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     pub(super) async fn perform_initial_assignment(
         &mut self,
@@ -111,7 +117,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // inherited occupancy (promotion/resume) it correctly
         // deprioritizes already-loaded secondaries, where the raw
         // `0..len` scan it replaces ignored load entirely.
-        let mut assignments_per_secondary: HashMap<String, Vec<(u32, TaskInfo<I>, ResourceMap)>> =
+        let mut assignments_per_secondary: HashMap<String, Vec<AssignmentEntry<I>>> =
             HashMap::new();
         let mut total_assigned_resources = ResourceMap::new();
 
@@ -222,7 +228,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // be carried so the secondary's dispatch behaviour matches
         // the primary's.
         for secondary_id in &secondary_ids {
-            let empty_assignments: Vec<(u32, TaskInfo<I>, ResourceMap)> = Vec::new();
+            let empty_assignments: Vec<AssignmentEntry<I>> = Vec::new();
             let assignments = assignments_per_secondary
                 .get(secondary_id)
                 .unwrap_or(&empty_assignments);

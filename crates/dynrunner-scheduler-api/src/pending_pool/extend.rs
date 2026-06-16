@@ -8,6 +8,7 @@
 //! failed/in-flight ids used by duplicate detection).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use dynrunner_core::{Identifier, PhaseId, TaskInfo};
 
@@ -217,8 +218,12 @@ impl<I: Identifier> PendingPool<I> {
         }
 
         // ---------- 4. Commit: insert each item into bucket OR blocked ----------
+        // Wrap each validated item in an `Arc` ONCE here, at the ingest
+        // boundary. From this point the pool holds only `Arc<TaskInfo>`,
+        // so dispatch / requeue / cascade share the SAME allocation
+        // (clone the Arc, never deep-clone the TaskInfo).
         for item in new_items {
-            self.commit_item(item);
+            self.commit_item(Arc::new(item));
         }
         Ok(())
     }
@@ -234,7 +239,7 @@ impl<I: Identifier> PendingPool<I> {
     /// blocked-map edges (`dependents_of`, `task_deps`, `blocked`,
     /// `blocked_per_phase`) are rebuilt identically to ingest — never a
     /// hand-rolled parallel builder.
-    pub(super) fn commit_item(&mut self, item: TaskInfo<I>) {
+    pub(super) fn commit_item(&mut self, item: Arc<TaskInfo<I>>) {
         // Cascade-fail at extend time: if any prereq is already in
         // `failed_tasks`, this item is itself a cascaded failure.
         let any_failed_dep = item

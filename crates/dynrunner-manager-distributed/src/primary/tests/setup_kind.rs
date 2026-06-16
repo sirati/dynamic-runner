@@ -72,7 +72,7 @@ fn seed_in_flight(
             phase: task.phase_id.clone(),
             secondary_id: secondary.to_string(),
             local_worker_id: Some(0),
-            task,
+            task: std::sync::Arc::new(task),
             deferred: false,
         },
     );

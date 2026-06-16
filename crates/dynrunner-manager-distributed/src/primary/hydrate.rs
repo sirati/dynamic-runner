@@ -714,7 +714,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `pre_owned_in_flight` ledger — there is now ONE ledger,
         // populated identically at dispatch and hydration.
         for (hash, phase_id, secondary, worker, binary) in in_flight_seed {
-            self.seed_inflight(hash, phase_id, secondary, worker, binary);
+            self.seed_inflight(hash, phase_id, secondary, worker, std::sync::Arc::new(binary));
         }
 
         // Single source of truth for the run-completion accounting:
@@ -888,7 +888,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     // still tracks the second by hash, as the `None` arm).
                     let _assigned = self.workers[idx].assign(
                         hash,
-                        task,
+                        std::sync::Arc::new(task),
                         estimated,
                         crate::primary::SlotProvenance::Inherited,
                     );

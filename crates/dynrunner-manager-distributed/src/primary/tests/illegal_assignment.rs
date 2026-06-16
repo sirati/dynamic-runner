@@ -113,7 +113,7 @@ async fn illegal_bounce_reconciles_occupancy_and_requeues_without_failure() {
                 phase.clone(),
                 "sec-0".into(),
                 0,
-                incumbent.clone(),
+                std::sync::Arc::new(incumbent.clone()),
             );
             // Stage the ASSIGNED task as the slot's current (diverged) holder
             // + its ledger entry, via the real commit lifecycle.
@@ -298,7 +298,7 @@ async fn handled_bounce_reconcile_logs_at_debug_not_error() {
                 phase.clone(),
                 "sec-0".into(),
                 0,
-                incumbent.clone(),
+                std::sync::Arc::new(incumbent.clone()),
             );
             primary.stage_in_flight_for_test("sec-0".into(), 0, assigned.clone());
 
@@ -410,7 +410,7 @@ async fn bounce_does_not_reseat_b_slot_onto_a_held_incumbent() {
                 phase.clone(),
                 "sec-a".into(),
                 0,
-                dup.clone(),
+                std::sync::Arc::new(dup.clone()),
             );
             // B's slot holds the (illegally) assigned new task — the diverged
             // belief the bounce will requeue.
@@ -492,7 +492,7 @@ async fn assign_guard_refuses_commit_onto_nonidle_slot() {
             let first_hash = compute_task_hash(&first);
             // First commit takes (slot was idle).
             assert!(
-                primary.commit_assignment(idx, first.clone(), first_hash.clone(), ResourceMap::new()),
+                primary.commit_assignment(idx, std::sync::Arc::new(first.clone()), first_hash.clone(), ResourceMap::new()),
                 "the first commit onto an idle slot must take"
             );
             assert!(primary.slot_holds_hash_for_test("sec-0", 0, &first_hash));
@@ -502,7 +502,7 @@ async fn assign_guard_refuses_commit_onto_nonidle_slot() {
             let second = work_task("second");
             let second_hash = compute_task_hash(&second);
             assert!(
-                !primary.commit_assignment(idx, second.clone(), second_hash.clone(), ResourceMap::new()),
+                !primary.commit_assignment(idx, std::sync::Arc::new(second.clone()), second_hash.clone(), ResourceMap::new()),
                 "a commit onto a NON-idle slot must be REFUSED (not silently \
                  overwritten) — the #517 enforced idle-guard"
             );

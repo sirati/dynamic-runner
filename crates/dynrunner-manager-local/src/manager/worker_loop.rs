@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use dynrunner_core::{
-    ErrorType, FailedTask, Identifier, ResourceKind, TaskInfo, WorkerId, gather_predecessor_outputs,
+    ErrorType, FailedTask, Identifier, ResourceKind, WorkerId, gather_predecessor_outputs,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{AssignmentDecision, ProcessingPhase, ResourceEstimator, Scheduler};
@@ -223,10 +223,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         // `resource_pressure_tasks`, matching the actual failure
         // class.
         if phase == ProcessingPhase::RetryPhase && !self.pool_ref().is_empty() {
-            let remaining: Vec<TaskInfo<I>> = self.pool_mut().drain_queued();
+            let remaining = self.pool_mut().drain_queued();
             for binary in remaining {
                 self.failed_tasks.push(FailedTask {
-                    binary,
+                    binary: crate::manager::own_task(binary),
                     error_type: ErrorType::Recoverable,
                     error_message: "Could not fit in any worker budget".into(),
                     retry_count: 0,
@@ -426,7 +426,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 let worker = &mut self.pool.workers[worker_id as usize];
                 match worker
                     .assign_task(
-                        binary.clone(),
+                        crate::manager::own_task(binary.clone()),
                         estimated_usage.clone(),
                         opportunistic,
                         predecessor_outputs,

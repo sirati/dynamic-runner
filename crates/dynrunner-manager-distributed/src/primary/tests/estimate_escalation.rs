@@ -188,7 +188,7 @@ fn make_worker_busy(primary: &mut TestPrimary, sec: &str, local_worker_id: u32) 
     assert!(
         primary.commit_assignment(
             idx,
-            occupier,
+            std::sync::Arc::new(occupier),
             hash,
             ResourceMap::from([(ResourceKind::memory(), GIB)]),
         ),

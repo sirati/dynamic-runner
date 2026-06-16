@@ -12,6 +12,7 @@
 //! lives in a sibling submodule of `pending_pool/`.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use dynrunner_core::{AffinityId, Identifier, PhaseId, TaskInfo, TypeId, WorkerId};
 
@@ -109,7 +110,7 @@ pub enum PhaseState {
 /// prefers this bucket but never refuses other work.
 #[derive(Debug)]
 pub(crate) struct Bucket<I: Identifier> {
-    pub items: VecDeque<TaskInfo<I>>,
+    pub items: VecDeque<Arc<TaskInfo<I>>>,
     pub pinned_workers: Vec<WorkerId>,
 }
 

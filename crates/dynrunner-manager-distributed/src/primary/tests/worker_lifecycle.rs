@@ -653,3 +653,48 @@ async fn complete_for_untracked_hash_is_noop() {
         })
         .await;
 }
+
+/// L4 end-to-end Arc-sharing: dispatching a task flows ONE
+/// `Arc<TaskInfo>` allocation pool → in-flight ledger → worker slot — the
+/// 2×16GB doubling fix. After a normal `TaskRequest`-driven dispatch the
+/// worker slot's held task and the `in_flight` ledger entry's task must be
+/// the SAME allocation (`Arc::ptr_eq`); a deep copy at either hop would
+/// reintroduce the doubling this change exists to remove.
+#[tokio::test(flavor = "current_thread")]
+async fn dispatch_shares_one_arc_pool_to_inflight_to_slot() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let x = phased("task-x", "work");
+            let hash_x = compute_task_hash(&x);
+            let (mut primary, _ends, _mesh) = primary_with_pool_and_idle_worker(vec![x]);
+
+            primary
+                .handle_task_request(task_request("sec-0", 0), &mut None)
+                .await
+                .unwrap();
+            assert!(
+                primary.slot_holds_hash_for_test("sec-0", 0, &hash_x),
+                "the request must dispatch X to the worker"
+            );
+
+            // The ledger entry's Arc.
+            let ledger_arc = primary
+                .in_flight
+                .get(&hash_x)
+                .map(|e| e.task.clone())
+                .expect("X tracked in the ledger");
+            // The worker slot's Arc.
+            let slot_arc = match &primary.workers[0].state {
+                crate::primary::SlotState::Assigned { task, .. } => task.clone(),
+                crate::primary::SlotState::Idle => panic!("slot must hold X"),
+            };
+            assert!(
+                std::sync::Arc::ptr_eq(&ledger_arc, &slot_arc),
+                "the in-flight ledger and the worker slot must share the SAME \
+                 Arc allocation (one TaskInfo flows pool → ledger → slot, not \
+                 a deep copy per hop)"
+            );
+        })
+        .await;
+}

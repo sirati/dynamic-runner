@@ -127,7 +127,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 let worker = &mut self.pool.workers[worker_id as usize];
                 match worker
                     .assign_task(
-                        binary.clone(),
+                        crate::manager::own_task(binary.clone()),
                         estimated_usage.clone(),
                         opportunistic,
                         predecessor_outputs,
@@ -185,8 +185,9 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         // These are tasks the scheduler couldn't fit during the main phase
         // (NoFit decisions across all idle attempts).
         if !self.pool_ref().is_empty() {
-            let remaining: Vec<TaskInfo<I>> = self.pool_mut().drain_queued();
-            self.unassigned_tasks.extend(remaining);
+            let remaining = self.pool_mut().drain_queued();
+            self.unassigned_tasks
+                .extend(remaining.into_iter().map(crate::manager::own_task));
         }
 
         tracing::info!(
@@ -241,7 +242,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 // Re-inject preserves in-flight counts (these tasks were
                 // never `on_item_finished`'d) and reactivates the phase
                 // if it had drained or was draining.
-                self.pool_mut().reinject(task.binary);
+                self.pool_mut().reinject(std::sync::Arc::new(task.binary));
             }
 
             // Restart any stopped/dead workers before retry (matching Python behavior)
@@ -302,7 +303,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
 
         let pressure_tasks: Vec<FailedTask<I>> = self.resource_pressure_tasks.drain(..).collect();
         for task in pressure_tasks {
-            self.pool_mut().reinject(task.binary);
+            self.pool_mut().reinject(std::sync::Arc::new(task.binary));
         }
 
         // Process with only worker 0
@@ -381,7 +382,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         self.boost_worker0_budget_to_max();
 
         for task in kept {
-            self.pool_mut().reinject(task);
+            self.pool_mut().reinject(std::sync::Arc::new(task));
         }
 
         let mut active_workers: HashSet<WorkerId> = HashSet::new();
@@ -404,7 +405,12 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         if !self.pool_ref().is_empty() {
             let max = self.max_resources().clone();
             let max_mb = max.get(&ResourceKind::memory()) / (1024 * 1024);
-            let remaining: Vec<TaskInfo<I>> = self.pool_mut().drain_queued();
+            let remaining: Vec<TaskInfo<I>> = self
+                .pool_mut()
+                .drain_queued()
+                .into_iter()
+                .map(crate::manager::own_task)
+                .collect();
             tracing::error!(
                 count = remaining.len(),
                 cluster_max_mb = max_mb,

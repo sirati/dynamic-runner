@@ -59,7 +59,7 @@ pub(crate) enum SlotState<I: Identifier> {
     /// slot frees.
     Assigned {
         task_hash: String,
-        task: TaskInfo<I>,
+        task: Arc<TaskInfo<I>>,
         estimated: ResourceMap,
         /// How this slot came to hold the task — the discriminator the
         /// promoted-primary occupancy reconciliation keys on. See
@@ -137,11 +137,13 @@ impl<I: Identifier> SlotState<I> {
         matches!(self, SlotState::Idle)
     }
 
-    /// The held task, if any. `None` for an `Idle` slot.
+    /// The held task, if any. `None` for an `Idle` slot. Borrows the
+    /// inner `&TaskInfo` out of the slot's shared `Arc` so callers see
+    /// the unchanged `&TaskInfo` shape.
     fn task(&self) -> Option<&TaskInfo<I>> {
         match self {
             SlotState::Idle => None,
-            SlotState::Assigned { task, .. } => Some(task),
+            SlotState::Assigned { task, .. } => Some(task.as_ref()),
         }
     }
 
@@ -220,7 +222,7 @@ impl<I: Identifier> RemoteWorkerState<I> {
     pub(super) fn assign(
         &mut self,
         task_hash: String,
-        task: TaskInfo<I>,
+        task: Arc<TaskInfo<I>>,
         estimated: ResourceMap,
         provenance: SlotProvenance,
     ) -> bool {
@@ -264,7 +266,7 @@ impl<I: Identifier> RemoteWorkerState<I> {
     /// re-confirmation); the routine terminal path goes through
     /// [`PrimaryCoordinator::free_slot_on_terminal`] which gates on the
     /// hash.
-    pub(super) fn vacate(&mut self) -> Option<TaskInfo<I>> {
+    pub(super) fn vacate(&mut self) -> Option<Arc<TaskInfo<I>>> {
         match std::mem::replace(&mut self.state, SlotState::Idle) {
             SlotState::Idle => None,
             SlotState::Assigned { task, .. } => Some(task),
@@ -347,8 +349,9 @@ pub(crate) struct InFlightEntry<I: Identifier> {
     /// safe-no-op guard for a slot that no longer exists.
     pub(super) local_worker_id: Option<u32>,
     /// The full task — its `task_id` resolves dep edges, its `type_id`
-    /// releases the per-type concurrency slot.
-    pub(super) task: TaskInfo<I>,
+    /// releases the per-type concurrency slot. An `Arc` shared with the
+    /// pool / worker slot at dispatch (clone is cheap; no deep copy).
+    pub(super) task: Arc<TaskInfo<I>>,
     /// `true` while this entry is PARKED behind a secondary's local
     /// SecondaryAffine import (#497): the holder reported
     /// `TaskQueuedAfterLocalDependency`, so `B` is genuinely waiting on a
@@ -3368,7 +3371,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     pub(super) fn commit_assignment(
         &mut self,
         worker_idx: usize,
-        task: TaskInfo<I>,
+        task: Arc<TaskInfo<I>>,
         task_hash: String,
         estimated: ResourceMap,
     ) -> bool {
@@ -3444,7 +3447,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         phase: PhaseId,
         secondary_id: String,
         local_worker_id: u32,
-        task: TaskInfo<I>,
+        task: Arc<TaskInfo<I>>,
     ) {
         // Mirror `commit_assignment`'s per-type slot reservation so the
         // inherited InFlight task's eventual terminal release
@@ -3821,7 +3824,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// completion walk, drain transition, phase lifecycle — accounts it
     /// exactly like a normally-held terminal (the requeue had decremented
     /// the in-flight counter; the +1/−1 pair keeps it balanced).
-    pub(super) fn reclaim_requeued_on_terminal(&mut self, task_hash: &str) -> Option<TaskInfo<I>> {
+    pub(super) fn reclaim_requeued_on_terminal(&mut self, task_hash: &str) -> Option<Arc<TaskInfo<I>>> {
         // No pool, no queued copy to reclaim (a terminal landing before
         // `run()` built the pool — same gate `handle_cluster_mutation`'s
         // pool-coherence block uses).
@@ -4363,7 +4366,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let task_hash = crate::primary::wire::compute_task_hash(&task);
         // The slot was just pushed Idle, so the commit always takes.
         assert!(
-            self.commit_assignment(idx, task, task_hash.clone(), ResourceMap::new()),
+            self.commit_assignment(idx, Arc::new(task), task_hash.clone(), ResourceMap::new()),
             "stage_in_flight_for_test must commit onto the freshly-idle slot"
         );
         task_hash

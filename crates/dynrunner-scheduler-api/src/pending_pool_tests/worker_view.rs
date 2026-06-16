@@ -57,6 +57,55 @@ fn take_selected_commits_chosen_index() {
     assert_eq!(p.in_flight(&phase("P")), 1);
 }
 
+/// L4 Arc-sharing: the pool holds each queued item as an `Arc<TaskInfo>`,
+/// and a dispatch (`take_selected`) hands back the SAME allocation it held
+/// in the bucket — not a deep clone. This is the seam the distributed
+/// primary relies on to flow ONE Arc pool → in-flight ledger → worker slot
+/// (the 2×16GB doubling fix): if take deep-cloned here, every dispatch
+/// would re-pay the full `TaskInfo`.
+#[test]
+fn take_selected_returns_the_same_arc_the_pool_held() {
+    use std::sync::Arc;
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([t("P", "T", "alpha", 1)]).expect("valid extend");
+    // The pool wrapped the item in an Arc at the ingest boundary; capture
+    // its allocation identity straight from the bucket.
+    let key = (
+        phase("P"),
+        dynrunner_core::TypeId::from("T"),
+        dynrunner_core::AffinityId::from("alpha"),
+    );
+    let bucket_arc: Arc<TaskInfo<_>> = p.buckets[&key].items[0].clone();
+    let view = p.view_for_worker(1, None);
+    let selection = view.select(0);
+    let taken = p.take_selected(selection);
+    assert!(
+        Arc::ptr_eq(&bucket_arc, &taken),
+        "take_selected must return the SAME Arc allocation the bucket held \
+         (shared, not deep-cloned)"
+    );
+}
+
+/// The same Arc-identity invariant for the single-shot `pop_for_worker`
+/// dispatch entry point.
+#[test]
+fn pop_for_worker_returns_the_same_arc_the_pool_held() {
+    use std::sync::Arc;
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([t("P", "T", "", 1)]).expect("valid extend");
+    let key = (
+        phase("P"),
+        dynrunner_core::TypeId::from("T"),
+        dynrunner_core::AffinityId::from(""),
+    );
+    let bucket_arc: Arc<TaskInfo<_>> = p.buckets[&key].items[0].clone();
+    let popped = p.pop_for_worker(1).expect("dispatchable");
+    assert!(
+        Arc::ptr_eq(&bucket_arc, &popped),
+        "pop_for_worker must return the SAME Arc allocation the bucket held"
+    );
+}
+
 /// Empty pool → empty view; `tasks()` is `&[]`.
 #[test]
 fn view_for_worker_empty_pool() {

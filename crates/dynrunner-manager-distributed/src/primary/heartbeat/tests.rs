@@ -1331,7 +1331,7 @@ async fn oracle_false_corners() {
         );
         install_default_pool(&mut p);
         register_operational_secondary(&mut p, "dead-sec", 0, "victim");
-        p.pool_mut().requeue(task("queued", &[]));
+        p.pool_mut().requeue(std::sync::Arc::new(task("queued", &[])));
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert!(
             !p.only_silent_held_work_remains(),

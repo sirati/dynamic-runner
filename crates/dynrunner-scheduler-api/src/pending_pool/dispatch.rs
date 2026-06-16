@@ -15,6 +15,7 @@
 //! * `choose_bucket_for` (private) — the read-only soft-pin algorithm.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use dynrunner_core::{Identifier, PhaseId, TaskInfo, WorkerId};
 
@@ -40,7 +41,7 @@ impl<I: Identifier> PendingPool<I> {
     /// On take: `in_flight_per_phase[phase]` increments. If the bucket
     /// becomes empty, its pinned workers' affinity records are
     /// cleared so they fall back to the free pool on subsequent calls.
-    pub fn pop_for_worker(&mut self, worker_id: WorkerId) -> Option<TaskInfo<I>> {
+    pub fn pop_for_worker(&mut self, worker_id: WorkerId) -> Option<Arc<TaskInfo<I>>> {
         let now = std::time::Instant::now();
         let key = self.choose_bucket_for(worker_id, now)?;
         // Pop the first dispatch-ELIGIBLE item of the chosen bucket (a
@@ -120,6 +121,10 @@ impl<I: Identifier> PendingPool<I> {
                               emitted: &mut HashSet<BucketKey>,
                               sink: &mut Vec<Paired<'p, I>>| {
             for (idx, item) in bucket.items.iter().enumerate() {
+                // `bucket.items` holds `Arc<TaskInfo>`; the view borrows the
+                // inner `&TaskInfo` (deref the Arc) so the view's value
+                // shape is unchanged — it still BORROWS, clones nothing.
+                let item: &TaskInfo<I> = item.as_ref();
                 // The SINGLE dispatch-eligibility gate (re-dispatch backoff
                 // AND worker-assignable kind) — a `Setup` task is invisible
                 // to the worker view here, never via a scattered kind check.
@@ -221,13 +226,16 @@ impl<I: Identifier> PendingPool<I> {
 
     /// Remove the item a [`ViewSelection`] ticket names from its bucket,
     /// recording the worker's affinity claim and incrementing the
-    /// in-flight count for the phase. Returns the owned `TaskInfo<I>`.
+    /// in-flight count for the phase. Returns the shared
+    /// `Arc<TaskInfo<I>>` the pool held — the dispatch path clones this
+    /// Arc into the in-flight ledger / worker slot, never deep-cloning
+    /// the `TaskInfo`.
     ///
     /// Panics (debug builds only) if the underlying bucket has shrunk
     /// since the view was constructed — callers are required to consume
     /// the selection before any other pool mutation. See
     /// [`view_for_worker`].
-    pub fn take_selected(&mut self, selection: ViewSelection) -> TaskInfo<I> {
+    pub fn take_selected(&mut self, selection: ViewSelection) -> Arc<TaskInfo<I>> {
         let ViewSelection {
             bucket_key,
             item_idx,
@@ -259,7 +267,7 @@ impl<I: Identifier> PendingPool<I> {
         key: &BucketKey,
         index: usize,
         worker_id: WorkerId,
-    ) -> TaskInfo<I> {
+    ) -> Arc<TaskInfo<I>> {
         let no_aff = no_affinity();
         let bucket = self
             .buckets

@@ -10,7 +10,22 @@ use dynrunner_core::{
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{PendingPool, PhaseState, ResourceEstimator, Scheduler};
+use std::sync::Arc;
 use tokio::sync::mpsc as tokio_mpsc;
+
+/// Take ownership of the `TaskInfo` behind a pool-returned `Arc`.
+///
+/// The pool hands out `Arc<TaskInfo>` (shared with the in-flight ledger
+/// on the distributed primary, the L4 doubling fix). The local manager's
+/// own carriers (`FailedTask::binary`, `unassigned_tasks`,
+/// `WorkerHandle::assign_task`) are by-value `TaskInfo` — so it unwraps
+/// the Arc at that single boundary. When the pool held the only reference
+/// (the common case — a queued/blocked item the local manager just
+/// drained or cascaded was never dispatched into a worker slot) this is a
+/// move with NO copy; a still-shared Arc falls back to a clone.
+pub(crate) fn own_task<I: Identifier>(task: Arc<TaskInfo<I>>) -> TaskInfo<I> {
+    Arc::try_unwrap(task).unwrap_or_else(|task| (*task).clone())
+}
 
 /// Per-completion context handed to a `RestartPredicate`. References borrow
 /// from the manager's per-worker state and live only for the predicate call.
