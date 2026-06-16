@@ -99,6 +99,7 @@ async fn bounce_requeue_originates_task_requeued() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: hash.clone(),
                     task,
+                    def_id: None,
                 });
             }
             primary

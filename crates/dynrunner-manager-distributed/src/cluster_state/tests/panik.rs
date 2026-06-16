@@ -22,6 +22,7 @@ fn seed_with_one_pending() -> (ClusterState<RunnerIdentifier>, String) {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     (s, "h".to_string())
 }
@@ -77,10 +78,12 @@ async fn peer_departure_does_not_touch_task_ledger() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h-pending".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAdded {
         hash: "h-inflight".into(),
         task: mk_task("b"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAssigned {
         attempt: 0,
@@ -92,6 +95,7 @@ async fn peer_departure_does_not_touch_task_ledger() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h-blocked".into(),
         task: mk_task("c"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskBlocked {
         hash: "h-blocked".into(),

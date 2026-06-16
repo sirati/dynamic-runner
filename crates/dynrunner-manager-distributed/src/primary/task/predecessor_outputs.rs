@@ -113,6 +113,7 @@ mod tests {
         state.apply(ClusterMutation::TaskAdded {
             hash: hash.clone(),
             task,
+            def_id: None,
         });
         if let Some(o) = outputs {
             // Mirror the Python encoder's wrapper shape: result_data is

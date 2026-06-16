@@ -63,6 +63,7 @@ fn task_completed_populates_task_outputs_cache() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     let outputs = outputs_with("nonce", "xyz");
     let bytes = encode_wire(&outputs);
@@ -87,6 +88,7 @@ fn task_completed_with_no_result_data_does_not_populate() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -111,6 +113,7 @@ fn task_completed_malformed_result_data_stores_empty_outputs() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     let garbage: Vec<u8> = b"not-json-at-all".to_vec();
     let outcome = s.apply(ClusterMutation::TaskCompleted {
@@ -135,6 +138,7 @@ fn task_outputs_round_trip_via_snapshot() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     let outputs = outputs_with("nonce", "xyz");
     let bytes = encode_wire(&outputs);
@@ -169,6 +173,7 @@ fn restore_first_write_wins_on_task_outputs_collision() {
     local.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     local.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -180,6 +185,7 @@ fn restore_first_write_wins_on_task_outputs_collision() {
     source.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     source.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -215,6 +221,7 @@ fn python_encode_full_wrapper_decodes_outputs() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     let wire = serde_json::to_vec(&serde_json::json!({
         "warnings": 2,
@@ -256,6 +263,7 @@ fn python_encode_outputs_only_decodes_outputs() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     let wire = serde_json::to_vec(&serde_json::json!({
         "outputs": {
@@ -299,16 +307,19 @@ fn phase_task_outputs_gathers_only_the_named_phase() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h_common".into(),
         task: mk_task_in_phase("common_dep", "build"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAdded {
         hash: "h_variant".into(),
         task: mk_task_in_phase("variant", "build"),
+        def_id: None,
     });
     // Phase "dependency_graph" — one task that publishes the pickle-ish
     // payload the consumer reads from on_phase_end.
     s.apply(ClusterMutation::TaskAdded {
         hash: "h_dep".into(),
         task: mk_task_in_phase("dependency_graph", "dependency_graph"),
+        def_id: None,
     });
 
     let common_outputs = outputs_with("artifact_drv", "/nix/store/abc");
@@ -370,6 +381,7 @@ fn python_encode_counters_only_populates_empty_cache() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     let wire = serde_json::to_vec(&serde_json::json!({
         "warnings": 7,

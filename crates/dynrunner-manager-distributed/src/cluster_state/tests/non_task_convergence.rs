@@ -360,6 +360,7 @@ fn task_outputs_value_divergence_detected() {
         s.apply(ClusterMutation::TaskAdded {
             hash: "t".into(),
             task: mk_task("t"),
+            def_id: None,
         });
     }
     // Same key "t", DIFFERENT output values on the two replicas.

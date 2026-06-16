@@ -48,6 +48,7 @@ fn outcome_tally_matches_scan() {
         s.apply(ClusterMutation::TaskAdded {
             hash: format!("t{i:02}"),
             task: mk_task(&format!("t{i:02}")),
+            def_id: None,
         });
         assert_tally_matches_scan(&s);
     }
@@ -198,6 +199,7 @@ fn outcome_tally_matches_scan() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "post-spill".into(),
         task: mk_task("post-spill"),
+        def_id: None,
     });
     assert_tally_matches_scan(&s);
     s.apply(ClusterMutation::TaskCompleted {
@@ -214,6 +216,7 @@ fn outcome_tally_matches_scan() {
         peer.apply(ClusterMutation::TaskAdded {
             hash: format!("p{i}"),
             task: mk_task(&format!("p{i}")),
+            def_id: None,
         });
         peer.apply(ClusterMutation::TaskCompleted {
             attempt: 0,

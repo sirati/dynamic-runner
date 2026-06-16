@@ -197,6 +197,7 @@ where
             cs.apply(ClusterMutation::TaskAdded {
                 hash: compute_task_hash(task),
                 task: task.clone(),
+                def_id: None,
             });
         }
         cs.snapshot()

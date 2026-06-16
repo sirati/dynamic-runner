@@ -155,6 +155,7 @@ async fn primary_with_tasks(
             cs.apply(ClusterMutation::TaskAdded {
                 hash: compute_task_hash(&task),
                 task,
+                def_id: None,
             });
         }
     }

@@ -71,6 +71,7 @@ fn seed_two_pending_on_sec0(
             cs.apply(ClusterMutation::TaskAdded {
                 hash: name.into(),
                 task: plain_task(name),
+                def_id: None,
             });
         }
     }
@@ -107,6 +108,7 @@ fn seed_member_with_inflight(
         cs.apply(ClusterMutation::TaskAdded {
             hash: hash.clone(),
             task: plain_task(&hash),
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAssigned {
             hash,
@@ -216,6 +218,7 @@ async fn promoted_primary_inherits_freeze_via_snapshot() {
                     cs.apply(ClusterMutation::TaskAdded {
                         hash: name.into(),
                         task: plain_task(name),
+                        def_id: None,
                     });
                 }
                 cs.snapshot()

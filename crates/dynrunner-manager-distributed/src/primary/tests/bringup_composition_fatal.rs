@@ -253,6 +253,7 @@ async fn primary_logs_error_exit_on_composition_fatal() {
                     cs.apply(ClusterMutation::TaskAdded {
                         hash: crate::primary::wire::compute_task_hash(&t),
                         task: t,
+                        def_id: None,
                     });
                 }
             }

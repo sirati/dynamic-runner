@@ -94,6 +94,7 @@ fn hydrate_seeds_completed_deps_so_dependents_enter_pool() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "toolchain".into(),
             task: toolchain.clone(),
+            def_id: None,
         });
         // Drive `toolchain` to terminal Completed.
         cs.apply(ClusterMutation::TaskCompleted {
@@ -104,10 +105,12 @@ fn hydrate_seeds_completed_deps_so_dependents_enter_pool() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "dep-a".into(),
             task: dep_a.clone(),
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAdded {
             hash: "dep-b".into(),
             task: dep_b.clone(),
+            def_id: None,
         });
     }
 
@@ -169,6 +172,7 @@ async fn hydrate_invalid_task_root_blocks_then_dooms_dependent() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: "toolchain".into(),
                     task: toolchain.clone(),
+                    def_id: None,
                 });
                 // Drive `toolchain` to terminal InvalidTask.
                 cs.apply(ClusterMutation::TaskFailed {
@@ -183,6 +187,7 @@ async fn hydrate_invalid_task_root_blocks_then_dooms_dependent() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: dep_hash.clone(),
                     task: dep_a.clone(),
+                    def_id: None,
                 });
             }
 
@@ -270,6 +275,7 @@ fn hydrate_inflight_task_not_reoffered_and_counter_one() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "inflight-1".into(),
             task: task.clone(),
+            def_id: None,
         });
         // Drive to InFlight on a remote secondary's worker.
         cs.apply(ClusterMutation::TaskAssigned {
@@ -357,6 +363,7 @@ async fn inherited_in_flight_completion_decrements_phase_counter() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: "inflight-1".into(),
                     task: task.clone(),
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskAssigned {
                     attempt: 0,
@@ -444,6 +451,7 @@ async fn hydrate_reconstructs_worker_roster_from_capacity_and_inflight() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: hash.clone(),
                     task,
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskAssigned {
                     attempt: 0,
@@ -569,6 +577,7 @@ async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
                     cs.apply(ClusterMutation::TaskAdded {
                         hash: hash.clone(),
                         task,
+                        def_id: None,
                     });
                     cs.apply(ClusterMutation::TaskAssigned {
                         attempt: 0,
@@ -722,6 +731,7 @@ async fn promoted_primary_reconciles_stale_inherited_slot_on_idle_request() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: stuck_hash.clone(),
                     task: stuck,
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskAssigned {
                     attempt: 0,
@@ -733,6 +743,7 @@ async fn promoted_primary_reconciles_stale_inherited_slot_on_idle_request() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: compute_task_hash(&ready),
                     task: ready,
+                    def_id: None,
                 });
             }
 
@@ -848,6 +859,7 @@ async fn dispatched_slot_request_is_noop_no_double_dispatch_rc_g2() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: running_hash.clone(),
                     task: running.clone(),
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskAssigned {
                     attempt: 0,
@@ -940,6 +952,7 @@ async fn reconcile_inherited_slot_gates_on_provenance() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: inh_hash.clone(),
                     task: inh,
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskAssigned {
                     attempt: 0,
@@ -1206,6 +1219,7 @@ fn hydrate_seeds_completed_phases_as_done_not_rerun() {
             cs.apply(ClusterMutation::TaskAdded {
                 hash: hash.into(),
                 task: task.clone(),
+                def_id: None,
             });
             cs.apply(ClusterMutation::TaskCompleted {
                 attempt: 0,
@@ -1227,6 +1241,7 @@ fn hydrate_seeds_completed_phases_as_done_not_rerun() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "w-task".into(),
             task: w.clone(),
+            def_id: None,
         });
     }
 
@@ -1295,12 +1310,14 @@ fn hydrate_does_not_seed_done_without_phase_ended_fact() {
             cs.apply(ClusterMutation::TaskAdded {
                 hash: hash.into(),
                 task: task.clone(),
+                def_id: None,
             });
             cs.apply(ClusterMutation::TaskSkippedAlreadyDone { hash: hash.into() });
         }
         cs.apply(ClusterMutation::TaskAdded {
             hash: "s-task".into(),
             task: s.clone(),
+            def_id: None,
         });
     }
 
@@ -1369,6 +1386,7 @@ async fn inherited_ended_phase_with_fact_does_not_refire_on_phase_end() {
                     cs.apply(ClusterMutation::TaskAdded {
                         hash: hash.into(),
                         task: task.clone(),
+                        def_id: None,
                     });
                     cs.apply(ClusterMutation::TaskSkippedAlreadyDone { hash: hash.into() });
                 }
@@ -1378,6 +1396,7 @@ async fn inherited_ended_phase_with_fact_does_not_refire_on_phase_end() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: "s-task".into(),
                     task: s.clone(),
+                    def_id: None,
                 });
             }
 
@@ -1543,6 +1562,7 @@ async fn hydrate_failed_final_root_dooms_dependents_via_finalize_cascade() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: a_hash.clone(),
                     task: a.clone(),
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskFailed {
                     attempt: 0,
@@ -1554,6 +1574,7 @@ async fn hydrate_failed_final_root_dooms_dependents_via_finalize_cascade() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: b_hash.clone(),
                     task: b.clone(),
+                    def_id: None,
                 });
             }
 
@@ -1646,6 +1667,7 @@ async fn hydrate_failed_retryable_root_reenters_retry_flow_dependent_blocked() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: a_hash.clone(),
                     task: a.clone(),
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskFailed {
                     attempt: 0,
@@ -1657,6 +1679,7 @@ async fn hydrate_failed_retryable_root_reenters_retry_flow_dependent_blocked() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: b_hash.clone(),
                     task: b.clone(),
+                    def_id: None,
                 });
             }
 
@@ -1740,6 +1763,7 @@ async fn hydrate_failed_retryable_budget_exhausted_dooms_dependent() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: a_hash.clone(),
                     task: a.clone(),
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskFailed {
                     attempt: 0,
@@ -1751,6 +1775,7 @@ async fn hydrate_failed_retryable_budget_exhausted_dooms_dependent() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: b_hash.clone(),
                     task: b.clone(),
+                    def_id: None,
                 });
             }
 
@@ -1808,6 +1833,7 @@ async fn hydrate_unfulfillable_root_keeps_dependent_blocked_dormant() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: a_hash.clone(),
                     task: a.clone(),
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskFailed {
                     attempt: 0,
@@ -1821,6 +1847,7 @@ async fn hydrate_unfulfillable_root_keeps_dependent_blocked_dormant() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: b_hash.clone(),
                     task: b.clone(),
+                    def_id: None,
                 });
             }
 

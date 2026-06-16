@@ -15,10 +15,12 @@ fn snapshot_round_trip_preserves_state() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "p".into(),
         task: mk_task("p"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAdded {
         hash: "i".into(),
         task: mk_task("i"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAssigned {
         attempt: 0,
@@ -30,6 +32,7 @@ fn snapshot_round_trip_preserves_state() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "c".into(),
         task: mk_task("c"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -78,6 +81,7 @@ fn snapshot_round_trip_preserves_invalid_task() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "bad".into(),
         task: mk_task("bad"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -107,6 +111,7 @@ fn snapshot_round_trip_preserves_invalid_task() {
     stale.apply(ClusterMutation::TaskAdded {
         hash: "bad".into(),
         task: mk_task("bad"),
+        def_id: None,
     });
     joiner.restore(stale.snapshot());
     assert!(
@@ -131,6 +136,7 @@ fn snapshot_round_trip_preserves_skipped_already_done() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "skip".into(),
         task: mk_task("skip"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskSkippedAlreadyDone {
         hash: "skip".into(),
@@ -155,6 +161,7 @@ fn snapshot_round_trip_preserves_skipped_already_done() {
     stale.apply(ClusterMutation::TaskAdded {
         hash: "skip".into(),
         task: mk_task("skip"),
+        def_id: None,
     });
     joiner.restore(stale.snapshot());
     assert!(
@@ -248,6 +255,7 @@ fn restore_lattice_merge_preserves_local_terminal() {
     joiner.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("h"),
+        def_id: None,
     });
     joiner.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -259,6 +267,7 @@ fn restore_lattice_merge_preserves_local_terminal() {
     peer.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("h"),
+        def_id: None,
     });
     peer.apply(ClusterMutation::TaskAssigned {
         attempt: 0,
@@ -283,12 +292,14 @@ fn restore_lattice_merge_promotes_pending_to_in_flight() {
     joiner.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("h"),
+        def_id: None,
     });
 
     let mut peer = ClusterState::<RunnerIdentifier>::new();
     peer.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("h"),
+        def_id: None,
     });
     peer.apply(ClusterMutation::TaskAssigned {
         attempt: 0,
@@ -341,6 +352,7 @@ fn restore_idempotent_under_double_apply() {
     peer.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("h"),
+        def_id: None,
     });
     peer.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -365,6 +377,7 @@ fn pending_pool_unfulfillable_state_round_trips_via_snapshot() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "u".into(),
         task: mk_task("u"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -378,6 +391,7 @@ fn pending_pool_unfulfillable_state_round_trips_via_snapshot() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "b".into(),
         task: mk_task("b"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskBlocked {
         hash: "b".into(),
@@ -431,6 +445,7 @@ fn restore_migrates_unphased_deps_to_enclosing_phase() {
     source.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task,
+        def_id: None,
     });
     let snap = source.snapshot();
 

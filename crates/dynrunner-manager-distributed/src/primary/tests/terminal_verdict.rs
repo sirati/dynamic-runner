@@ -735,6 +735,7 @@ async fn stamped_verdict_counts_equal_the_decision_counts() {
                     cs.apply(ClusterMutation::TaskAdded {
                         hash: hash.clone(),
                         task: t,
+                        def_id: None,
                     });
                     if i < 2 {
                         cs.apply(ClusterMutation::TaskCompleted {

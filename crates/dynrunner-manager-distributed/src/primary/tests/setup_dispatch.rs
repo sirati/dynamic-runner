@@ -119,6 +119,7 @@ fn primary_with_tasks(
             cs.apply(ClusterMutation::TaskAdded {
                 hash: compute_task_hash(task),
                 task: task.clone(),
+                def_id: None,
             });
         }
     }

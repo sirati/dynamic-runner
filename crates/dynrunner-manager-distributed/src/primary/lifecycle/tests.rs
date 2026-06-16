@@ -557,6 +557,7 @@ async fn unfulfillable_entry_does_not_consume_execution_error_retry_budget() {
                 coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                     hash: compute_task_hash(bin),
                     task: bin.clone(),
+                    def_id: None,
                 });
             }
 
@@ -698,6 +699,7 @@ async fn reinject_clears_failed_tasks_entry_for_hash() {
                 dynrunner_protocol_primary_secondary::ClusterMutation::TaskAdded {
                     hash: hash.clone(),
                     task: binary.clone(),
+                    def_id: None,
                 },
             );
             coordinator.cluster_state.apply(
@@ -776,6 +778,7 @@ async fn unfulfillable_reinjected_task_can_use_retry_pass() {
                 dynrunner_protocol_primary_secondary::ClusterMutation::TaskAdded {
                     hash: hash.clone(),
                     task: binary.clone(),
+                    def_id: None,
                 },
             );
             coordinator.cluster_state.apply(

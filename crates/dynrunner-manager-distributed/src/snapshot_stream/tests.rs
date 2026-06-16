@@ -41,6 +41,7 @@ fn big_state() -> ClusterState<RunnerIdentifier> {
         s.apply(ClusterMutation::TaskAdded {
             hash: name.clone(),
             task: mk_task(&name, 512 * 1024),
+            def_id: None,
         });
     }
     s
@@ -53,6 +54,7 @@ fn small_state() -> ClusterState<RunnerIdentifier> {
         s.apply(ClusterMutation::TaskAdded {
             hash: name.clone(),
             task: mk_task(&name, 16),
+            def_id: None,
         });
     }
     s

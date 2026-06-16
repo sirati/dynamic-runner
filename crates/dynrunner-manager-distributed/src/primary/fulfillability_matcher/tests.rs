@@ -105,6 +105,7 @@ fn seed_tasks(
         coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
             hash: hash.clone(),
             task: binary.clone(),
+            def_id: None,
         });
         match *state {
             "Pending" => {}

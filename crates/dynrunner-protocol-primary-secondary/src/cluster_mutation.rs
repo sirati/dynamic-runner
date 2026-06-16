@@ -244,6 +244,30 @@ pub enum ClusterMutation<I> {
     TaskAdded {
         hash: String,
         task: TaskInfo<I>,
+        /// The PRIMARY-allocated, CRDT-agreed compact def index for this
+        /// task's content (`TaskDefStore`'s `TaskDefId.0` on the receiver).
+        /// Stamped by the originating primary at the broadcast choke point
+        /// (`broadcast::stamp_def_ids`) so EVERY replica interns the def
+        /// under the SAME id (the prerequisite for deps-as-index): the
+        /// receiver places the wire-carried def at exactly this slot rather
+        /// than re-allocating a node-local position. The originator is
+        /// epoch-/failover-safe — a promoted primary resumes allocation
+        /// past `max(all replicated def ids)` so it never re-mints a live
+        /// id (the aliasing a node-local cold-start counter would cause).
+        ///
+        /// `None` is the un-allocated shape: a local-apply caller that does
+        /// not route through the broadcast stamp (the in-process unit-test
+        /// constructions and any pre-allocation local apply) leaves it
+        /// `None`, and the receiver falls back to node-local allocation —
+        /// the L2 behavior — so direct-apply paths converge by content hash
+        /// exactly as before. The production WIRE always carries `Some` (the
+        /// stamp pass fills it before the mutation is broadcast).
+        /// `#[serde(default)]` decodes a pre-field sender's frame to `None`
+        /// (wire-safe under rolling upgrade, like the version/attempt
+        /// fields); `skip_serializing_if` trims the bytes on the
+        /// un-allocated local shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        def_id: Option<u32>,
     },
     TaskAssigned {
         hash: String,

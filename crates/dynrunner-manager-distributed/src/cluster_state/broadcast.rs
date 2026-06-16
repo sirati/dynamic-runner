@@ -49,6 +49,17 @@ impl<I: Identifier> ClusterState<I> {
             seq: *seq,
         }
     }
+
+    /// Allocate the PRIMARY-owned, CRDT-agreed [`TaskDefId`](super::TaskDefId)
+    /// for `hash` at the originate stamp step — the originator's half of the
+    /// wire-agreed def id. Idempotent on hash (a re-added hash reuses its
+    /// existing id), epoch-/failover-safe (the def store's allocator resumed
+    /// past every observed id on promotion). Delegates wholly to the def
+    /// store's `alloc_for_hash`; the def slot is filled by the matching
+    /// `intern_at` when the stamped `TaskAdded` is applied locally.
+    pub(super) fn allocate_def_id(&mut self, hash: &str) -> super::TaskDefId {
+        self.definitions.alloc_for_hash(hash)
+    }
 }
 
 /// Stamp the originator's `TaskVersion` onto every version-bearing
@@ -241,6 +252,37 @@ fn stamp_versions<I: Identifier>(
     }
 }
 
+/// Stamp the PRIMARY-allocated, CRDT-agreed `def_id` onto every
+/// originated `TaskAdded` whose id is not yet allocated, BEFORE the
+/// apply+filter loop — the single originate choke point both originator
+/// paths route through, so the wire `TaskAdded` and the originator's own
+/// local apply observe the SAME id (the originator's `intern_at` sees the
+/// reservation `alloc_for_hash` records and treats it as the idempotent
+/// fill). A re-added hash reuses its existing id (the bijection lives in
+/// `alloc_for_hash`); a promoted primary's allocator resumed PAST every
+/// observed id, so it never re-mints a live id (epoch-/failover-safe).
+///
+/// Its own pass (NOT folded into `stamp_versions`): the def-id allocation
+/// is a distinct concern from the per-task version/attempt stamp, and the
+/// def store — not the version counter — owns the id. A `def_id` already
+/// `Some` (a re-broadcast of an already-stamped mutation) is left
+/// untouched, so the pass is idempotent under at-least-once re-origination.
+fn stamp_def_ids<I: Identifier>(
+    state: &mut ClusterState<I>,
+    mutations: &mut [ClusterMutation<I>],
+) {
+    for m in mutations.iter_mut() {
+        if let ClusterMutation::TaskAdded {
+            hash,
+            def_id: def_id @ None,
+            ..
+        } = m
+        {
+            *def_id = Some(state.allocate_def_id(hash).0);
+        }
+    }
+}
+
 /// `ClusterState` is the authoritative role-table owner; transports
 /// register their write-through cache through this boundary trait.
 ///
@@ -321,6 +363,11 @@ pub(crate) fn apply_locally_for_broadcast<I: Identifier>(
     // origination call site is impossible. The applied subset re-broadcast
     // below carries the stamped versions.
     stamp_versions(state, &mut mutations);
+    // Def-id stamp pass (L3a): allocate the primary-owned, CRDT-agreed
+    // `TaskDefId` onto every originated `TaskAdded` so every replica interns
+    // the def under the SAME id. Its own pass — a distinct concern from the
+    // version/attempt stamp above.
+    stamp_def_ids(state, &mut mutations);
     let mut applied: Vec<ClusterMutation<I>> = Vec::with_capacity(mutations.len());
     let mut resumed_for_dispatch: Vec<TaskInfo<I>> = Vec::new();
     // The originator paths (live primary's `apply_spawn_tasks`,

@@ -93,6 +93,7 @@ fn seed_and_hydrate(primary: &mut TestPrimary, tasks: Vec<TaskInfo<TestId>>) {
             cs.apply(ClusterMutation::TaskAdded {
                 hash: compute_task_hash(&t),
                 task: t,
+                def_id: None,
             });
         }
     }
@@ -160,6 +161,7 @@ async fn pinned_task_requeue_hides_from_peer_workers_and_resurfaces_on_readmissi
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: hash.clone(),
                     task,
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskAssigned {
                     attempt: 0,
@@ -295,6 +297,7 @@ async fn pinned_task_on_non_primary_secondary_emits_error_and_requeues() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: hash.clone(),
                     task,
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskAssigned {
                     attempt: 0,

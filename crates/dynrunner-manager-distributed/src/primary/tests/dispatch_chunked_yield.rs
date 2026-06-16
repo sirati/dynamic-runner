@@ -101,6 +101,7 @@ async fn primary_with_many_idle_workers(task_count: usize) -> (TestPrimary, Prim
             cs.apply(ClusterMutation::TaskAdded {
                 hash: compute_task_hash(&t),
                 task: t,
+                def_id: None,
             });
         }
     }

@@ -152,6 +152,7 @@ fn primary_one_task_no_worker() -> (
         cs.apply(ClusterMutation::TaskAdded {
             hash: hash.clone(),
             task,
+            def_id: None,
         });
     }
     primary.hydrate_from_cluster_state()

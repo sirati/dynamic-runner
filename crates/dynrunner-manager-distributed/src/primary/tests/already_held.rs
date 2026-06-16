@@ -165,6 +165,7 @@ async fn promoted_primary_with_lost_inflight_fact() -> (
         cs.apply(ClusterMutation::TaskAdded {
             hash: hash.clone(),
             task,
+            def_id: None,
         });
     }
     primary

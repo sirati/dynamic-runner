@@ -72,6 +72,7 @@ fn primary_with_dag(
             cs.apply(ClusterMutation::TaskAdded {
                 hash: compute_task_hash(&t),
                 task: t,
+                def_id: None,
             });
         }
     }

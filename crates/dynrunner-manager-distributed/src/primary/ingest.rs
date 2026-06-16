@@ -356,6 +356,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 .map(|b| ClusterMutation::TaskAdded {
                     hash: compute_task_hash(b),
                     task: b.clone(),
+                    // The originate stamp pass (`broadcast::stamp_def_ids`)
+                    // allocates the primary-owned, CRDT-agreed def id before
+                    // broadcast; `None` here is the un-stamped seed.
+                    def_id: None,
                 }),
         );
         // Discovery already-done partition: materialise the marked subset

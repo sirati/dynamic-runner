@@ -93,6 +93,7 @@ fn seed_roster_and_tasks(
             cs.apply(ClusterMutation::TaskAdded {
                 hash: crate::primary::wire::compute_task_hash(&task),
                 task,
+                def_id: None,
             });
         }
     }
@@ -466,6 +467,7 @@ fn seed_unstarted_multiphase(primary: &mut TestPrimary, n_run: usize) -> Vec<Str
             cs.apply(ClusterMutation::TaskAdded {
                 hash: crate::primary::wire::compute_task_hash(&task),
                 task,
+                def_id: None,
             });
         }
         // A run task that DEPENDS on a still-Pending build task (`t0`), then
@@ -482,6 +484,7 @@ fn seed_unstarted_multiphase(primary: &mut TestPrimary, n_run: usize) -> Vec<Str
         cs.apply(ClusterMutation::TaskAdded {
             hash: blocked_hash.clone(),
             task: blocked,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskBlocked {
             hash: blocked_hash,
@@ -624,6 +627,7 @@ async fn failover_started_ledger_does_not_open_reservation() {
                     cs.apply(ClusterMutation::TaskAdded {
                         hash: crate::primary::wire::compute_task_hash(&task),
                         task,
+                        def_id: None,
                     });
                 }
                 // Drive `inflight` to InFlight (a worker outcome the prior
@@ -703,6 +707,7 @@ async fn relocation_started_ledger_does_not_open_reservation() {
                     cs.apply(ClusterMutation::TaskAdded {
                         hash: crate::primary::wire::compute_task_hash(&task),
                         task,
+                        def_id: None,
                     });
                 }
                 let inflight = one_task("inflight");
@@ -774,6 +779,7 @@ async fn failover_all_pending_pool_does_not_open_reservation_despite_unstarted()
                     cs.apply(ClusterMutation::TaskAdded {
                         hash: crate::primary::wire::compute_task_hash(&task),
                         task,
+                        def_id: None,
                     });
                 }
             }

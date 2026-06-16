@@ -15,6 +15,7 @@ fn task_preferred_secondaries_updated_apply_writes_to_task() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("h"),
+        def_id: None,
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskPreferredSecondariesUpdated {
@@ -60,6 +61,7 @@ fn task_preferred_secondaries_updated_apply_preserves_state() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("h"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -101,6 +103,7 @@ fn task_failed_with_unfulfillable_lands_in_unfulfillable_variant() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("h"),
+        def_id: None,
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
@@ -133,6 +136,7 @@ fn task_failed_with_generic_nonrecoverable_lands_in_failed_variant() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("h"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -154,6 +158,7 @@ fn task_failed_with_generic_nonrecoverable_lands_in_failed_variant() {
     s2.apply(ClusterMutation::TaskAdded {
         hash: "h2".into(),
         task: mk_task("h2"),
+        def_id: None,
     });
     s2.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -183,6 +188,7 @@ fn cascade_on_unfulfillable_marks_dependents_blocked() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "prereq".into(),
         task: mk_task("prereq"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -197,6 +203,7 @@ fn cascade_on_unfulfillable_marks_dependents_blocked() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "dep".into(),
         task: mk_task("dep"),
+        def_id: None,
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskBlocked {
@@ -235,6 +242,7 @@ fn spawned_dep_on_existing_invalid_task_cascades_as_non_recoverable() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "x_hash".into(),
         task: mk_task("x"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -295,6 +303,7 @@ fn task_completed_auto_resumes_blocked_dependents() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "prereq".into(),
         task: mk_task("prereq"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -314,6 +323,7 @@ fn task_completed_auto_resumes_blocked_dependents() {
         s.apply(ClusterMutation::TaskAdded {
             hash: h.into(),
             task: mk_task(h),
+            def_id: None,
         });
         s.apply(ClusterMutation::TaskBlocked {
             hash: h.into(),
@@ -324,6 +334,7 @@ fn task_completed_auto_resumes_blocked_dependents() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "unrelated".into(),
         task: mk_task("unrelated"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskBlocked {
         hash: "unrelated".into(),
@@ -365,6 +376,7 @@ fn reinject_task_command_filters_to_unfulfillable_only() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "u".into(),
         task: mk_task("u"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -389,6 +401,7 @@ fn reinject_task_command_filters_to_unfulfillable_only() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "f".into(),
         task: mk_task("f"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -420,6 +433,7 @@ fn task_requeued_transitions_in_flight_back_to_pending() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("h"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAssigned {
         attempt: 0,
@@ -469,6 +483,7 @@ fn task_requeued_is_noop_against_non_in_flight_states() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "p".into(),
         task: mk_task("p"),
+        def_id: None,
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskRequeued {
@@ -482,6 +497,7 @@ fn task_requeued_is_noop_against_non_in_flight_states() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "c".into(),
         task: mk_task("c"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAssigned {
         attempt: 0,
@@ -511,6 +527,7 @@ fn task_requeued_is_noop_against_non_in_flight_states() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "i".into(),
         task: mk_task("i"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -547,6 +564,7 @@ fn task_failed_with_invalid_task_lands_in_invalid_task_variant() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("h"),
+        def_id: None,
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
@@ -579,6 +597,7 @@ fn reinject_against_invalid_task_is_noop_non_reinjectable() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("h"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -612,6 +631,7 @@ fn invalid_task_terminal_lockout_blocks_late_failed_and_completed() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("h"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -682,10 +702,12 @@ fn cascade_fail_resolves_direct_blocked_dependent() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "a".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAdded {
         hash: "b".into(),
         task: mk_task("b"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskBlocked {
         hash: "b".into(),
@@ -734,6 +756,7 @@ fn cascade_fail_is_transitive() {
         s.apply(ClusterMutation::TaskAdded {
             hash: h.into(),
             task: mk_task(h),
+            def_id: None,
         });
     }
     s.apply(ClusterMutation::TaskBlocked {
@@ -782,6 +805,7 @@ fn cascade_fail_one_failed_dep_suffices_diamond() {
         s.apply(ClusterMutation::TaskAdded {
             hash: h.into(),
             task: mk_task(h),
+            def_id: None,
         });
     }
     // c is blocked on a (the first unresolved dep); b stays Pending.
@@ -823,10 +847,12 @@ fn cascade_fail_fires_on_invalid_task_prereq() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "a".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAdded {
         hash: "b".into(),
         task: mk_task("b"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskBlocked {
         hash: "b".into(),
@@ -863,10 +889,12 @@ fn recoverable_fail_does_not_cascade() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "a".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAdded {
         hash: "b".into(),
         task: mk_task("b"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskBlocked {
         hash: "b".into(),
@@ -896,10 +924,12 @@ fn unfulfillable_fail_does_not_cascade() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "a".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAdded {
         hash: "b".into(),
         task: mk_task("b"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskBlocked {
         hash: "b".into(),
@@ -937,10 +967,12 @@ fn cascade_fail_drains_dependent_phase_cleanly() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "a".into(),
         task: mk_task_in("a", "p0"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAdded {
         hash: "b".into(),
         task: mk_task_in("b", "p1"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskBlocked {
         hash: "b".into(),
@@ -988,10 +1020,12 @@ fn cascade_fail_emits_dependent_completion_event() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "a".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAdded {
         hash: "b".into(),
         task: mk_task("b"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskBlocked {
         hash: "b".into(),

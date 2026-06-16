@@ -201,6 +201,7 @@ fn operational_snapshot(node_id: &str) -> ClusterState<TestId> {
     cs.apply(ClusterMutation::TaskAdded {
         hash: "t-0".into(),
         task: plain_task("t-0"),
+        def_id: None,
     });
     cs
 }

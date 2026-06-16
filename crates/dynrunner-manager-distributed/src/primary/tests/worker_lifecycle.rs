@@ -66,6 +66,7 @@ fn primary_with_pool_and_idle_worker(
         primary.cluster_state.apply(ClusterMutation::TaskAdded {
             hash: compute_task_hash(t),
             task: t.clone(),
+            def_id: None,
         });
     }
     primary.pool_mut().extend(tasks).expect("valid extend");
@@ -240,6 +241,7 @@ async fn dispatch_originates_inflight_and_completion_clears_it() {
                 .apply(ClusterMutation::TaskAdded {
                     hash: hash_x.clone(),
                     task: x,
+                    def_id: None,
                 });
             assert!(
                 matches!(
@@ -440,6 +442,7 @@ fn primary_two_secondaries_with_pool(
         primary.cluster_state.apply(ClusterMutation::TaskAdded {
             hash: compute_task_hash(t),
             task: t.clone(),
+            def_id: None,
         });
     }
     primary.pool_mut().extend(tasks).expect("valid extend");

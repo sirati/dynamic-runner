@@ -205,10 +205,12 @@ async fn drive_phase_end_with_two_phase_ledger(
         cs.apply(ClusterMutation::TaskAdded {
             hash: p1_hash.clone(),
             task: p1_task,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAdded {
             hash: p2_hash,
             task: p2_task,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAssigned {
             attempt: 0,

@@ -64,6 +64,7 @@ fn seed_in_flight(
     primary.cluster_state.apply(ClusterMutation::TaskAdded {
         hash: hash.clone(),
         task: task.clone(),
+        def_id: None,
     });
     primary.in_flight.insert(
         hash.clone(),

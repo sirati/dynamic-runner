@@ -66,6 +66,7 @@ fn add(state: &mut ClusterState<TestId>, t: &TaskInfo<TestId>) {
     state.apply(ClusterMutation::TaskAdded {
         hash: t.task_id.clone(),
         task: t.clone(),
+        def_id: None,
     });
 }
 

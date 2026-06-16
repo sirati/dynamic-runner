@@ -17,6 +17,7 @@ fn task_added_idempotent() {
         s.apply(ClusterMutation::TaskAdded {
             hash: "h".into(),
             task: t.clone(),
+            def_id: None,
         }),
         ApplyOutcome::Applied
     );
@@ -24,6 +25,7 @@ fn task_added_idempotent() {
         s.apply(ClusterMutation::TaskAdded {
             hash: "h".into(),
             task: t,
+            def_id: None,
         }),
         ApplyOutcome::NoOp
     );
@@ -40,6 +42,7 @@ fn assigned_late_after_completed_is_noop() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskCompleted {
@@ -71,6 +74,7 @@ fn duplicate_completed_is_noop() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -104,6 +108,7 @@ fn failed_then_completed_transitions_to_completed_retry_success() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -142,6 +147,7 @@ fn completed_then_failed_stays_completed_success_never_regresses() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -180,6 +186,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
         s.apply(ClusterMutation::TaskAdded {
             hash: hash.into(),
             task: mk_task(hash),
+            def_id: None,
         });
         s.apply(ClusterMutation::TaskCompleted {
             attempt: 0,
@@ -191,6 +198,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "c".into(),
         task: mk_task("c"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -203,6 +211,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "d".into(),
         task: mk_task("d"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -215,6 +224,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "e".into(),
         task: mk_task("e"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -227,6 +237,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "f".into(),
         task: mk_task("f"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -239,6 +250,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "g".into(),
         task: mk_task("g"),
+        def_id: None,
     });
 
     let o = s.outcome_counts();
@@ -264,6 +276,7 @@ fn invalid_task_counts_as_fail_final_and_is_terminal() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "ok".into(),
         task: mk_task("ok"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -273,6 +286,7 @@ fn invalid_task_counts_as_fail_final_and_is_terminal() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "bad".into(),
         task: mk_task("bad"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -286,6 +300,7 @@ fn invalid_task_counts_as_fail_final_and_is_terminal() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "pend".into(),
         task: mk_task("pend"),
+        def_id: None,
     });
 
     // outcome_counts: the InvalidTask folds into fail_final.
@@ -335,6 +350,7 @@ fn skipped_already_done_is_weakest_terminal_and_silent() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "skip".into(),
         task: mk_task("skip"),
+        def_id: None,
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskSkippedAlreadyDone {
@@ -384,6 +400,7 @@ fn skipped_already_done_is_weakest_terminal_and_silent() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "done".into(),
         task: mk_task("done"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -420,6 +437,7 @@ fn higher_version_refailure_supersedes() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -577,10 +595,12 @@ fn iter_pending_only_returns_pending() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "p".into(),
         task: mk_task("p"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAdded {
         hash: "i".into(),
         task: mk_task("i"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAssigned {
         attempt: 0,
@@ -592,6 +612,7 @@ fn iter_pending_only_returns_pending() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "c".into(),
         task: mk_task("c"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -619,6 +640,7 @@ fn convergence_completed_can_race_assigned() {
     let added = ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     };
     let assigned = ClusterMutation::TaskAssigned {
         attempt: 0,
@@ -662,10 +684,12 @@ fn convergence_under_duplicates() {
         ClusterMutation::TaskAdded {
             hash: "h1".into(),
             task: mk_task("h1"),
+            def_id: None,
         },
         ClusterMutation::TaskAdded {
             hash: "h2".into(),
             task: mk_task("h2"),
+            def_id: None,
         },
         ClusterMutation::TaskAssigned {
             attempt: 0,
@@ -765,6 +789,7 @@ fn def_arc_preserved_across_pending_inflight_completed_transitions() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     let pending_def = s.task_state("h").unwrap().def().clone();
 
@@ -806,6 +831,7 @@ fn routing_preferred_fields_carried_forward_across_transition() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     let pv = TaskVersion {
         primary_epoch: 1,
@@ -851,6 +877,7 @@ fn to_task_info_round_trips_a_constructed_state() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: original.clone(),
+        def_id: None,
     });
     let round_tripped = s.task_state("h").unwrap().to_task_info();
     assert_eq!(round_tripped.path, original.path);
@@ -865,4 +892,168 @@ fn to_task_info_round_trips_a_constructed_state() {
     );
     assert_eq!(round_tripped.preferred_version, original.preferred_version);
     assert_eq!(round_tripped.resolved_path, original.resolved_path);
+}
+
+// ── L3a: primary-allocated, CRDT-agreed def ids on TaskAdded ──
+
+/// A `TaskAdded` carrying a primary-allocated `def_id` interns the def at
+/// EXACTLY that id on the receiver (no node-local re-allocation): the
+/// receiver's def-store binding for the hash equals the wire-carried id.
+#[test]
+fn task_added_uses_wire_carried_def_id() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    assert_eq!(
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "h".into(),
+            task: mk_task("a"),
+            def_id: Some(7),
+        }),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(
+        s.def_id_for_hash_for_test("h"),
+        Some(crate::cluster_state::TaskDefId(7))
+    );
+}
+
+/// Two replicas that apply the SAME primary-allocated `TaskAdded` bind the
+/// hash to the SAME def id — the CRDT-agreement the wire id exists for. The
+/// originator (node A) stamps the id at the broadcast choke point; node B
+/// receives the stamped mutation and uses the SAME id (not a node-local
+/// position, which here would differ because B seeded an unrelated task
+/// first).
+#[test]
+fn two_replicas_agree_on_wire_def_id() {
+    // Node A originates two tasks through the broadcast stamp path so they
+    // carry real primary-allocated ids.
+    let mut a = ClusterState::<RunnerIdentifier>::new();
+    let batch = vec![
+        ClusterMutation::TaskAdded {
+            hash: "h0".into(),
+            task: mk_task("t0"),
+            def_id: None,
+        },
+        ClusterMutation::TaskAdded {
+            hash: "h1".into(),
+            task: mk_task("t1"),
+            def_id: None,
+        },
+    ];
+    let applied = crate::cluster_state::apply_locally_for_broadcast(&mut a, batch);
+    // The stamp pass filled the def ids; both originated tasks landed.
+    assert_eq!(applied.applied.len(), 2);
+    let id_a0 = a.def_id_for_hash_for_test("h0").unwrap();
+    let id_a1 = a.def_id_for_hash_for_test("h1").unwrap();
+    assert_ne!(id_a0, id_a1, "distinct hashes ⇒ distinct allocated ids");
+
+    // Node B receives A's stamped broadcast in REVERSE order. A node-local
+    // (position-based) allocator would bind the FIRST-received hash to the
+    // lower position — disagreeing with A; using the wire-carried id makes B
+    // agree with A regardless of arrival order (the convergence the wire id
+    // exists for, and the def-before-state out-of-order tolerance).
+    let mut b = ClusterState::<RunnerIdentifier>::new();
+    for m in applied.applied.into_iter().rev() {
+        b.apply(m);
+    }
+    assert_eq!(b.def_id_for_hash_for_test("h0"), Some(id_a0));
+    assert_eq!(b.def_id_for_hash_for_test("h1"), Some(id_a1));
+}
+
+/// A re-added hash REUSES its existing def id (the bijection is idempotent
+/// on hash): a second wire `TaskAdded` for the same hash NoOps at the ledger
+/// (the entry already exists) and never re-binds the id.
+#[test]
+fn re_added_hash_reuses_def_id() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("a"),
+        def_id: Some(4),
+    });
+    let first = s.def_id_for_hash_for_test("h");
+    // Re-delivery (at-least-once) of the SAME hash/id NoOps and keeps the id.
+    assert_eq!(
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "h".into(),
+            task: mk_task("a"),
+            def_id: Some(4),
+        }),
+        ApplyOutcome::NoOp
+    );
+    assert_eq!(s.def_id_for_hash_for_test("h"), first);
+    assert_eq!(first, Some(crate::cluster_state::TaskDefId(4)));
+}
+
+/// BIJECTION guard (stale-epoch / failover-aliasing class): a NEW hash whose
+/// wire `def_id` collides with an id ALREADY bound to a DIFFERENT hash is a
+/// loud-but-safe DROP — the apply NoOps and neither corrupts the registry nor
+/// rebinds the id. This is exactly the shape a demoted primary's stale
+/// `TaskAdded` would take after a promoted primary reused the id range for a
+/// different task (the aliasing the epoch-safe allocator prevents at the
+/// originator, caught defensively here at the receiver).
+#[test]
+fn task_added_def_id_conflict_is_noop() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h-a".into(),
+        task: mk_task("a"),
+        def_id: Some(0),
+    });
+    // A different hash claiming the SAME id 0 — the bijection violation.
+    // The helper logs LOUD + debug_asserts; in a release-shaped test build we
+    // pin the SAFE drop (NoOp, no ledger entry, id still bound to h-a).
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "h-b".into(),
+            task: mk_task("b"),
+            def_id: Some(0),
+        })
+    }));
+    // debug_assert fires in a debug build (the loud signal); either way the
+    // registry must NOT have rebound id 0 to h-b.
+    if let Ok(o) = outcome {
+        assert_eq!(o, ApplyOutcome::NoOp);
+    }
+    assert_eq!(
+        s.def_id_for_hash_for_test("h-a"),
+        Some(crate::cluster_state::TaskDefId(0))
+    );
+    assert_eq!(s.def_id_for_hash_for_test("h-b"), None);
+    assert!(s.task_state("h-b").is_none(), "conflicting TaskAdded dropped");
+}
+
+/// DEF-BEFORE-STATE (CL-A4): a state mutation that arrives BEFORE its
+/// `TaskAdded` (the def is not yet present) NoOps — it never panics and never
+/// fabricates a state for an unknown hash. This is the existing out-of-order
+/// silent-NoOp contract; with defs carried on `TaskAdded`, "def present" is
+/// "ledger entry present", so the get-miss NoOp IS the def-before-state guard.
+#[test]
+fn state_mutation_before_task_added_is_noop() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    // TaskAssigned for a hash whose TaskAdded (and thus def) has not arrived.
+    assert_eq!(
+        s.apply(ClusterMutation::TaskAssigned {
+            hash: "h".into(),
+            secondary: "s1".into(),
+            worker: 0,
+            version: Default::default(),
+            attempt: 0,
+        }),
+        ApplyOutcome::NoOp
+    );
+    assert!(s.task_state("h").is_none());
+    // The def-carrying TaskAdded then arrives; the entry materializes.
+    assert_eq!(
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "h".into(),
+            task: mk_task("a"),
+            def_id: Some(2),
+        }),
+        ApplyOutcome::Applied
+    );
+    assert!(matches!(s.task_state("h"), Some(TaskState::Pending { .. })));
+    assert_eq!(
+        s.def_id_for_hash_for_test("h"),
+        Some(crate::cluster_state::TaskDefId(2))
+    );
 }
