@@ -170,7 +170,8 @@ class Task:
 
     ``publish_string(key, value)`` records an inline string output
     under ``key``; ``publish(src, dst, key=k)`` records a file output
-    at the post-publish destination ``dst``. Both accumulate into
+    at the post-publish destination ``dst`` (``dst`` is required —
+    there is no implicit mirroring). Both accumulate into
     ``_outputs_accumulator``, which the runtime flushes into
     ``DoneResponse.result_data`` on task return. Consumers reach the
     accumulated values via the dependent task's
@@ -280,16 +281,15 @@ class Task:
         if self._emit is not None:
             self._emit(PhaseUpdateResponse(phase_name=phase_name))
 
-    def publish(self, src, dst=None, *, key: Optional[str] = None) -> None:
+    def publish(self, src, dst, *, key: Optional[str] = None) -> None:
         from .publish import publish as _publish
-        # `_publish` returns the resolved destination (either the
-        # caller-supplied `dst` verbatim or `dst_root / (src - src_root)`
-        # when omitted). The accumulator records that resolved path so a
+        # `_publish` returns the resolved destination (the explicit
+        # `dst` verbatim). The accumulator records that path so a
         # downstream consumer reading `predecessor_outputs[...][key]`
-        # sees the actual destination on the shared mount even when the
-        # caller relied on the auto-derived dst. Destination resolution
-        # is the single concern of `dynamic_runner.worker.publish`; the
-        # Task wrapper only owns the keyed-outputs side-effect.
+        # sees the actual destination on the shared mount. File
+        # delivery is the single concern of
+        # `dynamic_runner.worker.publish`; the Task wrapper only owns
+        # the keyed-outputs side-effect.
         resolved_dst = _publish(src, dst)
         if key is not None:
             self._outputs_accumulator[key] = {
@@ -332,9 +332,9 @@ class Task:
             )
         self._outputs_accumulator[key] = {"kind": "inline", "value": value}
 
-    def publish_all(self, *srcs) -> None:
+    def publish_all(self, pairs) -> None:
         from .publish import publish_all as _publish_all
-        _publish_all(*srcs)
+        _publish_all(pairs)
 
 
 @dataclass

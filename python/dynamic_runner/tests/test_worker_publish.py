@@ -4,12 +4,12 @@ Covers the contract documented in ``dynamic_runner.worker.publish``:
 
 * env-driven src_root/dst_root resolution with the slurm-wrapper
   defaults
-* dst-mirror derivation (``src - src_root → dst_root``) when ``dst``
-  is omitted
-* explicit ``dst`` override
+* explicit ``(src, dst)`` delivery — there is NO implicit
+  src_root→dst_root mirroring (removed footgun)
+* ``publish_all(pairs)`` set-atomic batch over explicit pairs
 * ``Task.publish`` / ``Task.publish_all`` method delegation
-* ``PublishError`` raised on src-outside-root, missing-src, and
-  cross-tree dst-derivation cases
+* ``PublishError`` raised on src-outside-root / missing-src
+* ``publish(src)`` (dst omitted) is a hard error
 
 Tests run unbound from the runtime loop — ``Task`` is constructed
 directly, exercising the same path that consumer unit tests follow.
@@ -87,57 +87,70 @@ class PublishContractTests(_PublishFixture):
         self.assertEqual(DEFAULT_SRC_ROOT, "/app/out-tmp")
         self.assertEqual(DEFAULT_DST_ROOT, "/app/out-network")
 
-    def test_publish_mirrors_path_under_dst_root(self):
+    def test_publish_delivers_to_explicit_dst(self):
         src = self._stage("a/b/c.txt", "hello")
-        publish(src)
         dst = self.dst_root / "a/b/c.txt"
+        publish(src, dst)
         self.assertEqual(dst.read_text(), "hello")
         self.assertFalse(src.exists())
 
     def test_publish_creates_dst_parent_dirs(self):
         src = self._stage("deep/nested/path/file", "x")
-        publish(src)
-        self.assertTrue((self.dst_root / "deep/nested/path/file").exists())
+        dst = self.dst_root / "deep/nested/path/file"
+        publish(src, dst)
+        self.assertTrue(dst.exists())
 
-    def test_publish_explicit_dst_override(self):
-        src = self._stage("a.json", "v")
+    def test_publish_explicit_dst_can_differ_from_src_layout(self):
+        # The scratch layout need not mirror the publish layout: a
+        # src under a scratch subdir lands at its EXPLICIT dst, never
+        # a mirrored `dst_root / (src - src_root)`.
+        src = self._stage("scratch/work/a.json", "v")
         explicit_dst = self.dst_root / "renamed.json"
         publish(src, explicit_dst)
         self.assertEqual(explicit_dst.read_text(), "v")
-        self.assertFalse((self.dst_root / "a.json").exists())
+        # No mirrored destination was created.
+        self.assertFalse((self.dst_root / "scratch/work/a.json").exists())
 
     def test_publish_overwrites_existing_dst(self):
         src = self._stage("k", "new")
-        prior = self.dst_root / "k"
-        prior.write_text("old")
-        publish(src)
-        self.assertEqual(prior.read_text(), "new")
+        dst = self.dst_root / "k"
+        dst.write_text("old")
+        publish(src, dst)
+        self.assertEqual(dst.read_text(), "new")
 
-    def test_publish_all_processes_each(self):
-        a = self._stage("one.txt", "1")
-        b = self._stage("two.txt", "2")
-        publish_all(a, b)
-        self.assertEqual((self.dst_root / "one.txt").read_text(), "1")
-        self.assertEqual((self.dst_root / "two.txt").read_text(), "2")
+    def test_publish_requires_dst_no_implicit_mirror(self):
+        # The auto-mirror footgun is GONE: omitting `dst` is a hard
+        # TypeError (required positional), not a silent mirror.
+        src = self._stage("x.txt", "v")
+        with self.assertRaises(TypeError):
+            publish(src)  # type: ignore[call-arg]
+
+    def test_publish_all_lands_both_pairs_and_consumes_srcs(self):
+        a = self._stage("scratch/one.txt", "1")
+        b = self._stage("other/two.txt", "2")
+        d1 = self.dst_root / "published/first.txt"
+        d2 = self.dst_root / "published/second.txt"
+        publish_all([(a, d1), (b, d2)])
+        self.assertEqual(d1.read_text(), "1")
+        self.assertEqual(d2.read_text(), "2")
         self.assertFalse(a.exists())
         self.assertFalse(b.exists())
+        # Explicit dsts only — no mirrored copies under the scratch
+        # relative paths.
+        self.assertFalse((self.dst_root / "scratch/one.txt").exists())
+        self.assertFalse((self.dst_root / "other/two.txt").exists())
 
-    def test_publish_outside_src_root_raises(self):
-        # An outside file resolves cleanly but lies outside the
-        # configured staging root → derivation rejects it.
-        outside = Path(self._dst_dir.name) / "notstaged.txt"
-        outside.write_text("x")
-        with self.assertRaises(PublishError):
-            publish(outside)
+    def test_publish_all_empty_iterable_is_noop(self):
+        # No native call, no error.
+        publish_all([])
 
     def test_publish_missing_src_raises(self):
         with self.assertRaises(PublishError):
-            publish(self.src_root / "no-such-file")
+            publish(self.src_root / "no-such-file", self.dst_root / "out.txt")
 
     def test_publish_explicit_dst_still_validates_src_root(self):
-        # Override path: dst-derivation is skipped, but the native
-        # layer's src_root canonicalize-and-check still fires. An
-        # outside src must fail even with an explicit dst.
+        # The native layer's src_root canonicalize-and-check still
+        # fires: an outside src must fail even with an explicit dst.
         outside = Path(self._dst_dir.name) / "outside.txt"
         outside.write_text("x")
         with self.assertRaises(PublishError):
@@ -147,15 +160,18 @@ class PublishContractTests(_PublishFixture):
 class TaskMethodTests(_PublishFixture):
     def test_task_publish_method(self):
         src = self._stage("via-method.txt", "m")
-        Task(relative_path="/x").publish(src)
-        self.assertEqual((self.dst_root / "via-method.txt").read_text(), "m")
+        dst = self.dst_root / "via-method.txt"
+        Task(relative_path="/x").publish(src, dst)
+        self.assertEqual(dst.read_text(), "m")
 
     def test_task_publish_all_method(self):
         a = self._stage("a", "1")
         b = self._stage("b", "2")
-        Task(relative_path="/x").publish_all(a, b)
-        self.assertEqual((self.dst_root / "a").read_text(), "1")
-        self.assertEqual((self.dst_root / "b").read_text(), "2")
+        d1 = self.dst_root / "a"
+        d2 = self.dst_root / "b"
+        Task(relative_path="/x").publish_all([(a, d1), (b, d2)])
+        self.assertEqual(d1.read_text(), "1")
+        self.assertEqual(d2.read_text(), "2")
 
     def test_task_publish_works_without_emit_hook(self):
         # Constructed outside the runtime loop. publish() is
@@ -164,46 +180,37 @@ class TaskMethodTests(_PublishFixture):
         t = Task(relative_path="/x")
         self.assertIsNone(t._emit)
         src = self._stage("hookless.txt", "ok")
-        t.publish(src)
-        self.assertEqual((self.dst_root / "hookless.txt").read_text(), "ok")
+        dst = self.dst_root / "hookless.txt"
+        t.publish(src, dst)
+        self.assertEqual(dst.read_text(), "ok")
 
-    def test_task_publish_with_key_records_resolved_dst_when_dst_omitted(self):
-        # End-to-end regression for the `dst=None` accumulator bug:
-        # the underlying publish helper resolves the destination via
-        # src_root/dst_root; the Task wrapper must record the
-        # resolved path, not the literal `None` the caller passed.
-        # No mocks here — the real publish() resolves the path,
-        # delivers the file, and returns the resolved dst the
-        # accumulator captures.
-        src = self._stage("nested/a/b/keyed.bin", "payload")
+    def test_task_publish_with_key_records_explicit_dst(self):
+        # `publish(src, dst, key=)` records the post-publish
+        # destination under the key. No mocks — the real publish()
+        # delivers the file and returns the explicit dst the
+        # accumulator captures. Guards the keyed-output accumulator
+        # path survived the explicit-pairs migration.
+        src = self._stage("scratch/keyed.bin", "payload")
+        dst = self.dst_root / "outputs/keyed.bin"
         t = Task(relative_path="/x")
-        t.publish(src, key="out")
-        expected_dst = self.dst_root / "nested/a/b/keyed.bin"
+        t.publish(src, dst, key="out")
         self.assertEqual(
             t._outputs_accumulator,
-            {"out": {"kind": "file", "value": str(expected_dst)}},
+            {"out": {"kind": "file", "value": str(dst)}},
         )
-        # Bonus: confirm the file actually lives at that path —
-        # ties the accumulator's recorded value to the real on-disk
+        # Tie the accumulator's recorded value to the real on-disk
         # delivery so a future regression can't silently desync them.
-        self.assertTrue(expected_dst.exists())
-        self.assertEqual(expected_dst.read_text(), "payload")
+        self.assertTrue(dst.exists())
+        self.assertEqual(dst.read_text(), "payload")
 
-    def test_publish_returns_resolved_dst_with_explicit_override(self):
-        # The Path-return contract holds for the explicit-dst path
-        # too — callers like Task.publish capture this verbatim.
+    def test_publish_returns_explicit_dst(self):
+        # The Path-return contract: publish returns the explicit dst
+        # verbatim — the single source of truth Task.publish captures
+        # into the keyed-outputs accumulator.
         src = self._stage("explicit.txt", "v")
         explicit_dst = self.dst_root / "alias.txt"
         returned = publish(src, explicit_dst)
         self.assertEqual(returned, explicit_dst)
-
-    def test_publish_returns_resolved_dst_when_derived(self):
-        # The Path-return contract for the derive-from-src_root path.
-        # This is the single source of truth Task.publish relies on
-        # when the caller omitted dst.
-        src = self._stage("d/e/derive.txt", "v")
-        returned = publish(src)
-        self.assertEqual(returned, self.dst_root / "d/e/derive.txt")
 
 
 class EnvOverrideTests(unittest.TestCase):
@@ -214,6 +221,9 @@ class EnvOverrideTests(unittest.TestCase):
     """
 
     def test_env_changes_take_effect_per_call(self):
+        # src_root is re-read per call: a src valid under src_root A
+        # but not under src_root B must fail once the env flips. The
+        # native under-root check is what observes the swap.
         with tempfile.TemporaryDirectory() as src_a, \
              tempfile.TemporaryDirectory() as dst_a, \
              tempfile.TemporaryDirectory() as src_b, \
@@ -226,12 +236,17 @@ class EnvOverrideTests(unittest.TestCase):
             os.environ[ENV_SRC_ROOT] = src_a
             os.environ[ENV_DST_ROOT] = dst_a
             try:
-                publish(file_a)
+                publish(file_a, Path(dst_a) / "x")
                 self.assertEqual((Path(dst_a) / "x").read_text(), "from-a")
 
+                # Flip src_root to B; file_a now lies outside it, so the
+                # native validation must reject it (proving the per-call
+                # env re-read), while file_b under B succeeds.
                 os.environ[ENV_SRC_ROOT] = src_b
                 os.environ[ENV_DST_ROOT] = dst_b
-                publish(file_b)
+                with self.assertRaises(PublishError):
+                    publish(file_a, Path(dst_b) / "a")
+                publish(file_b, Path(dst_b) / "x")
                 self.assertEqual((Path(dst_b) / "x").read_text(), "from-b")
             finally:
                 os.environ.pop(ENV_SRC_ROOT, None)
@@ -239,47 +254,34 @@ class EnvOverrideTests(unittest.TestCase):
 
 
 class PublishAllBatchTests(_PublishFixture):
-    """``publish_all`` resolves all triples up front and hands the
-    whole batch to the native ``publish_all`` in ONE call — it does
-    NOT fall back to N per-file ``publish_one`` calls. Stubs the
-    native layer so the call shape (single batch, all resolved pairs,
-    common src_root) is asserted directly without touching disk.
+    """``publish_all(pairs)`` hands the whole batch to the native
+    ``publish_all`` in ONE call — it does NOT fall back to N per-file
+    ``publish_one`` calls, and it does NOT derive/mirror any dst.
+    Stubs the native layer so the call shape (single batch, verbatim
+    pairs, process-wide src_root) is asserted without touching disk.
     """
 
-    def test_publish_all_calls_native_batch_once_with_resolved_pairs(self):
+    def test_publish_all_calls_native_batch_once_with_explicit_pairs(self):
         a = self._stage("one.txt", "1")
         b = self._stage("sub/two.txt", "2")
+        d1 = self.dst_root / "first.txt"
+        d2 = self.dst_root / "nested/second.txt"
         with patch.object(publish_mod, "_native_publish_all") as batch, \
              patch.object(publish_mod, "_native_publish_one") as one:
-            publish_all(a, b)
+            publish_all([(a, d1), (b, d2)])
         # Exactly one batch call, zero per-file publish_one calls.
         batch.assert_called_once()
         one.assert_not_called()
         items, src_root = batch.call_args.args
-        # All srcs resolved to their mirrored dsts, in order.
-        self.assertEqual(
-            items,
-            [
-                (a, self.dst_root / "one.txt"),
-                (b, self.dst_root / "sub/two.txt"),
-            ],
-        )
-        # The common, process-wide src_root is passed once.
+        # Pairs passed through verbatim, in order — no mirroring.
+        self.assertEqual(items, [(a, d1), (b, d2)])
+        # The process-wide src_root is forwarded once for the native
+        # cross-FS staging + under-root validation.
         self.assertEqual(src_root, self.src_root)
 
     def test_publish_all_empty_is_noop(self):
         with patch.object(publish_mod, "_native_publish_all") as batch:
-            publish_all()
-        batch.assert_not_called()
-
-    def test_publish_all_propagates_resolution_error_before_native_call(self):
-        # A src outside src_root must fail at resolution — the native
-        # batch is never invoked (no partial staging attempted).
-        outside = Path(self._dst_dir.name) / "escape.txt"
-        outside.write_text("x")
-        with patch.object(publish_mod, "_native_publish_all") as batch:
-            with self.assertRaises(PublishError):
-                publish_all(outside)
+            publish_all([])
         batch.assert_not_called()
 
 
