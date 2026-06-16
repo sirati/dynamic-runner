@@ -1021,6 +1021,107 @@ async fn ghost_task_request_must_not_self_relay_spin() {
         .await;
 }
 
+/// ── #491 parity: the primary inbox ARM batch-drains a backlog ──
+///
+/// The secondary's inbox arm (process_tasks.rs) was given a bounded follow-on
+/// `drain_ready(INBOX_BATCH_DRAIN_CAP)` sweep in #491 so one `select!`
+/// iteration consumes a BOUNDED BATCH, not a single frame, against the
+/// O(tasks) pull-model ingress rate. The primary oploop's inbox arm was never
+/// given the same sweep — at affine scale its single-frame-per-iteration drain
+/// lost to that ingress rate, pinning the inbox arm ~95% and starving the
+/// sibling timer arms into a runtime-starvation freeze. This pins the restored
+/// parity at the LOOP level (the shared `RoleInbox::drain_ready` primitive is
+/// unit-tested in `process::mesh_client`; here we prove the primary ARM
+/// invokes it).
+///
+/// MECHANISM OF THE ORACLE: `arm_stats.record(ARM_INBOX)` fires exactly ONCE
+/// per arm body — i.e. once per awaited `recv()` win — REGARDLESS of how many
+/// frames the follow-on `drain_ready` sweep then absorbs (it counts select!
+/// wins, not frames). So when a backlog of K frames is already queued:
+///   • one-per-iteration (pre-fix): the arm must win K separate times to drain
+///     K frames → `inbox` count ≈ K.
+///   • batch-drain (post-fix): each win absorbs the whole ready backlog in its
+///     `drain_ready` sweep → `inbox` count ≪ K (a handful of recv-led batches).
+/// We inject K=64 unassignable ghost `TaskRequest`s back-to-back (so they pile
+/// into the inbox as one ready backlog) and assert the inbox arm serviced them
+/// in FEWER than K/2 selections — a margin one-per-iteration provably cannot
+/// meet (it would need ≥K). Ghost requests are dropped on arrival (R1, see
+/// `ghost_task_request_must_not_self_relay_spin`) so they neither self-relay
+/// nor assign — each is purely a frame the arm must pull from the inbox, the
+/// clean drain-rate probe.
+#[tokio::test(flavor = "current_thread")]
+async fn primary_inbox_arm_batch_drains_backlog_in_one_selection() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let real = make_binary("bin_real", 50);
+            let ghost = make_binary("bin_ghost", 60);
+            // The ghost in-flight keeps the run open for the whole window so
+            // the live arm stats survive to be read post-timeout.
+            let fixture = ghost_fixture(vec![real, ghost.clone()], Some(ghost));
+            let GhostFixture {
+                mut primary,
+                mesh_keepalive: _mesh,
+                wire_tx,
+                _sec_handle,
+            } = fixture;
+
+            // After the loop settles into operational steady state, fire a
+            // BACKLOG of K ghost requests back-to-back (no awaits between
+            // sends) so on the current-thread runtime they all queue into the
+            // primary's inbox as one ready batch before the inbox arm next
+            // polls — the production "freed-worker re-poll burst" shape.
+            let backlog = 64usize;
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(StdDuration::from_millis(1500)).await;
+                for w in 0..backlog as u32 {
+                    let _ = wire_tx.send(ghost_task_request(w));
+                }
+            });
+
+            {
+                let (_deps, ops, ope) = noop_phase_args();
+                let run = primary.run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                );
+                tokio::pin!(run);
+                let _ = tokio::time::timeout(StdDuration::from_secs(5), &mut run).await;
+            }
+
+            let inbox = arm_count_of(&primary, "inbox");
+            // ORACLE 1 (the backlog WAS serviced): the inbox arm fired at least
+            // once — the loop pulled the burst, it was not left to rot.
+            assert!(
+                inbox >= 1,
+                "the inbox arm never won — the {backlog}-frame backlog was \
+                 never serviced",
+            );
+            // ORACLE 2 (batch-drain, not one-per-iteration): the K queued
+            // frames were absorbed in FEWER than K/2 inbox-arm selections. A
+            // one-per-iteration drain would need at LEAST K selections (one
+            // recv per frame); the batch-drain folds the ready backlog into a
+            // handful of recv-led batches. The K/2 ceiling is a wide,
+            // non-flaky margin — even if mesh keepalives and the backlog split
+            // across a few batches, it stays far below the K floor a
+            // single-frame drain is pinned to.
+            assert!(
+                (inbox as usize) < backlog / 2,
+                "PRIMARY INBOX ARM NOT BATCH-DRAINING (#491 parity): a backlog \
+                 of {backlog} queued frames drove {inbox} inbox-arm selections — \
+                 a one-per-iteration drain needs ≥{backlog} (one recv per \
+                 frame). The bounded `drain_ready` follow-on must absorb the \
+                 ready backlog within a recv-led batch so the count stays ≪ the \
+                 frame count.",
+            );
+        })
+        .await;
+}
+
 /// ── ROUND 6 repro #2 (the capture's ingest freeze, end-to-end) ──
 ///
 /// The production sequence replayed: unassignable TaskRequests are ALREADY

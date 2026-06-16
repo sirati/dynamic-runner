@@ -55,6 +55,20 @@ pub(crate) const OP_LOOP_ARM_NAMES: &[&str] = &[
     "persistent_dial_failure",
 ];
 
+/// Follow-on batch-drain cap for the inbox arm (#491, mirrored from the
+/// secondary's `process_tasks::INBOX_BATCH_DRAIN_CAP`). At affine scale the
+/// O(tasks) pull-model TaskRequest/TaskComplete arrival rate floods a
+/// single-frame-per-iteration drain, pinning the inbox arm ~95% and starving
+/// heartbeat/worker_mgmt → runtime-starvation freeze. After the awaited
+/// `recv()` yields, the arm synchronously sweeps up to this many MORE
+/// already-queued frames so the loop keeps up; the cap bounds the burst so
+/// every sibling arm still gets a turn each pass (a deeper backlog drains down
+/// across iterations). Held primary-side at the same 256 the secondary uses —
+/// the two loops are independent consumers of the same `RoleInbox` primitive,
+/// so a mirrored local const keeps each role's tuning self-contained rather
+/// than coupling them through a shared symbol.
+const INBOX_BATCH_DRAIN_CAP: usize = 256;
+
 /// Render a drain-by-`MessageType` tally as a single diagnostic string:
 /// `[TaskRequest=N, Keepalive=M, ...]`, only non-zero types, sorted by
 /// count descending (ties broken by the type's `Debug` name for a
@@ -907,6 +921,32 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             // mutation that reaches the primary via more
                             // than one peer-forward path is absorbed.
                             self.dispatch_message(m, &mut command_rx).await?;
+                            // Batch-drain relief (#491, ported from the
+                            // secondary): the awaited `recv` above is the ONE
+                            // cancel-safe wait — the only future a sibling arm
+                            // can cancel. Now committed to THIS iteration,
+                            // synchronously sweep up to `INBOX_BATCH_DRAIN_CAP`
+                            // MORE frames the channel already holds, in arrival
+                            // order. `drain_ready` never awaits, so the whole
+                            // sweep runs inside the arm body where no
+                            // cancellation can occur (each frame is already
+                            // removed from the channel, so the per-frame
+                            // `.await?` processes an already-owned frame — no
+                            // consume-then-await hazard). The cap bounds the
+                            // burst so the loop still yields to every sibling
+                            // arm each pass; a deeper backlog drains down across
+                            // iterations. At affine scale the O(tasks)
+                            // pull-model TaskRequest/TaskComplete arrival rate
+                            // floods a single-frame-per-iteration drain, pinning
+                            // the inbox arm ~95% and starving
+                            // heartbeat/worker_mgmt → runtime-starvation freeze;
+                            // the batch drain restores parity with the
+                            // secondary's inbox arm. `arm_stats` counts ONE
+                            // selection regardless of batch size (it measures
+                            // select! wins, not frames).
+                            for m in self.inbox.drain_ready(INBOX_BATCH_DRAIN_CAP) {
+                                self.dispatch_message(m, &mut command_rx).await?;
+                            }
                         }
                         None => {
                             // The operational inbox closed: every sender —
