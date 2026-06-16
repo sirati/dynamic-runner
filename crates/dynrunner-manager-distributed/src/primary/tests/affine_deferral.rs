@@ -97,6 +97,126 @@ fn released_report(secondary: &str, task_hash: &str, worker_id: u32) -> Distribu
     }
 }
 
+/// Count the `QueuedAfterLocalDependencySet` mutations carried by the
+/// `ClusterMutation` frames drained from a secondary end, and the number of
+/// distinct `ClusterMutation` FRAMES that carried at least one. Returns
+/// `(frames, mutations)`. Mesh keepalives / digests are a different
+/// `DistributedMessage` variant, so they are ignored.
+fn count_queued_set_broadcasts(
+    rx: &mut tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+) -> (usize, usize) {
+    let mut frames = 0;
+    let mut mutations = 0;
+    while let Ok(msg) = rx.try_recv() {
+        if let DistributedMessage::ClusterMutation { mutations: ms, .. } = msg {
+            let n = ms
+                .iter()
+                .filter(|m| {
+                    matches!(m, ClusterMutation::QueuedAfterLocalDependencySet { .. })
+                })
+                .count();
+            if n > 0 {
+                frames += 1;
+                mutations += n;
+            }
+        }
+    }
+    (frames, mutations)
+}
+
+/// COALESCING (Commit 3): a contiguous run of N `TaskQueuedAfterLocalDependency`
+/// reports dispatched through `dispatch_inbox_batch_coalescing_deferrals`
+/// produces exactly ONE `ClusterMutation` broadcast carrying all N rank-drops
+/// — not N broadcasts. The build_compilers affine burst (S × M reports) is
+/// thereby O(1) broadcasts per inbox drain instead of O(N), so it no longer
+/// floods ingest and trips the self-starvation false-election.
+#[tokio::test(flavor = "current_thread")]
+async fn deferral_burst_coalesces_into_one_broadcast() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Seat THREE distinct work tasks as InFlight on sec-0 (the
+            // build_compilers burst shape — many dependents parked behind one
+            // import), exactly as a live dispatch would.
+            let mut hashes = Vec::new();
+            for (slot, name) in ["dep-A", "dep-B", "dep-C"].iter().enumerate() {
+                let task = make_binary(name, 100);
+                let hash = compute_task_hash(&task);
+                {
+                    let cs = primary.cluster_state_mut_for_test();
+                    cs.apply(ClusterMutation::TaskAdded {
+                        hash: hash.clone(),
+                        task: task.clone(),
+                    });
+                }
+                let staged =
+                    primary.stage_in_flight_for_test("sec-0".into(), slot as u32, task.clone());
+                assert_eq!(staged, hash);
+                {
+                    let cs = primary.cluster_state_mut_for_test();
+                    cs.apply(ClusterMutation::TaskAssigned {
+                        hash: hash.clone(),
+                        secondary: "sec-0".into(),
+                        worker: slot as u32,
+                        version: Default::default(),
+                        attempt: 0,
+                    });
+                }
+                hashes.push(hash);
+            }
+
+            // Drain any setup/keepalive frames already queued so the count
+            // below reflects only the deferral burst's broadcasts.
+            settle_pump().await;
+            let (_, rx, _) = &mut ends[0];
+            while rx.try_recv().is_ok() {}
+
+            // The burst: three TaskQueuedAfterLocalDependency reports in one
+            // inbox-drain batch, dispatched through the coalescing path.
+            let batch: Vec<DistributedMessage<TestId>> = hashes
+                .iter()
+                .map(|h| queued_report("sec-0", h))
+                .collect();
+            primary
+                .dispatch_inbox_batch_coalescing_deferrals(batch, &mut None)
+                .await
+                .expect("coalescing dispatch succeeds");
+
+            // All three parked dependents are dropped from the ledger (the
+            // per-report local effect is unchanged by coalescing).
+            for h in &hashes {
+                assert!(
+                    !primary.in_flight_for_test().contains_key(h),
+                    "each parked dependent must be dropped from the in-flight ledger"
+                );
+            }
+
+            settle_pump().await;
+            let (_, rx, _) = &mut ends[0];
+            let (frames, mutations) = count_queued_set_broadcasts(rx);
+            assert_eq!(
+                frames, 1,
+                "the deferral burst must coalesce into exactly ONE ClusterMutation \
+                 broadcast frame (got {frames}); O(1) per inbox drain, not O(N)"
+            );
+            assert_eq!(
+                mutations, 3,
+                "the single coalesced frame must carry all three rank-drops (got \
+                 {mutations})"
+            );
+        })
+        .await;
+}
+
 /// THE round trip: defer parks B (CRDT QueuedAfterLocalDependency + dropped
 /// from the in-flight ledger so the probe cannot loop), release re-seats it
 /// (CRDT InFlight + re-entered in the ledger).
