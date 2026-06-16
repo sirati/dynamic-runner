@@ -50,6 +50,7 @@ pub(crate) mod retry_bucket;
 mod secondary_id;
 mod setup_dispatch;
 mod setup_staging;
+mod spawn_queue;
 pub mod staging;
 pub(crate) mod task;
 mod terminal_gate;

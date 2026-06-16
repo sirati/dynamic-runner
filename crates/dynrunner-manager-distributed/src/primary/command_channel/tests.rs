@@ -1377,7 +1377,7 @@ async fn spawn_tasks_within_batch_duplicate_invalidates_run_wide() {
 /// bad-dep entry surfaces as `SpawnError::UnknownDependency`;
 /// the other 2 land normally.
 #[tokio::test(flavor = "current_thread")]
-async fn spawn_tasks_unknown_dependency_returns_per_index_error() {
+async fn spawn_tasks_unknown_dependency_parks_then_surfaces_at_drain() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1396,24 +1396,18 @@ async fn spawn_tasks_unknown_dependency_returns_per_index_error() {
             let mut c = make_binary("c", 100);
             c.task_id = "c_id".into();
 
+            // CL-A8: a not-yet-defined dep does NOT fail per-index at spawn
+            // time — it PARKS (it could be a cross-batch forward-ref whose
+            // prereq arrives in a later batch). The other two publish now.
             let errors =
                 spawn_via_handler(&mut coordinator, vec![a.clone(), bad.clone(), c.clone()])
                     .await
                     .expect("spawn_tasks succeeds");
-            assert_eq!(errors.len(), 1, "exactly one per-index error: {errors:?}");
-            let (idx, err) = &errors[0];
-            assert_eq!(*idx, 1);
-            match err {
-                super::SpawnError::UnknownDependency {
-                    task_hash,
-                    dep_task_id,
-                } => {
-                    assert_eq!(task_hash, &compute_task_hash(&bad));
-                    assert_eq!(dep_task_id, "nope");
-                }
-                other => panic!("expected UnknownDependency, got {other:?}"),
-            }
-            // Other two land normally.
+            assert!(
+                errors.is_empty(),
+                "a parked unknown-dep task is NOT a per-index error: {errors:?}"
+            );
+            // The two dep-less tasks land normally.
             assert!(matches!(
                 coordinator.cluster_state.task_state(&compute_task_hash(&a)),
                 Some(TaskState::Pending { .. })
@@ -1422,13 +1416,31 @@ async fn spawn_tasks_unknown_dependency_returns_per_index_error() {
                 coordinator.cluster_state.task_state(&compute_task_hash(&c)),
                 Some(TaskState::Pending { .. })
             ));
-            // And the bad entry is NOT in the ledger.
+            // The unknown-dep task is parked: NOT in the ledger, queue
+            // non-empty.
             assert!(
                 coordinator
                     .cluster_state
                     .task_state(&compute_task_hash(&bad))
                     .is_none(),
-                "bad-dep task must not be inserted in the ledger"
+                "parked task must not be inserted in the ledger"
+            );
+            assert!(
+                !coordinator.spawn_queue.is_empty(),
+                "the unknown-dep task must be parked"
+            );
+
+            // Drain-completeness: `nope` is never defined ⇒ the run-end drain
+            // surfaces the orphan LOUD (folded into the spawn-rejection
+            // backstop ⇒ RunError::SpawnRejected), NOT a silent forever-park.
+            let leftovers = coordinator.spawn_queue.drain();
+            assert_eq!(leftovers.len(), 1, "the orphan must surface at drain");
+            assert_eq!(leftovers[0].0.task_id, "bad_id");
+            assert!(
+                leftovers[0]
+                    .1
+                    .contains(&(PhaseId::from("default"), "nope".to_string())),
+                "drain names the never-defined prerequisite"
             );
         })
         .await;
@@ -1572,16 +1584,20 @@ async fn spawn_tasks_refreshes_total_tasks_from_cluster_state() {
 
 /// SITE B (runtime SpawnTasks): a spawned task depending on
 /// `(phase=B, foo)` while `foo` exists only in a DIFFERENT phase (A)
-/// is minted `UnknownDependency` and NOT applied — it must NOT land
+/// names an identity that is NOT defined, so under CL-A8 it PARKS in the
+/// `PendingSpawnQueue` rather than landing silently Pending — and, since
+/// `(B, foo)` is never defined, surfaces LOUD at the run-end drain. The
+/// invariant the test guards is unchanged: the task must NOT land
 /// silently Pending with an unsatisfiable dep.
 ///
 /// Pre-fix the validator's dep resolution was phase-blind, so the
 /// phase-B dep passed (any phase carrying `foo` satisfied it). The
 /// task then reached `apply_tasks_spawned`, whose phase-aware
 /// `task_hash_for_dep(B, foo)` returned `None` → "treat as resolved" →
-/// the task landed Pending and never-runnable.
+/// the task landed Pending and never-runnable. Post-CL-A8 the phase-aware
+/// "defined?" probe parks it instead of admitting it never-runnable.
 #[tokio::test(flavor = "current_thread")]
-async fn spawn_tasks_cross_phase_missing_dep_is_invalid_not_silent_pending() {
+async fn spawn_tasks_cross_phase_missing_dep_parks_not_silent_pending() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1615,23 +1631,40 @@ async fn spawn_tasks_cross_phase_missing_dep_is_invalid_not_silent_pending() {
             let errors = spawn_via_handler(&mut coordinator, vec![child.clone()])
                 .await
                 .expect("spawn_tasks call itself succeeds");
-            assert_eq!(errors.len(), 1, "the phase-B dep is unsatisfiable");
-            match &errors[0].1 {
-                super::SpawnError::UnknownDependency { dep_task_id, .. } => {
-                    assert_eq!(dep_task_id, "foo");
-                }
-                other => panic!("expected UnknownDependency, got {other:?}"),
-            }
+            // CL-A8: the unsatisfiable `(B, foo)` dep parks `child` (no
+            // per-index error — it could be a forward-ref), NOT a silent
+            // never-runnable Pending.
+            assert!(
+                errors.is_empty(),
+                "a parked unsatisfiable-dep task is NOT a per-index error: {errors:?}"
+            );
 
-            // The task must NOT have been applied (no silent Pending).
+            // The task must NOT have been applied (no silent Pending) — it is
+            // parked, not in the ledger, not in the pool.
             let child_hash = compute_task_hash(&child);
             assert!(
                 coordinator.cluster_state.task_state(&child_hash).is_none(),
-                "the invalid-dep task must NOT land in the ledger"
+                "the unsatisfiable-dep task must NOT land in the ledger"
             );
             assert!(
                 !coordinator.pool().iter().any(|t| t.task_id == "child"),
-                "the invalid-dep task must NOT be in the pool"
+                "the unsatisfiable-dep task must NOT be in the pool"
+            );
+            assert!(
+                !coordinator.spawn_queue.is_empty(),
+                "the unsatisfiable-dep task must be parked"
+            );
+
+            // `(B, foo)` is never defined ⇒ the run-end drain surfaces it
+            // LOUD (the spawn-rejection backstop), NOT a silent forever-park.
+            let leftovers = coordinator.spawn_queue.drain();
+            assert_eq!(leftovers.len(), 1);
+            assert_eq!(leftovers[0].0.task_id, "child");
+            assert!(
+                leftovers[0]
+                    .1
+                    .contains(&(PhaseId::from("B"), "foo".to_string())),
+                "drain names the never-defined (B, foo) prerequisite"
             );
         })
         .await;
@@ -1722,6 +1755,128 @@ fn tasks_spawned_mutation_round_trips_through_serde() {
         }
         other => panic!("variant lost in round-trip: {other:?}"),
     }
+}
+
+/// CL-A8 seam: CROSS-batch forward-ref. Batch 1 spawns dependent `a`
+/// whose prerequisite `b` is defined only in a LATER batch — `a` PARKS in
+/// the `PendingSpawnQueue` (no per-index error, NOT in the ledger, NOT
+/// rejected as `UnknownDependency`). Batch 2 spawns `b`; the queue
+/// releases `a` (its prereq is now defined) and both publish — `b` lands
+/// Pending, `a` lands `Blocked{on=b}` (b is Pending, the existing apply
+/// rule). Pins the robustness for out-of-order/incremental spawning.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tasks_cross_batch_forward_ref_parks_then_publishes() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+            let mut a = make_binary("a", 100);
+            a.task_id = "a_id".into();
+            a.task_depends_on = vec![TaskDep {
+                task_id: "b_id".into(),
+                phase_id: PhaseId::from("default"),
+                inherit_outputs: false,
+                def_id: None,
+            }];
+            let mut b = make_binary("b", 100);
+            b.task_id = "b_id".into();
+            seed_pool(&mut coordinator, &[&a.phase_id]);
+
+            // Batch 1: dependent `a` ahead of its prerequisite `b`.
+            let errors = spawn_via_handler(&mut coordinator, vec![a.clone()])
+                .await
+                .expect("spawn_tasks succeeds (forward-ref parks, no vec-level error)");
+            assert!(
+                errors.is_empty(),
+                "a parked forward-ref is NOT a per-index error: {errors:?}"
+            );
+            let a_hash = compute_task_hash(&a);
+            assert!(
+                coordinator.cluster_state.task_state(&a_hash).is_none(),
+                "parked dependent must NOT be in the ledger yet"
+            );
+            assert!(
+                !coordinator.spawn_queue.is_empty(),
+                "the forward-ref dependent must be parked"
+            );
+
+            // Batch 2: the prerequisite lands ⇒ queue releases `a` too.
+            let errors = spawn_via_handler(&mut coordinator, vec![b.clone()])
+                .await
+                .expect("spawn_tasks succeeds");
+            assert!(errors.is_empty(), "no per-index errors expected: {errors:?}");
+            assert!(
+                coordinator.spawn_queue.is_empty(),
+                "releasing the dependent must empty the queue"
+            );
+
+            let b_hash = compute_task_hash(&b);
+            assert!(
+                matches!(
+                    coordinator.cluster_state.task_state(&b_hash),
+                    Some(TaskState::Pending { .. })
+                ),
+                "prerequisite must land Pending"
+            );
+            match coordinator.cluster_state.task_state(&a_hash) {
+                Some(TaskState::Blocked { on, .. }) => {
+                    assert_eq!(on, &b_hash, "released dependent blocks on its now-defined prereq");
+                }
+                other => panic!("released dependent must be published as Blocked, got {other:?}"),
+            }
+        })
+        .await;
+}
+
+/// CL-A8 seam: the COMMON topological case (deps-first, all deps already
+/// defined) publishes IMMEDIATELY — the queue is a transparent no-op
+/// pass-through and never parks. `a` depends on `b`, both in one batch
+/// ordered `[b, a]`; `validate_spawn_tasks` already treats within-batch
+/// deps as known, so the queue admits both at once and the queue stays
+/// empty.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tasks_topological_batch_is_queue_no_op() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+            let mut b = make_binary("b", 100);
+            b.task_id = "b_id".into();
+            let mut a = make_binary("a", 100);
+            a.task_id = "a_id".into();
+            a.task_depends_on = vec![TaskDep {
+                task_id: "b_id".into(),
+                phase_id: PhaseId::from("default"),
+                inherit_outputs: false,
+                def_id: None,
+            }];
+            seed_pool(&mut coordinator, &[&a.phase_id]);
+
+            // Deps-first within one batch: nothing parks.
+            let errors = spawn_via_handler(&mut coordinator, vec![b.clone(), a.clone()])
+                .await
+                .expect("spawn_tasks succeeds");
+            assert!(errors.is_empty(), "no per-index errors expected: {errors:?}");
+            assert!(
+                coordinator.spawn_queue.is_empty(),
+                "topological batch must be a queue no-op (nothing parked)"
+            );
+            assert!(
+                matches!(
+                    coordinator.cluster_state.task_state(&compute_task_hash(&b)),
+                    Some(TaskState::Pending { .. })
+                ),
+                "prerequisite published Pending"
+            );
+            assert!(
+                matches!(
+                    coordinator.cluster_state.task_state(&compute_task_hash(&a)),
+                    Some(TaskState::Blocked { .. })
+                ),
+                "dependent published Blocked on its in-batch prereq"
+            );
+        })
+        .await;
 }
 
 /// F4 event-shape: a fail → (retry) succeed sequence for the SAME phase
@@ -2189,9 +2344,17 @@ async fn spawn_tasks_chunked_continuation_returns_to_select_between_chunks() {
 /// A chunked SpawnTasks whose per-chunk validator produces per-index
 /// `SpawnError`s must thread the ABSOLUTE input index back to the caller
 /// (not the chunk-local index) — otherwise a multi-chunk path silently
-/// remaps the caller's per-index error semantics. Inject an
-/// `UnknownDependency` error at position CHUNK+1 (i.e. in the SECOND
+/// remaps the caller's per-index error semantics. Inject a
+/// `DuplicateTaskHash` error at position CHUNK+1 (i.e. in the SECOND
 /// chunk) and assert the reply carries index = CHUNK+1, NOT 1.
+///
+/// Uses an already-in-ledger DUPLICATE (not an unknown dep) as the
+/// rejection vehicle: a duplicate has no unmet deps, so it passes through
+/// the CL-A8 `PendingSpawnQueue` unparked and reaches the per-chunk
+/// validator at its original position — the right shape to exercise the
+/// absolute-index translation. (An unknown dep now PARKS in the spawn
+/// queue rather than failing per-index, so it would not exercise this
+/// path — see `spawn_tasks_unknown_dependency_parks_then_surfaces_at_drain`.)
 #[tokio::test(flavor = "current_thread")]
 async fn spawn_tasks_chunked_absolute_index_translation() {
     let local = tokio::task::LocalSet::new();
@@ -2203,24 +2366,24 @@ async fn spawn_tasks_chunked_absolute_index_translation() {
                 FixedEstimator,
                 TestId,
             >::APPLY_SPAWN_CHUNK_SIZE;
-            // CHUNK + 5 tasks total; index `CHUNK + 1` (in the SECOND
-            // chunk) declares an UnknownDependency. The other tasks are
-            // dep-less and apply cleanly.
+            // CHUNK + 5 tasks total; the task at index `CHUNK + 1` (in the
+            // SECOND chunk) is pre-seeded into the ledger, so re-spawning it
+            // is a `DuplicateTaskHash` per-index rejection. The other tasks
+            // are dep-less and apply cleanly.
             let bad_index = CHUNK + 1;
             let mut tasks = Vec::with_capacity(CHUNK + 5);
             for i in 0..(CHUNK + 5) {
                 let mut t = make_binary(&format!("t{i}"), 100);
                 t.task_id = format!("t{i}_id");
-                if i == bad_index {
-                    t.task_depends_on = vec![TaskDep {
-                        task_id: "does_not_exist".into(),
-                        phase_id: t.phase_id.clone(),
-                        inherit_outputs: false,
-                        def_id: None,
-                    }];
-                }
                 tasks.push(t);
             }
+            // Pre-seed the bad-index task into the ledger so its re-spawn
+            // collides (DuplicateTaskHash) at the per-chunk validator.
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: compute_task_hash(&tasks[bad_index]),
+                task: tasks[bad_index].clone(),
+                def_id: None,
+            });
             seed_pool(&mut coordinator, &[&tasks[0].phase_id]);
 
             let mut command_rx = coordinator.command_rx.take().expect("command_rx armed");
@@ -2267,8 +2430,8 @@ async fn spawn_tasks_chunked_absolute_index_translation() {
                 errors[0].0,
             );
             assert!(
-                matches!(errors[0].1, super::SpawnError::UnknownDependency { .. }),
-                "the error class must be UnknownDependency, got {:?}",
+                matches!(errors[0].1, super::SpawnError::DuplicateTaskHash(_)),
+                "the error class must be DuplicateTaskHash, got {:?}",
                 errors[0].1,
             );
         })
