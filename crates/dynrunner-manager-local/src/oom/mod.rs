@@ -64,7 +64,35 @@ use self::probe::{CpuStat, HostMemoryReading, ProcSysProbe, SystemProbe, cpu_bus
 /// Default cadence of the self-paced charge sweep: the sweep task
 /// `sleep`s this long after EACH sweep completes (await-before-resleep
 /// — a slow sweep cannot pile, the next starts this interval after the
-/// previous returned). 50ms = the historical 20Hz sample cadence.
+/// previous returned).
+///
+/// 250ms (4Hz). The sweep arm is a periodic-background arm like
+/// keepalive / settled-spill; its cadence must not let it dominate the
+/// operational `select!`. The former 50ms (20Hz) cadence fired the arm
+/// ~18.5×/sec — at consumer scale (14 workers, each ~2-3ms cgroup read)
+/// the sweep arm dominated 80-86% of all oploop arm executions and
+/// starved the control plane (inbox / keepalive / election / settle)
+/// into a fatal oploop stall. `biased;` arm ordering (so the data path
+/// beats the timer on a tie) was insufficient: when the higher-priority
+/// arms are idle — the steady state — the timer is the only ready arm
+/// and still fired at 20Hz with the full per-sweep blocking cost.
+///
+/// Bounds on this constant (must stay BETWEEN them):
+///   - Upper bound: it MUST be comfortably below
+///     [`crate::manager::events`]'s / the secondary's
+///     `KERNEL_OOM_CORRELATION_WINDOW` (500ms). The kernel `oom_kill`
+///     delta is timestamped at the sweep that observes it (see
+///     [`OomWatcher::apply_sweep`]), so a sweep slower than that window
+///     would let an `oom_kill`-then-pipe-EOF pair fall out of
+///     correlation and mis-classify a real OOM disconnect as
+///     `Recoverable`. 250ms leaves a 2× margin.
+///   - Lower bound: fast enough that a memory-pressure / OOM-kill
+///     candidate is detected and acted on within sub-second latency —
+///     well inside kernel-OOM-killer / swap-thrash dynamics.
+///
+/// 250ms satisfies both: ~4 fires/sec (vs 18.5) returns the idle-instant
+/// iterations to the control plane while keeping OOM detection
+/// sub-second and inside the correlation window.
 pub const SAMPLE_SWEEP_INTERVAL: Duration = DEFAULT_SAMPLE_INTERVAL;
 
 /// The per-worker inputs the blocking charge read consumes: the slot's
@@ -169,10 +197,14 @@ const DELTA_TRIGGER_BYTES: u64 = 1024 * 1024 * 1024;
 /// with the consumer.
 const DELTA_PRESSURE_RATIO: f64 = 0.80;
 
-/// Default sample cadence (50ms = 20Hz). Independent of the
-/// decision cadence so a slow decision tick still produces a dense
-/// forensic record.
-pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+/// Default sample cadence (250ms = 4Hz). See [`SAMPLE_SWEEP_INTERVAL`]
+/// for the full cadence rationale and its upper (correlation-window) /
+/// lower (detection-latency) bounds. The historical 20Hz value drove
+/// the sweep as a dense forensic sampler, but sampling and the
+/// per-sweep blocking read + pressure decision now run as ONE sweep, so
+/// the 20Hz cadence dragged the full blocking cost 18.5×/sec and
+/// starved the operational loop.
+pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Default heartbeat: a log line every 10s even when nothing
 /// triggered. Bounds the silence window during a healthy run so
@@ -314,9 +346,10 @@ pub struct OomWatcher {
     /// Consumed by [`Self::kernel_oom_recent`] so the manager-side
     /// disconnect reclassifier can ask "did a kernel-OOM land within
     /// the last N milliseconds?". `None` until the first positive
-    /// delta. Production sample cadence is 50ms; a 500ms window
-    /// covers ~10 samples worth of race tolerance between
-    /// `oom_kill` counter increment and pipe-EOF observation.
+    /// delta. Production sample cadence is [`SAMPLE_SWEEP_INTERVAL`]
+    /// (250ms), held at ≤ half the 500ms correlation window so any
+    /// `oom_kill` counter increment is recorded within the window of a
+    /// correlated pipe-EOF observation — the cadence's upper bound.
     recent_kernel_oom_at: Option<Instant>,
     /// Previous sweep's raw cumulative `/proc/stat` CPU readout. `None`
     /// before the first sweep, OR when the probe returned no
