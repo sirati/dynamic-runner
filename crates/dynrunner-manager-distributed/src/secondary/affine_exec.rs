@@ -273,11 +273,19 @@ where
         // one borrow so two near-simultaneous calls cannot both claim "first".
         let is_first = !self.op_mut().affine_running.contains_key(&affine_hash);
         let work_hash = dependent.work_hash.clone();
+        let dependent_worker = dependent.worker_id;
         self.op_mut()
             .affine_running
             .entry(affine_hash.clone())
             .or_default()
             .push(dependent);
+        // Maintain the O(1) reverse index alongside the park (the
+        // `holding_worker` probe responder reads it instead of scanning the
+        // parked vecs). Removed in lockstep when the import-completion drain
+        // clears the hash.
+        self.op_mut()
+            .affine_dependent_worker
+            .insert(work_hash.clone(), dependent_worker);
 
         // Every queued dependent (first or not) reports the CRDT-visible
         // queued state, so the primary/observer SEE `B` waiting on the local
@@ -374,6 +382,14 @@ where
             .affine_running
             .remove(&affine_hash)
             .unwrap_or_default();
+        // Drop every drained dependent from the O(1) reverse index in
+        // lockstep with the `affine_running` removal: once the run-once latch
+        // clears, the dependents are released onto their workers (Success) or
+        // re-routed (Failure) and are no longer parked, so `holding_worker`
+        // must no longer name a parked-slot for them.
+        for dep in &dependents {
+            self.op_mut().affine_dependent_worker.remove(&dep.work_hash);
+        }
         if matches!(outcome, AffineOutcome::Success) {
             self.op_mut().affine_done.insert(affine_hash.clone());
         }
