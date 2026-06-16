@@ -42,6 +42,7 @@ fn spilled_completed_state() -> (ClusterState<RunnerIdentifier>, tempfile::TempD
     s.apply(ClusterMutation::TaskAdded {
         hash: "done".into(),
         task: mk_task("done"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -102,6 +103,7 @@ fn digest_under_spill_equals_full_fold() {
         s.apply(ClusterMutation::TaskAdded {
             hash: "c".into(),
             task: mk_task("c"),
+            def_id: None,
         });
         s.apply(ClusterMutation::TaskCompleted {
             attempt: 0,
@@ -112,6 +114,7 @@ fn digest_under_spill_equals_full_fold() {
         s.apply(ClusterMutation::TaskAdded {
             hash: "f".into(),
             task: mk_task("f"),
+            def_id: None,
         });
         s.apply(ClusterMutation::TaskFailed {
             hash: "f".into(),
@@ -124,12 +127,14 @@ fn digest_under_spill_equals_full_fold() {
         s.apply(ClusterMutation::TaskAdded {
             hash: "sk".into(),
             task: mk_task("sk"),
+            def_id: None,
         });
         s.apply(ClusterMutation::TaskSkippedAlreadyDone { hash: "sk".into() });
         // A pending task — stays fat (live).
         s.apply(ClusterMutation::TaskAdded {
             hash: "p".into(),
             task: mk_task("p"),
+            def_id: None,
         });
         if spill {
             let n = s.test_spill_all(&dir.path().join("spill.cbor"));
@@ -187,6 +192,7 @@ fn joiner_from_spilled_responder_converges_identically() {
         fat_donor.apply(ClusterMutation::TaskAdded {
             hash: name.into(),
             task: mk_task(name),
+            def_id: None,
         });
     }
     fat_donor.apply(ClusterMutation::TaskCompleted {
@@ -292,6 +298,7 @@ fn retry_eligible_failure_stays_fat() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "r".into(),
         task: mk_task("r"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         hash: "r".into(),
@@ -376,6 +383,7 @@ fn settled_index_bytes_far_below_fat_bytes() {
         s.apply(ClusterMutation::TaskAdded {
             hash: name.clone(),
             task,
+            def_id: None,
         });
         s.apply(ClusterMutation::TaskCompleted {
             attempt: 0,
@@ -561,6 +569,7 @@ fn settled_outputs_leave_resident_map_but_stay_readable_via_disk() {
         s.apply(ClusterMutation::TaskAdded {
             hash: name.clone(),
             task: mk_task(&name),
+            def_id: None,
         });
         s.apply(ClusterMutation::TaskCompleted {
             attempt: 0,
@@ -691,6 +700,7 @@ fn stream_round_trips_spilled_outputs_no_rebloat() {
         donor.apply(ClusterMutation::TaskAdded {
             hash: h.into(),
             task: mk_task(h),
+            def_id: None,
         });
         donor.apply(ClusterMutation::TaskCompleted {
             attempt: 0,
@@ -740,6 +750,7 @@ fn stream_round_trips_spilled_outputs_no_rebloat() {
         already_settled.apply(ClusterMutation::TaskAdded {
             hash: h.into(),
             task: mk_task(h),
+            def_id: None,
         });
         already_settled.apply(ClusterMutation::TaskCompleted {
             attempt: 0,
@@ -791,6 +802,7 @@ fn writer_failure_keeps_entries_fat() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "c".into(),
         task: mk_task("c"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -843,6 +855,7 @@ fn fat_task_breakdown_splits_eligible_from_live() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "done".into(),
         task: mk_task("done"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -854,12 +867,14 @@ fn fat_task_breakdown_splits_eligible_from_live() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "pending".into(),
         task: mk_task("pending"),
+        def_id: None,
     });
 
     // One NON-terminal InFlight entry (TaskAssigned drives Pending -> InFlight).
     s.apply(ClusterMutation::TaskAdded {
         hash: "inflight".into(),
         task: mk_task("inflight"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAssigned {
         attempt: 0,

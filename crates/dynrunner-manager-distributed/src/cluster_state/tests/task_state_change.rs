@@ -38,6 +38,7 @@ fn add_and_assign(
     s.apply(ClusterMutation::TaskAdded {
         hash: hash.into(),
         task: mk_task(hash),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskAssigned {
         hash: hash.into(),
@@ -205,6 +206,7 @@ async fn live_non_terminal_transitions_narrate_via_a2_helper() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h5".into(),
         task: mk_task("h5"),
+        def_id: None,
     });
     // TaskBlocked → Blocked (rewrite_task_state arm).
     s.apply(ClusterMutation::TaskBlocked {

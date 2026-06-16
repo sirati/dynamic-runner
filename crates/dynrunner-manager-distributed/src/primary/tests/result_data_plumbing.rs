@@ -40,6 +40,7 @@ async fn primary_handle_task_complete_forwards_result_data_to_cluster_mutation()
                 .apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskAdded {
                     hash: hash.clone(),
                     task: bin,
+                    def_id: None,
                 }])
                 .await;
             // Let the pump drain the queued TaskAdded broadcast onto the wire,

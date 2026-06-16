@@ -431,6 +431,7 @@ async fn injection_during_cascade_dispatches_despite_busy_inbox() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: compute_task_hash(&utask),
                     task: utask.clone(),
+                    def_id: None,
                 });
             }
             primary.hydrate_from_cluster_state()

@@ -39,6 +39,7 @@ fn range_digest_folds_match_scalar() {
         s.apply(ClusterMutation::TaskAdded {
             hash: format!("task-{i:04}"),
             task: mk_task(&format!("task-{i:04}")),
+            def_id: None,
         });
     }
     // Advance a spread of tasks to terminal states so the per-entry fold
@@ -91,6 +92,7 @@ fn range_digest_folds_match_scalar_across_settled_split() {
         s.apply(ClusterMutation::TaskAdded {
             hash: format!("k-{i:04}"),
             task: mk_task(&format!("k-{i:04}")),
+            def_id: None,
         });
         s.apply(ClusterMutation::TaskCompleted {
             attempt: 0,
@@ -125,6 +127,7 @@ fn one_task_change_isolates_to_one_range() {
         s.apply(ClusterMutation::TaskAdded {
             hash: format!("t-{i:04}"),
             task: mk_task(&format!("t-{i:04}")),
+            def_id: None,
         });
     }
     let before = s.tasks_range_digest();
@@ -165,6 +168,7 @@ fn converged_replicas_have_no_divergent_ranges() {
         a.apply(ClusterMutation::TaskAdded {
             hash: format!("c-{i:03}"),
             task: mk_task(&format!("c-{i:03}")),
+            def_id: None,
         });
     }
     let mut b = ClusterState::<RunnerIdentifier>::new();
@@ -190,6 +194,7 @@ fn equal_count_divergent_content_in_bucket_is_detected() {
         stale.apply(ClusterMutation::TaskAdded {
             hash: format!("e-{i:03}"),
             task: mk_task(&format!("e-{i:03}")),
+            def_id: None,
         });
     }
     // The advanced replica is the stale one + one Completed (SAME key set,
@@ -226,6 +231,7 @@ fn empty_local_is_behind_every_populated_peer_bucket() {
         peer.apply(ClusterMutation::TaskAdded {
             hash: format!("a-{i:04}"),
             task: mk_task(&format!("a-{i:04}")),
+            def_id: None,
         });
     }
     let r_empty = empty.tasks_range_digest();
@@ -302,6 +308,7 @@ fn range_digest_memo_matches_fresh_fold() {
         s.apply(ClusterMutation::TaskAdded {
             hash: format!("t{i}"),
             task: mk_task(&format!("t{i}")),
+            def_id: None,
         });
         assert_range_memo_invariant(&s);
     }
@@ -422,6 +429,7 @@ fn range_digest_memo_matches_fresh_fold() {
         peer.apply(ClusterMutation::TaskAdded {
             hash: format!("t{i}"),
             task: mk_task(&format!("t{i}")),
+            def_id: None,
         });
         peer.apply(ClusterMutation::TaskCompleted {
             attempt: 0,
@@ -453,6 +461,7 @@ fn range_digest_memo_holds_across_settle_and_hydrate() {
         s.apply(ClusterMutation::TaskAdded {
             hash: format!("k-{i:04}"),
             task: mk_task(&format!("k-{i:04}")),
+            def_id: None,
         });
         s.apply(ClusterMutation::TaskCompleted {
             attempt: 0,
@@ -481,6 +490,7 @@ fn range_digest_memo_holds_across_settle_and_hydrate() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "post-spill".into(),
         task: mk_task("post-spill"),
+        def_id: None,
     });
     assert_range_memo_invariant(&s);
 }
@@ -497,6 +507,7 @@ fn range_digest_read_does_zero_full_folds_under_probe_burst() {
         s.apply(ClusterMutation::TaskAdded {
             hash: format!("task-{i:06}"),
             task: mk_task(&format!("task-{i:06}")),
+            def_id: None,
         });
     }
     // Advance a spread so the per-bucket folds carry varied terms.

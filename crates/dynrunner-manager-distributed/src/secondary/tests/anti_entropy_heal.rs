@@ -100,6 +100,7 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
             donor.apply(ClusterMutation::TaskAdded {
                 hash: "t".into(),
                 task: mk_task("t"),
+                def_id: None,
             });
             donor.apply(ClusterMutation::TaskCompleted {
                 attempt: 0,
@@ -118,6 +119,7 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
             sec.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: "t".into(),
                 task: mk_task("t"),
+                def_id: None,
             });
             assert!(
                 matches!(
@@ -245,6 +247,7 @@ async fn converged_secondary_emits_but_does_not_pull() {
             sec.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: "t".into(),
                 task: mk_task("t"),
+                def_id: None,
             });
 
             // A peer whose digest equals ours (converged).
@@ -252,6 +255,7 @@ async fn converged_secondary_emits_but_does_not_pull() {
             peer.apply(ClusterMutation::TaskAdded {
                 hash: "t".into(),
                 task: mk_task("t"),
+                def_id: None,
             });
             assert_eq!(sec.cluster_state.digest(), peer.digest());
 

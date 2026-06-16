@@ -65,6 +65,7 @@ fn seed_affine_task(
     sec.cluster_state.apply(ClusterMutation::TaskAdded {
         hash: hash.to_string(),
         task: task.clone(),
+        def_id: None,
     });
     task
 }

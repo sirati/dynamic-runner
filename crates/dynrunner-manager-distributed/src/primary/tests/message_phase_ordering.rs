@@ -92,6 +92,7 @@ fn seed_one_inflight_task(
         cs.apply(ClusterMutation::TaskAdded {
             hash: hash.clone(),
             task: task.clone(),
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAssigned {
             attempt: 0,

@@ -815,6 +815,7 @@ fn probe_burst_fixture(ledger_size: usize) -> GhostFixture {
         .apply(ClusterMutation::TaskAdded {
             hash: ghost_hash.clone(),
             task: ghost,
+            def_id: None,
         });
     primary
         .cluster_state_mut_for_test()

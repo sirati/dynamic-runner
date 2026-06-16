@@ -18,10 +18,12 @@ fn converged_replicas_produce_equal_digests() {
     a.apply(ClusterMutation::TaskAdded {
         hash: "p".into(),
         task: mk_task("p"),
+        def_id: None,
     });
     a.apply(ClusterMutation::TaskAdded {
         hash: "c".into(),
         task: mk_task("c"),
+        def_id: None,
     });
     a.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -53,6 +55,7 @@ fn digest_is_order_independent() {
         a.apply(ClusterMutation::TaskAdded {
             hash: name.into(),
             task: mk_task(name),
+            def_id: None,
         });
     }
     let mut b = ClusterState::<RunnerIdentifier>::new();
@@ -60,6 +63,7 @@ fn digest_is_order_independent() {
         b.apply(ClusterMutation::TaskAdded {
             hash: name.into(),
             task: mk_task(name),
+            def_id: None,
         });
     }
     assert_eq!(a.digest(), b.digest());
@@ -74,6 +78,7 @@ fn same_count_state_advance_changes_fold() {
     a.apply(ClusterMutation::TaskAdded {
         hash: "t".into(),
         task: mk_task("t"),
+        def_id: None,
     });
     let stale = a.digest();
     a.apply(ClusterMutation::TaskCompleted {
@@ -104,6 +109,7 @@ fn retry_attempt_advance_changes_fold() {
     a.apply(ClusterMutation::TaskAdded {
         hash: "t".into(),
         task: mk_task("t"),
+        def_id: None,
     });
     a.apply(ClusterMutation::TaskFailed {
         hash: "t".into(),
@@ -119,6 +125,7 @@ fn retry_attempt_advance_changes_fold() {
     b.apply(ClusterMutation::TaskAdded {
         hash: "t".into(),
         task: mk_task("t"),
+        def_id: None,
     });
     b.apply(ClusterMutation::TaskFailed {
         hash: "t".into(),
@@ -158,6 +165,7 @@ fn observer_capability_divergence_detected_and_heals() {
         s.apply(ClusterMutation::TaskAdded {
             hash: "t".into(),
             task: mk_task("t"),
+            def_id: None,
         });
     }
     // `a` knows an observer capability that `b` does not — a capability
@@ -193,6 +201,7 @@ fn can_be_primary_capability_divergence_detected_and_heals() {
         s.apply(ClusterMutation::TaskAdded {
             hash: "t".into(),
             task: mk_task("t"),
+            def_id: None,
         });
     }
     // `a` granted a peer primary-capability that `b` has not seen — a
@@ -228,6 +237,7 @@ fn residual_liveness_divergence_is_not_behind() {
         s.apply(ClusterMutation::TaskAdded {
             hash: "t".into(),
             task: mk_task("t"),
+            def_id: None,
         });
         // Both saw the peer join (Alive + an Advertised capability entry).
         s.apply(ClusterMutation::PeerJoined {
@@ -272,10 +282,12 @@ fn divergence_detected_then_quiescent_after_restore() {
     complete.apply(ClusterMutation::TaskAdded {
         hash: "a".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     complete.apply(ClusterMutation::TaskAdded {
         hash: "b".into(),
         task: mk_task("b"),
+        def_id: None,
     });
     complete.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -288,6 +300,7 @@ fn divergence_detected_then_quiescent_after_restore() {
     incomplete.apply(ClusterMutation::TaskAdded {
         hash: "a".into(),
         task: mk_task("a"),
+        def_id: None,
     });
 
     // First round: the incomplete replica is behind the complete one.
@@ -408,6 +421,7 @@ fn digest_memo_matches_fresh_fold() {
         s.apply(ClusterMutation::TaskAdded {
             hash: format!("t{i}"),
             task: mk_task(&format!("t{i}")),
+            def_id: None,
         });
         assert_memo_fresh!();
     }
@@ -508,6 +522,7 @@ fn digest_memo_matches_fresh_fold() {
         peer.apply(ClusterMutation::TaskAdded {
             hash: format!("t{i}"),
             task: mk_task(&format!("t{i}")),
+            def_id: None,
         });
     }
     peer.record_phase_event_tally((PhaseId::from("p9"), PhaseTally::Failed), 9);
@@ -533,6 +548,7 @@ fn digest_memo_hit_skips_the_fold() {
         s.apply(ClusterMutation::TaskAdded {
             hash: format!("t{i}"),
             task: mk_task(&format!("t{i}")),
+            def_id: None,
         });
     }
 

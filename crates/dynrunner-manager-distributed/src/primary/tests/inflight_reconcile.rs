@@ -158,6 +158,7 @@ async fn primary_with_cross_member_duplicate() -> (
         cs.apply(ClusterMutation::TaskAdded {
             hash: hash.clone(),
             task: task.clone(),
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAssigned {
             attempt: 0,

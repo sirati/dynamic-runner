@@ -83,7 +83,7 @@ impl<I: Identifier> ClusterState<I> {
         // NoOp arm still clears) — see `invalidate_digest_cache`.
         self.invalidate_digest_cache();
         match m {
-            ClusterMutation::TaskAdded { hash, task } => {
+            ClusterMutation::TaskAdded { hash, task, def_id } => {
                 // Occupied means occupied in the LOGICAL ledger: a SETTLED
                 // entry (fat body spilled to disk) is still this hash's
                 // ledger entry, and a re-delivered TaskAdded must NoOp
@@ -97,14 +97,26 @@ impl<I: Identifier> ClusterState<I> {
                 } else {
                     // A vacant slot in the LOGICAL ledger (the `settled_contains`
                     // guard above already excluded a spilled terminal): a
-                    // logical CREATE. The shared `set_task_state` write path
-                    // inserts, maintains the range-fold memo (`add` — a vacant
-                    // slot has no old term, so the bucket count bumps), and
-                    // emits the #520 "changed state to pending" narration event
-                    // from the post-write state (holder `None` — a spawn-time
-                    // Pending names none). No `fallback_holder` (this arm never
+                    // logical CREATE. DEF-BEFORE-STATE (CL-A4): intern the
+                    // frozen def into the store — at the primary-allocated
+                    // wire `def_id` when one rode the wire, else node-local —
+                    // BEFORE setting the referencing `TaskState`, so the in-
+                    // memory `Arc<FrozenTaskDef>` the state carries resolves
+                    // from the store under the same id every replica agrees on.
+                    // A hash↔id BIJECTION violation (never produced by a
+                    // converged registry) is logged LOUD inside the helper and
+                    // returns `None` — the loud-but-safe drop: this arm NoOps
+                    // rather than corrupt the registry.
+                    let Some((def, routing)) = self.intern_task_def_at(def_id, &hash, task) else {
+                        return ApplyOutcome::NoOp;
+                    };
+                    // The shared `set_task_state` write path inserts, maintains
+                    // the range-fold memo (`add` — a vacant slot has no old
+                    // term, so the bucket count bumps), and emits the #520
+                    // "changed state to pending" narration event from the
+                    // post-write state (holder `None` — a spawn-time Pending
+                    // names none). No `fallback_holder` (this arm never
                     // supersedes an `InFlight`).
-                    let (def, routing) = self.intern_task_def(&hash, task);
                     let state = TaskState::Pending {
                         def,
                         routing,
@@ -278,6 +290,18 @@ impl<I: Identifier> ClusterState<I> {
                 }
                 self.current_primary = Some(new.clone());
                 self.primary_epoch = epoch;
+                // Failover-safe def-id resume (L3a / CL-A2): co-located with
+                // the `primary_epoch` advance — the SAME seam a promotion
+                // crosses. Re-anchor the def allocator PAST every observed
+                // id so a promoted primary never re-mints a live id (the
+                // node-local cold-start aliasing CL-A2 forbids). The
+                // in-memory store's max already feeds `next_id` (every
+                // `intern_at`/`put_slot` advances it), so `next_id_floor()`
+                // IS the in-memory resume floor here; the full settled-scan
+                // over spilled entries is a later leaf (L6). Monotone — a
+                // non-promoting adopter's call is a harmless no-op.
+                let floor = self.definitions.next_id_floor();
+                self.definitions.resume_alloc_floor(floor);
                 // Keep the lock-free epoch mirror in lockstep with the
                 // field so off-`apply` readers (the observer
                 // resource-holdings announcer) see the post-mutation

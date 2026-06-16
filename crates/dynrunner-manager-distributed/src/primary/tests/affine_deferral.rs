@@ -95,6 +95,7 @@ async fn primary_with_live_dispatched_dependent() -> (
         cs.apply(ClusterMutation::TaskAdded {
             hash: hash.clone(),
             task,
+            def_id: None,
         });
     }
     primary
@@ -180,6 +181,7 @@ async fn primary_with_inflight_dependent() -> (
         cs.apply(ClusterMutation::TaskAdded {
             hash: hash.clone(),
             task: task.clone(),
+            def_id: None,
         });
     }
     // Seat B on sec-0's worker (slot Assigned + ledger entry + type slot),
@@ -284,6 +286,7 @@ async fn deferral_burst_coalesces_into_one_broadcast() {
                     cs.apply(ClusterMutation::TaskAdded {
                         hash: hash.clone(),
                         task: task.clone(),
+                        def_id: None,
                     });
                 }
                 let staged =

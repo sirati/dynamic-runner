@@ -302,6 +302,15 @@ impl<I: Identifier> ClusterState<I> {
         self.set_task_state(hash, state, None);
     }
 
+    /// Test-only seam: the def-store id this replica bound `hash` to (L3a) —
+    /// the convergence-test read that asserts two replicas agree on the SAME
+    /// primary-allocated `TaskDefId` for a content hash. `None` if this
+    /// replica has never interned the hash.
+    #[cfg(test)]
+    pub(crate) fn def_id_for_hash_for_test(&self, hash: &str) -> Option<super::TaskDefId> {
+        self.definitions.id_for_hash(hash)
+    }
+
     pub fn iter_pending(&self) -> impl Iterator<Item = (&String, TaskInfo<I>)> {
         self.tasks.iter().filter_map(|(h, s)| match s {
             TaskState::Pending { .. } => Some((h, s.to_task_info())),

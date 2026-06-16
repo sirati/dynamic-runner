@@ -61,6 +61,7 @@ async fn fail_permanent_via_channel() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: hash.clone(),
                 task: binary.clone(),
+                def_id: None,
             });
             let mut phase_set = std::collections::HashSet::new();
             phase_set.insert(binary.phase_id.clone());
@@ -128,6 +129,7 @@ async fn fail_permanent_oom_routes_into_per_phase_oom_bucket() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: hash.clone(),
                 task: binary.clone(),
+                def_id: None,
             });
             let mut phase_set = std::collections::HashSet::new();
             phase_set.insert(binary.phase_id.clone());
@@ -245,6 +247,7 @@ async fn reinject_task_budget_exhaustion() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: hash.clone(),
                 task: binary.clone(),
+                def_id: None,
             });
             coordinator
                 .cluster_state
@@ -335,6 +338,7 @@ async fn update_preferred_secondaries_smoke() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: hash.clone(),
                 task: binary.clone(),
+                def_id: None,
             });
             let mut phase_set = std::collections::HashSet::new();
             phase_set.insert(binary.phase_id.clone());
@@ -373,6 +377,7 @@ async fn command_channel_end_to_end() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: hash.clone(),
                 task: binary.clone(),
+                def_id: None,
             });
             let mut phase_set = std::collections::HashSet::new();
             phase_set.insert(binary.phase_id.clone());
@@ -439,10 +444,12 @@ async fn fail_permanent_unfulfillable_blocks_dependents() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: prereq_hash.clone(),
                 task: prereq.clone(),
+                def_id: None,
             });
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: dep_hash.clone(),
                 task: dep.clone(),
+                def_id: None,
             });
 
             // Pool seeded with both phases + the items so the cascade
@@ -534,10 +541,12 @@ async fn unfulfillable_reinject_root_complete_resumes_blocked_dependents_in_pool
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: prereq_hash.clone(),
                 task: prereq.clone(),
+                def_id: None,
             });
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: dep_hash.clone(),
                 task: dep.clone(),
+                def_id: None,
             });
             let mut phase_set = std::collections::HashSet::new();
             phase_set.insert(prereq.phase_id.clone());
@@ -663,10 +672,12 @@ async fn reinject_resets_blocked_dependents_pool_state() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: prereq_hash.clone(),
                 task: prereq.clone(),
+                def_id: None,
             });
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: dep_hash.clone(),
                 task: dep.clone(),
+                def_id: None,
             });
             let mut phase_set = std::collections::HashSet::new();
             phase_set.insert(prereq.phase_id.clone());
@@ -752,6 +763,7 @@ async fn update_preferred_secondaries_propagates_to_live_pool() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: hash.clone(),
                 task: binary.clone(),
+                def_id: None,
             });
             let mut phase_set = std::collections::HashSet::new();
             phase_set.insert(binary.phase_id.clone());
@@ -949,6 +961,7 @@ async fn spawn_tasks_with_pending_dep_lands_blocked() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: b_hash.clone(),
                 task: b.clone(),
+                def_id: None,
             });
             seed_pool(&mut coordinator, &[&b.phase_id]);
 
@@ -997,6 +1010,7 @@ async fn spawn_tasks_with_completed_dep_lands_pending() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: b_hash.clone(),
                 task: b.clone(),
+                def_id: None,
             });
             coordinator
                 .cluster_state
@@ -1055,6 +1069,7 @@ async fn spawn_tasks_with_unfulfillable_dep_lands_blocked() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: b_hash.clone(),
                 task: b.clone(),
+                def_id: None,
             });
             coordinator
                 .cluster_state
@@ -1121,6 +1136,7 @@ async fn spawn_tasks_already_in_ledger_dedups_no_run_wide_invalidation() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: dup_hash.clone(),
                 task: dup.clone(),
+                def_id: None,
             });
             seed_pool(&mut coordinator, &[&dup.phase_id]);
 
@@ -1195,6 +1211,7 @@ async fn spawn_tasks_all_already_in_ledger_is_noop_dedup() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: done_hash.clone(),
                 task: done.clone(),
+                def_id: None,
             });
             coordinator
                 .cluster_state
@@ -1210,6 +1227,7 @@ async fn spawn_tasks_all_already_in_ledger_is_noop_dedup() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: p1_hash.clone(),
                 task: p1.clone(),
+                def_id: None,
             });
 
             let mut p2 = make_binary("p2", 100);
@@ -1218,6 +1236,7 @@ async fn spawn_tasks_all_already_in_ledger_is_noop_dedup() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: p2_hash.clone(),
                 task: p2.clone(),
+                def_id: None,
             });
 
             seed_pool(&mut coordinator, &[&p1.phase_id]);
@@ -1295,6 +1314,7 @@ async fn spawn_tasks_within_batch_duplicate_invalidates_run_wide() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: p1_hash.clone(),
                 task: p1.clone(),
+                def_id: None,
             });
             seed_pool(&mut coordinator, &[&p1.phase_id]);
 
@@ -1447,6 +1467,7 @@ async fn spawn_tasks_refreshes_total_tasks_from_cluster_state() {
                 coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                     hash: h,
                     task: b.clone(),
+                    def_id: None,
                 });
                 pre_spawn.push(b);
             }
@@ -1564,6 +1585,7 @@ async fn spawn_tasks_cross_phase_missing_dep_is_invalid_not_silent_pending() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: foo_hash.clone(),
                 task: foo.clone(),
+                def_id: None,
             });
             seed_pool(
                 &mut coordinator,
@@ -1621,6 +1643,7 @@ async fn spawn_tasks_cross_phase_dep_naming_right_phase_resolves() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: foo_hash.clone(),
                 task: foo.clone(),
+                def_id: None,
             });
             seed_pool(
                 &mut coordinator,
@@ -1719,6 +1742,7 @@ async fn phase_event_tallies_are_event_shaped_and_survive_promotion() {
             cs.apply(ClusterMutation::TaskAdded {
                 hash: hash.clone(),
                 task,
+                def_id: None,
             });
             cs.apply(ClusterMutation::TaskFailed {
                 hash: hash.clone(),
@@ -1780,6 +1804,7 @@ async fn unbounded_reinject_cap_skips_used_origination() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: hash.clone(),
                 task: binary.clone(),
+                def_id: None,
             });
             let mut phase_set = std::collections::HashSet::new();
             phase_set.insert(binary.phase_id.clone());
@@ -1844,6 +1869,7 @@ async fn bounded_reinject_used_survives_promotion() {
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: hash.clone(),
                 task: binary.clone(),
+                def_id: None,
             });
             coordinator
                 .cluster_state
@@ -1946,6 +1972,7 @@ async fn drain_yields_and_drains_past_budget_in_order() {
                 coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                     hash: hash.clone(),
                     task: binary.clone(),
+                    def_id: None,
                 });
                 hashes.push(hash);
             }

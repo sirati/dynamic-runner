@@ -327,6 +327,7 @@ async fn runtime_spawn_with_dep_gate_resolves_when_dependency_completes() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: w_hash.clone(),
                     task: w.clone(),
+                    def_id: None,
                 });
             }
             primary
@@ -567,6 +568,7 @@ async fn with_dep_gate_resolves_when_dependency_completes_post_seed() {
                     cs.apply(ClusterMutation::TaskAdded {
                         hash: compute_task_hash(task),
                         task: task.clone(),
+                        def_id: None,
                     });
                 }
             }

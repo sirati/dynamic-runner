@@ -25,6 +25,7 @@ fn add_task(s: &mut ClusterState<RunnerIdentifier>, name: &str) {
     s.apply(ClusterMutation::TaskAdded {
         hash: name.to_string(),
         task: mk_task(name),
+        def_id: None,
     });
 }
 
@@ -303,6 +304,7 @@ fn task_batches_respect_the_byte_budget() {
         s.apply(ClusterMutation::TaskAdded {
             hash: name.clone(),
             task: t,
+            def_id: None,
         });
     }
     let mut plan = SnapshotStreamPlan::new(&s, None, &[]);
@@ -395,6 +397,7 @@ fn production_shaped_ledger_streams_bounded_and_converges_under_live_gossip() {
         s.apply(ClusterMutation::TaskAdded {
             hash: name,
             task: t,
+            def_id: None,
         });
     }
     for i in 0..500 {

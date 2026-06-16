@@ -62,6 +62,7 @@ fn spawn_with_pending_dep_indexes_blocked() {
     s.apply(ClusterMutation::TaskAdded {
         hash: prereq_hash.clone(),
         task: prereq,
+        def_id: None,
     });
 
     let mut dep = mk_task("d");
@@ -98,6 +99,7 @@ fn complete_cascade_drains_index_entry() {
     s.apply(ClusterMutation::TaskAdded {
         hash: prereq_hash.clone(),
         task: prereq,
+        def_id: None,
     });
     // Spawn two dependents both Blocked-on-prereq.
     for name in ["d1", "d2"] {
@@ -155,6 +157,7 @@ fn blocked_idempotent_apply_leaves_index_unchanged() {
     s.apply(ClusterMutation::TaskAdded {
         hash: p1_hash.clone(),
         task: p1,
+        def_id: None,
     });
     let mut dep = mk_task("d");
     dep.task_depends_on = vec![dynrunner_core::TaskDep {
@@ -200,12 +203,14 @@ fn set_task_state_blocked_to_blocked_different_on_rebuckets() {
     s.apply(ClusterMutation::TaskAdded {
         hash: p1_hash.clone(),
         task: p1,
+        def_id: None,
     });
     let p2 = mk_task("p2");
     let p2_hash = crate::primary::wire::compute_task_hash(&p2);
     s.apply(ClusterMutation::TaskAdded {
         hash: p2_hash.clone(),
         task: p2,
+        def_id: None,
     });
     let mut dep = mk_task("d");
     dep.task_depends_on = vec![TaskDep {
@@ -255,6 +260,7 @@ fn resume_blocked_on_empty_bucket_returns_empty() {
     s.apply(ClusterMutation::TaskAdded {
         hash: h.clone(),
         task: t,
+        def_id: None,
     });
     // Manually call resume_blocked_on with a hash that has no entry. The
     // function is `pub(super)`; reach it through the apply path: completing

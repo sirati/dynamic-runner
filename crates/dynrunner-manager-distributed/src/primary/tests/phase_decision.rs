@@ -132,6 +132,7 @@ fn phase_can_proceed_when_some_completed() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "ok".into(),
             task: ok,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskCompleted {
             attempt: 0,
@@ -141,6 +142,7 @@ fn phase_can_proceed_when_some_completed() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "bad".into(),
             task: bad,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskFailed {
             attempt: 0,
@@ -174,6 +176,7 @@ fn phase_can_proceed_when_all_items_failed_terminally() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: name.into(),
             task: item,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskFailed {
             attempt: 0,
@@ -207,6 +210,7 @@ fn phase_cannot_proceed_with_residual_unresolved_work() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "only".into(),
             task: only,
+            def_id: None,
         });
     }
     primary.hydrate_from_cluster_state()
@@ -254,6 +258,7 @@ fn empty_upstream_phase_with_blocked_dependent_proceeds() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "eval-item".into(),
             task: dep,
+            def_id: None,
         });
     }
     primary.hydrate_from_cluster_state()
@@ -304,6 +309,7 @@ fn empty_leaf_phase_proceeds_when_work_remains_elsewhere() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "work_item".into(),
             task: work_item,
+            def_id: None,
         });
     }
     primary.hydrate_from_cluster_state()
@@ -395,6 +401,7 @@ fn declared_may_be_empty_phase_proceeds_when_empty() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "work_item".into(),
             task: work_item,
+            def_id: None,
         });
     }
     primary.hydrate_from_cluster_state()
@@ -452,6 +459,7 @@ fn phase_all_skipped_as_existing_proceeds() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "dep".into(),
             task: dep,
+            def_id: None,
         });
         // Seed each build item Pending FIRST, then transition to
         // SkippedAlreadyDone — the same originate-Pending-then-skip pattern
@@ -460,6 +468,7 @@ fn phase_all_skipped_as_existing_proceeds() {
             cs.apply(ClusterMutation::TaskAdded {
                 hash: h.into(),
                 task,
+                def_id: None,
             });
             assert_eq!(
                 cs.apply(ClusterMutation::TaskSkippedAlreadyDone { hash: h.into() }),
@@ -513,6 +522,7 @@ fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "toolchain".into(),
             task: toolchain,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskCompleted {
             attempt: 0,
@@ -522,10 +532,12 @@ fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "dep-a".into(),
             task: dep_a,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAdded {
             hash: "dep-b".into(),
             task: dep_b,
+            def_id: None,
         });
     }
     primary.hydrate_from_cluster_state()
@@ -612,6 +624,7 @@ fn fire_initial_phase_starts_emits_one_starting_job_phase_important_event() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "toolchain".into(),
             task: toolchain,
+            def_id: None,
         });
     }
     primary.hydrate_from_cluster_state()
@@ -674,10 +687,12 @@ fn phase_can_proceed_holds_until_predecessor_ended() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "b1".into(),
             task: build,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAdded {
             hash: "e1".into(),
             task: eval,
+            def_id: None,
         });
         // matrix_eval's task completes FAST; build's task is still live.
         cs.apply(ClusterMutation::TaskCompleted {
@@ -743,10 +758,12 @@ fn fire_initial_phase_starts_skips_barrier_false_phase_until_predecessor_ended()
         cs.apply(ClusterMutation::TaskAdded {
             hash: "b1".into(),
             task: build,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAdded {
             hash: "e1".into(),
             task: eval,
+            def_id: None,
         });
     }
     primary.hydrate_from_cluster_state()
@@ -826,6 +843,7 @@ fn empty_phase_holds_proceed_until_predecessor_ended_v_a5() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "q1".into(),
             task: q_item,
+            def_id: None,
         });
     }
     primary.hydrate_from_cluster_state()
@@ -882,10 +900,12 @@ fn barrier_false_phase_tasks_dispatchable_before_predecessor_ended() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "b1".into(),
             task: build,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAdded {
             hash: "e1".into(),
             task: eval,
+            def_id: None,
         });
     }
     primary.hydrate_from_cluster_state()

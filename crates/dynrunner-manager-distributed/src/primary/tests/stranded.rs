@@ -1247,6 +1247,7 @@ async fn fleet_dead_does_not_fire_while_co_located_member_alive() {
                     cs.apply(ClusterMutation::TaskAdded {
                         hash: crate::primary::wire::compute_task_hash(b),
                         task: b.clone(),
+                        def_id: None,
                     });
                 }
             }
@@ -1325,6 +1326,7 @@ async fn fleet_dead_still_fires_when_no_member_is_membership_alive() {
                     cs.apply(ClusterMutation::TaskAdded {
                         hash: crate::primary::wire::compute_task_hash(b),
                         task: b.clone(),
+                        def_id: None,
                     });
                 }
             }

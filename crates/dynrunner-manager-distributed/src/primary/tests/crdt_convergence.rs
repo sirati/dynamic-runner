@@ -365,6 +365,7 @@ async fn primary_answers_request_cluster_snapshot() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: hash.clone(),
                     task,
+                    def_id: None,
                 });
             }
 

@@ -111,6 +111,7 @@ fn seed_inherited_inflight(
         cs.apply(ClusterMutation::TaskAdded {
             hash: lost_hash.clone(),
             task: lost.clone(),
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAssigned {
             attempt: 0,

@@ -96,6 +96,71 @@ fn task_skipped_already_done_decodes_literal_sender_bytes() {
     }
 }
 
+/// The minimal `task` JSON object a `TaskAdded` carries — only the
+/// non-serde-default `TaskInfo` fields (the rest decode to their defaults),
+/// so the def-id wire tests can decode literal sender bytes without spelling
+/// out all sixteen fields.
+fn minimal_task_json(task_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "path": "/tasks/x",
+        "size": 0,
+        "identifier": test_id(task_id),
+        "phase_id": "p0",
+        "type_id": "t0",
+        "affinity_id": null,
+        "payload": null,
+        "task_id": task_id,
+    })
+}
+
+/// `TaskAdded` round-trips its PRIMARY-allocated `def_id` (L3a): a stamped
+/// `Some(7)` survives the wire so every replica interns the def under the
+/// same id. Pins a NON-default id so a dropped `def_id` would fail the
+/// assertion.
+#[test]
+fn roundtrip_task_added_carries_def_id() {
+    let json = serde_json::json!({
+        "TaskAdded": {
+            "hash": "h-added",
+            "task": minimal_task_json("t-added"),
+            "def_id": 7,
+        }
+    })
+    .to_string();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+    match decoded {
+        ClusterMutation::TaskAdded { hash, def_id, .. } => {
+            assert_eq!(hash, "h-added");
+            assert_eq!(def_id, Some(7));
+        }
+        _ => panic!("expected TaskAdded"),
+    }
+}
+
+/// Backward-compat: a pre-L3a sender's `TaskAdded` JSON — no `def_id` field —
+/// decodes with `def_id: None` (the un-allocated local-apply shape, which the
+/// receiver falls back to node-local allocation for). Without `#[serde(default)]`
+/// the decode would refuse the frame and break rolling upgrades. Mirrors the
+/// `legacy_task_completed_decodes_without_result_data` contract.
+#[test]
+fn legacy_task_added_decodes_without_def_id() {
+    let json = serde_json::json!({
+        "TaskAdded": {
+            "hash": "h-legacy",
+            "task": minimal_task_json("t-legacy"),
+        }
+    })
+    .to_string();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+    match decoded {
+        ClusterMutation::TaskAdded { hash, def_id, .. } => {
+            assert_eq!(hash, "h-legacy");
+            assert_eq!(def_id, None);
+        }
+        _ => panic!("expected TaskAdded"),
+    }
+}
+
 /// `SetupCompleted` round-trips with its `hash` preserved (the setup-success
 /// terminal carries only the hash — version-LESS / attempt-LESS, like
 /// `TaskSkippedAlreadyDone`; the `TaskInfo` + `attempt` live on the ledger

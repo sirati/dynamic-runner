@@ -80,10 +80,12 @@ async fn two_phase_primary_with_counting_raise_hook() -> (
         cs.apply(ClusterMutation::TaskAdded {
             hash: p1_hash.clone(),
             task: p1_task,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAdded {
             hash: p2_hash,
             task: p2_task,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAssigned {
             attempt: 0,

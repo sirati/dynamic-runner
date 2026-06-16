@@ -228,6 +228,7 @@ fn completed_vs_invalidtask_invalidtask_wins() {
     a.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("x"),
+        def_id: None,
     });
     a.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -258,6 +259,7 @@ fn completed_vs_invalidtask_invalidtask_wins() {
     b.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("x"),
+        def_id: None,
     });
     b.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -525,6 +527,7 @@ async fn refailure_higher_version_emits_same_version_noops() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("x"),
+        def_id: None,
     });
     // First failure at v1 — emits.
     s.apply(ClusterMutation::TaskFailed {
@@ -592,6 +595,7 @@ fn failure_record_divergence_detected() {
         s.apply(ClusterMutation::TaskAdded {
             hash: "h".into(),
             task: mk_task("x"),
+            def_id: None,
         });
         s.apply(ClusterMutation::TaskFailed {
             attempt: 0,
@@ -649,6 +653,7 @@ fn last_error_survives_restore_for_all_terminals() {
         s.apply(ClusterMutation::TaskAdded {
             hash: h.into(),
             task: mk_task(h),
+            def_id: None,
         });
         s.apply(ClusterMutation::TaskFailed {
             attempt: 0,
@@ -682,6 +687,7 @@ fn apply_restore_digest_agree() {
         s.apply(ClusterMutation::TaskAdded {
             hash: h.into(),
             task: mk_task(h),
+            def_id: None,
         });
     }
     s.apply(ClusterMutation::TaskAssigned {
@@ -732,6 +738,7 @@ fn restore_supersedes_failed_with_completed() {
     src.apply(ClusterMutation::TaskAdded {
         hash: "prereq".into(),
         task: mk_task("prereq"),
+        def_id: None,
     });
     src.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -745,6 +752,7 @@ fn restore_supersedes_failed_with_completed() {
     local.apply(ClusterMutation::TaskAdded {
         hash: "prereq".into(),
         task: mk_task("prereq"),
+        def_id: None,
     });
     local.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -759,6 +767,7 @@ fn restore_supersedes_failed_with_completed() {
     local.apply(ClusterMutation::TaskAdded {
         hash: "dep".into(),
         task: mk_task("dep"),
+        def_id: None,
     });
     local.apply(ClusterMutation::TaskBlocked {
         hash: "dep".into(),
@@ -796,6 +805,7 @@ async fn re_restore_is_idempotent_and_emits_once() {
     src.apply(ClusterMutation::TaskAdded {
         hash: "c".into(),
         task: mk_task("c"),
+        def_id: None,
     });
     src.apply(ClusterMutation::TaskCompleted {
         attempt: 0,
@@ -805,6 +815,7 @@ async fn re_restore_is_idempotent_and_emits_once() {
     src.apply(ClusterMutation::TaskAdded {
         hash: "f".into(),
         task: mk_task("f"),
+        def_id: None,
     });
     src.apply(ClusterMutation::TaskFailed {
         attempt: 0,
@@ -848,6 +859,7 @@ fn n_responder_union_order_independent() {
         s.apply(ClusterMutation::TaskAdded {
             hash: h.into(),
             task: mk_task(h),
+            def_id: None,
         });
         if terminal {
             s.apply(ClusterMutation::TaskCompleted {
@@ -922,6 +934,7 @@ fn post_promotion_demoted_and_promoted_outcome_counts_converge() {
             s.apply(ClusterMutation::TaskAdded {
                 hash: h.into(),
                 task: mk_task(h),
+                def_id: None,
             });
         }
         s.apply(ClusterMutation::TaskCompleted {

@@ -147,10 +147,12 @@ async fn proactive_dispatch_skips_half_joined_member_until_mesh_ready_lands() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: hash_t0.clone(),
                     task: t0,
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: hash_t1.clone(),
                     task: t1,
+                    def_id: None,
                 });
             }
             primary.hydrate_from_cluster_state()
@@ -252,6 +254,7 @@ async fn reactive_task_request_is_honored_even_when_member_unconfirmed() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: hash.clone(),
                     task: t0,
+                    def_id: None,
                 });
             }
             primary.hydrate_from_cluster_state()
@@ -322,6 +325,7 @@ async fn first_dispatch_to_unconfirmed_member_is_withheld_until_mesh_ready() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: hash.clone(),
                     task: t0,
+                    def_id: None,
                 });
             }
             primary.hydrate_from_cluster_state()
@@ -446,10 +450,12 @@ async fn co_located_member_is_assignable_without_mesh_ready() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: compute_task_hash(&t0),
                     task: t0,
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: compute_task_hash(&t1),
                     task: t1,
+                    def_id: None,
                 });
             }
             primary
@@ -538,10 +544,12 @@ async fn co_located_rule_does_not_lift_gate_for_remote_members() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: compute_task_hash(&t0),
                     task: t0,
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: compute_task_hash(&t1),
                     task: t1,
+                    def_id: None,
                 });
             }
             primary

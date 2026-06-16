@@ -86,6 +86,7 @@ async fn task_completed_listener_fires_on_task_completed_apply() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h-alpha".into(),
         task: task.clone(),
+        def_id: None,
     });
     // Move it through to InFlight so the success transition isn't
     // a Pending → Completed shortcut (the apply rule covers both
@@ -130,6 +131,7 @@ async fn task_completed_listener_fires_on_task_failed_with_error_kind() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h-beta".into(),
         task: mk_task("beta"),
+        def_id: None,
     });
     // Pending → Failed (NonRecoverable). The wire tag for
     // NonRecoverable is `"non_recoverable"`.
@@ -173,6 +175,7 @@ async fn task_completed_listener_fires_on_unfulfillable_terminal() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h-gamma".into(),
         task: mk_task("gamma"),
+        def_id: None,
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
@@ -212,6 +215,7 @@ async fn task_completed_dedup_does_not_re_emit() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h-delta".into(),
         task: mk_task("delta"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskCompleted {
         attempt: 0,

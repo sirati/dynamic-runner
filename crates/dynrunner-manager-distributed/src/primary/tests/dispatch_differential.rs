@@ -152,6 +152,7 @@ async fn primary_with_mixed_pool() -> (
             cs.apply(ClusterMutation::TaskAdded {
                 hash: compute_task_hash(&t),
                 task: t,
+                def_id: None,
             });
         }
     }

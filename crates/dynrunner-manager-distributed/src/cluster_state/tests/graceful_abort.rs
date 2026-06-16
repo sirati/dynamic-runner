@@ -97,6 +97,7 @@ fn inflight_count_for_secondary_projects_replicated_occupancy() {
         s.apply(ClusterMutation::TaskAdded {
             hash: hash.into(),
             task: mk_task(hash),
+            def_id: None,
         });
         s.apply(ClusterMutation::TaskAssigned {
             hash: hash.into(),

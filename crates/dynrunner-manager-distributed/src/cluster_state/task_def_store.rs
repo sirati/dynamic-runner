@@ -189,12 +189,27 @@ pub(crate) fn split_task_def<I>(task: TaskInfo<I>) -> (Arc<FrozenTaskDef<I>>, su
 /// the store stays usable for every `I` the generic `ClusterState<I>`
 /// `Default` / bounded `Clone` impls require.
 pub(crate) struct TaskDefStore<I> {
-    /// Index = `TaskDefId.0`. Each entry is shared (`Arc`) so resolving a
-    /// def hands out a cheap clone.
-    defs: Vec<Arc<FrozenTaskDef<I>>>,
+    /// Slot = `TaskDefId.0`. Each occupied entry is shared (`Arc`) so
+    /// resolving a def hands out a cheap clone. `Option` slots make the
+    /// vector SPARSE-tolerant: a primary-allocated wire id is placed at
+    /// its EXACT slot ([`Self::intern_at`]) even when an earlier id has
+    /// not been observed yet (out-of-order `TaskAdded` delivery), so a
+    /// gap is a not-yet-seen def, NOT a mis-placement. Resolution stays
+    /// the O(1) slot read it was when the vector was dense.
+    defs: Vec<Option<Arc<FrozenTaskDef<I>>>>,
     /// Content hash ([`compute_task_hash`]) → the def's id. The dedup
-    /// gate: a re-intern of an already-known hash mints nothing.
+    /// gate AND one half of the hash↔id BIJECTION: a re-intern of an
+    /// already-known hash reuses its existing id and mints nothing.
     hash_to_id: HashMap<String, TaskDefId>,
+    /// The next id this store's NODE-LOCAL allocator
+    /// ([`Self::alloc_for_hash`]) would mint. Distinct from `defs.len()`
+    /// (the prior dense-position allocator): a sparse [`Self::intern_at`]
+    /// of a wire-carried id may leave gaps below `next_id`, and a promoted
+    /// primary's [`Self::resume_alloc_floor`] re-anchors this PAST every
+    /// id it has observed so it never re-mints a live id on failover (the
+    /// epoch-/failover-safety the wire-agreed id requires — a node-local
+    /// cold-start counter would alias).
+    next_id: u32,
     /// `Arc<str>` intern pool: maps an id string to its canonical `Arc`,
     /// so equal phase/type ids across distinct defs share one allocation.
     /// Keyed and valued by the same `Arc<str>` (a get-or-insert returns
@@ -202,11 +217,34 @@ pub(crate) struct TaskDefStore<I> {
     str_intern: HashMap<Arc<str>, Arc<str>>,
 }
 
+/// A hash↔id BIJECTION violation observed by [`TaskDefStore::intern_at`]:
+/// the wire-carried `(def_id, hash)` pair contradicts a binding the store
+/// already holds. A converged content-addressed registry NEVER produces
+/// one (equal content ⇒ equal hash ⇒ the same id on every node); it is the
+/// loud signal of a genuine fault — two primaries minting different ids for
+/// one hash, or an id re-used for a second hash (the failover-aliasing the
+/// epoch-safe allocator exists to prevent). The apply rule logs it and
+/// drops the mutation (NoOp), debug-asserting in a debug build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DefBijectionError {
+    /// `hash` is already bound to `existing` but the wire carried a
+    /// DIFFERENT `wire` id for it.
+    HashRebound {
+        hash: String,
+        existing: TaskDefId,
+        wire: TaskDefId,
+    },
+    /// The wire `id` slot is already occupied by a def for a DIFFERENT
+    /// hash than the incoming one.
+    IdRebound { id: TaskDefId },
+}
+
 impl<I> Default for TaskDefStore<I> {
     fn default() -> Self {
         Self {
             defs: Vec::new(),
             hash_to_id: HashMap::new(),
+            next_id: 0,
             str_intern: HashMap::new(),
         }
     }
@@ -217,6 +255,7 @@ impl<I> Clone for TaskDefStore<I> {
         Self {
             defs: self.defs.clone(),
             hash_to_id: self.hash_to_id.clone(),
+            next_id: self.next_id,
             str_intern: self.str_intern.clone(),
         }
     }
@@ -227,6 +266,7 @@ impl<I> std::fmt::Debug for TaskDefStore<I> {
         f.debug_struct("TaskDefStore")
             .field("defs", &self.defs.len())
             .field("hash_to_id", &self.hash_to_id.len())
+            .field("next_id", &self.next_id)
             .field("str_intern", &self.str_intern.len())
             .finish()
     }
@@ -245,53 +285,153 @@ impl<I> TaskDefStore<I> {
             .clone()
     }
 
-    /// Intern a frozen def under its content `hash`. If the hash is
-    /// already known, returns the existing id and mints NOTHING (the
-    /// content-addressed dedup gate — the store is append-only and a
-    /// hash binds to exactly one def). Otherwise the def's `Arc<str>`-
-    /// backed ids (phase/type) are folded through the intern pool so
-    /// equal ids share one allocation, the def is pushed, and the new id
-    /// is recorded and returned.
-    pub(crate) fn intern(&mut self, hash: String, mut frozen: FrozenTaskDef<I>) -> TaskDefId {
-        if let Some(&existing) = self.hash_to_id.get(&hash) {
-            return existing;
-        }
-        // Collapse the recurring `Arc<str>` ids onto canonical pool
-        // allocations before storing (phase/type only — `identifier: I`
-        // is opaque and may not be `Arc<str>`-backed).
+    /// Fold a frozen def's recurring `Arc<str>` ids (phase/type only —
+    /// `identifier: I` is opaque and may not be `Arc<str>`-backed) onto the
+    /// canonical intern-pool allocations, in place. The single str-intern
+    /// site both the node-local [`Self::intern`] and the wire-id
+    /// [`Self::intern_at`] route a stored def through.
+    fn canonicalize_strs(&mut self, frozen: &mut FrozenTaskDef<I>) {
         let phase = self.intern_str(frozen.phase_id.as_str());
         frozen.phase_id = PhaseId::new(phase);
         let ty = self.intern_str(frozen.type_id.as_str());
         frozen.type_id = TypeId::new(ty);
+    }
 
-        let id = TaskDefId(self.defs.len() as u32);
-        self.defs.push(Arc::new(frozen));
+    /// Place `frozen` into the `defs` slot at `id`, growing the sparse
+    /// vector with empty slots as needed. The single slot-write the two
+    /// fill paths share; the caller owns the bijection/dedup decision.
+    fn put_slot(&mut self, id: TaskDefId, frozen: Arc<FrozenTaskDef<I>>) {
+        let idx = id.0 as usize;
+        if idx >= self.defs.len() {
+            self.defs.resize(idx + 1, None);
+        }
+        self.defs[idx] = Some(frozen);
+        // Keep the allocator strictly above every observed id so a later
+        // node-local mint never collides with a wire-placed id.
+        self.next_id = self.next_id.max(id.0 + 1);
+    }
+
+    /// NODE-LOCAL allocate-and-intern: the un-agreed L2 fallback used when
+    /// no primary-allocated id rides the wire (a `def_id: None` `TaskAdded`,
+    /// the in-process direct-apply / unit-test path). If the hash is already
+    /// known, returns the existing id and mints NOTHING (the
+    /// content-addressed dedup gate). Otherwise mints the next node-local
+    /// id, canonicalizes the def's `Arc<str>` ids, and records it.
+    pub(crate) fn intern(&mut self, hash: String, mut frozen: FrozenTaskDef<I>) -> TaskDefId {
+        if let Some(&existing) = self.hash_to_id.get(&hash) {
+            return existing;
+        }
+        self.canonicalize_strs(&mut frozen);
+        let id = self.alloc();
+        self.put_slot(id, Arc::new(frozen));
         self.hash_to_id.insert(hash, id);
         id
     }
 
-    /// Resolve an id to its shared frozen def. `None` for an id this
-    /// store never minted (e.g. one from a replica that is ahead).
-    pub(crate) fn resolve(&self, id: TaskDefId) -> Option<&Arc<FrozenTaskDef<I>>> {
-        self.defs.get(id.0 as usize)
+    /// Mint the next node-local [`TaskDefId`] from the epoch-safe `next_id`
+    /// allocator (NOT `defs.len()` — a sparse `intern_at` can leave gaps).
+    fn alloc(&mut self) -> TaskDefId {
+        let id = TaskDefId(self.next_id);
+        self.next_id += 1;
+        id
     }
 
-    /// The id a content `hash` resolves to, if this store has interned it.
-    /// L1-tested but with no production caller until the primary-allocated
-    /// wire-agreed-id leaf lands (L2 interns LOCALLY per node); kept as the
-    /// real, tested surface that leaf consumes.
+    /// PRIMARY-side id allocation for `hash` at the broadcast STAMP step,
+    /// idempotent on hash: returns the existing id if `hash` is already
+    /// bound (a re-added hash reuses its def id — the bijection), else
+    /// reserves the next allocator id for it WITHOUT yet placing a def
+    /// (the def slot is filled by the matching [`Self::intern_at`] when the
+    /// stamped `TaskAdded` is applied). The reservation records the
+    /// hash→id binding so the originator's own apply observes it as the
+    /// idempotent fill case.
+    pub(crate) fn alloc_for_hash(&mut self, hash: &str) -> TaskDefId {
+        if let Some(&existing) = self.hash_to_id.get(hash) {
+            return existing;
+        }
+        let id = self.alloc();
+        self.hash_to_id.insert(hash.to_string(), id);
+        id
+    }
+
+    /// RECEIVE-side wire-id intern: place the wire-carried def at EXACTLY
+    /// `id`, enforcing the hash↔id BIJECTION so every replica converges on
+    /// the same id for a hash. Returns the (possibly already-bound) id on
+    /// success, or a [`DefBijectionError`] on a contradiction:
+    ///
+    ///   * hash already bound to a DIFFERENT id than `id` → `HashRebound`;
+    ///   * hash NEW but `id`'s slot already holds a def for another hash →
+    ///     `IdRebound`.
+    ///
+    /// The idempotent cases are NOT errors: a re-add of a hash already
+    /// bound to `id` reuses it (and fills the slot if a prior
+    /// [`Self::alloc_for_hash`] reservation left it empty), exactly as the
+    /// node-local [`Self::intern`] re-add mints nothing.
+    pub(crate) fn intern_at(
+        &mut self,
+        id: TaskDefId,
+        hash: String,
+        mut frozen: FrozenTaskDef<I>,
+    ) -> Result<TaskDefId, DefBijectionError> {
+        if let Some(&existing) = self.hash_to_id.get(&hash) {
+            if existing != id {
+                return Err(DefBijectionError::HashRebound {
+                    hash,
+                    existing,
+                    wire: id,
+                });
+            }
+            // Idempotent re-add (or the originator's own apply after its
+            // `alloc_for_hash` reservation): ensure the slot is filled, then
+            // return the established id. A re-add against an already-placed
+            // slot mints nothing.
+            if self.resolve(existing).is_none() {
+                self.canonicalize_strs(&mut frozen);
+                self.put_slot(existing, Arc::new(frozen));
+            }
+            return Ok(existing);
+        }
+        // Hash is NEW: the slot must be free (a new hash claiming an
+        // occupied slot is the id-rebind fault — the slot is bound to a
+        // hash other than this one, since this hash is not in `hash_to_id`).
+        if self.resolve(id).is_some() {
+            return Err(DefBijectionError::IdRebound { id });
+        }
+        self.canonicalize_strs(&mut frozen);
+        self.put_slot(id, Arc::new(frozen));
+        self.hash_to_id.insert(hash, id);
+        Ok(id)
+    }
+
+    /// Resolve an id to its shared frozen def. `None` for an id this store
+    /// never placed — either never minted, or a sparse gap below `next_id`
+    /// for a wire id whose `TaskAdded` has not arrived yet.
+    pub(crate) fn resolve(&self, id: TaskDefId) -> Option<&Arc<FrozenTaskDef<I>>> {
+        self.defs.get(id.0 as usize).and_then(|slot| slot.as_ref())
+    }
+
+    /// The id a content `hash` resolves to, if this store has bound it.
     #[allow(dead_code)]
     pub(crate) fn id_for_hash(&self, hash: &str) -> Option<TaskDefId> {
         self.hash_to_id.get(hash).copied()
     }
 
-    /// The next id this store would mint (`max id + 1`, i.e. the def
-    /// count) — the resume helper that re-anchors id minting after a
-    /// restore so a respawned originator never re-uses a live id. No
-    /// production caller until the resume/originate id leaf lands.
-    #[allow(dead_code)]
+    /// The next id the node-local allocator would mint — the failover-resume
+    /// floor a promoted primary re-anchors against so it never re-mints a
+    /// live id (see [`Self::resume_alloc_floor`]).
     pub(crate) fn next_id_floor(&self) -> u32 {
-        self.defs.len() as u32
+        self.next_id
+    }
+
+    /// Re-anchor the node-local allocator so the next minted id is at least
+    /// `floor` — the failover-safety seam a promoted primary fires so it
+    /// resumes PAST every replicated def id rather than from a cold counter
+    /// (the aliasing CL-A2 forbids). Monotone: never lowers `next_id`. The
+    /// caller supplies `max(observed id) + 1`; here the in-memory store's
+    /// own max already feeds `next_id` (every `put_slot` advances it), so a
+    /// `resume_alloc_floor(next_id_floor())` is the L3a resume — the full
+    /// settled-scan over spilled entries is a later leaf.
+    pub(crate) fn resume_alloc_floor(&mut self, floor: u32) {
+        self.next_id = self.next_id.max(floor);
     }
 }
 
@@ -325,6 +465,69 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
                 resolved_path,
             },
         )
+    }
+
+    /// The DEF-BEFORE-STATE construction helper the `TaskAdded` apply arm
+    /// calls: insert the frozen def into the store BEFORE the referencing
+    /// `TaskState` is set, resolving the in-memory `Arc<FrozenTaskDef>` the
+    /// state carries. Honors the wire-carried, primary-allocated `def_id`:
+    ///
+    ///   * `Some(wire)` — the production replicated path: intern the def at
+    ///     EXACTLY `wire` ([`TaskDefStore::intern_at`]) so this replica uses
+    ///     the SAME id the originator allocated. A hash↔id BIJECTION
+    ///     violation (a converged registry never produces one) is logged
+    ///     LOUD and the construction is REFUSED (`None`), so the apply arm
+    ///     NoOps the mutation rather than corrupting the registry.
+    ///   * `None` — the un-allocated local-apply fallback (direct-apply
+    ///     tests, any pre-stamp local apply): node-local allocation
+    ///     ([`TaskDefStore::intern`]), the L2 by-content-hash convergence.
+    ///
+    /// Returns `None` ONLY on a bijection violation (the loud-but-safe
+    /// drop); every well-formed call returns the `(def, routing)` the arm
+    /// writes onto the new `TaskState`.
+    pub(crate) fn intern_task_def_at(
+        &mut self,
+        def_id: Option<u32>,
+        hash: &str,
+        task: TaskInfo<I>,
+    ) -> Option<(Arc<FrozenTaskDef<I>>, super::types::TaskRouting)> {
+        let Some(wire) = def_id else {
+            return Some(self.intern_task_def(hash, task));
+        };
+        let (frozen, preferred_secondaries, preferred_version, resolved_path) =
+            FrozenTaskDef::from_task_info(task);
+        let id = match self
+            .definitions
+            .intern_at(TaskDefId(wire), hash.to_string(), frozen)
+        {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::error!(
+                    target: "dynrunner_cluster_state",
+                    ?err,
+                    "TaskAdded def-id BIJECTION violation — the wire-carried \
+                     (def_id, hash) contradicts an established binding (a \
+                     converged content-addressed registry never produces one; \
+                     two primaries minting different ids for one hash, or a \
+                     failover-aliased id reuse). Dropping the TaskAdded."
+                );
+                debug_assert!(false, "TaskAdded def-id bijection violation: {err:?}");
+                return None;
+            }
+        };
+        let def = self
+            .definitions
+            .resolve(id)
+            .expect("def placed at wire id resolves")
+            .clone();
+        Some((
+            def,
+            super::types::TaskRouting {
+                preferred_secondaries,
+                preferred_version,
+                resolved_path,
+            },
+        ))
     }
 }
 
@@ -484,5 +687,119 @@ mod tests {
         assert_eq!(store.next_id_floor(), 1);
         store.intern("h2".into(), mk_frozen("y", "p0"));
         assert_eq!(store.next_id_floor(), 2);
+    }
+
+    // ── L3a: primary-allocated, wire-agreed def ids ──
+
+    /// `intern_at` places the wire-carried def at EXACTLY the requested id —
+    /// the convergence primitive: a receiver uses the originator's id, never
+    /// a node-local position. A SPARSE id (a gap below it) is tolerated.
+    #[test]
+    fn intern_at_places_at_wire_id() {
+        let mut store: TaskDefStore<RunnerIdentifier> = TaskDefStore::default();
+        // Place id 5 first (a gap 0..=4): out-of-order wire delivery.
+        let id = store
+            .intern_at(TaskDefId(5), "h5".into(), mk_frozen("x", "p0"))
+            .unwrap();
+        assert_eq!(id, TaskDefId(5));
+        assert!(store.resolve(TaskDefId(5)).is_some());
+        assert!(store.resolve(TaskDefId(0)).is_none(), "gap is a not-yet-seen def");
+        // The allocator resumed past the placed id so a later node-local mint
+        // never collides with the wire-placed slot.
+        assert_eq!(store.next_id_floor(), 6);
+        let local = store.intern("h-local".into(), mk_frozen("y", "p0"));
+        assert_eq!(local, TaskDefId(6));
+    }
+
+    /// `intern_at` is idempotent on a re-add of a hash already bound to the
+    /// SAME id (at-least-once delivery / the originator's own apply after its
+    /// `alloc_for_hash` reservation) — it mints nothing and reuses the id.
+    #[test]
+    fn intern_at_idempotent_on_same_hash_same_id() {
+        let mut store: TaskDefStore<RunnerIdentifier> = TaskDefStore::default();
+        let a = store
+            .intern_at(TaskDefId(3), "h".into(), mk_frozen("x", "p0"))
+            .unwrap();
+        let b = store
+            .intern_at(TaskDefId(3), "h".into(), mk_frozen("x", "p0"))
+            .unwrap();
+        assert_eq!(a, TaskDefId(3));
+        assert_eq!(b, TaskDefId(3));
+        assert_eq!(store.next_id_floor(), 4);
+    }
+
+    /// `alloc_for_hash` reserves the binding WITHOUT placing a def; the
+    /// matching `intern_at` then FILLS the reserved slot (the originator's
+    /// two-step stamp→apply path). A second `alloc_for_hash` for the same
+    /// hash reuses the reservation.
+    #[test]
+    fn alloc_for_hash_reserves_then_intern_at_fills() {
+        let mut store: TaskDefStore<RunnerIdentifier> = TaskDefStore::default();
+        let reserved = store.alloc_for_hash("h");
+        assert_eq!(reserved, TaskDefId(0));
+        // Reserved but not yet placed: resolve is None until the def lands.
+        assert!(store.resolve(reserved).is_none());
+        // Idempotent reservation.
+        assert_eq!(store.alloc_for_hash("h"), TaskDefId(0));
+        // The originator's own apply fills the slot at the reserved id.
+        let id = store
+            .intern_at(reserved, "h".into(), mk_frozen("x", "p0"))
+            .unwrap();
+        assert_eq!(id, reserved);
+        assert!(store.resolve(reserved).is_some());
+    }
+
+    /// BIJECTION: a hash already bound to one id, re-presented on the wire
+    /// with a DIFFERENT id, is a `HashRebound` error (never produced by a
+    /// converged content-addressed registry).
+    #[test]
+    fn intern_at_hash_rebound_errors() {
+        let mut store: TaskDefStore<RunnerIdentifier> = TaskDefStore::default();
+        store
+            .intern_at(TaskDefId(0), "h".into(), mk_frozen("x", "p0"))
+            .unwrap();
+        let err = store
+            .intern_at(TaskDefId(1), "h".into(), mk_frozen("x", "p0"))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DefBijectionError::HashRebound {
+                hash: "h".into(),
+                existing: TaskDefId(0),
+                wire: TaskDefId(1),
+            }
+        );
+    }
+
+    /// BIJECTION: a NEW hash claiming an id slot already bound to a DIFFERENT
+    /// hash is an `IdRebound` error (the failover-aliasing the epoch-safe
+    /// allocator exists to prevent).
+    #[test]
+    fn intern_at_id_rebound_errors() {
+        let mut store: TaskDefStore<RunnerIdentifier> = TaskDefStore::default();
+        store
+            .intern_at(TaskDefId(0), "h-a".into(), mk_frozen("a", "p0"))
+            .unwrap();
+        let err = store
+            .intern_at(TaskDefId(0), "h-b".into(), mk_frozen("b", "p0"))
+            .unwrap_err();
+        assert_eq!(err, DefBijectionError::IdRebound { id: TaskDefId(0) });
+    }
+
+    /// `resume_alloc_floor` re-anchors the allocator forward (failover
+    /// resume) and is MONOTONE — it never lowers `next_id`.
+    #[test]
+    fn resume_alloc_floor_is_monotone() {
+        let mut store: TaskDefStore<RunnerIdentifier> = TaskDefStore::default();
+        store.intern("h0".into(), mk_frozen("x", "p0"));
+        assert_eq!(store.next_id_floor(), 1);
+        store.resume_alloc_floor(10);
+        assert_eq!(store.next_id_floor(), 10);
+        // A lower floor is a no-op (a promoted primary never regresses).
+        store.resume_alloc_floor(3);
+        assert_eq!(store.next_id_floor(), 10);
+        // The next node-local mint respects the resumed floor (no live-id reuse).
+        let id = store.intern("h-new".into(), mk_frozen("y", "p0"));
+        assert_eq!(id, TaskDefId(10));
     }
 }

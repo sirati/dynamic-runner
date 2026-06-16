@@ -47,6 +47,7 @@ async fn promoted_populated_crdt_does_not_redo_discovery_phase_start_or_reassign
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: dh.clone(),
                     task: done,
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskCompleted {
                     attempt: 0,
@@ -56,6 +57,7 @@ async fn promoted_populated_crdt_does_not_redo_discovery_phase_start_or_reassign
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: ih.clone(),
                     task: inflight,
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskAssigned {
                     attempt: 0,
@@ -207,6 +209,7 @@ async fn mid_run_failover_dispatches_all_inherited_pending() {
                     cs.apply(ClusterMutation::TaskAdded {
                         hash: compute_task_hash(&task),
                         task,
+                        def_id: None,
                     });
                 }
                 assert_eq!(cs.task_count(), N, "live ledger holds N Pending tasks");
@@ -889,6 +892,7 @@ async fn retry_reset_survives_anti_entropy_heal() {
             cs.apply(ClusterMutation::TaskAdded {
                 hash: h.clone(),
                 task,
+                def_id: None,
             });
             cs.apply(ClusterMutation::TaskFailed {
                 hash: h.clone(),
@@ -1023,6 +1027,7 @@ async fn promoted_inflight_reserves_per_type_slot_for_symmetric_release() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: "inflight-cap".into(),
                     task: task.clone(),
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskAssigned {
                     hash: "inflight-cap".into(),
@@ -1100,12 +1105,14 @@ fn promoted_hydrate_rebuilds_all_binaries_candidate_source() {
             cs.apply(ClusterMutation::TaskAdded {
                 hash: name.into(),
                 task: t,
+                def_id: None,
             });
         }
         let inflight = make_binary("inflight-1", 100);
         cs.apply(ClusterMutation::TaskAdded {
             hash: "inflight-1".into(),
             task: inflight,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAssigned {
             hash: "inflight-1".into(),
@@ -1118,6 +1125,7 @@ fn promoted_hydrate_rebuilds_all_binaries_candidate_source() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: "done-1".into(),
             task: done,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskCompleted {
             hash: "done-1".into(),
@@ -1232,6 +1240,7 @@ fn promoted_hydrate_seeds_phase_started_emitted_so_on_phase_start_not_refired() 
         cs.apply(ClusterMutation::TaskAdded {
             hash: hash.clone(),
             task: t,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAssigned {
             attempt: 0,
@@ -1345,6 +1354,7 @@ fn hydrate_does_not_seed_blocked_only_phase_as_started() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: bh.clone(),
             task: bt,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAssigned {
             attempt: 0,
@@ -1366,6 +1376,7 @@ fn hydrate_does_not_seed_blocked_only_phase_as_started() {
         cs.apply(ClusterMutation::TaskAdded {
             hash: compute_task_hash(&st),
             task: st,
+            def_id: None,
         });
     }
     primary
@@ -1435,6 +1446,7 @@ async fn promoted_run_does_not_refire_on_phase_start_for_inherited_started_phase
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: hash.clone(),
                     task,
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskCompleted {
                     attempt: 0,
@@ -1623,6 +1635,7 @@ async fn promoted_retries_inherited_recoverable_failed_task() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: h.clone(),
                     task,
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskFailed {
                     hash: h.clone(),
@@ -1758,6 +1771,7 @@ async fn promoted_combined_state_reconstructs_faithfully() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: failed_h.clone(),
                     task: failed_t.clone(),
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskFailed {
                     hash: failed_h.clone(),
@@ -1769,6 +1783,7 @@ async fn promoted_combined_state_reconstructs_faithfully() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: inflight_h.clone(),
                     task: inflight_t.clone(),
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskAssigned {
                     hash: inflight_h.clone(),
@@ -1925,10 +1940,12 @@ async fn promoted_inherited_failed_not_double_counted_against_pending() {
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: failed_hash.clone(),
                     task: failed_task.clone(),
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: pending_hash.clone(),
                     task: pending_task.clone(),
+                    def_id: None,
                 });
                 // Terminate the first task as a NonRecoverable Failed — the
                 // budget-exhausted / permanently-failed shape a promotion can

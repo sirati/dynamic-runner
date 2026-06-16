@@ -93,6 +93,7 @@ async fn illegal_bounce_reconciles_occupancy_and_requeues_without_failure() {
                 primary.cluster_state.apply(ClusterMutation::TaskAdded {
                     hash: compute_task_hash(t),
                     task: t.clone(),
+                    def_id: None,
                 });
             }
             // The incumbent is in the ledger but NOT held on a slot here (its
@@ -208,6 +209,7 @@ async fn illegal_bounce_without_incumbent_still_requeues_no_failure() {
             primary.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: assigned_hash.clone(),
                 task: assigned.clone(),
+                def_id: None,
             });
             primary.cluster_state.apply(ClusterMutation::SecondaryCapacity {
                 secondary: "sec-0".into(),
@@ -283,6 +285,7 @@ async fn handled_bounce_reconcile_logs_at_debug_not_error() {
                 primary.cluster_state.apply(ClusterMutation::TaskAdded {
                     hash: compute_task_hash(t),
                     task: t.clone(),
+                    def_id: None,
                 });
             }
             primary.cluster_state.apply(ClusterMutation::SecondaryCapacity {
@@ -382,6 +385,7 @@ async fn bounce_does_not_reseat_b_slot_onto_a_held_incumbent() {
                 primary.cluster_state.apply(ClusterMutation::TaskAdded {
                     hash: compute_task_hash(t),
                     task: t.clone(),
+                    def_id: None,
                 });
             }
             // Both members have capacity. A holds `dup` in the ledger; B is the

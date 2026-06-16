@@ -125,10 +125,12 @@ fn primary_two_phase_one_worker() -> (
         cs.apply(ClusterMutation::TaskAdded {
             hash: hash_a.clone(),
             task: a,
+            def_id: None,
         });
         cs.apply(ClusterMutation::TaskAdded {
             hash: hash_b.clone(),
             task: b,
+            def_id: None,
         });
     }
     primary.hydrate_from_cluster_state()
@@ -336,10 +338,12 @@ async fn dispatch_selects_on_authoritative_free_predicate_not_advisory_is_idle()
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: hash_t0.clone(),
                     task: t0,
+                    def_id: None,
                 });
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: hash_t1.clone(),
                     task: t1,
+                    def_id: None,
                 });
             }
             primary.hydrate_from_cluster_state()

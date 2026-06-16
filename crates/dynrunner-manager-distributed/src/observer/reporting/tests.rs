@@ -87,6 +87,7 @@ fn seed_state(
         s.apply(ClusterMutation::TaskAdded {
             hash: hash.clone(),
             task: t.clone(),
+            def_id: None,
         });
         match seed {
             Seed::Pending => {}

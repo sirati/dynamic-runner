@@ -667,7 +667,8 @@ fn build_staging_primary(shape: StagingSeedShape) -> (TestPrimaryForStaging, tem
             let mut b = make_binary(name, 7);
             b.path = std::path::PathBuf::from(name);
             let hash = crate::primary::wire::compute_task_hash(&b);
-            cs.apply(ClusterMutation::TaskAdded { hash: hash.clone(), task: b });
+            cs.apply(ClusterMutation::TaskAdded { hash: hash.clone(), task: b,
+                def_id: None, });
             // Drive the first task to InFlight when modelling a RESUME (a
             // task has progressed past Pending — the populated-CRDT signal).
             if matches!(shape, StagingSeedShape::Resumed) && i == 0 {
@@ -692,6 +693,7 @@ fn build_staging_primary(shape: StagingSeedShape) -> (TestPrimaryForStaging, tem
             cs.apply(ClusterMutation::TaskAdded {
                 hash: hash.clone(),
                 task: invalid,
+                def_id: None,
             });
             cs.apply(ClusterMutation::TaskFailed {
                 hash,

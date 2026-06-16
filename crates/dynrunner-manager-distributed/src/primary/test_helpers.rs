@@ -1409,6 +1409,7 @@ pub(super) fn seed_operational_ledger<S, E>(
         cs.apply(ClusterMutation::TaskAdded {
             hash: crate::primary::wire::compute_task_hash(task),
             task: task.clone(),
+            def_id: None,
         });
     }
 }

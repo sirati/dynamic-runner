@@ -128,6 +128,7 @@ fn task_failed_invalid_task_transitions_pending_to_invalid() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     assert_eq!(s.counts().pending, 1);
     assert_eq!(
@@ -156,6 +157,7 @@ fn invalid_task_terminal_locks_out_later_generic_failure() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     s.apply(ClusterMutation::TaskFailed {
         attempt: 0,

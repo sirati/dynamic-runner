@@ -161,6 +161,7 @@ fn tally_bumps_on_task_completed_apply_in_real_time() {
         mirror.apply(ClusterMutation::TaskAdded {
             hash: hash.into(),
             task: mk_task(name),
+            def_id: None,
         });
         assert_eq!(
             mirror.apply(ClusterMutation::TaskCompleted {
@@ -207,6 +208,7 @@ fn tally_apply_then_snapshot_merge_converges_without_double_count() {
             state.apply(ClusterMutation::TaskAdded {
                 hash: hash.into(),
                 task: mk_task(name),
+                def_id: None,
             });
             state.apply(ClusterMutation::TaskCompleted {
                 hash: hash.into(),
@@ -251,6 +253,7 @@ fn tally_restore_covers_cold_and_partial_knowledge_union() {
         originator.apply(ClusterMutation::TaskAdded {
             hash: hash.into(),
             task: mk_task(name),
+            def_id: None,
         });
     }
     originator.apply(ClusterMutation::TaskCompleted {
@@ -274,6 +277,7 @@ fn tally_restore_covers_cold_and_partial_knowledge_union() {
         partial.apply(ClusterMutation::TaskAdded {
             hash: hash.into(),
             task: mk_task(name),
+            def_id: None,
         });
     }
     partial.apply(ClusterMutation::TaskCompleted {
@@ -303,6 +307,7 @@ fn tally_failed_twin_is_event_shaped_on_apply() {
     s.apply(ClusterMutation::TaskAdded {
         hash: "ha".into(),
         task: mk_task("a"),
+        def_id: None,
     });
     let fail = |attempt: u32, seq: u32| ClusterMutation::TaskFailed {
         hash: "ha".into(),
