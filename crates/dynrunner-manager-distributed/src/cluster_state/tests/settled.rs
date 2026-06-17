@@ -349,6 +349,126 @@ fn promotion_adopts_settled_base_without_replay() {
     assert!(outputs.is_some());
 }
 
+/// Regression (promoted-primary verdict undercount): a failover DURING
+/// teardown relocates the primary role onto a fresh replica that adopts the
+/// donor's SETTLED base (`install_settled_base`) — the join-fixed-point ledger
+/// slice, where the BULK of the already-succeeded tasks live at 46k-affine
+/// scale (their fat bodies were spilled). The maintained incremental
+/// `outcome_tally` is kept ONLY at the fat `set_task_state` write seam, and a
+/// settled base enters via `install_settled_base` WITHOUT transiting that seam,
+/// so a promoted primary's `outcome_counts()` USED to reflect only its own
+/// post-promotion fat completions (the per-epoch undercount the consumer saw:
+/// the inherited cumulative `succeeded=28638` mis-reported as `succeeded=1`,
+/// and the graceful-abort verdict's `unscheduled = total − total_terminal()`
+/// wrongly absorbing the already-settled successes). The fix seeds the tally
+/// from the installed settled half at the install seam, so the maintained
+/// tally CONTINUES across the failover.
+#[test]
+fn promoted_primary_outcome_tally_inherits_settled_cumulative() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Donor (the pre-failover primary): N already-succeeded tasks + one
+    // distinct-bucket terminal (a final-failed), then spill the whole
+    // terminal slice to the settled store — the at-scale shape where the
+    // succeeded bulk lives settled, not fat.
+    const N: usize = 64;
+    let mut donor = ClusterState::<RunnerIdentifier>::new();
+    for i in 0..N {
+        let hash = format!("done-{i:04}");
+        donor.apply(ClusterMutation::TaskAdded {
+            hash: hash.clone(),
+            task: mk_task(&hash),
+            def_id: None,
+        });
+        donor.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
+            hash,
+            result_data: Some(done_with_output("k", "v")),
+        });
+    }
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: "ff".into(),
+        task: mk_task("ff"),
+        def_id: None,
+    });
+    donor.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
+        hash: "ff".into(),
+        kind: dynrunner_core::ErrorType::NonRecoverable,
+        error: "permanent".into(),
+        version: Default::default(),
+    });
+    let evicted = donor.test_spill_all(&dir.path().join("spill.cbor"));
+    assert_eq!(evicted, N + 1, "every terminal settles + evicts");
+    assert_eq!(donor.tasks_in_memory(), 0, "no fat residency on the donor");
+    // The donor's own maintained tally — counted at the fat write seam
+    // BEFORE the spill (spill is tally-neutral) — already holds the
+    // cumulative.
+    assert_eq!(donor.outcome_counts().succeeded, N);
+    assert_eq!(donor.outcome_counts().fail_final, 1);
+
+    // Promotion handover: a freshly-built replica installs the donor's
+    // settled base, then restores the disjoint fat snapshot (empty here —
+    // everything settled). This is the `adopt_settled_base` +
+    // `seed_from_promotion_snapshot` order the `PromotedPrimaryBuilder`
+    // runs.
+    let mut promoted = ClusterState::<RunnerIdentifier>::new();
+    promoted.install_settled_base(donor.settled_base_clone());
+    promoted.restore(donor.snapshot());
+
+    // THE FIX: the promoted primary's MAINTAINED tally inherits the
+    // cumulative — NOT 0/per-epoch. Without the seed at the install seam
+    // this read was succeeded=0 (the consumer's `succeeded=1`-after-its-own-
+    // completion shape).
+    assert_eq!(
+        promoted.outcome_counts().succeeded,
+        N,
+        "promoted primary inherits the cumulative succeeded count, not per-epoch"
+    );
+    assert_eq!(promoted.outcome_counts().fail_final, 1);
+    // The maintained tally now equals the full-scan oracle on a promoted
+    // primary — the invariant the bug broke (incremental ≠ scan after a
+    // settled-base install).
+    assert_eq!(
+        promoted.outcome_counts(),
+        promoted.outcome_counts_by_scan(),
+        "maintained tally == full-scan over fat ∪ settled on a promoted primary"
+    );
+
+    // A FURTHER completion on the promoted primary CONTINUES the tally
+    // (cumulative + delta), not a fresh per-epoch count.
+    promoted.apply(ClusterMutation::TaskAdded {
+        hash: "post".into(),
+        task: mk_task("post"),
+        def_id: None,
+    });
+    promoted.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "post".into(),
+        result_data: Some(done_with_output("k", "v")),
+    });
+    assert_eq!(
+        promoted.outcome_counts().succeeded,
+        N + 1,
+        "post-promotion completion increments the INHERITED cumulative"
+    );
+
+    // The graceful-abort verdict arithmetic (`coordinator.rs`: stranded =
+    // total − outcome.total_terminal()): with the cumulative restored,
+    // `unscheduled` counts ONLY the never-dispatched residue. Here every
+    // task is terminal (N succeeded + 1 fail-final + 1 post), so the verdict
+    // reports zero unscheduled — NOT the whole pre-failover cumulative
+    // mis-bucketed as "deliberately left unscheduled".
+    let outcome = promoted.outcome_counts();
+    let total = promoted.task_count();
+    assert_eq!(total, N + 2);
+    let unscheduled = total.saturating_sub(outcome.total_terminal());
+    assert_eq!(
+        unscheduled, 0,
+        "unscheduled = total − cumulative_terminal counts only never-dispatched tasks"
+    );
+}
+
 /// Memory arithmetic: at N settled entries the resident index bytes are
 /// a small fraction of the resident fat bytes — the structural win the
 /// spill exists for. Uses the counting/size seam, not RSS. Tasks carry a

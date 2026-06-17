@@ -690,6 +690,37 @@ impl<I: Identifier> ClusterState<I> {
         if let Some((file, committed)) = own {
             self.settled.attach_writer_segment(file, committed);
         }
+        self.seed_outcome_tally_from_settled();
+    }
+
+    /// Fold every just-installed settled terminal into the maintained
+    /// [`outcome_tally`](super::outcome_tally). The incremental tally is kept
+    /// at the SOLE `set_task_state` write seam: a terminal is counted once, at
+    /// the transition that made it terminal, and a live spill (fat→settled,
+    /// `commit_spill`) is tally-NEUTRAL because the term was already counted
+    /// while fat. A promotion-handover settled base, however, enters the ledger
+    /// via [`Self::install_settled_base`] WITHOUT ever transiting that seam on
+    /// this replica — the donor counted those terminals, this fresh tally has
+    /// not. Without this seed the maintained `outcome_counts()` on a promoted
+    /// primary reflects only its own post-promotion fat completions (the
+    /// per-epoch undercount the graceful-abort / run-complete verdict and the
+    /// live counter mis-reported), while `outcome_counts_by_scan` (which walks
+    /// the settled half) already yields the cumulative. Folding the installed
+    /// settled half here CONTINUES the tally across the failover, restoring the
+    /// `outcome_counts() == outcome_counts_by_scan()` invariant on a promoted
+    /// primary. Legal only at the install seam, where the settled base is fresh
+    /// and the fat half has not yet been restored (so a fat entry cannot also
+    /// carry the same terminal); the disjoint fat half is folded by its own
+    /// `set_task_state` restore path.
+    fn seed_outcome_tally_from_settled(&mut self) {
+        let buckets: Vec<super::outcome_tally::OutcomeBucket> = self
+            .settled
+            .iter()
+            .map(|(_, entry)| super::outcome_tally::settled_bucket_of(&entry.class))
+            .collect();
+        for bucket in buckets {
+            self.outcome_tally.swap(None, Some(bucket));
+        }
     }
 
     /// Clone this state's settled store read-only (the promotion
