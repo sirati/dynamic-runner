@@ -152,3 +152,92 @@ async fn broadcast_fans_out_to_all_others() {
     assert!(transports[1].try_recv_peer().is_some());
     assert!(transports[2].try_recv_peer().is_some());
 }
+
+// ── forward_to_peer: transparent forwarding ──
+//
+// `forward_to_peer(to, package)` routes an already-received package
+// toward `to` while preserving its ORIGINAL origin attribution — the
+// package's own `sender_id`. "Transparent" means the destination sees
+// the original sender, not whoever forwarded. The two tests below pin
+// that guarantee on the DIRECT path (forwarder adjacent to target) and
+// the VIA-RELAY path (forwarder must hop through an intermediary),
+// because the relay envelope wraps the package and the relay machinery
+// must hand the inner package back to the receiver with its origin
+// untouched.
+
+/// DIRECT path: `b` forwards to its direct neighbour `c` a package
+/// authored by a THIRD party `origin-x`. `c` receives the package with
+/// `sender_id == "origin-x"` — not `"b"` (the forwarder), not `"c"`.
+#[tokio::test]
+async fn forward_to_peer_preserves_origin_direct() {
+    let ids = vec!["b".to_string(), "c".to_string()];
+    let mut transports = peer_mesh::<SendTestId>(&ids);
+    // index 0 = b, index 1 = c (peer_mesh returns in input order)
+
+    // A package whose origin is a third party, received earlier by `b`
+    // and now forwarded on toward `c`.
+    let package = keepalive("origin-x");
+    transports[0].forward_to_peer("c", package).await.unwrap();
+
+    let delivered = transports[1]
+        .try_recv_peer()
+        .expect("c receives the forwarded package");
+    assert_eq!(
+        delivered.sender_id(),
+        "origin-x",
+        "the destination must see the ORIGINAL sender, not the forwarder"
+    );
+}
+
+/// VIA-RELAY path: topology `a — b — c` (a and c are NOT directly
+/// linked). `a` forwards a package authored by `origin-x` toward `c`;
+/// the router has no direct a→c link so it wraps the package in a relay
+/// envelope and hops it through `b`. `c` must still see `origin-x` —
+/// the relay wrapping/unwrapping must leave the inner package's origin
+/// intact end-to-end.
+#[tokio::test]
+async fn forward_to_peer_preserves_origin_via_relay() {
+    let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    // Linear chain: a—b and b—c, but NO a—c link.
+    let links = vec![
+        ("a".to_string(), "b".to_string()),
+        ("b".to_string(), "c".to_string()),
+    ];
+    let mut transports =
+        crate::mesh::peer_mesh_with_adjacency::<SendTestId>(&ids, &links);
+    // index 0 = a, 1 = b, 2 = c
+
+    // a has no direct route to c, so forward must relay through b.
+    assert!(!transports[0].has_peer(&dynrunner_protocol_primary_secondary::PeerId::from("c")));
+
+    let package = keepalive("origin-x");
+    transports[0].forward_to_peer("c", package).await.unwrap();
+
+    // Pump the relay hop through b's ASYNC recv path: b receives the
+    // relay envelope addressed through it and forwards it on toward c
+    // inside `process_inbound` (which dispatches the forward via b's
+    // outgoing table). The sync `try_recv_peer` path CANNOT forward a
+    // relay-for-others (it drops with a warn — see
+    // `Router::process_inbound_sync`), so this hop must use `recv_peer`.
+    // The envelope is forwarded internally, never delivered to b's
+    // application layer, so b's recv yields nothing and we time it out.
+    let b_drain = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        transports[1].recv_peer(),
+    )
+    .await;
+    assert!(
+        b_drain.is_err(),
+        "the relay envelope is forwarded by b, not delivered to b"
+    );
+
+    // c receives the unwrapped package with its origin preserved.
+    let delivered = transports[2]
+        .try_recv_peer()
+        .expect("c receives the relayed package");
+    assert_eq!(
+        delivered.sender_id(),
+        "origin-x",
+        "relay wrap/unwrap must preserve the ORIGINAL sender end-to-end"
+    );
+}

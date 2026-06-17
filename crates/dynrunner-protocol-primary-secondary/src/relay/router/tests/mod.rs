@@ -25,6 +25,7 @@ use super::*;
 use crate::messages::{DistributedMessage, KeepaliveRole};
 use crate::relay::testing::{DispatchedRecord, RecordingChannel};
 
+mod filter;
 mod inbound;
 mod inbound_sync;
 mod prune;

@@ -213,6 +213,44 @@ pub trait PeerTransport<I: Identifier> {
         msg: DistributedMessage<I>,
     ) -> impl std::future::Future<Output = Result<(), String>>;
 
+    /// Transparently forward an already-received `package` toward
+    /// `peer_id`, preserving its original origin attribution.
+    ///
+    /// "Transparent" means the destination cannot tell the package was
+    /// relayed: the application-visible origin — the package's own
+    /// [`DistributedMessage::sender_id`] — is carried through unchanged,
+    /// so the destination sees the ORIGINAL sender, not whoever forwarded.
+    ///
+    /// This is a GENERIC mesh primitive. It knows nothing about roles,
+    /// primaries, CRDTs, or why a caller forwards; it routes the given
+    /// package toward `peer_id` and guarantees the origin survives. A
+    /// caller draining a queue of state-change messages to a successor
+    /// peer is one such use, but the mechanism here is task-agnostic.
+    ///
+    /// Mechanism / why a default suffices: the mesh send path is already
+    /// origin-transparent. [`Self::send_to_peer`] hands the package to the
+    /// router which routes it (direct, or wrapped in a relay envelope for
+    /// multi-hop) WITHOUT ever rewriting the package's `sender_id` — the
+    /// relay envelope carries a separate, transport-only `sender_id` used
+    /// for routing/redial bookkeeping, and the relay machinery preserves
+    /// even that end-to-end. The receiver unwraps the relay envelope and
+    /// delivers the inner package with its origin intact. So forwarding an
+    /// already-received package is exactly "route it as-is": this method
+    /// is the documented forward-INTENT primitive over that existing
+    /// routing, distinct from [`Self::send_to_peer`] (which a caller uses
+    /// to ORIGINATE a package it itself authored) only in the contract it
+    /// names. It adds no new routing.
+    ///
+    /// A transport with non-origin-transparent send semantics (none today)
+    /// would override this; every current transport gets it for free.
+    fn forward_to_peer(
+        &mut self,
+        peer_id: &str,
+        package: DistributedMessage<I>,
+    ) -> impl std::future::Future<Output = Result<(), String>> {
+        self.send_to_peer(peer_id, package)
+    }
+
     /// Receive the next message from any peer.
     fn recv_peer(&mut self) -> impl std::future::Future<Output = Option<DistributedMessage<I>>>;
 
