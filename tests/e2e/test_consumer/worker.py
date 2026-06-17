@@ -44,6 +44,7 @@ from dynamic_runner.worker.publish import (
 
 from .task import (
     AFFINE_BUILD_MARKER,
+    AFFINE_IMPORT_MARKER,
     NARRATION_CUSTOM_MESSAGE_PAYLOAD,
     NARRATION_CUSTOM_MESSAGE_TOPIC,
     build_output_filename,
@@ -302,6 +303,45 @@ def _setup(task: Task) -> WorkerOutput:
     return WorkerOutput()
 
 
+def _import(task: Task) -> WorkerOutput:
+    """The SecondaryAffine import gate body (#497 / #577).
+
+    Post-#577 the gate body runs in a worker subprocess dispatched via the
+    normal task-dispatch path (the consumer's ``import_action`` kwarg is GONE);
+    the framework releases this node's queued build dependents on this task's
+    terminal. Records this node's identity to the shared import marker — one
+    line per import invocation — so the e2e driver can COUNT distinct importing
+    secondaries: the proof that the import ran EXACTLY ONCE per secondary (the
+    node-local run-once latch gates concurrent dependents) is the marker
+    carrying one line per distinct node identity.
+
+    Mirrors :func:`_build`'s marker-write idiom (same ``_destination_root()`` +
+    ``socket.gethostname()`` shared-NFS append); the import marker NAME is owned
+    by the consumer task module (``AFFINE_IMPORT_MARKER``). The gate publishes
+    no asserted output — a clean return is its successful terminal, which is
+    what releases the dependents (``expected_affine_outputs`` lists only the
+    setup stand-in + the builds, never an import output; the gate is otherwise
+    never worker-output-asserted).
+    """
+    _maybe_sleep()
+    payload = task.payload or {}
+    idx = payload.get("idx")
+    node = socket.gethostname()
+    dst_root = _destination_root()
+    dst_root.mkdir(parents=True, exist_ok=True)
+    marker = dst_root / AFFINE_IMPORT_MARKER
+    # Append (not truncate) so concurrent secondaries on the shared NFS never
+    # clobber each other's lines; the driver counts distinct node identities in
+    # field 0 (``line.split("\t", 1)[0]``), so the ``idx`` tail is diagnostic
+    # only. Mirrors the build marker's append-one-line-per-invocation shape.
+    with marker.open("a", encoding="utf-8") as fh:
+        fh.write(f"{node}\timport-{idx}\n")
+    _logger.info(
+        "affine import ran on node=%s (idx=%s), marker=%s", node, idx, marker
+    )
+    return WorkerOutput()
+
+
 def _build(task: Task) -> WorkerOutput:
     """A SecondaryAffine-gated build (#497).
 
@@ -312,8 +352,9 @@ def _build(task: Task) -> WorkerOutput:
     (none stranded/deadlocked behind the gate).
 
     By the run-once invariant this build only runs AFTER this node's single
-    import_action has completed; the marker line is therefore proof that a
-    build landed on a node that already imported exactly once.
+    import (the worker import arm, ``_import``) has completed; the marker line
+    is therefore proof that a build landed on a node that already imported
+    exactly once.
     """
     _maybe_sleep()
     payload = task.payload or {}
@@ -371,6 +412,8 @@ def handle(task: Task) -> WorkerOutput:
         return _consume(task, source_dir)
     if kind == "setup":
         return _setup(task)
+    if kind == "import":
+        return _import(task)
     if kind == "build":
         return _build(task)
     raise NonRecoverableError(f"unknown task kind: {kind!r}")
