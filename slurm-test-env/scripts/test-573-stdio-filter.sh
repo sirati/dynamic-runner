@@ -256,7 +256,11 @@ seam2_assigned_on_observer_task() {
   # The Assigned arm lives between the `Assigned =>` match and the closing
   # `}` of its `tracing::info!` macro; we pin both the target line and the
   # message shape so a target-only revert (line one only) still trips.
-  assert_grep 'target: OBSERVER_TASK_TARGET' "$f" \
+  # The target binding in this file is the local const PER_TASK_TARGET
+  # (= high_volume_target(true) = "dynrunner_observer_task"), the post
+  # #583/#587 rename of the inline OBSERVER_TASK_TARGET reference. Same
+  # runtime target; we pin the current source symbol.
+  assert_grep 'target: PER_TASK_TARGET' "$f" \
     && assert_grep 'task {id} assigned to {holder}' "$f"
 }
 
