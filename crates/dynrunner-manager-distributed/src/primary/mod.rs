@@ -34,6 +34,7 @@ pub mod consensus;
 mod coordinator;
 mod custom_message;
 mod discovery;
+mod eager_prep_dispatch;
 mod error;
 mod estimate_escalation;
 mod fulfillability_matcher;

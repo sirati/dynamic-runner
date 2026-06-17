@@ -168,6 +168,20 @@ impl TaskKind {
         matches!(self, TaskKind::Setup)
     }
 
+    /// Whether a def of this kind needs a PER-SECONDARY completion CELL on the
+    /// shared cell substrate — `true` for both [`Self::SecondaryAffine`] (the
+    /// import gate) and [`Self::SecondaryEagerPrep`] (the idle filler), `false`
+    /// for ordinary `Work`/`Setup`. The KIND-BLIND seam the cell-id registration
+    /// pass reads to decide which originated `TaskAdded` gets a CRDT-agreed dense
+    /// cell-id reserved + a paired `SecondaryCellRegistered` injected, so one
+    /// origination pass serves every cell-bearing kind (no per-kind pass).
+    pub fn has_secondary_cell(self) -> bool {
+        matches!(
+            self,
+            TaskKind::SecondaryAffine | TaskKind::SecondaryEagerPrep
+        )
+    }
+
     /// Whether this is a `SecondaryAffine` task (#497) — the per-secondary
     /// import gate. The plain discriminant query for the call sites that
     /// classify by kind without a behavioral predicate (the later phases'

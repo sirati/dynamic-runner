@@ -921,6 +921,35 @@ impl<I> TaskDefStore<I> {
         self.cell_id_to_hash.get(&id).map(String::as_str)
     }
 
+    /// The kind of the def a bound cell-id belongs to, resolved from the def
+    /// itself (`cell_id → hash → def → kind`) — the SINGLE source of truth, so
+    /// the substrate never duplicates a per-kind cell-id set. `None` when the
+    /// cell-id is unbound or its def is not (yet) interned in this store. The
+    /// cell-id space is KIND-BLIND, but the dispatch leaves need to know a
+    /// cell's kind (the eager-prep filler enumerates eager-prep cells; the
+    /// affine scheduler keys off the dependent's affine deps), so the def's
+    /// `kind` is the kind authority for its cell.
+    pub(crate) fn kind_for_cell_id(&self, id: SecondaryCellId) -> Option<TaskKind> {
+        let hash = self.cell_id_to_hash.get(&id)?;
+        let def_id = self.hash_to_id.get(hash)?;
+        self.resolve(*def_id).map(|def| def.kind)
+    }
+
+    /// Every bound cell-id whose def is a [`TaskKind::SecondaryEagerPrep`] —
+    /// the enumeration the eager-prep idle-filler dispatch leaf consumes to
+    /// derive its per-secondary candidates. Derived live from the def kinds
+    /// (no duplicated per-kind set), so a promoted primary that re-anchored the
+    /// cell bindings + defs via `register_restored_def` re-derives the exact
+    /// same set with no queue to rebuild (the model-A failover property). The
+    /// eager-prep cell count is small (one per prep def), so the scan is cheap.
+    pub(crate) fn eager_prep_cell_ids(&self) -> Vec<SecondaryCellId> {
+        self.cell_id_to_hash
+            .keys()
+            .copied()
+            .filter(|&id| self.kind_for_cell_id(id) == Some(TaskKind::SecondaryEagerPrep))
+            .collect()
+    }
+
     /// The next affine-id the allocator would mint — the failover-resume floor
     /// a promoted primary re-anchors against (the affine twin of
     /// [`Self::next_id_floor`]).

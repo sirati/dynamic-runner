@@ -366,6 +366,39 @@ impl SecondaryCellBitvector {
             .map(|(secondary, _)| secondary.clone())
             .collect()
     }
+
+    /// The subset of `cell_ids` that are NON-TERMINAL on `secondary` — i.e. a
+    /// cell still worth running there: `NotDone(00)` (never started) or
+    /// `Failed(10)` (failed, non-sticky under Q1 so retryable). EXCLUDES
+    /// `Queued(01)` (a run is in flight / claimed here) and `Done(11)` (already
+    /// completed here). The read query the eager-prep idle-filler consumes to
+    /// pick a per-secondary speculative-prep candidate: only a non-terminal cell
+    /// is dispatchable, and a `Queued`/`Done` cell must be skipped so the prep
+    /// runs at most once-per-secondary (the same per-secondary run-once
+    /// authority the affine dispatch reads off `Done`). KIND-BLIND — the
+    /// substrate does not know which kind a cell belongs to; the caller passes
+    /// only the cell-ids it owns.
+    pub(crate) fn non_terminal_cells_for(
+        &self,
+        secondary: &str,
+        cell_ids: &[SecondaryCellId],
+    ) -> Vec<SecondaryCellId> {
+        let Some(bits) = self.secondaries.get(secondary) else {
+            // A secondary with no written cells: every cell reads the default
+            // `NotDone`, so all are non-terminal (placeable).
+            return cell_ids.to_vec();
+        };
+        cell_ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                matches!(
+                    bits.cell(id.0),
+                    SecondaryCell::NotDone | SecondaryCell::Failed
+                )
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -495,6 +528,31 @@ mod tests {
         bv.set_cell("s1", aid(0), SecondaryCell::Queued, 3);
         bv.set_cell("s2", aid(0), SecondaryCell::Done, 9);
         assert_eq!(bv.max_generation(), 9);
+    }
+
+    #[test]
+    fn non_terminal_cells_for_returns_notdone_and_failed_only() {
+        // The eager-prep filler's candidate query: NotDone + Failed are
+        // non-terminal (placeable / retryable); Queued (in flight here) + Done
+        // (already ran here) are EXCLUDED so the prep runs at most once.
+        let mut bv = SecondaryCellBitvector::default();
+        bv.set_cell("s", aid(0), SecondaryCell::NotDone, 1);
+        bv.set_cell("s", aid(1), SecondaryCell::Queued, 1);
+        bv.set_cell("s", aid(2), SecondaryCell::Failed, 1);
+        bv.set_cell("s", aid(3), SecondaryCell::Done, 1);
+        // aid(4) is never written ⇒ reads the default NotDone ⇒ non-terminal.
+        let ids = [aid(0), aid(1), aid(2), aid(3), aid(4)];
+        let got = bv.non_terminal_cells_for("s", &ids);
+        assert_eq!(
+            got,
+            vec![aid(0), aid(2), aid(4)],
+            "exactly NotDone + Failed (incl. the unwritten default), order-preserved"
+        );
+
+        // A secondary with NO written cells: every queried cell is the default
+        // NotDone ⇒ all are non-terminal (placeable).
+        let fresh = bv.non_terminal_cells_for("fresh-sec", &ids);
+        assert_eq!(fresh, ids.to_vec(), "all cells placeable on a fresh secondary");
     }
 
     #[test]

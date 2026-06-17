@@ -370,23 +370,26 @@ fn assert_stamped_for_broadcast<I: Identifier>(mutations: &mut [ClusterMutation<
     );
 }
 
-/// Reserve the CRDT-agreed dense affine-id for every originated
-/// `TaskKind::SecondaryAffine` `TaskAdded` and INJECT a paired
-/// `SecondaryCellRegistered` mutation (AF-id) — the affine analogue of the
-/// def-id stamp, but its own pass on the OWNED `Vec` (it GROWS the batch, so
-/// it cannot ride the in-place `&mut [_]` stamp). Reservation is idempotent on
-/// hash (a re-added affine def reuses its affine-id and injects a registration
-/// the receiver NoOps), so the pass is safe under at-least-once re-origination.
-fn inject_affine_registrations<I: Identifier>(
+/// Reserve the CRDT-agreed dense cell-id for every originated cell-bearing
+/// `TaskAdded` (KIND-BLIND — `SecondaryAffine` + `SecondaryEagerPrep`) and
+/// INJECT a paired `SecondaryCellRegistered` mutation — the cell analogue of
+/// the def-id stamp, but its own pass on the OWNED `Vec` (it GROWS the batch,
+/// so it cannot ride the in-place `&mut [_]` stamp). Reservation is idempotent
+/// on hash (a re-added cell-bearing def reuses its cell-id and injects a
+/// registration the receiver NoOps), so the pass is safe under at-least-once
+/// re-origination. ONE pass for every cell-bearing kind (the seam is
+/// `TaskKind::has_secondary_cell`, not a per-kind discriminant), so a new
+/// cell-bearing kind is covered automatically with no parallel pass.
+fn inject_cell_registrations<I: Identifier>(
     state: &mut ClusterState<I>,
     mutations: &mut Vec<ClusterMutation<I>>,
 ) {
     let mut registrations: Vec<ClusterMutation<I>> = Vec::new();
     for m in mutations.iter() {
         if let ClusterMutation::TaskAdded { hash, task, .. } = m
-            && task.kind.is_secondary_affine()
+            && task.kind.has_secondary_cell()
         {
-            let cell_id = state.allocate_affine_id(hash).0;
+            let cell_id = state.allocate_cell_id(hash).0;
             registrations.push(ClusterMutation::SecondaryCellRegistered {
                 hash: hash.clone(),
                 cell_id,
@@ -476,13 +479,14 @@ pub(crate) fn apply_locally_for_broadcast<I: Identifier>(
     // a receiver. Loud-fail at this broadcast seam (the durable catch for an
     // unstamped task-creation path), the twin of the snapshot-seam guard.
     assert_stamped_for_broadcast(&mut mutations);
-    // Affine-id registration pass (AF-id): for every originated SecondaryAffine
-    // `TaskAdded`, reserve its CRDT-agreed dense affine-id and INJECT a paired
-    // `SecondaryCellRegistered` so every replica binds the affine def's
-    // content to the SAME affine-id (the per-secondary bitvector cell index).
-    // Its own pass — a distinct concern from the def-id stamp above (a sibling
-    // id space, minted only for the affine subset).
-    inject_affine_registrations(state, &mut mutations);
+    // Cell-id registration pass: for every originated cell-bearing `TaskAdded`
+    // (affine + eager-prep), reserve its CRDT-agreed dense cell-id and INJECT a
+    // paired `SecondaryCellRegistered` so every replica binds the def's content
+    // to the SAME cell-id (the per-secondary bitvector cell index). Its own
+    // pass — a distinct concern from the def-id stamp above (a sibling id space,
+    // minted only for the cell-bearing subset). KIND-BLIND: one pass per the
+    // `has_secondary_cell` seam, never a per-kind branch.
+    inject_cell_registrations(state, &mut mutations);
     let mut applied: Vec<ClusterMutation<I>> = Vec::with_capacity(mutations.len());
     let mut resumed_for_dispatch: Vec<TaskInfo<I>> = Vec::new();
     // The spawn-classified `newly_pending_from_spawn` surface is consumed by

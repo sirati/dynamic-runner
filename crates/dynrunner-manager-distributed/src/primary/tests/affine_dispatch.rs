@@ -238,7 +238,7 @@ fn primary_two_secondaries_with_phase_deps(
                 def_id: None,
             });
             if task.kind.is_secondary_affine() {
-                let cell_id = cs.allocate_affine_id(&hash).0;
+                let cell_id = cs.allocate_cell_id(&hash).0;
                 cs.apply(ClusterMutation::SecondaryCellRegistered { hash, cell_id });
             }
         }

@@ -103,12 +103,13 @@ impl<I: Identifier> ClusterState<I> {
         self.affine.next_cell_generation()
     }
 
-    /// PRIMARY-side affine-id reservation for a `SecondaryAffine` def's content
+    /// PRIMARY-side cell-id reservation for a cell-bearing def's content
     /// `hash` (idempotent on hash) — the broadcast-stamp seam: the originator
-    /// reserves the agreed affine-id here, then emits the matching
+    /// reserves the agreed cell-id here, then emits the matching
     /// `SecondaryCellRegistered`, so the wire and the originator's own apply
-    /// converge on the same id. The affine twin of `allocate_def_id`.
-    pub(crate) fn allocate_affine_id(&mut self, hash: &str) -> SecondaryCellId {
+    /// converge on the same id. KIND-BLIND (affine + eager-prep). The cell twin
+    /// of `allocate_def_id`.
+    pub(crate) fn allocate_cell_id(&mut self, hash: &str) -> SecondaryCellId {
         self.definitions.alloc_for_cell_hash(hash)
     }
 
@@ -157,5 +158,37 @@ impl<I: Identifier> ClusterState<I> {
     /// `affine_terminal_mutation`.
     pub(crate) fn affine_id_for_hash(&self, hash: &str) -> Option<SecondaryCellId> {
         self.definitions.cell_id_for_hash(hash)
+    }
+
+    // ── eager-prep cell-substrate queries (#638) ──
+    //
+    // The read surface the eager-prep idle-filler dispatch leaf consumes. They
+    // are kind-blind reads over the SAME cell substrate the affine queries
+    // above use — only the candidate SET differs (the def store reports which
+    // cell-ids are eager-prep), so the substrate gains zero eager-prep
+    // branches.
+
+    /// Every cell-id whose def is a `SecondaryEagerPrep` — the filler's
+    /// candidate universe (re-derived from the def kinds, no duplicated set).
+    pub(crate) fn eager_prep_cell_ids(&self) -> Vec<SecondaryCellId> {
+        self.definitions.eager_prep_cell_ids()
+    }
+
+    /// The content hash a cell-id is bound to — the filler maps a chosen
+    /// eager-prep cell back to its def hash to reconstruct the dispatch
+    /// `TaskInfo`. KIND-BLIND (the same `cell_id → hash` binding affine uses).
+    pub(crate) fn hash_for_cell_id(&self, cell_id: SecondaryCellId) -> Option<&str> {
+        self.definitions.cell_hash_for_id(cell_id)
+    }
+
+    /// The subset of `cell_ids` still non-terminal (NotDone/Failed) on
+    /// `secondary` — the filler's "which of my eager-prep cells are still worth
+    /// running here" query. Delegates to the kind-blind bitvector read.
+    pub(crate) fn non_terminal_cells_for(
+        &self,
+        secondary: &str,
+        cell_ids: &[SecondaryCellId],
+    ) -> Vec<SecondaryCellId> {
+        self.affine.bitvector().non_terminal_cells_for(secondary, cell_ids)
     }
 }
