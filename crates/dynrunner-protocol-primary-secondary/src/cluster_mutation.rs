@@ -111,7 +111,7 @@ pub struct SecondaryResourceSampleRecord {
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub oploop_iters_per_sec_milli: u64,
     /// #589 loop-health: the single hottest arm's NAME in the same
-    /// emit window — e.g. `"oom_sweep"`. The arm whose iteration
+    /// emit window — e.g. `"mem_check"`. The arm whose iteration
     /// delta is the largest share of the total iteration delta;
     /// paired with [`Self::dominant_arm_pct_milli`] (the share). Empty
     /// string is the cold-start / no-signal sentinel (no prior

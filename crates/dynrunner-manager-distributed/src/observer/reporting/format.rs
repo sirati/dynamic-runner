@@ -104,7 +104,7 @@ enum MetricShape {
         unit: ResourceUnit,
     },
     /// A #589 loop-health dominant-arm line — the (name, pct) pair
-    /// rendered as `oom_sweep:55.00%`. Inclusion shape mirrors
+    /// rendered as `mem_check:55.00%`. Inclusion shape mirrors
     /// `ResourceAvg`: present iff `value.is_some()`; changed iff
     /// `prev_printed_pct_milli` is `None` OR the relative move from
     /// it exceeds `RESOURCE_THRESHOLD` (the share is the wake-worthy

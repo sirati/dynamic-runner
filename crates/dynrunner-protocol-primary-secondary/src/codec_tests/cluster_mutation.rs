@@ -294,7 +294,7 @@ fn roundtrip_secondary_resource_sample() {
         // test below (a JSON literal omitting these fields must
         // serde-default to zero / empty).
         oploop_iters_per_sec_milli: 12_500,
-        dominant_arm_name: "oom_sweep".to_string(),
+        dominant_arm_name: "mem_check".to_string(),
         dominant_arm_pct_milli: 55_000,
         max_unacked_for_secs: 120,
     };
@@ -322,7 +322,7 @@ fn roundtrip_secondary_resource_sample() {
             assert_eq!(record.total_free_swap_bytes, 2 * 1024 * 1024 * 1024);
             assert_eq!(record.cpu_utilization_milli, 65_500);
             assert_eq!(record.oploop_iters_per_sec_milli, 12_500);
-            assert_eq!(record.dominant_arm_name, "oom_sweep");
+            assert_eq!(record.dominant_arm_name, "mem_check");
             assert_eq!(record.dominant_arm_pct_milli, 55_000);
             assert_eq!(record.max_unacked_for_secs, 120);
         }

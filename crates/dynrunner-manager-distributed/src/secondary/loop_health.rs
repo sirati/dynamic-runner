@@ -9,7 +9,7 @@
 //!
 //! Necessary-but-not-sufficient is the #586 lesson: host CPU%/mem/swap
 //! (the #575 axis) was ~15% while the oploop spent 52-62% of its
-//! iterations on `oom_sweep` — the operator's view said HEALTHY while the
+//! iterations on `mem_check` — the operator's view said HEALTHY while the
 //! coordinator was starved. Loop-health is the missing axis. Host health
 //! ≠ loop health.
 //!
@@ -59,7 +59,7 @@ pub struct LoopHealthFields {
     /// start sentinel.
     pub oploop_iters_per_sec_milli: u64,
     /// The name of the single hottest arm by iteration delta over the
-    /// window — e.g. `"oom_sweep"`. Empty when there is no prior
+    /// window — e.g. `"mem_check"`. Empty when there is no prior
     /// snapshot OR every arm's delta is zero (a silent loop). The
     /// observer's max-by-pct fleet aggregation passes over the empty
     /// case.
@@ -270,11 +270,11 @@ mod tests {
     /// share is rendered in milli-percent.
     #[test]
     fn dominant_arm_pct_milli_is_share_of_total_delta() {
-        let arm_stats = OpLoopArmStats::new(&["inbox", "oom_sweep", "other"], 0);
+        let arm_stats = OpLoopArmStats::new(&["inbox", "mem_check", "other"], 0);
         let mut tracker = LoopHealthTracker::new();
         let t0 = Instant::now();
         let _seed = tracker.compute(&arm_stats, 0, t0);
-        // After seed: inbox=10, oom_sweep=80, other=10 (deltas)
+        // After seed: inbox=10, mem_check=80, other=10 (deltas)
         for _ in 0..10 {
             arm_stats.record(0);
         }
@@ -285,7 +285,7 @@ mod tests {
             arm_stats.record(2);
         }
         let fields = tracker.compute(&arm_stats, 0, t0 + Duration::from_secs(60));
-        assert_eq!(fields.dominant_arm_name, "oom_sweep");
+        assert_eq!(fields.dominant_arm_name, "mem_check");
         // 80/100 = 80% = 80_000 milli-percent.
         assert_eq!(fields.dominant_arm_pct_milli, 80_000);
     }

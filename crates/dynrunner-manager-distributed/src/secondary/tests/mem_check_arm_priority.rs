@@ -10,7 +10,7 @@
 //! terminal-report reconciliation (30→60→120s unacked reports → fleet-
 //! wide buffered-report-replay → idled secondaries).
 //!
-//! The fix: add `biased;` + place `ARM_INBOX` BEFORE `ARM_OOM_SWEEP` in
+//! The fix: add `biased;` + place `ARM_INBOX` BEFORE `ARM_MEM_CHECK` in
 //! source order. The tests below verify the `tokio::select! biased;`
 //! semantics that the real loop now depends on.
 //!
@@ -38,7 +38,7 @@
 //! Tested IN ISOLATION — these don't drive the real loop (which would
 //! pull in ~3000 lines of fixture). They test the `tokio::select!
 //! biased;` macro semantics the real loop now relies on, with the
-//! arm shape that mirrors the real loop's ARM_INBOX-vs-ARM_OOM_SWEEP
+//! arm shape that mirrors the real loop's ARM_INBOX-vs-ARM_MEM_CHECK
 //! pair.
 
 use std::time::Duration;

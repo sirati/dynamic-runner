@@ -45,7 +45,7 @@ const ARM_POOL_EVENT: usize = 0;
 const ARM_INBOX: usize = 1;
 const ARM_ANNOUNCER_OUTBOX: usize = 2;
 const ARM_KEEPALIVE: usize = 3;
-const ARM_OOM_SWEEP: usize = 4;
+const ARM_MEM_CHECK: usize = 4;
 const ARM_PANIK: usize = 5;
 const ARM_FATAL_EXIT: usize = 6;
 const ARM_ANTI_ENTROPY: usize = 7;
@@ -80,7 +80,7 @@ const ARM_RESOURCE_STATS_EMIT: usize = 14;
 const INBOX_BATCH_DRAIN_CAP: usize = 256;
 
 /// Arm names, index-aligned with the `ARM_*` ids above (render order of the
-/// compact stats line). The single `oom_sweep` arm counts SWEEPS (one
+/// compact stats line). The single `mem_check` arm counts SWEEPS (one
 /// self-paced read-all-workers + decide pass per SAMPLE_SWEEP_INTERVAL),
 /// NOT the former per-worker sample / decision fires.
 const PROCESS_TASKS_ARM_NAMES: &[&str] = &[
@@ -88,7 +88,7 @@ const PROCESS_TASKS_ARM_NAMES: &[&str] = &[
     "inbox",
     "announcer_outbox",
     "keepalive",
-    "oom_sweep",
+    "mem_check",
     "panik",
     "fatal_exit",
     "anti_entropy",
@@ -977,7 +977,7 @@ where
                 // decision inline, then re-arms the deadline. ONE
                 // operational-loop wakeup per sweep replaces the former
                 // per-fire sample + decision ticks (the 58%-of-wakeups
-                // blocking-IO hot path). The arm-stats `oom_sweep` count
+                // blocking-IO hot path). The arm-stats `mem_check` count
                 // is therefore SWEEPS, not per-worker fires.
                 //
                 // Cancel-safety: `sleep_until` consumes nothing and the
@@ -986,7 +986,7 @@ where
                 // instant next iteration — the sweep cannot be starved
                 // into never firing by a busy loop.
                 _ = tokio::time::sleep_until(next_sweep_due) => {
-                    arm_stats.record(ARM_OOM_SWEEP);
+                    arm_stats.record(ARM_MEM_CHECK);
                     // Per-sweep cost telemetry (#586): the arm body
                     // covers `spawn_blocking().await` (blocking cgroup +
                     // /proc reads off the runtime), `apply_sweep`
@@ -1069,11 +1069,11 @@ where
                     // state at 20Hz and stays silent (no per-fire spam).
                     if cost_ms > 50 || kills > 0 {
                         tracing::trace!(
-                            target: "oom_sweep",
+                            target: "mem_check",
                             scanned = scanned_workers,
                             cost_ms,
                             kills,
-                            "oom_sweep fired"
+                            "mem_check fired"
                         );
                     }
                     // Await-before-resleep: arm the next sweep a full

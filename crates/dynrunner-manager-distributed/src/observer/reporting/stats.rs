@@ -151,7 +151,7 @@ pub struct StatsSnapshot {
     /// dragged toward the cold-start sentinel by a single just-
     /// respawned secondary. Necessary-but-not-sufficient is the host
     /// CPU% line ALONE; pairing the host axis with this loop-rate axis
-    /// catches the #586 oom_sweep class (low host CPU + low iter-rate).
+    /// catches the #586 mem_check class (low host CPU + low iter-rate).
     pub avg_oploop_iters_per_sec_milli: Option<u64>,
     /// #589 loop-health: the SINGLE alive compute secondary with the
     /// HIGHEST `dominant_arm_pct_milli` across the fleet — paired with
@@ -175,13 +175,13 @@ pub struct StatsSnapshot {
 /// #589 loop-health: the fleet's single hottest arm, by share of the
 /// originating secondary's emit-window iteration deltas. The (name,
 /// pct) pair the format layer renders as "dominant arm:
-/// `oom_sweep`:55.0%". Lives on the snapshot (not as two separate
+/// `mem_check`:55.0%". Lives on the snapshot (not as two separate
 /// `Option<String>` / `Option<u32>` fields) so the format layer
 /// renders ONE atomic line — a non-empty name without a pct, or vice
 /// versa, would be a structural lie the type system rules out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DominantArm {
-    /// The arm name from the winning secondary (e.g. `"oom_sweep"`).
+    /// The arm name from the winning secondary (e.g. `"mem_check"`).
     pub arm_name: String,
     /// That arm's share of the secondary's emit-window iteration
     /// deltas, in milli-percent (`55_000` = 55.0%).

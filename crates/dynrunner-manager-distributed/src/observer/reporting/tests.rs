@@ -1848,7 +1848,7 @@ fn loop_health_max_unacked_fleet_max() {
     let s = seed_resource_fleet(&[
         ("sec-a", lh_record(0, 5_000, ("inbox", 40_000), 30)),
         ("sec-b", lh_record(0, 6_000, ("inbox", 45_000), 60)),
-        ("sec-c", lh_record(0, 4_000, ("oom_sweep", 90_000), 120)),
+        ("sec-c", lh_record(0, 4_000, ("mem_check", 90_000), 120)),
     ]);
     let snap = Snap::from_cluster_state(&s);
     assert_eq!(snap.max_unacked_for_secs, Some(120));
@@ -1860,12 +1860,12 @@ fn loop_health_max_unacked_fleet_max() {
 fn loop_health_dominant_arm_max_by_pct() {
     let s = seed_resource_fleet(&[
         ("sec-a", lh_record(0, 5_000, ("inbox", 40_000), 0)),
-        ("sec-b", lh_record(0, 6_000, ("oom_sweep", 80_000), 0)),
+        ("sec-b", lh_record(0, 6_000, ("mem_check", 80_000), 0)),
         ("sec-c", lh_record(0, 4_000, ("anti_entropy", 30_000), 0)),
     ]);
     let snap = Snap::from_cluster_state(&s);
     let dominant = snap.dominant_arm.expect("at least one secondary with a non-empty dominant arm");
-    assert_eq!(dominant.arm_name, "oom_sweep");
+    assert_eq!(dominant.arm_name, "mem_check");
     assert_eq!(dominant.pct_milli, 80_000);
 }
 
@@ -1906,7 +1906,7 @@ fn loop_health_empty_fleet_yields_none() {
 fn loop_health_dominant_pct_25pct_threshold() {
     let cur_50 = StatsSnapshot {
         dominant_arm: Some(DominantArm {
-            arm_name: "oom_sweep".to_string(),
+            arm_name: "mem_check".to_string(),
             pct_milli: 50_000,
         }),
         ..Default::default()
@@ -1922,7 +1922,7 @@ fn loop_health_dominant_pct_25pct_threshold() {
     let r1 = render_report_full(&cur_50, &prev, &baseline_30);
     let body1 = r1.body.expect("at least one line moved enough to include");
     assert!(
-        body1.contains("dominant arm (fleet max): oom_sweep:50.00%"),
+        body1.contains("dominant arm (fleet max): mem_check:50.00%"),
         "30%→50% must include the dominant-arm line; got:\n{body1}"
     );
 
@@ -1941,7 +1941,7 @@ fn loop_health_dominant_pct_25pct_threshold() {
     // 50% baseline → 55% current (rel = 0.1 < 0.25), EXCLUDE.
     let cur_55 = StatsSnapshot {
         dominant_arm: Some(DominantArm {
-            arm_name: "oom_sweep".to_string(),
+            arm_name: "mem_check".to_string(),
             pct_milli: 55_000,
         }),
         ..Default::default()
@@ -1966,7 +1966,7 @@ fn loop_health_only_change_is_skip_eligible() {
     let cur = StatsSnapshot {
         avg_oploop_iters_per_sec_milli: Some(15_000),
         dominant_arm: Some(DominantArm {
-            arm_name: "oom_sweep".to_string(),
+            arm_name: "mem_check".to_string(),
             pct_milli: 80_000,
         }),
         max_unacked_for_secs: Some(120),
