@@ -6030,7 +6030,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 skipped = outcome.skipped,
                 stranded,
                 total,
-                "{stranded} tasks left unassigned because cluster routing collapsed \
+                "{stranded} task(s) never reached a terminal outcome — the run \
+                 loop exited (transport collapse / fleet-dead / inactivity) before \
+                 they were dispatched or accounted \
                  (succeeded={s} fail_retry={r} fail_oom={o} fail_final={fi} \
                  skipped={sk} stranded={stranded})",
                 s = outcome.succeeded,

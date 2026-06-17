@@ -305,9 +305,13 @@ impl fmt::Display for RunError {
         match self {
             Self::ClusterCollapsed { stranded, outcome } => write!(
                 f,
-                "{stranded} tasks left unassigned because cluster routing collapsed \
+                "{stranded} task(s) never reached a terminal outcome \
                  (succeeded={s} fail_retry={r} fail_oom={o} fail_final={fi} \
-                 skipped={sk} stranded={stranded})",
+                 skipped={sk} stranded={stranded}) — the run loop exited \
+                 (transport collapse / fleet-dead / inactivity) before these \
+                 tasks were dispatched or accounted. A doomed dependency chain \
+                 is NOT this terminal: an unresolvable prereq now cascade-fails \
+                 its dependents to fail_final and the run closes cleanly.",
                 s = outcome.succeeded,
                 r = outcome.fail_retry,
                 o = outcome.fail_oom,
