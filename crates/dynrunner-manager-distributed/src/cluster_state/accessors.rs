@@ -1243,6 +1243,30 @@ impl<I: Identifier> ClusterState<I> {
             .map(|c| u64::from(c.worker_count))
             .sum()
     }
+
+    /// Total advertised worker-slot count across only the LIVE
+    /// worker-secondaries ([`Self::alive_secondary_members`]) — the
+    /// alive-filtered companion to [`Self::total_worker_count`].
+    ///
+    /// `alive_secondary_members` is the worker-sum analogue of
+    /// [`Self::alive_worker_secondary_count`] (the alive *count*): both
+    /// project through the SAME `worker_count > 0 ∧ is_peer_alive` filter,
+    /// so the alive secondary-count and the alive worker-sum can never
+    /// disagree about who is live. Used as the stats occupancy DENOMINATOR
+    /// for "X/Y workers busy" so a DEPARTED secondary — whose set-once
+    /// `SecondaryCapacity` record lingers in `secondary_capacities` after
+    /// its membership flips `Dead` — no longer inflates the denominator
+    /// with slots no live worker fills. The numerator (busy slots, derived
+    /// from live `InFlight` entries) already excludes gone secondaries; this
+    /// makes the denominator agree.
+    pub fn alive_worker_count(&self) -> u64 {
+        self.secondary_capacities
+            .iter()
+            .filter(|(_, record)| record.worker_count > 0)
+            .filter(|(id, _)| self.is_peer_alive(id))
+            .map(|(_, c)| u64::from(c.worker_count))
+            .sum()
+    }
 }
 
 /// A phase is dispatchable iff every phase it depends on (transitively)

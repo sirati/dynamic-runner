@@ -368,7 +368,25 @@ async fn normal_pass_unmasked_when_oom_bucket_inactive() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (transport, _ends) = setup_test(0);
+            // Build the transport with a live leg per secondary so the
+            // dispatch-deliverability gate (`should_skip_worker_for_dispatch`
+            // → `MeshClient::has_route`) sees both as REACHABLE — the
+            // operational reality `register_secondary_with_workers` models. A
+            // secondary with no transport route is (correctly) skipped, which
+            // is a different concern than the single-worker-mask this test
+            // pins; without a leg the assertion below would conflate the two.
+            let (_incoming_tx_keepalive, incoming_rx) =
+                tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+            let mut outgoing: HashMap<
+                String,
+                tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+            > = HashMap::new();
+            for sec_id in ["sec-A", "sec-B"] {
+                let (tx, _rx) = tokio_mpsc::unbounded_channel();
+                outgoing.insert(sec_id.into(), tx);
+            }
+            let transport =
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
             // No OOM failures pre-loaded → no bucket fire path.
             let tasks = vec![
                 phased_task("t_no_pref", "default", 50),

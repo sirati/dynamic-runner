@@ -34,6 +34,7 @@ mod custom_messages;
 mod dependent_cascade;
 mod deposed_standdown;
 mod dial_failure_observer;
+mod disconnect_dispatch_gate;
 mod dispatch_chunked_yield;
 mod dispatch_decoupling;
 mod dispatch_differential;

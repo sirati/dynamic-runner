@@ -330,15 +330,26 @@ fn stats_ready_includes_phase_after_upstream_terminates() {
     assert_eq!(snap.ready_in_queue, 1, "b is now ready");
 }
 
-/// Apply a `SecondaryCapacity` record for each `(secondary, worker_count)`
-/// pair — the same wire mutation `primary/connect.rs` originates at the
+/// Apply a `PeerJoined` (so the secondary is `is_peer_alive`) + a
+/// `SecondaryCapacity` record for each `(secondary, worker_count)` pair —
+/// the same wire mutations `primary/connect.rs` originates at the
 /// `SecondaryWelcome` accept. The occupancy DENOMINATORS
-/// (`total_secondaries` = `known_secondaries().count()`, `total_workers`
-/// = `total_worker_count()`) read exactly this replicated map, so the
-/// tests seed it through the public apply path rather than reaching into
-/// private fields. `resources` are irrelevant to occupancy → empty.
+/// (`total_secondaries` = `alive_secondary_members().count()`,
+/// `total_workers` = `alive_worker_count()`) read this replicated map
+/// FILTERED to live members, so the tests must seed BOTH the membership and
+/// the capacity through the public apply path (a capacity-only secondary is
+/// a departed/never-alive ghost the live denominator excludes — see
+/// `stats_occupancy_excludes_departed_secondary`). `resources` are
+/// irrelevant to occupancy → empty.
 fn with_capacities(mut s: ClusterState<()>, caps: &[(&str, u32)]) -> ClusterState<()> {
     for (secondary, worker_count) in caps {
+        s.apply(ClusterMutation::PeerJoined {
+            peer_id: secondary.to_string(),
+            is_observer: false,
+            can_be_primary: false,
+            cap_version: Default::default(),
+            member_gen: 0,
+        });
         s.apply(ClusterMutation::SecondaryCapacity {
             secondary: secondary.to_string(),
             worker_count: *worker_count,
@@ -475,6 +486,62 @@ fn stats_occupancy_zero_numerators_when_no_in_flight() {
     assert_eq!(snap.busy_workers, 0);
     assert_eq!(snap.total_secondaries, 2);
     assert_eq!(snap.total_workers, 6);
+}
+
+/// RCA disco-prune edge B: a DEPARTED secondary's set-once
+/// `SecondaryCapacity` record lingers in `secondary_capacities` after its
+/// membership flips `Dead` (capacity is never deleted, so a re-admission can
+/// restore it). The occupancy DENOMINATORS must EXCLUDE it — counting a gone
+/// secondary's workers/slots inflated "X/Y busy" with a ghost. Pre-fix
+/// (`known_secondaries().count()` / `total_worker_count()`) this read 2/6;
+/// the live-filtered denominators read 1/4 (only the surviving sec-a).
+#[test]
+fn stats_occupancy_excludes_departed_secondary() {
+    use dynrunner_protocol_primary_secondary::RemovalCause;
+
+    // Two live secondaries, then sec-b DEPARTS (PeerRemoved ⇒ peer_state
+    // Dead) while its capacity record stays. sec-a runs one task.
+    let mut s = with_capacities(
+        seed_state(
+            &[],
+            &[(
+                task("t0", "P", &[]),
+                Seed::InFlight {
+                    secondary: "sec-a",
+                    worker: 0,
+                },
+            )],
+        ),
+        &[("sec-a", 4), ("sec-b", 2)],
+    );
+    s.apply(ClusterMutation::PeerRemoved {
+        id: "sec-b".to_string(),
+        cause: RemovalCause::KeepaliveMiss,
+        member_gen: 0,
+    });
+
+    // The capacity record for the departed secondary is still present —
+    // this is the lingering ghost the unfiltered denominators counted.
+    assert!(
+        s.known_secondaries().any(|id| id == "sec-b"),
+        "departed secondary's capacity record must still linger (set-once)"
+    );
+
+    let snap = Snap::from_cluster_state(&s);
+    assert_eq!(snap.busy_secondaries, 1, "only sec-a is running a task");
+    assert_eq!(
+        snap.total_secondaries, 1,
+        "departed sec-b excluded from the live secondary denominator"
+    );
+    assert_eq!(snap.busy_workers, 1, "one slot on sec-a busy");
+    assert_eq!(
+        snap.total_workers, 4,
+        "only sec-a's 4 live slots count; sec-b's lingering 2 excluded"
+    );
+    assert!(
+        !snap.alive_secondaries.contains("sec-b"),
+        "departed secondary must be absent from the live roster too"
+    );
 }
 
 // ── format: delta + inclusion rule ──

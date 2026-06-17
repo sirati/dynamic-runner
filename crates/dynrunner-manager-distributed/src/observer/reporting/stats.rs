@@ -100,9 +100,13 @@ pub struct StatsSnapshot {
     /// exactly the secondaries with ≥1 in-flight task), surfaced as its
     /// own field so the reporter need not know the map's "busy" meaning.
     pub busy_secondaries: usize,
-    /// Occupancy DENOMINATOR: total known secondaries —
-    /// `ClusterState::known_secondaries().count()` (the CRDT roster of
-    /// every secondary with a replicated capacity record).
+    /// Occupancy DENOMINATOR: total LIVE secondaries —
+    /// `ClusterState::alive_secondary_members().count()` (the CRDT roster
+    /// FILTERED to `worker_count > 0 ∧ is_peer_alive`). A DEPARTED secondary
+    /// — whose set-once `SecondaryCapacity` record outlives its membership in
+    /// `known_secondaries()` after `peer_state` flips `Dead` — is excluded,
+    /// so a gone peer no longer inflates "X/Y secondaries busy" with a ghost
+    /// denominator. Mirrors the `alive_secondaries` field's filter.
     pub total_secondaries: usize,
     /// Occupancy NUMERATOR: distinct `(secondary, worker)` pairs with an
     /// `InFlight` task — the count of worker slots currently executing.
@@ -110,9 +114,12 @@ pub struct StatsSnapshot {
     /// secondary running N tasks on N distinct workers contributes N
     /// (not 1).
     pub busy_workers: usize,
-    /// Occupancy DENOMINATOR: total advertised worker slots across every
-    /// secondary — `ClusterState::total_worker_count()` (sum of each
-    /// secondary's replicated `worker_count`).
+    /// Occupancy DENOMINATOR: total advertised worker slots across only the
+    /// LIVE secondaries — `ClusterState::alive_worker_count()` (sum of
+    /// `worker_count` over `alive_secondary_members()`). A DEPARTED
+    /// secondary's lingering set-once `worker_count` is excluded so the
+    /// "X/Y workers busy" denominator counts only slots a live worker can
+    /// fill. Mirrors the `total_secondaries` alive-filter.
     pub total_workers: usize,
     /// #575 averaged aggregated resource stats — each field is the
     /// arithmetic mean across the compute secondaries that have
@@ -535,9 +542,9 @@ impl StatsSnapshot {
             // functions of the CRDT (D1 capacity × D2 InFlight) — no
             // authority, no pool, no primary-local state.
             busy_secondaries: per_secondary_in_flight.len(),
-            total_secondaries: state.known_secondaries().count(),
+            total_secondaries: state.alive_secondary_members().count(),
             busy_workers: busy_worker_slots.len(),
-            total_workers: state.total_worker_count() as usize,
+            total_workers: state.alive_worker_count() as usize,
             per_secondary_in_flight,
             alive_secondaries: state.alive_secondary_members().map(String::from).collect(),
             avg_mem_p10_bytes,
