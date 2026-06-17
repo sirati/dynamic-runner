@@ -49,6 +49,31 @@ fn work_dep(name: &str, dep: &str) -> TaskInfo<TestId> {
     t
 }
 
+/// A `Work` task depending IN ORDER on two affine prereqs `[base, delta]` — the
+/// consumer's `build_variant` shape (a shared base import precedes the
+/// per-variant delta layered on top of it). The dep ORDER (base first) is the
+/// dispatch order the list-order gate must respect.
+fn work_two_deps(name: &str, base: &str, delta: &str) -> TaskInfo<TestId> {
+    let mut t = make_binary(name, 20);
+    t.phase_id = PhaseId::from("work");
+    t.type_id = TypeId::from("default");
+    t.task_depends_on = vec![
+        TaskDep {
+            task_id: base.into(),
+            phase_id: PhaseId::from("work"),
+            inherit_outputs: false,
+            def_id: None,
+        },
+        TaskDep {
+            task_id: delta.into(),
+            phase_id: PhaseId::from("work"),
+            inherit_outputs: false,
+            def_id: None,
+        },
+    ];
+    t
+}
+
 /// `PeerJoined` + `SecondaryCapacity` for `secondary` with `n` workers.
 fn capacity_batch(secondary: &str, n: u32) -> DistributedMessage<TestId> {
     DistributedMessage::ClusterMutation {
@@ -1579,6 +1604,280 @@ async fn affine_all_failed_batch_scales_past_command_channel_capacity() {
                      batched, not per-item"
                 );
             }
+        })
+        .await;
+}
+
+/// IN-FLIGHT DEP IS UNMET (the multi-worker-same-node race): a WORK unit whose
+/// affine deps are `[base, delta]` IN ORDER must treat an in-flight (`Queued`)
+/// `base` as NOT MET — the readiness gate must classify it `InFlightHere` and
+/// WAIT (withhold assignment), NEVER skip the unmet base to `StrandedHere`-
+/// dispatch the later `NotDone` delta.
+///
+/// The bug: with ≥2 workers on the same secondary, worker A claims the shared
+/// `base` import (its cell → `Queued`, in flight). Worker B then pops a
+/// `build_variant` whose deps are `[base, delta]`. The old ORDER-BLIND gate
+/// (`Failed` > `NotDone` > `Queued`) saw `base=Queued` + `delta=NotDone`, and
+/// since `NotDone` outranked `Queued` it returned `StrandedHere` — ASSIGNING the
+/// delta import to a worker BEFORE the base had landed on the node (the delta's
+/// imported path is invalid until the base is present ⇒ "path … is not valid"
+/// NonRecoverable). The list-order dependency-not-met gate classifies
+/// `base=Queued` as `InFlightHere` (unmet ⇒ wait) instead, so the delta is never
+/// considered — let alone assigned — until the base is `Done`.
+///
+/// Pins all the shapes the gate must produce, so a regression to the order-blind
+/// skip is caught directly at the classification:
+///   * `[base=Queued, delta=NotDone]` → `InFlightHere` (the BUG: was StrandedHere).
+///   * `[base=NotDone, delta=NotDone]` → `StrandedHere` (first not-Done is NotDone).
+///   * `[base=Done,    delta=NotDone]` → `StrandedHere` (advance past Done to delta).
+///   * `[base=Done,    delta=Queued ]` → `InFlightHere` (delta now the unmet one).
+///   * `[base=Done,    delta=Done   ]` → `Ready`.
+///   * `[base=Failed,  delta=NotDone]` → terminal (Failed is order-independent):
+///     Reroute to the still-satisfiable sibling secondary.
+///   * `base Failed on EVERY secondary`  → `Unsatisfiable` (unchanged).
+#[tokio::test(flavor = "current_thread")]
+async fn affine_gate_inflight_dep_is_unmet_not_skipped_to_delta() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let base = affine_import("base");
+            let delta = affine_import("delta");
+            let base_hash = compute_task_hash(&base);
+            let delta_hash = compute_task_hash(&delta);
+            let build = work_two_deps("build", "base", "delta");
+
+            let (mut primary, _ends, _wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![base, delta, build.clone()]);
+            confirm_two(&mut primary).await;
+
+            let base_aid = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&base_hash)
+                .expect("registered base affine-id");
+            let delta_aid = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&delta_hash)
+                .expect("registered delta affine-id");
+
+            // Helper: set a cell on a secondary directly. Cells are LWW by an
+            // ever-increasing generation, so each write (incl. a NotDone reset via
+            // SecondaryAffineUnqueued) out-stamps the previous — the gate test can
+            // walk a cell through any sequence of states. `gen` is a shared
+            // monotone counter so every write wins over the prior cell value.
+            let mut cell_gen: u64 = 1;
+            let mut set = |primary: &mut TestPrimary,
+                           sec: &str,
+                           aid: crate::cluster_state::AffineId,
+                           cell: AffineCell| {
+                let g = cell_gen;
+                cell_gen += 1;
+                let mutation = match cell {
+                    AffineCell::Queued => ClusterMutation::SecondaryAffineQueued {
+                        secondary: sec.into(),
+                        affine_id: aid.0,
+                        generation: g,
+                    },
+                    AffineCell::Done => ClusterMutation::SecondaryAffineFinished {
+                        secondary: sec.into(),
+                        affine_id: aid.0,
+                        generation: g,
+                    },
+                    AffineCell::Failed => ClusterMutation::SecondaryAffineFailed {
+                        secondary: sec.into(),
+                        affine_id: aid.0,
+                        generation: g,
+                    },
+                    AffineCell::NotDone => ClusterMutation::SecondaryAffineUnqueued {
+                        secondary: sec.into(),
+                        affine_id: aid.0,
+                        generation: g,
+                    },
+                };
+                primary.cluster_state_mut_for_test().apply(mutation);
+            };
+            let label =
+                |primary: &TestPrimary| primary.affine_gate_label_for_test("sec-0", &build);
+
+            // THE BUG SHAPE: base in flight (Queued), delta NotDone. Must WAIT on
+            // the unmet in-flight base — NOT skip to (and assign) the delta.
+            set(&mut primary, "sec-0", base_aid, AffineCell::Queued);
+            assert_eq!(
+                label(&primary),
+                "InFlightHere",
+                "an in-flight (Queued) base is UNMET — the gate must WAIT (withhold \
+                 assignment), never skip it to StrandedHere-dispatch the later \
+                 NotDone delta (the multi-worker-same-node 'path is not valid' race)"
+            );
+
+            // base NotDone, delta NotDone → first not-Done is the base (NotDone),
+            // so StrandedHere dispatches the base import (correct: base first).
+            set(&mut primary, "sec-0", base_aid, AffineCell::NotDone);
+            assert_eq!(
+                label(&primary),
+                "StrandedHere",
+                "both NotDone → stranded on the FIRST (base) import"
+            );
+
+            // base Done, delta NotDone → advance past the met base to the delta
+            // (NotDone) → StrandedHere on the delta (the original single-worker
+            // order: base lands, THEN the delta dispatches).
+            set(&mut primary, "sec-0", base_aid, AffineCell::Done);
+            assert_eq!(
+                label(&primary),
+                "StrandedHere",
+                "base Done (met) → advance to the delta (NotDone) and dispatch it"
+            );
+
+            // base Done, delta Queued (in flight) → the delta is now the unmet one.
+            set(&mut primary, "sec-0", delta_aid, AffineCell::Queued);
+            assert_eq!(
+                label(&primary),
+                "InFlightHere",
+                "base met + delta in flight → wait on the unmet delta"
+            );
+
+            // base Done, delta Done → Ready.
+            set(&mut primary, "sec-0", delta_aid, AffineCell::Done);
+            assert_eq!(label(&primary), "Ready", "all deps Done → Ready");
+
+            // FAILED IS ORDER-INDEPENDENT (unchanged): base Failed on sec-0 but
+            // sec-1 still satisfiable → Reroute(sec-1). Reset sec-0's delta cell so
+            // only the (order-independent) Failed base drives the decision.
+            set(&mut primary, "sec-0", delta_aid, AffineCell::NotDone);
+            set(&mut primary, "sec-0", base_aid, AffineCell::Failed);
+            assert_eq!(
+                label(&primary),
+                "Reroute(sec-1)",
+                "a Failed base is order-independent terminal → reroute to the \
+                 still-satisfiable sibling secondary"
+            );
+
+            // base Failed on EVERY secondary → Unsatisfiable (unchanged).
+            set(&mut primary, "sec-1", base_aid, AffineCell::Failed);
+            assert_eq!(
+                primary.affine_gate_label_for_test("sec-0", &build),
+                "Unsatisfiable",
+                "a base Failed on EVERY eligible secondary is Unsatisfiable \
+                 (the all-Failed terminal — unchanged)"
+            );
+        })
+        .await;
+}
+
+/// END-TO-END under ≥2 workers on the SAME secondary (the live race): two
+/// `build_variant`s share a base import and each layer a distinct delta on top
+/// (`build_a` deps `[base, delta_a]`, `build_b` deps `[base, delta_b]`). With 2
+/// idle workers on one secondary, the first build to commit claims the base
+/// import (cell → Queued, in flight); the SECOND build, popped for the sibling
+/// worker while the base is still `Queued` (UNMET), must NOT be assigned its
+/// delta import ahead of the base — it `InFlightHere`-waits at the queue front.
+/// Only after the base reaches `Done` (met) does each build's delta dispatch.
+/// The invariant re-checked every round: NO delta import is ever ASSIGNED on a
+/// secondary whose base cell is not yet `Done`.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_multiworker_same_node_delta_never_assigned_before_base_done() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let base = affine_import("base");
+            let delta_a = affine_import("delta_a");
+            let delta_b = affine_import("delta_b");
+            let base_hash = compute_task_hash(&base);
+            let delta_a_hash = compute_task_hash(&delta_a);
+            let delta_b_hash = compute_task_hash(&delta_b);
+            let build_a = work_two_deps("build_a", "base", "delta_a");
+            let build_b = work_two_deps("build_b", "base", "delta_b");
+
+            // 2 workers on sec-0 (forces the same-node concurrent pop); sec-1 has 1.
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![base, delta_a, delta_b, build_a, build_b]);
+            primary
+                .handle_cluster_mutation(capacity_batch("sec-0", 2), &mut None)
+                .await;
+            primary.handle_mesh_ready(mesh_ready_from("sec-0"));
+            primary
+                .handle_cluster_mutation(capacity_batch("sec-1", 1), &mut None)
+                .await;
+            primary.handle_mesh_ready(mesh_ready_from("sec-1"));
+
+            let base_aid = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&base_hash)
+                .expect("registered base affine-id");
+
+            // INVARIANT: a DELTA import is never ASSIGNED to a secondary whose BASE
+            // cell is not yet `Done`. A delta assigned before the base is the exact
+            // "path is not valid" race the dependency-not-met gate closes.
+            let assert_delta_only_after_base_done =
+                |primary: &TestPrimary, round: &[(String, String, u32, String)]| {
+                    for (_, sec, _, h) in round {
+                        if *h == delta_a_hash || *h == delta_b_hash {
+                            assert_eq!(
+                                primary.cluster_state_for_test().affine_state(sec, base_aid),
+                                AffineCell::Done,
+                                "a DELTA import was assigned on {sec} whose BASE cell \
+                                 is NOT Done — an unmet in-flight base was skipped \
+                                 (the multi-worker race); got {round:?}"
+                            );
+                        }
+                    }
+                };
+
+            // Drive to quiescence, completing every dispatched import on its
+            // secondary. The base must dispatch (and complete) before any delta on
+            // that node; the invariant catches any premature delta assignment.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut base_dispatches_by_sec: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+            loop {
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                if round.is_empty() {
+                    break;
+                }
+                assert_delta_only_after_base_done(&primary, &round);
+                for (_, sec, _, h) in &round {
+                    if *h == base_hash {
+                        *base_dispatches_by_sec.entry(sec.clone()).or_insert(0) += 1;
+                    }
+                }
+                for (_, sec, worker, h) in &round {
+                    primary
+                        .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                        .await;
+                    settle_pump().await;
+                }
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+            }
+
+            // The base dispatched EXACTLY ONCE on each secondary that ran it (the
+            // dependency-not-met wait serializes it, the run-once guard dedups it
+            // — not once-per-build). At least one node ran it.
+            assert!(
+                !base_dispatches_by_sec.is_empty(),
+                "the shared base import must have dispatched on at least one secondary"
+            );
+            for (sec, count) in &base_dispatches_by_sec {
+                assert_eq!(
+                    *count, 1,
+                    "the shared base import must dispatch EXACTLY ONCE on {sec}; got {count}"
+                );
+            }
+
+            // Both builds completed (each on a node whose base + its own delta
+            // reached Done — enforced by the per-round invariant), and the run
+            // drains cleanly with every slot freed.
+            assert_eq!(
+                primary.active_workers_for_test(),
+                0,
+                "no worker slot may stay Assigned after the run drains"
+            );
+            assert!(
+                primary.run_complete_check(),
+                "the run must complete once the base + both deltas + both builds drain"
+            );
         })
         .await;
 }

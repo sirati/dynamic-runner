@@ -465,34 +465,47 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
     /// Discriminate a popped WORK unit's affine-readiness on `secondary` by
     /// reading its deps' bitvector cells (the readiness authority). Returns the
-    /// action the gate must take — see [`AffineGateOutcome`]. The priority
-    /// among non-`Done` deps is `Failed` > `NotDone` > `Queued`: a `Failed` dep
-    /// means this secondary cannot run the unit regardless of any other dep's
-    /// state, so it forces the re-route / terminal-fail decision; a `NotDone`
-    /// dep (none failed) is the genuine stranded re-derive; an only-`Queued`
-    /// (the rest `Done`) dep is the in-flight-here no-op-but-wait. Pure reads —
-    /// no mutation, no emit.
+    /// action the gate must take — see [`AffineGateOutcome`]. Pure reads — no
+    /// mutation, no emit.
+    ///
+    /// ## Plain dependency-not-met semantics (walked in LIST ORDER)
+    /// A dep is MET only when its cell is `Done`; a `Queued` (in-flight here) or
+    /// `NotDone` dep is simply NOT MET, so nothing that depends on it can
+    /// dispatch yet. The gate walks the deps in LIST ORDER and decides on the
+    /// FIRST not-`Done` dep — it must NOT advance past an unmet earlier dep to a
+    /// later one.
+    ///
+    /// A `Failed` dep ANYWHERE is order-independent: it means this secondary
+    /// cannot run the unit no matter what the other deps are, so it forces the
+    /// re-route / terminal-fail decision regardless of position.
+    ///
+    /// Among the NON-failed deps, the FIRST not-`Done` dep is the decision point:
+    /// if it is `Queued` (in flight here — its import was claimed, possibly by a
+    /// SIBLING worker on this same secondary) it is UNMET, so the unit
+    /// `InFlightHere`-WAITS for it to reach `Done`; if it is `NotDone` the unit is
+    /// genuinely stranded without that import (`StrandedHere`). This is the
+    /// correction to the previously order-BLIND `Failed` > `NotDone` > `Queued`
+    /// precedence, which wrongly SKIPPED a `Queued` (unmet) earlier dep to act on
+    /// a later `NotDone` one — dispatching e.g. a delta import before its
+    /// still-in-flight base had landed on the node (the multi-worker-same-node
+    /// race: the delta's imported path is invalid until the base is present).
+    /// The wait reuses the EXISTING `InFlightHere` mechanics (`requeue_front` +
+    /// the import's own terminal re-nudge) — no new abstraction; the in-flight
+    /// dep WILL reach `Done` on the worker running it and re-nudge the waiter.
     fn affine_readiness_gate(
         &self,
         secondary: &str,
         placement: &WorkPlacement,
     ) -> AffineGateOutcome {
-        let mut any_failed = false;
-        let mut any_not_done = false;
-        let mut any_queued = false;
-        for (aid, _) in &placement.affine_deps {
-            match self.cluster_state.affine_state(secondary, *aid) {
-                AffineCell::Done => {}
-                AffineCell::Failed => any_failed = true,
-                AffineCell::NotDone => any_not_done = true,
-                AffineCell::Queued => any_queued = true,
-            }
-        }
+        // A `Failed` dep anywhere is order-independent terminal: this secondary
+        // cannot satisfy the unit regardless of any other dep's position. Re-route
+        // to an eligible secondary that can still satisfy EVERY dep (none `Failed`
+        // there), by the same locality rank a fresh placement uses; if none exists
+        // (the import failed everywhere), the unit is doomed.
+        let any_failed = placement.affine_deps.iter().any(|(aid, _)| {
+            self.cluster_state.affine_state(secondary, *aid) == AffineCell::Failed
+        });
         if any_failed {
-            // This secondary cannot satisfy the unit. Re-route to an eligible
-            // secondary that can still satisfy EVERY dep (none `Failed` there),
-            // preferring it by the same locality rank a fresh placement uses; if
-            // none exists (the import failed everywhere), the unit is doomed.
             let satisfiable = self.affine_unit_satisfiable_secondaries(placement);
             return match self.affine_scheduler.select_secondary(
                 &satisfiable,
@@ -503,11 +516,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 None => AffineGateOutcome::Unsatisfiable,
             };
         }
-        if any_not_done {
-            return AffineGateOutcome::StrandedHere;
-        }
-        if any_queued {
-            return AffineGateOutcome::InFlightHere;
+
+        // No dep failed: decide on the FIRST dep in LIST ORDER that is not yet
+        // `Done` (the deps list is the dispatch order — a base precedes the delta
+        // layered on it). A dep is MET only when `Done`; a `Queued` earlier dep
+        // (import in flight here, perhaps claimed by a sibling worker) is UNMET,
+        // so the unit `InFlightHere`-WAITS for it — the later deps are NOT
+        // considered, and the unit is never ASSIGNED ahead of the unmet dep. Only
+        // when the first not-`Done` dep is itself `NotDone` is the unit genuinely
+        // stranded without that import here. This stops the previously order-blind
+        // gate from skipping a `Queued` (unmet) earlier dep to a later `NotDone`.
+        for (aid, _) in &placement.affine_deps {
+            match self.cluster_state.affine_state(secondary, *aid) {
+                AffineCell::Done => {}
+                AffineCell::Queued => return AffineGateOutcome::InFlightHere,
+                AffineCell::NotDone => return AffineGateOutcome::StrandedHere,
+                // `Failed` was handled order-independently above.
+                AffineCell::Failed => unreachable!("Failed handled above"),
+            }
         }
         AffineGateOutcome::Ready
     }
@@ -562,12 +588,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// is never speculatively dispatched ahead of a work and never strandable by
     /// a steal.
     ///
-    /// Dispatches the FIRST `NotDone` dep (multi-dep units resolve one import per
-    /// re-pop until all are `Done`, then the work gates `Ready`). The run-once +
-    /// concurrent dispatch-once guards in [`Self::dispatch_affine_unit`] still
-    /// apply (a `Done`/in-flight import here is skipped), so a re-pop racing the
-    /// import's terminal cannot double-run it. The work is always requeued so it
-    /// is never lost.
+    /// Dispatches the FIRST `NotDone` dep. This is consistent with the
+    /// list-order dependency-not-met gate: `StrandedHere` fires ONLY when the
+    /// first not-`Done` dep is itself `NotDone` (an earlier `Queued`/unmet dep
+    /// would have gated `InFlightHere` and never reached here), so the first
+    /// `NotDone` dep IS the first not-`Done` dep — the right import to run.
+    /// Multi-dep units resolve one import per re-pop in list order (each earlier
+    /// dep, once in flight, is unmet so the unit `InFlightHere`-waits on it), so
+    /// a delta import is never dispatched ahead of its still-not-met base. The
+    /// run-once + concurrent dispatch-once guards in
+    /// [`Self::dispatch_affine_unit`] still apply (a `Done`/in-flight import here
+    /// is skipped), so a re-pop racing the import's terminal cannot double-run
+    /// it. The work is always requeued so it is never lost.
     async fn dispatch_affine_import_on_demand(
         &mut self,
         worker_idx: usize,
@@ -924,4 +956,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
     }
 
+    /// Test-only inspector: the [`AffineGateOutcome`] discriminant the readiness
+    /// gate produces for `task` on `secondary`, as a stable label. Lets the
+    /// gate tests assert the list-order classification (a `Queued`/unmet earlier
+    /// dep ⇒ `InFlightHere`, not skipped to a later `NotDone`) without exposing
+    /// the private outcome enum across the module boundary.
+    #[cfg(test)]
+    pub(crate) fn affine_gate_label_for_test(&self, secondary: &str, task: &TaskInfo<I>) -> String {
+        let placement = self.affine_placement_for(task);
+        match self.affine_readiness_gate(secondary, &placement) {
+            AffineGateOutcome::Ready => "Ready".into(),
+            AffineGateOutcome::InFlightHere => "InFlightHere".into(),
+            AffineGateOutcome::StrandedHere => "StrandedHere".into(),
+            AffineGateOutcome::Reroute(target) => format!("Reroute({target})"),
+            AffineGateOutcome::Unsatisfiable => "Unsatisfiable".into(),
+        }
+    }
 }
