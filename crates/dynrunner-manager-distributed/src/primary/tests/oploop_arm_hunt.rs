@@ -804,7 +804,7 @@ fn probe_burst_fixture(ledger_size: usize) -> GhostFixture {
         .collect();
     primary
         .cluster_state_mut_for_test()
-        .apply(ClusterMutation::TasksSpawned { tasks: binaries });
+        .apply(ClusterMutation::TasksSpawned { tasks: binaries, def_ids: Vec::new() });
 
     // An inherited ghost in-flight task keeps the run open for the whole
     // observation window (so the arm stats are still live to read).

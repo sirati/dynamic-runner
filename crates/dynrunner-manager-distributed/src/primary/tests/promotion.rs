@@ -2385,3 +2385,165 @@ fn recompose_with_settled_gate_and_pending_variant_hydrates_clean() {
 
     drop(dir);
 }
+
+/// RECOMPOSE v2 (the symptom-level proof): the same forced-failover recompose
+/// but the build graph is RUNTIME-SPAWNED via `ClusterMutation::TasksSpawned`
+/// (the asm-tokenizer phase-3 shape) rather than cold-seeded `TaskAdded`. Pre
+/// recompose-v2 the spawned defs were NEVER def-id-stamped, so on promotion
+/// they re-minted node-local from the resumed floor — overwriting the fat
+/// setup-phase ids (the IdRebound storm) and rebuilding `build_common_dep`'s
+/// dep against its OWN re-minted slot → a self-edge → `hydrate` aborts with
+/// `TaskDepCycle(["build_common_dep…"])`. With the spawned-def stamp + the
+/// `intern_at` apply, the promoted primary re-interns each spawned def at its
+/// portable wire id (no re-mint shuffle), so hydrate succeeds and the graph
+/// recomposes with NO self-edge.
+#[test]
+fn recompose_with_runtime_spawned_build_graph_hydrates_clean() {
+    use crate::primary::wire::compute_task_hash;
+    use dynrunner_core::{PhaseId, TaskDep, TaskKind};
+
+    let phase = PhaseId::from("BUILD");
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // --- Donor (raw ClusterState): cold-seed setup tasks at explicit wire ids
+    // 0..N (import_common gate at 0, toolchain at 1, an early filler at 2 that
+    // settles LOW, fat fillers at 3..N), then RUNTIME-SPAWN the build graph
+    // through the originate chokepoint (`apply_locally_for_broadcast`, which
+    // runs the real def-id stamp). ---
+    let mut donor = crate::cluster_state::ClusterState::<TestId>::new();
+    donor.apply(ClusterMutation::PrimaryChanged {
+        new: "epoch1".into(),
+        epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::default(),
+    });
+
+    let mut gate = make_binary("import_common", 100);
+    gate.phase_id = phase.clone();
+    gate.kind = TaskKind::SecondaryAffine;
+    let gate_hash = compute_task_hash(&gate);
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: gate_hash.clone(),
+        task: gate,
+        def_id: Some(0),
+    });
+    let mut toolchain = make_binary("toolchain", 100);
+    toolchain.phase_id = phase.clone();
+    let toolchain_hash = compute_task_hash(&toolchain);
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: toolchain_hash.clone(),
+        task: toolchain,
+        def_id: Some(1),
+    });
+    let mut early = make_binary("early_setup", 100);
+    early.phase_id = phase.clone();
+    let early_hash = compute_task_hash(&early);
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: early_hash.clone(),
+        task: early,
+        def_id: Some(2),
+    });
+    for id in 3u32..40 {
+        let mut t = make_binary(&format!("setup_{id}"), 100);
+        t.phase_id = phase.clone();
+        donor.apply(ClusterMutation::TaskAdded {
+            hash: compute_task_hash(&t),
+            task: t,
+            def_id: Some(id),
+        });
+    }
+    // Settle the gate + toolchain + early filler LOW (settled_max == 2 → the
+    // resumed floor lands inside the fat setup range on promotion).
+    for h in [&gate_hash, &toolchain_hash, &early_hash] {
+        donor.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
+            hash: h.clone(),
+            result_data: None,
+        });
+    }
+    let evicted = donor.test_spill_all(&dir.path().join("spill.cbor"));
+    assert_eq!(evicted, 3, "the three completed setup tasks spill");
+
+    // RUNTIME-SPAWN: build_common_dep (deps: import_common + toolchain) +
+    // several variants (dep: build_common_dep), all Pending.
+    let mut build_common = make_binary("build_common_dep", 100);
+    build_common.phase_id = phase.clone();
+    build_common.task_depends_on = vec![
+        TaskDep {
+            task_id: "import_common".into(),
+            phase_id: phase.clone(),
+            inherit_outputs: false,
+            def_id: None,
+        },
+        TaskDep {
+            task_id: "toolchain".into(),
+            phase_id: phase.clone(),
+            inherit_outputs: false,
+            def_id: None,
+        },
+    ];
+    let bcd_hash = compute_task_hash(&build_common);
+    let mut spawned = vec![build_common];
+    for vn in ["build_variant__a", "build_variant__b", "build_variant__c"] {
+        let mut v = make_binary(vn, 100);
+        v.phase_id = phase.clone();
+        v.task_depends_on = vec![TaskDep {
+            task_id: "build_common_dep".into(),
+            phase_id: phase.clone(),
+            inherit_outputs: false,
+            def_id: None,
+        }];
+        spawned.push(v);
+    }
+    crate::cluster_state::apply_locally_for_broadcast(
+        &mut donor,
+        vec![ClusterMutation::TasksSpawned {
+            tasks: spawned,
+            def_ids: Vec::new(),
+        }],
+    );
+
+    let base = donor.settled_base_clone();
+    let snapshot = donor.snapshot();
+
+    // --- Promoted primary: install settled base + restore + hydrate. ---
+    let (transport, _ends) = setup_test(1);
+    let (mut promoted, _mesh) = build_test_primary(
+        PrimaryConfig::default(),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    promoted
+        .cluster_state_mut_for_test()
+        .install_settled_base(base);
+    promoted.cluster_state_mut_for_test().restore(snapshot);
+
+    // THE symptom-level proof: hydrate succeeds — no TaskDepCycle on the
+    // runtime-spawned build_common_dep (the self-edge the re-mint shuffle
+    // fabricated is gone).
+    promoted.hydrate_from_cluster_state().expect(
+        "recompose-v2 hydrate must succeed: the stamped spawned defs re-intern \
+         at their portable wire ids (no re-mint shuffle → no self-edge → no \
+         TaskDepCycle)",
+    );
+
+    // build_common_dep's resolved deps are EXACTLY {import_common, toolchain},
+    // never itself.
+    let info = promoted
+        .cluster_state_for_test()
+        .task_info_for_hash(&bcd_hash)
+        .expect("build_common_dep restored fat");
+    let mut resolved: Vec<&str> = info
+        .task_depends_on
+        .iter()
+        .map(|d| d.task_id.as_str())
+        .collect();
+    resolved.sort_unstable();
+    assert_eq!(
+        resolved,
+        vec!["import_common", "toolchain"],
+        "build_common_dep recomposes onto its TRUE prereqs, not a self-edge"
+    );
+
+    drop(dir);
+}

@@ -450,7 +450,7 @@ async fn setup_success_unblocks_dependent_work_task_end_to_end() {
             let build_hash = compute_task_hash(&build);
             primary
                 .cluster_state_mut_for_test()
-                .apply(ClusterMutation::TasksSpawned { tasks: vec![build] });
+                .apply(ClusterMutation::TasksSpawned { tasks: vec![build], def_ids: Vec::new() });
 
             // The spawned dependent is CRDT-Blocked on the Pending setup task.
             assert!(
@@ -529,7 +529,7 @@ async fn upload_setup_task_fires_callback_then_unblocks_dependent() {
             let build_hash = compute_task_hash(&build);
             primary
                 .cluster_state_mut_for_test()
-                .apply(ClusterMutation::TasksSpawned { tasks: vec![build] });
+                .apply(ClusterMutation::TasksSpawned { tasks: vec![build], def_ids: Vec::new() });
 
             primary
                 .react_to_worker_signal_batch(one_tasks_added_batch(), &mut None)
@@ -762,6 +762,7 @@ async fn reorder_routes_both_and_strands_no_dependent() {
                 .cluster_state_mut_for_test()
                 .apply(ClusterMutation::TasksSpawned {
                     tasks: vec![b_build, a_build],
+                    def_ids: Vec::new(),
                 });
 
             // Drive the dispatch pass: both uploads self-exec to SetupCompleted.

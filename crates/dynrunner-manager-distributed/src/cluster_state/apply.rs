@@ -923,8 +923,8 @@ impl<I: Identifier> ClusterState<I> {
             ClusterMutation::SecondaryResourceSample { secondary, record } => {
                 self.apply_secondary_resource_sample(secondary, record)
             }
-            ClusterMutation::TasksSpawned { tasks } => {
-                self.apply_tasks_spawned(tasks, newly_pending_from_spawn)
+            ClusterMutation::TasksSpawned { tasks, def_ids } => {
+                self.apply_tasks_spawned(tasks, def_ids, newly_pending_from_spawn)
             }
             ClusterMutation::CustomMessagePosted {
                 origin,

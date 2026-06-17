@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use dynrunner_core::{Identifier, TaskInfo, TaskVersion};
+use dynrunner_core::{Identifier, TaskDep, TaskInfo, TaskVersion};
 use dynrunner_protocol_primary_secondary::{ClusterMutation, RoleChangeHookRegistrar, RoleTable};
 
 use super::{ApplyOutcome, ClusterState};
@@ -253,46 +253,58 @@ fn stamp_versions<I: Identifier>(
     }
 }
 
-/// Stamp the PRIMARY-allocated, CRDT-agreed `def_id` onto every
-/// originated `TaskAdded` whose id is not yet allocated, BEFORE the
-/// apply+filter loop — the single originate choke point both originator
-/// paths route through, so the wire `TaskAdded` and the originator's own
-/// local apply observe the SAME id (the originator's `intern_at` sees the
-/// reservation `alloc_for_hash` records and treats it as the idempotent
-/// fill). A re-added hash reuses its existing id (the bijection lives in
-/// `alloc_for_hash`); a promoted primary's allocator resumed PAST every
-/// observed id, so it never re-mints a live id (epoch-/failover-safe).
+/// Stamp the PRIMARY-allocated, CRDT-agreed `def_id` onto EVERY originated
+/// task-bearing mutation whose id is not yet allocated, BEFORE the
+/// apply+filter loop — the single originate choke point both originator paths
+/// route through, so the wire mutation and the originator's own local apply
+/// observe the SAME id (the originator's `intern_at` sees the reservation
+/// `alloc_for_hash` records and treats it as the idempotent fill). A re-added
+/// hash reuses its existing id (the bijection lives in `alloc_for_hash`); a
+/// promoted primary's allocator resumed PAST every observed id, so it never
+/// re-mints a live id (epoch-/failover-safe).
 ///
-/// Its own pass (NOT folded into `stamp_versions`): the def-id allocation
-/// is a distinct concern from the per-task version/attempt stamp, and the
-/// def store — not the version counter — owns the id. A `def_id` already
-/// `Some` (a re-broadcast of an already-stamped mutation) is left
-/// untouched, so the pass is idempotent under at-least-once re-origination.
+/// THE `all tasks are global` invariant's enforcement point. The pass is
+/// VARIANT-AGNOSTIC: it iterates [`ClusterMutation::tasks_to_stamp`] (the enum
+/// owns the single enumeration of which variants introduce a def), so a NEW
+/// task-bearing variant is stamped automatically once wired into that accessor
+/// — no per-variant arm here can silently skip a task. Every entry the
+/// accessor yields is allocated a global id; an UNBOUND def never survives
+/// this pass onto a task that is broadcast / persisted (the receive side's
+/// `intern_at` then anchors each replica at the wire id).
+///
+/// Its own pass (NOT folded into `stamp_versions`): the def-id allocation is a
+/// distinct concern from the per-task version/attempt stamp, and the def store
+/// — not the version counter — owns the id. A `def_id` already `Some` (a
+/// re-broadcast of an already-stamped mutation) is left untouched, so the pass
+/// is idempotent under at-least-once re-origination.
 fn stamp_def_ids<I: Identifier>(
     state: &mut ClusterState<I>,
     mutations: &mut [ClusterMutation<I>],
 ) {
-    // PASS 1 — reserve every originated `TaskAdded`'s own def id, recording
-    // each task's `(phase_id, task_id)` → def_id into a batch-local map. This
+    // PASS 1 — reserve every originated task's own def id, recording each
+    // task's `(phase_id, task_id)` → def_id into a batch-local map. This
     // reserves ids for EVERY task in the batch BEFORE any dep is resolved, so
     // an INTRA-batch forward-ref (a dependent listed before its prerequisite)
-    // resolves against the map even though the prereq's `TaskAdded` has not
-    // been applied yet (CL-A8). A re-broadcast (`def_id` already `Some`) is
-    // left untouched but its identity is still recorded so deps that point at
-    // it resolve.
+    // resolves against the map even though the prereq's mutation has not been
+    // applied yet (CL-A8). A re-broadcast (`def_id` already `Some`) is left
+    // untouched but its identity is still recorded so deps that point at it
+    // resolve. The hash is the wire-canonical `compute_task_hash` — the SAME
+    // function the receiver re-derives, so the content↔id binding has one
+    // source of truth regardless of which variant carried the task.
     let mut batch_ids: std::collections::HashMap<(dynrunner_core::PhaseId, String), u32> =
         std::collections::HashMap::new();
     for m in mutations.iter_mut() {
-        if let ClusterMutation::TaskAdded { hash, task, def_id } = m {
-            let id = match def_id {
+        for entry in m.tasks_to_stamp() {
+            let id = match entry.def_id {
                 Some(existing) => *existing,
                 None => {
-                    let allocated = state.allocate_def_id(hash).0;
-                    *def_id = Some(allocated);
+                    let hash = crate::primary::wire::compute_task_hash(entry.task);
+                    let allocated = state.allocate_def_id(&hash).0;
+                    *entry.def_id = Some(allocated);
                     allocated
                 }
             };
-            batch_ids.insert((task.phase_id.clone(), task.task_id.clone()), id);
+            batch_ids.insert((entry.task.phase_id.clone(), entry.task.task_id.clone()), id);
         }
     }
     // PASS 2 — resolve each dep's `(phase_id, task_id)` identity to the
@@ -302,20 +314,59 @@ fn stamp_def_ids<I: Identifier>(
     // already-stamped dep is left untouched (idempotent re-broadcast), and an
     // unresolvable dep is left `None` — the loud-unknown-dep failure is the
     // scheduler's concern (spawn validation / `PendingPool::extend` over the
-    // string deps), not silently fabricated here.
+    // string deps), not silently fabricated here. Same variant-agnostic
+    // iteration as PASS 1 (the enum's `tasks_to_stamp` accessor).
+    let resolve_deps = |deps: &mut [TaskDep]| {
+        for dep in deps.iter_mut() {
+            if dep.def_id.is_some() {
+                continue;
+            }
+            dep.def_id = batch_ids
+                .get(&(dep.phase_id.clone(), dep.task_id.clone()))
+                .copied()
+                .or_else(|| state.definitions.id_for_identity_pub(&dep.phase_id, &dep.task_id));
+        }
+    };
     for m in mutations.iter_mut() {
-        if let ClusterMutation::TaskAdded { task, .. } = m {
-            for dep in task.task_depends_on.iter_mut() {
-                if dep.def_id.is_some() {
-                    continue;
-                }
-                dep.def_id = batch_ids
-                    .get(&(dep.phase_id.clone(), dep.task_id.clone()))
-                    .copied()
-                    .or_else(|| state.definitions.id_for_identity_pub(&dep.phase_id, &dep.task_id));
+        for entry in m.tasks_to_stamp() {
+            resolve_deps(&mut entry.task.task_depends_on);
+        }
+    }
+}
+
+/// INVARIANT GUARD (`all tasks are global`) at the BROADCAST seam: after
+/// `stamp_def_ids`, every entry of every task-bearing mutation MUST carry a
+/// `Some` def_id — a `None` survivor would reach the wire and force the
+/// receiver to mint node-local (the recompose self-cycle bug class). Loud-fail
+/// here (the twin of the snapshot-seam guard): a `debug_assert!` PANICS in
+/// test/CI so an unstamped task-creation path is caught at development time;
+/// production emits a `tracing::error!` per offending task and proceeds (the
+/// receiver's node-local fallback still converges by content, so crashing a
+/// live originator would be strictly worse). Variant-agnostic via the enum's
+/// own `tasks_to_stamp` accessor — the single enumeration point.
+fn assert_stamped_for_broadcast<I: Identifier>(mutations: &mut [ClusterMutation<I>]) {
+    let mut unstamped = 0usize;
+    for m in mutations.iter_mut() {
+        for entry in m.tasks_to_stamp() {
+            if entry.def_id.is_none() {
+                unstamped += 1;
+                tracing::error!(
+                    target: "dynrunner_cluster_state",
+                    phase_id = %entry.task.phase_id,
+                    task_id = %entry.task.task_id,
+                    "INVARIANT VIOLATION (all tasks are global): a task is being \
+                     broadcast with an UNALLOCATED def_id — the originate def-id \
+                     stamp chokepoint (stamp_def_ids) did not assign one. Every \
+                     broadcast task must carry a primary-allocated, wire-agreed \
+                     def_id."
+                );
             }
         }
     }
+    debug_assert!(
+        unstamped == 0,
+        "all-tasks-global invariant: {unstamped} task(s) reached broadcast unstamped"
+    );
 }
 
 /// Reserve the CRDT-agreed dense affine-id for every originated
@@ -418,6 +469,12 @@ pub(crate) fn apply_locally_for_broadcast<I: Identifier>(
     // the def under the SAME id. Its own pass — a distinct concern from the
     // version/attempt stamp above.
     stamp_def_ids(state, &mut mutations);
+    // INVARIANT GUARD (all tasks are global): post-stamp, EVERY task-bearing
+    // mutation about to be broadcast MUST carry a global def_id on every entry
+    // — an UNBOUND survivor here would reach the wire and re-mint node-local on
+    // a receiver. Loud-fail at this broadcast seam (the durable catch for an
+    // unstamped task-creation path), the twin of the snapshot-seam guard.
+    assert_stamped_for_broadcast(&mut mutations);
     // Affine-id registration pass (AF-id): for every originated SecondaryAffine
     // `TaskAdded`, reserve its CRDT-agreed dense affine-id and INJECT a paired
     // `SecondaryAffineRegistered` so every replica binds the affine def's

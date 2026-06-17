@@ -259,10 +259,16 @@ impl<I: Identifier> ClusterState<I> {
     pub(super) fn apply_tasks_spawned(
         &mut self,
         tasks: Vec<TaskInfo<I>>,
+        def_ids: Vec<Option<u32>>,
         newly_pending_from_spawn: &mut Vec<TaskInfo<I>>,
     ) -> ApplyOutcome {
         let mut applied_any = false;
-        for task in tasks {
+        for (idx, task) in tasks.into_iter().enumerate() {
+            // The primary-allocated, CRDT-agreed def id for THIS task, read
+            // positionally from the parallel `def_ids` vector (`None` for an
+            // un-stamped local-apply batch or a short/legacy vector — the
+            // node-local fallback inside `intern_task_def_at`).
+            let wire_def_id = def_ids.get(idx).copied().flatten();
             let hash = crate::primary::wire::compute_task_hash(&task);
             if self.contains_task(&hash) {
                 // Idempotent: already present in the LOGICAL ledger —
@@ -408,9 +414,21 @@ impl<I: Identifier> ClusterState<I> {
                 && blocked_on_unfulfillable.is_none()
                 && blocked_on_pending.is_none())
             .then(|| task.clone());
-            // Split the brand-new task into the shared frozen `def` (interned
-            // under `hash`, deduplicated) + its per-entry mutable `routing`.
-            let (def, routing) = self.intern_task_def(&hash, task);
+            // Split the brand-new task into the shared frozen `def` + its
+            // per-entry mutable `routing`, interning at the PRIMARY-allocated
+            // wire def id when one rode the batch (`intern_task_def_at`,
+            // mirroring the `TaskAdded` apply arm) so the stored def carries
+            // the portable def_id + portable dep-refs AND the settled-guard /
+            // bijection protections apply to spawned defs too — a `None` wire
+            // id (un-stamped local apply) degrades to node-local content
+            // interning. A hash↔id BIJECTION violation (never produced by a
+            // converged registry) is logged LOUD inside the helper and returns
+            // `None` — the loud-but-safe drop: skip this entry rather than
+            // corrupt the registry (the brand-new entry never reaches a state,
+            // so it is not surfaced for pool growth either).
+            let Some((def, routing)) = self.intern_task_def_at(wire_def_id, &hash, task) else {
+                continue;
+            };
             // Every TasksSpawned entry is a BRAND-NEW task, so it enters at
             // the cold retry generation (F2 attempt 0) regardless of which
             // initial state it classifies into.

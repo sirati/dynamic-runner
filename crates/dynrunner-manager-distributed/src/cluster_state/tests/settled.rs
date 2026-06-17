@@ -1396,3 +1396,220 @@ fn pending_dependent_resolves_dep_to_settled_prereq_identity() {
 
     drop(dir);
 }
+
+// ── Recompose v2: runtime-spawned defs are def-id-stamped (the full
+// promotion-restore storm replay) ──
+
+/// THE recompose-v2 storm replay (RED pre-fix on a revert, GREEN post-fix).
+/// Reproduces the promoted-primary recompose self-edge cycle whose ROOT CAUSE
+/// is `ClusterMutation::TasksSpawned` defs NEVER being def-id-stamped: a
+/// runtime-spawned def interns at `TaskDefId::UNBOUND` with node-local
+/// dep-refs, so on promotion `register_restored_def` takes the UNBOUND branch
+/// and re-mints every spawned def via `intern()` from the resumed floor —
+/// overwriting slots held by the FAT setup-phase `TaskAdded` ids (the
+/// IdRebound storm) and rebuilding the spawned defs' deps against the
+/// re-minted (wrong) ids, so `build_common_dep`'s dep-ref aliases onto its
+/// OWN re-minted slot (the self-edge → cycle).
+///
+/// The donor mirrors the production sequence faithfully: setup tasks are
+/// COLD-SEEDED via `TaskAdded` at real wire ids 0..N (incl. a
+/// `SecondaryAffine` `import_common` + a `toolchain` task) — a few LOW ids
+/// (incl. `import_common`) are driven terminal so they settle+spill at a LOW
+/// `settled_max`, while several setup defs stay FAT at higher ids. The build
+/// graph is then RUNTIME-SPAWNED via the SAME originate chokepoint the primary
+/// uses (`apply_locally_for_broadcast`, which runs `stamp_def_ids`) —
+/// `build_common_dep` (deps: `import_common` + `toolchain`) + several
+/// `build_variant`s, left Pending.
+///
+/// GREEN (fix in): the stamped spawned defs carry PORTABLE (non-UNBOUND)
+/// def_ids on the promoted primary; `build_common_dep`'s resolved deps are
+/// EXACTLY `{import_common, toolchain}` — neither is `build_common_dep` itself
+/// (no self-edge). Asserted over SEVERAL spawned variants for
+/// HashMap-iteration-order robustness (the pre-fix re-mint shuffle is
+/// order-dependent; the post-fix portable-id path is order-INDEPENDENT).
+#[test]
+fn promotion_restore_recompose_stamps_runtime_spawned_defs() {
+    use dynrunner_core::{TaskDep, TaskKind};
+
+    let phase = PhaseId::from("BUILD");
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // ── DONOR (epoch-1 cold primary) ──
+    let mut donor = ClusterState::<RunnerIdentifier>::new();
+    apply_primary_changed(&mut donor, "epoch1-primary", 1);
+
+    // Cold-seed setup tasks at explicit wire ids 0..50. `import_common` (a
+    // SecondaryAffine gate) at id 0 and `toolchain` at id 1 are the two
+    // prerequisites the build graph depends on; the rest are filler that stay
+    // FAT (ids 3..50) so the resumed floor lands inside an OCCUPIED setup
+    // range on promotion.
+    let mut import_common = mk_task("import_common");
+    import_common.phase_id = phase.clone();
+    import_common.kind = TaskKind::SecondaryAffine;
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: "import_common".into(),
+        task: import_common,
+        def_id: Some(0),
+    });
+    let mut toolchain = mk_task("toolchain");
+    toolchain.phase_id = phase.clone();
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: "toolchain".into(),
+        task: toolchain,
+        def_id: Some(1),
+    });
+    // A third LOW-id setup task driven terminal so the settled range covers
+    // ids 0..=2 (settled_max == 2 → resumed floor == 3, an OCCUPIED setup id).
+    let mut early = mk_task("early_setup");
+    early.phase_id = phase.clone();
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: "early_setup".into(),
+        task: early,
+        def_id: Some(2),
+    });
+    // FAT filler setup defs at ids 3..50 — these stay in the in-memory store
+    // and ride the snapshot, so a re-minted spawned def collides with them.
+    for id in 3u32..50 {
+        let name = format!("setup_{id}");
+        let mut t = mk_task(&name);
+        t.phase_id = phase.clone();
+        donor.apply(ClusterMutation::TaskAdded {
+            hash: name.clone(),
+            task: t,
+            def_id: Some(id),
+        });
+    }
+
+    // Drive the two prereqs + the early filler terminal, then spill so they
+    // settle at LOW ids (settled_max low).
+    for h in ["import_common", "toolchain", "early_setup"] {
+        donor.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
+            hash: h.into(),
+            result_data: None,
+        });
+    }
+    let evicted = donor.test_spill_all(&dir.path().join("spill.cbor"));
+    assert_eq!(evicted, 3, "the three completed setup tasks spill");
+    assert_eq!(
+        donor.settled_store().max_def_id(),
+        Some(2),
+        "settled_max is LOW (the resumed floor will land inside the fat setup range)"
+    );
+
+    // ── RUNTIME-SPAWN the build graph through the originate chokepoint ──
+    // `build_common_dep` depends on BOTH prereqs; several `build_variant`s
+    // depend on `build_common_dep`. All Pending. `apply_locally_for_broadcast`
+    // runs the real `stamp_def_ids` pass (the code under test), so the donor's
+    // store + snapshot carry the stamped, portable def ids.
+    let common_deps = vec![
+        TaskDep {
+            task_id: "import_common".into(),
+            phase_id: phase.clone(),
+            inherit_outputs: false,
+            def_id: None,
+        },
+        TaskDep {
+            task_id: "toolchain".into(),
+            phase_id: phase.clone(),
+            inherit_outputs: false,
+            def_id: None,
+        },
+    ];
+    let mut build_common = mk_task("build_common_dep");
+    build_common.phase_id = phase.clone();
+    build_common.task_depends_on = common_deps;
+    // A spawned task is keyed in the ledger by its CONTENT hash (TasksSpawned
+    // carries no per-task hash; the receiver recomputes it), so capture each
+    // hash here for the post-promotion `task_state` lookups.
+    let bcd_hash = crate::primary::wire::compute_task_hash(&build_common);
+    let variant_names = ["build_variant__a", "build_variant__b", "build_variant__c"];
+    let mut spawned = vec![build_common];
+    let mut variant_hashes: Vec<(&str, String)> = Vec::new();
+    for vn in variant_names {
+        let mut v = mk_task(vn);
+        v.phase_id = phase.clone();
+        v.task_depends_on = vec![TaskDep {
+            task_id: "build_common_dep".into(),
+            phase_id: phase.clone(),
+            inherit_outputs: false,
+            def_id: None,
+        }];
+        variant_hashes.push((vn, crate::primary::wire::compute_task_hash(&v)));
+        spawned.push(v);
+    }
+    let batch = crate::cluster_state::apply_locally_for_broadcast(
+        &mut donor,
+        vec![ClusterMutation::TasksSpawned {
+            tasks: spawned,
+            def_ids: Vec::new(),
+        }],
+    );
+    // The stamp filled the parallel `def_ids` on the broadcast subset (every
+    // spawned def carries a portable id on the wire).
+    let applied_spawn = batch
+        .applied
+        .iter()
+        .find_map(|m| match m {
+            ClusterMutation::TasksSpawned { def_ids, .. } => Some(def_ids.clone()),
+            _ => None,
+        })
+        .expect("the TasksSpawned mutation applied");
+    assert!(
+        applied_spawn.iter().all(|d| d.is_some()),
+        "every spawned task's def id is stamped on the wire: {applied_spawn:?}"
+    );
+
+    // ── PROMOTED PRIMARY: install settled base + restore ──
+    let mut promoted = ClusterState::<RunnerIdentifier>::new();
+    promoted.install_settled_base(donor.settled_base_clone());
+    promoted.restore(donor.snapshot());
+
+    // GREEN invariant 1: every spawned def carries a PORTABLE (non-UNBOUND)
+    // def_id on the promoted primary (no node-local re-mint shuffle). Asserted
+    // over ALL spawned tasks for HashMap-order robustness.
+    for (name, hash) in
+        std::iter::once(("build_common_dep", bcd_hash.clone())).chain(variant_hashes.iter().cloned())
+    {
+        let state = promoted
+            .task_state(&hash)
+            .unwrap_or_else(|| panic!("{name} restored fat (Pending)"));
+        assert_ne!(
+            state.def().def_id,
+            crate::cluster_state::TaskDefId::UNBOUND,
+            "{name}'s spawned def must carry a portable (non-UNBOUND) def_id on \
+             the promoted primary — the stamped wire id re-interned at restore, \
+             not re-minted node-local"
+        );
+    }
+
+    // GREEN invariant 2: `build_common_dep`'s resolved deps are EXACTLY
+    // {import_common, toolchain} — NEITHER is build_common_dep itself (no
+    // self-edge → no `TaskDepCycle`). This is the decisive recompose datum.
+    let bcd_state = promoted
+        .task_state(&bcd_hash)
+        .expect("build_common_dep restored");
+    let bcd_info = promoted.task_to_info(bcd_state);
+    let mut resolved: Vec<&str> = bcd_info
+        .task_depends_on
+        .iter()
+        .map(|d| d.task_id.as_str())
+        .collect();
+    resolved.sort_unstable();
+    assert_eq!(
+        resolved,
+        vec!["import_common", "toolchain"],
+        "build_common_dep's deps must resolve to its TRUE prereqs, not the \
+         re-mint-aliased self-edge"
+    );
+    assert!(
+        !bcd_info
+            .task_depends_on
+            .iter()
+            .any(|d| d.task_id == "build_common_dep"),
+        "build_common_dep must NOT depend on ITSELF (the self-edge the \
+         re-mint shuffle fabricated → the TaskDepCycle the recompose aborts on)"
+    );
+
+    drop(dir);
+}

@@ -390,6 +390,7 @@ fn range_digest_memo_matches_fresh_fold() {
     // --- TasksSpawned create batch (apply_tasks.rs insert) ---
     s.apply(ClusterMutation::TasksSpawned {
         tasks: vec![mk_task("spawn-a"), mk_task("spawn-b"), mk_task("spawn-c")],
+        def_ids: Vec::new(),
     });
     assert_range_memo_invariant(&s);
 

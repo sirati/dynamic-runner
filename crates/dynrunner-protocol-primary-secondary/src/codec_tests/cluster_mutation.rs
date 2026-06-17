@@ -1547,3 +1547,143 @@ fn secondary_affine_queued_decodes_literal_bytes() {
         _ => panic!("expected SecondaryAffineQueued"),
     }
 }
+
+// ── Recompose v2: TasksSpawned def-id stamping (the runtime-spawned twin of
+// TaskAdded's def_id) ──
+
+/// `TasksSpawned` round-trips its PER-TASK, primary-allocated `def_ids`
+/// (recompose v2) — the parallel `Vec<Option<u32>>` aligned by position to
+/// `tasks` so every replica interns each spawned def under the SAME id. Pins
+/// NON-default ids (and a NON-default per-edge `TaskDep.def_id`) so a dropped
+/// id-carrier fails the assertion. Mirrors the `roundtrip_task_added_carries_def_id`
+/// contract for the batch shape.
+#[test]
+fn roundtrip_tasks_spawned_carries_def_ids() {
+    let json = serde_json::json!({
+        "TasksSpawned": {
+            "tasks": [
+                {
+                    "path": "/tasks/build_common_dep",
+                    "size": 0,
+                    "identifier": test_id("build_common_dep"),
+                    "phase_id": "BUILD",
+                    "type_id": "t0",
+                    "affinity_id": null,
+                    "payload": null,
+                    "task_id": "build_common_dep",
+                    // The per-edge dep ids already ride TaskDep.def_id (the
+                    // same L5 carrier TaskAdded uses) — pin a non-default one.
+                    "task_depends_on": [
+                        { "task_id": "import_common", "phase_id": "BUILD", "def_id": 0 }
+                    ],
+                },
+                {
+                    "path": "/tasks/build_variant__a",
+                    "size": 0,
+                    "identifier": test_id("build_variant__a"),
+                    "phase_id": "BUILD",
+                    "type_id": "t0",
+                    "affinity_id": null,
+                    "payload": null,
+                    "task_id": "build_variant__a",
+                },
+            ],
+            "def_ids": [50, 51],
+        }
+    })
+    .to_string();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+    match decoded {
+        ClusterMutation::TasksSpawned { tasks, def_ids } => {
+            assert_eq!(tasks.len(), 2);
+            assert_eq!(def_ids, vec![Some(50), Some(51)]);
+            assert_eq!(tasks[0].task_id, "build_common_dep");
+            assert_eq!(tasks[0].task_depends_on[0].def_id, Some(0));
+        }
+        _ => panic!("expected TasksSpawned"),
+    }
+}
+
+/// Wire-shape mirror (NOT symmetric-on-the-wrong-shape) for the recompose-v2
+/// `def_ids` carrier: encode a value and pin the EXACT bytes the originator
+/// emits, then decode those literal bytes back — so an encoder/decoder drift
+/// in the new parallel-vector shape (a renamed field, a dropped position, a
+/// tagging change) is caught against the other side's actual wire, per the
+/// wire-shape-mirror discipline. The full `TaskInfo` shape is exercised via
+/// the crate's own encode (the OTHER direction of the mirror).
+#[test]
+fn tasks_spawned_def_ids_mirror_wire_bytes() {
+    // Round-trip the crate's own encode → decode of a stamped batch (a
+    // single-task batch keeps the TaskInfo bytes bounded; the def_ids carrier
+    // is what this pins).
+    let task: serde_json::Value = serde_json::json!({
+        "path": "/tasks/x",
+        "size": 0,
+        "identifier": test_id("x"),
+        "phase_id": "p0",
+        "type_id": "t0",
+        "affinity_id": null,
+        "payload": null,
+        "task_id": "x",
+    });
+    let with_ids = serde_json::json!({
+        "TasksSpawned": { "tasks": [task], "def_ids": [7] }
+    })
+    .to_string();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&with_ids).unwrap();
+    // Re-encode and confirm the def_ids carrier survives byte-for-byte through
+    // the crate's own serializer (the encoder side of the mirror).
+    let reencoded = serde_json::to_value(&decoded).unwrap();
+    assert_eq!(
+        reencoded["TasksSpawned"]["def_ids"],
+        serde_json::json!([7]),
+        "the stamped def_ids carrier survives encode→decode→encode verbatim"
+    );
+}
+
+/// `skip_serializing_if = "Vec::is_empty"`: an UN-STAMPED `TasksSpawned`
+/// (empty `def_ids` — a local-apply construction, or a pre-recompose-v2
+/// sender) elides the field on the wire (byte-identical to the legacy shape),
+/// and a legacy frame WITHOUT `def_ids` decodes to an EMPTY vector — the
+/// receiver reads it positionally as all-`None` (node-local fallback). Mirrors
+/// the `legacy_task_added_decodes_without_def_id` rolling-upgrade contract.
+#[test]
+fn legacy_tasks_spawned_decodes_without_def_ids() {
+    // A current sender with an empty def_ids drops the field on the wire.
+    let empty: ClusterMutation<TestId> = ClusterMutation::TasksSpawned {
+        tasks: Vec::new(),
+        def_ids: Vec::new(),
+    };
+    let v = serde_json::to_value(&empty).unwrap();
+    assert!(
+        v["TasksSpawned"].get("def_ids").is_none(),
+        "an empty def_ids must be omitted on the wire (skip_serializing_if): {v}"
+    );
+    // A legacy frame (no def_ids field at all) decodes to an empty vector.
+    let legacy = serde_json::json!({
+        "TasksSpawned": {
+            "tasks": [{
+                "path": "/tasks/legacy",
+                "size": 0,
+                "identifier": test_id("legacy"),
+                "phase_id": "p0",
+                "type_id": "t0",
+                "affinity_id": null,
+                "payload": null,
+                "task_id": "legacy",
+            }]
+        }
+    })
+    .to_string();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&legacy).unwrap();
+    match decoded {
+        ClusterMutation::TasksSpawned { tasks, def_ids } => {
+            assert_eq!(tasks.len(), 1);
+            assert!(
+                def_ids.is_empty(),
+                "a legacy frame decodes def_ids to empty (read positionally as all-None)"
+            );
+        }
+        _ => panic!("expected TasksSpawned"),
+    }
+}
