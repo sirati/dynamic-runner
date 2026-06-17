@@ -45,3 +45,4 @@ pub(crate) mod predecessor_outputs;
 mod request;
 
 pub(in crate::primary) use illegal_assignment::ILLEGAL_ASSIGNMENT_WARN_INTERVAL;
+pub(in crate::primary) use request::UNASSIGNABLE_PARK_WARN_INTERVAL;

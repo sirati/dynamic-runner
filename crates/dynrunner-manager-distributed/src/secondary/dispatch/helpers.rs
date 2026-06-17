@@ -175,6 +175,14 @@ where
     pub(in crate::secondary) async fn react_to_primary_identity_change(&mut self) {
         self.rearm_mesh_ready_for_new_primary().await;
         self.op_mut().primary_link.reset_all_backoff();
+        // Open the failover slot-reconfirmation window: the new primary
+        // holds stale `InFlight` guesses for inherited slots, so the
+        // periodic keepalive re-poll (`repoll_idle_workers_periodic`) must
+        // run until every idle worker re-confirms its slot. The IMMEDIATE
+        // repoll just below is the first reconfirming wave; the window keeps
+        // the periodic driver alive for any worker that misses it (e.g. a
+        // worker that frees AFTER this reaction).
+        self.op_mut().primary_link.arm_failover_reconfirm();
         self.repoll_idle_workers().await;
         self.drain_report_replays_now().await;
     }

@@ -1607,6 +1607,28 @@ where
         // primary on the self-named promotion + reset election).
         self.apply_cluster_mutations(vec![mutation.clone()]);
 
+        // (1b) Open the failover slot-reconfirmation window for THIS
+        // winner's OWN workers, IFF the lifecycle is already operational.
+        // The peer-receive path runs the full
+        // `react_to_primary_identity_change` (which arms the window), but
+        // the self-promotion deliberately skips that reaction (no mesh
+        // re-announce / report re-drive to self). The window is still
+        // required for an OPERATIONAL winner: the newly-built self-primary
+        // seeds the winner's own inherited slots as stale `InFlight`
+        // guesses, which only each worker's own `TaskRequest` reconciles —
+        // so the secondary's periodic re-poll must run for them until they
+        // reconfirm (otherwise the inherited slots stay phantom-busy: the
+        // LMU-gating deadlock). Steady-state silence is preserved — the
+        // window auto-closes once every idle worker has reconfirmed. A
+        // SETUP-phase election winner has no operational state yet (no
+        // workers spawned, no `primary_link`): it leaves setup through the
+        // promotion arm and rebuilds inherited slots from the snapshot
+        // afterward, so there is nothing to arm here — guard against
+        // `op_mut`'s pre-operational panic.
+        if let Some(op) = self.lifecycle.operational_mut() {
+            op.primary_link.arm_failover_reconfirm();
+        }
+
         // (2) Broadcast the re-point so surviving peers apply the same
         // frame through the same hook. epoch+1 strictly supersedes the
         // prior primary identity.

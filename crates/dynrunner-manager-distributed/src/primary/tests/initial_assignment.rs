@@ -184,6 +184,69 @@ fn dispatch_order_production_shape_28_tasks_15_secondaries() {
     );
 }
 
+/// Regression-lock the owner's "round-robin over the SET with maximal
+/// idle-count" with DISTINCT idle counts {3, 1, 2} across three
+/// secondaries (the property the periodic-pull removal relies on: the
+/// push spreads work least-loaded-first so a parked worker on any
+/// secondary is reached). All-idle here (no busy), so each secondary's
+/// advisory load is 0 and the rank-within-secondary IS the projected
+/// load: the order interleaves wave-by-wave, and each wave grants to the
+/// secondaries with the MOST remaining idle, equal-idle secondaries
+/// alternating in worker_id order.
+///
+/// Layout: A has 3 idle (wid 0,1,2), B has 1 idle (wid 3), C has 2 idle
+/// (wid 4,5). The waves:
+///   * wave 0 (every secondary has ≥1 idle) → A(0), B(3), C(4);
+///   * wave 1 (only A,C still have idle) → A(1), C(5);
+///   * wave 2 (only A) → A(2).
+///
+/// So the grant order is [0, 3, 4, 1, 5, 2] — least-loaded-first with
+/// equal-idle A and C alternating each wave.
+#[test]
+fn dispatch_order_distinct_idle_counts_interleaves_max_idle_first() {
+    let workers = vec![
+        make_remote_worker(0, "A", false),
+        make_remote_worker(1, "A", false),
+        make_remote_worker(2, "A", false),
+        make_remote_worker(3, "B", false),
+        make_remote_worker(4, "C", false),
+        make_remote_worker(5, "C", false),
+    ];
+    let order = super::lifecycle::dispatch_order(&workers);
+    assert_eq!(
+        order,
+        vec![0, 3, 4, 1, 5, 2],
+        "grants must interleave least-loaded-first, equal-idle secondaries \
+         alternating each wave (round-robin over the maximal-idle set)"
+    );
+
+    // Wave-shape cross-check independent of the literal vector: walking the
+    // order, the count of DISTINCT secondaries seen must be non-increasing
+    // wave over wave (each wave covers exactly the secondaries that still
+    // have idle workers left), and no secondary appears twice before every
+    // OTHER still-eligible secondary has appeared once in that wave.
+    let secs: Vec<&str> = order
+        .iter()
+        .map(|&i| workers[i].secondary_id.as_str())
+        .collect();
+    // First three grants (wave 0) must be the three distinct secondaries.
+    let wave0: std::collections::BTreeSet<&str> = secs[0..3].iter().copied().collect();
+    assert_eq!(
+        wave0,
+        ["A", "B", "C"].into_iter().collect(),
+        "wave 0 must touch every secondary once before any second grant"
+    );
+    // Next two (wave 1) are the two secondaries with ≥2 idle: A and C.
+    let wave1: std::collections::BTreeSet<&str> = secs[3..5].iter().copied().collect();
+    assert_eq!(
+        wave1,
+        ["A", "C"].into_iter().collect(),
+        "wave 1 covers only the secondaries with idle remaining (A, C)"
+    );
+    // Last (wave 2) is the only secondary with 3 idle: A.
+    assert_eq!(secs[5], "A", "wave 2 is the deepest-idle secondary alone");
+}
+
 /// T-#33: initial assignment is round-robin across secondaries AND
 /// secondary iteration order is deterministic (sorted by name).
 ///

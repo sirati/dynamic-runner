@@ -489,3 +489,113 @@ async fn coalesce_multiple_tasks_added_into_one_recheck() {
         })
         .await;
 }
+
+/// (5) COMPLETION WAKES A PARKED WORKER ON ANOTHER SECONDARY — WITHOUT A
+/// RE-POLL. The steady-state push contract: a completion on sec-0 emits
+/// `TasksAdded`; the recheck (`dispatch_to_idle_workers`) iterates EVERY
+/// idle worker FLEET-WIDE and assigns the now-unblocked phase-B task to a
+/// worker on sec-1 that NEVER sent a `TaskRequest`. This is the property
+/// that makes the secondary's periodic keepalive re-poll redundant in
+/// steady state (the gate commit removes it): the parked worker on the
+/// OTHER secondary is woken by the push, not by its own pull.
+///
+/// Fixture: phase A (1 task, sec-0/w0 takes it) → phase B (1 task, dep A).
+/// sec-1/w0 is registered idle and NEVER requests. After A completes,
+/// assert B lands on sec-1/w0 via the recheck alone.
+#[tokio::test(flavor = "current_thread")]
+async fn completion_push_wakes_parked_worker_on_other_secondary_without_repoll() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(2);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let a = dep_binary("a", "a", &[]);
+            let b = dep_binary("b", "b", &[("a", "a")]);
+            let hash_a = compute_task_hash(&a);
+            let hash_b = compute_task_hash(&b);
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(PhaseId::from("b"), vec![PhaseId::from("a")])]),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: hash_a.clone(),
+                    task: a,
+                    def_id: None,
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: hash_b.clone(),
+                    task: b,
+                    def_id: None,
+                });
+            }
+            primary
+                .hydrate_from_cluster_state()
+                .expect("test fixture: composed task graph is valid");
+            let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
+            // Register sec-1/w0 FIRST (roster index 0) so that, once the
+            // sec-0 worker frees on A's completion, the equal-idle
+            // (projected_load, worker_id) tie resolves to the PARKED sec-1
+            // worker — proving the push reaches a DIFFERENT secondary's
+            // parked worker, not merely the just-freed local one. sec-1/w0
+            // stays PARKED (it never sends a TaskRequest anywhere here).
+            primary.register_idle_worker_for_test("sec-1".into(), 0, budget.clone());
+            primary.register_idle_worker_for_test("sec-0".into(), 0, budget);
+
+            // sec-0/w0 requests + takes A (phase B is blocked on A).
+            primary
+                .handle_task_request(task_request("sec-0", 0), &mut None)
+                .await
+                .unwrap();
+            assert!(
+                primary.slot_holds_hash_for_test("sec-0", 0, &hash_a),
+                "sec-0/w0 takes phase-A task (B blocked on A)"
+            );
+            settle_pump().await;
+            let _ = assigned_task_ids(&mut ends[0].1);
+            // sec-1/w0 has NOT requested and is parked; nothing assigned to it.
+            assert!(
+                assigned_task_ids(&mut ends[1].1).is_empty(),
+                "sec-1/w0 is parked — no assignment yet"
+            );
+
+            // Install the bus, complete A. The completion EMITS TasksAdded;
+            // dispatch is deferred to the recheck (no inline dispatch, no
+            // pull from sec-1).
+            let (wm_tx, mut wm_rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
+            primary
+                .cluster_state_mut_for_test()
+                .install_worker_mgmt_sender(wm_tx);
+            primary
+                .handle_task_complete(task_complete("sec-0", 0, &hash_a), &mut None)
+                .await;
+
+            // Drive the parked recheck exactly as the operational loop
+            // does. sec-1/w0 issues NO TaskRequest anywhere in this test —
+            // the ONLY thing that can assign it is the fleet-wide push.
+            let batch = recv_worker_signal_batch(&mut wm_rx)
+                .await
+                .expect("completion must emit a TasksAdded batch");
+            primary.react_to_worker_signal_batch(batch, &mut None).await;
+            settle_pump().await;
+
+            // B landed on the PARKED worker on the OTHER secondary, woken
+            // purely by the push.
+            assert_eq!(
+                assigned_task_ids(&mut ends[1].1),
+                vec!["b".to_string()],
+                "the completion's TasksAdded push wakes the parked sec-1/w0 \
+                 fleet-wide — no TaskRequest re-poll from sec-1 required"
+            );
+            assert!(
+                primary.slot_holds_hash_for_test("sec-1", 0, &hash_b),
+                "sec-1/w0 now holds B, assigned by the push alone"
+            );
+        })
+        .await;
+}

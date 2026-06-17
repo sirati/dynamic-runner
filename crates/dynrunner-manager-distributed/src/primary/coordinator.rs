@@ -992,6 +992,19 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// per-(secondary,worker) map to evict.
     pub(super) illegal_assignment_warn: crate::warn_throttle::WarnThrottle,
 
+    /// Rate-limited operator signal for the unassignable-TaskRequest PARK
+    /// case (`handle_task_request`'s drop path). A worker addressing a
+    /// known roster slot that finds no dispatchable work is PARKED awaiting
+    /// the push (`dispatch_to_idle_workers`) — at scale every idle worker
+    /// re-requests once per backoff tick, so the per-event DEBUG line
+    /// spammed (run report: once per worker per tick on a promoted
+    /// primary's drained phase). The drop path drives this throttle: one
+    /// rolled-up line per interval naming the parked-worker count + the
+    /// re-requests suppressed since. The orthogonal "no roster slot"
+    /// sub-cause (an unknown/dead-secondary target) keeps its individual
+    /// line — rare, and a membership/liveness signal, not park churn.
+    pub(super) unassignable_park_warn: crate::warn_throttle::WarnThrottle,
+
     /// The set of members whose operational MAIN LOOP has provably run
     /// this incarnation: a mesh `Keepalive` with the SECONDARY emitter
     /// role was received from them (the secondary's keepalive arm spins
@@ -1903,6 +1916,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             ),
             illegal_assignment_warn: crate::warn_throttle::WarnThrottle::new(
                 super::task::ILLEGAL_ASSIGNMENT_WARN_INTERVAL,
+            ),
+            unassignable_park_warn: crate::warn_throttle::WarnThrottle::new(
+                super::task::UNASSIGNABLE_PARK_WARN_INTERVAL,
             ),
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,
