@@ -720,6 +720,32 @@ pub struct ClusterState<I> {
     /// node-local in every exhaustive-destructure guard.
     pub(super) authority_snapshot:
         Option<Arc<dyn crate::authority_snapshot::SlurmAuthoritativeSnapshot>>,
+    /// Scoped marker: `true` only while a snapshot RESTORE / catch-up merge
+    /// is in progress. Set by the RAII guard
+    /// ([`super::snapshot::CatchUpRestoreGuard`]) at the head of the SOLE
+    /// restore chokepoint ([`Self::restore_collecting_resumed`]) and cleared
+    /// on the guard's drop, so it captures the WHOLE restore scope —
+    /// including the `merge_task_state` cascade-fail recursion (which runs
+    /// inside that scope and is equally catch-up). Read at the single
+    /// narration-emit chokepoint ([`Self::emit_task_state_change_event`]) to
+    /// stamp [`crate::task_state_change::NarrationSource`]: a transition the
+    /// restore writes is `CatchUp`, a transition a live broadcast apply
+    /// writes (outside any restore scope) is `LiveBroadcast`. This is the
+    /// operator-facing discriminator the CRDT-path-INDEPENDENT merge seam
+    /// otherwise erases — the seam stays path-independent, the marker only
+    /// records which path the scope took.
+    ///
+    /// A `Cell<bool>` (not a bool / signature thread): the emit chokepoint
+    /// reads through `&self`, and `ClusterState` is single-threaded-owned
+    /// (every coordinator runs it on a `current_thread` / `LocalSet`
+    /// runtime — the observer's narration drain is single-threaded), so the
+    /// Cell needs no lock and the read/write are branch-free and panic-free
+    /// (same idiom as `digest_cache`). Default `false` — a non-restoring
+    /// node (and every test fixture) reads `LiveBroadcast`, the prior
+    /// behaviour. NOT replicated / cloned / snapshotted / digest-folded: a
+    /// pure node-local scope marker, classified node-local in every
+    /// exhaustive-destructure guard (like `digest_cache`).
+    pub(super) in_catch_up_restore: std::cell::Cell<bool>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -824,6 +850,10 @@ where
             // its deployment wires one; otherwise the tiebreak stays
             // a no-op.
             authority_snapshot: _authority_snapshot,
+            // Node-local scoped restore marker — NOT cloned (a cloned
+            // replica is a fresh node-local view; it cold-starts the
+            // marker `false`, exactly like `digest_cache`).
+            in_catch_up_restore: _in_catch_up_restore,
         } = self;
         Self {
             tasks: tasks.clone(),
@@ -932,6 +962,9 @@ where
             affine: affine.clone(),
             // Node-local runtime handle — see field doc.
             authority_snapshot: None,
+            // Node-local scoped restore marker — fresh `false` on the clone
+            // (a cloned replica runs no restore until it calls one itself).
+            in_catch_up_restore: std::cell::Cell::new(false),
         }
     }
 }
@@ -993,6 +1026,7 @@ where
             definitions,
             affine,
             authority_snapshot,
+            in_catch_up_restore,
         } = self;
         f.debug_struct("ClusterState")
             .field("tasks", tasks)
@@ -1045,6 +1079,7 @@ where
             .field("definitions", definitions)
             .field("affine", affine)
             .field("authority_snapshot", &authority_snapshot.is_some())
+            .field("in_catch_up_restore", &in_catch_up_restore.get())
             .finish()
     }
 }
@@ -1099,6 +1134,9 @@ impl<I> Default for ClusterState<I> {
             definitions: super::task_def_store::TaskDefStore::default(),
             affine: Box::new(super::affine_state::AffineState::default()),
             authority_snapshot: None,
+            // Node-local scoped restore marker — `false` until a restore
+            // scope arms it via the RAII guard.
+            in_catch_up_restore: std::cell::Cell::new(false),
         }
     }
 }
