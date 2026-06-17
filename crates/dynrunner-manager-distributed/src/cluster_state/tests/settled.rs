@@ -1227,3 +1227,86 @@ fn cross_epoch_promotion_does_not_reuse_settled_def_id() {
         "the cross-epoch collision on the settled id is foreclosed"
     );
 }
+
+// ── Commit 2: intern_at settled-safety (a carried id never occupies a
+// settled slot) ──
+
+/// A restored fat def whose CARRIED def-id collides with a SETTLED id must
+/// NOT be placed onto the settled slot. `intern_at`'s free-slot check reads
+/// only the in-memory `defs` vector — a settled def left it, so the slot
+/// looks free and the (DIFFERENT) restored def would be placed SILENTLY at
+/// the settled id, aliasing a def-id dep ref onto the wrong def. The
+/// settled-collision guard in `register_restored_def` degrades it by content
+/// (a fresh local id), exactly like an in-memory IdRebound.
+///
+/// Pre-fix RED: V is placed at the settled id g (resolve(g) == V — the
+/// alias). Post-fix GREEN: V is degraded to a fresh id ≠ g.
+#[test]
+fn restored_def_with_settled_carried_id_degrades_by_content() {
+    use dynrunner_core::TaskKind;
+
+    // g is a wire-agreed SETTLED id; the cross-epoch transient hands a
+    // DIFFERENT fat task ("variant") the SAME carried id g.
+    const G: u32 = 5;
+    let phase = PhaseId::from("BUILD");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Donor 1: the import gate settled at wire id g (g lives only in the
+    // settled index; its slot is FREE in the in-memory def store).
+    let mut gate_donor = ClusterState::<RunnerIdentifier>::new();
+    let mut gate = mk_task("import_common");
+    gate.phase_id = phase.clone();
+    gate.kind = TaskKind::SecondaryAffine;
+    gate_donor.apply(ClusterMutation::TaskAdded {
+        hash: "import_common".into(),
+        task: gate,
+        def_id: Some(G),
+    });
+    gate_donor.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "import_common".into(),
+        result_data: None,
+    });
+    let evicted = gate_donor.test_spill_all(&dir.path().join("spill.cbor"));
+    assert_eq!(evicted, 1);
+    assert_eq!(gate_donor.settled_store().max_def_id(), Some(G));
+
+    // Donor 2 (a DIFFERENT epoch's allocator): a fat build variant minted at
+    // the SAME wire id g — the cross-epoch alias the guard must catch.
+    let mut variant_donor = ClusterState::<RunnerIdentifier>::new();
+    let mut variant = mk_task("build_variant__x");
+    variant.phase_id = phase.clone();
+    variant_donor.apply(ClusterMutation::TaskAdded {
+        hash: "build_variant__x".into(),
+        task: variant,
+        def_id: Some(G),
+    });
+
+    // Promote: install the settled base (gate at g), then restore the variant
+    // snapshot whose def carries the colliding wire id g.
+    let mut promoted = ClusterState::<RunnerIdentifier>::new();
+    promoted.install_settled_base(gate_donor.settled_base_clone());
+    promoted.restore(variant_donor.snapshot());
+
+    // The variant must NOT occupy the settled slot g.
+    let v_id = promoted
+        .def_id_for_hash_for_test("build_variant__x")
+        .expect("the variant's def is restored (degraded by content)");
+    assert_ne!(
+        v_id,
+        crate::cluster_state::TaskDefId(G),
+        "the restored variant must NOT be placed onto the settled id g — \
+         intern_at's in-memory free-slot check cannot see the settled def, so \
+         the settled-collision guard must degrade it by content"
+    );
+    assert!(
+        promoted
+            .resolve_def_for_test(crate::cluster_state::TaskDefId(G))
+            .is_none(),
+        "the settled id g must hold NO in-memory def (the variant did not \
+         alias onto it)"
+    );
+
+    drop(dir);
+}

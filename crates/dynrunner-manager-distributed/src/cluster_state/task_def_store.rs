@@ -1034,6 +1034,28 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
         let Some(wire) = def_id else {
             return Some(self.intern_task_def(hash, task));
         };
+        if self.settled.is_def_id_settled(TaskDefId(wire)) {
+            // SETTLED-id collision (CL-A2 allocator settled-safety): the wire
+            // id already belongs to a SETTLED (evicted) task, invisible to
+            // `intern_at`'s in-memory free-slot check — placing here would
+            // SILENTLY occupy the settled slot and alias a def-id dep ref onto
+            // the wrong def. The settled hash itself NoOps upstream (the
+            // `TaskAdded` arm's `settled_contains` guard), so a NON-settled
+            // hash reaching here with a settled wire id is a genuine
+            // cross-epoch alias — fall back to node-local CONTENT interning
+            // (the `None`-arm path), the same degrade `register_restored_def`
+            // uses; the def resolves by hash under a fresh local id.
+            tracing::error!(
+                target: "dynrunner_cluster_state",
+                hash,
+                wire,
+                "TaskAdded wire def-id collides with a SETTLED id — a new task's \
+                 wire-carried id is already held by a settled (evicted) task \
+                 (a failover cross-epoch transient). Interning node-local by \
+                 content so it never aliases onto the settled prereq's slot."
+            );
+            return Some(self.intern_task_def(hash, task));
+        }
         let (frozen, preferred_secondaries, preferred_version, resolved_path, deps) =
             FrozenTaskDef::from_task_info(task);
         // TWO-STEP intern at the wire id (L5, mirrors `intern_task_def`):
@@ -1126,6 +1148,34 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
             // Un-agreed / legacy def: no self-describing portable id —
             // re-anchor by content hash, exactly like the un-allocated apply
             // fallback.
+            self.definitions.intern(hash.to_string(), (**def).clone());
+            self.reanchor_restored_affine_id(hash, def);
+            return;
+        }
+        if self.settled.is_def_id_settled(carried) {
+            // SETTLED-id collision (CL-A2 allocator settled-safety): the
+            // carried id already belongs to a task that COMPLETED + SETTLED —
+            // its def left the in-memory store, so `intern_at`'s in-memory
+            // free-slot check would NOT see the collision and would place this
+            // (DIFFERENT) restored task SILENTLY onto the settled slot, so a
+            // def-id dep ref pointing at the settled prereq would then resolve
+            // to the WRONG def (the alias the floor-resume guards against on
+            // the node-local-mint path, here on the carried-id path
+            // `intern_at` ignores). A settled prereq's own def never reaches
+            // this loop (a settled entry is evicted from the fat snapshot
+            // batch), so a fat task carrying a settled id is always a genuine
+            // cross-epoch alias — degrade it by CONTENT, identical to the
+            // in-memory IdRebound path below; the def still resolves by hash
+            // under a fresh local id and is never lost.
+            tracing::error!(
+                target: "dynrunner_cluster_state",
+                hash,
+                carried = carried.0,
+                "snapshot-restore def-id collides with a SETTLED id — a restored \
+                 def carries an id a settled (evicted) task already holds (a \
+                 failover cross-epoch transient). Re-anchoring the def by \
+                 content so it never aliases onto the settled prereq's slot."
+            );
             self.definitions.intern(hash.to_string(), (**def).clone());
             self.reanchor_restored_affine_id(hash, def);
             return;
