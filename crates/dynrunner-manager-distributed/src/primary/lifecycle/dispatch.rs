@@ -266,7 +266,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `dispatch_order`) so a backpressure window or
             // single-worker-mode flip mid-tick takes effect
             // immediately.
-            if self.should_skip_worker_for_dispatch(worker_idx, bypass_backpressure, false) {
+            if self.should_skip_worker_for_dispatch(worker_idx, bypass_backpressure) {
                 continue;
             }
             // #519 per-decision bias: only a worker that reaches

@@ -52,6 +52,11 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
             let mut quotas = HashMap::new();
             quotas.insert("/tmp/flaky".to_string(), 1u32);
             let flaky = super::test_helpers::FlakyWorkerFactory::with_quotas(quotas);
+            // Hold the PHYSICAL-execution counter (each `ProcessTask` the
+            // worker receives bumps it) so we can prove the retry actually
+            // RE-EXECUTED the task in a real worker invocation — not merely
+            // that the ledger flipped to success.
+            let attempts = flaky.attempts.clone();
 
             let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) = spawn_real_secondary_flaky(
                 "sec-0".into(),
@@ -129,6 +134,27 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
             assert_eq!(
                 passes_used, 1,
                 "exactly one retry pass should have been consumed"
+            );
+            // PHYSICAL RE-EXECUTION PROOF (the decoupled-bring-up regression
+            // guard): the retry must run the task in a REAL worker invocation
+            // a SECOND time, not just flip the ledger. "flaky" has quota=1, so
+            // attempt 1 fails Recoverable and ONLY a genuine 2nd physical
+            // ProcessTask can produce the success counted above — assert the
+            // worker received exactly 2 ProcessTask invocations for it. This
+            // pins that the non-blocking bring-up did NOT suppress retry
+            // re-execution for a TRANSIENT failure (where the original
+            // terminal is already settled in failed_tasks before the retry
+            // pass re-dispatches, so the "terminal raced a requeue" dedup
+            // cannot reclaim the fresh attempt — contrast the deterministic
+            // instant-crash, where the compressed-time race is benign because
+            // re-executing a deterministic crash is pointless).
+            assert_eq!(
+                attempts.borrow().get("/tmp/flaky").copied(),
+                Some(2),
+                "the recoverable task must PHYSICALLY re-execute on the retry \
+                 pass (attempt 1 failed, attempt 2 succeeded) — exactly 2 worker \
+                 ProcessTask invocations; got {:?}",
+                attempts.borrow().get("/tmp/flaky")
             );
         })
         .await;

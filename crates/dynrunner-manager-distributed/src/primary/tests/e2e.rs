@@ -114,6 +114,14 @@ async fn e2e_primary_and_two_secondaries() {
                     }
                 });
             }
+            // Model the production formed peer mesh: a channel-transport
+            // fixture wires only primary↔secondary legs, so the real
+            // secondaries' watchdogs never see each other and would report
+            // a degraded (peer_count=0) mesh — which, under mesh-always,
+            // aborts the run on the mesh-formation deadline. Inject the
+            // FORMED-mesh MeshReady each secondary would emit on a real
+            // QUIC mesh so the run proceeds (see `inject_mesh_ready_for`).
+            inject_mesh_ready_for(&incoming_tx, &["sec-0".to_string(), "sec-1".to_string()]);
             drop(incoming_tx); // Only forwarding tasks hold senders now
 
             let transport =

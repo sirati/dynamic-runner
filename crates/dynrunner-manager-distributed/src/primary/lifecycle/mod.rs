@@ -17,9 +17,10 @@
 //!   `PhaseStartedNeedsWorkers` liveness check and the `RunShouldFail`
 //!   break-outcome. Decoupled from the phase/task code that emits the
 //!   signals (the dispatch-decoupling law).
-//! - [`promotion`] — `wait_for_mesh_ready` + `activate_local_primary`
-//!   (the mesh-settle gate + the single mechanism that activates THIS
-//!   node as the primary authority — see `activate_local_primary`).
+//! - [`promotion`] — the background mesh-formation deadline helpers
+//!   (`mesh_formation_missing` / `mesh_formation_abort_reason`) and
+//!   `activate_local_primary`, the single mechanism that activates THIS
+//!   node as the primary authority.
 //! - [`graceful_abort`] — the primary side of the observer-requested
 //!   graceful abort: the request→latch origination, the per-iteration
 //!   drain/relocate/terminal decision, and the respawn-admission gate

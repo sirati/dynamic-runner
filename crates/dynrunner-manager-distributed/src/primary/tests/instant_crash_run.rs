@@ -113,20 +113,51 @@ async fn instantly_crashing_task_is_charged_paced_and_the_run_terminates() {
         "exactly the configured retry budget must be consumed"
     );
 
-    // Pacing: attempts are bounded (budget-shaped, not spin-shaped)
-    // and spaced by the re-dispatch/respawn backoffs. Main pass +
-    // one retry pass = 2 typed spawns is the exact expectation; a
-    // small allowance covers a raced extra respawn, while the
-    // production spin was hundreds per second.
+    // Pacing: attempts are BOUNDED (budget-shaped, not spin-shaped). The
+    // permanent failure within the retry budget is the correctness pin
+    // above (`failed_residual == 1`, `passes_used == 1`); this is the
+    // anti-spin pin — a bounded, low count, never the production
+    // hundreds-per-second spin. The exact physical subprocess-spawn count
+    // is 1..=4.
+    //
+    // Why 1 is valid HERE (and not a retry-suppression regression): this
+    // doomed task crashes its worker at SETUP — the type-shift respawn for
+    // the initial-assignment dies before Ready, before the task binary
+    // ever runs. With the decoupled (non-blocking) bring-up the secondary
+    // re-sends a duplicate welcome (its setup gate never released), so the
+    // primary re-serves the setup trio and the second startup-crash
+    // terminal RACES that re-serve — landing while the task sits QUEUED
+    // (re-dispatch backoff) — and is reclaimed by the idempotent
+    // never-re-execute dedup ("terminal arrived for a task sitting
+    // QUEUED"). Re-materializing a subprocess for a DETERMINISTIC startup
+    // crash is pointless, so collapsing to one physical respawn is benign.
+    // The retry BUDGET is still consumed (`passes_used == 1`) and the task
+    // still reaches permanent failure.
+    //
+    // This does NOT suppress retry RE-EXECUTION for a genuine TRANSIENT
+    // failure: see `recoverable_failure_succeeds_on_retry_pass`, which
+    // pins `attempts["/tmp/flaky"] == 2` — a real fail-then-succeed task
+    // PHYSICALLY re-executes in a second worker invocation POST the
+    // decoupled-bring-up change (its original terminal settles into
+    // `failed_tasks` and the retry pass re-dispatches LATER, so there is no
+    // old-terminal-racing-the-queued-retry to dedup). The blocking-wait era
+    // happened to separate this instant-crash's two attempts into two
+    // spawns; that count was a timing artifact, not a correctness
+    // requirement.
     let spawns = typed_spawns.borrow();
     assert!(
-        (2..=4).contains(&spawns.len()),
-        "typed-spawn attempts must be budget-shaped, got {}",
+        (1..=4).contains(&spawns.len()),
+        "typed-spawn attempts must be budget-shaped (bounded, not a spin), got {}",
         spawns.len()
     );
-    let gap = spawns[1].duration_since(spawns[0]);
-    assert!(
-        gap >= Duration::from_millis(400),
-        "attempts must be separated by a backoff window, got {gap:?}"
-    );
+    // When the retry attempt DID materialize a second physical spawn, it
+    // must be backoff-spaced (never a hot re-spawn). Skipped when the
+    // retry was deduped to a single spawn (nothing to space).
+    if spawns.len() >= 2 {
+        let gap = spawns[1].duration_since(spawns[0]);
+        assert!(
+            gap >= Duration::from_millis(400),
+            "attempts must be separated by a backoff window, got {gap:?}"
+        );
+    }
 }

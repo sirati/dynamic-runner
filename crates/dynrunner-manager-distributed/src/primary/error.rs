@@ -264,6 +264,30 @@ pub enum RunError {
         /// The per-class outcome breakdown at drain time.
         outcome: OutcomeSummary,
     },
+    /// The peer mesh (≥2 compute nodes, the failover substrate) never
+    /// formed within the mesh-formation deadline
+    /// (`config.mesh_ready_timeout`). Under mesh-always the peer mesh IS
+    /// required: a ≥2-node fleet whose secondaries never report a FORMED
+    /// mesh (`MeshReady` with `peer_count >= 1`) by the deadline cannot
+    /// fail over, so the operational loop's background mesh-formation
+    /// watchdog returns this and the run aborts (the #563-Seam-0 chokepoint
+    /// broadcasts `RunAborted`; each secondary then tears down its workers
+    /// on the terminal-CRDT flag — the existing run-abort teardown).
+    ///
+    /// Distinct from `Other(String)` for the SAME reason `BringUpFailed`
+    /// is: `Other` is log-and-swallowed at the PyO3 boundary (exit 0),
+    /// which would turn a genuine mesh-formation abort into a FALSE GREEN
+    /// (the run printed a clean teardown and exited rc=0 despite aborting).
+    /// A structured variant RAISES non-zero. Distinct from `BringUpFailed`
+    /// because the fleet DID assemble (welcomes completed, work dispatched)
+    /// — only the secondary↔secondary failover mesh failed to form.
+    PeerMeshNotFormed {
+        /// Diagnosis from the watchdog: how many of how many expected
+        /// secondaries never reported a formed mesh, which ones, and the
+        /// deadline — the same wording the watchdog logs and the
+        /// `RunAborted` reason carries.
+        reason: String,
+    },
     /// Any other run-time failure — transport setup, pool
     /// construction, broadcast deliveries that exhausted retries, etc.
     ///
@@ -414,6 +438,17 @@ impl fmt::Display for RunError {
                 o = outcome.fail_oom,
                 fi = outcome.fail_final,
                 sk = outcome.skipped,
+            ),
+            Self::PeerMeshNotFormed { reason } => write!(
+                f,
+                "run aborted — peer mesh never formed: {reason}. The peer mesh \
+                 (>=2 compute nodes) is the failover substrate and is required \
+                 under mesh-always; task dispatch + execution proceeded normally \
+                 (they ride the independent primary->secondary leg), but the \
+                 secondary<->secondary mesh did not form within \
+                 --mesh-ready-timeout, so no failover is possible and the run was \
+                 aborted. If the fleet's inter-node connectivity is legitimately \
+                 slow, raise the mesh-ready timeout."
             ),
             Self::Other(msg) => f.write_str(msg),
         }

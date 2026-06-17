@@ -343,22 +343,33 @@ pub struct PrimaryConfig {
     /// and you want time for replacement secondaries to come up.
     pub fleet_dead_timeout: Duration,
 
-    /// Maximum time to wait for every connected secondary to send
-    /// `MeshReady` before issuing the `PrimaryChanged` announcement.
-    /// Secondaries emit `MeshReady` once their peer-mesh has settled
-    /// (mesh formed, watchdog elapsed, or no peers were expected for
-    /// single-secondary runs). Without the wait, the primary
-    /// previously announced `PrimaryChanged` ~750µs after every
-    /// secondary completed cert-exchange — that left the
-    /// newly-named primary "authoritative" against an empty peer
-    /// mesh for the full per-peer dial budget (10s QUIC + 10s
-    /// WSS), with every pre-mesh-formation message routed into
-    /// the void. Default `60s` — comfortably larger than the
-    /// secondary-side 30s peer-mesh watchdog plus a slack for
-    /// scheduling jitter. Stragglers past this deadline log a
-    /// warning and the run proceeds anyway (so a bug in one
-    /// secondary's mesh signalling can't deadlock the entire
-    /// dispatch).
+    /// Maximum time to wait for every EXPECTED secondary to report a
+    /// FORMED peer mesh (`MeshReady` with `peer_count >= 1`) before
+    /// issuing the `PrimaryChanged` announcement. Under mesh-always this
+    /// is the RUN-ABORT deadline: a secondary that the primary expected
+    /// to mesh but that never reports a formed mesh by this deadline
+    /// (degraded — `MeshReady(peer_count=0)` — or silent) means the peer
+    /// mesh (≥2 compute nodes, the failover substrate) genuinely never
+    /// formed, so the operational loop's mesh-formation deadline fires and the run aborts
+    /// (the #563-Seam-0 chokepoint broadcasts `RunAborted`; each
+    /// secondary then tears down its workers). This SUPERSEDES the old
+    /// degraded-tolerance behaviour (the `--jobs 2` proceed-WSS-only fix
+    /// is obsolete: no-mesh topologies are unsupported under mesh-always).
+    ///
+    /// Dispatch is NOT gated on this signal — `MeshReady` is failover
+    /// substrate only, and operational dispatch+terminals ride the
+    /// independent primary↔secondary WSS/QUIC leg (see
+    /// `should_skip_worker_for_dispatch`). So this deadline blocks ONLY
+    /// the `PrimaryChanged` self-announce, never task assignment/running.
+    ///
+    /// Default `180s` — deliberately GENEROUS so a slow-but-eventually-
+    /// formed mesh is NOT aborted prematurely: it is well past the
+    /// secondary-side 30s peer-mesh watchdog plus several per-peer
+    /// re-dial rounds (10s QUIC + 10s WSS each), and a mesh that forms
+    /// LATE re-reports `MeshReady(peer_count>=1)` (the degraded-recovery
+    /// branch in `check_peer_mesh_watchdog`) so this wait observes it and
+    /// does not abort. Only a genuinely-never-formed mesh exhausts the
+    /// deadline.
     pub mesh_ready_timeout: Duration,
 
     /// Local source-tree root the primary uses to read file
@@ -530,7 +541,7 @@ impl Default for PrimaryConfig {
             // operator opts out (`--oom-retry-max-passes 0`).
             oom_retry_max_passes: 1,
             fleet_dead_timeout: Duration::from_secs(30),
-            mesh_ready_timeout: Duration::from_secs(60),
+            mesh_ready_timeout: Duration::from_secs(180),
             source_dir: None,
             staging_strategy: crate::primary::StagingStrategy::Disabled,
             unfulfillable_reinject_max_per_task: None,

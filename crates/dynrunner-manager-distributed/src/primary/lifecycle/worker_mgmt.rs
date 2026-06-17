@@ -186,60 +186,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
     }
 
-    /// Drain whatever worker-management signals are CURRENTLY queued on
-    /// the bus (non-blocking) and run the same reaction the operational
-    /// loop's parked worker-management arm runs. Returns `true` iff a
-    /// batch was drained (at least one signal was queued).
-    ///
-    /// Single concern: let a caller OUTSIDE the operational loop service
-    /// the worker-management bus synchronously at a point where leaving a
-    /// queued `TasksAdded` unserviced would stall. The two callers are the
-    /// pre-loop waits (`wait_for_connections` / `wait_for_mesh_ready`) and
-    /// the operational-loop entry sweep:
-    ///
-    ///   - PRE-LOOP IN-WAIT SERVICING. `TasksAdded` signals emitted
-    ///     DURING a wait — a late `SecondaryCapacity` growing the roster
-    ///     (`react_to_capacity_growth`) or a `MeshReady` confirming a
-    ///     member into the assignable set (`handle_mesh_ready`'s
-    ///     confirmation-edge wakeup) — land on the bus, but the
-    ///     operational loop (the usual drain) has not started yet, so the
-    ///     dispatch recheck would be deferred past the wait and ready
-    ///     work would pool while admitted members idle. Draining +
-    ///     reacting inline dispatches NOW, per confirmation edge. (The
-    ///     `MeshReady` that `wait_for_mesh_ready` blocks on is not
-    ///     dispatch-driven: secondaries reach their operational loop via
-    ///     the ungated setup-trio fan-out and report from there.)
-    ///
-    ///   - ENTRY SWEEP. Any `TasksAdded` emitted across the pre-loop chain
-    ///     (initial empty-phase cascade, a late capacity, an `on_phase_end`
-    ///     spawn) is serviced once at loop entry so the steady state is
-    ///     reached with dispatch already a pure function of
-    ///     (ready-tasks ∩ idle-worker-capacity), never waiting for the
-    ///     next bus event to first act on a backlog.
-    ///
-    /// Take-drain-react-putback the receiver, mirroring the operational
-    /// loop's own borrow discipline (`react_to_worker_signal_batch` needs
-    /// `&mut self`; the drain needs `&mut rx`). A `None` receiver (already
-    /// consumed by a prior loop entry) is a no-op.
-    pub(crate) async fn drain_and_react_to_pending_worker_signals(&mut self) -> bool {
-        let Some(mut rx) = self.worker_mgmt_rx.take() else {
-            return false;
-        };
-        let drained = crate::worker_signal::try_collect_worker_signal_batch(&mut rx);
-        self.worker_mgmt_rx = Some(rx);
-        match drained {
-            Some(batch) => {
-                // Pre-loop in-wait servicing: no operational command channel
-                // is taken yet, so a setup task that self-execs here drives
-                // its phase cascade with no inline callback receiver (matching
-                // every other pre-loop `note_item_*` caller's `&mut None`).
-                self.react_to_worker_signal_batch(batch, &mut None).await;
-                true
-            }
-            None => false,
-        }
-    }
-
     /// The dispatch-altitude consult of the starvation oracle + command.
     /// Single concern: translate "only silent-held work remains" into a
     /// LOCAL scheduling-suspect — recover the in-flight tasks back into
@@ -324,11 +270,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// The operational loop reads `worker_mgmt_fail_outcome.is_some()` at
     /// the top of its next iteration and breaks; `run_pipeline` then
     /// returns the recorded outcome verbatim. The signal-to-`RunError`
-    /// classification happens at the single call site in
-    /// `react_to_worker_signal_batch` (generic wedge → `Other`,
-    /// consumer-policy abort → `FatalPolicyExit`); this method is the one
-    /// latch-write both classes funnel through.
-    fn record_run_fail_outcome(&mut self, outcome: RunError) {
+    /// classification happens at the call sites: the worker-management arm
+    /// (`react_to_worker_signal_batch` — generic wedge → `Other`,
+    /// consumer-policy abort → `FatalPolicyExit`), and the operational
+    /// loop's background mesh-formation watchdog (`PeerMeshNotFormed`).
+    /// This method is the one latch-write all of them funnel through —
+    /// `pub(super)` so the sibling lifecycle modules share the single
+    /// typed-fail channel rather than each inventing a return path.
+    pub(super) fn record_run_fail_outcome(&mut self, outcome: RunError) {
         // Belt to the emit chokepoint's suspenders: every recorded
         // outcome implies the dispatch freeze, including paths that
         // record directly (the phase-floor liveness check) without an

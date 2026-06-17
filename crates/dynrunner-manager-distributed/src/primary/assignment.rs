@@ -369,8 +369,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // EMIT one `TasksAdded` so the operational dispatch recheck
         // (`dispatch_to_idle_workers`, behind the mesh-confirmation /
         // backoff / already-held gates) owns it from here: the pre-loop
-        // `wait_for_mesh_ready` in-wait servicing or the operational-loop
-        // entry sweep drains the bus, and each member's `MeshReady`
+        // The operational-loop's worker-management arm drains the bus, and
+        // each member's `MeshReady`
         // confirmation edge fires its own wakeup as it lands. Decoupled
         // emit, never a direct dispatch call (the dispatch-decoupling
         // law). Emitted AFTER the fan-out above, so a co-located member's

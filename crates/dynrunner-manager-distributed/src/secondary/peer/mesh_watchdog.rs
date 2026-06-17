@@ -58,10 +58,10 @@ where
     ///      keepalives) can fail loud or skip — the contract is
     ///      owned by those callers, not by this watchdog.
     ///   2. `MeshReady` is sent with `peer_count=0` so the primary's
-    ///      `wait_for_mesh_ready` step releases its `PrimaryChanged` announcement and
-    ///      operational dispatch (over WSS, not the peer mesh) can
-    ///      flow. Without this the whole run blocks on the missing
-    ///      mesh signal.
+    ///      background mesh-formation deadline (`mesh_formation_missing`)
+    ///      observes the report and operational dispatch (over WSS, not
+    ///      the peer mesh) can flow. Without this the whole run would
+    ///      block until the mesh-formation deadline fires.
     ///   3. `peer_mesh_check_at = None` so the DEADLINE is one-shot —
     ///      but the verdict is not: the degraded-supervision branch
     ///      keeps re-evaluating the latch every tick (see below).
@@ -133,9 +133,6 @@ where
         //    (once per `DEGRADED_MESH_WARN_INTERVAL`, never per tick)
         //    keeps the fault visible while the transport retries.
         //
-        // `mesh_ready_sent` is deliberately untouched: the settled
-        // report to the primary stays once-per-primary-identity; this
-        // supervision changes only the local capability verdict.
         if self.mesh.degraded {
             let connected = self.alive_secondary_count();
             if connected > 0 {
@@ -147,6 +144,19 @@ where
                      latch cleared; failover and inter-secondary keepalive \
                      paths restored"
                 );
+                // RE-REPORT the now-FORMED mesh to the primary. The
+                // degraded path already sent a `MeshReady(peer_count=0)`
+                // and latched `mesh_ready_sent`, so without re-arming the
+                // one-shot reporter the primary would never learn the mesh
+                // formed late — and the primary's mesh-formation deadline
+                // (the run-abort condition under mesh-always) would fire on
+                // a since-healed mesh. Re-arm + re-announce so the primary
+                // observes the positive count and does NOT abort a
+                // slow-but-eventually-formed mesh. Idempotent at the
+                // primary (`handle_mesh_ready` insert is set-keyed); a
+                // duplicate after the wait already proceeded is a no-op.
+                self.mesh.mesh_ready_sent = false;
+                self.report_mesh_ready_if_needed().await;
             } else if let Some(suppressed) = self.mesh.degraded_warn.permit() {
                 tracing::warn!(
                     expected = self.mesh.peer_dial_count,
@@ -251,9 +261,9 @@ where
         }
 
         // Report mesh-ready (with the real-peer count, which is 0 in the
-        // lone case) so the primary's `wait_for_mesh_ready` step releases
-        // its `PrimaryChanged` announcement instead of blocking the full mesh-ready
-        // timeout. Fires in EVERY terminal case — full, partial, or lone
+        // lone case) so the primary's background mesh-formation deadline
+        // (`mesh_formation_missing`) observes the report instead of
+        // blocking until the full mesh-ready timeout fires. Fires in EVERY terminal case — full, partial, or lone
         // — so the primary always unblocks. Idempotent via
         // `mesh_ready_sent`.
         self.report_mesh_ready_if_needed().await;
@@ -295,7 +305,7 @@ where
         // peers that POSITIVELY have a live secondary), NOT the transport's
         // role-blind `peer_count()`. Both the `mesh_formed` test and the
         // reported `peer_count` use it so a primary-only fleet reads as
-        // zero peers, matching the primary's `wait_for_mesh_ready` which
+        // zero peers, matching the primary's mesh-formation deadline which
         // counts secondaries.
         let connected = self.alive_secondary_count() as u32;
         let no_peers_expected = self.mesh.peer_dial_count == 0;
@@ -334,9 +344,8 @@ where
         if let Err(e) = self.send_to_primary(msg).await {
             // Best-effort: log and flip the flag anyway so we
             // don't busy-retry on every keepalive tick. The
-            // primary's wait step will time out (warning, not a
-            // hard error — see lifecycle.rs `wait_for_mesh_ready`)
-            // and the run continues.
+            // primary's mesh-formation deadline will fire (warning, not
+            // a hard error) and the run continues.
             tracing::warn!(
                 error = %e,
                 "failed to send MeshReady to primary; primary will fall back to \

@@ -11,32 +11,23 @@
 //! drive the apply path, drain the coalesced batch, run the reaction)
 //! exactly as the dispatch-decoupling tests do.
 //!
-//! Capacity growth makes a member's workers EXIST in the roster; it does
-//! not make the member assignable — that is the mesh-readiness gate's
-//! sole call (`member_mesh_confirmed`, post-#360 with NO first-dispatch
-//! exemption), satisfied here by delivering the member's `MeshReady`
-//! through `handle_mesh_ready` alongside the capacity. Each test pins
-//! both halves: the capacity emits the worker-ready `TasksAdded`, and
-//! dispatch flows only once the confirmation is in.
+//! Capacity growth makes a member's workers EXIST in the roster, and that
+//! alone is now sufficient to dispatch to them: dispatch is decoupled from
+//! the peer mesh (no `MeshReady` gate — see `should_skip_worker_for_dispatch`
+//! and `mesh_readiness_gate.rs`). Each test pins: the capacity emits the
+//! worker-ready `TasksAdded`, and the recheck dispatches the ready task to
+//! the freshly-rostered idle worker immediately — no confirmation required.
 //!
-//! Three real stalls + revert-checks:
+//! Two real stalls + revert-checks:
 //!   (a) STARTUP via wire — a `SecondaryCapacity` arrives over the mesh
 //!       (`handle_cluster_mutation`) after assignment; the roster grows,
-//!       the recheck withholds while unconfirmed, and the member's
-//!       `MeshReady` (confirmation-edge `TasksAdded`) dispatches the
-//!       ready task. Revert-check: a redundant NoOp re-emit neither
-//!       re-grows the roster nor re-emits.
+//!       a `TasksAdded` is emitted, and the recheck dispatches the ready
+//!       task. Revert-check: a redundant NoOp re-emit neither re-grows the
+//!       roster nor re-emits.
 //!   (b) MID-RUN via local origination — a worker becomes ready through
 //!       the originator path (`apply_and_broadcast_cluster_mutations`,
 //!       the `handle_welcome` channel); the roster grows + the recheck
-//!       dispatches once confirmed. Revert-check: a re-origination NoOps.
-//!   (c) WAIT SELF-RECOVERY — the pre-loop bus-drain
-//!       (`drain_and_react_to_pending_worker_signals`, the mechanism
-//!       `wait_for_mesh_ready` runs inline) services the queued
-//!       `TasksAdded` signals (capacity growth + confirmation edge) and
-//!       dispatches, so a member that becomes ready during the wait is
-//!       not deferred past it. Revert-check: without the drain the freed
-//!       worker sits idle.
+//!       dispatches. Revert-check: a re-origination NoOps.
 
 use super::*;
 
@@ -89,19 +80,6 @@ fn capacity_batch(secondary: &str, n: u32) -> DistributedMessage<TestId> {
     }
 }
 
-/// The member's `MeshReady` confirmation — the gate's sole
-/// assignability fact (capacity growth alone never makes a member
-/// dispatch-eligible).
-fn mesh_ready_from(secondary_id: &str) -> DistributedMessage<TestId> {
-    DistributedMessage::MeshReady {
-        target: None,
-        sender_id: secondary_id.into(),
-        timestamp: 0.0,
-        secondary_id: secondary_id.into(),
-        peer_count: 1,
-    }
-}
-
 /// Drain every `TaskAssignment` `task_id` queued on a secondary's wire
 /// (non-blocking). `task_id == name` for `one_task`.
 fn assigned_ids(rx: &mut tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>) -> Vec<String> {
@@ -120,10 +98,9 @@ fn assigned_ids(rx: &mut tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId
 /// instant `perform_initial_assignment` ran and found assigned=0).
 ///
 /// The coordinator's PRODUCTION worker-management bus (installed at
-/// construction; receiver on `self.worker_mgmt_rx`) is left intact, so
-/// `drain_and_react_to_pending_worker_signals` — the in-wait drain — works
-/// end-to-end. A test that wants to OBSERVE the emit installs its own
-/// sender (replacing the internal one) AFTER calling this.
+/// construction; receiver on `self.worker_mgmt_rx`) is left intact. A test
+/// that wants to OBSERVE the emit installs its own sender (replacing the
+/// internal one) AFTER calling this.
 #[allow(clippy::type_complexity)]
 fn primary_one_task_no_worker() -> (
     TestPrimary,
@@ -170,9 +147,7 @@ fn primary_one_task_no_worker() -> (
 
 /// Replace the coordinator's worker-management bus sender with a fresh
 /// one whose receiver the caller keeps, so the reaction's `TasksAdded`
-/// emit is observable in-test. Use ONLY in tests that drain the emit
-/// directly (a/b) — never in the in-wait-drain test (c), which needs the
-/// internal `self.worker_mgmt_rx` pair intact.
+/// emit is observable in-test.
 fn install_observer_bus(primary: &mut TestPrimary) -> tokio_mpsc::UnboundedReceiver<WorkerMgmtSignal>
 {
     let (wm_tx, wm_rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
@@ -185,10 +160,9 @@ fn install_observer_bus(primary: &mut TestPrimary) -> tokio_mpsc::UnboundedRecei
 /// (a) STARTUP via wire. A `SecondaryCapacity` arrives over the mesh
 /// AFTER the (assigned=0) initial assignment. The wire-receive apply path
 /// (`handle_cluster_mutation`) must (1) grow the roster and (2) emit
-/// `TasksAdded`. The recheck withholds while sec-0 is unconfirmed (the
-/// mesh-readiness gate has no first-dispatch exemption); its `MeshReady`
-/// then dispatches the ready task to the freshly-rostered idle worker —
-/// no stall.
+/// `TasksAdded`; the recheck then dispatches the ready task to the
+/// freshly-rostered idle worker IMMEDIATELY — dispatch is decoupled from
+/// the peer mesh, so no `MeshReady` is required.
 #[tokio::test(flavor = "current_thread")]
 async fn late_capacity_over_wire_grows_roster_and_dispatches_ready_task() {
     let local = tokio::task::LocalSet::new();
@@ -220,29 +194,16 @@ async fn late_capacity_over_wire_grows_roster_and_dispatches_ready_task() {
                 batch.signals
             );
 
-            // The recheck runs but sec-0 has not confirmed its mesh leg:
-            // the gate withholds (capacity alone is not assignability).
-            primary.react_to_worker_signal_batch(batch, &mut None).await;
-            settle_pump().await;
-            assert!(
-                assigned_ids(&mut ends[0].1).is_empty(),
-                "no dispatch before sec-0's MeshReady confirms its leg"
-            );
-
-            // sec-0's MeshReady lands: the confirmation edge emits its own
-            // TasksAdded wakeup, and the recheck dispatches the ready task
-            // to the now-assignable idle worker — the stall is closed.
-            primary.handle_mesh_ready(mesh_ready_from("sec-0"));
-            let batch = recv_worker_signal_batch(&mut wm_rx)
-                .await
-                .expect("a confirming MeshReady must emit a wakeup batch");
+            // The recheck dispatches the ready task to the freshly-rostered
+            // idle worker — no MeshReady needed (dispatch ⊥ peer mesh).
             primary.react_to_worker_signal_batch(batch, &mut None).await;
             settle_pump().await;
             assert_eq!(
                 assigned_ids(&mut ends[0].1),
                 vec!["t".to_string()],
                 "the ready task must dispatch to the freshly-rostered idle worker \
-                 at the confirmation edge"
+                 on capacity growth — the bring-up stall is closed without a \
+                 mesh-readiness round-trip"
             );
         })
         .await;
@@ -290,9 +251,9 @@ async fn redundant_capacity_reemit_is_a_noop() {
 /// (b) MID-RUN via local origination. A worker becomes ready through the
 /// originator path (`apply_and_broadcast_cluster_mutations` — the channel
 /// `handle_welcome` uses). The roster must grow + a `TasksAdded` must be
-/// emitted; the recheck dispatches once the member's `MeshReady`
-/// confirms. Models the type-shift-respawned memmap worker becoming
-/// ready after its phase's assignment.
+/// emitted, and the recheck dispatches to the new worker IMMEDIATELY (no
+/// `MeshReady` gate). Models the type-shift-respawned memmap worker
+/// becoming ready after its phase's assignment.
 #[tokio::test(flavor = "current_thread")]
 async fn locally_originated_capacity_growth_grows_roster_and_dispatches() {
     let local = tokio::task::LocalSet::new();
@@ -332,11 +293,7 @@ async fn locally_originated_capacity_growth_grows_roster_and_dispatches() {
                 "local capacity growth must emit TasksAdded; got {:?}",
                 batch.signals
             );
-            // The member confirms its mesh leg; the recheck then
-            // dispatches to the new, now-assignable worker. (The
-            // confirmation-edge wakeup batch is coalesced into the same
-            // reaction.)
-            primary.handle_mesh_ready(mesh_ready_from("sec-0"));
+            // The recheck dispatches to the new worker — no MeshReady gate.
             primary.react_to_worker_signal_batch(batch, &mut None).await;
             settle_pump().await;
             // The capacity-batch broadcast itself rides the same wire
@@ -350,82 +307,10 @@ async fn locally_originated_capacity_growth_grows_roster_and_dispatches() {
         .await;
 }
 
-/// (c) WAIT SELF-RECOVERY. The pre-loop bus-drain that
-/// `wait_for_mesh_ready` runs inline after every `dispatch_message`
-/// (`drain_and_react_to_pending_worker_signals`) must SERVICE the queued
-/// `TasksAdded` signals — the capacity growth AND the member's
-/// confirmation-edge wakeup both land during the wait, and the inline
-/// drain dispatches the ready work NOW instead of deferring it past the
-/// wait. Neither event is dropped by the wait.
-#[tokio::test(flavor = "current_thread")]
-async fn wait_inline_drain_services_queued_capacity_signal() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            // Keep the coordinator's PRODUCTION worker-mgmt bus intact (no
-            // observer install) so the in-wait drain
-            // (`drain_and_react_to_pending_worker_signals`, which reads
-            // `self.worker_mgmt_rx`) services the real queued signals.
-            let (mut primary, mut ends, _hash, _mesh) = primary_one_task_no_worker();
-
-            // A capacity lands (e.g. a SecondaryWelcome handled during the
-            // wait), then the member's MeshReady (the wait's own subject)
-            // lands too: the applies grow the roster + confirm the member
-            // and queue `TasksAdded` signals on the bus — but the
-            // operational loop, the usual drain, has not started. This is
-            // the in-wait state.
-            primary
-                .handle_cluster_mutation(capacity_batch("sec-0", 1), &mut None)
-                .await;
-            assert_eq!(primary.alive_worker_count_for_test(), 1);
-            primary.handle_mesh_ready(mesh_ready_from("sec-0"));
-            settle_pump().await;
-            // Nothing dispatched yet: the recheck has not been run (the
-            // signals are parked on the bus).
-            assert!(
-                assigned_ids(&mut ends[0].1).is_empty(),
-                "precondition: no dispatch before the inline drain runs the recheck"
-            );
-
-            // The inline drain the wait performs services the queued
-            // signals and dispatches — self-recovery.
-            let reacted = primary.drain_and_react_to_pending_worker_signals().await;
-            assert!(reacted, "the queued TasksAdded must be drained + reacted to");
-            settle_pump().await;
-            assert_eq!(
-                assigned_ids(&mut ends[0].1),
-                vec!["t".to_string()],
-                "the in-wait inline drain must dispatch the ready task (self-recovery)"
-            );
-        })
-        .await;
-}
-
-/// (c) REVERT-CHECK. WITHOUT the inline drain, the queued `TasksAdded`
-/// signals sit unserviced: the freshly-rostered, freshly-confirmed
-/// worker stays idle and the ready task is NOT dispatched — proving the
-/// drain is load-bearing (the work would otherwise pool until the
-/// operational loop starts).
-#[tokio::test(flavor = "current_thread")]
-async fn without_inline_drain_queued_capacity_signal_strands() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (mut primary, mut ends, _hash, _mesh) = primary_one_task_no_worker();
-
-            primary
-                .handle_cluster_mutation(capacity_batch("sec-0", 1), &mut None)
-                .await;
-            assert_eq!(primary.alive_worker_count_for_test(), 1);
-            primary.handle_mesh_ready(mesh_ready_from("sec-0"));
-            settle_pump().await;
-
-            // No inline drain is run. The signals stay parked; nothing
-            // re-runs the dispatch recheck, so the worker sits idle.
-            assert!(
-                assigned_ids(&mut ends[0].1).is_empty(),
-                "without the inline drain the ready task strands at the idle worker"
-            );
-        })
-        .await;
-}
+// NOTE: the former cases (c) WAIT SELF-RECOVERY + its revert-check are
+// REMOVED. They exercised `drain_and_react_to_pending_worker_signals` —
+// the pre-loop in-wait drain of the OLD blocking `wait_for_mesh_ready`.
+// Bring-up no longer blocks on mesh formation (dispatch is decoupled and
+// the operational loop's own worker-management arm + entry sweep service
+// queued `TasksAdded`), so there is no pre-loop wait window to drain and
+// the helper was removed with the blocking wait.

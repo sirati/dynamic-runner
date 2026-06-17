@@ -365,54 +365,16 @@ async fn activate_local_primary_announces_primary_changed() {
         .await;
 }
 
-/// Emission-lifetime invariant (sub-fix A), pre-operational window: the
-/// bootstrap region (`perform_initial_assignment → wait_for_mesh_ready →
-/// activate_local_primary → operational_loop`) can outlast the
-/// secondary's primary-silence deadline while the mesh forms, yet only
-/// the operational loop used to tick keepalives. `wait_for_mesh_ready`
-/// must tick the SAME emitter so liveness is asserted across the wait.
-///
-/// Driven with paused time: one secondary is in the routable set but NOT
-/// in `mesh_ready_secondaries`, so the wait enters its loop and blocks
-/// until the mesh-ready timeout. Holding the secondary-end senders keeps
-/// `transport.recv()` pending, so the heartbeat-tick arm is what fires.
-/// Asserts at least one keepalive was emitted before the timeout returns.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn wait_for_mesh_ready_ticks_keepalive() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            // keepalive every 100ms, mesh-ready timeout at 350ms → at
-            // least three keepalive ticks fit before the wait gives up.
-            let (mut coordinator, log, _ends, _mesh) = make_recording_coordinator(
-                1,
-                Duration::from_millis(100),
-                Duration::from_millis(350),
-            );
-            seed_secondary(&mut coordinator, "sec-0");
-
-            // `sec-0` never reports MeshReady → the wait blocks on its
-            // select! until the mesh-ready deadline elapses, ticking the
-            // pre-operational keepalive arm in the meantime.
-            let mut no_cmd_rx: Option<tokio::sync::mpsc::Receiver<PrimaryCommand<TestId>>> = None;
-            coordinator
-                .wait_for_mesh_ready(&mut no_cmd_rx)
-                .await
-                .expect("wait returns on the mesh-ready timeout");
-
-            // The keepalives the wait ticked are QUEUED mesh sends; settle the
-            // production pump so any still on the egress queue reach the
-            // recorder before the count is read.
-            crate::primary::tests::settle_pump().await;
-            assert!(
-                count_keepalives(&log) >= 1,
-                "wait_for_mesh_ready must tick the keepalive emitter across the \
-                 pre-operational window; got {}",
-                count_keepalives(&log)
-            );
-        })
-        .await;
-}
+// NOTE: the former `wait_for_mesh_ready_ticks_keepalive` test was REMOVED
+// with the blocking pre-operational `wait_for_mesh_ready`. Bring-up is now
+// non-blocking (the primary goes operational + dispatches immediately; the
+// ≥2-node mesh-formation requirement is a BACKGROUND deadline polled in the
+// operational loop — see `PrimaryCoordinator::mesh_formation_missing` and the
+// op-loop's mesh-formation-deadline check). There is no longer a
+// pre-operational window during which a separate keepalive emitter must tick:
+// the operational loop's own `heartbeat_tick` asserts liveness across the
+// mesh-formation window, which the existing operational-loop heartbeat tests
+// already cover.
 
 /// The per-phase retry bucket primitive must NOT reinject entries
 /// whose `ErrorType` is `Unfulfillable { .. }`. Those are the
