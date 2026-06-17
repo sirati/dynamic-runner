@@ -294,13 +294,18 @@ const UPLOAD_TASK_ID_PREFIX: &str = "__framework_upload__";
 /// The `(source, dest)` dedup key for an [`UploadFileRef`], rendered as a
 /// single stable string. TWO files are "the same upload" iff this key matches
 /// — a file at the same `source` with the same explicit `dest` (or both
-/// derived, `dest = None`) is uploaded ONCE no matter how many work tasks list
-/// it. The key embeds BOTH coordinates because the same `source` placed at two
-/// different explicit `dest`s is two distinct uploads.
+/// derived, `dest = None`) under the same `root` is uploaded ONCE no matter how
+/// many work tasks list it. The key embeds ALL THREE coordinates because the
+/// same `source` placed at two different explicit `dest`s — or under two
+/// different mount roots (#644) — is two distinct uploads.
 fn upload_file_key(file: &UploadFileRef) -> String {
+    let root = match file.root {
+        dynrunner_core::UploadRoot::Source => "src",
+        dynrunner_core::UploadRoot::Output => "out",
+    };
     match &file.dest {
-        Some(dest) => format!("{}\u{1f}{}", file.source.display(), dest.display()),
-        None => format!("{}\u{1f}", file.source.display()),
+        Some(dest) => format!("{root}\u{1f}{}\u{1f}{}", file.source.display(), dest.display()),
+        None => format!("{root}\u{1f}{}\u{1f}", file.source.display()),
     }
 }
 
@@ -610,6 +615,7 @@ mod tests {
                 .map(|(source, dest)| UploadFileRef {
                     source: PathBuf::from(source),
                     dest: dest.map(PathBuf::from),
+                    root: dynrunner_core::UploadRoot::Source,
                 })
                 .collect(),
         );

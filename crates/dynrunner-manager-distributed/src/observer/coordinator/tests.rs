@@ -3652,6 +3652,7 @@ fn upload_setup(phase: &str, id: &str, source: &str) -> TaskInfo<TestId> {
     t.upload_file = Some(Box::new(dynrunner_core::UploadFileRef {
         source: std::path::PathBuf::from(source),
         dest: None,
+        root: dynrunner_core::UploadRoot::Source,
     }));
     t
 }

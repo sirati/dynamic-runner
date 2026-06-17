@@ -34,6 +34,7 @@ fn upload_setup_task(name: &str, affinity: Option<&str>, source: &str) -> TaskIn
     t.upload_file = Some(Box::new(dynrunner_core::UploadFileRef {
         source: std::path::PathBuf::from(source),
         dest: None,
+        root: dynrunner_core::UploadRoot::Source,
     }));
     t
 }

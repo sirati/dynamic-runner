@@ -183,14 +183,7 @@ pub(super) fn drive_rust_primary<'py>(
     // Absent → no upload action installed (any setup task that asks for
     // an upload fails loud with a wiring error — distinct from the no-ref
     // success that the mode-2 pre-staged gate produces).
-    let upload_action_obj: Option<Py<PyAny>> = match task.getattr("upload_action") {
-        Ok(v) if !v.is_none() => Some(v.unbind()),
-        _ => match job_manager.getattr("upload_task_file") {
-            Ok(m) if !m.is_none() => Some(m.unbind()),
-            _ => None,
-        },
-    };
-    if let Some(action) = upload_action_obj {
+    if let Some(action) = resolve_upload_action(task, job_manager)? {
         coord_kwargs.set_item("upload_action", action)?;
     }
 
@@ -474,4 +467,137 @@ pub(super) fn drive_rust_primary<'py>(
     log.call_method1("info", (format!("Failed: {failed}"),))?;
     log.call_method1("info", (format!("Stranded: {stranded}"),))?;
     Ok(())
+}
+
+/// Resolve the #336 P1 / #493 option-A upload callable the SLURM submitter
+/// primary installs on its setup executor. The SINGLE preference policy
+/// (extracted from [`drive_rust_primary`] so it is unit-testable in isolation;
+/// the order is unchanged):
+///
+///   1. `task.upload_action` — the consumer's own callable (the same protocol
+///      attribute the in-process local / single-process / remote-podman paths
+///      consult). Lets a SLURM consumer override the framework default (e.g. to
+///      drive a sidecar uploader).
+///   2. `job_manager.upload_task_file` (bound method) — the default SLURM
+///      upload callable; the `SlurmJobManager` already owns the gateway scp +
+///      per-blob `retry_transient` shape, so the bound method satisfies the
+///      `(source, dest, root) -> None` bridge contract directly.
+///   3. Neither present / both `None` ⇒ `None`: no upload action installed (a
+///      setup task that asks for an upload then fails loud with a wiring
+///      error, distinct from the mode-2 pre-staged no-ref success).
+fn resolve_upload_action<'py>(
+    task: &Bound<'py, PyAny>,
+    job_manager: &Bound<'py, PyAny>,
+) -> PyResult<Option<Py<PyAny>>> {
+    Ok(match task.getattr("upload_action") {
+        Ok(v) if !v.is_none() => Some(v.unbind()),
+        _ => match job_manager.getattr("upload_task_file") {
+            Ok(m) if !m.is_none() => Some(m.unbind()),
+            _ => None,
+        },
+    })
+}
+
+#[cfg(test)]
+#[cfg(feature = "test-with-python")]
+mod tests {
+    //! Pin the #493 / #644 SLURM upload-action FORWARDING preference
+    //! ([`resolve_upload_action`]) — the SLURM analogue of the distributed
+    //! manager's `upload_action_kwarg_is_stored_on_manager`. Before #644 there
+    //! was NO test pinning `drive_rust_primary`'s forwarding; this guards the
+    //! ec48f9a8 wireup against regression. Requires the interpreter (it reads
+    //! Python attributes), so it is `test-with-python`-gated like the rest of
+    //! the pyclass-touching suites.
+    use super::*;
+    use pyo3::types::PyDict;
+
+    /// A duck-typed stand-in for the consumer task object: a `SimpleNamespace`
+    /// with the given `upload_action` (a Python value or absent).
+    fn task_with(py: Python<'_>, upload_action: Option<&str>) -> Py<PyAny> {
+        let ns = PyDict::new(py);
+        if let Some(expr) = upload_action {
+            ns.set_item("upload_action", py.eval(&std::ffi::CString::new(expr).unwrap(), None, None).unwrap())
+                .unwrap();
+        }
+        let types = py.import("types").unwrap();
+        types
+            .getattr("SimpleNamespace")
+            .unwrap()
+            .call((), Some(&ns))
+            .unwrap()
+            .unbind()
+    }
+
+    /// A stand-in `job_manager`: a `SimpleNamespace` carrying (or omitting) an
+    /// `upload_task_file` callable, mirroring the real `SlurmJobManager`'s
+    /// bound-method surface the fallback binds.
+    fn job_manager_with(py: Python<'_>, has_upload_task_file: bool) -> Py<PyAny> {
+        let ns = PyDict::new(py);
+        if has_upload_task_file {
+            ns.set_item(
+                "upload_task_file",
+                py.eval(c"lambda source, dest, root=None: None", None, None)
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        let types = py.import("types").unwrap();
+        types
+            .getattr("SimpleNamespace")
+            .unwrap()
+            .call((), Some(&ns))
+            .unwrap()
+            .unbind()
+    }
+
+    #[test]
+    fn prefers_task_upload_action_when_present() {
+        Python::attach(|py| {
+            // The task's own callable wins over the job_manager default. We tag
+            // it with a sentinel attribute so we can assert WHICH callable was
+            // chosen, not just that one was.
+            let task = task_with(
+                py,
+                Some("type('U', (), {'tag': 'from_task'})()"),
+            );
+            let jm = job_manager_with(py, true);
+            let resolved = resolve_upload_action(task.bind(py), jm.bind(py))
+                .expect("resolve")
+                .expect("a callable must be resolved when task.upload_action is set");
+            let tag: String = resolved.bind(py).getattr("tag").unwrap().extract().unwrap();
+            assert_eq!(tag, "from_task", "task.upload_action must be preferred");
+        });
+    }
+
+    #[test]
+    fn falls_back_to_job_manager_upload_task_file() {
+        Python::attach(|py| {
+            // No task.upload_action ⇒ the SLURM default
+            // (`job_manager.upload_task_file`) is bound.
+            let task = task_with(py, None);
+            let jm = job_manager_with(py, true);
+            let resolved = resolve_upload_action(task.bind(py), jm.bind(py))
+                .expect("resolve");
+            assert!(
+                resolved.is_some(),
+                "absent task.upload_action must fall back to job_manager.upload_task_file"
+            );
+        });
+    }
+
+    #[test]
+    fn none_when_neither_present() {
+        Python::attach(|py| {
+            // Neither source present ⇒ no action installed (the loud-wiring-
+            // error path for any setup task that asks for an upload).
+            let task = task_with(py, None);
+            let jm = job_manager_with(py, false);
+            let resolved = resolve_upload_action(task.bind(py), jm.bind(py))
+                .expect("resolve");
+            assert!(
+                resolved.is_none(),
+                "no callable from either source must leave the kwarg unset"
+            );
+        });
+    }
 }

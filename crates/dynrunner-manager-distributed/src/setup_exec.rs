@@ -229,6 +229,7 @@ mod tests {
         t.upload_file = Some(Box::new(UploadFileRef {
             source: PathBuf::from(source),
             dest: None,
+            root: dynrunner_core::UploadRoot::Source,
         }));
         t
     }

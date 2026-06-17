@@ -13,8 +13,14 @@
 //! `SlurmJobManager.upload_task_file`):
 //!
 //! ```python
-//! def upload(source: str, dest: str | None) -> None: ...
+//! def upload(source: str, dest: str | None, root: UploadRoot) -> None: ...
 //! ```
+//!
+//! `root` (#644) is the framework mount-root selector — always passed as an
+//! explicit 3rd positional arg, never encoded into `dest`. A pre-#644 consumer
+//! override that only accepts `(source, dest)` stays compatible by tolerating
+//! the extra positional (`*_` / a defaulted param), as the upload-action
+//! typealias documents.
 //!
 //! Retry / classification (owner decision 2026-06-14, option A): the PYTHON
 //! callable owns the bounded per-blob TRANSIENT retry (the shipped
@@ -77,10 +83,16 @@ impl UploadAction for PyUploadAction {
             .dest
             .as_ref()
             .map(|d| d.to_string_lossy().into_owned());
+        // #644: the framework mount-root selector crosses as an EXPLICIT 3rd
+        // positional arg (a Python `UploadRoot` member) — never encoded into
+        // `dest`. The Python callable maps it to the cluster mount base. A
+        // 2-arg consumer override (pre-#644) stays compatible by tolerating
+        // the extra positional (e.g. `*_`), per the upload-action typealias.
+        let root = crate::pytypes::PyUploadRoot::from(file.root);
         let outcome: PyResult<()> = Python::attach(|py| {
             self.callable
                 .bind(py)
-                .call1((source.as_str(), dest.as_deref()))?;
+                .call1((source.as_str(), dest.as_deref(), root))?;
             Ok(())
         });
         match outcome {
@@ -128,16 +140,17 @@ mod tests {
 
     /// Compile a stub module exporting `record` (an arg-recording success
     /// callable) and `raise_os` / `raise_value` raising callables, plus a
-    /// `calls` list the test reads back.
+    /// `calls` list the test reads back. Each callable accepts the #644 3-arg
+    /// shape `(source, dest, root)` and records all three.
     fn stub_module<'py>(py: Python<'py>, name: &str) -> Bound<'py, PyModule> {
         let src = "calls = []\n\
-                   def record(source, dest):\n    \
-                       calls.append((source, dest))\n\
-                   def raise_os(source, dest):\n    \
-                       calls.append((source, dest))\n    \
+                   def record(source, dest, root):\n    \
+                       calls.append((source, dest, root))\n\
+                   def raise_os(source, dest, root):\n    \
+                       calls.append((source, dest, root))\n    \
                        raise OSError('scp stream reset')\n\
-                   def raise_value(source, dest):\n    \
-                       calls.append((source, dest))\n    \
+                   def raise_value(source, dest, root):\n    \
+                       calls.append((source, dest, root))\n    \
                        raise ValueError('source missing')\n";
         PyModule::from_code(
             py,
@@ -152,6 +165,19 @@ mod tests {
         UploadFileRef {
             source: std::path::PathBuf::from(source),
             dest: dest.map(std::path::PathBuf::from),
+            root: dynrunner_core::UploadRoot::Source,
+        }
+    }
+
+    fn file_ref_rooted(
+        source: &str,
+        dest: Option<&str>,
+        root: dynrunner_core::UploadRoot,
+    ) -> UploadFileRef {
+        UploadFileRef {
+            source: std::path::PathBuf::from(source),
+            dest: dest.map(std::path::PathBuf::from),
+            root,
         }
     }
 
@@ -180,10 +206,50 @@ mod tests {
         Python::attach(|py| {
             let calls = calls.bind(py).cast::<pyo3::types::PyList>().unwrap();
             assert_eq!(calls.len(), 1);
-            let (s, d): (String, Option<String>) =
+            let (s, d, r): (String, Option<String>, crate::pytypes::PyUploadRoot) =
                 calls.get_item(0).unwrap().extract().unwrap();
             assert_eq!(s, "/src/x.a");
             assert_eq!(d, Some("rel/x.a".to_string()), "the dest round-trips");
+            assert_eq!(
+                r,
+                crate::pytypes::PyUploadRoot::Source,
+                "the default Source root crosses as the 3rd arg"
+            );
+        });
+    }
+
+    #[test]
+    fn output_root_passes_as_third_arg() {
+        // #644: an `UploadFileRef { root: Output }` passes the OUTPUT selector
+        // to the stub callable as an EXPLICIT 3rd positional arg — never folded
+        // into `dest`. The default `Source` case is covered by the round-trip
+        // test above.
+        let (action, calls) = Python::attach(|py| {
+            let m = stub_module(py, "stub_upload_output_root");
+            let action = PyUploadAction::new(m.getattr("record").unwrap().unbind());
+            (action, m.getattr("calls").unwrap().unbind())
+        });
+        let res = block_on_upload(
+            action.as_ref(),
+            &file_ref_rooted("/src/o.a", Some("rel/o.a"), dynrunner_core::UploadRoot::Output),
+        );
+        assert!(res.is_ok(), "a clean callable returns Ok; got {res:?}");
+        Python::attach(|py| {
+            let calls = calls.bind(py).cast::<pyo3::types::PyList>().unwrap();
+            assert_eq!(calls.len(), 1);
+            let (s, d, r): (String, Option<String>, crate::pytypes::PyUploadRoot) =
+                calls.get_item(0).unwrap().extract().unwrap();
+            assert_eq!(s, "/src/o.a");
+            assert_eq!(
+                d,
+                Some("rel/o.a".to_string()),
+                "dest is unchanged — root is NOT folded into it"
+            );
+            assert_eq!(
+                r,
+                crate::pytypes::PyUploadRoot::Output,
+                "the OUTPUT selector crosses verbatim as the 3rd arg"
+            );
         });
     }
 

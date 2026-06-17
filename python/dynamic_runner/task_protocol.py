@@ -127,6 +127,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Protocol, runtime_checkable
 
+# Re-export the framework mount-root selector (#644) on the consumer
+# surface so a task can write ``files=[(src, dest, UploadRoot.OUTPUT)]``
+# (or pass ``root`` to a custom ``upload_action``) by importing it from
+# the same module as the task protocol. The enum is OWNED by the Rust
+# core (`dynrunner_core::UploadRoot`); this is purely a re-export.
+from ._native import UploadRoot  # noqa: F401  (re-export)
 from ._shared import TaskInfo
 
 if TYPE_CHECKING:
@@ -161,31 +167,44 @@ TaskCompletedListener = Callable[
 
 
 # Type alias for the optional ``upload_action`` task attribute (#336 P1 /
-# #493 option-A). The framework registers this callable on the in-process
-# primary's setup executor; when a TaskInfo declares ``files=[...]``, the
-# framework's #336 P2 attach derives one deduped upload setup task per
-# unique ``(source, dest)`` (executed on the source-owning member — the
-# submitter), and the executor invokes this callable for each.
-# Signature: ``(source, dest)`` where ``source`` is the on-disk path of
-# the local file to upload (as a ``str``) and ``dest`` is the cluster-side
-# destination relative to the framework's upload root (``None`` ⇒ derived
-# from the source basename). Raise ``OSError`` for a transient transport
-# fault (the framework retries a bounded number of times before falling
-# back to a permanent failure terminal) and anything else for a permanent
-# failure (NO retry — surfaces immediately as a non-recoverable setup
-# terminal whose cascade fails dependent work tasks). The Python callable
-# OWNS the per-blob transient retry (the shipped ``retry_transient``
-# helper the bulk walk uses); this seam classifies the FINAL outcome.
+# #493 option-A / #644). The framework registers this callable on the
+# in-process primary's setup executor; when a TaskInfo declares
+# ``files=[...]``, the framework's #336 P2 attach derives one deduped
+# upload setup task per unique ``(source, dest, root)`` (executed on the
+# source-owning member — the submitter), and the executor invokes this
+# callable for each.
+# Signature: ``(source, dest, root)`` where ``source`` is the on-disk path
+# of the local file to upload (as a ``str``), ``dest`` is the cluster-side
+# destination relative to the chosen mount root (``None`` ⇒ derived from
+# the source basename), and ``root`` (#644) is an :class:`UploadRoot`
+# selecting WHICH framework-owned cluster mount the upload lands under
+# (``UploadRoot.SOURCE`` ⇒ the srcbins mount, the default; or
+# ``UploadRoot.OUTPUT`` ⇒ the shared output mount). The consumer picks a
+# mount, never a host path — the framework owns the host→container mapping.
+# Raise ``OSError`` for a transient transport fault (the framework retries
+# a bounded number of times before falling back to a permanent failure
+# terminal) and anything else for a permanent failure (NO retry — surfaces
+# immediately as a non-recoverable setup terminal whose cascade fails
+# dependent work tasks). The Python callable OWNS the per-blob transient
+# retry (the shipped ``retry_transient`` helper the bulk walk uses); this
+# seam classifies the FINAL outcome.
+#
+# Back-compat: ``root`` is always passed as an explicit 3rd positional arg.
+# A pre-#644 consumer override that only accepts ``(source, dest)`` must
+# tolerate the extra positional — accept ``*_`` or a defaulted ``root``
+# parameter (e.g. ``def upload(source, dest, root=None): ...``); the
+# framework-default ``SlurmJobManager.upload_task_file`` already does.
 #
 # The SLURM packaging pipeline defaults this to
 # ``SlurmJobManager.upload_task_file`` (which already does the right
-# gateway scp + retry); the in-process local/single-process/remote-podman
-# paths consult ``getattr(task, "upload_action", None)`` only.
+# gateway scp + retry, and maps ``root`` to the cluster mount base); the
+# in-process local/single-process/remote-podman paths consult
+# ``getattr(task, "upload_action", None)`` only.
 # Runtime-spawned TaskInfos must NOT carry ``files=``: the runtime-spawn
 # path (``primary_handle.spawn_tasks``) does NOT call
 # ``augment_batch_for_staging`` today — declare ``files=`` at submit-time
 # (initial cold seed) or pre-upload from the spawner.
-UploadAction = Callable[[str, Optional[str]], None]
+UploadAction = Callable[..., None]
 
 
 # Type alias for the optional ``custom_message_handler`` task attribute

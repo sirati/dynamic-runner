@@ -442,23 +442,59 @@ pub fn required_files_storage(files: Vec<UploadFileRef>) -> Option<Box<[UploadFi
     }
 }
 
+/// The framework-owned cluster MOUNT ROOT an upload lands under (#644).
+///
+/// A consumer selects WHICH of the framework's bind-mount roots an
+/// attached file is uploaded into; it never spells a host path (the
+/// framework owns the host→container mount mapping). This is the mount
+/// SELECTOR primitive — a closed set of the roots the framework
+/// publishes, not a free path.
+///
+/// * [`UploadRoot::Source`] (the default) — the gateway srcbins dir, the
+///   SAME bind-mount root the bulk source walk populates, surfaced in a
+///   secondary container as `/app/src-network`. The pre-#644 behaviour:
+///   every upload landed here.
+/// * [`UploadRoot::Output`] — the shared output mount
+///   (`SlurmConfig::get_output_dir`), surfaced as `/app/out-network`,
+///   where the consumer's affine import gates read.
+///
+/// Wire-compatible: `#[serde(default)]` (⇒ [`UploadRoot::Source`]) so an
+/// `UploadFileRef` serialized by a peer / snapshot that predates this
+/// field decodes unchanged, and the common (`Source`) case never widens
+/// the wire when paired with `skip_serializing_if` on the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum UploadRoot {
+    /// The gateway srcbins root (`/app/src-network`). The default, and the
+    /// only root any pre-#644 upload used.
+    #[default]
+    Source,
+    /// The shared output root (`/app/out-network`).
+    Output,
+}
+
 /// The file a [`TaskKind::Setup`] upload-action task uploads to the
 /// cluster (#336 P1). Deliberately MINIMAL for P1: a `source` path on
 /// the source-owning member (the submitter / observer that physically
-/// holds the file) plus an optional explicit `dest`. P2 owns how
-/// discovery / consumers ATTACH refs to tasks; this type is only the
-/// per-file payload the registered upload callback receives.
+/// holds the file) plus an optional explicit `dest` and a framework
+/// mount-root selector. P2 owns how discovery / consumers ATTACH refs to
+/// tasks; this type is only the per-file payload the registered upload
+/// callback receives.
 ///
 /// `dest = None` ⇒ the upload callback derives the destination from
 /// `source` the same way the bulk-walk does (strip-prefix under the
-/// gateway srcbins dir). `dest = Some(p)` ⇒ upload to exactly `p` — the
-/// explicit-placement case a consumer-spawned file-setup-task uses for a
-/// shared resource that does not live under `--source`.
+/// chosen root). `dest = Some(p)` ⇒ upload to exactly `p` relative to the
+/// chosen root — the explicit-placement case a consumer-spawned
+/// file-setup-task uses for a shared resource that does not live under
+/// `--source`.
 ///
-/// Wire-compatible: `#[serde(default)]` on `dest` so a future field
-/// addition stays additive, and the whole type rides on `TaskInfo` only
-/// when present (`skip_serializing_if = "Option::is_none"` on the field),
-/// so a peer that predates #336 never sees it.
+/// `root` selects WHICH framework mount the `dest` (or derived
+/// destination) is relative to; see [`UploadRoot`]. Defaults to
+/// [`UploadRoot::Source`] (the pre-#644 behaviour).
+///
+/// Wire-compatible: `#[serde(default)]` on `dest` AND `root` so a future
+/// field addition stays additive, and the whole type rides on `TaskInfo`
+/// only when present (`skip_serializing_if` on the optional fields), so a
+/// peer that predates #336 / #644 never sees them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UploadFileRef {
     /// On-disk location of the file to upload, on the source-owning
@@ -467,11 +503,29 @@ pub struct UploadFileRef {
     /// bulk-walk's per-file path is resolved).
     pub source: PathBuf,
     /// Explicit cluster-side destination for the upload. `None` ⇒ the
-    /// callback derives it from `source` (strip-prefix under srcbins),
-    /// matching the bulk-walk's placement. `Some` ⇒ upload verbatim to
-    /// this path (the consumer-spawned shared-resource case).
+    /// callback derives it from `source` (strip-prefix under the chosen
+    /// `root`), matching the bulk-walk's placement. `Some` ⇒ upload
+    /// verbatim to this path under `root` (the consumer-spawned
+    /// shared-resource case).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dest: Option<PathBuf>,
+    /// The framework mount root the upload lands under. Defaults to
+    /// [`UploadRoot::Source`] (the srcbins root every pre-#644 upload
+    /// used); a consumer sets [`UploadRoot::Output`] to land in the shared
+    /// output mount instead. `#[serde(default)]` keeps an old serialized
+    /// form (no `root`) decoding to `Source`; `skip_serializing_if` keeps
+    /// the default off the wire so a `Source` upload is byte-identical to
+    /// the pre-#644 frame.
+    #[serde(default, skip_serializing_if = "is_default_root")]
+    pub root: UploadRoot,
+}
+
+/// Whether a [`UploadRoot`] is the serialization default ([`UploadRoot::Source`]).
+/// Used by `skip_serializing_if` so a default-root `UploadFileRef` serializes
+/// byte-identically to a pre-#644 frame (no `root` key), keeping the common
+/// case off the wire and old peers/snapshots compatible.
+fn is_default_root(root: &UploadRoot) -> bool {
+    *root == UploadRoot::default()
 }
 
 /// One edge in the per-task dep graph: the full `(phase_id, task_id)`
@@ -760,6 +814,71 @@ mod task_dep_tests {
             PhaseId::from("other"),
             "new dep untouched"
         );
+    }
+}
+
+#[cfg(test)]
+mod upload_file_ref_serde_tests {
+    //! #644 wire/snapshot back-compat for the new `root` field on
+    //! [`UploadFileRef`]. `UploadFileRef` rides the replicated CRDT
+    //! (`FrozenTaskCore::required_files` / `upload_file`, both
+    //! `#[derive(Serialize, Deserialize)]` with `pub` fields for the
+    //! def-transfer wire), so a peer / snapshot that predates this field MUST
+    //! decode unchanged.
+    use super::*;
+
+    #[test]
+    fn old_form_without_root_decodes_as_source() {
+        // A pre-#644 serialized form (no `root` key) decodes with the default
+        // root — keeping an old peer's / snapshot's frame compatible.
+        let old: UploadFileRef =
+            serde_json::from_str(r#"{"source":"/src/a"}"#).expect("decode pre-#644 form");
+        assert_eq!(old.source, PathBuf::from("/src/a"));
+        assert_eq!(old.dest, None);
+        assert_eq!(
+            old.root,
+            UploadRoot::Source,
+            "missing `root` must default to Source (wire back-compat)"
+        );
+
+        // The pre-#644 form WITH an explicit dest still decodes the same way.
+        let old_dest: UploadFileRef =
+            serde_json::from_str(r#"{"source":"/src/b","dest":"/dst/b"}"#)
+                .expect("decode pre-#644 form with dest");
+        assert_eq!(old_dest.dest, Some(PathBuf::from("/dst/b")));
+        assert_eq!(old_dest.root, UploadRoot::Source);
+    }
+
+    #[test]
+    fn default_root_is_omitted_from_the_wire() {
+        // A `Source`-root ref serializes byte-identically to a pre-#644 frame
+        // (no `root` key) — the common case never widens the wire and an old
+        // peer never sees a field it cannot decode.
+        let src_ref = UploadFileRef {
+            source: PathBuf::from("/src/a"),
+            dest: None,
+            root: UploadRoot::Source,
+        };
+        let json = serde_json::to_value(&src_ref).expect("serialize");
+        assert!(
+            json.get("root").is_none(),
+            "the default Source root must be skipped on the wire; got {json}"
+        );
+
+        // A non-default `Output` root IS serialized (so a #644-aware peer
+        // reconstructs it) and round-trips.
+        let out_ref = UploadFileRef {
+            source: PathBuf::from("/src/a"),
+            dest: None,
+            root: UploadRoot::Output,
+        };
+        let json = serde_json::to_value(&out_ref).expect("serialize output");
+        assert!(
+            json.get("root").is_some(),
+            "a non-default Output root must ride the wire; got {json}"
+        );
+        let back: UploadFileRef = serde_json::from_value(json).expect("round-trip");
+        assert_eq!(back, out_ref, "Output root round-trips");
     }
 }
 
