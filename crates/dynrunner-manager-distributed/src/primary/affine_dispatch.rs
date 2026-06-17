@@ -55,11 +55,36 @@ use dynrunner_core::{Identifier, TaskInfo};
 use dynrunner_protocol_primary_secondary::AffineCell;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use super::affine_scheduler::QueuedUnit;
+use super::affine_scheduler::{QueuedUnit, WorkPlacement};
 use super::lifecycle::dispatch::DispatchOutcome;
 use super::wire::compute_task_hash;
 use super::PrimaryCoordinator;
 use crate::cluster_state::AffineId;
+
+/// The per-secondary affine-readiness verdict for a popped WORK unit, derived
+/// from its affine deps' bitvector cells on the dispatching secondary (the
+/// readiness authority — never a global terminal). Discriminates the cell
+/// states so the gate acts correctly per shape instead of blindly re-placing
+/// on any non-`Done` (which storms on an in-flight import and livelocks on a
+/// failed one). Computed by [`PrimaryCoordinator::affine_readiness_gate`].
+enum AffineGateOutcome {
+    /// Every affine dep is `Done` on this secondary — dispatch now.
+    Ready,
+    /// A dep is `Queued` (the import is IN FLIGHT here), none `NotDone`/`Failed`
+    /// — leave the work at the queue front and let the import's terminal
+    /// re-nudge (no re-place, no re-emit: re-placing here would storm).
+    InFlightHere,
+    /// A dep is `NotDone` here (and none `Failed`) — the import was never
+    /// placed/run here: re-derive the prereq prefix + work onto THIS secondary.
+    StrandedHere,
+    /// A dep is `Failed` here, but the named OTHER secondary can still satisfy
+    /// every dep (none `Failed` there) — re-route the unit onto it. A `Failed`
+    /// cell is non-sticky, so the re-route recovers.
+    Reroute(String),
+    /// A dep is `Failed` on EVERY eligible secondary — the import cannot run
+    /// anywhere: terminal-fail the dependent (cascade) rather than spin.
+    Unsatisfiable,
+}
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Placement trigger: queue every WORK task whose non-affine deps are
@@ -77,14 +102,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// A work task is placed only when ALL its affine prereqs are
     /// ready-in-bucket (the whole schedulable unit is runnable), so a placed
     /// affine `QueuedUnit` is always dispatchable when popped. The work task
-    /// itself stays in the global pool (blocked on its affine deps): when the
-    /// placed affine prereq RUNS and completes on its secondary, the normal
-    /// terminal cascade (`note_item_completed`) unblocks it there, exactly as a
-    /// completed work prereq would — the per-secondary queue is a locality
-    /// HINT, not a second dependency authority. The affine prereq IS removed
-    /// from the pool bucket (it is now owned by the per-secondary queue,
-    /// mirroring the old gate-resolver's take-by-hash), so it is never
-    /// double-counted nor left as an inert never-dispatchable queued item.
+    /// itself stays in the global pool, ready on its non-affine deps but
+    /// withheld from the global worker view by `has_affine_dep` (the affine
+    /// deps are excluded from its pool-blocking set under Model B): it
+    /// dispatches ONLY through the per-secondary queue, whose per-secondary
+    /// bitvector readiness gate is the authority — the per-secondary queue is
+    /// a locality HINT, not a second dependency authority.
+    ///
+    /// The affine prereq STAYS in the pool bucket (it is NOT taken out): under
+    /// Model B it is the pool's placement-readiness SIGNAL + ledger token. It
+    /// is non-worker-assignable (the global worker view never grabs it) and
+    /// EXCLUDED from the phase-drain count (`counts_for_phase_drain` —
+    /// `pool::queued_count`), so it neither double-counts nor wedges the
+    /// drain; its per-secondary runs are driven off-queue by the affine
+    /// scheduler + bitvector. The token is dropped at the phase's
+    /// `Drained → Done` edge (`pool::mark_phase_done → drop_affine_items`), so
+    /// a drained phase's token can never bleed into a later phase's placement
+    /// scan.
     ///
     /// Idempotent + coalesced: a prereq already `Queued`/`Done` for the chosen
     /// secondary is not re-appended (the `place` policy skips it) and is the
@@ -250,48 +284,64 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let phase = task.phase_id.clone();
 
         // PER-SECONDARY AFFINE-READINESS GATE (the design's HINT-property safety
-        // net, Model B). A WORK unit may have been STRANDED on this secondary
-        // WITHOUT its import — e.g. an idle-steal moved the work task here after
-        // its import was already popped+dispatched elsewhere (the "partial
-        // work-stealing leaves a task without its affine deps" case). Dispatching
-        // it now would run the build on a secondary that never imported — the
-        // exact per-secondary-correctness violation the redesign prevents. So
-        // before dispatching a work unit, verify EVERY affine dep is `Done` on
-        // THIS secondary (the bitvector is the authority — never a global
-        // terminal). If any is not, RE-DERIVE: re-place the not-done prereqs
-        // ahead of the work task on THIS secondary's queue (the design's "the
-        // same dependency check re-derives and re-queues the missing affine
-        // deps"), then return — the re-queued import runs first on the next pop,
-        // and the work follows it. No special detection beyond this cell read.
+        // net, Model B). Before dispatching a WORK unit, DISCRIMINATE its affine
+        // deps' per-secondary bitvector cells on THIS secondary (the bitvector is
+        // the readiness authority — never a global terminal) and act per the cell
+        // state, rather than blindly re-placing on any non-`Done`. The four shapes
+        // and their owners are computed once in [`Self::affine_readiness_gate`];
+        // here we only carry out the chosen action:
+        //
+        //   * `Ready` (every dep `Done` here) — fall through to dispatch.
+        //   * `InFlightHere` (a dep `Queued` here, none `NotDone`/`Failed`) — the
+        //     import is RUNNING on this secondary. Do NOT re-place or re-emit
+        //     (that would storm: an idle worker re-pops W → re-place → re-emit →
+        //     loop until the import lands). Leave W at the FRONT of this queue and
+        //     return; the import's own terminal (`handle_affine_task_complete` /
+        //     `handle_affine_task_failed`) is the single owner of the re-pop nudge
+        //     (it emits `TasksAdded`), re-popping W once the cell goes
+        //     `Done`/`Failed`.
+        //   * `StrandedHere` (a dep `NotDone` here, none `Failed`) — genuinely
+        //     stranded without its import. RE-DERIVE: re-place the not-done
+        //     prereqs + the work onto THIS secondary's queue; discard the popped
+        //     orphan; re-nudge so the freshly-queued import is popped first.
+        //   * `Reroute(sec)` (a dep `Failed` here, but some OTHER eligible
+        //     secondary can still satisfy every dep) — re-place onto that
+        //     secondary; discard the orphan; re-nudge. A `Failed` cell is
+        //     non-sticky, so a re-route to a still-satisfiable secondary recovers.
+        //   * `Unsatisfiable` (a dep `Failed` on EVERY eligible secondary — the
+        //     import cannot run anywhere) — TERMINAL-FAIL the dependent (cascade),
+        //     do NOT spin. This both fixes the all-Failed LIVELOCK and realizes
+        //     the owner Q1 default (affine failure terminal-by-default).
         if is_work {
             let placement = self.affine_placement_for(&task);
-            let any_not_done = placement.affine_deps.iter().any(|(aid, _)| {
-                self.cluster_state.affine_state(secondary, *aid) != AffineCell::Done
-            });
-            if any_not_done {
-                // The popped work unit is stranded here without (all of) its
-                // import. RE-DERIVE: re-place its still-not-done prereqs + the
-                // work task onto THIS secondary's queue via the SAME `place`
-                // procedure (the design's "the same dependency check re-derives
-                // and re-queues the missing affine deps"). `place` appends
-                // `[not-done prereqs…, work]` to the tail; the popped (orphaned)
-                // copy is DISCARDED (not requeued), so the queue now carries the
-                // properly-ordered import→work prefix and the next pop runs the
-                // import first. No special detection beyond this per-secondary
-                // cell read — the bitvector is the readiness authority, never a
-                // global terminal.
-                let mutations = self.affine_scheduler.place::<I, _>(
-                    secondary,
-                    &placement,
-                    |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
-                );
-                if !mutations.is_empty() {
-                    self.apply_and_broadcast_cluster_mutations(mutations).await;
+            match self.affine_readiness_gate(secondary, &placement) {
+                AffineGateOutcome::Ready => {}
+                AffineGateOutcome::InFlightHere => {
+                    // Import in flight here: leave W at the front, let the
+                    // import's terminal re-nudge. No re-place, no emit.
+                    self.affine_scheduler.requeue_front(secondary, unit);
+                    return false;
                 }
-                // Re-nudge the recheck so the freshly-queued import is popped.
-                self.cluster_state
-                    .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
-                return false;
+                AffineGateOutcome::StrandedHere => {
+                    self.affine_replace_and_nudge(secondary, &placement).await;
+                    return false;
+                }
+                AffineGateOutcome::Reroute(target) => {
+                    self.affine_replace_and_nudge(&target, &placement).await;
+                    return false;
+                }
+                AffineGateOutcome::Unsatisfiable => {
+                    // The import failed on every eligible secondary — the work
+                    // task can never run. Take it OUT of its bucket and account
+                    // it in-flight (the symmetric accounting the dispatch path
+                    // below does), then enqueue a decoupled `FailPermanent` so
+                    // the operational loop cascades the terminal to dependents
+                    // with the proper `command_rx` (the dispatch path holds none
+                    // — the dispatch-decoupling law: emit a command, never drive
+                    // the cascade inline). The popped orphan is discarded.
+                    self.fail_unsatisfiable_affine_work(&hash, &phase);
+                    return false;
+                }
             }
         }
 
@@ -338,6 +388,153 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 self.affine_scheduler.requeue_front(secondary, unit);
                 false
             }
+        }
+    }
+
+    /// Discriminate a popped WORK unit's affine-readiness on `secondary` by
+    /// reading its deps' bitvector cells (the readiness authority). Returns the
+    /// action the gate must take — see [`AffineGateOutcome`]. The priority
+    /// among non-`Done` deps is `Failed` > `NotDone` > `Queued`: a `Failed` dep
+    /// means this secondary cannot run the unit regardless of any other dep's
+    /// state, so it forces the re-route / terminal-fail decision; a `NotDone`
+    /// dep (none failed) is the genuine stranded re-derive; an only-`Queued`
+    /// (the rest `Done`) dep is the in-flight-here no-op-but-wait. Pure reads —
+    /// no mutation, no emit.
+    fn affine_readiness_gate(
+        &self,
+        secondary: &str,
+        placement: &WorkPlacement,
+    ) -> AffineGateOutcome {
+        let mut any_failed = false;
+        let mut any_not_done = false;
+        let mut any_queued = false;
+        for (aid, _) in &placement.affine_deps {
+            match self.cluster_state.affine_state(secondary, *aid) {
+                AffineCell::Done => {}
+                AffineCell::Failed => any_failed = true,
+                AffineCell::NotDone => any_not_done = true,
+                AffineCell::Queued => any_queued = true,
+            }
+        }
+        if any_failed {
+            // This secondary cannot satisfy the unit. Re-route to an eligible
+            // secondary that can still satisfy EVERY dep (none `Failed` there),
+            // preferring it by the same locality rank a fresh placement uses; if
+            // none exists (the import failed everywhere), the unit is doomed.
+            let satisfiable = self.affine_unit_satisfiable_secondaries(placement);
+            return match self.affine_scheduler.select_secondary(
+                &satisfiable,
+                placement,
+                |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
+            ) {
+                Some(target) => AffineGateOutcome::Reroute(target),
+                None => AffineGateOutcome::Unsatisfiable,
+            };
+        }
+        if any_not_done {
+            return AffineGateOutcome::StrandedHere;
+        }
+        if any_queued {
+            return AffineGateOutcome::InFlightHere;
+        }
+        AffineGateOutcome::Ready
+    }
+
+    /// The eligible (roster) secondaries on which the unit is still SATISFIABLE
+    /// — every affine dep's cell is NOT `Failed` (a `Done`/`Queued`/`NotDone`
+    /// cell is satisfied, in flight, or placeable). The "any eligible secondary
+    /// still satisfiable?" check behind the re-route-vs-terminal-fail decision:
+    /// an empty result means the import `Failed` on every eligible secondary, so
+    /// the dependent is doomed. Reads the roster (not just the bitvector's
+    /// written secondaries) so a fresh all-`NotDone` secondary counts as
+    /// placeable.
+    fn affine_unit_satisfiable_secondaries(&self, placement: &WorkPlacement) -> Vec<String> {
+        self.affine_placement_secondaries()
+            .into_iter()
+            .filter(|sec| {
+                placement.affine_deps.iter().all(|(aid, _)| {
+                    self.cluster_state.affine_state(sec, *aid) != AffineCell::Failed
+                })
+            })
+            .collect()
+    }
+
+    /// Re-place `placement`'s still-not-done prereqs + the work onto `target`'s
+    /// per-secondary queue (the design's "re-derive and re-queue the missing
+    /// affine deps") and re-nudge the recheck so the freshly-queued import is
+    /// popped first. The popped orphan copy is DISCARDED by the caller (it
+    /// returns `false`), so the queue now carries the properly-ordered
+    /// import→work prefix. Shared by the `StrandedHere` (re-place on THIS
+    /// secondary) and `Reroute` (re-place on another satisfiable secondary)
+    /// arms — one re-derive owner.
+    async fn affine_replace_and_nudge(&mut self, target: &str, placement: &WorkPlacement) {
+        let mutations = self.affine_scheduler.place::<I, _>(
+            target,
+            placement,
+            |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
+        );
+        if !mutations.is_empty() {
+            self.apply_and_broadcast_cluster_mutations(mutations).await;
+        }
+        self.cluster_state
+            .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
+    }
+
+    /// Terminal-fail an affine-dep WORK task whose import `Failed` on every
+    /// eligible secondary (the `Unsatisfiable` gate verdict) — the cascade that
+    /// breaks the all-`Failed` livelock and realizes the owner Q1 default
+    /// (affine failure terminal-by-default).
+    ///
+    /// Takes the work item OUT of its bucket + `mark_in_flight` (the SAME
+    /// symmetric accounting the dispatch path does, so the subsequent
+    /// `on_item_failed_permanent` in-flight decrement balances — the item was
+    /// never globally dispatched but is queued, so without this the decrement
+    /// would corrupt a sibling's slot), then enqueues a decoupled
+    /// `PrimaryCommand::FailPermanent` onto the self command channel. The
+    /// operational loop drives `apply_fail_permanent` with the proper
+    /// `command_rx` (the dispatch path holds none) — the dispatch-decoupling
+    /// law: the dispatch path EMITS a command, it never drives the cascade
+    /// inline. A `Full`/`Closed` channel is a degenerate teardown state; the
+    /// drop is benign (the run is winding down). The reply oneshot is
+    /// fire-and-forget (the dropped receiver is the documented in-runtime
+    /// shape).
+    fn fail_unsatisfiable_affine_work(&mut self, hash: &str, phase: &dynrunner_core::PhaseId) {
+        // Take the queued work item out of its bucket; if it is not in a
+        // dispatchable bucket (already taken / phase not Active), the claim is
+        // stale and there is nothing to fail here — drop quietly.
+        let target = hash.to_string();
+        if self
+            .pool_mut()
+            .take_first_match(|t| compute_task_hash(t) == target)
+            .is_none()
+        {
+            return;
+        }
+        self.pool_mut().mark_in_flight(phase);
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        let reason = format!(
+            "affine import for work task {hash} FAILED on every eligible \
+             secondary — the per-secondary import cannot be satisfied anywhere, \
+             so the dependent is permanently unfulfillable"
+        );
+        let cmd = super::command_channel::PrimaryCommand::FailPermanent {
+            hash: target,
+            error: dynrunner_core::ErrorType::NonRecoverable,
+            reason,
+            reply,
+        };
+        if let Err(err) = self.command_tx.try_send(cmd) {
+            // A full/closed self-channel is a degenerate teardown state; the
+            // cascade is dropped (the work item is already out of the bucket +
+            // accounted in-flight, so it no longer dispatches — the run is
+            // winding down). Undo the in-flight bump so a surviving phase
+            // machine is not left with a phantom slot.
+            tracing::debug!(
+                task_hash = %hash,
+                error = %err,
+                "affine terminal-fail: command channel unavailable; dropping cascade"
+            );
+            self.pool_mut().on_item_finished(phase, None);
         }
     }
 
