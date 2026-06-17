@@ -798,6 +798,241 @@ async fn affine_import_failed_everywhere_terminal_fails_dependent() {
         .await;
 }
 
+/// A BACKPRESSURE-shaped `TaskFailed` from `secondary`/`worker` for `task_hash`
+/// — the exact wire shape a type-shift worker respawn's first-bind reinject
+/// sends ("worker pipe broken; respawning"). NOT a terminal: the task never ran
+/// to completion anywhere; it is a re-queue signal.
+fn task_failed_backpressure(
+    secondary: &str,
+    worker: u32,
+    task_hash: &str,
+) -> DistributedMessage<TestId> {
+    DistributedMessage::TaskFailed {
+        target: None,
+        sender_id: secondary.into(),
+        timestamp: 0.0,
+        secondary_id: secondary.into(),
+        worker_id: worker,
+        task_hash: task_hash.into(),
+        error_type: dynrunner_core::ErrorType::Recoverable,
+        error_message: "worker pipe broken; respawning".into(),
+        delivery_seq: None,
+        msgs_posted_through: None,
+    }
+}
+
+/// REGRESSION (affine-import backpressure-bounce wedge): an on-demand affine
+/// IMPORT that its secondary BACKPRESSURE-bounces (a type-shift worker respawn
+/// → first-bind reinject `TaskFailed{error_message="worker pipe broken;
+/// respawning"}`) must be recovered BY the affine subsystem — its per-secondary
+/// cell reset `Queued → NotDone` and its slot freed slot-direct — NEVER routed
+/// into the WORK pool.
+///
+/// Pre-fix: the bounce SKIPPED the affine handler (the gate required
+/// `!is_backpressure_shaped`) and fell into the generic work-pool requeue arm,
+/// which `pool.requeue`'d the import (a `SecondaryAffine` task —
+/// `is_worker_assignable() == false`, so the work pool can NEVER re-surface it)
+/// and left the cell `Queued`. The dependent work unit at the front of the
+/// secondary's affine queue then re-popped forever onto `InFlightHere`
+/// (cell == `Queued`) — a permanent stall, the import terminal having already
+/// left as the swallowed bounce.
+///
+/// Post-fix: the cell goes back to `NotDone`; the next pop reads `StrandedHere`
+/// and re-dispatches the import on-demand on a Ready worker; the import is NEVER
+/// in the work pool.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_import_backpressure_bounce_resets_cell_and_redispatches_not_pool() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+
+            // Round 1 — the dependent commits to a secondary and pops; its gate
+            // reads `NotDone` → `StrandedHere` → the import is dispatched
+            // on-demand there (cell `Queued`, the slot Assigned), the work
+            // requeued at the queue front. Capture which secondary it landed on.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut import_dispatch: Option<(String, u32)> = None;
+            for (_id, rx, _tx) in ends.iter_mut() {
+                for (_, sec, worker, h) in assignments(rx) {
+                    assert_ne!(
+                        h, build_hash,
+                        "the build must NOT dispatch before its import is Done"
+                    );
+                    if h == import_hash {
+                        assert!(
+                            import_dispatch.is_none(),
+                            "the import dispatches on exactly ONE secondary (one dependent)"
+                        );
+                        import_dispatch = Some((sec.clone(), worker));
+                    }
+                }
+            }
+            let (sec, worker) =
+                import_dispatch.expect("the on-demand import dispatched (StrandedHere)");
+
+            // The import is in flight on this secondary: cell `Queued`, slot held.
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state(&sec, affine_id),
+                AffineCell::Queued,
+                "on-demand dispatch claims the cell Queued"
+            );
+            assert!(
+                primary.secondary_has_slot_holding_hash(&sec, &import_hash),
+                "the import slot is Assigned on {sec}"
+            );
+            // The import sits in the pool as its ONE non-worker-assignable
+            // ledger TOKEN (the placement-readiness signal — never taken out;
+            // affine units are UNcounted). Capture the count so the bounce can be
+            // proven not to push a SECOND, work-pool copy. The pre-fix mis-route
+            // `pool.requeue`'d the import binary → a duplicate bucket entry.
+            let import_pool_count_before = primary
+                .pool()
+                .iter()
+                .filter(|t| compute_task_hash(t) == import_hash)
+                .count();
+            assert_eq!(
+                import_pool_count_before, 1,
+                "the affine import is its one ledger token in the pool"
+            );
+
+            // ── THE BOUNCE: a backpressure-shaped TaskFailed for the import. ──
+            primary
+                .handle_task_failed(task_failed_backpressure(&sec, worker, &import_hash), &mut None)
+                .await;
+            settle_pump().await;
+
+            // GREEN: the cell is reset to `NotDone` (NOT `Failed`, NOT left
+            // `Queued`), the slot freed, and — critically — the import is NOT in
+            // the work pool (the pre-fix mis-route would have dropped it there).
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state(&sec, affine_id),
+                AffineCell::NotDone,
+                "a backpressure bounce resets the import cell Queued → NotDone \
+                 (not Failed, not left Queued)"
+            );
+            assert!(
+                !primary.secondary_has_slot_holding_hash(&sec, &import_hash),
+                "the import slot is freed by the bounce"
+            );
+            assert_eq!(
+                primary
+                    .pool()
+                    .iter()
+                    .filter(|t| compute_task_hash(t) == import_hash)
+                    .count(),
+                import_pool_count_before,
+                "the affine import must NEVER be requeued into the work pool \
+                 (the pre-fix mis-route `pool.requeue`'d a SECOND copy of a \
+                 SecondaryAffine binary that is_worker_assignable == false could \
+                 never re-surface); the lone ledger token is unchanged"
+            );
+
+            // The dependent build is still pending, not terminal-failed (the
+            // bounce is recoverable, not a genuine import failure).
+            assert!(
+                primary
+                    .cluster_state_for_test()
+                    .task_state(&build_hash)
+                    .is_some_and(|s| !s.is_terminal()),
+                "a backpressure bounce must NOT terminal-fail the dependent"
+            );
+
+            // Round 2 — the freed worker re-evaluates; the dependent re-pops
+            // `StrandedHere` (cell == `NotDone`) and re-dispatches the import
+            // on-demand. RED pre-fix: the cell stayed `Queued`, so the re-pop hit
+            // `InFlightHere` forever and no fresh import dispatched.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut import_redispatched = false;
+            for (_id, rx, _tx) in ends.iter_mut() {
+                for (_, _sec, _worker, h) in assignments(rx) {
+                    assert_ne!(
+                        h, build_hash,
+                        "the build still must NOT dispatch before its import is Done"
+                    );
+                    if h == import_hash {
+                        import_redispatched = true;
+                    }
+                }
+            }
+            assert!(
+                import_redispatched,
+                "the import must be RE-DISPATCHED on-demand after the bounce reset \
+                 its cell to NotDone (StrandedHere) — not wedged InFlightHere forever"
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state(&sec, affine_id),
+                AffineCell::Queued,
+                "the re-dispatch re-claims the cell Queued"
+            );
+        })
+        .await;
+}
+
+/// PROTOCOL: the affine subsystem's backpressure-recovery mutation builder
+/// emits `SecondaryAffineUnqueued` (the Queued → NotDone cell reset) for an
+/// affine hash — and NEVER a `TaskRequeued` (the work-pool requeue that the
+/// pre-fix mis-route wrongly used, which does not touch the bitvector cell at
+/// all). A non-affine hash builds `None` (symmetric with
+/// `affine_terminal_mutation`), so an ordinary work bounce keeps using the
+/// generic work-pool requeue.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_backpressure_recovery_emits_unqueued_never_task_requeued() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let work = work_dep("build", "import");
+            let work_hash = compute_task_hash(&work);
+
+            let (primary, _ends, _wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, work.clone()]);
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+
+            // The affine import's bounce recovery is a `SecondaryAffineUnqueued`
+            // (Queued → NotDone) — NOT a `TaskRequeued`.
+            match primary.affine_unqueue_mutation("sec-0", &import_hash) {
+                Some(ClusterMutation::SecondaryAffineUnqueued {
+                    secondary,
+                    affine_id: aid,
+                    generation,
+                }) => {
+                    assert_eq!(secondary, "sec-0");
+                    assert_eq!(aid, affine_id.0);
+                    assert_eq!(generation, 0);
+                }
+                other => panic!(
+                    "affine backpressure recovery must emit SecondaryAffineUnqueued, \
+                     got {other:?}"
+                ),
+            }
+
+            // A non-affine (ordinary work) hash builds `None` — its bounce still
+            // routes through the generic work-pool requeue, unchanged.
+            assert!(
+                primary.affine_unqueue_mutation("sec-0", &work_hash).is_none(),
+                "a non-affine hash has no affine cell to reset — None"
+            );
+        })
+        .await;
+}
+
 /// RELOCATION-REBUILD under lazy import (c): the rebuild re-derives ONLY the
 /// dependent WORK units — it never reconstructs an import unit on the queue,
 /// regardless of the inherited `Queued` cell. The import is a DEPENDENCY derived
