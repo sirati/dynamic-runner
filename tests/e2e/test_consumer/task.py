@@ -39,17 +39,12 @@ from __future__ import annotations
 
 import logging
 import os
-import socket
 from argparse import ArgumentParser, Namespace
 from collections.abc import Iterable
 from pathlib import Path
 
 from dynamic_runner._shared import BinaryIdentifier, TaskDep, TaskInfo
 from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec, TypeId
-from dynamic_runner.worker.publish import (
-    DEFAULT_DST_ROOT,
-    ENV_DST_ROOT,
-)
 
 
 _PHASE_PRODUCE = "produce"
@@ -93,8 +88,9 @@ _AFFINE_VARIANTS = (_VARIANT_NODEP, _VARIANT_WITHDEP, _VARIANT_BOTH)
 # k=2*_BUILDS_PER_GROUP builds against WORKER_COUNT secondaries with
 # k >> WORKER_COUNT, so several builds provably co-land per secondary.
 _BUILDS_PER_GROUP = 8
-# The shared-NFS marker file the per-secondary import_action appends its node
-# identity to (one line per import invocation). Lives under the publish dst
+# The shared-NFS marker file the per-secondary import worker arm
+# (``worker._import``) appends its node identity to (one line per import
+# invocation). Lives under the publish dst
 # root (= ``/app/out-network`` in-container = the gateway's shared NFS out
 # dir), so the e2e driver reads it back via the same gateway path the failover
 # scenario ssh-reads. The COUNT of distinct node identities here is the whole
@@ -129,19 +125,6 @@ _NARRATION_MODES = (
     _NARRATION_MODE_OK,
     _NARRATION_MODE_FAIL,
 )
-
-
-def _destination_root() -> Path:
-    """The shared publish destination root, resolved the SAME way the worker
-    does (``DYNRUNNER_PUBLISH_DST_ROOT`` env, default ``/app/out-network``).
-
-    The ``import_action`` runs in the SECONDARY process (reconstructed there
-    — the #501-class path), which inherits the wrapper's bind-mount defaults,
-    so this resolves to the gateway's shared NFS out dir in SLURM mode and to
-    the scenario's tmpdir (env-redirected) in local mode. Centralised so the
-    import marker and the build marker land in the same readable place.
-    """
-    return Path(os.environ.get(ENV_DST_ROOT, DEFAULT_DST_ROOT))
 
 
 def _produce_task_id(idx: int) -> str:
@@ -194,8 +177,10 @@ class SyntheticTask:
         # discovered (an empty phase drains immediately), and keeps get_phases
         # free of the discovery-time opt-in branch — the framework's phase
         # state machine tolerates phases with zero items. The "import" phase
-        # holds the affine GATE tasks (never worker-assigned — a TaskTypeSpec
-        # is still required for the phase to exist, but no build runs there).
+        # holds the affine GATE tasks; post-#577 a gate body runs in a worker
+        # subprocess dispatched via the normal path (its TaskTypeSpec carries
+        # the worker module — see worker._import), and the gate releases this
+        # node's queued build dependents on that worker task's terminal.
         #
         # CRUCIALLY these phases carry NO inter-phase ``depends_on`` edges:
         # the ordering is expressed PURELY through per-task ``TaskDep`` edges
@@ -358,10 +343,12 @@ class SyntheticTask:
         co-land per secondary — making the run-once-under-multi-dependent
         invariant (assertion 3) non-vacuous.
 
-        The affine GATE tasks are NEVER worker-assigned; their per-secondary
-        import runs via :meth:`import_action` in the secondary process. Their
-        ``path`` still points at a staged input only to satisfy the wire
-        identifier — the gate is never opened by a worker.
+        The affine GATE tasks are marked ``is_secondary_affine``; post-#577
+        their per-secondary import body runs in a worker subprocess
+        (``worker._import``, dispatched via the normal path) and the gate
+        releases this node's queued builds on that worker task's terminal.
+        Their ``path`` points at a staged input to satisfy the wire identifier
+        (and the SLURM upload), though the import body does not read it.
 
         EVERY task gets a DISTINCT ``input-{idx}.txt`` path. The framework's
         content-hash recipe is ``{phase_id, path, identifier}`` (NOT task_id /
@@ -456,43 +443,14 @@ class SyntheticTask:
         )
         return items
 
-    def import_action(self, task_id: str, payload_json: str) -> None:
-        """Per-secondary SecondaryAffine import callback (#497).
-
-        Reconstructed FRESH in each secondary process (the #501-class path:
-        the framework reads ``getattr(task, "import_action", None)`` off the
-        ``SyntheticTask`` the secondary builds in ITS OWN process, then runs
-        this callable under the GIL inside the run-once affine executor — it
-        is NOT pickled across from the primary). RECORDS one line per
-        invocation under the shared publish-dst marker so the e2e driver can
-        COUNT distinct importing secondaries: the proof that the import ran
-        EXACTLY ONCE per secondary (never once globally, never k× per
-        secondary) is the marker carrying one line per distinct node identity.
-
-        A clean return ⇒ ``Ok`` (the gate releases this node's queued builds);
-        a raise would classify per the bridge (OSError=Transient, else
-        NonRecoverable). We never raise — recording is infallible by design,
-        and any failure here is a real wiring bug worth surfacing loudly.
-        """
-        node = socket.gethostname()
-        line = f"{node}\t{task_id}\n"
-        dst = _destination_root()
-        dst.mkdir(parents=True, exist_ok=True)
-        marker = dst / AFFINE_IMPORT_MARKER
-        # Append is atomic enough for the marker's purpose: each secondary's
-        # import runs once and writes one short line; the driver counts
-        # distinct node identities, not exact interleaving. Open in append
-        # mode so concurrent secondaries on the shared NFS never truncate
-        # each other's lines.
-        with marker.open("a", encoding="utf-8") as fh:
-            fh.write(line)
-        _logger.info(
-            "import_action: node=%s ran SecondaryAffine import for %s "
-            "(marker=%s)",
-            node,
-            task_id,
-            marker,
-        )
+    # (#577) The per-secondary ``import_action`` callback method is GONE — the
+    # framework no longer reads ``getattr(task, "import_action", None)`` (the
+    # kwarg + field were removed framework-side). The SecondaryAffine gate body
+    # now runs in a worker subprocess dispatched via the normal task-dispatch
+    # path: the import phase's ``TaskTypeSpec`` carries the worker module, and
+    # ``worker.handle`` branches on ``payload["kind"] == "import"`` to record
+    # the per-secondary import marker (see ``worker._import``). The gate
+    # releasing this node's queued builds is the worker task's terminal.
 
     # ── Per-type plumbing ──────────────────────────────────────────────
 
@@ -530,17 +488,17 @@ class SyntheticTask:
         )
         # Opt-in flag for the SecondaryAffine (#497) topology exercise. When
         # set, discovery emits the U → {I, I_dep} → k-builds gate topology
-        # instead of produce/consume, and the framework reads
-        # ``SyntheticTask.import_action`` (the per-secondary run-once import
-        # callback). Default off so existing scenarios are unaffected.
+        # instead of produce/consume, and the gate's per-secondary import body
+        # runs in a worker subprocess (``worker._import``, post-#577). Default
+        # off so existing scenarios are unaffected.
         parser.add_argument(
             "--secondary-affine",
             action="store_true",
             help=(
                 "Exercise the SecondaryAffine per-secondary run-once import "
                 "gate (#497): emit affine import gate(s) and k builds depending "
-                "on them. import_action records each invocation under the "
-                "shared publish-dst marker so the import-once-per-secondary "
+                "on them. The import worker arm records each invocation under "
+                "the shared publish-dst marker so the import-once-per-secondary "
                 "invariant can be COUNTED. See --secondary-affine-variant."
             ),
         )
@@ -687,8 +645,8 @@ def expected_affine_outputs(variant: str = _VARIANT_BOTH) -> list[str]:
     """The full set of published output filenames a successful affine run of
     ``variant`` produces: the upload stand-in (with-dep only) plus every
     build's output. The single source of truth the scenario asserts against
-    (assertion 2: ALL k builds completed). The affine GATE tasks publish
-    nothing (never worker-run)."""
+    (assertion 2: ALL k builds completed). The affine GATE tasks publish no
+    asserted output — their worker import arm records only the import marker."""
     gates = _affine_gates_for(variant)
     out: list[str] = []
     if _AFFINE_DEP_ID in gates:
@@ -732,8 +690,9 @@ def _build_task(
     drifting between the two phase loops.
 
     ``is_secondary_affine`` (default False) marks the task as a #497
-    SecondaryAffine GATE — never worker-assigned; its per-secondary import
-    runs via :meth:`SyntheticTask.import_action`.
+    SecondaryAffine GATE; post-#577 its per-secondary import body runs in a
+    worker subprocess (``worker._import``) and the gate releases this node's
+    queued build dependents on that worker task's terminal.
     """
     input_name = _input_filename(idx)
     return TaskInfo(
