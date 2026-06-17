@@ -257,7 +257,12 @@ stage_resource_fields_render() {
   fi
   local any_fail=0 label hit
   for label in "${RESOURCE_LABELS[@]}"; do
-    hit="$(ssh_user "grep -cF '$label' $OBSERVER_LOG_PATH" 2>/dev/null || echo 0)"
+    # grep -c prints its own 0 and exits 1 on no-match; swallow the
+    # nonzero exit WITHOUT a spurious second echo, then keep only the
+    # first line so $hit is always a single clean integer (empty → 0)
+    # for the (( hit == 0 )) test below.
+    hit="$(ssh_user "grep -cF '$label' $OBSERVER_LOG_PATH 2>/dev/null; true" | head -n1)"
+    hit="${hit:-0}"
     printf '    "%s": %s appearance(s)\n' "$label" "$hit"
     if (( hit == 0 )); then
       any_fail=1
@@ -367,8 +372,12 @@ stage_rolling_buffer_inference() {
     return 77
   fi
   local count
-  count="$(ssh_user "grep -cF 'periodic cluster stats' $OBSERVER_LOG_PATH" \
-    2>/dev/null || echo 0)"
+  # grep -c prints its own 0 and exits 1 on no-match; swallow the
+  # nonzero exit WITHOUT a spurious second echo, then keep only the
+  # first line so $count is always a single clean integer (empty → 0)
+  # for the (( count < 2 )) test below.
+  count="$(ssh_user "grep -cF 'periodic cluster stats' $OBSERVER_LOG_PATH 2>/dev/null; true" | head -n1)"
+  count="${count:-0}"
   printf '  observed %s "periodic cluster stats" report(s)\n' "$count"
   if (( count < 2 )); then
     printf '  run did not reach two emit cycles (≥10min); buffer life unverified\n'

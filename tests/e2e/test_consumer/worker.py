@@ -147,7 +147,10 @@ def _produce(task: Task, source_dir: Path) -> WorkerOutput:
     _logger.info(
         "produce-%d: wrote %d bytes to %s, publishing", idx, out_path.stat().st_size, out_path
     )
-    _publish(out_path)
+    # Land the canonical produce output at the publish DST root under its
+    # framework-declared name (``get_output_filename_pattern`` → produce-{idx}.out).
+    # ``consume-{idx}`` reads exactly this back from ``_destination_root()``.
+    _publish(out_path, dst=_destination_root() / out_path.name)
     # Framework-output exercise: ALSO deliver one artifact under the
     # worker's framework-threaded `--output` directory (the explicit-dst
     # publish form real consumers use). This is a DIFFERENT delivery
@@ -237,7 +240,10 @@ def _consume(task: Task, source_dir: Path) -> WorkerOutput:
         len(producer_bytes),
         out_path.stat().st_size,
     )
-    _publish(out_path)
+    # Land the canonical consume output at the publish DST root under its
+    # framework-declared name (``get_output_filename_pattern`` → consume-{idx}.out),
+    # the surface the driver's already-done / output asserts read back.
+    _publish(out_path, dst=_destination_root() / out_path.name)
     return WorkerOutput()
 
 
@@ -289,7 +295,10 @@ def _setup(task: Task) -> WorkerOutput:
     out_path = staging / setup_output_filename()
     out_path.write_bytes(b"affine-upload-stand-in\n")
     _logger.info("affine setup: published %s", out_path)
-    _publish(out_path)
+    # Land the upload stand-in output at the publish DST root under its
+    # framework-declared name (``setup_output_filename`` → affine-upload-stand-in.out),
+    # which ``expected_affine_outputs`` asserts and the with-dep gate fires on.
+    _publish(out_path, dst=_destination_root() / out_path.name)
     return WorkerOutput()
 
 
@@ -332,7 +341,10 @@ def _build(task: Task) -> WorkerOutput:
         gate,
         out_path,
     )
-    _publish(out_path)
+    # Land the build output at the publish DST root under its framework-declared
+    # name (``build_output_filename`` → {build_id}.out), the name
+    # ``expected_affine_outputs`` asserts every k build completed by.
+    _publish(out_path, dst=_destination_root() / out_path.name)
     return WorkerOutput()
 
 
