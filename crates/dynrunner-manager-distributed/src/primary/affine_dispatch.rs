@@ -617,13 +617,53 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         for placement in &placements {
             self.affine_scheduler.record_placed_work(&placement.hash);
         }
-        let mutations = self.affine_scheduler.rebuild::<I, _>(
+        // The discriminator for the relocation/failover stranded-import
+        // recovery (`place_rebuild`): is affine-id `a`'s import currently HELD by
+        // a live worker on secondary `s`? Built once from the just-reconstructed
+        // worker roster (`reconstruct_workers_from_cluster_state` ran first in
+        // `hydrate_from_cluster_state`). A `Queued` cell whose import is
+        // worker-held is a mid-run failover (the running import will terminal) —
+        // the rebuild must NOT restore its unit (double-run); a `Queued` cell
+        // whose import is NOT worker-held was placed-but-never-dispatched by the
+        // lost prior primary — its node-local unit died with that primary and
+        // must be restored ahead of its dependent work.
+        let held: HashSet<(String, AffineId)> = self.affine_imports_held_by_live_workers();
+        let mutations = self.affine_scheduler.rebuild::<I, _, _>(
             &secondaries,
             &placements,
             |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
+            |s: &str, a: AffineId| held.contains(&(s.to_string(), a)),
         );
         if !mutations.is_empty() {
             crate::cluster_state::apply_locally_for_broadcast(&mut self.cluster_state, mutations);
         }
+    }
+
+    /// The set of `(secondary, affine_id)` whose affine IMPORT is currently held
+    /// by a live (reconstructed) worker on that secondary — the rebuild's
+    /// stranded-vs-in-flight discriminator (consumed by `rebuild_affine_schedule`
+    /// → `AffineScheduler::place_rebuild`).
+    ///
+    /// Read off `self.workers` AFTER
+    /// [`PrimaryCoordinator::reconstruct_workers_from_cluster_state`] has crossed
+    /// the replicated `TaskState::InFlight { secondary, worker }` occupancy onto
+    /// the roster: an `Assigned` slot's held task hash that binds to an affine-id
+    /// is an import RUNNING on that slot's secondary. The bitvector cell key is
+    /// `(secondary, affine_id)`, so the holder key is the worker's
+    /// `secondary_id` crossed with the held task's affine-id — the same per-
+    /// secondary identity the cell uses. A `Queued` cell present in this set is
+    /// mid-run failover (in-flight import); a `Queued` cell ABSENT was
+    /// placed-but-never-dispatched (stranded by the prior primary's loss).
+    fn affine_imports_held_by_live_workers(&self) -> HashSet<(String, AffineId)> {
+        self.workers
+            .iter()
+            .filter_map(|w| {
+                let task = w.held_task()?;
+                let aid = self
+                    .cluster_state
+                    .affine_id_for_hash(&compute_task_hash(task))?;
+                Some((w.secondary_id.clone(), aid))
+            })
+            .collect()
     }
 }

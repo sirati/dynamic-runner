@@ -234,6 +234,13 @@ impl AffineScheduler {
     ///
     /// Returns the cell mutations the caller must originate (generation is
     /// stamped at the broadcast choke). `cell_of` is the AF-id bitvector read.
+    ///
+    /// The LIVE placement seam: a `Queued` cell is left as-is (its import is
+    /// already claimed AND its node-local unit is alive on this primary's
+    /// queue). The failover rebuild instead re-arms a `Queued` cell's LOST unit
+    /// via [`Self::place_core`] with a real `import_held` predicate; `place`
+    /// supplies the always-held predicate, so a `Queued` cell is never restored
+    /// here (its unit already exists).
     pub(crate) fn place<I, F>(
         &mut self,
         secondary: &str,
@@ -243,23 +250,65 @@ impl AffineScheduler {
     where
         F: Fn(&str, AffineId) -> AffineCell,
     {
+        // Always-held ⇒ a `Queued` cell is treated as "import already held" and
+        // skipped: the live queue still carries the unit, so there is nothing
+        // to restore.
+        self.place_core::<I, _, _>(secondary, placement, cell_of, |_s, _a| true)
+    }
+
+    /// The unified placement core for both the live [`Self::place`] and the
+    /// failover [`Self::rebuild`]: append `S`'s affine prereqs then the work
+    /// task. The ONLY policy difference between the two callers is the `Queued`
+    /// cell — encoded by the `import_held(S, aid)` predicate:
+    ///
+    /// * `NotDone` — queue the import unit AND emit `SecondaryAffineQueued`
+    ///   (claim the cell). Both callers behave identically here.
+    /// * `Queued` and `!import_held` — RESTORE the node-local import unit with
+    ///   NO mutation (the cell's `Queued` claim is unchanged; only the lost
+    ///   local unit is rebuilt). This is the failover-rebuild recovery for an
+    ///   import the lost prior primary PLACED-but-never-DISPATCHED: without the
+    ///   unit the dependent work pops and spins forever on the `InFlightHere`
+    ///   gate. The live `place` passes always-`true`, so this arm never fires
+    ///   for it (its unit is alive).
+    /// * `Queued` and `import_held`, or `Done`/`Failed` — leave as-is. A
+    ///   worker-held `Queued` import must NOT be re-queued (it would double-run
+    ///   the in-flight import — the failover no-reassign-in-flight law); `Done`
+    ///   is satisfied; `Failed` is non-sticky and re-routes via the dependent.
+    fn place_core<I, F, G>(
+        &mut self,
+        secondary: &str,
+        placement: &WorkPlacement,
+        cell_of: F,
+        import_held: G,
+    ) -> Vec<ClusterMutation<I>>
+    where
+        F: Fn(&str, AffineId) -> AffineCell,
+        G: Fn(&str, AffineId) -> bool,
+    {
         let queue = self.queues.entry(secondary.to_string()).or_default();
         let mut mutations = Vec::new();
         for (aid, hash) in &placement.affine_deps {
-            // Only a NOT-done cell is (re-)queued; Done/Queued/Failed are left
-            // as-is (Queued already claims this secondary; Done is satisfied;
-            // Failed is non-sticky and re-routes via the dependent, not a
-            // blind re-queue here).
-            if cell_of(secondary, *aid) == AffineCell::NotDone {
-                queue.push(QueuedUnit::Affine {
-                    affine_id: *aid,
-                    hash: hash.clone(),
-                });
-                mutations.push(ClusterMutation::SecondaryAffineQueued {
-                    secondary: secondary.to_string(),
-                    affine_id: aid.0,
-                    generation: 0,
-                });
+            match cell_of(secondary, *aid) {
+                AffineCell::NotDone => {
+                    queue.push(QueuedUnit::Affine {
+                        affine_id: *aid,
+                        hash: hash.clone(),
+                    });
+                    mutations.push(ClusterMutation::SecondaryAffineQueued {
+                        secondary: secondary.to_string(),
+                        affine_id: aid.0,
+                        generation: 0,
+                    });
+                }
+                AffineCell::Queued if !import_held(secondary, *aid) => {
+                    // Restore the lost unit (NO mutation: the claim is unchanged).
+                    queue.push(QueuedUnit::Affine {
+                        affine_id: *aid,
+                        hash: hash.clone(),
+                    });
+                }
+                // `Done`/`Failed`, or `Queued`-and-worker-held: leave as-is.
+                _ => {}
             }
         }
         queue.push(QueuedUnit::Work {
@@ -368,31 +417,43 @@ impl AffineScheduler {
         mutations
     }
 
-    /// Failover rebuild: discard every local queue, then re-run [`Self::place`]
-    /// over `placements` (the pending work pool, in a deterministic order the
-    /// caller supplies) against the inherited replicated bitvector via
-    /// `select_secondary` + `place`. Returns the accumulated cell mutations.
+    /// Failover rebuild: discard every local queue, then re-run
+    /// [`Self::place_core`] over `placements` (the pending work pool, in a
+    /// deterministic order the caller supplies) against the inherited replicated
+    /// bitvector via `select_secondary`. Returns the accumulated cell mutations.
     ///
     /// The locality claims survive failover because the bitvector — including
     /// `Queued` — is replicated; re-placing each task lands it on a secondary
     /// whose claims it can see, reproducing the pre-failover layout up to the
     /// deterministic tie-break. A cell already `Queued` for the chosen secondary
-    /// is left as-is by `place` (no duplicate mutation), so re-running on an
-    /// already-converged bitvector is a near-no-op.
-    pub(crate) fn rebuild<I, F>(
+    /// emits no duplicate mutation, but its lost node-local import unit IS
+    /// restored when no live worker holds it (`import_held(sec, aid)` is
+    /// `false`) — the relocation/failover rebuild's stranded-import recovery
+    /// (see [`Self::place_core`]). `import_held` is the caller's
+    /// reconstructed-worker view: a `Queued` cell whose import is still running
+    /// on a worker is LEFT ALONE (restoring it would double-run the in-flight
+    /// import — the failover no-reassign-in-flight law).
+    pub(crate) fn rebuild<I, F, G>(
         &mut self,
         secondaries: &[String],
         placements: &[WorkPlacement],
         cell_of: F,
+        import_held: G,
     ) -> Vec<ClusterMutation<I>>
     where
         F: Fn(&str, AffineId) -> AffineCell + Copy,
+        G: Fn(&str, AffineId) -> bool + Copy,
     {
         self.clear();
         let mut mutations = Vec::new();
         for placement in placements {
             if let Some(sec) = self.select_secondary(secondaries, placement, cell_of) {
-                mutations.extend(self.place::<I, F>(&sec, placement, cell_of));
+                mutations.extend(self.place_core::<I, F, G>(
+                    &sec,
+                    placement,
+                    cell_of,
+                    import_held,
+                ));
             }
         }
         mutations
@@ -763,12 +824,15 @@ mod tests {
         ];
         let secondaries = secs(&["s1", "s2"]);
 
+        // No import is worker-held in this default-cell layout (every cell is
+        // NotDone), so the rebuild's stranded-import discriminator never fires.
+        let no_held = |_s: &str, _a: AffineId| false;
         let mut a = AffineScheduler::default();
-        a.rebuild::<TaskId, _>(&secondaries, &placements, cells.of());
+        a.rebuild::<TaskId, _, _>(&secondaries, &placements, cells.of(), no_held);
         let mut b = AffineScheduler::default();
         // A pre-failover scheduler with stale queues rebuilds to the SAME layout.
         b.place::<TaskId, _>("s1", &work("garbage", &[]), cells.of());
-        b.rebuild::<TaskId, _>(&secondaries, &placements, cells.of());
+        b.rebuild::<TaskId, _, _>(&secondaries, &placements, cells.of(), no_held);
 
         for sec in &secondaries {
             assert_eq!(a.queue(sec), b.queue(sec), "rebuild deterministic for {sec}");
@@ -779,6 +843,88 @@ mod tests {
             .map(|s| a.queue(s).iter().filter(|u| u.is_work()).count())
             .sum();
         assert_eq!(total_work, 3);
+    }
+
+    #[test]
+    fn place_core_restores_queued_import_when_not_worker_held() {
+        // The relocation/failover bug: the prior primary PLACED the import
+        // (cell → Queued) but RELOCATED before dispatching it, so the import
+        // unit lived only in its now-lost node-local queue. On rebuild, no live
+        // worker holds it ⇒ restore the import unit ahead of the work, with NO
+        // cell mutation (the Queued claim is unchanged).
+        let mut sched = AffineScheduler::default();
+        let mut cells = Cells::default();
+        cells.set("s1", aid(0), AffineCell::Queued);
+        let p = work("w1", &[(aid(0), "a0")]);
+        let not_held = |_s: &str, _a: AffineId| false;
+        let muts: Vec<Mutation> = sched.place_core("s1", &p, cells.of(), not_held);
+        assert_eq!(
+            sched.queue("s1"),
+            &[
+                QueuedUnit::Affine { affine_id: aid(0), hash: "a0".into() },
+                QueuedUnit::Work { hash: "w1".into() },
+            ],
+            "the stranded import unit must be restored ahead of its work"
+        );
+        assert!(
+            muts.is_empty(),
+            "restoring a Queued cell's lost unit emits NO mutation (claim unchanged)"
+        );
+    }
+
+    #[test]
+    fn place_core_leaves_queued_import_when_worker_held() {
+        // Mid-run failover: a live worker holds the running import (cell Queued).
+        // Restoring the unit would DOUBLE-RUN the import — so leave it; only the
+        // work is queued, gated by the bitvector until the running import
+        // terminals the cell Done.
+        let mut sched = AffineScheduler::default();
+        let mut cells = Cells::default();
+        cells.set("s1", aid(0), AffineCell::Queued);
+        let p = work("w1", &[(aid(0), "a0")]);
+        let held = |_s: &str, _a: AffineId| true;
+        let muts: Vec<Mutation> = sched.place_core("s1", &p, cells.of(), held);
+        assert_eq!(
+            sched.queue("s1"),
+            &[QueuedUnit::Work { hash: "w1".into() }],
+            "a worker-held import must NOT be re-queued (no double-run)"
+        );
+        assert!(muts.is_empty());
+    }
+
+    #[test]
+    fn place_core_not_done_matches_place() {
+        // A NotDone cell behaves exactly as `place`: queue the import + emit the
+        // claim. The held discriminator is irrelevant for NotDone.
+        let mut sched = AffineScheduler::default();
+        let cells = Cells::default();
+        let p = work("w1", &[(aid(0), "a0")]);
+        let held = |_s: &str, _a: AffineId| true;
+        let muts: Vec<Mutation> = sched.place_core("s1", &p, cells.of(), held);
+        assert_eq!(
+            sched.queue("s1"),
+            &[
+                QueuedUnit::Affine { affine_id: aid(0), hash: "a0".into() },
+                QueuedUnit::Work { hash: "w1".into() },
+            ]
+        );
+        assert_eq!(muts.len(), 1, "NotDone is claimed (one Queued mutation)");
+    }
+
+    #[test]
+    fn place_core_skips_done_cell() {
+        let mut sched = AffineScheduler::default();
+        let mut cells = Cells::default();
+        cells.set("s1", aid(0), AffineCell::Done);
+        let p = work("w1", &[(aid(0), "a0")]);
+        let not_held = |_s: &str, _a: AffineId| false;
+        let muts: Vec<Mutation> = sched.place_core("s1", &p, cells.of(), not_held);
+        assert_eq!(
+            sched.queue("s1"),
+            &[QueuedUnit::Work { hash: "w1".into() }],
+            "a Done import is not re-queued"
+        );
+        assert!(muts.is_empty());
     }
 
     #[test]

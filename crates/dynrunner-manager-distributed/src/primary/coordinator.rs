@@ -4217,6 +4217,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.in_flight_per_type.get(type_id).copied().unwrap_or(0)
     }
 
+    /// Test-only inspector: the content hashes of `secondary`'s per-secondary
+    /// affine queue, in order (empty for an unseen secondary). Lets the failover
+    /// rebuild tests assert which import/work units are present on a secondary's
+    /// queue after `rebuild_affine_schedule` (e.g. that a stranded import unit
+    /// was reconstructed ahead of its dependent work).
+    #[cfg(test)]
+    pub fn affine_queue_hashes_for_test(&self, secondary: &str) -> Vec<String> {
+        self.affine_scheduler
+            .queue(secondary)
+            .iter()
+            .map(|u| match u {
+                super::affine_scheduler::QueuedUnit::Affine { hash, .. } => hash.clone(),
+                super::affine_scheduler::QueuedUnit::Work { hash } => hash.clone(),
+            })
+            .collect()
+    }
+
     /// Test-only inspector: does the `(secondary_id, worker_id)` slot
     /// currently hold a task whose hash equals `task_hash`? Lets the
     /// reorder/reassignment tests assert the slot's held-task identity
