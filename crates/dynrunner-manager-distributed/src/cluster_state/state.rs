@@ -700,9 +700,9 @@ pub struct ClusterState<I> {
     /// half, so the destructure guards classify it as MIXED (treated replicated
     /// for Clone/snapshot/digest of its bitvector; the gen counter is reset on
     /// Clone, not snapshotted, not digest-folded — handled inside
-    /// `AffineState`'s own `Clone` and the seam methods). Carried in Clone /
+    /// `SecondaryCellState`'s own `Clone` and the seam methods). Carried in Clone /
     /// snapshot (bitvector) / digest (bitvector) / restore (bitvector merge).
-    pub(super) affine: Box<super::affine_state::AffineState>,
+    pub(super) affine: Box<super::secondary_cell_state::SecondaryCellState>,
     /// Slurm-authoritative life-state snapshot consulted by the apply-path
     /// sticky-removal reversibility tiebreak (#546): an apply of
     /// `PeerJoined` for a peer this node already marked `Dead` at a
@@ -842,7 +842,7 @@ where
             // like `tasks`; the content-addressed registry is the same on
             // every node and the `Arc` clones are cheap).
             definitions,
-            // AF-id affine state — carried via `AffineState`'s own Clone (the
+            // AF-id affine state — carried via `SecondaryCellState`'s own Clone (the
             // bitvector is cloned, the node-local gen counter reset).
             affine,
             // Node-local runtime handle (slurm-authoritative life-state
@@ -958,7 +958,7 @@ where
             // Frozen task-def registry — REPLICATED, full clone (like
             // `tasks`; `Arc` clones are cheap).
             definitions: definitions.clone(),
-            // AF-id affine state — `Box<AffineState>`; the inner `Clone`
+            // AF-id affine state — `Box<SecondaryCellState>`; the inner `Clone`
             // carries the replicated bitvector and resets the node-local gen.
             affine: affine.clone(),
             // Node-local runtime handle — see field doc.
@@ -1133,7 +1133,7 @@ impl<I> Default for ClusterState<I> {
             settled: super::settled::SettledStore::default(),
             output_store: super::output_store::OutputStore::default(),
             definitions: super::task_def_store::TaskDefStore::default(),
-            affine: Box::new(super::affine_state::AffineState::default()),
+            affine: Box::new(super::secondary_cell_state::SecondaryCellState::default()),
             authority_snapshot: None,
             // Node-local scoped restore marker — `false` until a restore
             // scope arms it via the RAII guard.

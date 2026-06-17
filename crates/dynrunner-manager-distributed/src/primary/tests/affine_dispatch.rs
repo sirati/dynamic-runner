@@ -12,7 +12,7 @@
 use super::*;
 
 use dynrunner_core::{PhaseId, ResourceAmount, ResourceKind, TaskDep, TaskKind, TypeId};
-use dynrunner_protocol_primary_secondary::AffineCell;
+use dynrunner_protocol_primary_secondary::SecondaryCell;
 
 use crate::primary::wire::compute_task_hash;
 use crate::worker_signal::WorkerMgmtSignal;
@@ -320,7 +320,7 @@ async fn affine_import_runs_per_secondary_and_gates_each_dependent() {
                         if *h == build_0_hash || *h == build_1_hash {
                             assert_eq!(
                                 primary.cluster_state_for_test().affine_state(sec, affine_id),
-                                AffineCell::Done,
+                                SecondaryCell::Done,
                                 "build dispatched to {sec} whose import cell is NOT Done \
                                  — a dependent on a non-imported secondary; got {round:?}"
                             );
@@ -363,7 +363,7 @@ async fn affine_import_runs_per_secondary_and_gates_each_dependent() {
             for sec in ["sec-0", "sec-1"] {
                 assert_eq!(
                     primary.cluster_state_for_test().affine_state(sec, affine_id),
-                    AffineCell::Done,
+                    SecondaryCell::Done,
                     "the affine import must have RUN (cell Done) on {sec}"
                 );
             }
@@ -484,7 +484,7 @@ async fn affine_phase_drains_on_phase_end_fires_and_run_completes() {
             for sec in ["sec-0", "sec-1"] {
                 assert_eq!(
                     primary.cluster_state_for_test().affine_state(sec, affine_id),
-                    AffineCell::Done,
+                    SecondaryCell::Done,
                     "the affine import must have RUN on {sec}"
                 );
             }
@@ -654,7 +654,7 @@ async fn affine_only_phase_waits_for_import_then_drains_and_activates_dependents
             for sec in ["sec-0", "sec-1"] {
                 assert_eq!(
                     primary.cluster_state_for_test().affine_state(sec, affine_id),
-                    AffineCell::Done,
+                    SecondaryCell::Done,
                     "the affine import must have RUN on {sec}"
                 );
             }
@@ -765,7 +765,7 @@ async fn affine_import_failed_everywhere_terminal_fails_dependent() {
             for sec in ["sec-0", "sec-1"] {
                 assert_eq!(
                     primary.cluster_state_for_test().affine_state(sec, affine_id),
-                    AffineCell::Failed,
+                    SecondaryCell::Failed,
                     "the import cell must be Failed on {sec}"
                 );
             }
@@ -886,7 +886,7 @@ async fn affine_import_backpressure_bounce_resets_cell_and_redispatches_not_pool
             // The import is in flight on this secondary: cell `Queued`, slot held.
             assert_eq!(
                 primary.cluster_state_for_test().affine_state(&sec, affine_id),
-                AffineCell::Queued,
+                SecondaryCell::Queued,
                 "on-demand dispatch claims the cell Queued"
             );
             assert!(
@@ -919,7 +919,7 @@ async fn affine_import_backpressure_bounce_resets_cell_and_redispatches_not_pool
             // the work pool (the pre-fix mis-route would have dropped it there).
             assert_eq!(
                 primary.cluster_state_for_test().affine_state(&sec, affine_id),
-                AffineCell::NotDone,
+                SecondaryCell::NotDone,
                 "a backpressure bounce resets the import cell Queued → NotDone \
                  (not Failed, not left Queued)"
             );
@@ -974,7 +974,7 @@ async fn affine_import_backpressure_bounce_resets_cell_and_redispatches_not_pool
             );
             assert_eq!(
                 primary.cluster_state_for_test().affine_state(&sec, affine_id),
-                AffineCell::Queued,
+                SecondaryCell::Queued,
                 "the re-dispatch re-claims the cell Queued"
             );
         })
@@ -1193,7 +1193,7 @@ async fn affine_import_on_n_secondaries_satisfies_run_completion_once() {
             for sec in ["sec-0", "sec-1"] {
                 assert_eq!(
                     primary.cluster_state_for_test().affine_state(sec, affine_id),
-                    AffineCell::Done,
+                    SecondaryCell::Done,
                     "the affine import must have RUN on {sec} (N concurrent runs)"
                 );
             }
@@ -1414,7 +1414,7 @@ async fn affine_all_failed_batch_fast_fails_every_dependent_promptly() {
                 }
                 let both_failed = ["sec-0", "sec-1"].iter().all(|sec| {
                     primary.cluster_state_for_test().affine_state(sec, affine_id)
-                        == AffineCell::Failed
+                        == SecondaryCell::Failed
                 });
                 if both_failed {
                     break;
@@ -1426,7 +1426,7 @@ async fn affine_all_failed_batch_fast_fails_every_dependent_promptly() {
             for sec in ["sec-0", "sec-1"] {
                 assert_eq!(
                     primary.cluster_state_for_test().affine_state(sec, affine_id),
-                    AffineCell::Failed,
+                    SecondaryCell::Failed,
                     "the import cell must be Failed on {sec} (the arming transition)"
                 );
             }
@@ -1514,7 +1514,7 @@ async fn affine_partial_failed_does_not_fast_fail_dependents() {
                         // The build dispatched on a Done secondary — complete it.
                         assert_eq!(
                             primary.cluster_state_for_test().affine_state(sec, affine_id),
-                            AffineCell::Done,
+                            SecondaryCell::Done,
                             "the build must only dispatch where the import is Done"
                         );
                         primary
@@ -1611,7 +1611,7 @@ async fn affine_fresh_secondary_keeps_gate_satisfiable_no_premature_fail() {
                     } else if *h == build_hash {
                         assert_eq!(
                             primary.cluster_state_for_test().affine_state(sec, affine_id),
-                            AffineCell::Done,
+                            SecondaryCell::Done,
                             "the build must only dispatch where the import is Done"
                         );
                         primary
@@ -1757,7 +1757,7 @@ async fn affine_all_failed_batch_scales_past_command_channel_capacity() {
                 }
                 let both_failed = ["sec-0", "sec-1"].iter().all(|sec| {
                     primary.cluster_state_for_test().affine_state(sec, affine_id)
-                        == AffineCell::Failed
+                        == SecondaryCell::Failed
                 });
                 if both_failed {
                     break;
@@ -1767,7 +1767,7 @@ async fn affine_all_failed_batch_scales_past_command_channel_capacity() {
             for sec in ["sec-0", "sec-1"] {
                 assert_eq!(
                     primary.cluster_state_for_test().affine_state(sec, affine_id),
-                    AffineCell::Failed,
+                    SecondaryCell::Failed,
                     "the import cell must be Failed on {sec} (arming transition)"
                 );
             }
@@ -1902,27 +1902,27 @@ async fn affine_gate_inflight_dep_is_unmet_not_skipped_to_delta() {
             let mut cell_gen: u64 = 1;
             let mut set = |primary: &mut TestPrimary,
                            sec: &str,
-                           aid: crate::cluster_state::AffineId,
-                           cell: AffineCell| {
+                           aid: crate::cluster_state::SecondaryCellId,
+                           cell: SecondaryCell| {
                 let g = cell_gen;
                 cell_gen += 1;
                 let mutation = match cell {
-                    AffineCell::Queued => ClusterMutation::SecondaryAffineQueued {
+                    SecondaryCell::Queued => ClusterMutation::SecondaryAffineQueued {
                         secondary: sec.into(),
                         affine_id: aid.0,
                         generation: g,
                     },
-                    AffineCell::Done => ClusterMutation::SecondaryAffineFinished {
+                    SecondaryCell::Done => ClusterMutation::SecondaryAffineFinished {
                         secondary: sec.into(),
                         affine_id: aid.0,
                         generation: g,
                     },
-                    AffineCell::Failed => ClusterMutation::SecondaryAffineFailed {
+                    SecondaryCell::Failed => ClusterMutation::SecondaryAffineFailed {
                         secondary: sec.into(),
                         affine_id: aid.0,
                         generation: g,
                     },
-                    AffineCell::NotDone => ClusterMutation::SecondaryAffineUnqueued {
+                    SecondaryCell::NotDone => ClusterMutation::SecondaryAffineUnqueued {
                         secondary: sec.into(),
                         affine_id: aid.0,
                         generation: g,
@@ -1935,7 +1935,7 @@ async fn affine_gate_inflight_dep_is_unmet_not_skipped_to_delta() {
 
             // THE BUG SHAPE: base in flight (Queued), delta NotDone. Must WAIT on
             // the unmet in-flight base — NOT skip to (and assign) the delta.
-            set(&mut primary, "sec-0", base_aid, AffineCell::Queued);
+            set(&mut primary, "sec-0", base_aid, SecondaryCell::Queued);
             assert_eq!(
                 label(&primary),
                 "InFlightHere",
@@ -1946,7 +1946,7 @@ async fn affine_gate_inflight_dep_is_unmet_not_skipped_to_delta() {
 
             // base NotDone, delta NotDone → first not-Done is the base (NotDone),
             // so StrandedHere dispatches the base import (correct: base first).
-            set(&mut primary, "sec-0", base_aid, AffineCell::NotDone);
+            set(&mut primary, "sec-0", base_aid, SecondaryCell::NotDone);
             assert_eq!(
                 label(&primary),
                 "StrandedHere",
@@ -1956,7 +1956,7 @@ async fn affine_gate_inflight_dep_is_unmet_not_skipped_to_delta() {
             // base Done, delta NotDone → advance past the met base to the delta
             // (NotDone) → StrandedHere on the delta (the original single-worker
             // order: base lands, THEN the delta dispatches).
-            set(&mut primary, "sec-0", base_aid, AffineCell::Done);
+            set(&mut primary, "sec-0", base_aid, SecondaryCell::Done);
             assert_eq!(
                 label(&primary),
                 "StrandedHere",
@@ -1964,7 +1964,7 @@ async fn affine_gate_inflight_dep_is_unmet_not_skipped_to_delta() {
             );
 
             // base Done, delta Queued (in flight) → the delta is now the unmet one.
-            set(&mut primary, "sec-0", delta_aid, AffineCell::Queued);
+            set(&mut primary, "sec-0", delta_aid, SecondaryCell::Queued);
             assert_eq!(
                 label(&primary),
                 "InFlightHere",
@@ -1972,14 +1972,14 @@ async fn affine_gate_inflight_dep_is_unmet_not_skipped_to_delta() {
             );
 
             // base Done, delta Done → Ready.
-            set(&mut primary, "sec-0", delta_aid, AffineCell::Done);
+            set(&mut primary, "sec-0", delta_aid, SecondaryCell::Done);
             assert_eq!(label(&primary), "Ready", "all deps Done → Ready");
 
             // FAILED IS ORDER-INDEPENDENT (unchanged): base Failed on sec-0 but
             // sec-1 still satisfiable → Reroute(sec-1). Reset sec-0's delta cell so
             // only the (order-independent) Failed base drives the decision.
-            set(&mut primary, "sec-0", delta_aid, AffineCell::NotDone);
-            set(&mut primary, "sec-0", base_aid, AffineCell::Failed);
+            set(&mut primary, "sec-0", delta_aid, SecondaryCell::NotDone);
+            set(&mut primary, "sec-0", base_aid, SecondaryCell::Failed);
             assert_eq!(
                 label(&primary),
                 "Reroute(sec-1)",
@@ -1988,7 +1988,7 @@ async fn affine_gate_inflight_dep_is_unmet_not_skipped_to_delta() {
             );
 
             // base Failed on EVERY secondary → Unsatisfiable (unchanged).
-            set(&mut primary, "sec-1", base_aid, AffineCell::Failed);
+            set(&mut primary, "sec-1", base_aid, SecondaryCell::Failed);
             assert_eq!(
                 primary.affine_gate_label_for_test("sec-0", &build),
                 "Unsatisfiable",
@@ -2049,7 +2049,7 @@ async fn affine_multiworker_same_node_delta_never_assigned_before_base_done() {
                         if *h == delta_a_hash || *h == delta_b_hash {
                             assert_eq!(
                                 primary.cluster_state_for_test().affine_state(sec, base_aid),
-                                AffineCell::Done,
+                                SecondaryCell::Done,
                                 "a DELTA import was assigned on {sec} whose BASE cell \
                                  is NOT Done — an unmet in-flight base was skipped \
                                  (the multi-worker race); got {round:?}"

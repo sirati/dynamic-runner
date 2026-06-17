@@ -3,9 +3,9 @@
 //! snapshot/digest/restore round-trip, and the failover gen-floor resume.
 
 use super::*;
-use crate::cluster_state::AffineId;
+use crate::cluster_state::SecondaryCellId;
 use dynrunner_core::TaskKind;
-use dynrunner_protocol_primary_secondary::AffineCell;
+use dynrunner_protocol_primary_secondary::SecondaryCell;
 
 /// A `TaskKind::SecondaryAffine` task fixture (twin of `mk_task`).
 fn mk_affine_task(name: &str) -> TaskInfo<RunnerIdentifier> {
@@ -121,7 +121,7 @@ fn cell_apply_is_lww_and_idempotent() {
         },
     ];
     crate::cluster_state::apply_locally_for_broadcast(&mut s, cells);
-    assert_eq!(s.affine_state("s1", aid), AffineCell::Done);
+    assert_eq!(s.affine_state("s1", aid), SecondaryCell::Done);
 
     // A STALE Failed at generation 1 (below the stamped Finished) is a NoOp.
     assert_eq!(
@@ -132,7 +132,7 @@ fn cell_apply_is_lww_and_idempotent() {
         }),
         ApplyOutcome::NoOp
     );
-    assert_eq!(s.affine_state("s1", aid), AffineCell::Done);
+    assert_eq!(s.affine_state("s1", aid), SecondaryCell::Done);
 }
 
 /// The load-bearing convergence case: two replicas that diverge on a cell
@@ -171,8 +171,8 @@ fn steal_reset_converges_via_snapshot_restore() {
     a_into_b.restore(b.snapshot());
     let mut b_into_a = b.clone();
     b_into_a.restore(a.snapshot());
-    assert_eq!(a_into_b.affine_state("s1", AffineId(0)), AffineCell::NotDone);
-    assert_eq!(b_into_a.affine_state("s1", AffineId(0)), AffineCell::NotDone);
+    assert_eq!(a_into_b.affine_state("s1", SecondaryCellId(0)), SecondaryCell::NotDone);
+    assert_eq!(b_into_a.affine_state("s1", SecondaryCellId(0)), SecondaryCell::NotDone);
 }
 
 /// The digest DETECTS an affine-cell divergence (count-OR-hash), and a
@@ -194,7 +194,7 @@ fn digest_detects_and_restore_heals_affine_divergence() {
     // Restore heals: B pulls A's snapshot and converges.
     let mut b = b;
     b.restore(a.snapshot());
-    assert_eq!(b.affine_state("s1", AffineId(0)), AffineCell::Done);
+    assert_eq!(b.affine_state("s1", SecondaryCellId(0)), SecondaryCell::Done);
     assert!(!b.digest().is_behind(&a.digest()));
     assert!(!a.digest().is_behind(&b.digest()));
 }
@@ -501,5 +501,5 @@ fn failover_resumes_cell_generation_past_inherited() {
         generation: 0, // stamped at the choke point, resumed past 100
     }];
     crate::cluster_state::apply_locally_for_broadcast(&mut s, cells);
-    assert_eq!(s.affine_state("s1", AffineId(0)), AffineCell::Done);
+    assert_eq!(s.affine_state("s1", SecondaryCellId(0)), SecondaryCell::Done);
 }

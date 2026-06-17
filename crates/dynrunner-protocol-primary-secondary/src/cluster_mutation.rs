@@ -249,20 +249,22 @@ pub enum PrimaryChangeReason {
     Transferred,
 }
 
-/// The per-(secondary, affine-id) completion CELL of the replicated affine
-/// bitvector — the value half of one 2-bit cell (the bitvector packs these
+/// The per-(secondary, cell-id) completion CELL of the replicated per-secondary
+/// cell bitvector — the value half of one 2-bit cell (the bitvector packs these
 /// two bits each; this is the logical view the mutations + state-query helpers
-/// speak). Every cell starts [`Self::NotDone`].
+/// speak). KIND-BLIND: the same cell value backs every per-secondary scheduling
+/// kind that needs a 2-bit completion cell (affine + eager-prep). Every cell
+/// starts [`Self::NotDone`].
 ///
 /// LATTICE NOTE: the cell is NOT a join-semilattice on its own — the idle-steal
 /// performs a `Queued → NotDone` un-queue (it relinquishes a queued claim), so
 /// there is no monotone partial order under which every transition only moves
 /// UP. Convergence is therefore achieved by a per-cell LAST-WRITER-WINS stamp
 /// (the `generation` the mutations carry — primary-monotone, failover-resumed),
-/// NOT by a value max-join. See the `affine_state` module's merge doc.
+/// NOT by a value max-join. See the `secondary_cell_state` module's merge doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum AffineCell {
-    /// `00` — the affine def is neither queued nor terminal on this secondary.
+pub enum SecondaryCell {
+    /// `00` — the def is neither queued nor terminal on this secondary.
     #[default]
     NotDone,
     /// `01` — the affine def is QUEUED on this secondary (a locality claim the
@@ -1300,7 +1302,7 @@ pub enum ClusterMutation<I> {
         affine_id: u32,
     },
     /// Set the affine bitvector CELL for `(secondary, affine_id)` to DONE
-    /// (`11`). LWW per cell on `generation` (see [`AffineCell`]'s lattice
+    /// (`11`). LWW per cell on `generation` (see [`SecondaryCell`]'s lattice
     /// note): a strictly-greater generation wins; equal/older is a NoOp
     /// (idempotent under at-least-once + snapshot replay).
     SecondaryAffineFinished {

@@ -952,7 +952,7 @@ impl<I: Identifier> ClusterState<I> {
             } => self.apply_secondary_affine_cell(
                 &secondary,
                 affine_id,
-                dynrunner_protocol_primary_secondary::AffineCell::Done,
+                dynrunner_protocol_primary_secondary::SecondaryCell::Done,
                 generation,
             ),
             ClusterMutation::SecondaryAffineQueued {
@@ -962,7 +962,7 @@ impl<I: Identifier> ClusterState<I> {
             } => self.apply_secondary_affine_cell(
                 &secondary,
                 affine_id,
-                dynrunner_protocol_primary_secondary::AffineCell::Queued,
+                dynrunner_protocol_primary_secondary::SecondaryCell::Queued,
                 generation,
             ),
             ClusterMutation::SecondaryAffineFailed {
@@ -972,7 +972,7 @@ impl<I: Identifier> ClusterState<I> {
             } => self.apply_secondary_affine_cell(
                 &secondary,
                 affine_id,
-                dynrunner_protocol_primary_secondary::AffineCell::Failed,
+                dynrunner_protocol_primary_secondary::SecondaryCell::Failed,
                 generation,
             ),
             ClusterMutation::SecondaryAffineUnqueued {
@@ -982,7 +982,7 @@ impl<I: Identifier> ClusterState<I> {
             } => self.apply_secondary_affine_cell(
                 &secondary,
                 affine_id,
-                dynrunner_protocol_primary_secondary::AffineCell::NotDone,
+                dynrunner_protocol_primary_secondary::SecondaryCell::NotDone,
                 generation,
             ),
         }

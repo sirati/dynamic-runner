@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::{Identifier, PhaseId, TaskInfo, TaskOutputs, TerminalOutcomeCounts};
 use dynrunner_protocol_primary_secondary::{
-    AffineCell, DiscoveryDebt, SecondaryCapacityRecord, SecondaryResourceSampleRecord,
+    SecondaryCell, DiscoveryDebt, SecondaryCapacityRecord, SecondaryResourceSampleRecord,
 };
 use serde::{Deserialize, Serialize};
 
@@ -499,7 +499,7 @@ pub struct ClusterStateSnapshot<I> {
     /// the owned `(affine_id, cell, generation)` tuple list so the snapshot
     /// carries no in-crate type.
     #[serde(default)]
-    pub affine: HashMap<String, Vec<(u32, AffineCell, u64)>>,
+    pub affine: HashMap<String, Vec<(u32, SecondaryCell, u64)>>,
 }
 
 impl<I> Default for ClusterStateSnapshot<I> {
@@ -733,7 +733,7 @@ impl<I: Identifier> ClusterState<I> {
             // per-secondary affine bitvector is per-cell LWW (never join-bumped
             // by the task merge, unlike the F4 grow-max tally), so import order
             // vs the task batch is free and it rides the head.
-            // The BOXED `AffineState`: its REPLICATED bitvector half is carried
+            // The BOXED `SecondaryCellState`: its REPLICATED bitvector half is carried
             // below (head-safe — per-cell LWW, never join-bumped); its
             // node-local gen-counter half never crosses the wire (a restoring
             // replica cold-starts it and re-anchors via the gen-floor resume),
@@ -1409,6 +1409,6 @@ impl<I: Identifier> ClusterState<I> {
         // stamp counter past every inherited cell generation.
         self.affine
             .bitvector_mut()
-            .merge(&super::affine_state::AffineBitvector::from_wire(affine));
+            .merge(&super::secondary_cell_state::SecondaryCellBitvector::from_wire(affine));
     }
 }

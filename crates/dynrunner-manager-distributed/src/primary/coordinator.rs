@@ -1135,7 +1135,7 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// BOXED so the per-secondary-affine consumer state (the queues + the
     /// placement-idempotency guard) adds exactly ONE pointer to the
     /// coordinator's already-large inline footprint — the same boxing rationale
-    /// `cluster_state::affine_state::AffineState` documents: the coordinator is
+    /// `cluster_state::secondary_cell_state::SecondaryCellState` documents: the coordinator is
     /// held BY VALUE across `.await` in the deeply-nested operational /
     /// relocation futures, so inline growth costs STACK (the debug-build
     /// relocation futures sit near the default test stack limit; an inline

@@ -48,9 +48,9 @@
 
 use std::collections::HashMap;
 
-use dynrunner_protocol_primary_secondary::{AffineCell, ClusterMutation};
+use dynrunner_protocol_primary_secondary::{SecondaryCell, ClusterMutation};
 
-use crate::cluster_state::AffineId;
+use crate::cluster_state::SecondaryCellId;
 
 /// One placed item on a secondary's local queue: either an affine prereq (its
 /// affine-id + content hash, so the dispatch path can resolve the task body)
@@ -69,7 +69,7 @@ pub(crate) enum QueuedUnit {
     /// An affine prereq: run this affine def on the owning secondary. Carries
     /// the affine-id (the bitvector cell key) and the content hash (the
     /// dispatch key).
-    Affine { affine_id: AffineId, hash: String },
+    Affine { affine_id: SecondaryCellId, hash: String },
     /// A work task gated on the affine prereqs queued before it.
     Work { hash: String },
 }
@@ -96,7 +96,7 @@ pub(crate) struct WorkPlacement {
     /// This task's affine prereqs: `(affine_id, prereq content hash)`. Empty ⇒
     /// no affine deps; the task is placed with no prereqs appended (the
     /// all-done case falls out as the best affine rank everywhere).
-    pub(crate) affine_deps: Vec<(AffineId, String)>,
+    pub(crate) affine_deps: Vec<(SecondaryCellId, String)>,
 }
 
 /// The primary-LOCAL per-secondary affine queues + the placement/steal policy.
@@ -184,7 +184,7 @@ impl AffineScheduler {
         cell_of: F,
     ) -> Option<String>
     where
-        F: Fn(&str, AffineId) -> AffineCell,
+        F: Fn(&str, SecondaryCellId) -> SecondaryCell,
     {
         if secondaries.is_empty() {
             return None;
@@ -198,7 +198,7 @@ impl AffineScheduler {
                 .affine_deps
                 .iter()
                 .filter(|(aid, _)| {
-                    matches!(cell_of(sec, *aid), AffineCell::Done | AffineCell::Queued)
+                    matches!(cell_of(sec, *aid), SecondaryCell::Done | SecondaryCell::Queued)
                 })
                 .count()
         };
@@ -259,7 +259,7 @@ impl AffineScheduler {
         cell_of: F,
     ) -> Vec<ClusterMutation<I>>
     where
-        F: Fn(&str, AffineId) -> AffineCell,
+        F: Fn(&str, SecondaryCellId) -> SecondaryCell,
     {
         let _ = &cell_of;
         self.queues
@@ -336,7 +336,7 @@ impl AffineScheduler {
         can_steal_work: C,
     ) -> Vec<ClusterMutation<I>>
     where
-        F: Fn(&str, AffineId) -> AffineCell,
+        F: Fn(&str, SecondaryCellId) -> SecondaryCell,
         C: Fn(&str, &str) -> bool,
     {
         // Pick the donor T: longest queue, name tie-break, never S itself, must
@@ -372,7 +372,7 @@ impl AffineScheduler {
         let mut mutations = Vec::new();
         for unit in &prefix {
             if let QueuedUnit::Affine { affine_id, .. } = unit
-                && cell_of(&donor, *affine_id) == AffineCell::Queued
+                && cell_of(&donor, *affine_id) == SecondaryCell::Queued
             {
                 mutations.push(ClusterMutation::SecondaryAffineUnqueued {
                     secondary: donor.clone(),
@@ -389,7 +389,7 @@ impl AffineScheduler {
         let dest = self.queues.entry(secondary.to_string()).or_default();
         for unit in prefix {
             if let QueuedUnit::Affine { affine_id, .. } = &unit
-                && cell_of(secondary, *affine_id) == AffineCell::NotDone
+                && cell_of(secondary, *affine_id) == SecondaryCell::NotDone
             {
                 mutations.push(ClusterMutation::SecondaryAffineQueued {
                     secondary: secondary.to_string(),
@@ -429,7 +429,7 @@ impl AffineScheduler {
         cell_of: F,
     ) -> Vec<ClusterMutation<I>>
     where
-        F: Fn(&str, AffineId) -> AffineCell + Copy,
+        F: Fn(&str, SecondaryCellId) -> SecondaryCell + Copy,
     {
         self.clear();
         let mut mutations = Vec::new();
@@ -585,28 +585,28 @@ mod tests {
     type TaskId = String;
     type Mutation = ClusterMutation<TaskId>;
 
-    fn aid(n: u32) -> AffineId {
-        AffineId(n)
+    fn aid(n: u32) -> SecondaryCellId {
+        SecondaryCellId(n)
     }
 
     /// A cell map for the `cell_of` closure: `(secondary, affine_id) → cell`.
     #[derive(Default, Clone)]
-    struct Cells(HashMap<(String, u32), AffineCell>);
+    struct Cells(HashMap<(String, u32), SecondaryCell>);
     impl Cells {
-        fn set(&mut self, sec: &str, aid: AffineId, cell: AffineCell) {
+        fn set(&mut self, sec: &str, aid: SecondaryCellId, cell: SecondaryCell) {
             self.0.insert((sec.to_string(), aid.0), cell);
         }
-        fn of(&self) -> impl Fn(&str, AffineId) -> AffineCell + Copy + '_ {
-            move |sec: &str, a: AffineId| {
+        fn of(&self) -> impl Fn(&str, SecondaryCellId) -> SecondaryCell + Copy + '_ {
+            move |sec: &str, a: SecondaryCellId| {
                 self.0
                     .get(&(sec.to_string(), a.0))
                     .copied()
-                    .unwrap_or(AffineCell::NotDone)
+                    .unwrap_or(SecondaryCell::NotDone)
             }
         }
     }
 
-    fn work(hash: &str, deps: &[(AffineId, &str)]) -> WorkPlacement {
+    fn work(hash: &str, deps: &[(SecondaryCellId, &str)]) -> WorkPlacement {
         WorkPlacement {
             hash: hash.to_string(),
             affine_deps: deps
@@ -641,7 +641,7 @@ mod tests {
         // work, no mutation. (The cell drives readiness at dispatch, not here.)
         let mut sched = AffineScheduler::default();
         let mut cells = Cells::default();
-        cells.set("s1", aid(0), AffineCell::Done);
+        cells.set("s1", aid(0), SecondaryCell::Done);
         let p = work("w1", &[(aid(0), "a0"), (aid(1), "a1")]);
         let muts: Vec<Mutation> = sched.place("s1", &p, cells.of());
         assert_eq!(sched.queue("s1"), &[QueuedUnit::Work { hash: "w1".into() }]);
@@ -652,7 +652,7 @@ mod tests {
     fn place_all_done_appends_only_work() {
         let mut sched = AffineScheduler::default();
         let mut cells = Cells::default();
-        cells.set("s1", aid(0), AffineCell::Done);
+        cells.set("s1", aid(0), SecondaryCell::Done);
         let p = work("w1", &[(aid(0), "a0")]);
         let muts: Vec<Mutation> = sched.place("s1", &p, cells.of());
         assert_eq!(sched.queue("s1"), &[QueuedUnit::Work { hash: "w1".into() }]);
@@ -664,8 +664,8 @@ mod tests {
         let sched = AffineScheduler::default();
         let mut cells = Cells::default();
         // s1 has both deps done; s2/s3 have none. Equal empty queues.
-        cells.set("s1", aid(0), AffineCell::Done);
-        cells.set("s1", aid(1), AffineCell::Queued);
+        cells.set("s1", aid(0), SecondaryCell::Done);
+        cells.set("s1", aid(1), SecondaryCell::Queued);
         let p = work("w1", &[(aid(0), "a0"), (aid(1), "a1")]);
         let chosen = sched
             .select_secondary(&secs(&["s1", "s2", "s3"]), &p, cells.of())
@@ -840,7 +840,7 @@ mod tests {
         // Done deps alike. (The old `place_core` import-reconstruction + the
         // `import_held` discriminator are gone: the import is derived on-demand at
         // dispatch, never reconstructed at placement.)
-        for state in [AffineCell::NotDone, AffineCell::Queued, AffineCell::Done] {
+        for state in [SecondaryCell::NotDone, SecondaryCell::Queued, SecondaryCell::Done] {
             let mut sched = AffineScheduler::default();
             let mut cells = Cells::default();
             cells.set("s1", aid(0), state);

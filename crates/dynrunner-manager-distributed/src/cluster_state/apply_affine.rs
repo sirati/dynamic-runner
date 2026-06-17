@@ -8,9 +8,9 @@
 //! scheduler (AF-sched) and the failover path call. It owns NO scheduling.
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::AffineCell;
+use dynrunner_protocol_primary_secondary::SecondaryCell;
 
-use super::task_def_store::{AffineId, DefBijectionError};
+use super::task_def_store::{SecondaryCellId, DefBijectionError};
 use super::{ApplyOutcome, ClusterState};
 
 impl<I: Identifier> ClusterState<I> {
@@ -27,8 +27,8 @@ impl<I: Identifier> ClusterState<I> {
     ) -> ApplyOutcome {
         // Idempotent on a same-id re-add (at-least-once / snapshot replay):
         // already-bound ⇒ NoOp; a fresh binding ⇒ Applied.
-        let already = self.definitions.affine_id_for_hash(hash) == Some(AffineId(affine_id));
-        match self.definitions.intern_affine_at(AffineId(affine_id), hash) {
+        let already = self.definitions.cell_id_for_hash(hash) == Some(SecondaryCellId(affine_id));
+        match self.definitions.intern_cell_at(SecondaryCellId(affine_id), hash) {
             Ok(_) if already => ApplyOutcome::NoOp,
             Ok(_) => {
                 // Stamp the affine-id INLINE onto the live `TaskState`'s def so
@@ -46,7 +46,7 @@ impl<I: Identifier> ClusterState<I> {
                 // stamping the store slot alone would fork an unstamped per-task
                 // copy into the snapshot — the stamp MUST happen here.
                 if let Some(state) = self.tasks.get_mut(hash) {
-                    std::sync::Arc::make_mut(state.def_mut()).affine_id = Some(AffineId(affine_id));
+                    std::sync::Arc::make_mut(state.def_mut()).affine_id = Some(SecondaryCellId(affine_id));
                 }
                 ApplyOutcome::Applied
             }
@@ -66,13 +66,13 @@ impl<I: Identifier> ClusterState<I> {
         &mut self,
         secondary: &str,
         affine_id: u32,
-        cell: AffineCell,
+        cell: SecondaryCell,
         generation: u64,
     ) -> ApplyOutcome {
         if self
             .affine
             .bitvector_mut()
-            .set_cell(secondary, AffineId(affine_id), cell, generation)
+            .set_cell(secondary, SecondaryCellId(affine_id), cell, generation)
         {
             ApplyOutcome::Applied
         } else {
@@ -108,8 +108,8 @@ impl<I: Identifier> ClusterState<I> {
     /// reserves the agreed affine-id here, then emits the matching
     /// `SecondaryAffineRegistered`, so the wire and the originator's own apply
     /// converge on the same id. The affine twin of `allocate_def_id`.
-    pub(crate) fn allocate_affine_id(&mut self, hash: &str) -> AffineId {
-        self.definitions.alloc_for_affine_hash(hash)
+    pub(crate) fn allocate_affine_id(&mut self, hash: &str) -> SecondaryCellId {
+        self.definitions.alloc_for_cell_hash(hash)
     }
 
     // ── FAILOVER resume seam ──
@@ -124,8 +124,8 @@ impl<I: Identifier> ClusterState<I> {
     pub(crate) fn resume_affine_cell_gen_floor(&mut self) {
         let floor = self.affine.bitvector().max_generation().saturating_add(1);
         self.affine.resume_cell_gen_floor(floor);
-        let id_floor = self.definitions.next_affine_id_floor();
-        self.definitions.resume_affine_alloc_floor(id_floor);
+        let id_floor = self.definitions.next_cell_id_floor();
+        self.definitions.resume_cell_alloc_floor(id_floor);
     }
 
     // ── AF-sched state-query helpers ──
@@ -136,7 +136,7 @@ impl<I: Identifier> ClusterState<I> {
     /// The affine cell for `(secondary, affine_id)` — AF-sched's locality-rank
     /// input (`Done`/`Queued` count better). `NotDone` for an unwritten cell.
     /// Consumed by `primary::affine_dispatch`'s `cell_of` reads.
-    pub(crate) fn affine_state(&self, secondary: &str, affine_id: AffineId) -> AffineCell {
+    pub(crate) fn affine_state(&self, secondary: &str, affine_id: SecondaryCellId) -> SecondaryCell {
         self.affine.bitvector().cell(secondary, affine_id)
     }
 
@@ -147,7 +147,7 @@ impl<I: Identifier> ClusterState<I> {
     /// all-`Done` subset), leaving this all-`Done` query for a future
     /// locality-aware caller — `#[allow(dead_code)]` until then (real + tested).
     #[allow(dead_code)]
-    pub(crate) fn secondaries_with_all_done(&self, affine_ids: &[AffineId]) -> Vec<String> {
+    pub(crate) fn secondaries_with_all_done(&self, affine_ids: &[SecondaryCellId]) -> Vec<String> {
         self.affine.bitvector().secondaries_with_all_done(affine_ids)
     }
 
@@ -155,7 +155,7 @@ impl<I: Identifier> ClusterState<I> {
     /// the seam AF-sched uses to map an affine dep (resolved by content hash) to
     /// its bitvector cell index. Consumed by `affine_placement_for` +
     /// `affine_terminal_mutation`.
-    pub(crate) fn affine_id_for_hash(&self, hash: &str) -> Option<AffineId> {
-        self.definitions.affine_id_for_hash(hash)
+    pub(crate) fn affine_id_for_hash(&self, hash: &str) -> Option<SecondaryCellId> {
+        self.definitions.cell_id_for_hash(hash)
     }
 }

@@ -76,8 +76,9 @@ pub enum TaskKind {
     SecondaryAffine,
     /// A per-secondary SPECULATIVE-PREP primitive (#638): a phase-AGNOSTIC,
     /// idle-filler "eager prep" task that runs once-per-secondary as the LAST
-    /// dispatch resort (only when an idle worker has nothing else — pool empty
-    /// + affine queue empty + idle-steal failed). Like [`Self::SecondaryAffine`]
+    /// dispatch resort (only when an idle worker has nothing else: an empty
+    /// pool view, an empty affine queue, and a failed idle-steal). Like
+    /// [`Self::SecondaryAffine`]
     /// it is NEITHER worker-assignable NOR reassignable, the primary NEVER
     /// executes it, and it is NEVER counted in any success/fail bucket. Unlike
     /// `SecondaryAffine` it is NOT a schedulability gate — it has NO dependents,
