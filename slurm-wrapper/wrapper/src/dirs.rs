@@ -132,7 +132,22 @@ impl Layout {
         // Node-local image cache root: sibling of the per-job rndtmp
         // under /tmp, NOT under it — it must survive the per-job teardown
         // so later secondaries reuse the cached tarball (see field doc).
-        let image_cache_root = PathBuf::from(format!("/tmp/{}-imgcache", cfg.name_prefix));
+        //
+        // UID-namespaced: the dir name carries the current euid so two
+        // distinct uids running on the SAME shared SLURM node with the
+        // SAME `name_prefix` derive DISTINCT cache roots. Without this a
+        // second uid hits the first uid's root-owned `/tmp/<prefix>-imgcache`
+        // (mode-0755, foreign-owned): `create_dir_all` "succeeds" on the
+        // existing dir, then the populate copy INTO it is EACCES → every
+        // secondary of the second uid aborts before connecting. Keying on
+        // euid gives each uid its own writable root while preserving the
+        // cache's per-node-per-uid reuse purpose. Mirrors the euid-scoped
+        // `/run/user/<uid>` convention used in `shutdown_spawn`.
+        let image_cache_root = PathBuf::from(format!(
+            "/tmp/{}-imgcache-{}",
+            cfg.name_prefix,
+            nix::unistd::geteuid()
+        ));
 
         Self {
             rndtmp,
@@ -277,11 +292,24 @@ mod tests {
         assert_eq!(l.local_image, PathBuf::from("/tmp/asm-2f1d4e89/img.tar"));
         // Image cache root is a SIBLING of the per-job rndtmp under /tmp
         // (prefix-scoped, NOT under rndtmp) so it survives per-job
-        // teardown and is shared across secondaries on the node.
+        // teardown and is shared across secondaries on the node. It is
+        // ALSO euid-namespaced so two uids on a shared node with the same
+        // name_prefix derive distinct, each-writable roots (no cross-uid
+        // collision on the root-owned `/tmp/<prefix>-imgcache`).
+        let euid = nix::unistd::geteuid();
         assert_eq!(
             l.image_cache_root,
-            PathBuf::from("/tmp/asm-imgcache"),
-            "image cache root must be /tmp/<name_prefix>-imgcache, outside rndtmp"
+            PathBuf::from(format!("/tmp/asm-imgcache-{euid}")),
+            "image cache root must be /tmp/<name_prefix>-imgcache-<euid>, outside rndtmp"
+        );
+        // The euid MUST appear in the derived path: this is the property
+        // that makes two distinct uids derive distinct cache roots.
+        assert!(
+            l.image_cache_root
+                .to_string_lossy()
+                .ends_with(&format!("-{euid}")),
+            "cache root must be uid-namespaced: {}",
+            l.image_cache_root.display()
         );
     }
 
