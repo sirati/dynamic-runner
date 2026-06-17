@@ -103,8 +103,8 @@ enum MetricShape {
         prev_printed: Option<u64>,
         unit: ResourceUnit,
     },
-    /// A #589 loop-health dominant-arm line — the (name, pct) pair
-    /// rendered as `oom_sweep:55.00%`. Inclusion shape mirrors
+    /// A #589 loop-health dominant-arm line — the (name, pct, time) triple
+    /// rendered as `idle:78.49% time=425ms/s`. Inclusion shape mirrors
     /// `ResourceAvg`: present iff `value.is_some()`; changed iff
     /// `prev_printed_pct_milli` is `None` OR the relative move from
     /// it exceeds `RESOURCE_THRESHOLD` (the share is the wake-worthy
@@ -230,9 +230,10 @@ impl MetricShape {
             },
             MetricShape::DominantArmLine { value, .. } => match value {
                 Some(v) => format!(
-                    "{label}: {}:{}",
+                    "{label}: {}:{} time={}ms/s",
                     v.arm_name,
-                    format_milli_percent(v.pct_milli as u64)
+                    format_milli_percent(v.pct_milli as u64),
+                    v.time_ms_per_sec
                 ),
                 None => format!("{label}: -"),
             },
@@ -408,9 +409,10 @@ pub fn render_report_full(cur: &StatsSnapshot) -> String {
     }
     if let Some(v) = &cur.dominant_arm {
         lines.push(format!(
-            "dominant arm (fleet max): {}:{}",
+            "dominant arm (fleet max): {}:{} time={}ms/s",
             v.arm_name,
-            format_milli_percent(v.pct_milli as u64)
+            format_milli_percent(v.pct_milli as u64),
+            v.time_ms_per_sec
         ));
     }
     if let Some(v) = cur.max_unacked_for_secs {

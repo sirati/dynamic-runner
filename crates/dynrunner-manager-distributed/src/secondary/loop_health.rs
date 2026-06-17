@@ -2,25 +2,30 @@
 //!
 //! # Single concern
 //!
-//! Compute the 3 loop-health fields the secondary stamps onto its 5-minute
-//! `SecondaryResourceSampleRecord` broadcast, from raw sources that already
-//! exist on the secondary: the operational-loop's `arm_stats` counters and
-//! the buffered-report-replay queue's oldest-unACKed age.
+//! Compute the loop-health fields the secondary stamps onto its 5-minute
+//! `SecondaryResourceSampleRecord` broadcast — the iter-rate, the
+//! WALL-CLOCK-TIME dominant arm (name + time-share + ms/s, including the
+//! `idle` select!-wait pseudo-arm), and the oldest-unACKed age — from raw
+//! sources that already exist on the secondary: the operational-loop's
+//! `arm_stats` counters + per-arm/idle TIME accumulators and the
+//! buffered-report-replay queue's oldest-unACKed age.
 //!
 //! Necessary-but-not-sufficient is the #586 lesson: host CPU%/mem/swap
 //! (the #575 axis) was ~15% while the oploop spent 52-62% of its
-//! iterations on `oom_sweep` — the operator's view said HEALTHY while the
+//! iterations on `mem_check` — the operator's view said HEALTHY while the
 //! coordinator was starved. Loop-health is the missing axis. Host health
 //! ≠ loop health.
 //!
 //! # Boundary
 //!
-//! - This module OWNS: the prior-snapshot tracking (so iteration deltas
-//!   are over the emit window, not lifetime totals), the dominant-arm
-//!   max-by-delta selection, and the rate/share arithmetic.
-//! - This module does NOT OWN: the arm-stats counter source (the oploop's
-//!   own `arm_stats.record(arm_id)` calls — read here via the existing
-//!   `ArmStatsSnapshot` accessor, no new instrumentation), the
+//! - This module OWNS: the prior-snapshot tracking (so the deltas are over
+//!   the emit window, not lifetime totals), the dominant-arm
+//!   max-by-TIME-delta selection (including the `idle` pseudo-arm), and the
+//!   rate/share/ms-per-sec arithmetic.
+//! - This module does NOT OWN: the arm-stats source (the oploop's own
+//!   `arm_stats.record(arm_id)` + `begin_select` timing calls — read here
+//!   via the existing `ArmStatsSnapshot` accessor, no new instrumentation),
+//!   the
 //!   report-replay queue (the caller passes in the already-computed
 //!   `max_unacked_for_secs`), the emit cadence (the operational
 //!   `select!`'s 5-minute interval wakes the caller), or the wire
@@ -37,11 +42,11 @@
 //! next emit 5 minutes later the tracker has both endpoints and emits
 //! real numbers.
 
-use crate::oploop_instrumentation::OpLoopArmStats;
+use crate::oploop_instrumentation::{IDLE_ARM_NAME, OpLoopArmStats};
 use dynrunner_protocol_primary_secondary::SecondaryResourceSampleRecord;
 use std::time::Instant;
 
-/// The 3 loop-health values the secondary stamps onto its 5-minute
+/// The loop-health values the secondary stamps onto its 5-minute
 /// [`SecondaryResourceSampleRecord`] broadcast. Pure data — no
 /// authority, no timer, no I/O — so the unit tests can drive the
 /// dominant-arm + iter-rate math without a clock or a runtime.
@@ -58,16 +63,23 @@ pub struct LoopHealthFields {
     /// sub-iter resolution against an integer wire. `0` is the cold-
     /// start sentinel.
     pub oploop_iters_per_sec_milli: u64,
-    /// The name of the single hottest arm by iteration delta over the
-    /// window — e.g. `"oom_sweep"`. Empty when there is no prior
-    /// snapshot OR every arm's delta is zero (a silent loop). The
-    /// observer's max-by-pct fleet aggregation passes over the empty
-    /// case.
+    /// The name of the single hottest arm by WALL-CLOCK TIME delta over
+    /// the window — a real `select!` arm OR the
+    /// [`crate::oploop_instrumentation::IDLE_ARM_NAME`] pseudo-arm (the
+    /// select!-wait). Empty when there is no prior snapshot OR the window's
+    /// total time delta is zero (a silent loop). The observer's max-by-pct
+    /// fleet aggregation passes over the empty case. TIME, not COUNT: a
+    /// lightly-loaded loop reports `idle`; an overloaded loop reports its
+    /// slowest arm.
     pub dominant_arm_name: String,
-    /// The dominant arm's share of total iteration deltas, in milli-
-    /// percent (`55_000` = 55.0%). `0` when [`Self::dominant_arm_name`]
-    /// is empty.
+    /// The dominant arm's share of the window's total wall-clock time
+    /// (`idle + Σ arm-time`), in milli-percent (`55_000` = 55.0%). `0`
+    /// when [`Self::dominant_arm_name`] is empty.
     pub dominant_arm_pct_milli: u32,
+    /// The dominant arm's body-time per wall-clock second over the window,
+    /// in milliseconds-per-second (`425` = 425ms of each second spent in
+    /// this arm). `0` when [`Self::dominant_arm_name`] is empty.
+    pub dominant_arm_time_ms_per_sec: u64,
     /// The longest age of any retained confirmable report on the
     /// secondary's buffered-report-replay queue at emit time, in
     /// seconds. `0` when the queue is empty (no unacked) — the
@@ -86,19 +98,23 @@ impl LoopHealthFields {
         record.oploop_iters_per_sec_milli = self.oploop_iters_per_sec_milli;
         record.dominant_arm_name = self.dominant_arm_name;
         record.dominant_arm_pct_milli = self.dominant_arm_pct_milli;
+        record.dominant_arm_time_ms_per_sec = self.dominant_arm_time_ms_per_sec;
         record.max_unacked_for_secs = self.max_unacked_for_secs;
     }
 }
 
 /// One arm-stats endpoint the tracker holds between emits. Owns ONLY
-/// what the next emit's delta needs: the iter counter, the per-arm
-/// counts (in arm-id order, named so a re-spawn that reordered the
-/// arm set would still produce correct deltas-by-name), and the
-/// captured instant.
+/// what the next emit's delta needs: the iter counter (for the iter-rate
+/// axis), the per-arm BODY-time nanos + the IDLE nanos (the time axis the
+/// dominant selection deltas, named so a re-spawn that reordered the arm
+/// set still produces correct deltas-by-name), and the captured instant.
 #[derive(Debug, Clone)]
 struct ArmEndpoint {
     iter: u64,
-    counts: Vec<(&'static str, u64)>,
+    /// Per-arm cumulative body-time nanos `(name, nanos)`, arm-id order.
+    arm_nanos: Vec<(&'static str, u64)>,
+    /// Cumulative idle (select!-wait) nanos.
+    idle_nanos: u64,
     at: Instant,
 }
 
@@ -143,7 +159,8 @@ impl LoopHealthTracker {
         let snap = arm_stats.snapshot();
         let current = ArmEndpoint {
             iter: snap.iter,
-            counts: snap.counts.clone(),
+            arm_nanos: snap.arm_nanos.clone(),
+            idle_nanos: snap.idle_nanos,
             at: now,
         };
         let Some(prior) = self.prior.take() else {
@@ -178,37 +195,55 @@ impl LoopHealthTracker {
             0
         };
 
-        // Dominant arm: zip the prior and current per-arm counts BY
-        // NAME (not by index) so a re-instantiated arm set whose order
-        // changed across the emit window still produces correct deltas.
-        // In practice the order is stable (the same `const ARM_*` ids
-        // back the same arm-name slice), but matching by name is a
-        // cheap correctness anchor.
+        // Dominant arm by WALL-CLOCK TIME, including the `idle`
+        // (select!-wait) pseudo-arm. Delta the per-arm body-time BY NAME
+        // (not by index) so a re-instantiated arm set whose order changed
+        // across the window still deltas correctly; idle is a single
+        // scalar delta. The `idle` pseudo-arm competes with the real arms
+        // uniformly: light load ⇒ idle dominates (healthy); overload ⇒ a
+        // slow body dominates over a small idle (the wedge signature).
         let prior_by_name: std::collections::HashMap<&'static str, u64> =
-            prior.counts.iter().copied().collect();
+            prior.arm_nanos.iter().copied().collect();
+        let idle_delta = current.idle_nanos.saturating_sub(prior.idle_nanos);
+        // Combined (name, time-delta-nanos) over {idle} ∪ {real arms}.
+        let candidates = std::iter::once((IDLE_ARM_NAME, idle_delta)).chain(
+            current.arm_nanos.iter().map(|(name, cur)| {
+                let prev = prior_by_name.get(name).copied().unwrap_or(0);
+                (*name, cur.saturating_sub(prev))
+            }),
+        );
         let mut total_delta: u64 = 0;
         let mut max_delta: u64 = 0;
-        let mut max_name: &'static str = "";
-        for (name, cur) in &current.counts {
-            let prev = prior_by_name.get(name).copied().unwrap_or(0);
-            let d = cur.saturating_sub(prev);
+        let mut max_name: &str = "";
+        for (name, d) in candidates {
             total_delta = total_delta.saturating_add(d);
             if d > max_delta {
                 max_delta = d;
-                max_name = *name;
+                max_name = name;
             }
         }
-        // Share in milli-percent. `total_delta == 0` is a silent loop
-        // (no arm fired): empty name + zero pct.
-        let (dominant_arm_name, dominant_arm_pct_milli) = if total_delta > 0 && !max_name.is_empty()
-        {
-            // (max_delta * 100_000) / total_delta — u128 to keep the
-            // numerator overflow-safe for any plausible iter count.
-            let pct = ((max_delta as u128) * 100_000u128) / (total_delta as u128);
-            (max_name.to_string(), pct.min(100_000) as u32)
-        } else {
-            (String::new(), 0)
-        };
+        // Share in milli-percent + body-time-per-second (ms/s). A zero
+        // total time delta is a silent window (no time accounted —
+        // pre-instrumentation arm-stats or a same-instant recompute):
+        // empty name + zero pct + zero rate.
+        let (dominant_arm_name, dominant_arm_pct_milli, dominant_arm_time_ms_per_sec) =
+            if total_delta > 0 && !max_name.is_empty() {
+                // (max_delta * 100_000) / total_delta — u128 keeps the
+                // numerator overflow-safe at any nanos magnitude.
+                let pct = ((max_delta as u128) * 100_000u128) / (total_delta as u128);
+                // ms/s = (max_delta nanos / 1e6 ms) / elapsed_secs.
+                let ms_per_sec = if elapsed_secs > 0.0 {
+                    ((max_delta as f64 / 1_000_000.0) / elapsed_secs)
+                        .round()
+                        .min(u64::MAX as f64)
+                        .max(0.0) as u64
+                } else {
+                    0
+                };
+                (max_name.to_string(), pct.min(100_000) as u32, ms_per_sec)
+            } else {
+                (String::new(), 0, 0)
+            };
 
         // Advance the prior to the current endpoint AFTER the deltas
         // have been read — so the NEXT emit's window starts where this
@@ -219,6 +254,7 @@ impl LoopHealthTracker {
             oploop_iters_per_sec_milli,
             dominant_arm_name,
             dominant_arm_pct_milli,
+            dominant_arm_time_ms_per_sec,
             max_unacked_for_secs,
         }
     }
@@ -266,28 +302,81 @@ mod tests {
         assert_eq!(fields.oploop_iters_per_sec_milli, 9_000);
     }
 
-    /// Dominant arm is selected by the largest iteration delta and the
-    /// share is rendered in milli-percent.
+    /// Dominant arm is selected by the largest WALL-CLOCK-TIME delta and
+    /// the share is rendered in milli-percent + ms/s. Inject body-time
+    /// directly via the low-level accumulator (deterministic, no sleep).
     #[test]
-    fn dominant_arm_pct_milli_is_share_of_total_delta() {
-        let arm_stats = OpLoopArmStats::new(&["inbox", "oom_sweep", "other"], 0);
+    fn dominant_arm_pct_milli_is_share_of_total_time() {
+        let arm_stats = OpLoopArmStats::new(&["inbox", "mem_check", "other"], 0);
         let mut tracker = LoopHealthTracker::new();
         let t0 = Instant::now();
         let _seed = tracker.compute(&arm_stats, 0, t0);
-        // After seed: inbox=10, oom_sweep=80, other=10 (deltas)
-        for _ in 0..10 {
-            arm_stats.record(0);
-        }
-        for _ in 0..80 {
+        // Window: inbox 10ms body, mem_check 80ms body, other 10ms body,
+        // idle 0 ⇒ total 100ms; mem_check is 80% by TIME.
+        arm_stats.record_arm_time(0, Duration::from_millis(10));
+        arm_stats.record_arm_time(1, Duration::from_millis(80));
+        arm_stats.record_arm_time(2, Duration::from_millis(10));
+        let fields = tracker.compute(&arm_stats, 0, t0 + Duration::from_secs(60));
+        assert_eq!(fields.dominant_arm_name, "mem_check");
+        // 80ms/100ms = 80% = 80_000 milli-percent.
+        assert_eq!(fields.dominant_arm_pct_milli, 80_000);
+        // 80ms over 60s window ⇒ round(80/60) = 1 ms/s.
+        assert_eq!(fields.dominant_arm_time_ms_per_sec, 1);
+    }
+
+    /// Light load: the loop spends almost all its time WAITING in the
+    /// select! — the `idle` pseudo-arm dominates BY TIME even though a
+    /// timer arm FIRED far more often. This is the count-vs-time
+    /// distinction: a frequent-but-fast arm must NOT read as dominant.
+    #[test]
+    fn idle_dominates_under_light_load_despite_a_high_count_fast_arm() {
+        let arm_stats = OpLoopArmStats::new(&["inbox", "mem_check"], 0);
+        let mut tracker = LoopHealthTracker::new();
+        let t0 = Instant::now();
+        let _seed = tracker.compute(&arm_stats, 0, t0);
+        // mem_check FIRES 1000× but each body is trivially short (total
+        // 50ms of body time); the loop was idle 950ms of the 1s window.
+        for _ in 0..1000 {
             arm_stats.record(1);
         }
-        for _ in 0..10 {
-            arm_stats.record(2);
+        arm_stats.record_arm_time(1, Duration::from_millis(50));
+        arm_stats.record_idle(Duration::from_millis(950));
+        let fields = tracker.compute(&arm_stats, 0, t0 + Duration::from_secs(1));
+        // By COUNT mem_check would win (1000 fires); by TIME idle wins.
+        assert_eq!(fields.dominant_arm_name, "idle");
+        // 950ms / 1000ms = 95%.
+        assert_eq!(fields.dominant_arm_pct_milli, 95_000);
+        // idle 950ms over a 1s window ⇒ 950 ms/s.
+        assert_eq!(fields.dominant_arm_time_ms_per_sec, 950);
+    }
+
+    /// Overload: a RARE arm (fires few times) whose body is SLOW
+    /// dominates BY TIME over a frequent fast arm — the wedge signature
+    /// that the count axis would have hidden.
+    #[test]
+    fn slow_low_count_arm_dominates_by_time_over_a_fast_high_count_arm() {
+        let arm_stats = OpLoopArmStats::new(&["inbox", "mem_check"], 0);
+        let mut tracker = LoopHealthTracker::new();
+        let t0 = Instant::now();
+        let _seed = tracker.compute(&arm_stats, 0, t0);
+        // inbox fires 2× but each body is a long 400ms blocking pass
+        // (800ms total); mem_check fires 500× but only 100ms total; idle
+        // 100ms. By COUNT mem_check wins; by TIME inbox wins (overload on
+        // the data path's slow body).
+        for _ in 0..2 {
+            arm_stats.record(0);
         }
-        let fields = tracker.compute(&arm_stats, 0, t0 + Duration::from_secs(60));
-        assert_eq!(fields.dominant_arm_name, "oom_sweep");
-        // 80/100 = 80% = 80_000 milli-percent.
+        for _ in 0..500 {
+            arm_stats.record(1);
+        }
+        arm_stats.record_arm_time(0, Duration::from_millis(800));
+        arm_stats.record_arm_time(1, Duration::from_millis(100));
+        arm_stats.record_idle(Duration::from_millis(100));
+        let fields = tracker.compute(&arm_stats, 0, t0 + Duration::from_secs(1));
+        assert_eq!(fields.dominant_arm_name, "inbox");
+        // 800ms / 1000ms = 80%.
         assert_eq!(fields.dominant_arm_pct_milli, 80_000);
+        assert_eq!(fields.dominant_arm_time_ms_per_sec, 800);
     }
 
     /// Successive windows do not overlap: a SECOND post-seed emit reads
@@ -315,8 +404,9 @@ mod tests {
         assert_eq!(f2.oploop_iters_per_sec_milli, 20_000);
     }
 
-    /// A silent loop (no arm fired between seed and emit) reports an
-    /// empty dominant-arm name and zero pct — a wire-eliding result.
+    /// A silent loop (no time accounted between seed and emit — neither
+    /// idle nor any arm body) reports an empty dominant-arm name and zero
+    /// pct/rate — a wire-eliding result.
     #[test]
     fn silent_loop_reports_empty_dominant_and_zero_pct() {
         let arm_stats = OpLoopArmStats::new(&["a", "b"], 0);
@@ -326,6 +416,7 @@ mod tests {
         let fields = tracker.compute(&arm_stats, 0, t0 + Duration::from_secs(10));
         assert!(fields.dominant_arm_name.is_empty());
         assert_eq!(fields.dominant_arm_pct_milli, 0);
+        assert_eq!(fields.dominant_arm_time_ms_per_sec, 0);
         assert_eq!(fields.oploop_iters_per_sec_milli, 0);
     }
 

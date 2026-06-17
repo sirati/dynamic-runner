@@ -3,24 +3,32 @@
 //!
 //! # Concern (and ONLY this concern)
 //!
-//! OBSERVE which `select!` arm of an operational loop won each iteration, and
-//! how long the loop has gone without the INBOUND (ingest) arm winning. Pure
-//! observation: every method is a handful of relaxed atomic stores/loads, NO
-//! allocation on the per-iteration path, NO behaviour change. The production
-//! ingest-wedge signature ("relocated primary ingests exactly 4 of 16, never
-//! returns to its inbox; ~97% CPU spin through the wedge") is, in arm terms,
-//! "some OTHER arm wins every iteration while the inbox arm never wins again".
-//! This component converts that into one log line — `arm_counts=[...]`,
-//! `since_inbox=K`, `last_arm=X` — so the next occurrence names its own arm.
+//! OBSERVE which `select!` arm of an operational loop won each iteration, how
+//! much WALL-CLOCK TIME the loop spent in each arm's body vs WAITING in the
+//! `select!` (the `idle` pseudo-arm), and how long the loop has gone without
+//! the INBOUND (ingest) arm winning. Pure observation: the per-iteration path
+//! is a handful of relaxed atomic stores plus one uncontended cursor lock, NO
+//! allocation, NO behaviour change. The production ingest-wedge signature
+//! ("relocated primary ingests exactly 4 of 16, never returns to its inbox;
+//! ~97% CPU spin through the wedge") is, in arm terms, "some OTHER arm wins
+//! every iteration while the inbox arm never wins again". This component
+//! converts that into one log line — `arm_counts=[...]`, `arm_ms=[idle=..,
+//! ...]`, `since_inbox=K`, `last_arm=X` — so the next occurrence names its own
+//! arm, and the TIME axis distinguishes a healthy idle loop (idle dominates)
+//! from an overloaded one (a slow arm body dominates).
 //!
 //! # Why a separate component
 //!
 //! The recording is shared between the loop (writer, on the watched runtime)
 //! and the off-runtime [`crate::runtime_watchdog`] checker thread (reader, on
-//! its own OS thread). Wrapping the counters in an [`Arc`] of relaxed atomics
-//! lets BOTH halves touch them without a lock: the loop never blocks on the
-//! watchdog, and the watchdog reads a coherent-enough snapshot even while the
-//! runtime is wedged/spinning (the watchdog's whole reason to exist). The
+//! its own OS thread). Wrapping the counters + the per-arm/idle time
+//! accumulators in an [`Arc`] of relaxed atomics lets BOTH halves touch them
+//! without blocking each other: the loop never blocks on the watchdog, and the
+//! watchdog reads a coherent-enough snapshot even while the runtime is
+//! wedged/spinning (the watchdog's whole reason to exist). The only non-atomic
+//! piece — the in-flight timing cursor that splits idle vs body — is touched
+//! ONLY by the loop writer (in `begin_select`/`record`), never by the
+//! watchdog reader, so the no-blocking-watchdog invariant is preserved. The
 //! cadence policy for the loop's own periodic emit + starvation WARN lives
 //! HERE (not in the loop body) so the loop stays a pure `record(arm)` caller
 //! and the threshold/rate-limit knobs are unit-testable in isolation.
@@ -28,16 +36,32 @@
 //! # Boundary
 //!
 //! - Loop side: build one [`OpLoopArmStats`] per loop entry (naming its arms +
-//!   which one is the inbound arm), call [`OpLoopArmStats::record`] once per
-//!   iteration with the winning arm's id. That call also drives the internal
-//!   cadence (periodic INFO stats line + rate-limited starvation WARN).
+//!   which one is the inbound arm), call [`OpLoopArmStats::begin_select`] once
+//!   per iteration immediately before the `tokio::select!`, and
+//!   [`OpLoopArmStats::record`] once with the winning arm's id as the first
+//!   body statement. The begin_select/record pair splits each iteration's
+//!   wall-clock into idle (select!-wait) and the winning arm's body; `record`
+//!   also drives the internal cadence (periodic INFO stats line +
+//!   rate-limited starvation WARN). The loop never sees a threshold or a
+//!   timing accumulator — those policies live HERE.
 //! - Watchdog / stats side: [`OpLoopArmStats::snapshot`] renders an
 //!   [`ArmStatsSnapshot`] whose [`std::fmt::Display`] is the one compact line.
 //!   The watchdog holds the same [`Arc`] and dumps the snapshot when it fires.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// The pseudo-arm name for time the `select!` spent WAITING for any arm to
+/// become ready — the loop's IDLE time. Not a real `select!` arm; it is
+/// accumulated separately (see [`OpLoopArmStats::record_idle`]) and folds
+/// into the time-based dominant-arm competition alongside the real arms so
+/// a lightly-loaded loop reads as `idle:NN%` (healthy) rather than naming
+/// whichever timer happened to fire most. Lives HERE (not in the loop or
+/// the loop-health tracker) so every consumer of an arm-time breakdown
+/// sees the SAME idle label.
+pub const IDLE_ARM_NAME: &str = "idle";
 
 /// Iterations-since-inbox past which the loop is suspected starved of its
 /// ingest arm. The production wedge ran at ~97% CPU spin, so a wedged loop
@@ -95,6 +119,31 @@ pub struct OpLoopArmStats {
     iter: AtomicU64,
     /// Per-arm win counts, index-aligned with `arm_names`.
     counts: Vec<AtomicU64>,
+    /// Per-arm cumulative BODY time in nanoseconds, index-aligned with
+    /// `arm_names`. The wall-clock the loop spent IN each arm's body
+    /// (from the arm winning the `select!` until the next `begin_select`).
+    /// Read lock-free by the watchdog/snapshot; written only by the loop
+    /// writer via the timing cursor. The TIME axis the dominant-arm
+    /// selection now uses (a frequent-but-fast arm no longer "dominates"
+    /// a rare-but-slow one).
+    arm_nanos: Vec<AtomicU64>,
+    /// Cumulative IDLE time in nanoseconds — the wall-clock the `select!`
+    /// spent WAITING for any arm to become ready (between one arm's body
+    /// finishing, i.e. the next `begin_select`, and the next arm winning).
+    /// Competes as the [`IDLE_ARM_NAME`] pseudo-arm in the time-based
+    /// dominant selection: a lightly-loaded loop's idle dominates
+    /// (healthy); an overloaded loop's slow body dominates over a small
+    /// idle (the wedge signature). Over any window
+    /// `idle + Σ arm_nanos ≈ wall-clock`.
+    idle_nanos: AtomicU64,
+    /// Loop-writer-only timing cursor: the in-flight instants needed to
+    /// split idle vs body. Touched ONLY by the loop (in `begin_select` +
+    /// `record`) — never by the off-runtime watchdog reader (which reads
+    /// the atomic accumulators above), so it never blocks the loop and the
+    /// no-lock watchdog-read invariant holds. A `Mutex` (not atomics)
+    /// because an `Instant` is not atomic; uncontended in practice (one
+    /// writer), so the lock is effectively free.
+    timing: Mutex<TimingCursor>,
     /// The last arm id that won (as `u64` for a single atomic).
     last_arm: AtomicU64,
     /// Wall-clock millis the last arm won.
@@ -108,6 +157,30 @@ pub struct OpLoopArmStats {
     last_warn_at_millis: AtomicU64,
     /// Wall-clock millis the last periodic stats line emitted (0 = never).
     last_stats_at_millis: AtomicU64,
+}
+
+/// The loop-writer-only in-flight timing state that splits each
+/// iteration's wall-clock into IDLE (the `select!` wait) and the winning
+/// arm's BODY. Two transition points drive it, in source order each
+/// iteration: [`OpLoopArmStats::begin_select`] (just before the
+/// `tokio::select!`) and [`OpLoopArmStats::record`] (the FIRST statement of
+/// the winning arm's body). The window between `begin_select` and the next
+/// `record` is IDLE; the window between a `record` and the next
+/// `begin_select` is that arm's BODY (it also absorbs the cheap loop-top
+/// bookkeeping of the next iteration — loop overhead, honestly NOT idle).
+///
+/// Pure cursor — holds no accumulation; on each transition it folds the
+/// elapsed span into the [`OpLoopArmStats`] atomic accumulators and stores
+/// the new mark. `None` marks are the loop-entry / first-transition state.
+#[derive(Debug, Default)]
+struct TimingCursor {
+    /// Instant the most recent `begin_select` happened (the IDLE-window
+    /// open). `None` before the first `begin_select`.
+    select_enter: Option<Instant>,
+    /// The arm currently executing its body and the instant it won the
+    /// `select!` (the BODY-window open). `None` between a `begin_select`
+    /// and the next arm winning (i.e. while idle / waiting).
+    running: Option<(usize, Instant)>,
 }
 
 impl OpLoopArmStats {
@@ -125,6 +198,9 @@ impl OpLoopArmStats {
             inbox_arm,
             iter: AtomicU64::new(0),
             counts: arm_names.iter().map(|_| AtomicU64::new(0)).collect(),
+            arm_nanos: arm_names.iter().map(|_| AtomicU64::new(0)).collect(),
+            idle_nanos: AtomicU64::new(0),
+            timing: Mutex::new(TimingCursor::default()),
             last_arm: AtomicU64::new(0),
             last_arm_at_millis: AtomicU64::new(now),
             iter_at_last_inbox: AtomicU64::new(0),
@@ -144,6 +220,27 @@ impl OpLoopArmStats {
     /// intervals. `arm` out of range is recorded against `iter`/`last_arm`
     /// only (defensive — a caller bug, never the steady state).
     pub fn record(&self, arm: usize) {
+        self.record_at(arm, Instant::now())
+    }
+
+    /// As [`Self::record`] but against a caller-supplied monotonic `at`
+    /// instant — the timing seam the unit tests drive deterministically
+    /// (inject instants, never sleep). The production [`Self::record`]
+    /// passes `Instant::now()`. Closes the IDLE window opened by the prior
+    /// [`Self::begin_select`] (`at - select_enter` ⇒ idle) and opens this
+    /// arm's BODY window. The count/cadence accounting is unchanged.
+    pub fn record_at(&self, arm: usize, at: Instant) {
+        // Time-axis: close the idle window (begin_select → this win) and
+        // open the body window. Loop-writer-only cursor; recovers a poison
+        // so observation never widens a fault.
+        {
+            let mut cur = self.timing.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(enter) = cur.select_enter.take() {
+                self.record_idle(at.saturating_duration_since(enter));
+            }
+            cur.running = Some((arm, at));
+        }
+
         let now = now_millis();
         let iter = self.iter.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(cell) = self.counts.get(arm) {
@@ -156,6 +253,42 @@ impl OpLoopArmStats {
             self.inbox_at_millis.store(now, Ordering::Relaxed);
         }
         self.maybe_emit(now);
+    }
+
+    /// Mark the loop about to AWAIT its `select!` — the loop's ONLY
+    /// per-iteration timing call (the `record` per arm is the existing
+    /// count call). Closes the BODY window of the arm that was running
+    /// (`now - running_start` ⇒ that arm's body time, which also absorbs
+    /// the cheap loop-top bookkeeping of this iteration — loop overhead,
+    /// not idle) and opens the IDLE window. Call it immediately before
+    /// `tokio::select! { ... }`. The production caller passes
+    /// `Instant::now()`; tests inject an instant.
+    pub fn begin_select(&self, now: Instant) {
+        let mut cur = self.timing.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((arm, start)) = cur.running.take() {
+            self.record_arm_time(arm, now.saturating_duration_since(start));
+        }
+        cur.select_enter = Some(now);
+    }
+
+    /// Accumulate `dur` against `arm`'s cumulative body time. The
+    /// low-level time accumulator (the [`Self::begin_select`] /
+    /// [`Self::record_at`] cursor folds the split spans through here);
+    /// public so the share arithmetic is unit-testable by feeding
+    /// durations directly without a cursor or a clock. `arm` out of range
+    /// is a defensive no-op (a caller bug, never the steady state).
+    pub fn record_arm_time(&self, arm: usize, dur: Duration) {
+        if let Some(cell) = self.arm_nanos.get(arm) {
+            cell.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Accumulate `dur` against the IDLE pseudo-arm (the `select!` wait).
+    /// Low-level twin of [`Self::record_arm_time`]; driven by the cursor
+    /// in [`Self::record_at`] and exposed for direct unit testing.
+    pub fn record_idle(&self, dur: Duration) {
+        self.idle_nanos
+            .fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
     }
 
     /// Cadence policy, factored out of `record` so the loop body never sees a
@@ -246,6 +379,13 @@ impl OpLoopArmStats {
             .zip(self.counts.iter())
             .map(|(name, c)| (*name, c.load(Ordering::Relaxed)))
             .collect();
+        let arm_nanos: Vec<(&'static str, u64)> = self
+            .arm_names
+            .iter()
+            .zip(self.arm_nanos.iter())
+            .map(|(name, c)| (*name, c.load(Ordering::Relaxed)))
+            .collect();
+        let idle_nanos = self.idle_nanos.load(Ordering::Relaxed);
         let last_arm_idx = self.last_arm.load(Ordering::Relaxed) as usize;
         let last_arm = self.arm_names.get(last_arm_idx).copied().unwrap_or("?");
         let since_inbox = iter.saturating_sub(self.iter_at_last_inbox.load(Ordering::Relaxed));
@@ -255,6 +395,8 @@ impl OpLoopArmStats {
         ArmStatsSnapshot {
             iter,
             counts,
+            arm_nanos,
+            idle_nanos,
             last_arm,
             last_arm_age: Duration::from_millis(
                 now.saturating_sub(self.last_arm_at_millis.load(Ordering::Relaxed)),
@@ -407,6 +549,14 @@ pub struct ArmStatsSnapshot {
     pub iter: u64,
     /// Per-arm `(name, count)`, arm-id order.
     pub counts: Vec<(&'static str, u64)>,
+    /// Per-arm cumulative BODY time in nanoseconds `(name, nanos)`, arm-id
+    /// order (index-aligned with [`Self::counts`]). The TIME axis the
+    /// dominant-arm selection uses.
+    pub arm_nanos: Vec<(&'static str, u64)>,
+    /// Cumulative IDLE time in nanoseconds — the `select!`-wait. The
+    /// [`IDLE_ARM_NAME`] pseudo-arm's time; competes with [`Self::arm_nanos`]
+    /// in the time-based dominant selection.
+    pub idle_nanos: u64,
     /// The arm that won most recently.
     pub last_arm: &'static str,
     /// Wall-clock age of the last arm win.
@@ -418,22 +568,36 @@ pub struct ArmStatsSnapshot {
 }
 
 impl std::fmt::Display for ArmStatsSnapshot {
-    /// `iter=N arm_counts=[A=.., B=..] since_inbox=K inbox_idle=Ts last_arm=X`
-    /// — the single line wired into the watchdog dump + the periodic stats
-    /// emission. Counts are rendered in arm-id order (stable across emits) so
-    /// successive lines diff cleanly.
+    /// `iter=N arm_counts=[A=.., B=..] arm_ms=[idle=.., A=.., B=..]`
+    /// `since_inbox=K inbox_idle=Ts last_arm=X` — the single line wired into
+    /// the watchdog dump + the periodic stats emission. Counts AND the
+    /// per-arm body-time (with the `idle` select!-wait pseudo-arm first) are
+    /// rendered in arm-id order (stable across emits) so successive lines
+    /// diff cleanly. The `arm_ms` breakdown is the disambiguator for the
+    /// `iter` rate: high `idle` ms = healthy light load; low `idle` + a fat
+    /// arm ms = overload on that arm.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let body = self
+        let counts = self
             .counts
             .iter()
             .map(|(name, n)| format!("{name}={n}"))
             .collect::<Vec<_>>()
             .join(", ");
+        // `idle` first, then the real arms in arm-id order; render as
+        // whole milliseconds (the nanos resolution is for the share math,
+        // not the human line).
+        let mut times = vec![format!("{IDLE_ARM_NAME}={}", self.idle_nanos / 1_000_000)];
+        times.extend(
+            self.arm_nanos
+                .iter()
+                .map(|(name, nanos)| format!("{name}={}", nanos / 1_000_000)),
+        );
         write!(
             f,
-            "iter={} arm_counts=[{}] since_inbox={} inbox_idle={}s last_arm={}",
+            "iter={} arm_counts=[{}] arm_ms=[{}] since_inbox={} inbox_idle={}s last_arm={}",
             self.iter,
-            body,
+            counts,
+            times.join(", "),
             self.since_inbox,
             self.inbox_idle.as_secs(),
             self.last_arm,
@@ -463,6 +627,58 @@ mod tests {
     }
 
     #[test]
+    fn begin_select_record_split_attributes_idle_and_body() {
+        // Drive one full iteration deterministically (inject instants, no
+        // sleep): the gap begin_select→record is IDLE; the gap
+        // record→next begin_select is the arm's BODY.
+        let stats = OpLoopArmStats::new(ARMS, INBOX);
+        let t0 = Instant::now();
+        // Iteration 1: wait 100ms (idle), then arm 0's body runs 30ms.
+        stats.begin_select(t0);
+        stats.record_at(0, t0 + Duration::from_millis(100));
+        // Iteration 2 begins: closing arm 0's body at +130ms ⇒ 30ms body.
+        stats.begin_select(t0 + Duration::from_millis(130));
+        // Wait 50ms (idle), then arm 2's body runs (closed by emit below).
+        stats.record_at(2, t0 + Duration::from_millis(180));
+        // Close arm 2's body at +200ms ⇒ 20ms body.
+        stats.begin_select(t0 + Duration::from_millis(200));
+
+        let s = stats.snapshot();
+        // idle = 100 + 50 = 150ms.
+        assert_eq!(s.idle_nanos, 150 * 1_000_000, "idle = sum of select! waits");
+        // arm 0 body = 30ms; arm 2 body = 20ms; inbox untouched.
+        assert_eq!(s.arm_nanos[0], ("command", 30 * 1_000_000));
+        assert_eq!(s.arm_nanos[1], ("inbox", 0));
+        assert_eq!(s.arm_nanos[2], ("heartbeat", 20 * 1_000_000));
+        // Counts are preserved alongside the new time axis.
+        assert_eq!(s.counts[0], ("command", 1));
+        assert_eq!(s.counts[2], ("heartbeat", 1));
+    }
+
+    #[test]
+    fn record_arm_time_and_record_idle_accumulate() {
+        // The low-level accumulators add directly, no cursor needed.
+        let stats = OpLoopArmStats::new(ARMS, INBOX);
+        stats.record_arm_time(0, Duration::from_millis(10));
+        stats.record_arm_time(0, Duration::from_millis(5));
+        stats.record_arm_time(2, Duration::from_millis(7));
+        stats.record_idle(Duration::from_millis(40));
+        stats.record_idle(Duration::from_millis(2));
+        let s = stats.snapshot();
+        assert_eq!(s.arm_nanos[0], ("command", 15 * 1_000_000));
+        assert_eq!(s.arm_nanos[2], ("heartbeat", 7 * 1_000_000));
+        assert_eq!(s.idle_nanos, 42 * 1_000_000);
+    }
+
+    #[test]
+    fn out_of_range_arm_time_is_defensive_noop() {
+        let stats = OpLoopArmStats::new(ARMS, INBOX);
+        stats.record_arm_time(99, Duration::from_millis(10));
+        let s = stats.snapshot();
+        assert_eq!(s.arm_nanos.iter().map(|(_, n)| n).sum::<u64>(), 0);
+    }
+
+    #[test]
     fn since_inbox_grows_until_inbox_wins() {
         let stats = OpLoopArmStats::new(ARMS, INBOX);
         // Three non-inbox iterations: since_inbox == iter (never ingested).
@@ -486,9 +702,16 @@ mod tests {
         stats.record(2);
         let line = stats.snapshot().to_string();
         // Arm-id order, since_inbox = 2 (no ingest yet), last_arm = heartbeat.
+        // The arm_ms breakdown (idle first, then arm-id order) sits between
+        // the counts and since_inbox.
         assert!(
-            line.starts_with("iter=2 arm_counts=[command=1, inbox=0, heartbeat=1] since_inbox=2"),
+            line.starts_with("iter=2 arm_counts=[command=1, inbox=0, heartbeat=1] arm_ms=["),
             "unexpected line: {line}"
+        );
+        assert!(line.contains("since_inbox=2"), "unexpected line: {line}");
+        assert!(
+            line.contains("arm_ms=[idle="),
+            "idle pseudo-arm renders first in arm_ms: {line}"
         );
         assert!(line.ends_with("last_arm=heartbeat"), "unexpected line: {line}");
     }

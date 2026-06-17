@@ -1818,7 +1818,8 @@ fn seed_resource_fleet(
 fn lh_record(
     member_gen: u64,
     iters_per_sec_milli: u64,
-    dominant: (&str, u32),
+    // (arm_name, time-share milli-percent, time ms/s)
+    dominant: (&str, u32, u64),
     unacked: u32,
 ) -> SecondaryResourceSampleRecord {
     SecondaryResourceSampleRecord {
@@ -1837,6 +1838,7 @@ fn lh_record(
         oploop_iters_per_sec_milli: iters_per_sec_milli,
         dominant_arm_name: dominant.0.to_string(),
         dominant_arm_pct_milli: dominant.1,
+        dominant_arm_time_ms_per_sec: dominant.2,
         max_unacked_for_secs: unacked,
     }
 }
@@ -1846,27 +1848,30 @@ fn lh_record(
 #[test]
 fn loop_health_max_unacked_fleet_max() {
     let s = seed_resource_fleet(&[
-        ("sec-a", lh_record(0, 5_000, ("inbox", 40_000), 30)),
-        ("sec-b", lh_record(0, 6_000, ("inbox", 45_000), 60)),
-        ("sec-c", lh_record(0, 4_000, ("oom_sweep", 90_000), 120)),
+        ("sec-a", lh_record(0, 5_000, ("inbox", 40_000, 400), 30)),
+        ("sec-b", lh_record(0, 6_000, ("inbox", 45_000, 450), 60)),
+        ("sec-c", lh_record(0, 4_000, ("mem_check", 90_000, 900), 120)),
     ]);
     let snap = Snap::from_cluster_state(&s);
     assert_eq!(snap.max_unacked_for_secs, Some(120));
 }
 
-/// T2 (observer side) — `dominant_arm`: max-by-pct across secondaries
-/// emits the single hottest arm name+pct, NOT the fleet average.
+/// T2 (observer side) — `dominant_arm`: max-by-pct (TIME share) across
+/// secondaries emits the single hottest arm name+pct+time, carrying the
+/// ms/s from the SAME winning secondary (NOT a fleet average).
 #[test]
 fn loop_health_dominant_arm_max_by_pct() {
     let s = seed_resource_fleet(&[
-        ("sec-a", lh_record(0, 5_000, ("inbox", 40_000), 0)),
-        ("sec-b", lh_record(0, 6_000, ("oom_sweep", 80_000), 0)),
-        ("sec-c", lh_record(0, 4_000, ("anti_entropy", 30_000), 0)),
+        ("sec-a", lh_record(0, 5_000, ("inbox", 40_000, 400), 0)),
+        ("sec-b", lh_record(0, 6_000, ("mem_check", 80_000, 800), 0)),
+        ("sec-c", lh_record(0, 4_000, ("anti_entropy", 30_000, 300), 0)),
     ]);
     let snap = Snap::from_cluster_state(&s);
     let dominant = snap.dominant_arm.expect("at least one secondary with a non-empty dominant arm");
-    assert_eq!(dominant.arm_name, "oom_sweep");
+    assert_eq!(dominant.arm_name, "mem_check");
     assert_eq!(dominant.pct_milli, 80_000);
+    // The ms/s comes from sec-b (the max-pct winner), not sec-a/sec-c.
+    assert_eq!(dominant.time_ms_per_sec, 800);
 }
 
 /// T1 (observer side) — `avg_oploop_iters_per_sec_milli` is the
@@ -1876,11 +1881,11 @@ fn loop_health_dominant_arm_max_by_pct() {
 #[test]
 fn loop_health_avg_iters_excludes_zero_sentinels() {
     let s = seed_resource_fleet(&[
-        ("sec-a", lh_record(0, 10_000, ("inbox", 50_000), 0)),
-        ("sec-b", lh_record(0, 20_000, ("inbox", 50_000), 0)),
+        ("sec-a", lh_record(0, 10_000, ("inbox", 50_000, 500), 0)),
+        ("sec-b", lh_record(0, 20_000, ("inbox", 50_000, 500), 0)),
         // sec-c is cold-start / pre-#589 (iter rate at the wire-default
         // sentinel) — MUST NOT drag the average toward zero.
-        ("sec-c", lh_record(0, 0, ("", 0), 0)),
+        ("sec-c", lh_record(0, 0, ("", 0, 0), 0)),
     ]);
     let snap = Snap::from_cluster_state(&s);
     // (10_000 + 20_000) / 2 = 15_000; cold-start sec-c excluded.
@@ -1906,8 +1911,9 @@ fn loop_health_empty_fleet_yields_none() {
 fn loop_health_dominant_pct_25pct_threshold() {
     let cur_50 = StatsSnapshot {
         dominant_arm: Some(DominantArm {
-            arm_name: "oom_sweep".to_string(),
+            arm_name: "mem_check".to_string(),
             pct_milli: 50_000,
+            time_ms_per_sec: 500,
         }),
         ..Default::default()
     };
@@ -1922,7 +1928,7 @@ fn loop_health_dominant_pct_25pct_threshold() {
     let r1 = render_report_full(&cur_50, &prev, &baseline_30);
     let body1 = r1.body.expect("at least one line moved enough to include");
     assert!(
-        body1.contains("dominant arm (fleet max): oom_sweep:50.00%"),
+        body1.contains("dominant arm (fleet max): mem_check:50.00% time=500ms/s"),
         "30%→50% must include the dominant-arm line; got:\n{body1}"
     );
 
@@ -1941,8 +1947,9 @@ fn loop_health_dominant_pct_25pct_threshold() {
     // 50% baseline → 55% current (rel = 0.1 < 0.25), EXCLUDE.
     let cur_55 = StatsSnapshot {
         dominant_arm: Some(DominantArm {
-            arm_name: "oom_sweep".to_string(),
+            arm_name: "mem_check".to_string(),
             pct_milli: 55_000,
+            time_ms_per_sec: 550,
         }),
         ..Default::default()
     };
@@ -1966,8 +1973,9 @@ fn loop_health_only_change_is_skip_eligible() {
     let cur = StatsSnapshot {
         avg_oploop_iters_per_sec_milli: Some(15_000),
         dominant_arm: Some(DominantArm {
-            arm_name: "oom_sweep".to_string(),
+            arm_name: "mem_check".to_string(),
             pct_milli: 80_000,
+            time_ms_per_sec: 800,
         }),
         max_unacked_for_secs: Some(120),
         ..Default::default()
