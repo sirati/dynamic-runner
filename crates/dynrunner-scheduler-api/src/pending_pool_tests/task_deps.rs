@@ -547,6 +547,161 @@ fn seeded_dormant_id_resolves_dep_and_blocks_dependent_until_revival() {
     assert_eq!(child.task_id, "child");
 }
 
+/// LIVENESS REGRESSION-LOCK (Defect 2 — the cross-phase drain-edge
+/// deadlock). Two phases each hold their OWN retry-exhausted soft root
+/// AND a dependent blocked on the OTHER phase's soft root:
+///
+///   A: a1 (soft, exhausted), a2 blocked on B.b1
+///   B: b1 (soft, exhausted), b2 blocked on A.a1
+///
+/// Pre-fix `live_blocked_count(A)` counts a2 as LIVE (its prereq b1 is
+/// soft in a FOREIGN phase, so `is_dead` is false) → A never reaches its
+/// drain edge → a1 never finalizes. Symmetrically B never drains → b1
+/// never finalizes. Neither soft root promotes, neither cascades: the
+/// pool never empties (the 3h hang). The blocking prereqs are genuinely
+/// exhausted, so the dependents are doomed; nothing can ever revive them.
+///
+/// Post-fix: each phase reaches a finalize-bearing drain edge despite the
+/// foreign-blocked dependent, so finalizing the soft roots cascades every
+/// dependent and the pool empties. NO premature cascade (the prereqs are
+/// exhausted) and no premature phase-Done (a phase still owning a live
+/// blocked dependent of a *revivable* prereq must NOT drain — covered by
+/// the foreign-revivable guard test below).
+#[test]
+fn cross_phase_drain_edge_deadlock_resolves() {
+    let mut p = pool_with(&["A", "B"], &[]);
+    p.extend([
+        t_cross("A", "a1", &[]),
+        t_cross("A", "a2", &[("B", "b1")]),
+        t_cross("B", "b1", &[]),
+        t_cross("B", "b2", &[("A", "a1")]),
+    ])
+    .expect("valid extend");
+    // a1 and b1 dispatch and soft-fail (retry-pending), exhausted.
+    let r1 = p.pop_for_worker(1).expect("a root dispatchable");
+    let r2 = p.pop_for_worker(1).expect("another root dispatchable");
+    for r in [&r1, &r2] {
+        match r.task_id.as_str() {
+            "a1" => p.on_item_failed_pending_retry(&phase("A"), "a1"),
+            "b1" => p.on_item_failed_pending_retry(&phase("B"), "b1"),
+            other => panic!("unexpected dispatched root {other}"),
+        }
+    }
+    // Both phases are now (queued=0, in_flight=0, blocked=1) with the one
+    // blocked item doomed by the OTHER phase's exhausted soft root. The
+    // ordinary drain machinery NEVER surfaces them (each is held open by
+    // its foreign-blocked dependent) — that is the deadlock.
+    p.drain_empty_active_phases();
+    assert!(
+        p.poll_drain_transitions().is_empty(),
+        "the ordinary drain machinery cannot break the cycle"
+    );
+    // The pool surfaces BOTH phases as owning a soft root with no live
+    // work of their own — the manager's deadlock-break entry point.
+    let mut surfaced = p.phases_pending_soft_finalize();
+    surfaced.sort();
+    assert_eq!(
+        surfaced,
+        vec![phase("A"), phase("B")],
+        "both deadlocked phases must be surfaced for soft-finalize"
+    );
+    // Simulate the manager's deadlock-break + ordinary cascade loop: a
+    // surfaced phase's exhausted soft root is finalized (the manager's
+    // `drive_soft_finalize_deadlock`), and any phase the cascade flips to
+    // `Drained` is finalized through the ordinary drained-phase path
+    // (`poll_drain_transitions`). Finalizing one phase's root cascades the
+    // OTHER phase's dependent, which flips THAT phase toward its own edge —
+    // so both must be driven to a fixpoint, exactly as the manager's outer
+    // `process_phase_lifecycle` loop does.
+    let mut cascaded: Vec<String> = Vec::new();
+    loop {
+        // Ordinary drained-phase finalize (the cascade-flipped phases).
+        let drained_now = p.poll_drain_transitions();
+        let mut progressed = false;
+        for ph in &drained_now {
+            for (_, deps) in p.finalize_soft_failures(ph) {
+                cascaded.extend(deps.iter().map(|t| t.task_id.clone()));
+                progressed = true;
+            }
+        }
+        // Deadlock-break surface (a phase held open by a foreign dependent).
+        if let Some(ph) = p.phases_pending_soft_finalize().first().cloned() {
+            for (_, deps) in p.finalize_soft_failures(&ph) {
+                cascaded.extend(deps.iter().map(|t| t.task_id.clone()));
+            }
+            progressed = true;
+        }
+        p.drain_empty_active_phases();
+        if !progressed {
+            break;
+        }
+    }
+    cascaded.sort();
+    assert_eq!(
+        cascaded,
+        vec!["a2".to_string(), "b2".to_string()],
+        "both blocked dependents cascade-fail"
+    );
+    assert!(p.is_empty(), "no blocked stragglers survive — run can end");
+}
+
+/// Commit-2 correctness guard: a phase surfaced for soft-finalize because
+/// a FOREIGN-blocked dependent holds it open must NOT be cascade-failed by
+/// the pool when its soft root is still REVIVABLE. The pool primitive only
+/// reports the structural fact (surfaced); the EXHAUSTION decision stays
+/// with the manager, which — budget remaining — REINJECTS rather than
+/// finalizes, and a later success is never stranded.
+///
+/// Shape: P owns soft root `pr` (revivable) AND `pblock` blocked on Q.qr
+/// (foreign), so P is held open by the foreign dependent (its own-phase
+/// dependent of `pr` is doomed and discounted, but `pblock` keeps it from
+/// draining) => P is surfaced. The manager reinjects `pr`; the pool never
+/// cascades on its own. (The exhausted counterpart is
+/// `cross_phase_drain_edge_deadlock_resolves`.)
+#[test]
+fn surfaced_revivable_soft_phase_reinjects_not_cascades() {
+    let mut p = pool_with(&["Q", "P"], &[]);
+    p.extend([
+        t_cross("Q", "qr", &[]),
+        t_cross("P", "pr", &[]),
+        t_cross("P", "pblock", &[("Q", "qr")]),
+    ])
+    .expect("valid extend");
+    // Dispatch + soft-fail pr (P's own root). qr stays queued (Q is live).
+    let mut pr_dispatched = false;
+    while let Some(item) = p.pop_for_worker(1) {
+        if item.task_id == "pr" {
+            p.on_item_failed_pending_retry(&phase("P"), "pr");
+            pr_dispatched = true;
+            break;
+        }
+    }
+    assert!(pr_dispatched, "pr must dispatch");
+    // P has no own live work (pr soft, pblock blocked on foreign qr) but a
+    // foreign-blocked dependent holds it open => surfaced for soft-finalize.
+    p.drain_empty_active_phases();
+    assert!(
+        p.phases_pending_soft_finalize().contains(&phase("P")),
+        "P is surfaced (foreign-blocked dependent holds it open)"
+    );
+    // The manager (budget remaining) REINJECTS pr — the pool's reinject
+    // clears the soft marker. The pool itself NEVER cascade-fails pr's
+    // dependents; pblock stays blocked awaiting qr.
+    p.reinject(std::sync::Arc::new(t_cross("P", "pr", &[])));
+    assert!(
+        !p.phases_pending_soft_finalize().contains(&phase("P")),
+        "the revived root cleared the soft marker — no longer surfaced"
+    );
+    assert!(
+        !p.is_dead_ended("pr"),
+        "a revivable root is NEVER moved to failed_tasks by the pool"
+    );
+    assert!(
+        p.finalize_soft_failures(&phase("P")).is_empty(),
+        "no soft root survives for P — revival superseded it"
+    );
+}
+
 #[test]
 fn seeded_failure_ids_reject_duplicate_task_id_on_extend() {
     // Both seed classes claim the identity: a later batch reusing the

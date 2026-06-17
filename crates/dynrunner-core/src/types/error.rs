@@ -39,7 +39,55 @@ pub enum ErrorType {
     },
 }
 
+/// How a failed task's [`ErrorType`] routes through the failure
+/// pipeline — the SINGLE classification of an error's permanence, owned
+/// here alongside `ErrorType` so no consumer re-derives it with an ad-hoc
+/// `match`. The three callers (the live wire-failure path, the CRDT-apply
+/// mirror, and the audit/forward path) route on this verb instead of each
+/// carving out their own carve-outs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryClass {
+    /// The failure MIGHT clear on a re-run: the per-phase retry buckets
+    /// decide (`Recoverable` → error-retry bucket; memory
+    /// `ResourceExhausted` → OOM bucket). Routes to the soft / retry-
+    /// pending path; permanence is decided later at the phase drain edge.
+    Retryable,
+    /// The failure can NEVER clear on a re-run — it is terminal NOW.
+    /// `NonRecoverable`, `InvalidTask` (structurally invalid, see the
+    /// variant doc), and a NON-memory `ResourceExhausted` (no retry
+    /// bucket accepts it, so a soft marker would only wedge it) all land
+    /// here. Routes to the immediate-permanence path: into `failed_tasks`
+    /// with an immediate dependent cascade.
+    Permanent,
+    /// The failure is operator-reinjectable: `Unfulfillable` — the task
+    /// could not run because a required resource is held by no peer, but
+    /// becomes runnable again if that resource reappears. Routes to the
+    /// dormancy path (`on_item_finished(None)`); its dependents stay
+    /// Blocked awaiting the reinject, NOT cascaded.
+    Reinjectable,
+}
+
 impl ErrorType {
+    /// Classify this error by PERMANENCE — the one place the failure
+    /// pipeline's routing decision is derived. See [`RetryClass`].
+    ///
+    /// A NON-memory `ResourceExhausted` is `Permanent`, not `Retryable`:
+    /// only the memory kind has a retry bucket (the OOM bucket), so any
+    /// other resource kind has no reinjection path and a soft marker would
+    /// merely hold its dependents hostage at the drain edge forever.
+    pub fn retry_class(&self) -> RetryClass {
+        match self {
+            ErrorType::Recoverable => RetryClass::Retryable,
+            ErrorType::ResourceExhausted(kind) if *kind == ResourceKind::memory() => {
+                RetryClass::Retryable
+            }
+            ErrorType::ResourceExhausted(_)
+            | ErrorType::NonRecoverable
+            | ErrorType::InvalidTask { .. } => RetryClass::Permanent,
+            ErrorType::Unfulfillable { .. } => RetryClass::Reinjectable,
+        }
+    }
+
     /// Wire encoding (owned string because `ResourceExhausted` carries a
     /// task-defined kind name we have to interpolate). The legacy `oom`
     /// shorthand is preserved for the conventional `"memory"` kind.

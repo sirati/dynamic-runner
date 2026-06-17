@@ -22,7 +22,7 @@ pub use task_hash::compute_task_hash;
 pub use traits::{MessageReceiver, MessageSender};
 pub use types::{
     AffinityId, DonePayload, ErrorType, FailedTask, INLINE_VALUE_HARD_CAP_BYTES, Identifier,
-    PhaseId, ResourceAmount, ResourceKind, ResourceMap, ResultValue, RunnerIdentifier,
+    PhaseId, ResourceAmount, ResourceKind, ResourceMap, ResultValue, RetryClass, RunnerIdentifier,
     SoftPreferredSecondaries, TaskCountCategory, TaskDep, TaskInfo, TaskInput, TaskKind,
     TaskOutputs, TaskResult,
     TaskVersion, TerminalOutcomeCounts, TypeId, UploadFileRef, WorkerId, check_soft_caps,
