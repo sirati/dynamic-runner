@@ -52,7 +52,7 @@
 use std::collections::HashSet;
 
 use dynrunner_core::{Identifier, TaskInfo};
-use dynrunner_protocol_primary_secondary::AffineCell;
+use dynrunner_protocol_primary_secondary::{AffineCell, ClusterMutation};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::affine_scheduler::{QueuedUnit, WorkPlacement};
@@ -245,9 +245,36 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// when no donor had work to steal (the worker stays idle this tick).
     pub(crate) async fn try_affine_steal_for_worker(&mut self, worker_idx: usize) -> bool {
         let secondary = self.workers[worker_idx].secondary_id.clone();
-        let mutations = self.affine_scheduler.steal_for::<I, _>(
+        // Disjoint-field borrows: the steal-eligibility closure reads
+        // `cluster_state` + `workers` while `affine_scheduler` is mutably borrowed
+        // (distinct fields). A work is steal-INELIGIBLE when its affine import is
+        // in flight on the donor — under lazy import (c) that means the work
+        // committed there (it triggered the on-demand import), so it belongs there
+        // and must not be stolen (which would strand the running import).
+        let cluster_state = &self.cluster_state;
+        let workers = &self.workers;
+        let mutations = self.affine_scheduler.steal_for::<I, _, _>(
             &secondary,
-            |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
+            |s: &str, a: AffineId| cluster_state.affine_state(s, a),
+            |donor: &str, work_hash: &str| {
+                let Some(task) = cluster_state.task_info_for_hash(work_hash) else {
+                    return true;
+                };
+                let import_in_flight_on_donor = task.task_depends_on.iter().any(|dep| {
+                    let Some(import_hash) =
+                        cluster_state.task_hash_for_dep(&dep.phase_id, &dep.task_id)
+                    else {
+                        return false;
+                    };
+                    if cluster_state.affine_id_for_hash(import_hash).is_none() {
+                        return false; // not an affine dep
+                    }
+                    workers
+                        .iter()
+                        .any(|w| w.secondary_id == donor && w.held_task_hash() == Some(import_hash))
+                });
+                !import_in_flight_on_donor
+            },
         );
         if !mutations.is_empty() {
             self.apply_and_broadcast_cluster_mutations(mutations).await;
@@ -323,7 +350,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     return false;
                 }
                 AffineGateOutcome::StrandedHere => {
-                    self.affine_replace_and_nudge(secondary, &placement).await;
+                    // Lazy-import model (c): the work has committed to THIS
+                    // secondary (it was popped for a worker here) but an affine
+                    // dep is NotDone here — dispatch the import ON-DEMAND now,
+                    // claiming the cell `Queued`, and requeue the work to the
+                    // front so it dispatches after the import's terminal nudge
+                    // (the `InFlightHere` gate holds it until the cell is Done).
+                    // The import runs ONLY because this dependent committed here —
+                    // never speculatively ahead of one — so it can never be
+                    // stranded by a steal.
+                    self.dispatch_affine_import_on_demand(worker_idx, secondary, &placement, unit)
+                        .await;
                     return false;
                 }
                 AffineGateOutcome::Reroute(target) => {
@@ -515,6 +552,77 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
     }
 
+    /// Lazy-import ON-DEMAND dispatch (model c): a WORK unit committed on
+    /// `secondary` (popped for `worker_idx`) found an affine dep `NotDone` here
+    /// (the `StrandedHere` gate). Dispatch that import on `secondary` NOW —
+    /// claiming the cell `Queued` and sending the import to this worker — and
+    /// requeue the work to the FRONT so it re-pops once the import terminals (the
+    /// `InFlightHere` gate holds it `Queued`, the import's terminal nudges the
+    /// re-pop). The import runs ONLY because this dependent committed here, so it
+    /// is never speculatively dispatched ahead of a work and never strandable by
+    /// a steal.
+    ///
+    /// Dispatches the FIRST `NotDone` dep (multi-dep units resolve one import per
+    /// re-pop until all are `Done`, then the work gates `Ready`). The run-once +
+    /// concurrent dispatch-once guards in [`Self::dispatch_affine_unit`] still
+    /// apply (a `Done`/in-flight import here is skipped), so a re-pop racing the
+    /// import's terminal cannot double-run it. The work is always requeued so it
+    /// is never lost.
+    async fn dispatch_affine_import_on_demand(
+        &mut self,
+        worker_idx: usize,
+        secondary: &str,
+        placement: &WorkPlacement,
+        work_unit: QueuedUnit,
+    ) {
+        // The work re-pops after the import terminals; keep it at the front so it
+        // is the next unit this secondary serves. Requeue FIRST so an early
+        // return (no dispatchable import) never loses it.
+        self.affine_scheduler.requeue_front(secondary, work_unit);
+
+        // First NotDone affine dep — the import to run on-demand here. (Queued =
+        // already in flight here; Done = already ran here; Failed = the gate took
+        // a different arm — none reach `StrandedHere`.)
+        let next_import = placement.affine_deps.iter().find(|(aid, _)| {
+            self.cluster_state.affine_state(secondary, *aid) == AffineCell::NotDone
+        });
+        let Some((aid, import_hash)) = next_import.cloned() else {
+            // No NotDone dep (raced to Done/Queued/Failed since the gate read) —
+            // just nudge so the work re-pops and re-gates.
+            self.cluster_state
+                .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
+            return;
+        };
+
+        // Claim the cell `Queued` (the per-secondary in-flight claim), then
+        // dispatch the import as its own affine unit through the shared seam —
+        // which re-applies the run-once + dispatch-once guards.
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::SecondaryAffineQueued {
+            secondary: secondary.to_string(),
+            affine_id: aid.0,
+            generation: 0,
+        }])
+        .await;
+        // `Box::pin` the recursive dispatch: `dispatch_affine_unit` (work arm) →
+        // here → `dispatch_affine_unit` (import arm) is a cycle the async state
+        // machine must box. The import arm never re-enters this helper (it is not
+        // a work unit), so the recursion is depth-1.
+        Box::pin(self.dispatch_affine_unit(
+            worker_idx,
+            secondary,
+            QueuedUnit::Affine {
+                affine_id: aid,
+                hash: import_hash,
+            },
+        ))
+        .await;
+
+        // Re-nudge so a sibling idle worker re-pops the work (held `InFlightHere`
+        // until the import's terminal flips the cell `Done`).
+        self.cluster_state
+            .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
+    }
+
     /// Terminal-fail an affine-dep WORK task whose import `Failed` on every
     /// eligible secondary (the `Unsatisfiable` gate verdict) — the cascade that
     /// breaks the all-`Failed` livelock and realizes the owner Q1 default
@@ -652,53 +760,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         for placement in &placements {
             self.affine_scheduler.record_placed_work(&placement.hash);
         }
-        // The discriminator for the relocation/failover stranded-import
-        // recovery (`place_rebuild`): is affine-id `a`'s import currently HELD by
-        // a live worker on secondary `s`? Built once from the just-reconstructed
-        // worker roster (`reconstruct_workers_from_cluster_state` ran first in
-        // `hydrate_from_cluster_state`). A `Queued` cell whose import is
-        // worker-held is a mid-run failover (the running import will terminal) —
-        // the rebuild must NOT restore its unit (double-run); a `Queued` cell
-        // whose import is NOT worker-held was placed-but-never-dispatched by the
-        // lost prior primary — its node-local unit died with that primary and
-        // must be restored ahead of its dependent work.
-        let held: HashSet<(String, AffineId)> = self.affine_imports_held_by_live_workers();
-        let mutations = self.affine_scheduler.rebuild::<I, _, _>(
+        // Lazy import (c): the rebuild re-derives ONLY the work units against the
+        // inherited bitvector. There is no enqueued import unit to reconstruct, so
+        // the stranded-vs-in-flight `import_held` discriminator the eager model
+        // needed is gone: a `Queued` cell whose import was in flight will terminal
+        // (its cell flips and the work gates normally); a `Queued` cell whose
+        // holder also died re-derives a fresh import on-demand when the work next
+        // commits (the `StrandedHere` arm reads the live cell). Either way no
+        // double-run, no stranded dependent.
+        let mutations = self.affine_scheduler.rebuild::<I, _>(
             &secondaries,
             &placements,
             |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
-            |s: &str, a: AffineId| held.contains(&(s.to_string(), a)),
         );
         if !mutations.is_empty() {
             crate::cluster_state::apply_locally_for_broadcast(&mut self.cluster_state, mutations);
         }
     }
 
-    /// The set of `(secondary, affine_id)` whose affine IMPORT is currently held
-    /// by a live (reconstructed) worker on that secondary — the rebuild's
-    /// stranded-vs-in-flight discriminator (consumed by `rebuild_affine_schedule`
-    /// → `AffineScheduler::place_rebuild`).
-    ///
-    /// Read off `self.workers` AFTER
-    /// [`PrimaryCoordinator::reconstruct_workers_from_cluster_state`] has crossed
-    /// the replicated `TaskState::InFlight { secondary, worker }` occupancy onto
-    /// the roster: an `Assigned` slot's held task hash that binds to an affine-id
-    /// is an import RUNNING on that slot's secondary. The bitvector cell key is
-    /// `(secondary, affine_id)`, so the holder key is the worker's
-    /// `secondary_id` crossed with the held task's affine-id — the same per-
-    /// secondary identity the cell uses. A `Queued` cell present in this set is
-    /// mid-run failover (in-flight import); a `Queued` cell ABSENT was
-    /// placed-but-never-dispatched (stranded by the prior primary's loss).
-    fn affine_imports_held_by_live_workers(&self) -> HashSet<(String, AffineId)> {
-        self.workers
-            .iter()
-            .filter_map(|w| {
-                let task = w.held_task()?;
-                let aid = self
-                    .cluster_state
-                    .affine_id_for_hash(&compute_task_hash(task))?;
-                Some((w.secondary_id.clone(), aid))
-            })
-            .collect()
-    }
 }

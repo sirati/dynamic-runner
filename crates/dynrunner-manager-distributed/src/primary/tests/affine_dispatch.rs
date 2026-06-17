@@ -773,17 +773,18 @@ async fn affine_import_failed_everywhere_terminal_fails_dependent() {
         .await;
 }
 
-/// RELOCATION-REBUILD STRANDED IMPORT (bug 3): the prior primary PLACED the
-/// affine import (cell → `Queued` on a secondary) but RELOCATED before
-/// DISPATCHING it, so the import unit lived ONLY in that primary's now-lost
-/// node-local queue. After the promoted primary's rebuild, a `Queued`-cell
-/// import that NO live worker holds must be RECONSTRUCTED on its secondary's
-/// queue (ahead of its dependent work) — without this the dependent pops and
-/// spins forever on the `InFlightHere` gate (the hot re-pop worker storm). The
-/// cell STAYS `Queued` (no CRDT mutation); only the lost node-local unit is
-/// restored.
+/// RELOCATION-REBUILD under lazy import (c): the rebuild re-derives ONLY the
+/// dependent WORK units — it never reconstructs an import unit on the queue,
+/// regardless of the inherited `Queued` cell. The import is a DEPENDENCY derived
+/// on-demand when the work commits (the `StrandedHere` arm reads the live cell),
+/// so there is nothing to reconstruct and nothing to double-run: an in-flight
+/// inherited import terminals normally (cell flips, the rebuilt work gates), and
+/// a stranded one (its holder also died) re-derives a fresh import on-demand.
+/// This supersedes the eager model's reconstruct-vs-leave `import_held`
+/// discriminator (both arms — stranded-restore and in-flight-leave — collapse to
+/// "queue only the work").
 #[tokio::test(flavor = "current_thread")]
-async fn rebuild_reconstructs_stranded_queued_import_not_worker_held() {
+async fn rebuild_queues_only_work_import_derived_on_demand() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -794,8 +795,6 @@ async fn rebuild_reconstructs_stranded_queued_import_not_worker_held() {
 
             let (mut primary, _ends, _wm_rx, _mesh) =
                 primary_two_secondaries_with(vec![import, build]);
-            // Roster + capacity present (the rebuild ranks over the live roster
-            // and reconstruct_workers reads the per-secondary capacity).
             confirm_two(&mut primary).await;
 
             let affine_id = primary
@@ -803,10 +802,9 @@ async fn rebuild_reconstructs_stranded_queued_import_not_worker_held() {
                 .affine_id_for_hash(&import_hash)
                 .expect("registered affine-id");
 
-            // Simulate the inherited replicated state: the prior primary CLAIMED
-            // the import on sec-0 (cell → Queued) but never dispatched it — so
-            // there is NO TaskAssigned (no live worker holds it). This is the
-            // bitvector the promoted primary inherits.
+            // Inherited bitvector: the prior primary CLAIMED the import on sec-0
+            // (cell → Queued). Whether or not it dispatched it, the rebuild does
+            // NOT reconstruct an import unit.
             primary
                 .cluster_state_mut_for_test()
                 .apply(ClusterMutation::SecondaryAffineQueued {
@@ -814,99 +812,25 @@ async fn rebuild_reconstructs_stranded_queued_import_not_worker_held() {
                     affine_id: affine_id.0,
                     generation: 1,
                 });
-            assert_eq!(
-                primary.cluster_state_for_test().affine_state("sec-0", affine_id),
-                AffineCell::Queued,
-                "fixture: the inherited cell is Queued on sec-0"
-            );
 
-            // Promotion rebuild: reconstruct the roster (crosses any InFlight
-            // occupancy — here NONE for the import) then re-derive the queues.
             primary.reconstruct_workers_from_cluster_state();
             primary.rebuild_affine_schedule();
 
-            // The stranded import unit must be reconstructed on sec-0's queue,
-            // AHEAD of its dependent work (so the import dispatches, runs,
-            // terminals the cell Done, and the build's gate then dispatches).
+            // ONLY the work is queued (on whichever secondary rank chose) — no
+            // import unit reconstructed anywhere. The import re-derives on-demand
+            // when the work commits.
+            let sec0_q = primary.affine_queue_hashes_for_test("sec-0");
+            let sec1_q = primary.affine_queue_hashes_for_test("sec-1");
+            let mut all: Vec<String> = sec0_q.into_iter().chain(sec1_q).collect();
+            all.sort();
             assert_eq!(
-                primary.affine_queue_hashes_for_test("sec-0"),
-                vec![import_hash.clone(), build_hash.clone()],
-                "the placed-but-undispatched import must be restored ahead of \
-                 its work on sec-0's queue"
-            );
-            // The cell is UNCHANGED (still Queued — the restore emits no
-            // mutation; the claim was already on sec-0).
-            assert_eq!(
-                primary.cluster_state_for_test().affine_state("sec-0", affine_id),
-                AffineCell::Queued,
-                "restoring the lost unit must NOT mutate the cell"
-            );
-        })
-        .await;
-}
-
-/// RELOCATION-REBUILD IN-FLIGHT IMPORT (the discriminator's OTHER arm): a
-/// `Queued`-cell import that IS held by a live (reconstructed) worker on its
-/// secondary is a mid-run failover — the running import will terminal. The
-/// rebuild must NOT reconstruct its unit (doing so would DOUBLE-RUN the import,
-/// violating affine run-once-per-secondary + the failover no-reassign-in-flight
-/// law). Only the dependent work is queued, gated until the running import's
-/// terminal sets the cell Done.
-#[tokio::test(flavor = "current_thread")]
-async fn rebuild_leaves_inflight_queued_import_worker_held() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let import = affine_import("import");
-            let import_hash = compute_task_hash(&import);
-            let build = work_dep("build", "import");
-            let build_hash = compute_task_hash(&build);
-
-            let (mut primary, _ends, _wm_rx, _mesh) =
-                primary_two_secondaries_with(vec![import, build]);
-            confirm_two(&mut primary).await;
-
-            let affine_id = primary
-                .cluster_state_for_test()
-                .affine_id_for_hash(&import_hash)
-                .expect("registered affine-id");
-
-            // Inherited state: the prior primary CLAIMED (cell → Queued) AND
-            // DISPATCHED the import — the replicated InFlight fact names sec-0's
-            // worker 0 as the live holder.
-            {
-                let cs = primary.cluster_state_mut_for_test();
-                cs.apply(ClusterMutation::SecondaryAffineQueued {
-                    secondary: "sec-0".into(),
-                    affine_id: affine_id.0,
-                    generation: 1,
-                });
-                cs.apply(ClusterMutation::TaskAssigned {
-                    attempt: 0,
-                    hash: import_hash.clone(),
-                    secondary: "sec-0".into(),
-                    worker: 0,
-                    version: Default::default(),
-                });
-            }
-
-            // Promotion rebuild: reconstruct_workers crosses the InFlight import
-            // onto sec-0's slot, so the rebuild's held-discriminator sees the
-            // import as worker-held on sec-0.
-            primary.reconstruct_workers_from_cluster_state();
-            assert!(
-                primary.slot_holds_hash_for_test("sec-0", 0, &import_hash),
-                "fixture: the reconstructed sec-0/worker-0 slot holds the import"
-            );
-            primary.rebuild_affine_schedule();
-
-            // The worker-held import must NOT be re-queued: only the dependent
-            // work sits on the queue (no import unit ahead of it).
-            assert_eq!(
-                primary.affine_queue_hashes_for_test("sec-0"),
+                all,
                 vec![build_hash.clone()],
-                "a worker-held (in-flight) import must NOT be reconstructed — \
-                 only the dependent work is queued (no double-run)"
+                "rebuild queues ONLY the work; no import unit is reconstructed"
+            );
+            assert!(
+                !all.contains(&import_hash),
+                "the import is never an enqueued unit under lazy import"
             );
         })
         .await;

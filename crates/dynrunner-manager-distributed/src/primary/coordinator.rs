@@ -197,6 +197,16 @@ impl<I: Identifier> RemoteWorkerState<I> {
         self.state.task()
     }
 
+    /// The held task's content hash, if any — `None` for an `Idle` slot. The
+    /// hash carried inside the `Assigned` variant (the slot's held-task
+    /// identity), borrowed without recomputing it.
+    pub(super) fn held_task_hash(&self) -> Option<&str> {
+        match &self.state {
+            SlotState::Idle => None,
+            SlotState::Assigned { task_hash, .. } => Some(task_hash),
+        }
+    }
+
     /// Move the slot `Idle -> Assigned` with explicit `provenance`, IFF
     /// the slot is currently `Idle`. Returns `true` when the assign took
     /// effect, `false` when it was REFUSED because the slot already holds
