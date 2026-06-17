@@ -270,7 +270,7 @@ impl<I: Identifier> ClusterState<I> {
             // fold, so a same-count divergence (a cell at a different
             // value/generation) is detected and the snapshot pull's per-cell
             // LWW restore heals it.
-            // The BOXED `AffineState`: its REPLICATED bitvector half is folded
+            // The BOXED `SecondaryCellState`: its REPLICATED bitvector half is folded
             // below (the genuinely-independent replicated mutation state — NOT
             // implied by the tasks fold); its node-local gen-counter half
             // carries no convergence signal and is excluded by reading only

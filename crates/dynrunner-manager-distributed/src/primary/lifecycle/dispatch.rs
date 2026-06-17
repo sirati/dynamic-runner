@@ -304,6 +304,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 drop(view);
                 if self.try_affine_steal_for_worker(worker_idx).await {
                     all_infos[worker_idx] = self.workers[worker_idx].budget_info();
+                    continue;
+                }
+                // LAST-resort eager-prep idle filler (#638): the worker has
+                // NOTHING else — empty pool view, empty affine queue, and no
+                // steal donor — so speculatively run one eager-prep task on its
+                // secondary. This is the LOWEST dispatch precedence by
+                // construction (it runs only after every other source declined),
+                // so it never displaces real work and never blocks a phase
+                // transition (eager-prep is phase-agnostic + uncounted). A no-op
+                // when no eager-prep cell is non-terminal here.
+                if self.try_eager_prep_fill_for_worker(worker_idx).await {
+                    all_infos[worker_idx] = self.workers[worker_idx].budget_info();
                 }
                 continue;
             }

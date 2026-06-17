@@ -3,14 +3,21 @@
 //! snapshot/digest/restore round-trip, and the failover gen-floor resume.
 
 use super::*;
-use crate::cluster_state::AffineId;
+use crate::cluster_state::SecondaryCellId;
 use dynrunner_core::TaskKind;
-use dynrunner_protocol_primary_secondary::AffineCell;
+use dynrunner_protocol_primary_secondary::SecondaryCell;
 
 /// A `TaskKind::SecondaryAffine` task fixture (twin of `mk_task`).
 fn mk_affine_task(name: &str) -> TaskInfo<RunnerIdentifier> {
     let mut t = mk_task(name);
     t.kind = TaskKind::SecondaryAffine;
+    t
+}
+
+/// A `TaskKind::SecondaryEagerPrep` task fixture (twin of `mk_affine_task`).
+fn mk_eager_prep_task(name: &str) -> TaskInfo<RunnerIdentifier> {
+    let mut t = mk_task(name);
+    t.kind = TaskKind::SecondaryEagerPrep;
     t
 }
 
@@ -29,7 +36,7 @@ fn mk_work_task_in(name: &str, phase: &str) -> TaskInfo<RunnerIdentifier> {
 }
 
 /// Originating a `SecondaryAffine` `TaskAdded` through the broadcast choke
-/// point reserves an affine-id, INJECTS a paired `SecondaryAffineRegistered`,
+/// point reserves an affine-id, INJECTS a paired `SecondaryCellRegistered`,
 /// and binds the def's content hash to that affine-id. A NON-affine task gets
 /// NO affine-id (the bitvector tracks only the affine subset — dense).
 #[test]
@@ -52,7 +59,7 @@ fn originate_secondary_affine_allocates_and_registers_affine_id() {
     let registrations = applied
         .applied
         .iter()
-        .filter(|m| matches!(m, ClusterMutation::SecondaryAffineRegistered { .. }))
+        .filter(|m| matches!(m, ClusterMutation::SecondaryCellRegistered { .. }))
         .count();
     assert_eq!(registrations, 1, "exactly one affine registration injected");
     // The affine task's hash is bound to an affine-id; the work task is not.
@@ -109,30 +116,30 @@ fn cell_apply_is_lww_and_idempotent() {
 
     // Originate Queued then Finished through the choke point (monotone gens).
     let cells = vec![
-        ClusterMutation::SecondaryAffineQueued {
+        ClusterMutation::SecondaryCellQueued {
             secondary: "s1".into(),
-            affine_id: aid.0,
+            cell_id: aid.0,
             generation: 0, // stamped at the choke point
         },
-        ClusterMutation::SecondaryAffineFinished {
+        ClusterMutation::SecondaryCellFinished {
             secondary: "s1".into(),
-            affine_id: aid.0,
+            cell_id: aid.0,
             generation: 0,
         },
     ];
     crate::cluster_state::apply_locally_for_broadcast(&mut s, cells);
-    assert_eq!(s.affine_state("s1", aid), AffineCell::Done);
+    assert_eq!(s.affine_state("s1", aid), SecondaryCell::Done);
 
     // A STALE Failed at generation 1 (below the stamped Finished) is a NoOp.
     assert_eq!(
-        s.apply(ClusterMutation::SecondaryAffineFailed {
+        s.apply(ClusterMutation::SecondaryCellFailed {
             secondary: "s1".into(),
-            affine_id: aid.0,
+            cell_id: aid.0,
             generation: 1,
         }),
         ApplyOutcome::NoOp
     );
-    assert_eq!(s.affine_state("s1", aid), AffineCell::Done);
+    assert_eq!(s.affine_state("s1", aid), SecondaryCell::Done);
 }
 
 /// The load-bearing convergence case: two replicas that diverge on a cell
@@ -143,25 +150,25 @@ fn cell_apply_is_lww_and_idempotent() {
 fn steal_reset_converges_via_snapshot_restore() {
     // Replica A: the affine def is Queued on s1 at generation 5.
     let mut a = ClusterState::<RunnerIdentifier>::new();
-    a.apply(ClusterMutation::SecondaryAffineRegistered {
+    a.apply(ClusterMutation::SecondaryCellRegistered {
         hash: "h".into(),
-        affine_id: 0,
+        cell_id: 0,
     });
-    a.apply(ClusterMutation::SecondaryAffineQueued {
+    a.apply(ClusterMutation::SecondaryCellQueued {
         secondary: "s1".into(),
-        affine_id: 0,
+        cell_id: 0,
         generation: 5,
     });
     // Replica B: the idle-steal moved the unit away, resetting s1 to NotDone
     // at generation 6 (strictly greater than the Queued it undoes).
     let mut b = ClusterState::<RunnerIdentifier>::new();
-    b.apply(ClusterMutation::SecondaryAffineRegistered {
+    b.apply(ClusterMutation::SecondaryCellRegistered {
         hash: "h".into(),
-        affine_id: 0,
+        cell_id: 0,
     });
-    b.apply(ClusterMutation::SecondaryAffineUnqueued {
+    b.apply(ClusterMutation::SecondaryCellUnqueued {
         secondary: "s1".into(),
-        affine_id: 0,
+        cell_id: 0,
         generation: 6,
     });
 
@@ -171,8 +178,8 @@ fn steal_reset_converges_via_snapshot_restore() {
     a_into_b.restore(b.snapshot());
     let mut b_into_a = b.clone();
     b_into_a.restore(a.snapshot());
-    assert_eq!(a_into_b.affine_state("s1", AffineId(0)), AffineCell::NotDone);
-    assert_eq!(b_into_a.affine_state("s1", AffineId(0)), AffineCell::NotDone);
+    assert_eq!(a_into_b.affine_state("s1", SecondaryCellId(0)), SecondaryCell::NotDone);
+    assert_eq!(b_into_a.affine_state("s1", SecondaryCellId(0)), SecondaryCell::NotDone);
 }
 
 /// The digest DETECTS an affine-cell divergence (count-OR-hash), and a
@@ -181,9 +188,9 @@ fn steal_reset_converges_via_snapshot_restore() {
 #[test]
 fn digest_detects_and_restore_heals_affine_divergence() {
     let mut a = ClusterState::<RunnerIdentifier>::new();
-    a.apply(ClusterMutation::SecondaryAffineFinished {
+    a.apply(ClusterMutation::SecondaryCellFinished {
         secondary: "s1".into(),
-        affine_id: 0,
+        cell_id: 0,
         generation: 3,
     });
     let b = ClusterState::<RunnerIdentifier>::new();
@@ -194,7 +201,7 @@ fn digest_detects_and_restore_heals_affine_divergence() {
     // Restore heals: B pulls A's snapshot and converges.
     let mut b = b;
     b.restore(a.snapshot());
-    assert_eq!(b.affine_state("s1", AffineId(0)), AffineCell::Done);
+    assert_eq!(b.affine_state("s1", SecondaryCellId(0)), SecondaryCell::Done);
     assert!(!b.digest().is_behind(&a.digest()));
     assert!(!a.digest().is_behind(&b.digest()));
 }
@@ -211,7 +218,7 @@ fn digest_detects_and_restore_heals_affine_divergence() {
 #[test]
 fn affine_id_binding_survives_snapshot_restore_into_fresh_replica() {
     // Originate the affine def through the broadcast choke (reserves the id,
-    // injects + applies `SecondaryAffineRegistered`, and stamps the def).
+    // injects + applies `SecondaryCellRegistered`, and stamps the def).
     let mut a = ClusterState::<RunnerIdentifier>::new();
     let batch = vec![ClusterMutation::TaskAdded {
         hash: "h-affine".into(),
@@ -239,6 +246,67 @@ fn affine_id_binding_survives_snapshot_restore_into_fresh_replica() {
         "the restored replica must re-anchor the affine-id from the def's \
          inline field — else affine placement finds no affine deps and the \
          import never dispatches"
+    );
+}
+
+/// (Step 7 failover, #638) Eager-prep cells live in the REPLICATED bitvector
+/// and their def kind survives snapshot/restore, so a promoted primary
+/// re-derives its eager-prep candidates from the inherited cells with NO queue
+/// to rebuild (model A). Originate an eager-prep def (the kind-blind cell
+/// registration pass binds its cell-id + stamps the inline id), write a Done
+/// cell on one secondary, restore into a fresh replica, and assert the
+/// candidate set, the cell value, and the binding all survive.
+#[test]
+fn eager_prep_cells_and_candidates_survive_failover_into_fresh_replica() {
+    let mut a = ClusterState::<RunnerIdentifier>::new();
+    crate::cluster_state::apply_locally_for_broadcast(
+        &mut a,
+        vec![ClusterMutation::TaskAdded {
+            hash: "h-prep".into(),
+            task: mk_eager_prep_task("prep"),
+            def_id: None,
+        }],
+    );
+    let cid = a
+        .affine_id_for_hash("h-prep")
+        .expect("origin binds the eager-prep cell-id");
+    // The def store reports the cell-id as eager-prep (derived from its kind).
+    assert_eq!(a.eager_prep_cell_ids(), vec![cid]);
+    // Run the prep on sec-0 (cell → Done).
+    crate::cluster_state::apply_locally_for_broadcast(
+        &mut a,
+        vec![ClusterMutation::SecondaryCellFinished {
+            secondary: "sec-0".into(),
+            cell_id: cid.0,
+            generation: 0,
+        }],
+    );
+    assert_eq!(a.affine_state("sec-0", cid), SecondaryCell::Done);
+
+    // A FRESH replica (promoted primary) restores A's snapshot.
+    let mut fresh = ClusterState::<RunnerIdentifier>::new();
+    fresh.restore(a.snapshot());
+
+    // The promoted primary re-derives the SAME eager-prep candidate set (no
+    // queue to rebuild — the cells + def kinds are replicated) and inherits the
+    // Done cell, so its filler skips sec-0 (already run) and would prep only a
+    // not-yet-run secondary.
+    assert_eq!(
+        fresh.eager_prep_cell_ids(),
+        vec![cid],
+        "the promoted primary re-derives the eager-prep candidates from \
+         inherited cells"
+    );
+    assert_eq!(
+        fresh.affine_state("sec-0", cid),
+        SecondaryCell::Done,
+        "the inherited Done cell survives — the prep is not re-run on sec-0"
+    );
+    // A fresh secondary's cell is the default NotDone ⇒ still a candidate.
+    assert_eq!(
+        fresh.non_terminal_cells_for("sec-1", &[cid]),
+        vec![cid],
+        "an un-run secondary is still a placeable eager-prep candidate post-failover"
     );
 }
 
@@ -482,9 +550,9 @@ fn phase_rollup_affine_only_phase_keeps_has_any() {
 fn failover_resumes_cell_generation_past_inherited() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
     // Inherit a cell at a high generation (e.g. restored from a prior epoch).
-    s.apply(ClusterMutation::SecondaryAffineQueued {
+    s.apply(ClusterMutation::SecondaryCellQueued {
         secondary: "s1".into(),
-        affine_id: 0,
+        cell_id: 0,
         generation: 100,
     });
     // Promotion: a new primary epoch advances → the gen-floor resume fires.
@@ -495,11 +563,11 @@ fn failover_resumes_cell_generation_past_inherited() {
     });
     // A newly originated cell write through the choke point must out-stamp the
     // inherited generation-100 cell, so it WINS the LWW (lands as Done).
-    let cells = vec![ClusterMutation::SecondaryAffineFinished {
+    let cells = vec![ClusterMutation::SecondaryCellFinished {
         secondary: "s1".into(),
-        affine_id: 0,
+        cell_id: 0,
         generation: 0, // stamped at the choke point, resumed past 100
     }];
     crate::cluster_state::apply_locally_for_broadcast(&mut s, cells);
-    assert_eq!(s.affine_state("s1", AffineId(0)), AffineCell::Done);
+    assert_eq!(s.affine_state("s1", SecondaryCellId(0)), SecondaryCell::Done);
 }

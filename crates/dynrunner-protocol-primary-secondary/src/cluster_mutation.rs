@@ -249,20 +249,22 @@ pub enum PrimaryChangeReason {
     Transferred,
 }
 
-/// The per-(secondary, affine-id) completion CELL of the replicated affine
-/// bitvector — the value half of one 2-bit cell (the bitvector packs these
+/// The per-(secondary, cell-id) completion CELL of the replicated per-secondary
+/// cell bitvector — the value half of one 2-bit cell (the bitvector packs these
 /// two bits each; this is the logical view the mutations + state-query helpers
-/// speak). Every cell starts [`Self::NotDone`].
+/// speak). KIND-BLIND: the same cell value backs every per-secondary scheduling
+/// kind that needs a 2-bit completion cell (affine + eager-prep). Every cell
+/// starts [`Self::NotDone`].
 ///
 /// LATTICE NOTE: the cell is NOT a join-semilattice on its own — the idle-steal
 /// performs a `Queued → NotDone` un-queue (it relinquishes a queued claim), so
 /// there is no monotone partial order under which every transition only moves
 /// UP. Convergence is therefore achieved by a per-cell LAST-WRITER-WINS stamp
 /// (the `generation` the mutations carry — primary-monotone, failover-resumed),
-/// NOT by a value max-join. See the `affine_state` module's merge doc.
+/// NOT by a value max-join. See the `secondary_cell_state` module's merge doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum AffineCell {
-    /// `00` — the affine def is neither queued nor terminal on this secondary.
+pub enum SecondaryCell {
+    /// `00` — the def is neither queued nor terminal on this secondary.
     #[default]
     NotDone,
     /// `01` — the affine def is QUEUED on this secondary (a locality claim the
@@ -1286,53 +1288,56 @@ pub enum ClusterMutation<I> {
         secondary: String,
         record: SecondaryResourceSampleRecord,
     },
-    /// Bind a `TaskKind::SecondaryAffine` def's content `hash` to its
-    /// PRIMARY-allocated, CRDT-agreed dense AFFINE-id (the per-secondary
-    /// bitvector cell index). The affine analogue of the `def_id` stamp on
-    /// `TaskAdded`, carried as its OWN mutation (its own single concern — the
-    /// affine-id agreement — so it touches NO existing `TaskAdded` originator).
-    /// Originated by the primary alongside the affine `TaskAdded`; idempotent
-    /// (keyed by hash, bijection-enforced on apply), so order vs the
-    /// `TaskAdded` is free. Carries no `generation` — the binding is set-once /
-    /// content-addressed (like the def-id stamp), not LWW.
-    SecondaryAffineRegistered {
+    /// Bind a per-secondary cell-bearing def's content `hash` to its
+    /// PRIMARY-allocated, CRDT-agreed dense CELL-id (the per-secondary
+    /// bitvector cell index). KIND-BLIND: originated for any cell-bearing kind
+    /// (`SecondaryAffine` + `SecondaryEagerPrep`). The cell analogue of the
+    /// `def_id` stamp on `TaskAdded`, carried as its OWN mutation (its own
+    /// single concern — the cell-id agreement — so it touches NO existing
+    /// `TaskAdded` originator). Originated by the primary alongside the
+    /// cell-bearing `TaskAdded`; idempotent (keyed by hash, bijection-enforced
+    /// on apply), so order vs the `TaskAdded` is free. Carries no `generation`
+    /// — the binding is set-once / content-addressed (like the def-id stamp),
+    /// not LWW.
+    SecondaryCellRegistered {
         hash: String,
-        affine_id: u32,
+        cell_id: u32,
     },
-    /// Set the affine bitvector CELL for `(secondary, affine_id)` to DONE
-    /// (`11`). LWW per cell on `generation` (see [`AffineCell`]'s lattice
+    /// Set the bitvector CELL for `(secondary, cell_id)` to DONE
+    /// (`11`). LWW per cell on `generation` (see [`SecondaryCell`]'s lattice
     /// note): a strictly-greater generation wins; equal/older is a NoOp
     /// (idempotent under at-least-once + snapshot replay).
-    SecondaryAffineFinished {
+    SecondaryCellFinished {
         secondary: String,
-        affine_id: u32,
+        cell_id: u32,
         generation: u64,
     },
-    /// Set the affine bitvector CELL for `(secondary, affine_id)` to QUEUED
+    /// Set the bitvector CELL for `(secondary, cell_id)` to QUEUED
     /// (`01`). LWW per cell on `generation`. The locality claim the primary
-    /// places when it appends an affine prereq to a secondary's queue.
-    SecondaryAffineQueued {
+    /// places when it appends a cell prereq to a secondary's queue.
+    SecondaryCellQueued {
         secondary: String,
-        affine_id: u32,
+        cell_id: u32,
         generation: u64,
     },
-    /// Set the affine bitvector CELL for `(secondary, affine_id)` to FAILED
+    /// Set the bitvector CELL for `(secondary, cell_id)` to FAILED
     /// (`10`). LWW per cell on `generation`. NOT sticky (Q1 default): a later
     /// higher-generation Queued/Done overrides it.
-    SecondaryAffineFailed {
+    SecondaryCellFailed {
         secondary: String,
-        affine_id: u32,
+        cell_id: u32,
         generation: u64,
     },
-    /// Reset the affine bitvector CELL for `(secondary, affine_id)` to NOT_DONE
+    /// Reset the bitvector CELL for `(secondary, cell_id)` to NOT_DONE
     /// (`00`). LWW per cell on `generation`. The idle-steal's `01 → 00`
     /// un-queue (the source secondary relinquishes its queued claim when the
-    /// schedulable unit moves to another secondary). AF-sched originates this;
-    /// it carries a generation strictly greater than the Queued it undoes so
-    /// the reset wins the LWW.
-    SecondaryAffineUnqueued {
+    /// schedulable unit moves to another secondary), AND the eager-prep
+    /// phase-transition reset of a stale `Queued → NotDone` cell. The
+    /// originator carries a generation strictly greater than the Queued it
+    /// undoes so the reset wins the LWW.
+    SecondaryCellUnqueued {
         secondary: String,
-        affine_id: u32,
+        cell_id: u32,
         generation: u64,
     },
 }

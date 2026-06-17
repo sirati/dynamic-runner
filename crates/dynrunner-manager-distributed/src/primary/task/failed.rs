@@ -490,7 +490,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// The single split this function owns: a BACKPRESSURE-shaped bounce is NOT
     /// a terminal — the import never ran on this secondary (a worker-pipe
     /// respawn, a full pool, a no-fault preempt …), so it RESETS the cell
-    /// `Queued → NotDone` (the same `SecondaryAffineUnqueued` mutation `steal_for`
+    /// `Queued → NotDone` (the same `SecondaryCellUnqueued` mutation `steal_for`
     /// emits when a donor relinquishes a queued claim). The dependent work unit
     /// sitting `InFlightHere` at the front of this secondary's affine queue then
     /// reads `NotDone` on its next pop → `StrandedHere` →

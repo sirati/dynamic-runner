@@ -32,7 +32,6 @@
 //! arm doc.
 
 mod accessors;
-mod affine_state;
 mod apply;
 mod apply_affine;
 mod apply_custom;
@@ -48,6 +47,7 @@ mod outcome_tally;
 mod output_store;
 mod range_digest;
 mod range_fold_memo;
+mod secondary_cell_state;
 mod settled;
 mod snapshot;
 mod state;
@@ -81,12 +81,12 @@ pub(crate) use settled::{SettledClass, SpillReceipt, write_spill_batch};
 // content-addressed replicated store of those cores. Crate-internal (the
 // store is owned by `ClusterState`, like `settled`); additive in L1.
 #[allow(unused_imports)]
-pub(crate) use task_def_store::{AffineId, FrozenTaskDef, TaskDefId, TaskDefStore};
+pub(crate) use task_def_store::{SecondaryCellId, FrozenTaskDef, TaskDefId, TaskDefStore};
 // Per-secondary affine bitvector (the AF-id state layer): the replicated CRDT
 // the affine SCHEDULER (AF-sched) reads/writes through. Crate-internal, owned
 // by `ClusterState`.
 #[allow(unused_imports)]
-pub(crate) use affine_state::{AffineBitvector, AffineState};
+pub(crate) use secondary_cell_state::{SecondaryCellBitvector, SecondaryCellState};
 #[cfg(test)]
 pub(crate) use task_def_store::split_task_def;
 pub use snapshot::ClusterStateSnapshot;

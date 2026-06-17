@@ -18,7 +18,7 @@
 //!   secondary by rank ([`PrimaryCoordinator::affine_placement_for`] +
 //!   `AffineScheduler::select_secondary`) and `AffineScheduler::place` the work
 //!   task there after its still-not-done affine prereqs, emitting the resulting
-//!   `SecondaryAffineQueued` mutations. Detection REUSES the pool's
+//!   `SecondaryCellQueued` mutations. Detection REUSES the pool's
 //!   already-computed readiness (a `SecondaryAffine` task in a bucket = its deps
 //!   are met) — it never re-decides dep resolution.
 //! - PER-SECONDARY-FIRST pop ([`Self::try_affine_pop_for_worker`]): when
@@ -32,7 +32,7 @@
 //! - IDLE-STEAL ([`Self::try_affine_steal_for_worker`]): when BOTH the global
 //!   pool view AND `S`'s queue are empty at assignment time,
 //!   `AffineScheduler::steal_for` a whole schedulable unit from the
-//!   longest-queue donor, emit the `SecondaryAffineUnqueued`/re-`Queued`
+//!   longest-queue donor, emit the `SecondaryCellUnqueued`/re-`Queued`
 //!   mutations, and dispatch the stolen unit.
 //! - FAILOVER rebuild ([`Self::rebuild_affine_schedule`], called from
 //!   [`PrimaryCoordinator::hydrate_from_cluster_state`]): discard the local
@@ -52,14 +52,14 @@
 use std::collections::HashSet;
 
 use dynrunner_core::{Identifier, TaskInfo};
-use dynrunner_protocol_primary_secondary::{AffineCell, ClusterMutation};
+use dynrunner_protocol_primary_secondary::{SecondaryCell, ClusterMutation};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::affine_scheduler::{QueuedUnit, WorkPlacement};
 use super::lifecycle::dispatch::DispatchOutcome;
 use super::wire::compute_task_hash;
 use super::PrimaryCoordinator;
-use crate::cluster_state::AffineId;
+use crate::cluster_state::SecondaryCellId;
 
 /// The per-secondary affine-readiness verdict for a popped WORK unit, derived
 /// from its affine deps' bitvector cells on the dispatching secondary (the
@@ -203,7 +203,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             let Some(sec) = self.affine_scheduler.select_secondary(
                 &secondaries,
                 &placement,
-                |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
+                |s: &str, a: SecondaryCellId| self.cluster_state.affine_state(s, a),
             ) else {
                 self.affine_scheduler.unrecord_placed_work(&work_hash);
                 continue;
@@ -211,7 +211,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             let mutations = self.affine_scheduler.place::<I, _>(
                 &sec,
                 &placement,
-                |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
+                |s: &str, a: SecondaryCellId| self.cluster_state.affine_state(s, a),
             );
             if !mutations.is_empty() {
                 self.apply_and_broadcast_cluster_mutations(mutations).await;
@@ -240,7 +240,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// precondition is that BOTH the global pool view AND this worker's
     /// secondary's queue are empty (the design's idle-steal trigger). Steal a
     /// whole schedulable unit from the longest-queue donor — emitting the
-    /// `SecondaryAffineUnqueued`/re-`Queued` cell mutations — then pop +
+    /// `SecondaryCellUnqueued`/re-`Queued` cell mutations — then pop +
     /// dispatch it. Returns `true` iff a stolen unit was committed; `false`
     /// when no donor had work to steal (the worker stays idle this tick).
     pub(crate) async fn try_affine_steal_for_worker(&mut self, worker_idx: usize) -> bool {
@@ -255,7 +255,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let workers = &self.workers;
         let mutations = self.affine_scheduler.steal_for::<I, _, _>(
             &secondary,
-            |s: &str, a: AffineId| cluster_state.affine_state(s, a),
+            |s: &str, a: SecondaryCellId| cluster_state.affine_state(s, a),
             |donor: &str, work_hash: &str| {
                 let Some(task) = cluster_state.task_info_for_hash(work_hash) else {
                     return true;
@@ -410,7 +410,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // and are never gated here.
         if !is_work {
             let cell_done = affine_unit_id.is_some_and(|aid| {
-                self.cluster_state.affine_state(secondary, aid) == AffineCell::Done
+                self.cluster_state.affine_state(secondary, aid) == SecondaryCell::Done
             });
             if cell_done || self.secondary_has_slot_holding_hash(secondary, &hash) {
                 return false;
@@ -503,14 +503,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // there), by the same locality rank a fresh placement uses; if none exists
         // (the import failed everywhere), the unit is doomed.
         let any_failed = placement.affine_deps.iter().any(|(aid, _)| {
-            self.cluster_state.affine_state(secondary, *aid) == AffineCell::Failed
+            self.cluster_state.affine_state(secondary, *aid) == SecondaryCell::Failed
         });
         if any_failed {
             let satisfiable = self.affine_unit_satisfiable_secondaries(placement);
             return match self.affine_scheduler.select_secondary(
                 &satisfiable,
                 placement,
-                |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
+                |s: &str, a: SecondaryCellId| self.cluster_state.affine_state(s, a),
             ) {
                 Some(target) => AffineGateOutcome::Reroute(target),
                 None => AffineGateOutcome::Unsatisfiable,
@@ -528,11 +528,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // gate from skipping a `Queued` (unmet) earlier dep to a later `NotDone`.
         for (aid, _) in &placement.affine_deps {
             match self.cluster_state.affine_state(secondary, *aid) {
-                AffineCell::Done => {}
-                AffineCell::Queued => return AffineGateOutcome::InFlightHere,
-                AffineCell::NotDone => return AffineGateOutcome::StrandedHere,
+                SecondaryCell::Done => {}
+                SecondaryCell::Queued => return AffineGateOutcome::InFlightHere,
+                SecondaryCell::NotDone => return AffineGateOutcome::StrandedHere,
                 // `Failed` was handled order-independently above.
-                AffineCell::Failed => unreachable!("Failed handled above"),
+                SecondaryCell::Failed => unreachable!("Failed handled above"),
             }
         }
         AffineGateOutcome::Ready
@@ -551,7 +551,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .into_iter()
             .filter(|sec| {
                 placement.affine_deps.iter().all(|(aid, _)| {
-                    self.cluster_state.affine_state(sec, *aid) != AffineCell::Failed
+                    self.cluster_state.affine_state(sec, *aid) != SecondaryCell::Failed
                 })
             })
             .collect()
@@ -569,7 +569,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let mutations = self.affine_scheduler.place::<I, _>(
             target,
             placement,
-            |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
+            |s: &str, a: SecondaryCellId| self.cluster_state.affine_state(s, a),
         );
         if !mutations.is_empty() {
             self.apply_and_broadcast_cluster_mutations(mutations).await;
@@ -616,7 +616,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // already in flight here; Done = already ran here; Failed = the gate took
         // a different arm — none reach `StrandedHere`.)
         let next_import = placement.affine_deps.iter().find(|(aid, _)| {
-            self.cluster_state.affine_state(secondary, *aid) == AffineCell::NotDone
+            self.cluster_state.affine_state(secondary, *aid) == SecondaryCell::NotDone
         });
         let Some((aid, import_hash)) = next_import.cloned() else {
             // No NotDone dep (raced to Done/Queued/Failed since the gate read) —
@@ -629,9 +629,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // Claim the cell `Queued` (the per-secondary in-flight claim), then
         // dispatch the import as its own affine unit through the shared seam —
         // which re-applies the run-once + dispatch-once guards.
-        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::SecondaryAffineQueued {
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::SecondaryCellQueued {
             secondary: secondary.to_string(),
-            affine_id: aid.0,
+            cell_id: aid.0,
             generation: 0,
         }])
         .await;
@@ -949,7 +949,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let mutations = self.affine_scheduler.rebuild::<I, _>(
             &secondaries,
             &placements,
-            |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
+            |s: &str, a: SecondaryCellId| self.cluster_state.affine_state(s, a),
         );
         if !mutations.is_empty() {
             crate::cluster_state::apply_locally_for_broadcast(&mut self.cluster_state, mutations);

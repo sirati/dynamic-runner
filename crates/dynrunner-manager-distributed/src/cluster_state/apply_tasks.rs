@@ -410,9 +410,17 @@ impl<I: Identifier> ClusterState<I> {
             // grow its local dispatch pool. The clone is independent of the
             // CRDT entry — callers may move it into a pool via `reinject`
             // without disturbing the ledger.
+            // EAGER-PREP divert (#638): a `SecondaryEagerPrep` task is NEVER a
+            // pool item — it lives only in the CRDT ledger + the per-secondary
+            // cell substrate (no dependents, phase-agnostic, uncounted). So it
+            // must NOT surface for pool growth here, the single live seam that
+            // feeds `newly_pending_from_spawn` → the receivers' `reinject`. ONE
+            // filter at the kind seam (the affine token DOES surface — it is a
+            // pool placement-readiness token; eager-prep is not).
             let pending_surface = (!cascade_fail
                 && blocked_on_unfulfillable.is_none()
-                && blocked_on_pending.is_none())
+                && blocked_on_pending.is_none()
+                && !task.kind.is_secondary_eager_prep())
             .then(|| task.clone());
             // Split the brand-new task into the shared frozen `def` + its
             // per-entry mutable `routing`, interning at the PRIMARY-allocated

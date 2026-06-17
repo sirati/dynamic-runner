@@ -1,18 +1,23 @@
-//! Per-secondary AFFINE bitvector — the replicated CRDT state that models,
-//! per `(secondary_id, affine_id)`, the completion of a
-//! `TaskKind::SecondaryAffine` def on that secondary.
+//! Per-secondary CELL bitvector — the KIND-BLIND replicated CRDT state that
+//! models, per `(secondary_id, cell_id)`, the completion of a per-secondary
+//! def on that secondary. The cell substrate is SHARED by every per-secondary
+//! scheduling kind that needs a 2-bit completion cell — today
+//! `TaskKind::SecondaryAffine` (the affine scheduler) and
+//! `TaskKind::SecondaryEagerPrep` (the idle-filler) — neither of which this
+//! layer knows about: it only stores + converges cells indexed by a dense
+//! [`SecondaryCellId`].
 //!
-//! Single concern: WHERE the per-secondary affine cell state lives, its
-//! compact representation, its per-cell convergent merge, and the
-//! state-query helpers the affine SCHEDULER (AF-sched) reads. It owns NO
-//! scheduling: it does not decide WHICH secondary an affine def goes to, nor
-//! place per-secondary queues — it only records and converges the cells the
-//! scheduler reads/writes through the typed API below.
+//! Single concern: WHERE the per-secondary cell state lives, its compact
+//! representation, its per-cell convergent merge, and the state-query helpers
+//! the per-secondary SCHEDULERS read. It owns NO scheduling: it does not decide
+//! WHICH secondary a def goes to, nor place per-secondary queues — it only
+//! records and converges the cells the schedulers read/write through the typed
+//! API below.
 //!
 //! ## Cell value
-//! Each cell is one [`AffineCell`] — `NotDone(00) / Queued(01) / Failed(10) /
+//! Each cell is one [`SecondaryCell`] — `NotDone(00) / Queued(01) / Failed(10) /
 //! Done(11)`. The compact store packs the two bits per cell (four cells per
-//! byte), indexed by the DENSE affine-id (see `task_def_store::AffineId`); all
+//! byte), indexed by the DENSE cell-id (see `task_def_store::SecondaryCellId`); all
 //! cells start `NotDone`.
 //!
 //! ## Merge lattice (the load-bearing part)
@@ -28,7 +33,7 @@
 //! * the LATTICE is, per cell, the set `{(generation, value)}` ordered by
 //!   `generation` (with a deterministic value tiebreak at equal generation);
 //!   the JOIN keeps the entry with the strictly-greater generation, and at an
-//!   equal generation the higher [`AffineCell`] discriminant
+//!   equal generation the higher [`SecondaryCell`] discriminant
 //!   (`Done > Failed > Queued > NotDone`) — a total order, so the join is
 //!   commutative + associative + idempotent ⇒ it CONVERGES under anti-entropy
 //!   regardless of delivery order.
@@ -52,32 +57,32 @@
 //! affine build). This is the recommended default the owner left open
 //! (design Q1). It is a PURE consequence of LWW-on-generation: nothing special-
 //! cases `Failed`. Should the owner later decide `Failed` IS sticky, the change
-//! is localized to [`SecondaryAffineBits::merge_cell`] / [`Self::set_cell`]
+//! is localized to [`SecondaryCellBits::merge_cell`] / [`Self::set_cell`]
 //! (clamp a `Failed` cell against an incoming non-`Done`), NOT a wire change.
 
 use std::collections::HashMap;
 
-use dynrunner_protocol_primary_secondary::AffineCell;
+use dynrunner_protocol_primary_secondary::SecondaryCell;
 
-use super::task_def_store::AffineId;
+use super::task_def_store::SecondaryCellId;
 
-/// Pack an [`AffineCell`] into its 2-bit code (the wire/bitvector encoding).
-fn cell_to_bits(cell: AffineCell) -> u8 {
+/// Pack an [`SecondaryCell`] into its 2-bit code (the wire/bitvector encoding).
+fn cell_to_bits(cell: SecondaryCell) -> u8 {
     match cell {
-        AffineCell::NotDone => 0b00,
-        AffineCell::Queued => 0b01,
-        AffineCell::Failed => 0b10,
-        AffineCell::Done => 0b11,
+        SecondaryCell::NotDone => 0b00,
+        SecondaryCell::Queued => 0b01,
+        SecondaryCell::Failed => 0b10,
+        SecondaryCell::Done => 0b11,
     }
 }
 
-/// Unpack a 2-bit code into its [`AffineCell`]. Total over the 4 codes.
-fn bits_to_cell(bits: u8) -> AffineCell {
+/// Unpack a 2-bit code into its [`SecondaryCell`]. Total over the 4 codes.
+fn bits_to_cell(bits: u8) -> SecondaryCell {
     match bits & 0b11 {
-        0b00 => AffineCell::NotDone,
-        0b01 => AffineCell::Queued,
-        0b10 => AffineCell::Failed,
-        _ => AffineCell::Done,
+        0b00 => SecondaryCell::NotDone,
+        0b01 => SecondaryCell::Queued,
+        0b10 => SecondaryCell::Failed,
+        _ => SecondaryCell::Done,
     }
 }
 
@@ -86,7 +91,7 @@ fn bits_to_cell(bits: u8) -> AffineCell {
 /// carry the SAME generation (which the single-primary monotone stamp makes
 /// vanishingly rare); it exists solely to keep the merge a deterministic,
 /// commutative join.
-fn cell_rank(cell: AffineCell) -> u8 {
+fn cell_rank(cell: SecondaryCell) -> u8 {
     cell_to_bits(cell)
 }
 
@@ -97,7 +102,7 @@ fn cell_rank(cell: AffineCell) -> u8 {
 /// `NotDone` at generation 0) costs ~2 bits/cell, the design's compactness
 /// requirement, while LWW still has a stamp for every NON-default cell.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct SecondaryAffineBits {
+pub(crate) struct SecondaryCellBits {
     /// Packed 2-bit cells, indexed by affine-id (`affine_id / 4` byte,
     /// `(affine_id % 4) * 2` bit offset). Grows on demand; an out-of-range
     /// affine-id reads as the default `NotDone` (a not-yet-written cell).
@@ -107,12 +112,12 @@ pub(crate) struct SecondaryAffineBits {
     generations: HashMap<u32, u64>,
 }
 
-impl SecondaryAffineBits {
+impl SecondaryCellBits {
     /// The cell value for `affine_id` (default `NotDone` for an unwritten one).
-    fn cell(&self, affine_id: u32) -> AffineCell {
+    fn cell(&self, affine_id: u32) -> SecondaryCell {
         let byte = (affine_id / 4) as usize;
         let Some(&packed) = self.bits.get(byte) else {
-            return AffineCell::NotDone;
+            return SecondaryCell::NotDone;
         };
         let shift = (affine_id % 4) * 2;
         bits_to_cell((packed >> shift) & 0b11)
@@ -125,7 +130,7 @@ impl SecondaryAffineBits {
 
     /// Write `cell` at `affine_id` with stamp `generation`, growing the packed
     /// vector as needed. The single packed-bits write seam.
-    fn write(&mut self, affine_id: u32, cell: AffineCell, generation: u64) {
+    fn write(&mut self, affine_id: u32, cell: SecondaryCell, generation: u64) {
         let byte = (affine_id / 4) as usize;
         if byte >= self.bits.len() {
             self.bits.resize(byte + 1, 0);
@@ -142,7 +147,7 @@ impl SecondaryAffineBits {
     /// per-cell convergent join — `set_cell` (live apply) and `merge`
     /// (snapshot/anti-entropy) both route through it, so apply == merge by
     /// construction.
-    fn merge_cell(&mut self, affine_id: u32, cell: AffineCell, generation: u64) -> bool {
+    fn merge_cell(&mut self, affine_id: u32, cell: SecondaryCell, generation: u64) -> bool {
         let local_gen = self.generation(affine_id);
         let wins = generation > local_gen
             || (generation == local_gen && cell_rank(cell) > cell_rank(self.cell(affine_id)));
@@ -170,13 +175,13 @@ impl SecondaryAffineBits {
 /// node-local (RESET — a cloned replica originates nothing inherited from the
 /// source, same contract as `task_seq`).
 #[derive(Debug, Default)]
-pub(crate) struct AffineState {
-    bitvector: AffineBitvector,
+pub(crate) struct SecondaryCellState {
+    bitvector: SecondaryCellBitvector,
     /// Node-local monotone LWW stamp source (see the `ClusterState` field doc).
     next_cell_gen: u64,
 }
 
-impl Clone for AffineState {
+impl Clone for SecondaryCellState {
     fn clone(&self) -> Self {
         Self {
             bitvector: self.bitvector.clone(),
@@ -188,14 +193,14 @@ impl Clone for AffineState {
     }
 }
 
-impl AffineState {
+impl SecondaryCellState {
     /// The replicated bitvector (read seam for the digest / snapshot / queries).
-    pub(crate) fn bitvector(&self) -> &AffineBitvector {
+    pub(crate) fn bitvector(&self) -> &SecondaryCellBitvector {
         &self.bitvector
     }
 
     /// Mutable bitvector (the apply / restore-merge write seam).
-    pub(crate) fn bitvector_mut(&mut self) -> &mut AffineBitvector {
+    pub(crate) fn bitvector_mut(&mut self) -> &mut SecondaryCellBitvector {
         &mut self.bitvector
     }
 
@@ -221,18 +226,18 @@ impl AffineState {
 /// the `tasks` fold already implies), this state is GENUINELY independent
 /// replicated mutation state, so it IS summarised in the digest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct AffineBitvector {
-    secondaries: HashMap<String, SecondaryAffineBits>,
+pub(crate) struct SecondaryCellBitvector {
+    secondaries: HashMap<String, SecondaryCellBits>,
 }
 
-impl AffineBitvector {
+impl SecondaryCellBitvector {
     /// The cell for `(secondary, affine_id)` — `NotDone` for an unwritten one.
     /// The primary read AF-sched's locality ranking consumes (via
     /// `ClusterState::affine_state` → `primary::affine_dispatch`).
-    pub(crate) fn cell(&self, secondary: &str, affine_id: AffineId) -> AffineCell {
+    pub(crate) fn cell(&self, secondary: &str, affine_id: SecondaryCellId) -> SecondaryCell {
         self.secondaries
             .get(secondary)
-            .map_or(AffineCell::NotDone, |b| b.cell(affine_id.0))
+            .map_or(SecondaryCell::NotDone, |b| b.cell(affine_id.0))
     }
 
     /// LWW-apply a cell write for `(secondary, affine_id)`. Returns `true` iff
@@ -242,8 +247,8 @@ impl AffineBitvector {
     pub(crate) fn set_cell(
         &mut self,
         secondary: &str,
-        affine_id: AffineId,
-        cell: AffineCell,
+        affine_id: SecondaryCellId,
+        cell: SecondaryCell,
         generation: u64,
     ) -> bool {
         self.secondaries
@@ -255,7 +260,7 @@ impl AffineBitvector {
     /// Merge another bitvector into this one per the per-cell LWW lattice —
     /// the snapshot/anti-entropy restore seam. Idempotent + order-insensitive
     /// (the per-cell join is commutative/associative/idempotent).
-    pub(crate) fn merge(&mut self, other: &AffineBitvector) {
+    pub(crate) fn merge(&mut self, other: &SecondaryCellBitvector) {
         for (secondary, bits) in &other.secondaries {
             let local = self.secondaries.entry(secondary.clone()).or_default();
             for (&affine_id, &generation) in &bits.generations {
@@ -272,7 +277,7 @@ impl AffineBitvector {
     pub(crate) fn max_generation(&self) -> u64 {
         self.secondaries
             .values()
-            .map(SecondaryAffineBits::max_generation)
+            .map(SecondaryCellBits::max_generation)
             .max()
             .unwrap_or(0)
     }
@@ -303,8 +308,8 @@ impl AffineBitvector {
     /// Clone the wire-portable contents for a snapshot: `secondary →
     /// [(affine_id, cell, generation)]`. A plain owned form so the snapshot
     /// struct carries no in-crate type. The restore rebuilds an
-    /// [`AffineBitvector`] and [`Self::merge`]s it.
-    pub(crate) fn to_wire(&self) -> HashMap<String, Vec<(u32, AffineCell, u64)>> {
+    /// [`SecondaryCellBitvector`] and [`Self::merge`]s it.
+    pub(crate) fn to_wire(&self) -> HashMap<String, Vec<(u32, SecondaryCell, u64)>> {
         self.secondaries
             .iter()
             .map(|(secondary, bits)| {
@@ -322,7 +327,7 @@ impl AffineBitvector {
 
     /// Rebuild a bitvector from the wire form (the restore side of
     /// [`Self::to_wire`]). The caller [`Self::merge`]s it into local state.
-    pub(crate) fn from_wire(wire: HashMap<String, Vec<(u32, AffineCell, u64)>>) -> Self {
+    pub(crate) fn from_wire(wire: HashMap<String, Vec<(u32, SecondaryCell, u64)>>) -> Self {
         let mut out = Self::default();
         for (secondary, cells) in wire {
             let bits = out.secondaries.entry(secondary).or_default();
@@ -349,16 +354,49 @@ impl AffineBitvector {
     #[allow(dead_code)]
     pub(crate) fn secondaries_with_all_done(
         &self,
-        affine_ids: &[AffineId],
+        affine_ids: &[SecondaryCellId],
     ) -> Vec<String> {
         self.secondaries
             .iter()
             .filter(|(_, bits)| {
                 affine_ids
                     .iter()
-                    .all(|id| bits.cell(id.0) == AffineCell::Done)
+                    .all(|id| bits.cell(id.0) == SecondaryCell::Done)
             })
             .map(|(secondary, _)| secondary.clone())
+            .collect()
+    }
+
+    /// The subset of `cell_ids` that are NON-TERMINAL on `secondary` — i.e. a
+    /// cell still worth running there: `NotDone(00)` (never started) or
+    /// `Failed(10)` (failed, non-sticky under Q1 so retryable). EXCLUDES
+    /// `Queued(01)` (a run is in flight / claimed here) and `Done(11)` (already
+    /// completed here). The read query the eager-prep idle-filler consumes to
+    /// pick a per-secondary speculative-prep candidate: only a non-terminal cell
+    /// is dispatchable, and a `Queued`/`Done` cell must be skipped so the prep
+    /// runs at most once-per-secondary (the same per-secondary run-once
+    /// authority the affine dispatch reads off `Done`). KIND-BLIND — the
+    /// substrate does not know which kind a cell belongs to; the caller passes
+    /// only the cell-ids it owns.
+    pub(crate) fn non_terminal_cells_for(
+        &self,
+        secondary: &str,
+        cell_ids: &[SecondaryCellId],
+    ) -> Vec<SecondaryCellId> {
+        let Some(bits) = self.secondaries.get(secondary) else {
+            // A secondary with no written cells: every cell reads the default
+            // `NotDone`, so all are non-terminal (placeable).
+            return cell_ids.to_vec();
+        };
+        cell_ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                matches!(
+                    bits.cell(id.0),
+                    SecondaryCell::NotDone | SecondaryCell::Failed
+                )
+            })
             .collect()
     }
 }
@@ -367,82 +405,82 @@ impl AffineBitvector {
 mod tests {
     use super::*;
 
-    fn aid(n: u32) -> AffineId {
-        AffineId(n)
+    fn aid(n: u32) -> SecondaryCellId {
+        SecondaryCellId(n)
     }
 
     #[test]
     fn cell_round_trips_through_packed_bits() {
-        for cell in [AffineCell::NotDone, AffineCell::Queued, AffineCell::Failed, AffineCell::Done] {
+        for cell in [SecondaryCell::NotDone, SecondaryCell::Queued, SecondaryCell::Failed, SecondaryCell::Done] {
             assert_eq!(bits_to_cell(cell_to_bits(cell)), cell);
         }
     }
 
     #[test]
     fn unwritten_cell_is_not_done() {
-        let bv = AffineBitvector::default();
-        assert_eq!(bv.cell("s1", aid(0)), AffineCell::NotDone);
-        assert_eq!(bv.cell("s1", aid(999)), AffineCell::NotDone);
+        let bv = SecondaryCellBitvector::default();
+        assert_eq!(bv.cell("s1", aid(0)), SecondaryCell::NotDone);
+        assert_eq!(bv.cell("s1", aid(999)), SecondaryCell::NotDone);
     }
 
     #[test]
     fn set_cell_writes_and_packs_multiple_in_one_byte() {
-        let mut bv = AffineBitvector::default();
+        let mut bv = SecondaryCellBitvector::default();
         // Four affine-ids share byte 0 (ids 0..=3).
-        assert!(bv.set_cell("s", aid(0), AffineCell::Queued, 1));
-        assert!(bv.set_cell("s", aid(1), AffineCell::Done, 1));
-        assert!(bv.set_cell("s", aid(2), AffineCell::Failed, 1));
-        assert!(bv.set_cell("s", aid(3), AffineCell::NotDone, 1));
-        assert_eq!(bv.cell("s", aid(0)), AffineCell::Queued);
-        assert_eq!(bv.cell("s", aid(1)), AffineCell::Done);
-        assert_eq!(bv.cell("s", aid(2)), AffineCell::Failed);
-        assert_eq!(bv.cell("s", aid(3)), AffineCell::NotDone);
+        assert!(bv.set_cell("s", aid(0), SecondaryCell::Queued, 1));
+        assert!(bv.set_cell("s", aid(1), SecondaryCell::Done, 1));
+        assert!(bv.set_cell("s", aid(2), SecondaryCell::Failed, 1));
+        assert!(bv.set_cell("s", aid(3), SecondaryCell::NotDone, 1));
+        assert_eq!(bv.cell("s", aid(0)), SecondaryCell::Queued);
+        assert_eq!(bv.cell("s", aid(1)), SecondaryCell::Done);
+        assert_eq!(bv.cell("s", aid(2)), SecondaryCell::Failed);
+        assert_eq!(bv.cell("s", aid(3)), SecondaryCell::NotDone);
     }
 
     #[test]
     fn lww_higher_generation_wins() {
-        let mut bv = AffineBitvector::default();
-        assert!(bv.set_cell("s", aid(5), AffineCell::Queued, 1));
+        let mut bv = SecondaryCellBitvector::default();
+        assert!(bv.set_cell("s", aid(5), SecondaryCell::Queued, 1));
         // A higher-generation Done wins.
-        assert!(bv.set_cell("s", aid(5), AffineCell::Done, 2));
-        assert_eq!(bv.cell("s", aid(5)), AffineCell::Done);
+        assert!(bv.set_cell("s", aid(5), SecondaryCell::Done, 2));
+        assert_eq!(bv.cell("s", aid(5)), SecondaryCell::Done);
         // A LOWER-generation Failed LOSES (NoOp) — stale write rejected.
-        assert!(!bv.set_cell("s", aid(5), AffineCell::Failed, 1));
-        assert_eq!(bv.cell("s", aid(5)), AffineCell::Done);
+        assert!(!bv.set_cell("s", aid(5), SecondaryCell::Failed, 1));
+        assert_eq!(bv.cell("s", aid(5)), SecondaryCell::Done);
     }
 
     #[test]
     fn steal_unqueue_converges_via_higher_generation() {
         // The load-bearing case: Queued(gen 3) then the steal's NotDone(gen 4)
         // must WIN (a value max-join would keep Queued and never converge).
-        let mut bv = AffineBitvector::default();
-        bv.set_cell("s", aid(0), AffineCell::Queued, 3);
-        assert!(bv.set_cell("s", aid(0), AffineCell::NotDone, 4));
-        assert_eq!(bv.cell("s", aid(0)), AffineCell::NotDone);
+        let mut bv = SecondaryCellBitvector::default();
+        bv.set_cell("s", aid(0), SecondaryCell::Queued, 3);
+        assert!(bv.set_cell("s", aid(0), SecondaryCell::NotDone, 4));
+        assert_eq!(bv.cell("s", aid(0)), SecondaryCell::NotDone);
     }
 
     #[test]
     fn failed_is_not_sticky_q1_default() {
         // Q1 default: Failed(gen 1) is overridden by a later Queued(gen 2) and
         // a later Done(gen 3) — failed retries/re-routes are allowed.
-        let mut bv = AffineBitvector::default();
-        bv.set_cell("s", aid(0), AffineCell::Failed, 1);
-        assert!(bv.set_cell("s", aid(0), AffineCell::Queued, 2));
-        assert_eq!(bv.cell("s", aid(0)), AffineCell::Queued);
-        assert!(bv.set_cell("s", aid(0), AffineCell::Done, 3));
-        assert_eq!(bv.cell("s", aid(0)), AffineCell::Done);
+        let mut bv = SecondaryCellBitvector::default();
+        bv.set_cell("s", aid(0), SecondaryCell::Failed, 1);
+        assert!(bv.set_cell("s", aid(0), SecondaryCell::Queued, 2));
+        assert_eq!(bv.cell("s", aid(0)), SecondaryCell::Queued);
+        assert!(bv.set_cell("s", aid(0), SecondaryCell::Done, 3));
+        assert_eq!(bv.cell("s", aid(0)), SecondaryCell::Done);
     }
 
     #[test]
     fn merge_is_commutative_and_idempotent() {
         // Two replicas with divergent same-cell writes converge to the SAME
         // value regardless of merge direction (LWW total order).
-        let mut a = AffineBitvector::default();
-        a.set_cell("s", aid(0), AffineCell::Queued, 2);
-        a.set_cell("s", aid(1), AffineCell::Done, 5);
-        let mut b = AffineBitvector::default();
-        b.set_cell("s", aid(0), AffineCell::NotDone, 3); // steal reset, higher gen
-        b.set_cell("s", aid(2), AffineCell::Failed, 1);
+        let mut a = SecondaryCellBitvector::default();
+        a.set_cell("s", aid(0), SecondaryCell::Queued, 2);
+        a.set_cell("s", aid(1), SecondaryCell::Done, 5);
+        let mut b = SecondaryCellBitvector::default();
+        b.set_cell("s", aid(0), SecondaryCell::NotDone, 3); // steal reset, higher gen
+        b.set_cell("s", aid(2), SecondaryCell::Failed, 1);
 
         let mut ab = a.clone();
         ab.merge(&b);
@@ -451,9 +489,9 @@ mod tests {
         assert_eq!(ab, ba, "merge is commutative");
 
         // Cell 0: b's gen-3 NotDone beats a's gen-2 Queued.
-        assert_eq!(ab.cell("s", aid(0)), AffineCell::NotDone);
-        assert_eq!(ab.cell("s", aid(1)), AffineCell::Done);
-        assert_eq!(ab.cell("s", aid(2)), AffineCell::Failed);
+        assert_eq!(ab.cell("s", aid(0)), SecondaryCell::NotDone);
+        assert_eq!(ab.cell("s", aid(1)), SecondaryCell::Done);
+        assert_eq!(ab.cell("s", aid(2)), SecondaryCell::Failed);
 
         // Idempotent: re-merging changes nothing.
         let mut ab2 = ab.clone();
@@ -464,20 +502,20 @@ mod tests {
 
     #[test]
     fn wire_round_trips() {
-        let mut bv = AffineBitvector::default();
-        bv.set_cell("s1", aid(0), AffineCell::Done, 4);
-        bv.set_cell("s2", aid(7), AffineCell::Queued, 2);
-        let rebuilt = AffineBitvector::from_wire(bv.to_wire());
+        let mut bv = SecondaryCellBitvector::default();
+        bv.set_cell("s1", aid(0), SecondaryCell::Done, 4);
+        bv.set_cell("s2", aid(7), SecondaryCell::Queued, 2);
+        let rebuilt = SecondaryCellBitvector::from_wire(bv.to_wire());
         assert_eq!(rebuilt, bv);
     }
 
     #[test]
     fn secondaries_with_all_done() {
-        let mut bv = AffineBitvector::default();
-        bv.set_cell("s1", aid(0), AffineCell::Done, 1);
-        bv.set_cell("s1", aid(1), AffineCell::Done, 1);
-        bv.set_cell("s2", aid(0), AffineCell::Done, 1);
-        bv.set_cell("s2", aid(1), AffineCell::Queued, 1); // not done
+        let mut bv = SecondaryCellBitvector::default();
+        bv.set_cell("s1", aid(0), SecondaryCell::Done, 1);
+        bv.set_cell("s1", aid(1), SecondaryCell::Done, 1);
+        bv.set_cell("s2", aid(0), SecondaryCell::Done, 1);
+        bv.set_cell("s2", aid(1), SecondaryCell::Queued, 1); // not done
         let mut all = bv.secondaries_with_all_done(&[aid(0), aid(1)]);
         all.sort();
         assert_eq!(all, vec!["s1".to_string()]);
@@ -485,20 +523,45 @@ mod tests {
 
     #[test]
     fn max_generation_tracks_highest() {
-        let mut bv = AffineBitvector::default();
+        let mut bv = SecondaryCellBitvector::default();
         assert_eq!(bv.max_generation(), 0);
-        bv.set_cell("s1", aid(0), AffineCell::Queued, 3);
-        bv.set_cell("s2", aid(0), AffineCell::Done, 9);
+        bv.set_cell("s1", aid(0), SecondaryCell::Queued, 3);
+        bv.set_cell("s2", aid(0), SecondaryCell::Done, 9);
         assert_eq!(bv.max_generation(), 9);
     }
 
     #[test]
+    fn non_terminal_cells_for_returns_notdone_and_failed_only() {
+        // The eager-prep filler's candidate query: NotDone + Failed are
+        // non-terminal (placeable / retryable); Queued (in flight here) + Done
+        // (already ran here) are EXCLUDED so the prep runs at most once.
+        let mut bv = SecondaryCellBitvector::default();
+        bv.set_cell("s", aid(0), SecondaryCell::NotDone, 1);
+        bv.set_cell("s", aid(1), SecondaryCell::Queued, 1);
+        bv.set_cell("s", aid(2), SecondaryCell::Failed, 1);
+        bv.set_cell("s", aid(3), SecondaryCell::Done, 1);
+        // aid(4) is never written ⇒ reads the default NotDone ⇒ non-terminal.
+        let ids = [aid(0), aid(1), aid(2), aid(3), aid(4)];
+        let got = bv.non_terminal_cells_for("s", &ids);
+        assert_eq!(
+            got,
+            vec![aid(0), aid(2), aid(4)],
+            "exactly NotDone + Failed (incl. the unwritten default), order-preserved"
+        );
+
+        // A secondary with NO written cells: every queried cell is the default
+        // NotDone ⇒ all are non-terminal (placeable).
+        let fresh = bv.non_terminal_cells_for("fresh-sec", &ids);
+        assert_eq!(fresh, ids.to_vec(), "all cells placeable on a fresh secondary");
+    }
+
+    #[test]
     fn digest_count_tracks_written_cells() {
-        let mut bv = AffineBitvector::default();
+        let mut bv = SecondaryCellBitvector::default();
         assert_eq!(bv.written_cell_count(), 0);
-        bv.set_cell("s1", aid(0), AffineCell::Queued, 1);
-        bv.set_cell("s1", aid(1), AffineCell::Done, 1);
-        bv.set_cell("s2", aid(0), AffineCell::Failed, 1);
+        bv.set_cell("s1", aid(0), SecondaryCell::Queued, 1);
+        bv.set_cell("s1", aid(1), SecondaryCell::Done, 1);
+        bv.set_cell("s2", aid(0), SecondaryCell::Failed, 1);
         assert_eq!(bv.written_cell_count(), 3);
     }
 }

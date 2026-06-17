@@ -216,10 +216,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let mut affine_prereq_ids: HashSet<String> = HashSet::new();
 
         for (hash, state) in self.cluster_state.tasks_iter() {
+            let def = state.def();
+            // EAGER-PREP divert (#638): a `SecondaryEagerPrep` task lives ONLY
+            // in the CRDT ledger + the per-secondary cell substrate — never in
+            // the pool, the retry/OOM candidate universe (`all_binaries`), or
+            // the phase-discovery scan. It is phase-agnostic + uncounted + has
+            // no dependents, so it must NOT enter any phase bucket (the brief's
+            // zero-new-pool-branches requirement: `queued_count` /
+            // `has_affine_dep` / `phase_has_live_affine_prereq` stay
+            // byte-identical). Its readiness is the per-secondary cell, derived
+            // live from `eager_prep_cell_ids`, so skipping it here loses
+            // nothing — the filler re-derives candidates from the inherited
+            // cells (the model-A failover property). ONE filter at the kind seam.
+            if def.kind.is_secondary_eager_prep() {
+                continue;
+            }
             // L5: resolve dep refs via the store (two shared borrows of
             // `self.cluster_state` — the iter + the resolve — is fine).
             all_binaries.push(self.cluster_state.task_to_info(state));
-            let def = state.def();
             if def.kind.is_secondary_affine() {
                 affine_prereq_ids.insert(def.task_id.clone());
             }
