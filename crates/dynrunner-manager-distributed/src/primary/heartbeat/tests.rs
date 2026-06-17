@@ -389,9 +389,10 @@ async fn gracefully_departed_member_is_not_silence_removed() {
 
     // The replicated membership facts: the member joined, advertised
     // capacity, then SELF-DEPARTED gracefully (the leaving node's
-    // `PeerRemoved { SelfDeparture }`). After the apply the membership
-    // ledger reads `RemovedMember` — but the roster cache still holds the
-    // departed member (the apply path does not reap it).
+    // `PeerRemoved { SelfDeparture }`). After the apply the member is
+    // projected OUT via the convergent `Departed` tombstone — but its
+    // `peer_state` stays Alive (a graceful self-departure is NOT a death),
+    // and the roster cache still holds it (the apply path does not reap it).
     {
         let cs = primary.cluster_state_mut_for_test();
         cs.apply(ClusterMutation::PeerJoined {
@@ -414,9 +415,17 @@ async fn gracefully_departed_member_is_not_silence_removed() {
             member_gen: 0,
         });
     }
+    // A graceful self-departure does NOT flip Dead — but it DOES tombstone
+    // the member (the convergent departure signal the silence sweep reads).
     assert!(
-        !primary.cluster_state_for_test().is_peer_alive("departed-sec"),
-        "the graceful departure flipped the membership ledger to removed"
+        primary.cluster_state_for_test().is_peer_alive("departed-sec"),
+        "a graceful self-departure must NOT flip the member to Dead",
+    );
+    assert!(
+        primary
+            .cluster_state_for_test()
+            .is_member_departed("departed-sec"),
+        "the graceful departure wrote the Departed tombstone",
     );
 
     // Sleep WELL past the hard backstop (2x the 50ms interval) — a member

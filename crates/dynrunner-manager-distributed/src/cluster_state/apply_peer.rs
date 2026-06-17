@@ -349,79 +349,23 @@ impl<I: Identifier> ClusterState<I> {
         }
     }
 
-    /// Apply a `ClusterMutation::PeerRemoved`.
+    /// Merge a `Departed` tombstone for `id` into the `capabilities`
+    /// 2P-set at `member_gen`, PRESERVING the advertisement current at
+    /// departure so a re-admission can restore the exact capability, and
+    /// return whether the stored entry actually changed (the `Applied`
+    /// signal — it gates the digest fold and idempotent re-delivery).
+    /// Routed through `merge_capability` so the generation-first rule
+    /// arbitrates (a higher-generation `Advertised` already present keeps
+    /// winning; a same-generation re-tombstone is absorbed).
     ///
-    /// Sticky-per-GENERATION: once `peer_state[id]` is `Dead` at
-    /// generation N, any further `PeerRemoved` for the same id at a
-    /// generation `<= N` is a silent NoOp — and so is a removal whose
-    /// generation is strictly BELOW an `Alive` entry's (a stale removal
-    /// of an already-superseded membership incarnation must not re-bury
-    /// the re-admitted live peer). A removal at the `Alive` entry's own
-    /// generation kills that incarnation (the authoritative removal); a
-    /// removal at a generation this node has never seen join is applied
-    /// at that generation so it still blocks the late out-of-order
-    /// `PeerJoined` of the same incarnation. An absent id is inserted as
-    /// `Dead` for the same reason. A `Departed` tombstone PRESERVING the
-    /// advertisement current at departure is merged into the
-    /// `capabilities` 2P-set at the removal's generation (it dominates
-    /// the same-generation `Advertised`; a later re-admission's
-    /// higher-generation advertise supersedes it), and `reproject_roles`
-    /// drops the id from both role sets for free (Departed/Dead projects
-    /// out). A `PeerLifecycleEvent::Removed` is emitted on every
-    /// state-changing apply.
-    pub(super) fn apply_peer_removed(
-        &mut self,
-        id: String,
-        cause: RemovalCause,
-        member_gen: u64,
-    ) -> ApplyOutcome {
-        if let Some(entry) = self.peer_state.get(&id) {
-            if entry.state == PeerState::Dead && member_gen <= entry.member_gen {
-                return ApplyOutcome::NoOp;
-            }
-            if entry.state == PeerState::Alive && member_gen < entry.member_gen {
-                // Stale removal of a superseded incarnation: the peer was
-                // already re-admitted at a higher generation, so this
-                // removal lost. Name the drop (silent-branch rule) — a
-                // swallowed removal is a membership decision.
-                tracing::info!(
-                    target: "dynrunner_cluster_state",
-                    peer_id = %id,
-                    entry_gen = entry.member_gen,
-                    removal_gen = member_gen,
-                    "stale PeerRemoved for a superseded membership \
-                     incarnation ignored (peer was re-admitted at a higher \
-                     generation)",
-                );
-                return ApplyOutcome::NoOp;
-            }
-        }
-        // Liveness: mark Dead (sticky within the incarnation) / insert a
-        // Dead entry if absent. The entry's generation adopts the
-        // removal's when higher (a removal observed before its join).
-        match self.peer_state.get_mut(&id) {
-            None => {
-                self.peer_state.insert(
-                    id.clone(),
-                    PeerEntry {
-                        state: PeerState::Dead,
-                        member_gen,
-                        pubkey: None,
-                        endpoint: None,
-                    },
-                );
-            }
-            Some(entry) => {
-                entry.state = PeerState::Dead;
-                entry.member_gen = entry.member_gen.max(member_gen);
-            }
-        }
-        // Capability: merge the 2P-set Departed tombstone at the removal's
-        // generation, PRESERVING the advertisement current at departure so
-        // a re-admission can restore the exact capability. Routed through
-        // `merge_capability` so the generation-first rule arbitrates (a
-        // higher-generation Advertised already present keeps winning).
-        let (is_observer, can_be_primary, cap_version) = match self.capabilities.get(&id) {
+    /// This is the SOLE membership-departure projection: it removes the id
+    /// from role/setup/dispatch via the convergent capability tombstone
+    /// (which IS digest-folded and heals fleet-wide), independent of the
+    /// node-local `peer_state` liveness bit. Both the genuine-death arm
+    /// and the deliberate self-departure arm of `apply_peer_removed` go
+    /// through here so the projection-out logic lives in ONE place.
+    fn merge_departed_tombstone(&mut self, id: &str, member_gen: u64) -> bool {
+        let (is_observer, can_be_primary, cap_version) = match self.capabilities.get(id) {
             Some(CapabilityEntry::Advertised {
                 is_observer,
                 can_be_primary,
@@ -442,13 +386,126 @@ impl<I: Identifier> ClusterState<I> {
             can_be_primary,
             cap_version,
         };
-        let merged = match self.capabilities.get(&id) {
+        let merged = match self.capabilities.get(id) {
             Some(local) => super::merge::merge_capability(local, &tombstone),
             None => tombstone,
         };
-        self.capabilities.insert(id.clone(), merged);
-        // Rebuild the role projections (and fire hooks) — the Departed +
-        // Dead id projects out of both sets.
+        let changed = self.capabilities.get(id) != Some(&merged);
+        if changed {
+            self.capabilities.insert(id.to_string(), merged);
+        }
+        changed
+    }
+
+    /// Apply a `ClusterMutation::PeerRemoved`.
+    ///
+    /// The removal `cause` discriminates the ONE axis that differs between
+    /// a genuine death and a deliberate self-departure — whether the
+    /// node-local `peer_state` liveness flips to `Dead`:
+    ///
+    /// * Every cause EXCEPT [`RemovalCause::SelfDeparture`] is an
+    ///   authoritative death (keepalive-miss watchdog, fatal-error
+    ///   consensus, persistent-dial-failure, roster re-emit of an already
+    ///   departed id). It flips `peer_state` to `Dead` under the
+    ///   sticky-per-GENERATION rule: once `Dead` at generation N, a
+    ///   further removal at `<= N` is a silent NoOp, as is a removal whose
+    ///   generation is strictly BELOW an `Alive` entry's (a stale removal
+    ///   of an already-superseded incarnation must not re-bury the
+    ///   re-admitted live peer). A removal at the `Alive` entry's own
+    ///   generation kills that incarnation; a removal at a generation this
+    ///   node never saw join is applied at that generation so it still
+    ///   blocks the late out-of-order `PeerJoined`; an absent id is
+    ///   inserted `Dead` for the same reason.
+    ///
+    /// * [`RemovalCause::SelfDeparture`] is a peer announcing its OWN
+    ///   clean exit (graceful-abort drain / panik file). It must NOT flip
+    ///   `peer_state` to `Dead`: the liveness bit is node-local and NOT
+    ///   anti-entropy-healed, and a Dead flip here shrinks the perceived
+    ///   live fleet on some peer whose transport-liveness gate timing did
+    ///   not yet cover the window, arming a spurious election and bumping
+    ///   the primary epoch. Leaving the peer `Alive` in `peer_state` keeps
+    ///   it a first-class CRDT participant so its final task-state/outcome
+    ///   mutations still converge; the projection-OUT (role/setup/dispatch
+    ///   exclusion) is owned entirely by the `Departed` capability
+    ///   tombstone written below. The stale-generation guard still applies
+    ///   (a self-departure of a superseded incarnation loses) — only the
+    ///   Dead-stickiness and the Dead flip are exempted.
+    ///
+    /// Both arms merge the convergent `Departed` capability tombstone
+    /// (PRESERVING the departure advertisement at the removal's
+    /// generation) via [`Self::merge_departed_tombstone`], so
+    /// `reproject_roles` drops the id from both role sets for free, and
+    /// both emit a `PeerLifecycleEvent::Removed` on a state-changing
+    /// apply. An idempotent re-delivery (nothing changed) is a NoOp.
+    pub(super) fn apply_peer_removed(
+        &mut self,
+        id: String,
+        cause: RemovalCause,
+        member_gen: u64,
+    ) -> ApplyOutcome {
+        let self_departure = matches!(cause, RemovalCause::SelfDeparture(_));
+        if let Some(entry) = self.peer_state.get(&id) {
+            if !self_departure && entry.state == PeerState::Dead && member_gen <= entry.member_gen {
+                return ApplyOutcome::NoOp;
+            }
+            if entry.state == PeerState::Alive && member_gen < entry.member_gen {
+                // Stale removal of a superseded incarnation: the peer was
+                // already re-admitted at a higher generation, so this
+                // removal lost. Name the drop (silent-branch rule) — a
+                // swallowed removal is a membership decision. This guard
+                // is liveness-agnostic and applies to both arms.
+                tracing::info!(
+                    target: "dynrunner_cluster_state",
+                    peer_id = %id,
+                    entry_gen = entry.member_gen,
+                    removal_gen = member_gen,
+                    "stale PeerRemoved for a superseded membership \
+                     incarnation ignored (peer was re-admitted at a higher \
+                     generation)",
+                );
+                return ApplyOutcome::NoOp;
+            }
+        }
+        // Liveness: a self-departure leaves `peer_state` UNTOUCHED (the
+        // departing peer stays a first-class CRDT participant; its final
+        // mutations still converge). Any other cause marks Dead (sticky
+        // within the incarnation) / inserts a Dead entry if absent, the
+        // entry's generation adopting the removal's when higher.
+        let liveness_changed = if self_departure {
+            false
+        } else {
+            match self.peer_state.get_mut(&id) {
+                None => {
+                    self.peer_state.insert(
+                        id.clone(),
+                        PeerEntry {
+                            state: PeerState::Dead,
+                            member_gen,
+                            pubkey: None,
+                            endpoint: None,
+                        },
+                    );
+                    true
+                }
+                Some(entry) => {
+                    let changed =
+                        entry.state != PeerState::Dead || entry.member_gen < member_gen;
+                    entry.state = PeerState::Dead;
+                    entry.member_gen = entry.member_gen.max(member_gen);
+                    changed
+                }
+            }
+        };
+        // Capability: the convergent `Departed` tombstone is the SOLE
+        // role/setup/dispatch projection-out for BOTH arms.
+        let capability_changed = self.merge_departed_tombstone(&id, member_gen);
+        if !liveness_changed && !capability_changed {
+            // Idempotent re-delivery (e.g. a second self-departure for an
+            // already-tombstoned still-Alive peer): nothing moved.
+            return ApplyOutcome::NoOp;
+        }
+        // Rebuild the role projections (and fire hooks) — the Departed
+        // (and, on a death, Dead) id projects out of both sets.
         self.reproject_roles();
         self.emit_lifecycle_event(PeerLifecycleEvent::Removed { id, cause });
         ApplyOutcome::Applied

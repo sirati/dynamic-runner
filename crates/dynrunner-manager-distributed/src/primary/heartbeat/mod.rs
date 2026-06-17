@@ -340,11 +340,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // task requeue for a deliberately-departed member (the
             // run_20260612_094056 face: a member departed cleanly, a promotion
             // followed, and the promoted primary silence-removed-with-requeue
-            // the gone member two minutes later). A re-admission flips the same
-            // entry back to `AliveMember` and the member is judged again.
-            if self.cluster_state.peer_membership(id)
-                == crate::cluster_state::PeerMembership::RemovedMember
-            {
+            // the gone member two minutes later). The filter is the convergent
+            // departure tombstone (`is_member_departed`), NOT the `peer_state`
+            // liveness bit: a graceful `SelfDeparture` deliberately leaves the
+            // member `Alive` (it stays a CRDT participant), so a liveness-keyed
+            // pre-filter would let the gracefully-departed member back into the
+            // sweep. A re-admission supersedes the tombstone and the member is
+            // judged again.
+            if self.cluster_state.is_member_departed(id) {
                 continue;
             }
             if !matches!(

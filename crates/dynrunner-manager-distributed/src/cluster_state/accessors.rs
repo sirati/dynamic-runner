@@ -789,6 +789,29 @@ impl<I: Identifier> ClusterState<I> {
         })
     }
 
+    /// Has `peer_id` AUTHORITATIVELY DEPARTED the cluster — i.e. its
+    /// `capabilities` 2P-set entry is a `Departed` tombstone? This is THE
+    /// convergent, cause-agnostic departure signal: BOTH a genuine-death
+    /// removal AND a deliberate self-departure write the tombstone (in
+    /// `apply_peer_removed`), and it is digest-folded + anti-entropy-healed
+    /// fleet-wide (unlike the node-local `peer_state` `Dead` bit).
+    ///
+    /// Use this — NOT `peer_membership == RemovedMember` — wherever the
+    /// question is "is this member gone from the ROSTER / role / setup
+    /// projection". The two formerly moved in lockstep, but a graceful
+    /// `SelfDeparture` now leaves `peer_state` `Alive` (so the departing
+    /// peer's final mutations still converge) while writing ONLY the
+    /// tombstone; a roster filter keyed on the liveness bit would wrongly
+    /// re-admit a self-departed member into the silence sweep / rebuild.
+    /// A re-admission (generation-advancing `PeerJoined`) supersedes the
+    /// tombstone with an `Advertised` entry, so this flips back to `false`.
+    pub fn is_member_departed(&self, peer_id: &str) -> bool {
+        matches!(
+            self.capabilities.get(peer_id),
+            Some(super::types::CapabilityEntry::Departed { .. })
+        )
+    }
+
     /// Resolve a dependency's full `(phase_id, task_id)` identity to its
     /// wire-canonical hash via a linear scan over `self.tasks`. Returns
     /// `None` if no entry in the ledger carries that exact identity.
@@ -1162,18 +1185,22 @@ impl<I: Identifier> ClusterState<I> {
     /// Capacity records are set-once and never deleted: a removed peer's
     /// `secondary_capacities` entry outlives its membership (preserved so
     /// a re-admission restores the EXACT capacity the member departed
-    /// with — the removed node never re-advertises). The membership
-    /// ledger (`peer_state` `Dead`, written in lockstep with the
-    /// `CapabilityEntry::Departed` tombstone by `apply_peer_removed`) is
-    /// therefore the filter: a `RemovedMember` id is excluded; a
-    /// re-admission (a generation-advancing `PeerJoined`) flips the same
-    /// entry back to `Alive` and the id re-enters this view with its
-    /// preserved capacity. A `NeverJoined` capacity-bearer is INCLUDED —
-    /// membership may lag capacity at this replica (out-of-order apply),
-    /// and only an authoritative removal may suppress a rebuild.
+    /// with — the removed node never re-advertises). The AUTHORITATIVE
+    /// departure signal ([`Self::is_member_departed`] — the convergent
+    /// `CapabilityEntry::Departed` tombstone written by `apply_peer_removed`
+    /// for EVERY removal cause) is therefore the filter: a departed id is
+    /// excluded; a re-admission (a generation-advancing `PeerJoined`)
+    /// supersedes the tombstone and the id re-enters this view with its
+    /// preserved capacity. The tombstone — NOT `peer_state` `RemovedMember`
+    /// — is the filter precisely because a graceful `SelfDeparture` leaves
+    /// `peer_state` `Alive`: a liveness-keyed filter would wrongly feed a
+    /// self-departed member into a primary-local rebuild. A `NeverJoined`
+    /// capacity-bearer is INCLUDED — membership may lag capacity at this
+    /// replica (out-of-order apply), and only an authoritative departure
+    /// may suppress a rebuild.
     pub fn live_known_secondaries(&self) -> impl Iterator<Item = &str> {
         self.known_secondaries()
-            .filter(|id| self.peer_membership(id) != super::types::PeerMembership::RemovedMember)
+            .filter(|id| !self.is_member_departed(id))
     }
 
     /// The replicated-membership roster of peers that POSITIVELY run a
@@ -1201,12 +1228,20 @@ impl<I: Identifier> ClusterState<I> {
     /// `ClusterMutation` arm). The OPERATIONAL signal is the coordinator's
     /// keepalive map; `alive_secondary_ids` selects whichever signal
     /// exists in the current regime.
+    ///
+    /// Departure exclusion is the convergent tombstone, NOT the liveness
+    /// bit: a genuine-death removal flips `is_peer_alive` to `false`, but a
+    /// graceful `SelfDeparture` deliberately leaves it `Alive` (the
+    /// departing peer stays a CRDT participant). A departed member must
+    /// never count toward this roster (promotion eligibility, mesh roster),
+    /// so it is excluded by [`Self::is_member_departed`] — present for both
+    /// causes — in addition to the positive liveness AND capacity gates.
     pub fn alive_secondary_members(&self) -> impl Iterator<Item = &str> {
         self.secondary_capacities
             .iter()
             .filter(|(_, record)| record.worker_count > 0)
             .map(|(id, _)| id.as_str())
-            .filter(move |id| self.is_peer_alive(id))
+            .filter(move |id| self.is_peer_alive(id) && !self.is_member_departed(id))
     }
 
     /// The latest aggregated resource-sample record (#575) for each
@@ -1284,15 +1319,19 @@ impl<I: Identifier> ClusterState<I> {
     /// disagree about who is live. Used as the stats occupancy DENOMINATOR
     /// for "X/Y workers busy" so a DEPARTED secondary — whose set-once
     /// `SecondaryCapacity` record lingers in `secondary_capacities` after
-    /// its membership flips `Dead` — no longer inflates the denominator
-    /// with slots no live worker fills. The numerator (busy slots, derived
-    /// from live `InFlight` entries) already excludes gone secondaries; this
-    /// makes the denominator agree.
+    /// it departs — no longer inflates the denominator with slots no live
+    /// worker fills. Departure is the convergent tombstone
+    /// ([`Self::is_member_departed`]), NOT the `peer_state` liveness bit: a
+    /// graceful `SelfDeparture` keeps the member Alive, so a liveness-keyed
+    /// denominator would re-inflate with a leaving member's slots. The
+    /// numerator (busy slots, derived from live `InFlight` entries) already
+    /// excludes gone secondaries; this keeps the denominator in step,
+    /// matching [`Self::alive_secondary_members`].
     pub fn alive_worker_count(&self) -> u64 {
         self.secondary_capacities
             .iter()
             .filter(|(_, record)| record.worker_count > 0)
-            .filter(|(id, _)| self.is_peer_alive(id))
+            .filter(|(id, _)| self.is_peer_alive(id) && !self.is_member_departed(id))
             .map(|(_, c)| u64::from(c.worker_count))
             .sum()
     }

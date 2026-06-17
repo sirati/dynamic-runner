@@ -228,11 +228,17 @@ where
                 //
                 // A pre-#530 sender that omits the hint falls through (the
                 // pre-existing #518 inflight-reconcile post-start dedup
-                // contract is preserved). A hint whose holder is no longer
-                // alive (the death was genuine, no re-admission) also
-                // falls through — the dispatch is legitimate.
+                // contract is preserved). A hint whose holder is no longer a
+                // live, present member — the death was genuine (no
+                // re-admission), OR the holder deliberately DEPARTED (its
+                // `Departed` tombstone is the convergent signal; a graceful
+                // self-departure leaves `peer_state` Alive, so the liveness
+                // bit alone would wrongly keep a leaving holder
+                // "authoritative") — also falls through: the dispatch is
+                // legitimate.
                 if let Some((peer, supplanted_gen)) = &supplanted_holder {
-                    let alive = self.cluster_state.is_peer_alive(peer);
+                    let alive = self.cluster_state.is_peer_alive(peer)
+                        && !self.cluster_state.is_member_departed(peer);
                     let live_gen = self.cluster_state.peer_member_gen(peer);
                     if alive && live_gen >= *supplanted_gen {
                         tracing::warn!(
