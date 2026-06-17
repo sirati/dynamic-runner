@@ -172,22 +172,126 @@ where
         reason: String,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<(), String> {
-        let Some((phase_id, task_id)) = self.task_meta_for_hash(&hash) else {
+        // In-memory cascade + mutation build (the shared core).
+        let Some((phase_id, _task_id, mutations)) =
+            self.fail_permanent_cascade_mutations(hash.clone(), error, reason)
+        else {
             return Err(format!("fail_permanent: unknown task hash {hash}"));
         };
-        // Record the failure in the local per-pass ledger so the
-        // operational loop's accounting + the per-phase counters match
-        // the wire-side state. Mirrors `handle_task_failed`'s
-        // `failed_tasks.insert(...)` step (the same in-memory side-
-        // effect a worker-originated failure would have).
+
+        // Broadcast the terminal state for the originating task plus any
+        // cascade-paused dependents — see `fail_permanent_cascade_mutations`
+        // for the apply-before-lifecycle ordering rationale (#358).
+        self.apply_and_broadcast_cluster_mutations(mutations).await;
+
+        // Phase + lifecycle bookkeeping. Must run AFTER the pool mutation so
+        // `process_phase_lifecycle` observes the post-cascade pool state.
+        // `kind = None`: the pool ALREADY observed this failure's identity +
+        // permanence through the `on_item_failed_permanent` call inside the
+        // cascade helper, so the routing takes the legacy in-flight-only
+        // decrement.
+        self.note_item_failed(&phase_id, None, None, command_rx).await;
+        Ok(())
+    }
+
+    /// BATCH permanent-failure: fail every `(hash, error, reason)` in `items`
+    /// with EXACTLY ONE broadcast and ONE phase-lifecycle pass — the scale path
+    /// for a burst (an all-`Failed` affine gate's thousands of dependents).
+    ///
+    /// ## Why a batch (the two scale flaws this closes)
+    /// 1. The self command channel is BOUNDED ([`COMMAND_CHANNEL_CAPACITY`]), so
+    ///    enqueuing N `FailPermanent`s for a burst would `Err(Full)` past the cap
+    ///    and DROP the overflow dependents (each already out of its bucket ⇒
+    ///    permanently lost ⇒ the run hangs). The caller drives this DIRECTLY
+    ///    (it holds `command_rx`), so no channel is involved.
+    /// 2. Calling [`Self::apply_fail_permanent`] PER item would do N separate
+    ///    `apply_and_broadcast_cluster_mutations` (N broadcasts pushed onto the
+    ///    mesh send queue) + N `process_phase_lifecycle` passes — an op-loop
+    ///    stall + a mesh-send flood. This accumulates ALL terminal mutations and
+    ///    broadcasts them ONCE, then runs the lifecycle cascade ONCE.
+    ///
+    /// Ordering is identical to the single-item path: every TaskFailed/TaskBlocked
+    /// is APPLIED (broadcast) BEFORE the lifecycle cascade, so a phase that drains
+    /// inside the cascade fires `on_phase_end` with the Failed EVENT tally already
+    /// including these failures (#358). The per-item in-flight DECREMENT
+    /// (`on_item_finished`) is run for each before the single lifecycle pass —
+    /// `process_phase_lifecycle` is whole-pool (it drains every transitioned
+    /// phase), so one pass covers all affected phases.
+    ///
+    /// An unknown hash in `items` is SKIPPED (the in-memory accounting is never
+    /// applied for it, so the in-flight ledger stays balanced) rather than
+    /// failing the whole batch.
+    pub(crate) async fn apply_fail_permanent_batch(
+        &mut self,
+        items: Vec<(String, ErrorType, String)>,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+        let mut all_mutations: Vec<ClusterMutation<I>> = Vec::with_capacity(items.len());
+        // The phases each failed item belongs to — the in-flight decrement
+        // targets, applied after the single broadcast.
+        let mut decrements: Vec<dynrunner_core::PhaseId> = Vec::with_capacity(items.len());
+        for (hash, error, reason) in items {
+            if let Some((phase_id, _task_id, mutations)) =
+                self.fail_permanent_cascade_mutations(hash, error, reason)
+            {
+                all_mutations.extend(mutations);
+                decrements.push(phase_id);
+            }
+            // Unknown hash: skipped — no mutation, no decrement (the in-memory
+            // cascade was never applied for it, so accounting stays balanced).
+        }
+        if all_mutations.is_empty() {
+            return;
+        }
+
+        // ONE broadcast for the whole burst — before the lifecycle cascade
+        // (the #358 apply-then-cascade order), so every drained phase sees its
+        // Failed tally already including these terminals.
+        self.apply_and_broadcast_cluster_mutations(all_mutations)
+            .await;
+
+        // Per-item in-flight decrement (the `kind = None` legacy in-flight-only
+        // routing `note_item_failed` takes), THEN one whole-pool lifecycle pass.
+        for phase_id in &decrements {
+            self.pool_mut().on_item_finished(phase_id, None);
+        }
+        self.process_phase_lifecycle(command_rx).await;
+    }
+
+    /// The shared in-memory core of permanent-failure: record `hash` in the
+    /// per-pass `failed_tasks` ledger, cascade-to-dependents via the pool
+    /// primitive, and BUILD (but do not broadcast) the resulting terminal
+    /// mutations. Returns `(phase_id, task_id, mutations)` or `None` for an
+    /// unknown hash. Consumed by both [`Self::apply_fail_permanent`] (single,
+    /// channel-driven) and [`Self::apply_fail_permanent_batch`] (burst,
+    /// one-broadcast) so the cascade + mutation shape can never drift.
+    ///
+    /// The mutation order — originating `TaskFailed` first, then any cascaded
+    /// `TaskBlocked` — is load-bearing: receivers see the prereq's terminal
+    /// before a dependent's `Blocked { on }` state, so the cascade root is
+    /// visible whenever a dependent's `on` field is consulted. The CALLER must
+    /// apply/broadcast these mutations BEFORE running the phase-lifecycle
+    /// cascade (#358: the apply's `merge_task_state` join owns the per-phase
+    /// Failed EVENT tally bump, so a phase draining inside the cascade must fire
+    /// `on_phase_end` with the tally already including this failure).
+    fn fail_permanent_cascade_mutations(
+        &mut self,
+        hash: String,
+        error: ErrorType,
+        reason: String,
+    ) -> Option<(dynrunner_core::PhaseId, String, Vec<ClusterMutation<I>>)> {
+        let (phase_id, task_id) = self.task_meta_for_hash(&hash)?;
+        // Record the failure in the local per-pass ledger so the operational
+        // loop's accounting + the per-phase counters match the wire-side state
+        // (mirrors `handle_task_failed`'s `failed_tasks.insert`).
         self.failed_tasks.insert(hash.clone(), error.clone());
 
-        // Cascade-to-dependents via the pool primitive. The returned
-        // list is the dependents that the pool just gave up on; how
-        // the caller observes them depends on the error class
-        // (cascade-pause for Unfulfillable, cascade-fail otherwise).
-        // `task_id` is non-optional per the framework's boundary
-        // contract.
+        // Cascade-to-dependents via the pool primitive. How the caller observes
+        // them depends on the error class (cascade-pause for Unfulfillable,
+        // cascade-fail otherwise).
         let cascaded_blocks: Vec<(String, String)> = {
             let cascaded = self
                 .pool_mut()
@@ -205,29 +309,14 @@ where
             blocks
         };
 
-        // Broadcast the terminal state for the originating task plus
-        // any cascade-paused dependents (Unfulfillable case only).
-        // The CRDT-applied broadcast is the single source of truth
-        // for every observer; ordering the originating TaskFailed
-        // first means receivers see the prereq's Unfulfillable state
-        // before the dependents' Blocked state — the cascade root is
-        // visible whenever a dependent's `on` field is consulted.
-        //
-        // Applied BEFORE the `note_item_failed` lifecycle cascade below —
-        // the uniform apply-then-cascade order the worker-terminal paths
-        // (`handle_task_failed` / `handle_task_complete`) already use, and
-        // load-bearing since #358: the apply's `merge_task_state` join owns
-        // the per-phase Failed EVENT tally bump, so a phase that drains
-        // inside the cascade must fire `on_phase_end` with a tally that
-        // already includes THIS failure.
         let mut mutations: Vec<ClusterMutation<I>> = Vec::with_capacity(1 + cascaded_blocks.len());
         mutations.push(ClusterMutation::TaskFailed {
             hash,
             kind: error,
             error: reason,
             // Both stamped at the origination choke point
-            // (apply_locally_for_broadcast): `version` minted, `attempt`
-            // read from the task's current generation (C-1).
+            // (apply_locally_for_broadcast): `version` minted, `attempt` read
+            // from the task's current generation (C-1).
             version: Default::default(),
             attempt: Default::default(),
         });
@@ -237,18 +326,7 @@ where
                 on: on_hash,
             });
         }
-        self.apply_and_broadcast_cluster_mutations(mutations).await;
-
-        // Phase + lifecycle bookkeeping. Must run AFTER the pool
-        // mutation so `process_phase_lifecycle` observes the post-
-        // cascade pool state. `kind = None`: the pool ALREADY observed
-        // this failure's identity + permanence through the
-        // `on_item_failed_permanent` call above, so the routing must take
-        // the legacy in-flight-only decrement — a retry-pending marker
-        // here would be redundant with the final `failed_tasks` entry.
-        self.note_item_failed(&phase_id, Some(task_id.as_str()), None, command_rx)
-            .await;
-        Ok(())
+        Some((phase_id, task_id, mutations))
     }
 
     /// Handler for `PrimaryCommand::ReinjectTask`. Accepts only entries
