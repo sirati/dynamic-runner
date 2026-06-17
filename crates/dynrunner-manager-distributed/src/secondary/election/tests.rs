@@ -106,6 +106,117 @@ async fn no_route_enters_election_and_never_aborts_a_voter() {
     );
 }
 
+/// Trace-replay of the asm-dataset graceful SIGUSR2-abort cascade: a
+/// multi-secondary fleet with a LIVE primary drains, each departing peer
+/// emitting a self-authored `PeerRemoved { SelfDeparture }`. The survivor
+/// (`sec-a`) ingests both departures into its `cluster_state`. The
+/// contract being pinned (the A-edge):
+///
+///   * a `SelfDeparture` must NOT flip the departing peer's `peer_state`
+///     to `Dead` — it stays `Alive` (this is the amplifier the cascade
+///     rode; RED before the fix, where the apply marked Dead), while the
+///     `Departed` capability tombstone projects it out of the role table;
+///   * with the primary still keepalive-fresh, NO election arms and the
+///     `primary_epoch` STAYS at its pre-abort value (no 1→2 bump). The
+///     spurious failover the Dead-flood triggered is gone.
+#[tokio::test(flavor = "current_thread")]
+async fn graceful_self_departure_flood_does_not_arm_election_or_bump_epoch() {
+    use crate::ApplyOutcome;
+    use dynrunner_core::BoundedString;
+    use dynrunner_protocol_primary_secondary::{ClusterMutation, RemovalCause};
+
+    // A 3-secondary fleet (sec-a is us; sec-b, sec-c are peer members) with
+    // a recognized, live primary at epoch 1. The primary is a live transport
+    // mesh member (`primary-orig` in the membership set) so the primary-
+    // silence/no-route failover legs stay quiet — isolating the ONE variable
+    // under test: the effect of the peer SelfDeparture flood.
+    let (mut sec, _members) = make_secondary_membership(
+        election_config("sec-a"),
+        vec![
+            PeerId::from("sec-b"),
+            PeerId::from("sec-c"),
+            PeerId::from("primary-orig"),
+        ],
+    );
+    sec.enter_operational_for_test();
+    for peer in ["sec-b", "sec-c"] {
+        // Each peer is keepalive-tracked AND a member of the CRDT (joined
+        // as an observer-capable worker so a Dead flip would visibly drop
+        // it from the role projection).
+        sec.op_mut()
+            .peer_keepalives
+            .insert(peer.into(), std::time::Instant::now());
+        sec.cluster_state.apply(ClusterMutation::PeerJoined {
+            peer_id: peer.into(),
+            is_observer: false,
+            can_be_primary: true,
+            cap_version: Default::default(),
+            member_gen: 0,
+        });
+    }
+    sec.cluster_state.apply(ClusterMutation::PrimaryChanged {
+        new: "primary-orig".into(),
+        epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+    });
+    sec.record_primary_message();
+
+    let epoch_before = sec.cluster_state.primary_epoch();
+    assert_eq!(epoch_before, 1);
+    assert!(matches!(sec.op_mut().election, ElectionState::Normal));
+
+    // Replay the graceful-abort drain: each peer announces its OWN
+    // SelfDeparture (the SIGUSR2 graceful-leave path).
+    for peer in ["sec-b", "sec-c"] {
+        let outcome = sec.cluster_state.apply(ClusterMutation::PeerRemoved {
+            id: peer.into(),
+            cause: RemovalCause::SelfDeparture(BoundedString::from(
+                "graceful abort: local work drained",
+            )),
+            member_gen: 0,
+        });
+        assert_eq!(outcome, ApplyOutcome::Applied);
+        // THE A-EDGE: the deliberate departure does NOT mark the peer Dead
+        // (RED pre-fix — the old apply flipped Dead here).
+        assert!(
+            sec.cluster_state.is_peer_alive(peer),
+            "a graceful self-departure must NOT flip {peer} to Dead",
+        );
+        // ...but the Departed tombstone DID project it out of the roles.
+        assert!(
+            !sec.cluster_state.role_table().can_be_primary.contains(peer),
+            "the Departed tombstone must drop {peer} from the role projection",
+        );
+    }
+
+    // The primary is still alive, so the survivor's election stays put.
+    let actions = sec.run_election_tick();
+    assert!(
+        matches!(sec.op_mut().election, ElectionState::Normal),
+        "a graceful self-departure flood (with a live primary) must NOT arm \
+         an election; got {:?}",
+        std::mem::discriminant(&sec.op_mut().election),
+    );
+    assert!(
+        !actions
+            .broadcast
+            .iter()
+            .any(|m| matches!(m, DistributedMessage::TimeoutQuery { target: _, .. })),
+        "no TimeoutQuery — no election was entered",
+    );
+    assert!(
+        sec.fatal_exit.is_none(),
+        "a graceful self-departure flood must not fatal-exit a survivor",
+    );
+    // NO epoch bump — the spurious 1→2 failover cascade is gone.
+    assert_eq!(
+        sec.cluster_state.primary_epoch(),
+        epoch_before,
+        "the primary_epoch must STAY at its pre-abort value (no failover cascade)",
+    );
+    assert_eq!(sec.cluster_state.current_primary(), Some("primary-orig"));
+}
+
 /// Adaptive quorum — the 2-node-trap fix. A 3-node fleet (1 primary + 2
 /// secondaries) loses its primary. From a survivor's view the live-peer
 /// set is the ONE other survivor (`live_peer_ids` excludes the dead

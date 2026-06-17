@@ -3,11 +3,13 @@
 //! Single concern: a node observing its OWN panik signal announces its
 //! departure from the mesh via a self-authored
 //! `ClusterMutation::PeerRemoved { id: <self>, cause:
-//! SelfDeparture(reason) }`. The apply rule for that mutation is
-//! observability-only — it marks the peer `Dead`, fires
-//! `PeerLifecycleEvent::Removed`, and leaves the task ledger UNTOUCHED.
-//! It does NOT cancel cluster work or move any task to a terminal
-//! state on a peer.
+//! SelfDeparture(reason) }`. The apply rule for that mutation projects
+//! the peer OUT of membership/roles via the convergent `Departed`
+//! capability tombstone, fires `PeerLifecycleEvent::Removed`, and leaves
+//! the task ledger UNTOUCHED. Unlike a genuine-death removal it does NOT
+//! flip the node-local `peer_state` liveness bit to `Dead` (that would
+//! shrink the perceived live fleet and arm a spurious election). It does
+//! NOT cancel cluster work or move any task to a terminal state on a peer.
 //!
 //! These pin the post-`PanikRequested` contract: there is no longer a
 //! cluster-wide cancel-sweep, no `panik_active` latch, and no
@@ -27,24 +29,32 @@ fn seed_with_one_pending() -> (ClusterState<RunnerIdentifier>, String) {
     (s, "h".to_string())
 }
 
-/// A self-authored `PeerRemoved { SelfDeparture(reason) }` for the
-/// node's OWN id is accepted and applied: the peer is marked Dead and
-/// a `PeerLifecycleEvent::Removed` carrying the cause is emitted. This
-/// is the membership-layer rule that a node may author its own
-/// departure (vs. the historically primary-authored-only removal).
+/// A self-authored `PeerRemoved { SelfDeparture(reason) }` for an
+/// observer-capable node's OWN id is accepted and applied: the peer is
+/// projected OUT of the role table via the `Departed` tombstone, a
+/// `PeerLifecycleEvent::Removed` carrying the cause is emitted — and
+/// critically, the node-local `peer_state` liveness bit stays `Alive`
+/// (NOT flipped Dead). The departing peer remains a first-class CRDT
+/// participant so its final mutations converge; only the role/setup
+/// projection drops it. This is the membership-layer rule that a node
+/// may author its own departure (vs. the historically primary-authored-
+/// only removal).
 #[tokio::test]
-async fn self_authored_departure_marks_peer_dead_and_emits_removed_event() {
+async fn self_authored_departure_projects_out_without_dead_flip() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     s.install_lifecycle_sender(tx);
-    // The node is alive in the mesh.
+    // The node is alive in the mesh and an observer (so we can observe
+    // the role projection drop it).
     s.apply(ClusterMutation::PeerJoined {
         peer_id: "self-node".into(),
-        is_observer: false,
+        is_observer: true,
         can_be_primary: false,
         cap_version: Default::default(),
         member_gen: 0,
     });
+    assert!(s.is_peer_alive("self-node"));
+    assert!(s.role_table().observers.contains("self-node"));
     // Drain the Added event.
     let _ = rx.try_recv();
 
@@ -56,6 +66,17 @@ async fn self_authored_departure_marks_peer_dead_and_emits_removed_event() {
     });
     assert_eq!(outcome, ApplyOutcome::Applied);
 
+    // The CONTRACT: liveness UNTOUCHED (still Alive), role projection
+    // dropped via the Departed tombstone.
+    assert!(
+        s.is_peer_alive("self-node"),
+        "a self-departure must NOT flip peer_state to Dead",
+    );
+    assert!(
+        !s.role_table().observers.contains("self-node"),
+        "the Departed tombstone must project the peer out of the role table",
+    );
+
     match rx.try_recv() {
         Ok(crate::peer_lifecycle::PeerLifecycleEvent::Removed { id, cause }) => {
             assert_eq!(id, "self-node");
@@ -66,6 +87,45 @@ async fn self_authored_departure_marks_peer_dead_and_emits_removed_event() {
         }
         other => panic!("expected Removed event with SelfDeparture cause, got {other:?}"),
     }
+
+    // Idempotent re-delivery: a second SelfDeparture for the same
+    // still-Alive, already-tombstoned id moves nothing → NoOp.
+    assert_eq!(
+        s.apply(ClusterMutation::PeerRemoved {
+            id: "self-node".into(),
+            cause: RemovalCause::SelfDeparture(BoundedString::from("panik file: /tmp/asm.panik")),
+            member_gen: 0,
+        }),
+        ApplyOutcome::NoOp,
+        "a duplicate self-departure must be a NoOp",
+    );
+}
+
+/// A genuine-death removal (any cause OTHER than `SelfDeparture`) still
+/// flips `peer_state` to `Dead` — the exemption is scoped to
+/// `SelfDeparture` ONLY, so the authoritative-death path is intact.
+#[test]
+fn genuine_death_removal_still_flips_dead() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::PeerJoined {
+        peer_id: "p1".into(),
+        is_observer: true,
+        can_be_primary: false,
+        cap_version: Default::default(),
+        member_gen: 0,
+    });
+    assert!(s.is_peer_alive("p1"));
+    let outcome = s.apply(ClusterMutation::PeerRemoved {
+        id: "p1".into(),
+        cause: RemovalCause::KeepaliveMiss,
+        member_gen: 0,
+    });
+    assert_eq!(outcome, ApplyOutcome::Applied);
+    assert!(
+        !s.is_peer_alive("p1"),
+        "a genuine-death removal MUST flip peer_state to Dead",
+    );
+    assert!(!s.role_table().observers.contains("p1"));
 }
 
 /// Negative control: a peer applying another node's self-departure
@@ -134,10 +194,15 @@ async fn peer_departure_does_not_touch_task_ledger() {
 
 /// `SelfDeparture` round-trips through the `PeerRemoved` apply on a
 /// previously-unseen id (the departing node need not have a prior
-/// `PeerJoined` in this replica's view): an absent id is inserted as
-/// Dead so a late `PeerJoined` for the same id is blocked.
+/// `PeerJoined` in this replica's view): the absent id gets a `Departed`
+/// capability tombstone (NOT a `Dead` `peer_state` entry), and the
+/// ledger is preserved. A late same-generation `PeerJoined` may bring
+/// the liveness bit Alive (honest — the frames ARE arriving), but the
+/// same-generation tombstone ABSORBS the advertise so the peer stays
+/// projected OUT of the role table; re-admission requires the next
+/// generation (the convergent membership-incarnation rule).
 #[test]
-fn self_departure_for_unseen_id_inserts_dead_and_preserves_ledger() {
+fn self_departure_for_unseen_id_tombstones_without_dead_and_preserves_ledger() {
     let (mut s, hash) = seed_with_one_pending();
     let outcome = s.apply(ClusterMutation::PeerRemoved {
         id: "never-joined".into(),
@@ -150,16 +215,28 @@ fn self_departure_for_unseen_id_inserts_dead_and_preserves_ledger() {
         s.task_state(&hash),
         Some(TaskState::Pending { .. })
     ));
-    // Sticky-per-id still holds: a late PeerJoined for the same id is
-    // a NoOp.
+    // No Dead flip: the id was never marked a live member, and the
+    // departure did NOT insert a Dead peer_state entry.
+    assert!(!s.is_peer_alive("never-joined"));
+    assert_eq!(
+        s.peer_membership("never-joined"),
+        crate::cluster_state::PeerMembership::NeverJoined,
+        "a self-departure must NOT insert a Dead peer_state entry",
+    );
+    // A late same-generation PeerJoined applies (no sticky-Dead block),
+    // but the same-gen Departed tombstone keeps the peer out of roles.
     assert_eq!(
         s.apply(ClusterMutation::PeerJoined {
             peer_id: "never-joined".into(),
-            is_observer: false,
+            is_observer: true,
             can_be_primary: false,
             cap_version: Default::default(),
             member_gen: 0,
         }),
-        ApplyOutcome::NoOp,
+        ApplyOutcome::Applied,
+    );
+    assert!(
+        !s.role_table().observers.contains("never-joined"),
+        "the same-generation Departed tombstone must keep the peer projected out",
     );
 }

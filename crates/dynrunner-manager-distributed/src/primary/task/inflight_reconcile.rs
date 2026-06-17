@@ -124,13 +124,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             );
             return;
         }
-        // Skip a member that is not currently a live member (re-removed
-        // after the gen read above is impossible on the single-writer loop,
-        // but a never-readmitted id reporting unsolicited is rejected here).
-        if !self.cluster_state.is_peer_alive(&secondary_id) {
+        // Skip a member that is not currently a live, PRESENT member: a
+        // never-readmitted id reporting unsolicited, OR a deliberately
+        // DEPARTED member (its `Departed` tombstone is the convergent
+        // signal — a graceful self-departure keeps `peer_state` Alive, so
+        // the liveness bit alone would admit a leaving member's roster into
+        // the re-admission reconcile). A re-removed-after-the-gen-read race
+        // is impossible on the single-writer loop.
+        if !self.cluster_state.is_peer_alive(&secondary_id)
+            || self.cluster_state.is_member_departed(&secondary_id)
+        {
             tracing::warn!(
                 member = %secondary_id,
-                "ignoring an in-flight roster from a non-live member"
+                "ignoring an in-flight roster from a non-live or departed member"
             );
             return;
         }

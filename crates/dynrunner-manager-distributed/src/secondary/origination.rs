@@ -145,8 +145,10 @@ where
     /// SelfDeparture("graceful abort: local work drained") }`, applied
     /// locally and fanned out — the SAME graceful-leave path the
     /// file-source panik uses ([`Self::handle_panik_signal`] step 1), so
-    /// peers LOG the departure and mark this node Dead-deliberately instead
-    /// of the keepalive watchdog later declaring an unexplained death.
+    /// peers LOG the departure and project this node OUT of membership/roles
+    /// via the convergent `Departed` tombstone — WITHOUT a node-local Dead
+    /// flip (see `apply_peer_removed`) — instead of the keepalive watchdog
+    /// later declaring an unexplained death.
     /// Observability + membership only: it does NOT cancel cluster work,
     /// does NOT terminate the run on peers, and never touches the failover
     /// machinery (elections key on PRIMARY silence, which a departing
@@ -167,8 +169,9 @@ where
     /// current incarnation> }`, applied locally and broadcast to every
     /// known mesh endpoint via [`Self::apply_and_broadcast_mutations`].
     ///
-    /// Single source of truth for "this node is leaving the mesh; mark it
-    /// Dead-deliberately and stop dialing it". The graceful-drain departure,
+    /// Single source of truth for "this node is leaving the mesh; project
+    /// it out of membership/roles via the `Departed` tombstone (NOT a
+    /// node-local Dead flip) and stop dialing it". The graceful-drain departure,
     /// the panik file-source departure, and the setup-timeout abort all
     /// route through here — they differ ONLY in the reason string, so the
     /// `PeerRemoved` shape + member_gen stamp + apply-then-broadcast +

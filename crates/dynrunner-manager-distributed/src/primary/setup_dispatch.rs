@@ -162,7 +162,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         match task.setup_affinity.as_deref() {
             None => true,
             Some(a) if a == own_id => true,
-            Some(a) => self.cluster_state.peer_membership(a) == PeerMembership::AliveMember,
+            // A live, NON-DEPARTED member. The departure tombstone
+            // (`is_member_departed`) excludes a gracefully self-departed
+            // peer that — unlike a genuine death — keeps `peer_state`
+            // Alive; routing a setup task at a leaving member would strand
+            // it.
+            Some(a) => {
+                self.cluster_state.peer_membership(a) == PeerMembership::AliveMember
+                    && !self.cluster_state.is_member_departed(a)
+            }
         }
     }
 

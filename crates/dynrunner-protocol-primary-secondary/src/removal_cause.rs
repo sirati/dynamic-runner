@@ -36,11 +36,22 @@ pub enum RemovalCause {
     /// reporter cannot force unbounded allocation on receivers.
     FatalError(BoundedString<1024>),
     /// A node is announcing its own departure from the mesh (it observed
-    /// a panik FILE and is tearing down its own workers and exiting
-    /// locally). Self-authored: the leaving node authors the `PeerRemoved`
-    /// for its OWN id so peers LOG the departure and mark the peer Dead —
-    /// it is observability-only and MUST NOT cancel cluster work or
-    /// terminate the run on peers.
+    /// a panik FILE or drained on a graceful abort and is tearing down its
+    /// own workers and exiting locally). Self-authored: the leaving node
+    /// authors the `PeerRemoved` for its OWN id so peers LOG the departure
+    /// and project it OUT of membership/roles via the convergent `Departed`
+    /// capability tombstone — it is observability + membership only and
+    /// MUST NOT cancel cluster work or terminate the run on peers.
+    ///
+    /// Unlike every other cause, a `SelfDeparture` does NOT flip the
+    /// receiver-local `peer_state` liveness bit to `Dead`: the departing
+    /// peer is leaving cleanly, and a Dead flip (which is node-local and
+    /// not anti-entropy-healed) would shrink the perceived live fleet on a
+    /// peer whose transport-liveness gate hadn't yet covered the window,
+    /// arming a spurious election and bumping the primary epoch. The
+    /// `Departed` tombstone alone removes it from role/setup/dispatch
+    /// projection; transport/quorum exclusion is owned by the
+    /// transport-liveness gate. See `apply_peer_removed`.
     ///
     /// Only the FILE-source panik broadcasts this: a per-host SIGTERM is a
     /// purely local teardown that announces NOTHING on the mesh (the mesh
