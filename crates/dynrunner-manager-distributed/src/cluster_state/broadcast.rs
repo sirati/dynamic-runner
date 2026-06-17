@@ -233,20 +233,21 @@ fn stamp_versions<I: Identifier>(
             | ClusterMutation::CustomMessagePosted { .. }
             | ClusterMutation::CustomMessageHandled { .. }
             | ClusterMutation::CustomMessageFailed { .. }
-            // `SecondaryAffineRegistered` (AF-id) is generation-LESS: the
-            // affine-id binding is set-once / content-addressed (bijection-
+            // `SecondaryCellRegistered` (cell-id) is generation-LESS: the
+            // cell-id binding is set-once / content-addressed (bijection-
             // enforced on apply), like the def-id stamp — no LWW arbitration.
-            | ClusterMutation::SecondaryAffineRegistered { .. } => {}
-            // The affine bitvector CELL mutations (AF-id) carry a per-cell LWW
+            | ClusterMutation::SecondaryCellRegistered { .. } => {}
+            // The per-secondary cell bitvector mutations carry a per-cell LWW
             // `generation`: stamp it here from the originator's global monotone
             // counter (a strictly-increasing source, so a later write — incl.
-            // the steal's `Unqueued` reset — always out-stamps the write it
-            // supersedes), the affine twin of the `TaskVersion` stamp above.
-            // One arm for all four cell variants — no per-variant duplication.
-            ClusterMutation::SecondaryAffineFinished { generation, .. }
-            | ClusterMutation::SecondaryAffineQueued { generation, .. }
-            | ClusterMutation::SecondaryAffineFailed { generation, .. }
-            | ClusterMutation::SecondaryAffineUnqueued { generation, .. } => {
+            // the steal's / eager-prep phase-reset's `Unqueued` reset — always
+            // out-stamps the write it supersedes), the cell twin of the
+            // `TaskVersion` stamp above. One arm for all four cell variants — no
+            // per-variant duplication, KIND-BLIND.
+            ClusterMutation::SecondaryCellFinished { generation, .. }
+            | ClusterMutation::SecondaryCellQueued { generation, .. }
+            | ClusterMutation::SecondaryCellFailed { generation, .. }
+            | ClusterMutation::SecondaryCellUnqueued { generation, .. } => {
                 *generation = state.next_affine_cell_generation();
             }
         }
@@ -371,7 +372,7 @@ fn assert_stamped_for_broadcast<I: Identifier>(mutations: &mut [ClusterMutation<
 
 /// Reserve the CRDT-agreed dense affine-id for every originated
 /// `TaskKind::SecondaryAffine` `TaskAdded` and INJECT a paired
-/// `SecondaryAffineRegistered` mutation (AF-id) — the affine analogue of the
+/// `SecondaryCellRegistered` mutation (AF-id) — the affine analogue of the
 /// def-id stamp, but its own pass on the OWNED `Vec` (it GROWS the batch, so
 /// it cannot ride the in-place `&mut [_]` stamp). Reservation is idempotent on
 /// hash (a re-added affine def reuses its affine-id and injects a registration
@@ -385,10 +386,10 @@ fn inject_affine_registrations<I: Identifier>(
         if let ClusterMutation::TaskAdded { hash, task, .. } = m
             && task.kind.is_secondary_affine()
         {
-            let affine_id = state.allocate_affine_id(hash).0;
-            registrations.push(ClusterMutation::SecondaryAffineRegistered {
+            let cell_id = state.allocate_affine_id(hash).0;
+            registrations.push(ClusterMutation::SecondaryCellRegistered {
                 hash: hash.clone(),
-                affine_id,
+                cell_id,
             });
         }
     }
@@ -477,7 +478,7 @@ pub(crate) fn apply_locally_for_broadcast<I: Identifier>(
     assert_stamped_for_broadcast(&mut mutations);
     // Affine-id registration pass (AF-id): for every originated SecondaryAffine
     // `TaskAdded`, reserve its CRDT-agreed dense affine-id and INJECT a paired
-    // `SecondaryAffineRegistered` so every replica binds the affine def's
+    // `SecondaryCellRegistered` so every replica binds the affine def's
     // content to the SAME affine-id (the per-secondary bitvector cell index).
     // Its own pass — a distinct concern from the def-id stamp above (a sibling
     // id space, minted only for the affine subset).

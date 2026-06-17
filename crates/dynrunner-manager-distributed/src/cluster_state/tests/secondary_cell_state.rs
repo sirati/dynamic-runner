@@ -29,7 +29,7 @@ fn mk_work_task_in(name: &str, phase: &str) -> TaskInfo<RunnerIdentifier> {
 }
 
 /// Originating a `SecondaryAffine` `TaskAdded` through the broadcast choke
-/// point reserves an affine-id, INJECTS a paired `SecondaryAffineRegistered`,
+/// point reserves an affine-id, INJECTS a paired `SecondaryCellRegistered`,
 /// and binds the def's content hash to that affine-id. A NON-affine task gets
 /// NO affine-id (the bitvector tracks only the affine subset — dense).
 #[test]
@@ -52,7 +52,7 @@ fn originate_secondary_affine_allocates_and_registers_affine_id() {
     let registrations = applied
         .applied
         .iter()
-        .filter(|m| matches!(m, ClusterMutation::SecondaryAffineRegistered { .. }))
+        .filter(|m| matches!(m, ClusterMutation::SecondaryCellRegistered { .. }))
         .count();
     assert_eq!(registrations, 1, "exactly one affine registration injected");
     // The affine task's hash is bound to an affine-id; the work task is not.
@@ -109,14 +109,14 @@ fn cell_apply_is_lww_and_idempotent() {
 
     // Originate Queued then Finished through the choke point (monotone gens).
     let cells = vec![
-        ClusterMutation::SecondaryAffineQueued {
+        ClusterMutation::SecondaryCellQueued {
             secondary: "s1".into(),
-            affine_id: aid.0,
+            cell_id: aid.0,
             generation: 0, // stamped at the choke point
         },
-        ClusterMutation::SecondaryAffineFinished {
+        ClusterMutation::SecondaryCellFinished {
             secondary: "s1".into(),
-            affine_id: aid.0,
+            cell_id: aid.0,
             generation: 0,
         },
     ];
@@ -125,9 +125,9 @@ fn cell_apply_is_lww_and_idempotent() {
 
     // A STALE Failed at generation 1 (below the stamped Finished) is a NoOp.
     assert_eq!(
-        s.apply(ClusterMutation::SecondaryAffineFailed {
+        s.apply(ClusterMutation::SecondaryCellFailed {
             secondary: "s1".into(),
-            affine_id: aid.0,
+            cell_id: aid.0,
             generation: 1,
         }),
         ApplyOutcome::NoOp
@@ -143,25 +143,25 @@ fn cell_apply_is_lww_and_idempotent() {
 fn steal_reset_converges_via_snapshot_restore() {
     // Replica A: the affine def is Queued on s1 at generation 5.
     let mut a = ClusterState::<RunnerIdentifier>::new();
-    a.apply(ClusterMutation::SecondaryAffineRegistered {
+    a.apply(ClusterMutation::SecondaryCellRegistered {
         hash: "h".into(),
-        affine_id: 0,
+        cell_id: 0,
     });
-    a.apply(ClusterMutation::SecondaryAffineQueued {
+    a.apply(ClusterMutation::SecondaryCellQueued {
         secondary: "s1".into(),
-        affine_id: 0,
+        cell_id: 0,
         generation: 5,
     });
     // Replica B: the idle-steal moved the unit away, resetting s1 to NotDone
     // at generation 6 (strictly greater than the Queued it undoes).
     let mut b = ClusterState::<RunnerIdentifier>::new();
-    b.apply(ClusterMutation::SecondaryAffineRegistered {
+    b.apply(ClusterMutation::SecondaryCellRegistered {
         hash: "h".into(),
-        affine_id: 0,
+        cell_id: 0,
     });
-    b.apply(ClusterMutation::SecondaryAffineUnqueued {
+    b.apply(ClusterMutation::SecondaryCellUnqueued {
         secondary: "s1".into(),
-        affine_id: 0,
+        cell_id: 0,
         generation: 6,
     });
 
@@ -181,9 +181,9 @@ fn steal_reset_converges_via_snapshot_restore() {
 #[test]
 fn digest_detects_and_restore_heals_affine_divergence() {
     let mut a = ClusterState::<RunnerIdentifier>::new();
-    a.apply(ClusterMutation::SecondaryAffineFinished {
+    a.apply(ClusterMutation::SecondaryCellFinished {
         secondary: "s1".into(),
-        affine_id: 0,
+        cell_id: 0,
         generation: 3,
     });
     let b = ClusterState::<RunnerIdentifier>::new();
@@ -211,7 +211,7 @@ fn digest_detects_and_restore_heals_affine_divergence() {
 #[test]
 fn affine_id_binding_survives_snapshot_restore_into_fresh_replica() {
     // Originate the affine def through the broadcast choke (reserves the id,
-    // injects + applies `SecondaryAffineRegistered`, and stamps the def).
+    // injects + applies `SecondaryCellRegistered`, and stamps the def).
     let mut a = ClusterState::<RunnerIdentifier>::new();
     let batch = vec![ClusterMutation::TaskAdded {
         hash: "h-affine".into(),
@@ -482,9 +482,9 @@ fn phase_rollup_affine_only_phase_keeps_has_any() {
 fn failover_resumes_cell_generation_past_inherited() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
     // Inherit a cell at a high generation (e.g. restored from a prior epoch).
-    s.apply(ClusterMutation::SecondaryAffineQueued {
+    s.apply(ClusterMutation::SecondaryCellQueued {
         secondary: "s1".into(),
-        affine_id: 0,
+        cell_id: 0,
         generation: 100,
     });
     // Promotion: a new primary epoch advances → the gen-floor resume fires.
@@ -495,9 +495,9 @@ fn failover_resumes_cell_generation_past_inherited() {
     });
     // A newly originated cell write through the choke point must out-stamp the
     // inherited generation-100 cell, so it WINS the LWW (lands as Done).
-    let cells = vec![ClusterMutation::SecondaryAffineFinished {
+    let cells = vec![ClusterMutation::SecondaryCellFinished {
         secondary: "s1".into(),
-        affine_id: 0,
+        cell_id: 0,
         generation: 0, // stamped at the choke point, resumed past 100
     }];
     crate::cluster_state::apply_locally_for_broadcast(&mut s, cells);

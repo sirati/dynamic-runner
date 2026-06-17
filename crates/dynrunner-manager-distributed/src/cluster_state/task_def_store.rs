@@ -380,7 +380,7 @@ pub(crate) struct TaskDefStore<I> {
     /// exact match always dominates a phaseless one.
     task_id_to_id: HashMap<String, TaskDefId>,
     /// Content hash → the def's COMMITTED AFFINE-id, populated ONLY for
-    /// [`TaskKind::SecondaryAffine`] defs whose `SecondaryAffineRegistered`
+    /// [`TaskKind::SecondaryAffine`] defs whose `SecondaryCellRegistered`
     /// has been APPLIED (the affine analogue of `hash_to_id`): the dedup gate
     /// AND one half of the hash↔affine_id BIJECTION the wire-agreed
     /// [`Self::intern_cell_at`] enforces, so every replica converges on the
@@ -394,10 +394,10 @@ pub(crate) struct TaskDefStore<I> {
     cell_hash_to_id: HashMap<String, SecondaryCellId>,
     /// PRIMARY-side pre-broadcast affine-id RESERVATIONS — `hash → affine_id`
     /// minted by [`Self::alloc_for_cell_hash`] at the broadcast stamp step
-    /// BEFORE the matching `SecondaryAffineRegistered` is applied. Keeps the
+    /// BEFORE the matching `SecondaryCellRegistered` is applied. Keeps the
     /// stamp pass's id allocation idempotent on hash (a re-stamp reuses the
     /// reservation) WITHOUT pre-committing the binding, so the originator's own
-    /// apply of its `SecondaryAffineRegistered` is the FIRST commit (Applied,
+    /// apply of its `SecondaryCellRegistered` is the FIRST commit (Applied,
     /// hence broadcast) rather than a NoOp the wire-filter would drop — the
     /// affine twin of `alloc_for_hash`-reserves / `intern_at`-fills.
     cell_id_reserved: HashMap<String, SecondaryCellId>,
@@ -853,7 +853,7 @@ impl<I> TaskDefStore<I> {
     /// idempotent on hash: returns the COMMITTED id if already bound, else the
     /// existing RESERVATION, else mints a fresh one into `cell_id_reserved`. The
     /// affine twin of [`Self::alloc_for_hash`] — the broadcast stamp step calls
-    /// it for a SecondaryAffine `TaskAdded` so the wire `SecondaryAffineRegistered`
+    /// it for a SecondaryAffine `TaskAdded` so the wire `SecondaryCellRegistered`
     /// carries the agreed affine-id. It RESERVES but does NOT commit the
     /// binding (so the matching registration apply is the first commit / is
     /// Applied / is broadcast), exactly as `alloc_for_hash` reserves without
@@ -1304,13 +1304,13 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
     /// The affine-id binding lives in a SEPARATE registry
     /// ([`TaskDefStore::cell_hash_to_id`]) populated ONLY by
     /// `intern_cell_at` (driven on the live path by
-    /// `SecondaryAffineRegistered`). Interning the def's CONTENT does NOT touch
+    /// `SecondaryCellRegistered`). Interning the def's CONTENT does NOT touch
     /// that registry, so without this re-anchor a snapshot-restored affine def
     /// resolves `cell_id_for_hash == None` on the restoring replica — the
     /// affine-dep placement (`affine_placement_for`) then finds the dependent's
     /// affine deps EMPTY, never places the per-secondary unit, and the import
     /// never dispatches (the run stalls with the import phase held open). The
-    /// `SecondaryAffineRegistered` mutation is a SEED-time fact (injected at cold
+    /// `SecondaryCellRegistered` mutation is a SEED-time fact (injected at cold
     /// seed); it is not re-broadcast to a primary that promotes from a snapshot,
     /// so the inline `affine_id` is the ONLY carrier across the relocation/
     /// failover handoff. `None` for every ordinary (Work/Setup) def — a no-op.

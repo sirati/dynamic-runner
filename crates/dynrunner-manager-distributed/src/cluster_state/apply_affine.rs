@@ -1,5 +1,5 @@
 //! Apply rules + origination seams for the AF-id affine state layer:
-//! the affine-id agreement (`SecondaryAffineRegistered`) and the
+//! the affine-id agreement (`SecondaryCellRegistered`) and the
 //! per-secondary bitvector cell writes (`SecondaryAffine{Finished,Queued,
 //! Failed,Unqueued}`).
 //!
@@ -14,31 +14,31 @@ use super::task_def_store::{SecondaryCellId, DefBijectionError};
 use super::{ApplyOutcome, ClusterState};
 
 impl<I: Identifier> ClusterState<I> {
-    /// Apply `SecondaryAffineRegistered`: bind a `SecondaryAffine` def's
-    /// content `hash` to its CRDT-agreed dense affine-id. Delegates the
-    /// bijection-enforced placement to the def store (the affine twin of the
-    /// def-id `intern_at`). A bijection violation (a converged registry never
-    /// produces one) is logged LOUD and NoOps — the loud-but-safe drop, exactly
-    /// like the def-id `TaskAdded` arm.
-    pub(super) fn apply_secondary_affine_registered(
+    /// Apply `SecondaryCellRegistered`: bind a cell-bearing def's content
+    /// `hash` to its CRDT-agreed dense cell-id. KIND-BLIND (affine + eager-prep
+    /// both register here). Delegates the bijection-enforced placement to the
+    /// def store (the cell-id twin of the def-id `intern_at`). A bijection
+    /// violation (a converged registry never produces one) is logged LOUD and
+    /// NoOps — the loud-but-safe drop, exactly like the def-id `TaskAdded` arm.
+    pub(super) fn apply_secondary_cell_registered(
         &mut self,
         hash: &str,
-        affine_id: u32,
+        cell_id: u32,
     ) -> ApplyOutcome {
         // Idempotent on a same-id re-add (at-least-once / snapshot replay):
         // already-bound ⇒ NoOp; a fresh binding ⇒ Applied.
-        let already = self.definitions.cell_id_for_hash(hash) == Some(SecondaryCellId(affine_id));
-        match self.definitions.intern_cell_at(SecondaryCellId(affine_id), hash) {
+        let already = self.definitions.cell_id_for_hash(hash) == Some(SecondaryCellId(cell_id));
+        match self.definitions.intern_cell_at(SecondaryCellId(cell_id), hash) {
             Ok(_) if already => ApplyOutcome::NoOp,
             Ok(_) => {
-                // Stamp the affine-id INLINE onto the live `TaskState`'s def so
+                // Stamp the cell-id INLINE onto the live `TaskState`'s def so
                 // the binding is self-describing in a snapshot. The snapshot
                 // serializes THIS per-task def by value (NOT the def store's
                 // registry, which it discards + rebuilds per-task via
                 // `register_restored_def`), so a snapshot-promoted / relocated
-                // primary's ONLY carrier of the affine binding is the def's own
+                // primary's ONLY carrier of the cell binding is the def's own
                 // `affine_id` field. Without this, the restored def resolves
-                // `affine_id_for_hash == None`, the dependent's affine deps read
+                // `cell_id_for_hash == None`, the dependent's affine deps read
                 // EMPTY in `affine_placement_for`, the per-secondary import is
                 // never placed, and the run stalls with the import phase held
                 // open (the secondary-affine --mode local stall). The
@@ -46,33 +46,33 @@ impl<I: Identifier> ClusterState<I> {
                 // stamping the store slot alone would fork an unstamped per-task
                 // copy into the snapshot — the stamp MUST happen here.
                 if let Some(state) = self.tasks.get_mut(hash) {
-                    std::sync::Arc::make_mut(state.def_mut()).affine_id = Some(SecondaryCellId(affine_id));
+                    std::sync::Arc::make_mut(state.def_mut()).affine_id = Some(SecondaryCellId(cell_id));
                 }
                 ApplyOutcome::Applied
             }
             Err(err) => {
-                Self::log_affine_bijection_violation(&err);
+                Self::log_cell_bijection_violation(&err);
                 ApplyOutcome::NoOp
             }
         }
     }
 
-    /// Apply a per-cell affine bitvector write (the shared body the four named
-    /// cell mutations route through — no per-variant duplication). Per-cell LWW
-    /// on `generation`: returns `Applied` iff the local cell CHANGED, else
-    /// `NoOp` (a stale/equal generation is idempotent under at-least-once +
-    /// snapshot replay).
-    pub(super) fn apply_secondary_affine_cell(
+    /// Apply a per-cell bitvector write (the shared body the four named cell
+    /// mutations route through — no per-variant duplication, KIND-BLIND).
+    /// Per-cell LWW on `generation`: returns `Applied` iff the local cell
+    /// CHANGED, else `NoOp` (a stale/equal generation is idempotent under
+    /// at-least-once + snapshot replay).
+    pub(super) fn apply_secondary_cell_write(
         &mut self,
         secondary: &str,
-        affine_id: u32,
+        cell_id: u32,
         cell: SecondaryCell,
         generation: u64,
     ) -> ApplyOutcome {
         if self
             .affine
             .bitvector_mut()
-            .set_cell(secondary, SecondaryCellId(affine_id), cell, generation)
+            .set_cell(secondary, SecondaryCellId(cell_id), cell, generation)
         {
             ApplyOutcome::Applied
         } else {
@@ -80,16 +80,16 @@ impl<I: Identifier> ClusterState<I> {
         }
     }
 
-    fn log_affine_bijection_violation(err: &DefBijectionError) {
+    fn log_cell_bijection_violation(err: &DefBijectionError) {
         tracing::error!(
             target: "dynrunner_cluster_state",
             ?err,
-            "SecondaryAffineRegistered affine-id BIJECTION violation — the \
-             wire-carried (affine_id, hash) contradicts an established binding \
+            "SecondaryCellRegistered cell-id BIJECTION violation — the \
+             wire-carried (cell_id, hash) contradicts an established binding \
              (a converged content-addressed registry never produces one). \
              Dropping the registration."
         );
-        debug_assert!(false, "affine-id bijection violation: {err:?}");
+        debug_assert!(false, "cell-id bijection violation: {err:?}");
     }
 
     // ── ORIGINATION seams (the primary stamps the LWW generation here) ──
@@ -106,7 +106,7 @@ impl<I: Identifier> ClusterState<I> {
     /// PRIMARY-side affine-id reservation for a `SecondaryAffine` def's content
     /// `hash` (idempotent on hash) — the broadcast-stamp seam: the originator
     /// reserves the agreed affine-id here, then emits the matching
-    /// `SecondaryAffineRegistered`, so the wire and the originator's own apply
+    /// `SecondaryCellRegistered`, so the wire and the originator's own apply
     /// converge on the same id. The affine twin of `allocate_def_id`.
     pub(crate) fn allocate_affine_id(&mut self, hash: &str) -> SecondaryCellId {
         self.definitions.alloc_for_cell_hash(hash)

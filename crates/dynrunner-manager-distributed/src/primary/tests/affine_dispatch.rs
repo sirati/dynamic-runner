@@ -238,8 +238,8 @@ fn primary_two_secondaries_with_phase_deps(
                 def_id: None,
             });
             if task.kind.is_secondary_affine() {
-                let affine_id = cs.allocate_affine_id(&hash).0;
-                cs.apply(ClusterMutation::SecondaryAffineRegistered { hash, affine_id });
+                let cell_id = cs.allocate_affine_id(&hash).0;
+                cs.apply(ClusterMutation::SecondaryCellRegistered { hash, cell_id });
             }
         }
     }
@@ -982,7 +982,7 @@ async fn affine_import_backpressure_bounce_resets_cell_and_redispatches_not_pool
 }
 
 /// PROTOCOL: the affine subsystem's backpressure-recovery mutation builder
-/// emits `SecondaryAffineUnqueued` (the Queued → NotDone cell reset) for an
+/// emits `SecondaryCellUnqueued` (the Queued → NotDone cell reset) for an
 /// affine hash — and NEVER a `TaskRequeued` (the work-pool requeue that the
 /// pre-fix mis-route wrongly used, which does not touch the bitvector cell at
 /// all). A non-affine hash builds `None` (symmetric with
@@ -1005,12 +1005,12 @@ async fn affine_backpressure_recovery_emits_unqueued_never_task_requeued() {
                 .affine_id_for_hash(&import_hash)
                 .expect("registered affine-id");
 
-            // The affine import's bounce recovery is a `SecondaryAffineUnqueued`
+            // The affine import's bounce recovery is a `SecondaryCellUnqueued`
             // (Queued → NotDone) — NOT a `TaskRequeued`.
             match primary.affine_unqueue_mutation("sec-0", &import_hash) {
-                Some(ClusterMutation::SecondaryAffineUnqueued {
+                Some(ClusterMutation::SecondaryCellUnqueued {
                     secondary,
-                    affine_id: aid,
+                    cell_id: aid,
                     generation,
                 }) => {
                     assert_eq!(secondary, "sec-0");
@@ -1018,7 +1018,7 @@ async fn affine_backpressure_recovery_emits_unqueued_never_task_requeued() {
                     assert_eq!(generation, 0);
                 }
                 other => panic!(
-                    "affine backpressure recovery must emit SecondaryAffineUnqueued, \
+                    "affine backpressure recovery must emit SecondaryCellUnqueued, \
                      got {other:?}"
                 ),
             }
@@ -1067,9 +1067,9 @@ async fn rebuild_queues_only_work_import_derived_on_demand() {
             // NOT reconstruct an import unit.
             primary
                 .cluster_state_mut_for_test()
-                .apply(ClusterMutation::SecondaryAffineQueued {
+                .apply(ClusterMutation::SecondaryCellQueued {
                     secondary: "sec-0".into(),
-                    affine_id: affine_id.0,
+                    cell_id: affine_id.0,
                     generation: 1,
                 });
 
@@ -1896,7 +1896,7 @@ async fn affine_gate_inflight_dep_is_unmet_not_skipped_to_delta() {
 
             // Helper: set a cell on a secondary directly. Cells are LWW by an
             // ever-increasing generation, so each write (incl. a NotDone reset via
-            // SecondaryAffineUnqueued) out-stamps the previous — the gate test can
+            // SecondaryCellUnqueued) out-stamps the previous — the gate test can
             // walk a cell through any sequence of states. `gen` is a shared
             // monotone counter so every write wins over the prior cell value.
             let mut cell_gen: u64 = 1;
@@ -1907,24 +1907,24 @@ async fn affine_gate_inflight_dep_is_unmet_not_skipped_to_delta() {
                 let g = cell_gen;
                 cell_gen += 1;
                 let mutation = match cell {
-                    SecondaryCell::Queued => ClusterMutation::SecondaryAffineQueued {
+                    SecondaryCell::Queued => ClusterMutation::SecondaryCellQueued {
                         secondary: sec.into(),
-                        affine_id: aid.0,
+                        cell_id: aid.0,
                         generation: g,
                     },
-                    SecondaryCell::Done => ClusterMutation::SecondaryAffineFinished {
+                    SecondaryCell::Done => ClusterMutation::SecondaryCellFinished {
                         secondary: sec.into(),
-                        affine_id: aid.0,
+                        cell_id: aid.0,
                         generation: g,
                     },
-                    SecondaryCell::Failed => ClusterMutation::SecondaryAffineFailed {
+                    SecondaryCell::Failed => ClusterMutation::SecondaryCellFailed {
                         secondary: sec.into(),
-                        affine_id: aid.0,
+                        cell_id: aid.0,
                         generation: g,
                     },
-                    SecondaryCell::NotDone => ClusterMutation::SecondaryAffineUnqueued {
+                    SecondaryCell::NotDone => ClusterMutation::SecondaryCellUnqueued {
                         secondary: sec.into(),
-                        affine_id: aid.0,
+                        cell_id: aid.0,
                         generation: g,
                     },
                 };

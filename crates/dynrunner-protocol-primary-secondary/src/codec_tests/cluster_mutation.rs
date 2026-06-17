@@ -1455,49 +1455,49 @@ fn run_complete_literal_carries_counts_object() {
 
 // ── AF-id: affine state-layer mutations ──
 
-/// `SecondaryAffineRegistered` round-trips with its `hash` + affine-id (the
-/// content→affine-id binding, the per-secondary bitvector cell index).
+/// `SecondaryCellRegistered` round-trips with its `hash` + cell-id (the
+/// content→cell-id binding, the per-secondary bitvector cell index).
 #[test]
-fn roundtrip_secondary_affine_registered() {
-    let mutation: ClusterMutation<TestId> = ClusterMutation::SecondaryAffineRegistered {
+fn roundtrip_secondary_cell_registered() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::SecondaryCellRegistered {
         hash: "h-affine".into(),
-        affine_id: 11,
+        cell_id: 11,
     };
     let json = serde_json::to_string(&mutation).unwrap();
     let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
     match decoded {
-        ClusterMutation::SecondaryAffineRegistered { hash, affine_id } => {
+        ClusterMutation::SecondaryCellRegistered { hash, cell_id } => {
             assert_eq!(hash, "h-affine");
-            assert_eq!(affine_id, 11);
+            assert_eq!(cell_id, 11);
         }
-        _ => panic!("expected SecondaryAffineRegistered"),
+        _ => panic!("expected SecondaryCellRegistered"),
     }
 }
 
-/// The four affine bitvector CELL mutations round-trip with their
-/// `(secondary, affine_id, generation)` preserved — pinning a dropped
+/// The four per-secondary bitvector CELL mutations round-trip with their
+/// `(secondary, cell_id, generation)` preserved — pinning a dropped
 /// `generation` (the per-cell LWW stamp) on the wire.
 #[test]
-fn roundtrip_secondary_affine_cell_mutations() {
+fn roundtrip_secondary_cell_mutations() {
     let cells: Vec<ClusterMutation<TestId>> = vec![
-        ClusterMutation::SecondaryAffineFinished {
+        ClusterMutation::SecondaryCellFinished {
             secondary: "s1".into(),
-            affine_id: 3,
+            cell_id: 3,
             generation: 7,
         },
-        ClusterMutation::SecondaryAffineQueued {
+        ClusterMutation::SecondaryCellQueued {
             secondary: "s2".into(),
-            affine_id: 4,
+            cell_id: 4,
             generation: 8,
         },
-        ClusterMutation::SecondaryAffineFailed {
+        ClusterMutation::SecondaryCellFailed {
             secondary: "s3".into(),
-            affine_id: 5,
+            cell_id: 5,
             generation: 9,
         },
-        ClusterMutation::SecondaryAffineUnqueued {
+        ClusterMutation::SecondaryCellUnqueued {
             secondary: "s4".into(),
-            affine_id: 6,
+            cell_id: 6,
             generation: 10,
         },
     ];
@@ -1506,24 +1506,24 @@ fn roundtrip_secondary_affine_cell_mutations() {
         let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
         match (m, decoded) {
             (
-                ClusterMutation::SecondaryAffineFinished { secondary: a, affine_id: b, generation: c },
-                ClusterMutation::SecondaryAffineFinished { secondary: x, affine_id: y, generation: z },
+                ClusterMutation::SecondaryCellFinished { secondary: a, cell_id: b, generation: c },
+                ClusterMutation::SecondaryCellFinished { secondary: x, cell_id: y, generation: z },
             )
             | (
-                ClusterMutation::SecondaryAffineQueued { secondary: a, affine_id: b, generation: c },
-                ClusterMutation::SecondaryAffineQueued { secondary: x, affine_id: y, generation: z },
+                ClusterMutation::SecondaryCellQueued { secondary: a, cell_id: b, generation: c },
+                ClusterMutation::SecondaryCellQueued { secondary: x, cell_id: y, generation: z },
             )
             | (
-                ClusterMutation::SecondaryAffineFailed { secondary: a, affine_id: b, generation: c },
-                ClusterMutation::SecondaryAffineFailed { secondary: x, affine_id: y, generation: z },
+                ClusterMutation::SecondaryCellFailed { secondary: a, cell_id: b, generation: c },
+                ClusterMutation::SecondaryCellFailed { secondary: x, cell_id: y, generation: z },
             )
             | (
-                ClusterMutation::SecondaryAffineUnqueued { secondary: a, affine_id: b, generation: c },
-                ClusterMutation::SecondaryAffineUnqueued { secondary: x, affine_id: y, generation: z },
+                ClusterMutation::SecondaryCellUnqueued { secondary: a, cell_id: b, generation: c },
+                ClusterMutation::SecondaryCellUnqueued { secondary: x, cell_id: y, generation: z },
             ) => {
                 assert_eq!((a, b, c), (x, y, z));
             }
-            _ => panic!("affine cell mutation variant changed across round-trip"),
+            _ => panic!("cell mutation variant changed across round-trip"),
         }
     }
 }
@@ -1532,19 +1532,19 @@ fn roundtrip_secondary_affine_cell_mutations() {
 /// emits for a queued-cell mutation, pinning the shape the other side produces.
 #[test]
 fn secondary_affine_queued_decodes_literal_bytes() {
-    let bytes = r#"{"SecondaryAffineQueued":{"secondary":"node-7","affine_id":2,"generation":5}}"#;
+    let bytes = r#"{"SecondaryCellQueued":{"secondary":"node-7","cell_id":2,"generation":5}}"#;
     let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
     match decoded {
-        ClusterMutation::SecondaryAffineQueued {
+        ClusterMutation::SecondaryCellQueued {
             secondary,
-            affine_id,
+            cell_id,
             generation,
         } => {
             assert_eq!(secondary, "node-7");
-            assert_eq!(affine_id, 2);
+            assert_eq!(cell_id, 2);
             assert_eq!(generation, 5);
         }
-        _ => panic!("expected SecondaryAffineQueued"),
+        _ => panic!("expected SecondaryCellQueued"),
     }
 }
 

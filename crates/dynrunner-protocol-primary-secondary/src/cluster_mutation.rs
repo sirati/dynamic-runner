@@ -1288,53 +1288,56 @@ pub enum ClusterMutation<I> {
         secondary: String,
         record: SecondaryResourceSampleRecord,
     },
-    /// Bind a `TaskKind::SecondaryAffine` def's content `hash` to its
-    /// PRIMARY-allocated, CRDT-agreed dense AFFINE-id (the per-secondary
-    /// bitvector cell index). The affine analogue of the `def_id` stamp on
-    /// `TaskAdded`, carried as its OWN mutation (its own single concern — the
-    /// affine-id agreement — so it touches NO existing `TaskAdded` originator).
-    /// Originated by the primary alongside the affine `TaskAdded`; idempotent
-    /// (keyed by hash, bijection-enforced on apply), so order vs the
-    /// `TaskAdded` is free. Carries no `generation` — the binding is set-once /
-    /// content-addressed (like the def-id stamp), not LWW.
-    SecondaryAffineRegistered {
+    /// Bind a per-secondary cell-bearing def's content `hash` to its
+    /// PRIMARY-allocated, CRDT-agreed dense CELL-id (the per-secondary
+    /// bitvector cell index). KIND-BLIND: originated for any cell-bearing kind
+    /// (`SecondaryAffine` + `SecondaryEagerPrep`). The cell analogue of the
+    /// `def_id` stamp on `TaskAdded`, carried as its OWN mutation (its own
+    /// single concern — the cell-id agreement — so it touches NO existing
+    /// `TaskAdded` originator). Originated by the primary alongside the
+    /// cell-bearing `TaskAdded`; idempotent (keyed by hash, bijection-enforced
+    /// on apply), so order vs the `TaskAdded` is free. Carries no `generation`
+    /// — the binding is set-once / content-addressed (like the def-id stamp),
+    /// not LWW.
+    SecondaryCellRegistered {
         hash: String,
-        affine_id: u32,
+        cell_id: u32,
     },
-    /// Set the affine bitvector CELL for `(secondary, affine_id)` to DONE
+    /// Set the bitvector CELL for `(secondary, cell_id)` to DONE
     /// (`11`). LWW per cell on `generation` (see [`SecondaryCell`]'s lattice
     /// note): a strictly-greater generation wins; equal/older is a NoOp
     /// (idempotent under at-least-once + snapshot replay).
-    SecondaryAffineFinished {
+    SecondaryCellFinished {
         secondary: String,
-        affine_id: u32,
+        cell_id: u32,
         generation: u64,
     },
-    /// Set the affine bitvector CELL for `(secondary, affine_id)` to QUEUED
+    /// Set the bitvector CELL for `(secondary, cell_id)` to QUEUED
     /// (`01`). LWW per cell on `generation`. The locality claim the primary
-    /// places when it appends an affine prereq to a secondary's queue.
-    SecondaryAffineQueued {
+    /// places when it appends a cell prereq to a secondary's queue.
+    SecondaryCellQueued {
         secondary: String,
-        affine_id: u32,
+        cell_id: u32,
         generation: u64,
     },
-    /// Set the affine bitvector CELL for `(secondary, affine_id)` to FAILED
+    /// Set the bitvector CELL for `(secondary, cell_id)` to FAILED
     /// (`10`). LWW per cell on `generation`. NOT sticky (Q1 default): a later
     /// higher-generation Queued/Done overrides it.
-    SecondaryAffineFailed {
+    SecondaryCellFailed {
         secondary: String,
-        affine_id: u32,
+        cell_id: u32,
         generation: u64,
     },
-    /// Reset the affine bitvector CELL for `(secondary, affine_id)` to NOT_DONE
+    /// Reset the bitvector CELL for `(secondary, cell_id)` to NOT_DONE
     /// (`00`). LWW per cell on `generation`. The idle-steal's `01 → 00`
     /// un-queue (the source secondary relinquishes its queued claim when the
-    /// schedulable unit moves to another secondary). AF-sched originates this;
-    /// it carries a generation strictly greater than the Queued it undoes so
-    /// the reset wins the LWW.
-    SecondaryAffineUnqueued {
+    /// schedulable unit moves to another secondary), AND the eager-prep
+    /// phase-transition reset of a stale `Queued → NotDone` cell. The
+    /// originator carries a generation strictly greater than the Queued it
+    /// undoes so the reset wins the LWW.
+    SecondaryCellUnqueued {
         secondary: String,
-        affine_id: u32,
+        cell_id: u32,
         generation: u64,
     },
 }

@@ -18,7 +18,7 @@
 //!   secondary by rank ([`PrimaryCoordinator::affine_placement_for`] +
 //!   `AffineScheduler::select_secondary`) and `AffineScheduler::place` the work
 //!   task there after its still-not-done affine prereqs, emitting the resulting
-//!   `SecondaryAffineQueued` mutations. Detection REUSES the pool's
+//!   `SecondaryCellQueued` mutations. Detection REUSES the pool's
 //!   already-computed readiness (a `SecondaryAffine` task in a bucket = its deps
 //!   are met) — it never re-decides dep resolution.
 //! - PER-SECONDARY-FIRST pop ([`Self::try_affine_pop_for_worker`]): when
@@ -32,7 +32,7 @@
 //! - IDLE-STEAL ([`Self::try_affine_steal_for_worker`]): when BOTH the global
 //!   pool view AND `S`'s queue are empty at assignment time,
 //!   `AffineScheduler::steal_for` a whole schedulable unit from the
-//!   longest-queue donor, emit the `SecondaryAffineUnqueued`/re-`Queued`
+//!   longest-queue donor, emit the `SecondaryCellUnqueued`/re-`Queued`
 //!   mutations, and dispatch the stolen unit.
 //! - FAILOVER rebuild ([`Self::rebuild_affine_schedule`], called from
 //!   [`PrimaryCoordinator::hydrate_from_cluster_state`]): discard the local
@@ -240,7 +240,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// precondition is that BOTH the global pool view AND this worker's
     /// secondary's queue are empty (the design's idle-steal trigger). Steal a
     /// whole schedulable unit from the longest-queue donor — emitting the
-    /// `SecondaryAffineUnqueued`/re-`Queued` cell mutations — then pop +
+    /// `SecondaryCellUnqueued`/re-`Queued` cell mutations — then pop +
     /// dispatch it. Returns `true` iff a stolen unit was committed; `false`
     /// when no donor had work to steal (the worker stays idle this tick).
     pub(crate) async fn try_affine_steal_for_worker(&mut self, worker_idx: usize) -> bool {
@@ -629,9 +629,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // Claim the cell `Queued` (the per-secondary in-flight claim), then
         // dispatch the import as its own affine unit through the shared seam —
         // which re-applies the run-once + dispatch-once guards.
-        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::SecondaryAffineQueued {
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::SecondaryCellQueued {
             secondary: secondary.to_string(),
-            affine_id: aid.0,
+            cell_id: aid.0,
             generation: 0,
         }])
         .await;

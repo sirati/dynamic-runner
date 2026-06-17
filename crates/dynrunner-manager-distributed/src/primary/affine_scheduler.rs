@@ -227,7 +227,7 @@ impl AffineScheduler {
     }
 
     /// Place a work task on secondary `S`: append `S`'s STILL-not-done affine
-    /// prereqs (each emitting a `SecondaryAffineQueued` so the cell goes
+    /// prereqs (each emitting a `SecondaryCellQueued` so the cell goes
     /// `→ Queued`), then append the work task after them. A prereq already
     /// `Done`/`Queued`/`Failed` on `S` is NOT re-appended (and emits nothing) —
     /// the all-done case falls out as "append only the work task".
@@ -305,10 +305,10 @@ impl AffineScheduler {
     /// the affine prereqs and their dependent work task) — onto `S`.
     ///
     /// For each MOVED affine unit, reset `T`'s cell `Queued → NotDone` (emit
-    /// `SecondaryAffineUnqueued`) ONLY IF it is currently `Queued`
+    /// `SecondaryCellUnqueued`) ONLY IF it is currently `Queued`
     /// (Done/Failed/NotDone untouched — `T` relinquishes only its queued
     /// CLAIM), then RE-mark the still-not-done ones `Queued` for `S` (emit
-    /// `SecondaryAffineQueued`). This is the design's only `01 → 00` site.
+    /// `SecondaryCellQueued`). This is the design's only `01 → 00` site.
     ///
     /// Returns the emitted cell mutations (empty when no donor with a non-empty
     /// queue exists, i.e. nothing to steal). `cell_of` is the AF-id bitvector
@@ -374,9 +374,9 @@ impl AffineScheduler {
             if let QueuedUnit::Affine { affine_id, .. } = unit
                 && cell_of(&donor, *affine_id) == SecondaryCell::Queued
             {
-                mutations.push(ClusterMutation::SecondaryAffineUnqueued {
+                mutations.push(ClusterMutation::SecondaryCellUnqueued {
                     secondary: donor.clone(),
-                    affine_id: affine_id.0,
+                    cell_id: affine_id.0,
                     generation: 0,
                 });
             }
@@ -391,9 +391,9 @@ impl AffineScheduler {
             if let QueuedUnit::Affine { affine_id, .. } = &unit
                 && cell_of(secondary, *affine_id) == SecondaryCell::NotDone
             {
-                mutations.push(ClusterMutation::SecondaryAffineQueued {
+                mutations.push(ClusterMutation::SecondaryCellQueued {
                     secondary: secondary.to_string(),
-                    affine_id: affine_id.0,
+                    cell_id: affine_id.0,
                     generation: 0,
                 });
             }
@@ -533,15 +533,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ) -> Option<ClusterMutation<I>> {
         let affine_id = self.cluster_state.affine_id_for_hash(task_hash)?;
         Some(if succeeded {
-            ClusterMutation::SecondaryAffineFinished {
+            ClusterMutation::SecondaryCellFinished {
                 secondary: secondary.to_string(),
-                affine_id: affine_id.0,
+                cell_id: affine_id.0,
                 generation: 0,
             }
         } else {
-            ClusterMutation::SecondaryAffineFailed {
+            ClusterMutation::SecondaryCellFailed {
                 secondary: secondary.to_string(),
-                affine_id: affine_id.0,
+                cell_id: affine_id.0,
                 generation: 0,
             }
         })
@@ -549,7 +549,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
     /// Map a per-secondary affine import's BACKPRESSURE bounce onto the
     /// bitvector: reset `(secondary, affine_id)` `Queued → NotDone` (the
-    /// `SecondaryAffineUnqueued` mutation — the SAME `01 → 00` cell reset
+    /// `SecondaryCellUnqueued` mutation — the SAME `01 → 00` cell reset
     /// `steal_for` emits when a donor relinquishes its queued claim). `None` ⇒
     /// the hash is not an affine def (an ordinary work task), so nothing
     /// affine-side happens — symmetric with [`Self::affine_terminal_mutation`].
@@ -567,9 +567,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         task_hash: &str,
     ) -> Option<ClusterMutation<I>> {
         let affine_id = self.cluster_state.affine_id_for_hash(task_hash)?;
-        Some(ClusterMutation::SecondaryAffineUnqueued {
+        Some(ClusterMutation::SecondaryCellUnqueued {
             secondary: secondary.to_string(),
-            affine_id: affine_id.0,
+            cell_id: affine_id.0,
             generation: 0,
         })
     }
@@ -623,7 +623,7 @@ mod tests {
     #[test]
     fn place_enqueues_only_work_no_import_prefix() {
         // Lazy-import model (c): placement enqueues ONLY the work unit and emits
-        // NO `SecondaryAffineQueued` — the import is dispatched ON-DEMAND when the
+        // NO `SecondaryCellQueued` — the import is dispatched ON-DEMAND when the
         // work commits on a secondary (the dispatch path's `StrandedHere` arm),
         // never enqueued ahead of a committed work. This holds regardless of the
         // deps' cell state (both not-done here).

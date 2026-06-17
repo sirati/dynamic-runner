@@ -941,47 +941,47 @@ impl<I: Identifier> ClusterState<I> {
                 seq,
                 reason,
             } => self.apply_custom_message_failed(origin, seq, reason),
-            // ── AF-id: affine-id agreement + the per-secondary bitvector ──
-            ClusterMutation::SecondaryAffineRegistered { hash, affine_id } => {
-                self.apply_secondary_affine_registered(&hash, affine_id)
+            // ── per-secondary cell substrate: cell-id agreement + bitvector ──
+            ClusterMutation::SecondaryCellRegistered { hash, cell_id } => {
+                self.apply_secondary_cell_registered(&hash, cell_id)
             }
-            ClusterMutation::SecondaryAffineFinished {
+            ClusterMutation::SecondaryCellFinished {
                 secondary,
-                affine_id,
+                cell_id,
                 generation,
-            } => self.apply_secondary_affine_cell(
+            } => self.apply_secondary_cell_write(
                 &secondary,
-                affine_id,
+                cell_id,
                 dynrunner_protocol_primary_secondary::SecondaryCell::Done,
                 generation,
             ),
-            ClusterMutation::SecondaryAffineQueued {
+            ClusterMutation::SecondaryCellQueued {
                 secondary,
-                affine_id,
+                cell_id,
                 generation,
-            } => self.apply_secondary_affine_cell(
+            } => self.apply_secondary_cell_write(
                 &secondary,
-                affine_id,
+                cell_id,
                 dynrunner_protocol_primary_secondary::SecondaryCell::Queued,
                 generation,
             ),
-            ClusterMutation::SecondaryAffineFailed {
+            ClusterMutation::SecondaryCellFailed {
                 secondary,
-                affine_id,
+                cell_id,
                 generation,
-            } => self.apply_secondary_affine_cell(
+            } => self.apply_secondary_cell_write(
                 &secondary,
-                affine_id,
+                cell_id,
                 dynrunner_protocol_primary_secondary::SecondaryCell::Failed,
                 generation,
             ),
-            ClusterMutation::SecondaryAffineUnqueued {
+            ClusterMutation::SecondaryCellUnqueued {
                 secondary,
-                affine_id,
+                cell_id,
                 generation,
-            } => self.apply_secondary_affine_cell(
+            } => self.apply_secondary_cell_write(
                 &secondary,
-                affine_id,
+                cell_id,
                 dynrunner_protocol_primary_secondary::SecondaryCell::NotDone,
                 generation,
             ),
