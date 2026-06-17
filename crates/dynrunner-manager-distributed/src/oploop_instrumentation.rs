@@ -170,7 +170,7 @@ impl OpLoopArmStats {
         let last_stats = self.last_stats_at_millis.load(Ordering::Relaxed);
         if now.saturating_sub(last_stats) >= STATS_LINE_INTERVAL.as_millis() as u64 {
             self.last_stats_at_millis.store(now, Ordering::Relaxed);
-            tracing::info!(oploop = %self.snapshot_at(now), "oploop arm stats");
+            self.emit_stats_line(now);
         }
 
         // Starvation gate — derived from two atomic reads, NO snapshot alloc.
@@ -199,6 +199,34 @@ impl OpLoopArmStats {
                  only (the ingest-wedge signature)"
             );
         }
+    }
+
+    /// Emit ONE periodic-shape stats line at `now` — the single source of truth
+    /// for the `"oploop arm stats"` line that both the interval-gated
+    /// [`Self::maybe_emit`] and the unconditional [`Self::emit_final`] produce.
+    /// Builds the renderable snapshot, logs it, and returns it so a test can
+    /// assert the exact rendered content without intercepting `tracing` (the
+    /// tracing call stays a thin one-liner; the line shape lives in
+    /// [`ArmStatsSnapshot`]'s [`std::fmt::Display`]). NOT a gate — the caller
+    /// owns the decision to emit; this method just renders + logs.
+    fn emit_stats_line(&self, now: u64) -> ArmStatsSnapshot {
+        let snap = self.snapshot_at(now);
+        tracing::info!(oploop = %snap, "oploop arm stats");
+        snap
+    }
+
+    /// Emit ONE final stats line UNCONDITIONALLY, bypassing the
+    /// [`STATS_LINE_INTERVAL`] gate that [`Self::maybe_emit`] applies. Called
+    /// exactly once on the operational loop's termination so EVERY run — even a
+    /// short burst that completes inside one interval and so never tripped the
+    /// periodic emit — leaves at least one `"oploop arm stats"` line carrying
+    /// the cumulative per-arm tallies (the line operators + the test-547 gate
+    /// grep for). Same line shape and emit path as the periodic twin (shared
+    /// [`Self::emit_stats_line`] body — no duplicated formatting). Returns the
+    /// rendered snapshot for the same test-assertion reason as the helper.
+    /// Observation-only: no scheduling/behaviour effect.
+    pub fn emit_final(&self) -> ArmStatsSnapshot {
+        self.emit_stats_line(now_millis())
     }
 
     /// Render a snapshot of the current accounting. One small `Vec` alloc for
@@ -541,6 +569,39 @@ mod tests {
         let line = cell.snapshot_line().expect("one entry");
         assert_eq!(line.matches("primary:").count(), 1, "no dup role: {line}");
         assert!(line.contains("iter=2"), "kept the latest: {line}");
+    }
+
+    #[test]
+    fn emit_final_renders_the_line_unconditionally_within_the_interval() {
+        // A short run: a handful of arms recorded, then the loop exits well
+        // within STATS_LINE_INTERVAL — so the periodic gate has NOT elapsed and
+        // `maybe_emit` would NOT have emitted. `emit_final` must still produce
+        // the cumulative arm-stats line so the run is not BLIND on exit.
+        let stats = OpLoopArmStats::new(ARMS, INBOX);
+        stats.record(0);
+        stats.record(0);
+        stats.record(2);
+
+        // Precondition: the interval gate has NOT elapsed since construction
+        // (last_stats seeded to loop-entry "now"), so the periodic emit is dued
+        // off — the very case that blinds short runs.
+        let last_stats = stats.last_stats_at_millis.load(Ordering::Relaxed);
+        let elapsed_since_stats = now_millis().saturating_sub(last_stats);
+        assert!(
+            elapsed_since_stats < STATS_LINE_INTERVAL.as_millis() as u64,
+            "test premise: interval must NOT have elapsed ({elapsed_since_stats}ms)"
+        );
+
+        // emit_final fires regardless and carries the cumulative tallies, the
+        // SAME line shape the periodic twin would have produced.
+        let snap = stats.emit_final();
+        let line = snap.to_string();
+        assert_eq!(snap.iter, 3, "cumulative iter count on exit");
+        assert!(
+            line.starts_with("iter=3 arm_counts=[command=2, inbox=0, heartbeat=1]"),
+            "emit_final line: {line}"
+        );
+        assert!(line.ends_with("last_arm=heartbeat"), "emit_final line: {line}");
     }
 
     #[test]

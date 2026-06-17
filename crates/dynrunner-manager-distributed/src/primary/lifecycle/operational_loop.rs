@@ -1382,6 +1382,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }
         }
 
+        // Unconditional final arm-stats emit. Every `break` above converges
+        // here, so this fires exactly once per loop run regardless of how the
+        // loop terminated (run-complete, run-should-fail, RunAborted,
+        // graceful-abort, transport-closed). The periodic 120 s emit only fires
+        // for long runs; a short burst that completes inside one interval would
+        // otherwise leave ZERO `"oploop arm stats"` lines, blinding operators
+        // to the arm distribution / control-plane starvation on exactly the
+        // runs the line exists to diagnose. Observation-only — the emit body +
+        // line shape are owned by `OpLoopArmStats` (see `emit_final`); this site
+        // only calls the public method.
+        arm_stats.emit_final();
+
         // Return the command-channel receiver to `self` so subsequent
         // operational-loop entries (retry passes) re-attach. Without
         // this, the second pass would see `command_rx = None` and the
