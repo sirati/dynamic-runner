@@ -1482,7 +1482,7 @@ where
                     // bring-up story + the one-knob hint), never the
                     // generic policy-exit misattribution or a silent
                     // cold-exit.
-                    if peers == 0 {
+                    let reason = if peers == 0 {
                         // The asm-dataset-nix T7 attempt 2 scenario:
                         // primary URL unreachable AND no peers have
                         // dialled in. The run is almost certainly
@@ -1496,13 +1496,11 @@ where
                              no instructions ever arrived from setup; run appears \
                              already complete, aborting"
                         );
-                        let reason = format!(
+                        format!(
                             "setup deadline ({}s) elapsed: no primary, no peers \
                              (cluster appears dead, run likely complete)",
                             deadline.as_secs()
-                        );
-                        self.enter_terminal_bring_up_failed(reason.clone());
-                        return Err(reason);
+                        )
                     } else {
                         // Peers reachable but setup didn't complete. This
                         // is a distinct scenario from cold-start (primary
@@ -1516,15 +1514,27 @@ where
                             "setup deadline elapsed despite peers reachable — \
                              primary unresponsive, aborting"
                         );
-                        let reason = format!(
+                        format!(
                             "setup deadline ({}s) elapsed: primary unresponsive \
                              despite {} peer(s) reachable",
                             deadline.as_secs(),
                             peers
-                        );
-                        self.enter_terminal_bring_up_failed(reason.clone());
-                        return Err(reason);
-                    }
+                        )
+                    };
+                    // Broadcast an AUTHORITATIVE self-departure to every
+                    // known mesh endpoint BEFORE the abort exits. This is an
+                    // ABNORMAL exit (the primary was unresponsive), so it is
+                    // modelled on the panik self-departure: best-effort
+                    // broadcast then exit — a failure is logged, not fatal
+                    // (the node is aborting regardless). Without it the peers
+                    // (peer_count above) keep dialing a dead connection and
+                    // infer death only from keepalive silence (slow + noisy);
+                    // the explicit `PeerRemoved { SelfDeparture }` lets them
+                    // drop this node from membership and stop waiting/dialing
+                    // immediately, even though the primary never answered.
+                    self.announce_self_departure(reason.clone()).await;
+                    self.enter_terminal_bring_up_failed(reason.clone());
+                    return Err(reason);
                 }
             }
 

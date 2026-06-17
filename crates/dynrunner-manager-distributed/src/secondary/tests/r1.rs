@@ -651,6 +651,126 @@ async fn cold_start_with_peers_emits_distinct_error() {
         .await;
 }
 
+/// #628 — the setup-timeout abort must BROADCAST an authoritative
+/// self-departure before it exits, so the peers it knows immediately drop
+/// it from membership and stop dialing/waiting (instead of inferring death
+/// from keepalive silence). Same scenario as
+/// `cold_start_with_peers_emits_distinct_error` (primary silent, two peers
+/// alive in the replicated roster → the "peers reachable" abort branch),
+/// but here we KEEP the primary-link receiver, run to the Err, flush the
+/// queued egress, and assert a self-authored `PeerRemoved { SelfDeparture }`
+/// fanned out onto the mesh. This rides the SAME shared
+/// `announce_self_departure` helper the graceful-drain / panik departures
+/// use — only the reason string differs.
+#[tokio::test(flavor = "current_thread")]
+async fn setup_timeout_abort_broadcasts_self_departure() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // KEEP the receiver: the self-departure broadcast fans out to
+            // every `outgoing` member incl. the folded primary link, so it
+            // lands here.
+            let (sec_to_pri_tx, mut sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            // Silent primary: the sender is dropped, so the secondary blocks
+            // on the inbound until its own `unconfigured_deadline` expires.
+            let (_pri_to_sec_tx, pri_to_sec_rx) =
+                tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+            let unified =
+                channel_mesh_to_primary("sec-abort-departs", sec_to_pri_tx, pri_to_sec_rx);
+
+            let config = SecondaryConfig {
+                secondary_id: "sec-abort-departs".into(),
+                num_workers: 1,
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    1024 * 1024 * 1024,
+                )]),
+                hostname: "test-host".into(),
+                keepalive_interval: Duration::from_millis(50),
+                src_network: None,
+                src_tmp: None,
+                peer_timeout: Duration::from_secs(120),
+                keepalive_miss_threshold: 3,
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                primary_link_failure_threshold: 5,
+                primary_link_failure_window: Duration::from_secs(30),
+                primary_silence_backstop: Duration::from_secs(120),
+                unconfigured_deadline: Duration::from_millis(200),
+                can_be_primary: false,
+                resource_check_interval: Duration::from_millis(100),
+                log_oom_watcher: false,
+                phase_status_log_intervals: vec![Duration::from_secs(60)],
+                promoted_primary_quiesce_grace: Duration::from_millis(100),
+                unfulfillable_reinject_max_per_task: None,
+                mem_manager_reserved_bytes: None,
+                output_dir: None,
+                memuse_log_path: None,
+                forwarded_argv: Vec::new(),
+            };
+
+            let mut secondary = make_secondary_channel(config, unified);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+
+            // Two alive peer-secondaries in the replicated roster → the
+            // "peers reachable" abort branch fires (the one with peers to
+            // notify of the departure).
+            for i in 0..2u32 {
+                let peer_id = format!("peer-{i}");
+                secondary.cluster_state.apply(
+                    dynrunner_protocol_primary_secondary::ClusterMutation::<TestId>::PeerJoined {
+                        peer_id: peer_id.clone(),
+                        is_observer: false,
+                        can_be_primary: false,
+                        cap_version: Default::default(),
+                        member_gen: 0,
+                    },
+                );
+                secondary.cluster_state.apply(
+                    dynrunner_protocol_primary_secondary::ClusterMutation::<TestId>::SecondaryCapacity {
+                        secondary: peer_id,
+                        worker_count: 1,
+                        resources: vec![],
+                    },
+                );
+            }
+
+            let mut factory = FakeWorkerFactory;
+            let result = run_secondary_to_completion(&mut secondary, &mut factory).await;
+            assert!(result.is_err(), "expected setup-deadline failure");
+
+            // The abort queues the self-departure broadcast just before it
+            // returns; flush the queued egress onto the transport so the
+            // primary-link receiver observes it.
+            secondary.drain_egress().await;
+
+            // A self-authored `PeerRemoved { SelfDeparture }` for THIS node
+            // reached the mesh before the exit.
+            let mut saw_self_departure = false;
+            while let Ok(frame) = sec_to_pri_rx.try_recv() {
+                if let DistributedMessage::ClusterMutation { mutations, .. } = &frame {
+                    saw_self_departure |= mutations.iter().any(|m| matches!(
+                        m,
+                        dynrunner_protocol_primary_secondary::ClusterMutation::PeerRemoved {
+                            id,
+                            cause: dynrunner_protocol_primary_secondary::RemovalCause::SelfDeparture(reason),
+                            ..
+                        } if id == "sec-abort-departs"
+                            && reason.as_str().contains("setup deadline")
+                    ));
+                }
+            }
+            assert!(
+                saw_self_departure,
+                "the setup-timeout abort must broadcast a self-authored \
+                 PeerRemoved {{ SelfDeparture }} naming the setup-deadline \
+                 reason before exiting"
+            );
+        })
+        .await;
+}
+
 /// T-#28 (post-promotion task distribution):
 /// When a peer-routed TaskAssignment arrives at `handle_peer_message`,
 /// it MUST be dispatched to a worker — not silently dropped via the
