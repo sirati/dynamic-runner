@@ -208,8 +208,21 @@ impl<I: Identifier> ClusterState<I> {
     /// CCD-9 invariant: this method must never invoke a consumer directly.
     /// Consumption happens off the apply/merge path on the observer's run
     /// loop; the channel is the only synchronization crossing.
-    pub(crate) fn emit_task_state_change_event(&self, event: TaskStateChangeEvent) {
+    pub(crate) fn emit_task_state_change_event(&self, mut event: TaskStateChangeEvent) {
         if let Some(tx) = &self.task_state_change_tx {
+            // The SOLE narration-source stamp seam: the write path built the
+            // event CRDT-path-independently (default `LiveBroadcast`); here —
+            // the one chokepoint every transition crosses — we overwrite it
+            // with `CatchUp` IFF a restore scope is active. The scoped marker
+            // is set by the RAII guard at the head of the sole restore
+            // chokepoint (`restore_collecting_resumed`), so EVERY write that
+            // restore performs (including `merge_task_state`'s cascade-fail
+            // recursion, which runs inside the same scope) is tagged CatchUp,
+            // while a genuine live-broadcast apply (outside any restore scope)
+            // keeps the default. No write-path signature carries the tag.
+            if self.in_catch_up_restore.get() {
+                event.source = crate::task_state_change::NarrationSource::CatchUp;
+            }
             // `send` on `UnboundedSender` only fails when the receiver is
             // dropped; silent drop matches the best-effort contract above.
             let _ = tx.send(event);

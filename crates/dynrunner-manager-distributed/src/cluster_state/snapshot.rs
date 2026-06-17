@@ -25,6 +25,50 @@ use super::types::{
     CapabilityEntry, CustomMsgState, PeerEntry, PeerState, PhaseTally, RespawnEventRecord,
 };
 
+/// RAII scope guard for the catch-up narration marker
+/// ([`ClusterState::in_catch_up_restore`]). Arms the marker on
+/// construction and clears it on drop (including an unwind), so the SOLE
+/// restore chokepoint [`ClusterState::restore_collecting_resumed`] tags
+/// EXACTLY the writes it performs as [`crate::task_state_change::
+/// NarrationSource::CatchUp`] — the merge seam stays CRDT-path-independent
+/// and only the emit chokepoint reads the marker.
+///
+/// Holds a raw `*const Cell<bool>` rather than a `&Cell<bool>`: the
+/// guard is created from `&self.in_catch_up_restore` at the head of a
+/// `&mut self` method whose body then re-borrows `self` mutably (the
+/// per-task `merge_task_state` join), so retaining the shared field borrow
+/// across the body would not type-check. The `&` is released the instant
+/// [`Self::arm`] returns (the guard keeps only the pointer); the `Cell`
+/// gives panic-free interior mutation through it.
+///
+/// SAFETY: `ClusterState` is single-threaded-owned (every coordinator runs
+/// it on a `current_thread` / `LocalSet` runtime — same invariant
+/// `digest_cache`'s `Cell` relies on), so there is no aliasing `&mut` to
+/// the `Cell` itself (interior mutability) and no cross-thread race. The
+/// guard is a stack local in `restore_collecting_resumed` and is dropped
+/// before that frame returns, so the pointer never outlives the `Cell` it
+/// points at.
+struct CatchUpRestoreGuard {
+    flag: *const std::cell::Cell<bool>,
+}
+
+impl CatchUpRestoreGuard {
+    /// Arm the marker (`set(true)`) and capture the cell pointer for the
+    /// drop-time clear. The borrow of `flag` ends when this returns.
+    fn arm(flag: &std::cell::Cell<bool>) -> Self {
+        flag.set(true);
+        Self { flag }
+    }
+}
+
+impl Drop for CatchUpRestoreGuard {
+    fn drop(&mut self) {
+        // SAFETY: see the type doc — single-threaded owner, the pointer is
+        // a stack-frame-scoped `&Cell` that outlives this guard.
+        unsafe { (*self.flag).set(false) };
+    }
+}
+
 /// Wire adapter for the TUPLE-keyed grow-only-MAX maps (F4
 /// `phase_event_tallies`, P3 `retry_passes_used`): the snapshot rides the
 /// wire as JSON (`DistributedMessage::ClusterSnapshot { snapshot_json }`),
@@ -692,6 +736,11 @@ impl<I: Identifier> ClusterState<I> {
             // (#546) — a pure runtime handle the restoring replica re-wires
             // on its own deployment side, never crosses the wire.
             authority_snapshot: _authority_snapshot,
+            // node-local: scoped restore marker (catch-up narration source
+            // tag). A pure node-local scope flag, never crosses the wire —
+            // the restoring replica arms it for the duration of its own
+            // restore via the RAII guard. Bound for the exhaustive guard.
+            in_catch_up_restore: _in_catch_up_restore,
         } = self;
         ClusterStateSnapshot {
             // Task-batch partition — empty in the head; the stream's
@@ -849,6 +898,18 @@ impl<I: Identifier> ClusterState<I> {
         snap: ClusterStateSnapshot<I>,
         resumed: &mut Vec<TaskInfo<I>>,
     ) {
+        // Catch-up narration scope (separate concern from the def-alloc
+        // floor below, placed cleanly alongside it at the same head): arm
+        // the scoped restore marker for the WHOLE duration of this restore,
+        // so every `set_task_state` write the merge performs below —
+        // including `merge_task_state`'s cascade-fail recursion, which runs
+        // inside this scope — is stamped `CatchUp` at the emit chokepoint
+        // (`emit_task_state_change_event`). The RAII guard clears the marker
+        // on drop (incl. an unwind), so a genuine live broadcast applied
+        // AFTER this restore returns is correctly stamped `LiveBroadcast`.
+        // The seam stays CRDT-path-independent; only the tag records the
+        // path. No write-path signature carries the marker.
+        let _catch_up_guard = CatchUpRestoreGuard::arm(&self.in_catch_up_restore);
         // The restore chokepoint: this entry (and the per-task
         // `merge_task_state` join + grow-max field merges it runs below) is
         // the only path a snapshot merge changes a digest-folded field, so

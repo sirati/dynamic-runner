@@ -19,4 +19,4 @@
 
 pub mod event;
 
-pub use event::{TaskStateChange, TaskStateChangeEvent, TaskTxnId};
+pub use event::{NarrationSource, TaskStateChange, TaskStateChangeEvent, TaskTxnId};

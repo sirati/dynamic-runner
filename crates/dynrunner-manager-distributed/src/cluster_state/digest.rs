@@ -282,6 +282,11 @@ impl<I: Identifier> ClusterState<I> {
             // carries no convergence signal — same classification as the
             // lifecycle dispatcher senders. Bound for the exhaustive guard.
             authority_snapshot: _authority_snapshot,
+            // node-local: scoped restore marker (catch-up narration source
+            // tag). A pure node-local scope flag carrying no convergence
+            // signal — same classification as the dispatcher senders. Bound
+            // for the exhaustive guard.
+            in_catch_up_restore: _in_catch_up_restore,
         } = self;
 
         // `peer_holdings` is steady-state best-effort metadata

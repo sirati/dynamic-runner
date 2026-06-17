@@ -81,7 +81,7 @@ use dynrunner_core::{IMPORTANT_TARGET, high_volume_target};
 const PER_TASK_TARGET: &str = high_volume_target(true);
 
 use crate::cluster_state::StateCounts;
-use crate::task_state_change::{TaskStateChange, TaskStateChangeEvent};
+use crate::task_state_change::{NarrationSource, TaskStateChange, TaskStateChangeEvent};
 
 /// Per-task operator narrator. Holds only the baseline-vs-live latch
 /// (narration bookkeeping, NOT replicated CRDT): live narration is armed
@@ -94,6 +94,17 @@ pub(crate) struct ObserverTaskNarrator {
     /// narration is gated on it so a stray live event drained before the
     /// baseline summary cannot pre-empt the ordering.
     baseline_emitted: bool,
+    /// The IN-PROGRESS catch-up batch accumulator: how many
+    /// snapshot-restore-sourced ([`NarrationSource::CatchUp`]) transitions
+    /// have drained since the last flush, and the DISTINCT tasks they
+    /// touched. A relocated / late-join observer mirroring its whole
+    /// InFlight partition over an in-loop bootstrap restore folds into ONE
+    /// summary line on the batch's terminal package, NEVER N per-task
+    /// "assigned" lines — the same fold [`Self::narrate_baseline`] applies
+    /// to the PRE-loop bootstrap, extended to the IN-loop restore the
+    /// CRDT-path-independent merge seam would otherwise narrate as live.
+    catch_up_transitions: usize,
+    catch_up_tasks: std::collections::HashSet<String>,
 }
 
 impl ObserverTaskNarrator {
@@ -151,6 +162,63 @@ impl ObserverTaskNarrator {
             counts.setup_succeeded,
             counts.secondary_affine,
         );
+    }
+
+    /// Route ONE drained transition by its [`NarrationSource`] — the single
+    /// owner of the live-vs-catch-up narration decision (#636-followup).
+    ///
+    /// - [`NarrationSource::LiveBroadcast`] → narrate INDIVIDUALLY via
+    ///   [`Self::narrate_live`] (one operator line per transition).
+    /// - [`NarrationSource::CatchUp`] → accumulate into the in-progress
+    ///   batch (count + distinct task), emitting NOTHING now; the caller
+    ///   emits the ONE summary line via [`Self::flush_catch_up`] when the
+    ///   restore batch's terminal package is fully drained.
+    ///
+    /// Returns whether an operator line was emitted NOW (only the
+    /// `LiveBroadcast` path can) — the caller's wake-stream piggyback seam,
+    /// exactly like [`Self::narrate_live`].
+    pub(crate) fn observe(&mut self, event: &TaskStateChangeEvent) -> bool {
+        match event.source {
+            NarrationSource::LiveBroadcast => self.narrate_live(event),
+            NarrationSource::CatchUp => {
+                self.catch_up_transitions += 1;
+                self.catch_up_tasks.insert(event.task_id.clone());
+                false
+            }
+        }
+    }
+
+    /// Emit the ONE-LINE summary for the just-completed catch-up batch and
+    /// RESET the accumulator. Called by the observer when a snapshot-stream
+    /// batch's terminal (`done`) package is processed AND the narration
+    /// channel has drained (so every `CatchUp` transition the restore
+    /// enqueued is already counted — the ordering the coordinator's
+    /// flush-on-(pending && channel-empty) gate enforces).
+    ///
+    /// An EMPTY batch (a `done` over a restore that won no transitions — a
+    /// converged re-stream) emits NOTHING and resets, so a quiescent
+    /// observer stays silent. Mirrors `narrate_baseline`'s empty-baseline
+    /// no-op. Returns whether a line was emitted (the wake-stream host seam).
+    pub(crate) fn flush_catch_up(&mut self) -> bool {
+        let transitions = self.catch_up_transitions;
+        let tasks = self.catch_up_tasks.len();
+        self.catch_up_transitions = 0;
+        self.catch_up_tasks.clear();
+        if transitions == 0 {
+            return false;
+        }
+        // Per-RUN-scale (one line per catch-up batch, not per task), so it
+        // rides IMPORTANT_TARGET like the baseline summary — the operator
+        // sees the late-join / recovery catch-up as one wake line, never
+        // the N-task InFlight-partition flood the path-independent merge
+        // seam would otherwise narrate as live.
+        tracing::info!(
+            target: IMPORTANT_TARGET,
+            catch_up_transitions = transitions,
+            catch_up_tasks = tasks,
+            "observer caught up: {transitions} transitions over {tasks} tasks (from snapshot)",
+        );
+        true
     }
 
     /// Narrate ONE live task transition. Emits a single line at the

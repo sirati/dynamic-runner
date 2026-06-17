@@ -347,6 +347,24 @@ where
     /// operator narrator on every path); primary / secondary install
     /// no such sender, so this channel is observer-only.
     custom_message_outcome_rx: Option<mpsc::UnboundedReceiver<CustomMessageOutcomeEvent>>,
+    /// Catch-up narration flush latch (#636-followup): set by
+    /// [`Self::on_snapshot_stream_package`] when a snapshot-stream batch's
+    /// TERMINAL (`done`) package is processed, cleared by the narration arm
+    /// once it has flushed the catch-up summary.
+    ///
+    /// Why a latch and not an immediate flush on `done`: `restore` enqueues
+    /// the batch's `CatchUp` transitions onto the (loop-local)
+    /// `task_state_change_rx` and returns; those events are NOT yet drained
+    /// when the `done` package is processed (the narration `select!` arm
+    /// hasn't run). The narration arm drains them, accumulates the
+    /// per-batch count, and flushes the ONE summary line ONLY once this
+    /// latch is set AND the channel has gone empty — so every `CatchUp`
+    /// transition the final package enqueued is counted before the summary
+    /// fires. A node-local narration-bookkeeping bit (NOT replicated /
+    /// snapshotted), the dispatch-chain→loop carrier for the terminal-package
+    /// signal `on_snapshot_stream_package` cannot hand the loop-local
+    /// narrator directly.
+    catch_up_flush_pending: bool,
     /// AE-3 recovery-cadence state: the LAST-SEEN `(declared-observer bit,
     /// [`StateDigest`])` of each peer that has broadcast one, keyed by
     /// sender-id. The timer-driven recovery arm intersects this with the
@@ -688,6 +706,8 @@ where
             task_completed_rx: Some(task_rx),
             task_state_change_rx: Some(state_change_rx),
             custom_message_outcome_rx: Some(custom_outcome_rx),
+            // No catch-up batch in flight at construction.
+            catch_up_flush_pending: false,
             peer_digests: std::collections::HashMap::new(),
             snapshot_streams,
             settled_spill,
@@ -820,6 +840,8 @@ where
             task_completed_rx: Some(task_rx),
             task_state_change_rx: Some(state_change_rx),
             custom_message_outcome_rx: Some(custom_outcome_rx),
+            // No catch-up batch in flight at construction.
+            catch_up_flush_pending: false,
             peer_digests: std::collections::HashMap::new(),
             snapshot_streams,
             settled_spill,
@@ -1724,16 +1746,39 @@ where
                     Some(outcome) = respawn_exec_rx.recv() => {
                         self.on_respawn_exec_complete(outcome).await;
                     }
-                    // #520 per-task narration arm: one LIVE transition the
-                    // CRDT merge applied (live broadcast OR snapshot restore
-                    // — path-independent) → one operator wake-line at the
-                    // spec-fixed level. Never `None`: `self.cluster_state`
-                    // holds the sender for the coordinator's lifetime.
-                    // Cancel-safe: a single mpsc recv. A narrated transition
+                    // #520 / #636-followup per-task narration arm: each
+                    // drained transition is ROUTED by its `NarrationSource`
+                    // (the SOLE owner of the live-vs-catch-up decision is the
+                    // narrator's `observe`). A LIVE broadcast → one operator
+                    // wake-line; a snapshot-restore CATCH-UP transition →
+                    // folded into the in-progress batch (silent now). Never
+                    // `None`: `self.cluster_state` holds the sender for the
+                    // coordinator's lifetime. Cancel-safe: a single mpsc recv
+                    // (the synchronous greedy try_recv drain below is also
+                    // cancel-safe — it never awaits). A narrated transition
                     // is a wake-stream HOST — flush the parked reconnection
                     // note right after, exactly like `RunNarrator::observe`.
                     Some(change) = task_state_change_rx.recv() => {
-                        if task_narrator.narrate_live(&change) {
+                        let mut hosted = task_narrator.observe(&change);
+                        // Greedily drain every transition the restore (or a
+                        // burst of live broadcasts) already enqueued, so the
+                        // channel is EMPTY when the catch-up flush gate below
+                        // checks it — guaranteeing the terminal package's
+                        // whole `CatchUp` batch is counted before the summary.
+                        while let Ok(more) = task_state_change_rx.try_recv() {
+                            hosted |= task_narrator.observe(&more);
+                        }
+                        // Catch-up summary flush gate: a snapshot batch's
+                        // `done` armed the latch; now that the channel has
+                        // drained, the batch is complete — emit the ONE
+                        // summary line (a zero-count batch emits nothing) and
+                        // disarm. The live `observe` lines above already
+                        // narrated individually.
+                        if self.catch_up_flush_pending {
+                            self.catch_up_flush_pending = false;
+                            hosted |= task_narrator.flush_catch_up();
+                        }
+                        if hosted {
                             self.wake_note.flush_after_host();
                         }
                     }
@@ -2633,6 +2678,14 @@ where
         // for a bootstrap-stream `done`.
         if done {
             self.pull_coordinator.on_pull_done(stream_id);
+            // Arm the catch-up summary flush: the restore above enqueued
+            // this batch's `CatchUp` transitions onto the narration channel.
+            // The narration arm folds them and emits ONE summary line once
+            // it has drained the channel (the flush-on-(pending &&
+            // channel-empty) gate), so the final package's events are all
+            // counted first. An empty / converged re-stream flushes a
+            // zero-count batch → emits nothing.
+            self.catch_up_flush_pending = true;
         }
     }
 

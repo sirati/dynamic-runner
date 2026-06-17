@@ -816,6 +816,222 @@ async fn observer_recovers_from_snapshot_reply() {
     .expect("the recovery observer must terminate");
 }
 
+/// #636-followup: a relocated / late-join observer mirroring its whole
+/// InFlight partition over an IN-LOOP bootstrap restore narrates ONE
+/// catch-up SUMMARY line, NOT N per-task "assigned" lines — then a genuine
+/// LIVE assignment narrates individually. This replays the production
+/// trace shape (a `task_ranges: []` full-ledger bootstrap whose reply
+/// arrives AFTER `narrate_baseline` armed, restored live through the
+/// path-INDEPENDENT merge seam). The fix's RAII catch-up marker stamps the
+/// restore-sourced transitions `CatchUp`; the narration arm folds them and
+/// flushes one summary on the batch's terminal (`done`) package, while the
+/// live broadcast stays `LiveBroadcast` and narrates per-event.
+///
+/// Captured across the live `run()` via the always-interest [`TargetCapture`]
+/// (safe to hold across `.await` on a current-thread runtime — unlike the
+/// synchronous-only `capture_important`), on BOTH the per-RUN importance
+/// target (the catch-up summary) and the per-TASK observer-task target (the
+/// individual assign lines), so the test asserts the ROUTING split.
+#[tokio::test(flavor = "current_thread")]
+async fn relocated_observer_folds_inloop_catch_up_into_one_summary() {
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    // N InFlight tasks the relocated observer learns ONLY via the in-loop
+    // bootstrap restore (its own ledger starts empty).
+    const N: usize = 5;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Donor: N tasks ASSIGNED (InFlight), never completed — the
+                // bootstrap snapshot's InFlight partition.
+                let snapshot_frames = {
+                    let mut donor = ClusterState::<TestId>::new();
+                    donor.apply(ClusterMutation::PrimaryChanged {
+                        new: "promoted-sec".into(),
+                        epoch: 2,
+                        reason: PrimaryChangeReason::Election,
+                    });
+                    for i in 0..N {
+                        let t = task("work", &format!("inflight-{i}"), &[]);
+                        add(&mut donor, &t);
+                        donor.apply(ClusterMutation::TaskAssigned {
+                            hash: format!("inflight-{i}"),
+                            secondary: "sec-0".into(),
+                            worker: 1,
+                            version: Default::default(),
+                            attempt: 0,
+                        });
+                    }
+                    crate::snapshot_stream::stream_frames_for_test(
+                        &donor,
+                        "promoted-sec",
+                        "obs/0",
+                    )
+                };
+                // At least one task package must carry the `done` terminal.
+                assert!(
+                    snapshot_frames.iter().any(|f| matches!(
+                        f,
+                        DistributedMessage::SnapshotStreamPackage { done: true, .. }
+                    )),
+                    "the donor stream must end with a terminal package"
+                );
+
+                let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+                let (to_primary_tx, _to_primary_rx) = mpsc::unbounded_channel();
+                let mut outgoing = HashMap::new();
+                outgoing.insert("promoted-sec".to_string(), to_primary_tx);
+                let transport = ChannelPeerTransport::from_raw_channels(
+                    "obs".into(),
+                    outgoing,
+                    inbound_rx,
+                );
+
+                let mut cs = ClusterState::<TestId>::new();
+                cs.apply(ClusterMutation::PrimaryChanged {
+                    new: "promoted-sec".into(),
+                    epoch: 2,
+                    reason: PrimaryChangeReason::Election,
+                });
+
+                // Pre-feed the bootstrap restore (the catch-up batch), then a
+                // genuine LIVE assignment of a NEW task (must narrate
+                // individually).
+                for frame in snapshot_frames {
+                    inbound_tx.send(frame).unwrap();
+                }
+                inbound_tx
+                    .send(DistributedMessage::ClusterMutation {
+                        target: None,
+                        sender_id: "promoted-sec".into(),
+                        timestamp: 0.0,
+                        mutations: vec![
+                            ClusterMutation::TaskAdded {
+                                hash: "live-task".into(),
+                                task: task("work", "live-task", &[]),
+                                def_id: None,
+                            },
+                            ClusterMutation::TaskAssigned {
+                                hash: "live-task".into(),
+                                secondary: "sec-0".into(),
+                                worker: 2,
+                                version: Default::default(),
+                                attempt: 0,
+                            },
+                        ],
+                    })
+                    .unwrap();
+
+                // Terminal AFTER a short delay so the narration arm has
+                // drained + flushed the catch-up batch and narrated the live
+                // assign before the loop exits on RunComplete.
+                let inbound_terminal = inbound_tx.clone();
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    inbound_terminal
+                        .send(DistributedMessage::ClusterMutation {
+                            target: None,
+                            sender_id: "promoted-sec".into(),
+                            timestamp: 0.0,
+                            mutations: vec![ClusterMutation::RunComplete {
+                                counts: Default::default(),
+                            }],
+                        })
+                        .unwrap();
+                });
+
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+                let mut observer =
+                    ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
+
+                // Install the always-interest captures across the live run.
+                let important =
+                    crate::test_capture::TargetCapture::for_target(dynrunner_core::IMPORTANT_TARGET);
+                let per_task = crate::test_capture::TargetCapture::for_target(
+                    dynrunner_core::OBSERVER_TASK_TARGET,
+                );
+                let subscriber = Registry::default()
+                    .with(important.clone())
+                    .with(per_task.clone());
+                let terminal = {
+                    let _guard = tracing::subscriber::set_default(subscriber);
+                    observer.run().await.expect("Ok on run_complete")
+                };
+                assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+
+                let summaries: Vec<_> = important
+                    .events()
+                    .into_iter()
+                    .filter(|e| e.event.message.contains("observer caught up"))
+                    .collect();
+                let per_task_assigns: Vec<_> = per_task
+                    .events()
+                    .into_iter()
+                    .filter(|e| e.event.message.contains("assigned to"))
+                    .collect();
+
+                // The relocated-observer shape: `narrate_baseline` ran at loop
+                // entry over an EMPTY channel (the bootstrap reply had not yet
+                // arrived) → NO baseline summary line (the empty-baseline
+                // no-op). The in-loop restore is what carries the partition.
+                assert!(
+                    !important
+                        .events()
+                        .iter()
+                        .any(|e| e.event.message.contains("mirroring baseline")),
+                    "an empty pre-loop baseline emits no summary: important={:?}",
+                    important.events()
+                );
+
+                // GREEN assertions: the N InFlight catch-up transitions fold
+                // into EXACTLY ONE summary naming N, and ONLY the single LIVE
+                // assignment narrates individually (NOT the N restored ones).
+                assert_eq!(
+                    summaries.len(),
+                    1,
+                    "exactly one catch-up summary line: important={:?}",
+                    important.events()
+                );
+                assert_eq!(
+                    summaries[0].event.fields.get("catch_up_tasks").map(String::as_str),
+                    Some(N.to_string().as_str()),
+                    "the summary names N distinct catch-up tasks: {:?}",
+                    summaries[0]
+                );
+                assert_eq!(
+                    summaries[0]
+                        .event
+                        .fields
+                        .get("catch_up_transitions")
+                        .map(String::as_str),
+                    Some(N.to_string().as_str()),
+                    "the summary names N catch-up transitions: {:?}",
+                    summaries[0]
+                );
+                assert_eq!(
+                    per_task_assigns.len(),
+                    1,
+                    "ONLY the live assignment narrates individually — the N \
+                     restored InFlight tasks must NOT (the pre-fix RED state \
+                     emits {N} 'assigned' lines here): per_task={:?}",
+                    per_task.events()
+                );
+                assert!(
+                    per_task_assigns[0].event.message.contains("live-task"),
+                    "the one individual line is the LIVE task: {:?}",
+                    per_task_assigns[0]
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("the catch-up-fold observer must terminate");
+}
+
 /// BUG-1: `run_aborted` ⇒ non-zero exit (Aborted terminal), checked
 /// BEFORE `run_complete` so an aborted run never exits as completed.
 #[tokio::test(flavor = "current_thread")]
