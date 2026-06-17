@@ -82,6 +82,17 @@ pub struct Router<I: Identifier> {
     /// window (naming the suppressed count) instead of one WARN per flip
     /// / per message. See [`super::log_rate`].
     pub(super) warn_gate: super::log_rate::RelayWarnGate,
+    /// Optional opaque filter applied to every package the Router is
+    /// about to DELIVER to the local consumer (the would-be
+    /// [`InboundOutcome::Deliver`] seam). `None` → pure Accept-all
+    /// pass-through. The Router knows nothing of what the closure
+    /// decides — it applies the [`super::Verdict`] mechanically: Drop
+    /// discards, Bounce re-sends the carried package to the inbound
+    /// origin via the existing send path, Accept delivers onward.
+    /// Stored on the Router (which the transport task owns for its
+    /// whole lifetime) so the filter PERSISTS after whatever installed
+    /// it is gone. See [`super::filter`].
+    pub(super) inbound_filter: Option<super::filter::InboundFilter<I>>,
 }
 
 impl<I: Identifier> Router<I> {
@@ -94,7 +105,36 @@ impl<I: Identifier> Router<I> {
             failed_forwarders: HashMap::new(),
             route_state: HashMap::new(),
             warn_gate: super::log_rate::RelayWarnGate::default(),
+            inbound_filter: None,
         }
+    }
+
+    /// Install an opaque filter applied to each package the Router is
+    /// about to deliver to the local consumer. Replaces any previously
+    /// installed filter. With no filter installed the seam is pure
+    /// Accept-all pass-through.
+    ///
+    /// The closure takes ownership of the package and returns a
+    /// [`super::Verdict`]:
+    ///   - [`Verdict::Drop`](super::Verdict::Drop) — discard, do not
+    ///     deliver.
+    ///   - [`Verdict::Bounce`](super::Verdict::Bounce) — do not
+    ///     deliver; send the carried package back to the ORIGINAL
+    ///     sender of the inbound package via the Router's existing send
+    ///     path (direct-or-relay).
+    ///   - [`Verdict::Accept`](super::Verdict::Accept) — deliver the
+    ///     carried package onward (identity in the common case).
+    ///
+    /// This is a generic mesh primitive: the Router has zero knowledge
+    /// of WHAT the closure decides or WHY. A caller wanting to bounce
+    /// (say) primary-addressed packages with a redirect constructs that
+    /// redirect package itself and returns it in `Bounce` — building
+    /// the bounce payload is the caller's concern, never the mesh's.
+    pub fn install_filter<F>(&mut self, filter: F)
+    where
+        F: FnMut(DistributedMessage<I>) -> super::filter::Verdict<I> + Send + 'static,
+    {
+        self.inbound_filter = Some(Box::new(filter));
     }
 
     /// The node id this Router routes AS — the `self_id` it was
@@ -289,12 +329,10 @@ impl<I: Identifier> Router<I> {
                     // the same reason.
                     let _ = path;
                     let redial_target = self.observe_relay_recv(&sender_id, clocks.now);
-                    return InboundOutcome::Deliver {
-                        // `inner` is already `Box<DistributedMessage<I>>`;
-                        // forward the existing allocation.
-                        msg: inner,
-                        redial_target,
-                    };
+                    // `inner` is already `Box<DistributedMessage<I>>`;
+                    // forward the existing allocation through the filter
+                    // seam.
+                    return self.deliver_filtered(*inner, redial_target, connections, clocks);
                 }
                 let blacklist = blacklist_for(&self.failed_forwarders, &target_id, clocks.now);
                 let decision = forward_step(
@@ -339,10 +377,7 @@ impl<I: Identifier> Router<I> {
                     redial_target: None,
                 }
             }
-            other => InboundOutcome::Deliver {
-                msg: Box::new(other),
-                redial_target: None,
-            },
+            other => self.deliver_filtered(other, None, connections, clocks),
         }
     }
 
@@ -374,12 +409,9 @@ impl<I: Identifier> Router<I> {
                 ..
             } if target_id == self.self_id => {
                 let redial_target = self.observe_relay_recv(&sender_id, clocks.now);
-                InboundOutcome::Deliver {
-                    // `inner` is already `Box<DistributedMessage<I>>`;
-                    // forward the existing allocation.
-                    msg: inner,
-                    redial_target,
-                }
+                // `inner` is already `Box<DistributedMessage<I>>`;
+                // forward the existing allocation through the filter seam.
+                self.deliver_filtered_sync(*inner, redial_target, clocks)
             }
             DistributedMessage::Relay { target_id, .. } => {
                 if let Some(suppressed) = self.warn_gate.admit(
@@ -401,9 +433,120 @@ impl<I: Identifier> Router<I> {
             DistributedMessage::RelayBackoff { .. } => InboundOutcome::Handled {
                 redial_target: None,
             },
-            other => InboundOutcome::Deliver {
-                msg: Box::new(other),
-                redial_target: None,
+            other => self.deliver_filtered_sync(other, None, clocks),
+        }
+    }
+
+    /// Apply the installed inbound filter to a package the Router has
+    /// decided to deliver, and turn the resulting [`super::Verdict`]
+    /// into the final [`InboundOutcome`] — the single delivery seam
+    /// shared by every would-be-`Deliver` site in [`Self::process_inbound`].
+    ///
+    /// No filter installed → pass-through `Deliver` (Accept-all). On
+    /// `Bounce` the carried package is returned to the inbound
+    /// `origin` (the original sender of the package we received) via
+    /// the Router's existing [`Self::send_to_peer`] path, so direct
+    /// or relay routing is reused — the mesh invents no new send.
+    ///
+    /// The filter is `take`n out for the duration of the call so the
+    /// `&mut self` borrow needed by `send_to_peer` does not collide
+    /// with the `&mut` borrow of the closure, then restored. A filter
+    /// is single-owner (one in-flight inbound dispatch per Router, see
+    /// the concurrency note) so the take/restore window is never
+    /// observed by another caller, and a filter that itself calls back
+    /// into this Router is structurally impossible (it only owns the
+    /// package, not the Router).
+    fn deliver_filtered<C: OutboundChannel<I>>(
+        &mut self,
+        pkg: DistributedMessage<I>,
+        redial_target: Option<String>,
+        connections: &mut HashMap<String, C>,
+        clocks: Clocks,
+    ) -> InboundOutcome<I> {
+        let mut filter = match self.inbound_filter.take() {
+            Some(f) => f,
+            None => {
+                return InboundOutcome::Deliver {
+                    msg: Box::new(pkg),
+                    redial_target,
+                };
+            }
+        };
+        // Capture the inbound package's origin BEFORE the filter takes
+        // ownership: a `Bounce` is addressed back to whoever sent us
+        // THIS package, not derived from the (caller-built) reply whose
+        // own `sender_id` is this node.
+        let origin = pkg.sender_id().to_string();
+        let verdict = filter(pkg);
+        self.inbound_filter = Some(filter);
+        match verdict {
+            super::filter::Verdict::Drop => InboundOutcome::Handled { redial_target },
+            super::filter::Verdict::Bounce(reply) => {
+                // Reuse the existing send path: address the bounce back
+                // to the original sender of the package we received.
+                if let Err(e) = self.send_to_peer(&origin, reply, connections, clocks) {
+                    tracing::warn!(
+                        target: RELAY_LOG_TARGET,
+                        target_peer = %origin,
+                        "inbound-filter bounce send failed: {e}"
+                    );
+                }
+                InboundOutcome::Handled { redial_target }
+            }
+            super::filter::Verdict::Accept(delivered) => InboundOutcome::Deliver {
+                msg: Box::new(delivered),
+                redial_target,
+            },
+        }
+    }
+
+    /// Sync-path counterpart of [`Self::deliver_filtered`]. The sync
+    /// dispatch path holds no `connections` map (it is the try-recv
+    /// fast path that, by the same constraint, cannot forward relays —
+    /// see [`Self::process_inbound_sync`]), so a `Bounce` cannot be
+    /// sent here. Drop and Accept behave identically to the async
+    /// path; a `Bounce` returned on the sync path is dropped (not
+    /// delivered, not sent) with a rate-limited warn directing the
+    /// consumer to drive recv via the async `recv_peer` path if it
+    /// needs bounce.
+    fn deliver_filtered_sync(
+        &mut self,
+        pkg: DistributedMessage<I>,
+        redial_target: Option<String>,
+        clocks: Clocks,
+    ) -> InboundOutcome<I> {
+        let mut filter = match self.inbound_filter.take() {
+            Some(f) => f,
+            None => {
+                return InboundOutcome::Deliver {
+                    msg: Box::new(pkg),
+                    redial_target,
+                };
+            }
+        };
+        let origin = pkg.sender_id().to_string();
+        let verdict = filter(pkg);
+        self.inbound_filter = Some(filter);
+        match verdict {
+            super::filter::Verdict::Drop => InboundOutcome::Handled { redial_target },
+            super::filter::Verdict::Bounce(_reply) => {
+                if let Some(suppressed) = self.warn_gate.admit(
+                    super::log_rate::RelayWarnKind::SyncDropForward,
+                    &origin,
+                    clocks.now,
+                ) {
+                    tracing::warn!(
+                        target: RELAY_LOG_TARGET,
+                        target_peer = %origin,
+                        suppressed_repeats = suppressed,
+                        "try_recv path dropped inbound-filter bounce: cannot send synchronously, use recv_peer"
+                    );
+                }
+                InboundOutcome::Handled { redial_target }
+            }
+            super::filter::Verdict::Accept(delivered) => InboundOutcome::Deliver {
+                msg: Box::new(delivered),
+                redial_target,
             },
         }
     }
