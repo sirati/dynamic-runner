@@ -135,6 +135,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     self.workers[idx].resource_budgets = available_res.clone();
                 }
 
+                // Per-secondary-FIRST affine source (ADDITIVE): pop this
+                // worker's secondary's affine queue BEFORE the global-pool
+                // decision, mirroring the proactive `dispatch_to_idle_workers`
+                // path so the per-secondary import→work ordering holds on the
+                // REACTIVE request path too (a worker requesting work runs its
+                // secondary's queued import THEN its dependent build, in order).
+                // A committed affine dispatch satisfies this request. When the
+                // queue is empty this is a no-op and the unchanged global path
+                // below runs (baseline-preserved).
+                if self.try_affine_pop_for_worker(idx).await {
+                    return Ok(());
+                }
+
                 // #519 dispatch-bias: a single `TaskRequest` serves ONE
                 // worker = ONE dispatch decision, so the per-decision
                 // primitive runs exactly once here (it folds the decision

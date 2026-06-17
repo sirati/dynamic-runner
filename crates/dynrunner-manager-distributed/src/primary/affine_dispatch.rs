@@ -12,53 +12,47 @@
 //! ([`PrimaryCoordinator::apply_and_broadcast_cluster_mutations`], where the
 //! generation is stamped):
 //!
-//!   * **placement trigger** ([`Self::place_dependency_satisfied_affine_tasks`])
-//!     — when an affine-dep WORK task is otherwise ready-to-schedule (its
-//!     non-affine deps satisfied AND all its affine prereqs are themselves
-//!     ready), select a secondary by rank ([`PrimaryCoordinator::affine_placement_for`]
-//!     + [`super::affine_scheduler::AffineScheduler::select_secondary`]) and
-//!     [`super::affine_scheduler::AffineScheduler::place`] the work task there
-//!     after its still-not-done affine prereqs, emitting the resulting
-//!     `SecondaryAffineQueued` mutations. The affine prereq is then taken OUT
-//!     of the global pool (it is now owned by the per-secondary queue, exactly
-//!     as the removed gate-resolver took a ready gate by hash). Detection
-//!     REUSES the pool's already-computed readiness (a `SecondaryAffine` task
-//!     in a bucket = its deps are met) — it never re-decides dep resolution.
-//!   * **per-secondary-first pop** ([`Self::try_affine_dispatch_for_worker`])
-//!     — when assigning to a worker on secondary `S`, pop `S`'s per-secondary
-//!     queue FIRST and dispatch the popped unit through the shared
-//!     [`PrimaryCoordinator::dispatch_one_assignment`] seam, BEFORE the global
-//!     pool view. The popped unit's `TaskInfo` is reconstructed by hash
-//!     ([`crate::cluster_state::ClusterState::task_info_for_hash`]) — here it
-//!     is explicitly dispatched from the per-secondary queue (the design's
-//!     "secondary treats it like any other task"), so the global-queue
-//!     `is_worker_assignable` gate that hid the affine def does not apply.
-//!   * **idle-steal** ([`Self::try_affine_dispatch_for_worker`], the empty-pool
-//!     branch) — when BOTH the global pool view AND `S`'s queue are empty at
-//!     assignment time, [`super::affine_scheduler::AffineScheduler::steal_for`]
-//!     a whole schedulable unit from the longest-queue donor, emit the
-//!     `SecondaryAffineUnqueued`/re-`Queued` mutations, and dispatch the
-//!     stolen unit.
-//!   * **failover rebuild** is the hydrate seam
-//!     ([`PrimaryCoordinator::hydrate_from_cluster_state`] calls
-//!     [`super::affine_scheduler::AffineScheduler::clear`] +
-//!     `rebuild`), not here.
+//! - PLACEMENT trigger ([`Self::place_dependency_satisfied_affine_tasks`]):
+//!   when an affine-dep WORK task is otherwise ready-to-schedule (its non-affine
+//!   deps satisfied AND all its affine prereqs themselves ready), select a
+//!   secondary by rank ([`PrimaryCoordinator::affine_placement_for`] +
+//!   `AffineScheduler::select_secondary`) and `AffineScheduler::place` the work
+//!   task there after its still-not-done affine prereqs, emitting the resulting
+//!   `SecondaryAffineQueued` mutations. Detection REUSES the pool's
+//!   already-computed readiness (a `SecondaryAffine` task in a bucket = its deps
+//!   are met) — it never re-decides dep resolution.
+//! - PER-SECONDARY-FIRST pop ([`Self::try_affine_pop_for_worker`]): when
+//!   assigning to a worker on secondary `S`, pop `S`'s per-secondary queue FIRST
+//!   and dispatch the popped unit through the shared
+//!   [`PrimaryCoordinator::dispatch_one_assignment`] seam, BEFORE the global
+//!   pool view. The popped unit's `TaskInfo` is reconstructed by hash
+//!   ([`crate::cluster_state::ClusterState::task_info_for_hash`]); a popped WORK
+//!   unit is gated on EVERY affine dep being `Done` on `S` (the bitvector is the
+//!   readiness authority) and re-derived if stranded without its import.
+//! - IDLE-STEAL ([`Self::try_affine_steal_for_worker`]): when BOTH the global
+//!   pool view AND `S`'s queue are empty at assignment time,
+//!   `AffineScheduler::steal_for` a whole schedulable unit from the
+//!   longest-queue donor, emit the `SecondaryAffineUnqueued`/re-`Queued`
+//!   mutations, and dispatch the stolen unit.
+//! - FAILOVER rebuild ([`Self::rebuild_affine_schedule`], called from
+//!   [`PrimaryCoordinator::hydrate_from_cluster_state`]): discard the local
+//!   queues and re-derive them from the inherited bitvector + work pool.
 //!
 //! ## Module boundary (CLAUDE.md design-first)
-//!   * Owner: the primary. The seams it crosses are (1) the worker-management
-//!     reaction's `TasksAdded` branch (placement, the same seam the removed
-//!     gate-resolver used) and (2) the per-worker assignment sites
-//!     (`dispatch_to_idle_workers` + `handle_task_request`), which call the
-//!     ADDITIVE per-secondary-first pop BEFORE their unchanged global-pool
-//!     decision.
-//!   * The pure policy is consumed, never reimplemented: ranking / append /
-//!     pop / steal / rebuild all live in `affine_scheduler`; the cell state +
-//!     merge live in `cluster_state::affine_state`; this module only wires the
-//!     two together through the typed seams.
+//!
+//! Owner: the primary. The seams it crosses are (1) the worker-management
+//! reaction's `TasksAdded` branch (placement, the same seam the removed
+//! gate-resolver used) and (2) the per-worker assignment sites
+//! (`dispatch_to_idle_workers` + `handle_task_request`), which call the ADDITIVE
+//! per-secondary-first pop BEFORE their unchanged global-pool decision. The pure
+//! policy is consumed, never reimplemented: ranking / append / pop / steal /
+//! rebuild all live in `affine_scheduler`; the cell state + merge live in
+//! `cluster_state::affine_state`; this module only wires the two together.
 
 use std::collections::HashSet;
 
 use dynrunner_core::{Identifier, TaskInfo};
+use dynrunner_protocol_primary_secondary::AffineCell;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::affine_scheduler::QueuedUnit;
@@ -254,6 +248,52 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             return false;
         };
         let phase = task.phase_id.clone();
+
+        // PER-SECONDARY AFFINE-READINESS GATE (the design's HINT-property safety
+        // net, Model B). A WORK unit may have been STRANDED on this secondary
+        // WITHOUT its import — e.g. an idle-steal moved the work task here after
+        // its import was already popped+dispatched elsewhere (the "partial
+        // work-stealing leaves a task without its affine deps" case). Dispatching
+        // it now would run the build on a secondary that never imported — the
+        // exact per-secondary-correctness violation the redesign prevents. So
+        // before dispatching a work unit, verify EVERY affine dep is `Done` on
+        // THIS secondary (the bitvector is the authority — never a global
+        // terminal). If any is not, RE-DERIVE: re-place the not-done prereqs
+        // ahead of the work task on THIS secondary's queue (the design's "the
+        // same dependency check re-derives and re-queues the missing affine
+        // deps"), then return — the re-queued import runs first on the next pop,
+        // and the work follows it. No special detection beyond this cell read.
+        if is_work {
+            let placement = self.affine_placement_for(&task);
+            let any_not_done = placement.affine_deps.iter().any(|(aid, _)| {
+                self.cluster_state.affine_state(secondary, *aid) != AffineCell::Done
+            });
+            if any_not_done {
+                // The popped work unit is stranded here without (all of) its
+                // import. RE-DERIVE: re-place its still-not-done prereqs + the
+                // work task onto THIS secondary's queue via the SAME `place`
+                // procedure (the design's "the same dependency check re-derives
+                // and re-queues the missing affine deps"). `place` appends
+                // `[not-done prereqs…, work]` to the tail; the popped (orphaned)
+                // copy is DISCARDED (not requeued), so the queue now carries the
+                // properly-ordered import→work prefix and the next pop runs the
+                // import first. No special detection beyond this per-secondary
+                // cell read — the bitvector is the readiness authority, never a
+                // global terminal.
+                let mutations = self.affine_scheduler.place::<I, _>(
+                    secondary,
+                    &placement,
+                    |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
+                );
+                if !mutations.is_empty() {
+                    self.apply_and_broadcast_cluster_mutations(mutations).await;
+                }
+                // Re-nudge the recheck so the freshly-queued import is popped.
+                self.cluster_state
+                    .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
+                return false;
+            }
+        }
 
         // POOL ACCOUNTING (Model B). A WORK unit is a pool item (the
         // phase-drain token): take it OUT of its bucket + `mark_in_flight` so

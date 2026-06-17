@@ -104,7 +104,7 @@ pub struct PendingPool<I: Identifier> {
     /// exclusion set. A `SecondaryAffine` task is the per-secondary toolchain
     /// IMPORT primitive: it runs PER-SECONDARY (each node imports locally) and
     /// its readiness is tracked by the primary's per-secondary affine BITVECTOR
-    /// + the per-secondary queue order, NOT a single global terminal. So an
+    /// plus the per-secondary queue order, NOT a single global terminal. So an
     /// affine dep must NOT block its dependent work task in this global pool
     /// (no global terminal satisfies it) — the work task is POOL-READY when its
     /// NON-affine deps are satisfied, and is then routed PER-SECONDARY by the
@@ -112,17 +112,18 @@ pub struct PendingPool<I: Identifier> {
     /// set (populated by [`PendingPool::mark_affine_prereqs`] from the primary's
     /// `cluster_state` def kinds at spawn + hydrate, BEFORE the referencing
     /// `extend`):
-    ///   * [`PendingPool::commit_item`] EXCLUDES an affine dep from a work
+    ///   - [`PendingPool::commit_item`] EXCLUDES an affine dep from a work
     ///     task's unresolved blocking set (so the work task is ready on its
     ///     non-affine deps alone, never blocked-forever on an affine dep with no
     ///     global terminal); and
-    ///   * the worker dispatch view ([`PendingPool::dispatch_eligible`])
+    ///   - the worker dispatch view ([`PendingPool::dispatch_eligible`])
     ///     EXCLUDES a work task that HAS an affine dep (so the global pool never
     ///     dispatches it to a secondary that has not imported its toolchain —
     ///     the head-of-line-blocking bug the per-secondary model fixes). Such a
     ///     work task dispatches ONLY through the primary's per-secondary affine
     ///     queue, which runs the import THEN the work in order on the chosen
     ///     secondary.
+    ///
     /// An affine TASK itself is already non-worker-assignable (its kind), so it
     /// never enters the worker view nor `in_flight_per_phase` here (it is
     /// dispatched by-hash from the per-secondary queue, never `take_selected`

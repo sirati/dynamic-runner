@@ -342,7 +342,10 @@ impl AffineBitvector {
     /// with no affine deps is trivially satisfied everywhere — AF-sched treats
     /// the empty case at its own layer; here it falls out as "all-of-none").
     ///
-    /// AF-sched consumer; `#[allow(dead_code)]` until that leaf (see `cell`).
+    /// Part of the AF-sched read API; the current rank policy reads per-cell
+    /// state via [`Self::cell`] (counting `Done` OR `Queued`, not just the
+    /// all-`Done` subset), leaving this all-`Done` query for a future
+    /// locality-aware caller — `#[allow(dead_code)]` until then (real + tested).
     #[allow(dead_code)]
     pub(crate) fn secondaries_with_all_done(
         &self,

@@ -17,6 +17,7 @@
 //!   `WorkerMgmtSignal::TasksAdded`; positive + negative-control +
 //!   is_idle-advisory + coalesce.
 
+mod affine_dispatch;
 mod already_held;
 mod assembly_beacon;
 mod backpressure_requeue;
