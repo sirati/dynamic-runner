@@ -166,43 +166,64 @@ impl ObserverTaskNarrator {
         }
         let id = &event.task_id;
         let holder = Self::holder_str(event);
+        // The `(from {prev}→…)` suffix the transition arms carry, or "" on
+        // a CREATE (no prior state to name). One owner for the rendering so
+        // every arm shows the from-state uniformly.
+        let from = Self::from_suffix(event);
+        // The CRDT transaction coordinates — appended to EVERY arm so the
+        // operator can correlate any narration line to the originating CRDT
+        // change (`crdt_txn=e0.v0.a0`). Formatted once via `TaskTxnId`'s
+        // Display.
+        let txn = event.txn;
         match &event.change {
             TaskStateChange::Assigned => {
                 tracing::info!(
                     target: PER_TASK_TARGET,
-                    "task {id} assigned to {holder}",
+                    "task {id} assigned to {holder}{from} crdt_txn={txn}",
                 );
             }
             TaskStateChange::Completed => {
                 tracing::info!(
                     target: PER_TASK_TARGET,
-                    "task {id} completed on {holder}",
+                    "task {id} completed on {holder}{from} crdt_txn={txn}",
                 );
             }
             TaskStateChange::TerminalFailure { reason, last_error } => {
                 tracing::error!(
                     target: PER_TASK_TARGET,
-                    "task {id} terminally failed on {holder}: {reason} — {last_error}",
+                    "task {id} terminally failed on {holder}{from}: {reason} — {last_error} crdt_txn={txn}",
                 );
             }
             TaskStateChange::RecoverableFailure { reason } => {
                 tracing::warn!(
                     target: PER_TASK_TARGET,
-                    "task {id} failed (recoverable) on {holder}: {reason}",
+                    "task {id} failed (recoverable) on {holder}{from}: {reason} crdt_txn={txn}",
                 );
             }
             TaskStateChange::OomFailure { reason } => {
                 tracing::warn!(
                     target: PER_TASK_TARGET,
-                    "task {id} failed (oom) on {holder}: {reason}",
+                    "task {id} failed (oom) on {holder}{from}: {reason} crdt_txn={txn}",
                 );
             }
-            TaskStateChange::Other { state } => {
-                tracing::info!(
-                    target: PER_TASK_TARGET,
-                    "task {id} changed state to {state}",
-                );
-            }
+            TaskStateChange::Other { state } => match event.from {
+                // The transition is the operator's primary interest for a
+                // non-terminal change, so when a prior state is known the
+                // line reads "changed state from {prev} to {new}".
+                Some(prev) => {
+                    tracing::info!(
+                        target: PER_TASK_TARGET,
+                        "task {id} changed state from {prev} to {state} crdt_txn={txn}",
+                    );
+                }
+                // A CREATE (spawn-time first write) names no prior state.
+                None => {
+                    tracing::info!(
+                        target: PER_TASK_TARGET,
+                        "task {id} changed state to {state} crdt_txn={txn}",
+                    );
+                }
+            },
         }
         true
     }
@@ -217,6 +238,41 @@ impl ObserverTaskNarrator {
         match &event.holder {
             Some((secondary, worker)) => format!("{secondary}-{worker}"),
             None => "unknown-holder".to_string(),
+        }
+    }
+
+    /// The ` (from {prev}→…)` transition suffix the holder-bearing arms
+    /// (assign / complete / failure) append, naming the PRE-write state.
+    /// Empty on a CREATE (no prior state) so a spawn-time first
+    /// assignment reads cleanly with no dangling arrow. The `→…` head of
+    /// the rendering is closed by the arm (e.g. assign → "(pending→in-flight)")
+    /// — this owns ONLY the from-half; the to-half is the arm's own state.
+    /// Returns the FULL parenthesised `(prev→{new})` so every arm renders
+    /// the transition identically; the `new` tag is the arm's target state.
+    fn from_suffix(event: &TaskStateChangeEvent) -> String {
+        match (event.from, Self::to_tag(&event.change)) {
+            (Some(prev), Some(new)) => format!(" ({prev}→{new})"),
+            // A CREATE, or an arm with no canonical post-tag: no suffix.
+            _ => String::new(),
+        }
+    }
+
+    /// The post-write state tag for the holder-bearing arms, mirroring the
+    /// `TaskState::state_tag` the FROM-state carries — so an
+    /// `assigned`/`completed`/failed line renders the symmetric
+    /// `(from→to)` pair (e.g. `(pending→in-flight)`,
+    /// `(in-flight→completed)`, `(in-flight→failed)`). The non-terminal
+    /// `Other` arm is handled inline (it owns the explicit
+    /// "changed state from X to Y" wording) so it returns `None` here.
+    fn to_tag(change: &TaskStateChange) -> Option<&'static str> {
+        match change {
+            TaskStateChange::Assigned => Some("in-flight"),
+            TaskStateChange::Completed => Some("completed"),
+            TaskStateChange::TerminalFailure { .. } => Some("failed"),
+            TaskStateChange::RecoverableFailure { .. } => Some("failed"),
+            TaskStateChange::OomFailure { .. } => Some("failed"),
+            // The non-terminal arm renders its own "from {prev} to {state}".
+            TaskStateChange::Other { .. } => None,
         }
     }
 }

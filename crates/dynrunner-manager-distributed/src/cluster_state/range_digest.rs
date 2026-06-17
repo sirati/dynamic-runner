@@ -118,6 +118,18 @@ impl<I: Identifier> ClusterState<I> {
             .tasks
             .get(hash)
             .map(|old| task_digest_term(hash, old));
+        // #520 FROM-state: the human tag of the slot's PRE-write occupant,
+        // captured under the same immutable borrow that reads `old_term`,
+        // BEFORE the move-in overwrites the slot. `None` for a logical
+        // CREATE (vacant slot — a spawn-time first write), where there is
+        // no prior state to name. Skipped (along with the whole event
+        // build below) when no observer is narrating, but read here while
+        // the borrow is cheap and the slot still holds the old state.
+        let from_state: Option<&'static str> = self
+            .tasks
+            .get(hash)
+            .filter(|_| self.task_state_change_tx.is_some())
+            .map(|old| old.state_tag());
         // Capture the OLD slot's outcome bucket (if it held a terminal) under
         // the same immutable borrow, before the move-in overwrites it. The
         // post-insert `outcome_tally.swap` decrements it and increments the
@@ -202,6 +214,13 @@ impl<I: Identifier> ClusterState<I> {
                 task_id: state.def().task_id.clone(),
                 change: state.to_state_change(),
                 holder: state.holder().or(fallback_holder),
+                // The PRE-write occupant's tag (`None` on a CREATE) +
+                // the POST-write state's CRDT transaction coordinates —
+                // the from→to transition + the correlator the merge join
+                // arbitrated on. Both read off the SAME shared write seam,
+                // path-independent across apply / restore / rank-drop.
+                from: from_state,
+                txn: state.txn_id(),
             };
             self.emit_task_state_change_event(event);
         }

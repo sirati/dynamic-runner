@@ -504,6 +504,63 @@ impl<I> TaskState<I> {
         }
     }
 
+    /// The human state tag of this variant — the SINGLE spelling of each
+    /// discriminant's operator-facing name, used for the #520 narration
+    /// FROM-state (the prior slot occupant the apply seam captured). A
+    /// `&'static str` so the from→to line allocates nothing.
+    ///
+    /// Distinct from [`Self::to_state_change`]: that classifies the
+    /// WINNING transition into the level/wording arm (assign / complete /
+    /// fail-class / other); this is a flat per-variant name for ANY state
+    /// (incl. the terminals `to_state_change` folds into `TerminalFailure`
+    /// / `Completed`), so a "from {failed} to {pending}" retry-reset line
+    /// names the prior `failed` exactly.
+    pub(crate) fn state_tag(&self) -> &'static str {
+        match self {
+            TaskState::Pending { .. } => "pending",
+            TaskState::InFlight { .. } => "in-flight",
+            TaskState::Completed { .. } => "completed",
+            TaskState::Failed { .. } => "failed",
+            TaskState::Unfulfillable { .. } => "unfulfillable",
+            TaskState::Blocked { .. } => "blocked",
+            TaskState::InvalidTask { .. } => "invalid-task",
+            TaskState::SkippedAlreadyDone { .. } => "skipped-already-done",
+            TaskState::SetupCompleted { .. } => "setup-completed",
+        }
+    }
+
+    /// The CRDT transaction coordinates of this (POST-merge winning)
+    /// state — the id the operator correlates a #520 narration line to the
+    /// originating CRDT change. Surfaces the SAME `(TaskVersion, attempt)`
+    /// the per-task monotone join
+    /// (`crate::cluster_state::merge::task_join_key`) arbitrates on, so the
+    /// rendered `crdt_txn` IS the join's own transaction arbiter (no
+    /// invented id). The version-LESS terminals (`Completed`, `Blocked`,
+    /// `SkippedAlreadyDone`, `SetupCompleted`) carry no per-transition
+    /// `TaskVersion` — the terminal RANK settles them — so they report the
+    /// `TaskVersion::default()` `(0, 0)` and the `attempt` is the
+    /// meaningful coordinate (the SAME defaulting `task_join_key` uses for
+    /// their keys).
+    pub(crate) fn txn_id(&self) -> crate::task_state_change::TaskTxnId {
+        let version = match self {
+            TaskState::Pending { version, .. }
+            | TaskState::InFlight { version, .. }
+            | TaskState::Failed { version, .. }
+            | TaskState::Unfulfillable { version, .. }
+            | TaskState::InvalidTask { version, .. } => *version,
+            // Version-LESS by design: terminal-rank-settled.
+            TaskState::Completed { .. }
+            | TaskState::Blocked { .. }
+            | TaskState::SkippedAlreadyDone { .. }
+            | TaskState::SetupCompleted { .. } => TaskVersion::default(),
+        };
+        crate::task_state_change::TaskTxnId {
+            primary_epoch: version.primary_epoch,
+            seq: version.seq,
+            attempt: self.attempt(),
+        }
+    }
+
     /// Project this (POST-merge) `TaskState` onto the #520
     /// [`crate::task_state_change::TaskStateChange`] classification — the
     /// SINGLE place the discriminant + the fail-class fold map onto the
