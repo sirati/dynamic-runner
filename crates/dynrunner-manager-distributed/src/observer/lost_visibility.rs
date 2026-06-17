@@ -342,8 +342,9 @@ pub struct LostVisibilityReporter {
     /// The instant of the LAST wake-stream DEGRADED emit (the honest
     /// "primary keepalive not reaching this observer; data plane live"
     /// line), threshold/recurrence-spaced exactly like the loss policy
-    /// but on its OWN clock — it must never advance
-    /// [`Self::wake_emit_instant`], the cluster-gone consult key.
+    /// but on its OWN clock — it must never advance `last_wake_emit`, the
+    /// LOSS-emit clock that gates the outage/note bookkeeping (and that the
+    /// degraded-episode veto pin observes via `wake_emit_instant`).
     last_degraded_wake_emit: Option<Instant>,
     /// The latest degraded reason observed, so the threshold emit (which
     /// fires from the deadline arm, between `observe` calls) carries the
@@ -680,14 +681,19 @@ impl LostVisibilityReporter {
         self.note.flush_after_host();
     }
 
-    /// The instant of the LAST wake-stream loss emit of the CURRENT
-    /// episode, or `None` if the episode has not yet been logged on the
-    /// wake stream (or visibility is fine). The coordinator's job-ledger
-    /// consult keys on THIS clock: it consults once per wake-loss emit (so
-    /// the two-consecutive-empty double-check is one wake-loss interval
-    /// apart), detecting a fresh emit by this instant advancing — reusing
-    /// the existing wake-loss cadence rather than adding a timer. Reset to
-    /// `None` on regain.
+    /// The instant of the LAST wake-stream LOSS emit of the CURRENT episode,
+    /// or `None` if the episode has not yet been logged on the wake stream
+    /// (or visibility is fine, or the episode is DEGRADED not lost — that
+    /// rides `last_degraded_wake_emit`, a separate clock). Reset to `None`
+    /// on regain.
+    ///
+    /// Test-only observation handle for the loss-vs-degraded clock split
+    /// (the cluster-gone consult no longer keys on this — it runs its own
+    /// `CLUSTER_GONE_CONSULT_INTERVAL` cadence in the coordinator). The
+    /// loss-emit clock itself remains live (it gates the outage/note
+    /// bookkeeping via `last_wake_emit`); this accessor only exposes it for
+    /// the degraded-episode veto pin.
+    #[cfg(test)]
     pub(crate) fn wake_emit_instant(&self) -> Option<Instant> {
         self.last_wake_emit
     }
@@ -1301,12 +1307,12 @@ mod tests {
     }
 
     /// The escalation VETO pin: a degraded episode's wake emit rides its
-    /// OWN clock — [`LostVisibilityReporter::wake_emit_instant`] (the
-    /// cluster-gone consult key, and the gate for the outage/note
-    /// bookkeeping) must NEVER advance, and the wake line must carry the
-    /// honest wording, never the "has been down for" outage claim.
+    /// OWN clock — the LOSS-emit clock
+    /// [`LostVisibilityReporter::wake_emit_instant`] (the gate for the
+    /// outage/note bookkeeping) must NEVER advance, and the wake line must
+    /// carry the honest wording, never the "has been down for" outage claim.
     #[test]
-    fn degraded_wake_emit_never_advances_the_cluster_gone_consult_key() {
+    fn degraded_wake_emit_never_advances_the_loss_emit_clock() {
         let t0 = Instant::now();
         let note = WakeNoteSlot::default();
         let wake = capture_important(|| {
@@ -1322,13 +1328,11 @@ mod tests {
             // The threshold mark: the degraded wake line fires…
             r.observe(&degraded("keepalive gap"), at(t0, 300));
             r.on_wake_deadline(at(t0, 300));
-            // …and the LOSS wake-emit clock (the cluster-gone consult
-            // key) still reads None.
+            // …and the LOSS wake-emit clock still reads None.
             assert_eq!(
                 r.wake_emit_instant(),
                 None,
-                "the cluster-gone consult key must NOT advance on a degraded \
-                 wake emit"
+                "the LOSS-emit clock must NOT advance on a degraded wake emit"
             );
             // Self-spacing on the degraded clock: nothing inside the
             // 10-minute window repeats.

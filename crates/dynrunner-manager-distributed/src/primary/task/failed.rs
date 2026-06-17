@@ -538,59 +538,109 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         if finalized.is_empty() {
             return;
         }
-        let mut mutations: Vec<ClusterMutation<I>> = Vec::new();
-        let mut unfulfillable_dependents = 0usize;
-        for (root_id, cascaded) in finalized {
-            for dep in cascaded {
-                let dep_hash = crate::primary::wire::compute_task_hash(&dep);
-                if self.completed_tasks.contains(&dep_hash)
-                    || self.failed_tasks.contains_key(&dep_hash)
-                {
-                    continue;
-                }
-                self.failed_tasks
-                    .insert(dep_hash.clone(), dynrunner_core::ErrorType::NonRecoverable);
-                // Pre-start fence A side-map drop (#530a): an unfulfillable
-                // cascade is a terminal — no further dispatch will fence on
-                // this hash, the hint must not outlive it.
-                self.drop_supplanted_holder(&dep_hash);
-                tracing::warn!(
-                    task_id = %dep.task_id,
-                    phase = %dep.phase_id,
-                    failed_dependency = %root_id,
-                    "task can never run: its dependency terminally failed \
-                     with no retry path; cascading permanent failure"
-                );
-                mutations.push(ClusterMutation::TaskFailed {
-                    hash: dep_hash,
-                    kind: dynrunner_core::ErrorType::NonRecoverable,
-                    error: format!(
-                        "upstream-failed: dependency '{root_id}' terminally \
-                         failed with no retry path"
-                    ),
-                    // Both stamped at the origination choke point
-                    // (apply_locally_for_broadcast): `version` minted,
-                    // `attempt` read from the task's current generation.
-                    version: Default::default(),
-                    attempt: Default::default(),
-                });
-                unfulfillable_dependents += 1;
-            }
+        // Each promoted root's transitive dependents become permanent
+        // upstream-failures — recorded + broadcast through the shared
+        // cascade-terminal helper so the drain-edge path and the
+        // immediate-permanence path (`note_item_failed`) build the SAME
+        // cascade shape. Aggregated across roots into ONE broadcast.
+        let mut pairs: Vec<(String, Vec<std::sync::Arc<dynrunner_core::TaskInfo<I>>>)> = finalized;
+        let mut all_mutations: Vec<ClusterMutation<I>> = Vec::new();
+        let mut total = 0usize;
+        for (root_id, cascaded) in pairs.drain(..) {
+            let (muts, n) = self.build_cascade_terminal_mutations(&root_id, cascaded);
+            all_mutations.extend(muts);
+            total += n;
         }
-        if unfulfillable_dependents == 0 {
+        if total == 0 {
             return;
         }
         // Operator-facing run event (the LLM-wake class): N dependents
         // just became permanently unfulfillable. Emitted ONCE per drain
-        // edge with the aggregate count; the per-task WARNs above carry
-        // the identities.
+        // edge with the aggregate count; the per-task WARNs in the helper
+        // carry the identities.
         tracing::warn!(
             target: crate::primary::important_events::IMPORTANT_TARGET,
             phase = %phase,
-            unfulfillable_dependents,
+            unfulfillable_dependents = total,
             "dependency graph can no longer complete here: cascading \
              permanent failure to dependents of terminally-failed tasks"
         );
+        self.apply_and_broadcast_cluster_mutations(all_mutations).await;
+    }
+
+    /// Record + broadcast the permanent `upstream-failed` terminal of every
+    /// transitive dependent in `cascaded` (the dependents the pool's
+    /// permanent-failure cascade returned for the failed root `root_id`).
+    ///
+    /// The SINGLE owner of the cascade-fail-to-dependents shape, shared by
+    /// the drain-edge path ([`Self::finalize_phase_soft_failures`]) and the
+    /// immediate-permanence path (`note_item_failed`'s `Permanent` route).
+    /// Each dependent gains the hash-keyed `failed_tasks` ledger entry (the
+    /// run-completion counter reads it) and a broadcast
+    /// `ClusterMutation::TaskFailed` with the canonical `NonRecoverable` /
+    /// `upstream-failed` shape (the replicated per-phase rollup
+    /// `phase_can_proceed` reads it). Already-terminal hashes (a raced wire
+    /// terminal, or a re-delivery) are skipped — idempotent.
+    pub(crate) async fn cascade_fail_dependents_terminal(
+        &mut self,
+        root_id: &str,
+        cascaded: Vec<std::sync::Arc<dynrunner_core::TaskInfo<I>>>,
+    ) {
+        let (mutations, n) = self.build_cascade_terminal_mutations(root_id, cascaded);
+        if n == 0 {
+            return;
+        }
         self.apply_and_broadcast_cluster_mutations(mutations).await;
+    }
+
+    /// Build (but do not broadcast) the per-dependent `TaskFailed`
+    /// mutations for a permanent-failure cascade, recording each dependent
+    /// in the local `failed_tasks` ledger as a side effect. Returns
+    /// `(mutations, count)` so a caller can aggregate several roots into
+    /// one broadcast. The in-memory ledger record is applied immediately
+    /// (it must reflect the cascade even for a caller that batches the
+    /// broadcast); a dependent already terminal in the local caches is
+    /// skipped (idempotent).
+    fn build_cascade_terminal_mutations(
+        &mut self,
+        root_id: &str,
+        cascaded: Vec<std::sync::Arc<dynrunner_core::TaskInfo<I>>>,
+    ) -> (Vec<ClusterMutation<I>>, usize) {
+        let mut mutations: Vec<ClusterMutation<I>> = Vec::with_capacity(cascaded.len());
+        for dep in cascaded {
+            let dep_hash = crate::primary::wire::compute_task_hash(&dep);
+            if self.completed_tasks.contains(&dep_hash)
+                || self.failed_tasks.contains_key(&dep_hash)
+            {
+                continue;
+            }
+            self.failed_tasks
+                .insert(dep_hash.clone(), dynrunner_core::ErrorType::NonRecoverable);
+            // Pre-start fence A side-map drop (#530a): the cascade is a
+            // terminal — no further dispatch will fence on this hash.
+            self.drop_supplanted_holder(&dep_hash);
+            tracing::warn!(
+                task_id = %dep.task_id,
+                phase = %dep.phase_id,
+                failed_dependency = %root_id,
+                "task can never run: its dependency terminally failed \
+                 with no retry path; cascading permanent failure"
+            );
+            mutations.push(ClusterMutation::TaskFailed {
+                hash: dep_hash,
+                kind: dynrunner_core::ErrorType::NonRecoverable,
+                error: format!(
+                    "upstream-failed: dependency '{root_id}' terminally \
+                     failed with no retry path"
+                ),
+                // Both stamped at the origination choke point
+                // (apply_locally_for_broadcast): `version` minted, `attempt`
+                // read from the task's current generation.
+                version: Default::default(),
+                attempt: Default::default(),
+            });
+        }
+        let n = mutations.len();
+        (mutations, n)
     }
 }
