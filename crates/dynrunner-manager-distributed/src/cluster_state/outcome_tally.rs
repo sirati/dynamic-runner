@@ -55,7 +55,6 @@
 use dynrunner_core::ErrorType;
 
 use super::TaskState;
-#[cfg(test)]
 use super::settled::SettledClass;
 use super::types::OutcomeSummary;
 
@@ -125,12 +124,15 @@ pub(super) fn outcome_bucket_of<I>(state: &TaskState<I>) -> Option<OutcomeBucket
 
 /// Classify a SETTLED entry's [`SettledClass`] onto its outcome bucket. A
 /// settled entry is ALWAYS terminal (only terminals settle), so this is total
-/// (no `Option`). Used ONLY by the `#[cfg(test)]` full-walk oracle to fold the
-/// settled half; the maintained tally never touches the settled half (a spill
-/// is tally-neutral — see the module doc). `FailedFinal` routes through the
-/// SAME [`bucket_for_failed_kind`] split as the fat arm so the kind partition
-/// cannot drift across the fat/settled split.
-#[cfg(test)]
+/// (no `Option`). Folded by the `#[cfg(test)]` full-walk oracle over the
+/// settled half AND by the production [`ClusterState::seed_outcome_tally_from_settled`](super::ClusterState::seed_outcome_tally_from_settled)
+/// promotion seed (a settled base installed via `install_settled_base` enters
+/// the ledger WITHOUT routing through the `set_task_state` write seam, so its
+/// terminals must be folded into the tally explicitly there). A live spill
+/// (fat→settled) stays tally-neutral — the term was already counted fat — so
+/// this is NOT folded at the `commit_spill` seam. `FailedFinal` routes through
+/// the SAME [`bucket_for_failed_kind`] split as the fat arm so the kind
+/// partition cannot drift across the fat/settled split.
 pub(super) fn settled_bucket_of(class: &SettledClass) -> OutcomeBucket {
     match class {
         SettledClass::Completed => OutcomeBucket::Succeeded,
