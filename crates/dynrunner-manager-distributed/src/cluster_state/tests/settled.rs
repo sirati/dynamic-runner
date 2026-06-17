@@ -1613,3 +1613,181 @@ fn promotion_restore_recompose_stamps_runtime_spawned_defs() {
 
     drop(dir);
 }
+
+// ── Read-path log hygiene: skip undecodable (old/foreign format) records,
+//    throttle the WARN to one rollup, never re-scan or per-record ERROR ──
+
+/// The tracing target every `settled.rs` log line carries — the module
+/// path. The decode-skip rollup WARN + the structural-fault ERRORs all
+/// emit here, so a `TargetCapture` over it sees the full log shape.
+const SETTLED_TARGET: &str = "dynrunner_manager_distributed::cluster_state::settled";
+
+/// Frame one body the way the spill writer does: a `u32`-LE length prefix
+/// in front of the CBOR-or-junk body. Returns `(framed_bytes, total_len)`.
+fn frame_record(body: &[u8]) -> Vec<u8> {
+    let mut out = (body.len() as u32).to_le_bytes().to_vec();
+    out.extend_from_slice(body);
+    out
+}
+
+/// A DECODABLE settled record's framed bytes (real `SettledRecord` CBOR
+/// behind the length prefix). The `state` is a genuine `Completed`
+/// terminal lifted from a built `ClusterState`, so the round-trip
+/// exercises the real record shape (not a fabricated stub).
+fn decodable_framed(hash: &str) -> Vec<u8> {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: hash.into(),
+        task: mk_task(hash),
+        def_id: None,
+    });
+    s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: hash.into(),
+        result_data: None,
+    });
+    let state = s.task_state(hash).expect("completed state present").clone();
+    let rec = crate::cluster_state::settled::SettledRecord::<RunnerIdentifier> {
+        hash: hash.into(),
+        state,
+        outputs: None,
+    };
+    let mut cbor = Vec::new();
+    ciborium::into_writer(&rec, &mut cbor).expect("encode SettledRecord");
+    frame_record(&cbor)
+}
+
+/// An UNDECODABLE ("old/foreign on-disk format") record's framed bytes:
+/// the framing (length prefix) is INTACT — so the read locates + advances
+/// past it exactly — but the body is junk that no `SettledRecord` decode
+/// accepts (a record a prior on-disk format wrote, whose CBOR shape this
+/// build no longer recognizes).
+fn undecodable_framed() -> Vec<u8> {
+    // 0xFF bytes are not a valid CBOR document head for our record map.
+    frame_record(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+}
+
+/// THE log-hygiene invariant (the brief's test): a spill file with a MIX
+/// of decodable + undecodable(old-format) records → the decodable ones
+/// load, the undecodable ones are SKIPPED (not aborting the read, the
+/// index untouched), and EXACTLY ONE rolled-up WARN naming the skipped
+/// count is emitted per throttle interval — never one ERROR per record,
+/// and no re-scan.
+///
+/// `start_paused` drives the [`WarnThrottle`] interval deterministically.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn undecodable_records_are_skipped_and_warn_is_throttled() {
+    use crate::cluster_state::SettledStore;
+    use std::io::Write as _;
+
+    let log = crate::test_capture::TargetCapture::for_target(SETTLED_TARGET);
+    let _guard = {
+        use tracing_subscriber::layer::SubscriberExt;
+        tracing::subscriber::set_default(tracing_subscriber::Registry::default().with(log.clone()))
+    };
+
+    // Lay down a mixed file: valid, junk, valid, junk, junk — tracking each
+    // record's (offset, len) so the reader is driven by coordinates exactly
+    // as the production index entries are.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mixed.cbor");
+    let records: Vec<(bool, Vec<u8>)> = vec![
+        (true, decodable_framed("good-a")),
+        (false, undecodable_framed()),
+        (true, decodable_framed("good-b")),
+        (false, undecodable_framed()),
+        (false, undecodable_framed()),
+    ];
+    let mut coords: Vec<(bool, u64, u32)> = Vec::new();
+    let mut offset = 0u64;
+    {
+        let mut f = std::fs::File::create(&path).expect("create mixed spill");
+        for (decodable, framed) in &records {
+            f.write_all(framed).expect("write framed record");
+            coords.push((*decodable, offset, framed.len() as u32));
+            offset += framed.len() as u64;
+        }
+        f.flush().expect("flush");
+    }
+    let committed = offset;
+
+    let mut store = SettledStore::empty();
+    let read_fd = std::sync::Arc::new(std::fs::File::open(&path).expect("read fd"));
+    let segment = store.attach_read_segment_for_test(read_fd, committed);
+
+    // Drive a read for every record. The decodable ones decode; the
+    // undecodable ones return None (skipped) — the read advances past each
+    // by its own (offset, len), so a junk record never derails the records
+    // around it (no re-scan).
+    let mut decoded = 0usize;
+    let mut skipped = 0usize;
+    for (decodable, off, len) in &coords {
+        let got = store.read_at_for_test::<RunnerIdentifier>(segment, *off, *len);
+        if *decodable {
+            let rec = got.expect("a decodable record must load");
+            assert!(matches!(rec.state, TaskState::Completed { .. }));
+            decoded += 1;
+        } else {
+            assert!(got.is_none(), "an undecodable record must be skipped (None)");
+            skipped += 1;
+        }
+    }
+    assert_eq!(decoded, 2, "both decodable records loaded");
+    assert_eq!(skipped, 3, "all three old-format records were skipped");
+
+    // Exactly ONE rolled-up WARN this interval — NOT one per skipped record.
+    let warns: Vec<_> = log
+        .events()
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .collect();
+    assert_eq!(
+        warns.len(),
+        1,
+        "three skips in one window emit exactly one rolled-up WARN, not per-record"
+    );
+    // The first skip emits immediately (0 prior suppressed); the other two
+    // are suppressed + counted, surfacing on the NEXT permitted emit.
+    assert_eq!(
+        warns[0]
+            .event
+            .fields
+            .get("also_skipped_since_last")
+            .map(String::as_str),
+        Some("0"),
+        "the first skip emits immediately carrying a zero suppressed count"
+    );
+    // No ERROR-level line for a mere old-format body — the loud ERROR is
+    // reserved for STRUCTURAL faults (read-past-committed / IO error), which
+    // this coherent file never triggers.
+    assert!(
+        log.events().iter().all(|e| e.level != tracing::Level::ERROR),
+        "an old-format record must NOT emit a per-record ERROR"
+    );
+
+    // Past the interval, the next skip re-emits, NAMING the two suppressed
+    // in between — the throttle rolls up rather than dropping the count.
+    tokio::time::advance(std::time::Duration::from_secs(61)).await;
+    let (_decodable, off, len) = coords[1];
+    assert!(
+        store
+            .read_at_for_test::<RunnerIdentifier>(segment, off, len)
+            .is_none(),
+        "the old-format record is still skipped on a later read"
+    );
+    let warns: Vec<_> = log
+        .events()
+        .into_iter()
+        .filter(|e| e.level == tracing::Level::WARN)
+        .collect();
+    assert_eq!(warns.len(), 2, "past the interval the throttle re-emits");
+    assert_eq!(
+        warns[1]
+            .event
+            .fields
+            .get("also_skipped_since_last")
+            .map(String::as_str),
+        Some("2"),
+        "the second WARN names the two skips suppressed inside the interval"
+    );
+}

@@ -678,9 +678,10 @@ pub struct ClusterState<I> {
     /// digest: a def's content is already implied by the `tasks` fold
     /// through the content-based join key, so folding the index would
     /// double-count and diverge (see `digest.rs`). Empty until an
-    /// originator interns its first def; rebuilt (empty) on restore in
-    /// L1 — the full def-transfer over the snapshot stream is a later
-    /// leaf.
+    /// originator interns its first def; rebuilt on restore from the
+    /// self-describing inline def each `TaskState` carries by value
+    /// (`register_restored_def` per task — there is no separate def-transfer
+    /// head/stream field; the def rides its state).
     pub(super) definitions: super::task_def_store::TaskDefStore<I>,
     /// The AF-id affine state sub-store (BOXED — one heap allocation, one
     /// pointer inline): the REPLICATED per-secondary bitvector — per

@@ -2972,8 +2972,8 @@ fn observer_with_ledger(
 /// submitter→observer that hosts the job ledger loses visibility for the
 /// whole run (zero legs, never fed) and the cluster is GONE (every job left
 /// the queue → the ledger returns `Empty`). On TWO consecutive consults
-/// (driven by the 5-min / 15-min wake-loss cadence) the observer renders
-/// the cluster-empty terminal verdict and exits non-zero
+/// (driven by the dedicated `CLUSTER_GONE_CONSULT_INTERVAL` cadence) the
+/// observer renders the cluster-empty terminal verdict and exits non-zero
 /// (`FatalPolicyExit`) — it does NOT spin forever, and it reaches the
 /// verdict BEFORE the (longer) fleet-death presumption window.
 ///
@@ -2992,8 +2992,8 @@ async fn cluster_empty_ledger_consult_renders_bounded_terminal_verdict() {
                 let probe = ScriptedJobLedger::new(vec![JobLedgerStatus::Empty]);
                 let mut config = observer_config("obs");
                 config.fleet_dead_timeout = Duration::from_millis(50);
-                // Far longer than the wake-loss cadence (consults at +300s,
-                // +900s), so the GROUND-TRUTH ledger verdict wins ahead of
+                // Far longer than the consult cadence (consults at +0s,
+                // +90s), so the GROUND-TRUTH ledger verdict wins ahead of
                 // the indirect fleet-death presumption.
                 config.fleet_death_presumption = Duration::from_secs(100_000);
                 let mut observer =
@@ -3034,6 +3034,66 @@ async fn cluster_empty_ledger_consult_renders_bounded_terminal_verdict() {
     .expect(
         "BOUNDED terminal: the observer must exit within the wake-loss \
          cadence window — the pre-fix behaviour spins on lost visibility forever",
+    );
+}
+
+/// CADENCE PIN (the observer-termination-latency fix): the two-consecutive-
+/// empty cluster-gone double-check completes on the DEDICATED
+/// `CLUSTER_GONE_CONSULT_INTERVAL` (90s, → terminal at ~180s), NOT the old
+/// operator wake-loss cadence (first consult at +300s, second at +900s →
+/// ~15 min). A REALISTIC `fleet_dead_timeout` (30s, the production value) is
+/// set so the loop's recheck tick CANNOT mask the dedicated consult arm: if
+/// the consult were still keyed on the wake-loss emit clock, two consults
+/// could not complete inside the 240s bound and the test would time out.
+///
+/// RED→GREEN: with the consult keyed on `wake_emit_instant()` (the pre-fix
+/// code) the second consult lands at +900s, so the 240s outer timeout
+/// expires with the observer still spinning — the test FAILS. With the
+/// dedicated 90s cadence the terminal lands at ~180s — GREEN.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn cluster_gone_terminal_lands_within_dedicated_consult_cadence() {
+    use crate::observer::JobLedgerStatus;
+    use crate::primary::RunError;
+
+    // 240s outer bound: comfortably past the new ~180s two-consult terminal,
+    // but FAR below the old 900s (300s + 600s) wake-loss-keyed second consult.
+    tokio::time::timeout(Duration::from_secs(240), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let probe = ScriptedJobLedger::new(vec![JobLedgerStatus::Empty]);
+                let mut config = observer_config("obs");
+                // The PRODUCTION recheck cadence — long enough that it cannot
+                // accidentally drive consults faster than the dedicated arm.
+                config.fleet_dead_timeout = Duration::from_secs(30);
+                config.peer_timeout = Duration::from_secs(300);
+                // Long enough that the indirect presumption never trips inside
+                // the bound — the ground-truth ledger verdict must win.
+                config.fleet_death_presumption = Duration::from_secs(100_000);
+                let mut observer = observer_with_ledger(probe.clone(), config);
+
+                let err = observer.run().await.expect_err(
+                    "a gone cluster must reach the cluster-empty terminal on the \
+                     dedicated 90s consult cadence (terminal ~180s), well inside the \
+                     240s bound the old 900s wake-loss cadence would have blown",
+                );
+                assert!(
+                    matches!(err, RunError::FatalPolicyExit { .. }),
+                    "the bounded terminal is the structured FatalPolicyExit; got {err:?}"
+                );
+                assert!(
+                    probe.consult_count() >= 2,
+                    "the verdict STILL requires two consecutive empties (the safety is \
+                     unchanged — only the spacing shortened); got {}",
+                    probe.consult_count()
+                );
+            })
+            .await;
+    })
+    .await
+    .expect(
+        "GREEN only with the dedicated consult cadence: the pre-fix \
+         wake-loss-keyed second consult at +900s blows this 240s bound",
     );
 }
 
@@ -3097,7 +3157,7 @@ async fn one_empty_then_jobs_reappear_renders_no_verdict() {
                 let mut observer = ObserverCoordinator::from_handoff(handoff);
 
                 // Land RunComplete well after both consults have happened
-                // (+300s, +900s) so the test verifies the observer kept
+                // (+0s, +90s) so the test verifies the observer kept
                 // observing (no cluster-gone verdict) and exits cleanly on
                 // the primary's terminal.
                 tokio::task::spawn_local(async move {
@@ -3264,8 +3324,8 @@ async fn clean_run_complete_is_not_reclassified_by_the_ledger_consult() {
 /// THE #532 REPLAY (the 66k LMU recovery false-FAIL, gateway-verified clean
 /// completion): a relocated submitter→observer hosts the job ledger; the
 /// primary terminated RIGHT AFTER completing the run, the observer's leg
-/// dropped at that instant so it NEVER received `RunComplete`, and after the
-/// 900s+ lost-visibility episode the queue is empty on two consecutive
+/// dropped at that instant so it NEVER received `RunComplete`, and during the
+/// sustained lost-visibility episode the queue is empty on two consecutive
 /// consults — the cluster is GONE. The AUTHORITATIVE accounting (sacct)
 /// shows every job COMPLETED (exit 0), so the gone-cluster is gone BECAUSE
 /// the run finished cleanly. The observer MUST exit `Done` (success / exit
@@ -3294,7 +3354,7 @@ async fn cluster_gone_but_authoritatively_completed_exits_done_not_failed() {
                 );
                 let mut config = observer_config("obs");
                 config.fleet_dead_timeout = Duration::from_millis(50);
-                // Far longer than the wake-loss cadence so the ground-truth
+                // Far longer than the consult cadence so the ground-truth
                 // ledger verdict wins ahead of the fleet-death presumption.
                 config.fleet_death_presumption = Duration::from_secs(100_000);
                 let mut observer = observer_with_ledger(probe.clone(), config);

@@ -116,6 +116,29 @@ use crate::warn_throttle::WarnThrottle;
 /// suppressed-occurrence count rides each emitted WARN.
 const AE_FAULT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Spacing between two cluster-gone job-ledger consults (the relocated-
+/// submitter cluster-empty double-check, see
+/// [`ObserverCoordinator::consult_cluster_gone`] +
+/// [`crate::observer::cluster_gone`]). A DEDICATED cadence, distinct from
+/// the operator-facing wake-loss WARN cadence
+/// ([`crate::observer::lost_visibility`]'s 300s threshold / 600s
+/// recurrence): the two concerns share no clock. The consult is a cheap
+/// local `squeue` read, so it can run far more often than the operator wake
+/// stream without spamming it.
+///
+/// Why 90s: the verdict still requires
+/// [`crate::observer::cluster_gone::REQUIRED_CONSECUTIVE_EMPTY`] (= 2)
+/// empties on CONSECUTIVE consults, so detection takes two intervals (≈
+/// first consult at +90s, terminal at +180s — ~3 minutes), well inside the
+/// 20-minute [`ObserverConfig::DEFAULT_FLEET_DEATH_PRESUMPTION`] and far
+/// below the prior ~15-minute (300s + 600s) wake-cadence-keyed timing. 90s
+/// is deliberately NOT shorter: it must keep the two consults sampling two
+/// GENUINELY-DISTINCT `squeue` states so a single momentary accounting blip
+/// (an empty-then-refilled window) cannot be double-counted as two empties —
+/// any `Present`/`ProbeFailed` between them resets the streak. The
+/// two-consecutive-empty safety is unchanged; only the spacing shortens.
+const CLUSTER_GONE_CONSULT_INTERVAL: Duration = Duration::from_secs(90);
+
 /// Configuration for a standalone observer. Carries only the values the
 /// observer's own concerns read: the node identity, the lost-visibility
 /// report thresholds, and the panik trigger inputs. It carries NO scheduler
@@ -1382,20 +1405,21 @@ where
                 FleetDeathDetector::new(self.config.fleet_death_presumption);
             // Cluster-empty terminal verdict (see `cluster_gone.rs`): when
             // this process hosts the job ledger (the relocated-submitter
-            // path), a long lost-visibility episode triggers a squeue
+            // path), a sustained lost-visibility episode triggers a squeue
             // consult for the run's job ids; two consecutive empty results
             // PROVE the cluster is gone (a ground truth the fleet-death
-            // PRESUMPTION need not be used for). Driven once per wake-loss
-            // cadence emit — keyed on `last_consulted_wake_emit` advancing
-            // — so the double-check is one wake-loss interval apart and no
-            // new timer is introduced. Inert (never consulted) when the
-            // observer hosts no ledger.
+            // PRESUMPTION need not be used for). Driven on a DEDICATED
+            // `CLUSTER_GONE_CONSULT_INTERVAL` cadence (this concern's own
+            // clock — NOT the operator wake-loss WARN cadence, which it used
+            // to be keyed on), so the two-consecutive-empty double-check
+            // completes in ~3 minutes instead of ~15. Inert (never
+            // consulted) when the observer hosts no ledger.
             let mut cluster_gone = ClusterGoneDetector::new();
-            // The wake-loss emit instant the job ledger was last consulted
-            // for. The consult fires when the reporter's wake-emit instant
-            // ADVANCES past this (a fresh 5-min-threshold / 10-min-recurrence
-            // emit), reusing the existing wake-loss cadence.
-            let mut last_consulted_wake_emit: Option<tokio::time::Instant> = None;
+            // When the job ledger was last consulted. `None` until the first
+            // consult of the CURRENT loss episode; reset to `None` whenever
+            // visibility regains so a fresh episode re-starts the cadence
+            // (and the detector streak) from scratch.
+            let mut last_consult_at: Option<tokio::time::Instant> = None;
             // When the observer last received ANYTHING from ANY member
             // (every inbound frame, regardless of type/sender). Seeded at
             // loop entry so the presumption clock starts from "now", not
@@ -1537,14 +1561,18 @@ where
                 }
 
                 // Cluster-empty terminal verdict (the relocated-submitter
-                // ground truth). Consult the hosted job ledger ONCE per
-                // wake-loss cadence emit — keyed on the reporter's wake-emit
-                // instant advancing past the last consulted one, so it
-                // reuses the existing 5-min-threshold / 10-min-recurrence
-                // cadence (no new timer) and the two-consecutive-empty
-                // double-check is one wake-loss interval apart. Conditional
-                // on hosting a ledger (`Some`): a cold-join observer keeps
-                // the never-terminal report-and-retry behaviour.
+                // ground truth). Consult the hosted job ledger on the
+                // DEDICATED `CLUSTER_GONE_CONSULT_INTERVAL` cadence — this
+                // concern's own clock, decoupled from the operator wake-loss
+                // WARN cadence it used to be keyed on — so the
+                // two-consecutive-empty double-check completes in ~3 minutes,
+                // not ~15. Gated on visibility being LOST/DEGRADED: a
+                // directly-visible run is never consulted (its terminal
+                // arrives over the live leg), and a REGAIN resets both the
+                // consult cadence and the detector streak so a later loss
+                // episode starts fresh. Conditional on hosting a ledger
+                // (`Some` via `consult_cluster_gone`): a cold-join observer
+                // keeps the never-terminal report-and-retry behaviour.
                 //
                 // Once the double-check concludes the cluster is GONE, the
                 // consult disambiguates WHY via SLURM accounting (the #532
@@ -1556,9 +1584,23 @@ where
                 // `FatalPolicyExit`. Both route the single wake-stream
                 // terminal-reason emit + the single-teardown below, exactly
                 // like the fleet-death exit above.
-                let wake_emit = visibility_reporter.wake_emit_instant();
-                if wake_emit.is_some() && wake_emit != last_consulted_wake_emit {
-                    last_consulted_wake_emit = wake_emit;
+                let visibility_lost = matches!(
+                    self.current_visibility(primary_last_seen),
+                    Visibility::Lost { .. } | Visibility::Degraded { .. }
+                );
+                if !visibility_lost {
+                    // Visible: end any in-progress episode's consult cadence
+                    // and discard a partial empty streak — the next loss
+                    // episode re-confirms from scratch.
+                    last_consult_at = None;
+                    cluster_gone = ClusterGoneDetector::new();
+                }
+                let now = tokio::time::Instant::now();
+                let consult_due = visibility_lost
+                    && last_consult_at
+                        .is_none_or(|at| now.duration_since(at) >= CLUSTER_GONE_CONSULT_INTERVAL);
+                if consult_due {
+                    last_consult_at = Some(now);
                     match self.consult_cluster_gone(&mut cluster_gone).await {
                         Some(ClusterGoneDecision::CompletedClean { note }) => {
                             // The cluster is gone BECAUSE the run completed
@@ -1642,6 +1684,26 @@ where
                             visibility_reporter.on_wake_deadline(tokio::time::Instant::now());
                         }
                     }
+                    // Cluster-gone consult cadence: re-drive the loop so the
+                    // top-of-loop consult check fires at the NEXT
+                    // `CLUSTER_GONE_CONSULT_INTERVAL` even with zero inbound
+                    // traffic and a long `fleet_dead_timeout`. A PERSISTENT
+                    // deadline (the watchdog law): `sleep_until` targets the
+                    // absolute `last_consult_at + interval`, so sibling-arm
+                    // activity never resets it. Parked (`pending`) until the
+                    // FIRST consult of an episode has stamped `last_consult_at`
+                    // — the first consult fires from the top-of-loop the
+                    // instant visibility is found lost, driven by whatever wake
+                    // detected the loss. No work in the arm body; the
+                    // top-of-loop owns the consult + the verdict.
+                    _ = async {
+                        match last_consult_at {
+                            Some(at) => {
+                                tokio::time::sleep_until(at + CLUSTER_GONE_CONSULT_INTERVAL).await
+                            }
+                            None => std::future::pending().await,
+                        }
+                    } => {}
                     // Snapshot-stream production arm: ONE bounded package
                     // per wakeup (the driver re-enqueues its own token
                     // while the stream has more), so serving a behind

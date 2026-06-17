@@ -19,12 +19,15 @@
 //! already implied by the `tasks` fold through the content-based join
 //! key, so folding the index would double-count and diverge.
 //!
-//! L1 is ADDITIVE: the store + its `from_task_info` splitter are owned by
-//! `ClusterState` and exercised by this module's tests, but no production
-//! caller interns or resolves yet (the originate/apply wiring is a later
-//! leaf). The constructor-, intern-, and resolve-surfaces are therefore
-//! `#[allow(dead_code)]` until that leaf lands — the methods are real and
-//! tested, just not yet called outside `#[cfg(test)]`.
+//! The originate/apply wiring is LIVE: the broadcast choke point stamps a
+//! primary-allocated `TaskDefId` onto every `TaskAdded`, and the apply path
+//! interns at that wire id ([`TaskDefStore::intern_at`] /
+//! `ClusterState::intern_task_def_at`), while dep edges resolve back to their
+//! `(phase_id, task_id)` identity through [`TaskDefStore::resolve`] /
+//! `resolve_dep_refs` on every replica. A handful of read surfaces
+//! (`id_for_hash`, `affine_hash_for_id`) are not yet wired to a production
+//! caller and carry `#[allow(dead_code)]` until their leaf lands — they are
+//! real and tested, just not yet called outside `#[cfg(test)]`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -818,9 +821,12 @@ impl<I> TaskDefStore<I> {
     /// resumes PAST every replicated def id rather than from a cold counter
     /// (the aliasing CL-A2 forbids). Monotone: never lowers `next_id`. The
     /// caller supplies `max(observed id) + 1`; here the in-memory store's
-    /// own max already feeds `next_id` (every `put_slot` advances it), so a
-    /// `resume_alloc_floor(next_id_floor())` is the L3a resume — the full
-    /// settled-scan over spilled entries is a later leaf.
+    /// own max already feeds `next_id` (every `put_slot` advances it). This
+    /// method is settled-BLIND by design — the full settled-scan over spilled
+    /// entries is composed by its `ClusterState` wrapper
+    /// [`super::ClusterState::resume_def_alloc_floor`], which folds
+    /// `next_id_floor()` together with the settled base's `max_def_id` before
+    /// calling here (L6a).
     pub(crate) fn resume_alloc_floor(&mut self, floor: u32) {
         self.next_id = self.next_id.max(floor);
     }
@@ -1004,8 +1010,12 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
     /// helper a `TaskState` builder calls when it holds a whole `TaskInfo`
     /// and `&mut self` (the apply / merge / hydrate paths): it owns the
     /// `from_task_info` split + `intern` + `resolve` sequence so no caller
-    /// re-spells it. Local interning per node is fine — the in-memory `Arc`
-    /// is what dedups; wire-agreed ids are a later leaf.
+    /// re-spells it. This is the NODE-LOCAL-allocation half: the id is minted
+    /// from the local monotone allocator, the L2 by-content-hash convergence
+    /// (equal content yields equal hash yields the same `Arc` dedup). The
+    /// wire-stamped sibling [`Self::intern_task_def_at`] interns at the
+    /// primary-allocated wire id on the replicated path and delegates HERE as
+    /// its un-stamped fallback (direct-apply tests, any pre-stamp local apply).
     pub(crate) fn intern_task_def(
         &mut self,
         hash: &str,
