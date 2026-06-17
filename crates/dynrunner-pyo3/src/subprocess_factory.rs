@@ -19,9 +19,21 @@ use crate::transport::EitherManagerEnd;
 /// across all worker subprocess kinds so containerised workers and
 /// direct Python workers share one teardown ladder.
 const TERMINATE_GRACE: Duration = Duration::from_secs(5);
-/// Poll interval while waiting for SIGTERM to take effect. Cheap
-/// `waitpid(WNOHANG)` calls are bounded by `TERMINATE_GRACE` anyway.
-const TERMINATE_POLL: Duration = Duration::from_millis(50);
+/// Poll interval while waiting for a signalled worker to be reaped.
+///
+/// 100ms caps the `try_wait` poll at 10/s (the prior 50ms was 20/s).
+/// The old cadence flooded the log on the type-shift respawn path: the
+/// pool SIGKILLs the prior worker and `reap_detached` collects it, so by
+/// the time `track_child`'s teardown ladder runs the prior PID is
+/// usually already gone — every poll then returned `ECHILD` and (under
+/// the old code) was re-logged ~20×/s for the full grace window. The
+/// reap is not latency-critical here (the replacement worker has already
+/// spawned), so a 100ms cadence is ample.
+const TERMINATE_POLL: Duration = Duration::from_millis(100);
+/// First point at which a still-unreaped worker is worth a single WARN.
+/// Below this the wait is normal procedure (SIGTERM in flight, or a
+/// racing reaper about to collect the PID) and must stay silent.
+const TERMINATE_WARN_AFTER: Duration = Duration::from_secs(3);
 
 /// Niceness increment applied to every worker subprocess at spawn
 /// (owner-set constant — deliberately +10, not +19, and deliberately
@@ -157,9 +169,24 @@ pub(crate) fn terminate_children_with_process_group(
 }
 
 /// SIGTERM → up to `TERMINATE_GRACE` poll → SIGKILL → reap one child.
-/// Errors are logged at debug/warn but never propagated: teardown is a
+/// Errors are logged at warn but never propagated: teardown is a
 /// best-effort lattice, and the only sane fallback if SIGKILL itself
 /// fails is to leak the handle (the kernel will reap it).
+///
+/// **Wait-for-exit is the single concern here.** The poll is the one
+/// place worker-reap timing lives, so the rate-limit (>=100ms /
+/// `TERMINATE_POLL`), the silent-while-normal window, and the
+/// warn-after-`TERMINATE_WARN_AFTER` escalation are all encoded here —
+/// no caller knows or replicates any of it.
+///
+/// `ECHILD` ("No child processes") is success, not a failure to retry:
+/// the kernel has no record of this PID because it has *already been
+/// reaped*. On the type-shift respawn path that is the common case —
+/// `WorkerHandle::kill_subprocess` SIGKILLs the prior worker and hands
+/// its leader to `reap_detached`, which `waitpid`s it; whichever side
+/// wins, the other observes `ECHILD`. Treating it as "gone" returns
+/// immediately instead of spinning (and, under the old code, re-logging
+/// every poll) for the whole grace window.
 fn terminate_child(child: &mut std::process::Child) {
     use nix::errno::Errno;
     use nix::sys::signal::{Signal, kill};
@@ -178,25 +205,68 @@ fn terminate_child(child: &mut std::process::Child) {
     // Poll `try_wait` until the child is reaped or the grace window
     // expires. `try_wait` is non-blocking; on success it consumes the
     // child's exit status and frees the kernel slot.
-    let deadline = Instant::now() + TERMINATE_GRACE;
+    //
+    // Normal procedure is SILENT: a worker that exits within the grace
+    // window (the overwhelming majority) produces no log line at all.
+    // Only crossing `TERMINATE_WARN_AFTER` while STILL alive earns one
+    // WARN — and exactly one, latched by `warned`.
+    let start = Instant::now();
+    let warn_deadline = start + TERMINATE_WARN_AFTER;
+    let grace_deadline = start + TERMINATE_GRACE;
+    let mut warned = false;
     loop {
         match child.try_wait() {
+            // Reaped here: clean exit or signal. Goal satisfied.
             Ok(Some(_)) => return,
+            // Already reaped by another path (the detached reaper on the
+            // kill-before-respawn edge). The PID is gone — that IS the
+            // goal. Return silently; do NOT retry-spin or log-spam.
+            Err(e) if e.raw_os_error() == Some(libc::ECHILD) => return,
+            // Still alive — keep waiting (rate-limited below).
             Ok(None) => {}
+            // Any other `try_wait` error is genuinely unexpected (not the
+            // normal racing-reaper case); surface it once at debug.
             Err(e) => {
-                tracing::debug!(error = %e, "try_wait on worker failed");
+                tracing::debug!(pid = pid.as_raw(), error = %e, "try_wait on worker failed");
             }
         }
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= grace_deadline {
             break;
+        }
+        if !warned && now >= warn_deadline {
+            warned = true;
+            tracing::warn!(
+                pid = pid.as_raw(),
+                waited = ?now.duration_since(start),
+                "worker still not reaped after grace warn-deadline; \
+                 escalating to SIGKILL shortly"
+            );
         }
         std::thread::sleep(TERMINATE_POLL);
     }
 
     // Grace expired — escalate to SIGKILL and blocking-wait. SIGKILL
-    // is unignorable, so the blocking wait is bounded.
+    // is unignorable, so the blocking wait is bounded. A child that
+    // survives even this is a genuine hard failure: we surface it
+    // loudly (the operator-visible FAIL) and leak the handle rather
+    // than crash — teardown is best-effort and a later respawn of this
+    // worker slot is unaffected (this helper is stateless).
     let _ = child.kill();
-    let _ = child.wait();
+    match child.wait() {
+        Ok(_) => {}
+        // ECHILD again means a racing reaper got it between our SIGKILL
+        // and `wait` — still "gone", still success.
+        Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {}
+        Err(e) => {
+            tracing::warn!(
+                pid = pid.as_raw(),
+                error = %e,
+                "worker did not reap after SIGKILL; leaking handle \
+                 (kernel will reap). Respawn of this slot is unaffected."
+            );
+        }
+    }
 }
 
 /// One of the two transport-specific values that have to flow into the worker
@@ -932,6 +1002,106 @@ mod tests {
         assert!(
             elapsed < TERMINATE_GRACE + Duration::from_secs(2),
             "SIGKILL fallback took too long: {elapsed:?}"
+        );
+    }
+
+    /// The wait-for-exit poll must run at <=10/s (requirement: never
+    /// flood the log / the scheduler while waiting for a worker to be
+    /// reaped). `TERMINATE_POLL` is the sole knob; assert the invariant
+    /// at its definition so a future tightening below 100ms is caught.
+    #[test]
+    fn terminate_poll_is_capped_at_10_per_second() {
+        assert!(
+            TERMINATE_POLL >= Duration::from_millis(100),
+            "poll cadence {TERMINATE_POLL:?} exceeds 10/s; \
+             wait-for-exit must poll no faster than every 100ms"
+        );
+    }
+
+    /// The warn-deadline must fall strictly inside the grace window, so
+    /// a still-alive worker earns exactly one WARN *before* the SIGKILL
+    /// escalation — never after grace has already expired (which would
+    /// make the WARN pointless) and never at zero (which would WARN on
+    /// the normal fast-exit path).
+    #[test]
+    fn warn_deadline_is_inside_grace_window() {
+        assert!(TERMINATE_WARN_AFTER > Duration::ZERO);
+        assert!(
+            TERMINATE_WARN_AFTER < TERMINATE_GRACE,
+            "warn-deadline {TERMINATE_WARN_AFTER:?} must precede SIGKILL \
+             grace {TERMINATE_GRACE:?}"
+        );
+    }
+
+    /// ECHILD ("No child processes") means the worker has ALREADY been
+    /// reaped by another path — on the type-shift respawn edge that is
+    /// `WorkerHandle`'s detached reaper racing the factory's teardown.
+    /// The teardown must treat it as "gone" and return immediately, not
+    /// spin (and, pre-fix, log-spam) for the whole grace window.
+    ///
+    /// Repro: spawn a child, SIGKILL it, then reap it directly via
+    /// `waitpid` so the kernel forgets the PID. The subsequent
+    /// `terminate_child` sees `try_wait` → ECHILD on its first poll and
+    /// must return promptly (well under the grace window).
+    #[test]
+    fn terminate_child_treats_echild_as_already_exited() {
+        use nix::sys::signal::{Signal, kill};
+        use nix::sys::wait::waitpid;
+        use nix::unistd::Pid;
+
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 30");
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = cmd.spawn().expect("spawn /bin/sh sleep");
+        let pid = Pid::from_raw(child.id() as i32);
+
+        // Kill and reap OUT OF BAND so the kernel no longer knows the
+        // PID — exactly the post-`reap_detached` state on the respawn
+        // path. `child.try_wait()` inside `terminate_child` will now hit
+        // ECHILD.
+        kill(pid, Signal::SIGKILL).expect("sigkill");
+        waitpid(pid, None).expect("out-of-band reap");
+
+        let mut children = vec![Some(child)];
+        let start = Instant::now();
+        terminate_children(&mut children);
+        let elapsed = start.elapsed();
+
+        assert!(children[0].is_none());
+        // ECHILD → return on the FIRST poll. Must be far under the grace
+        // window; if it spun to grace the ECHILD-as-gone shortcut broke.
+        assert!(
+            elapsed < TERMINATE_WARN_AFTER,
+            "ECHILD path spun instead of returning fast: {elapsed:?}"
+        );
+    }
+
+    /// A worker that exits BEFORE the warn-deadline must reap silently
+    /// and well before grace — the common case must never approach the
+    /// SIGKILL escalation. Pairs with the ECHILD test (already-reaped)
+    /// to cover both "gone via our wait" and "gone via a racing reaper".
+    #[test]
+    fn terminate_child_reaps_fast_exit_well_under_warn_deadline() {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        // Exits on SIGTERM immediately — no trap needed, default
+        // disposition terminates the shell.
+        cmd.arg("-c").arg("sleep 30");
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = cmd.spawn().expect("spawn /bin/sh sleep");
+
+        let mut children = vec![Some(child)];
+        let start = Instant::now();
+        terminate_children(&mut children);
+        let elapsed = start.elapsed();
+
+        assert!(children[0].is_none());
+        assert!(
+            elapsed < TERMINATE_WARN_AFTER,
+            "SIGTERM-responsive child crossed the warn-deadline: {elapsed:?}"
         );
     }
 
