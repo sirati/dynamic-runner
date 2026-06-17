@@ -74,6 +74,19 @@ pub enum TaskKind {
     /// in this primitive the kind exists so it can be declared, routed
     /// past the worker-dispatch view, and serialized on the wire.
     SecondaryAffine,
+    /// A per-secondary SPECULATIVE-PREP primitive (#638): a phase-AGNOSTIC,
+    /// idle-filler "eager prep" task that runs once-per-secondary as the LAST
+    /// dispatch resort (only when an idle worker has nothing else — pool empty
+    /// + affine queue empty + idle-steal failed). Like [`Self::SecondaryAffine`]
+    /// it is NEITHER worker-assignable NOR reassignable, the primary NEVER
+    /// executes it, and it is NEVER counted in any success/fail bucket. Unlike
+    /// `SecondaryAffine` it is NOT a schedulability gate — it has NO dependents,
+    /// so it never enters the pool's phase buckets at all; its readiness is
+    /// purely the per-secondary 2-bit cell it shares with affine on the cell
+    /// substrate. It MUST NOT hold a phase open (`counts_for_phase_drain` is
+    /// false) and MUST be serialized on the wire (like `SecondaryAffine`, a
+    /// peer that dropped it from the wire would lose the prep declaration).
+    SecondaryEagerPrep,
 }
 
 /// The COUNTING category of a task — the mutually-exclusive partition a
@@ -92,6 +105,11 @@ pub enum TaskCountCategory {
     /// subdivision (phase-uncounted; readiness is the per-secondary
     /// bitvector, not a global state).
     SecondaryAffine,
+    /// A per-secondary SPECULATIVE-PREP token (#638) — one flat count, no
+    /// per-state subdivision (phase-uncounted; readiness is the per-secondary
+    /// cell, not a global state). The eager-prep twin of
+    /// [`Self::SecondaryAffine`]'s flat count.
+    SecondaryEagerPrep,
 }
 
 impl TaskKind {
@@ -120,7 +138,10 @@ impl TaskKind {
     /// gates the worker VIEW, this gates the drain COUNT. The scheduling seam
     /// (`PendingPool::queued_count`) reads this.
     pub fn counts_for_phase_drain(self) -> bool {
-        !matches!(self, TaskKind::SecondaryAffine)
+        !matches!(
+            self,
+            TaskKind::SecondaryAffine | TaskKind::SecondaryEagerPrep
+        )
     }
 
     /// Whether an in-flight task of this kind may be REASSIGNED (requeued
@@ -155,6 +176,17 @@ impl TaskKind {
         matches!(self, TaskKind::SecondaryAffine)
     }
 
+    /// Whether this is a `SecondaryEagerPrep` task (#638) — the per-secondary
+    /// speculative idle-filler. The plain discriminant query for the call
+    /// sites that classify by kind without a behavioral predicate (the
+    /// eager-prep dispatch leaf, the pool intake divert, and the PyO3 boundary
+    /// mapping an `is_secondary_eager_prep` bool). A `SecondaryAffine` task is
+    /// NOT an eager-prep task — they share the per-secondary CELL substrate but
+    /// are distinct kinds with distinct dispatch precedence.
+    pub fn is_secondary_eager_prep(self) -> bool {
+        matches!(self, TaskKind::SecondaryEagerPrep)
+    }
+
     /// The COUNTING category this kind belongs to — the single modular
     /// projection a tally/reporting concern dispatches on so it never
     /// spells a bare `if kind == Setup` (the antipattern the four-seam
@@ -181,6 +213,7 @@ impl TaskKind {
             TaskKind::Work => TaskCountCategory::Work,
             TaskKind::Setup => TaskCountCategory::Setup,
             TaskKind::SecondaryAffine => TaskCountCategory::SecondaryAffine,
+            TaskKind::SecondaryEagerPrep => TaskCountCategory::SecondaryEagerPrep,
         }
     }
 
@@ -926,6 +959,35 @@ mod task_kind_tests {
         // The other kinds answer the new discriminant false.
         assert!(!TaskKind::Work.is_secondary_affine());
         assert!(!TaskKind::Setup.is_secondary_affine());
+        assert!(!TaskKind::SecondaryEagerPrep.is_secondary_affine());
+    }
+
+    #[test]
+    fn secondary_eager_prep_predicates() {
+        // SecondaryEagerPrep MIRRORS SecondaryAffine at the kind seams: NEITHER
+        // worker-assignable, reassignable, nor a setup task; it does NOT count
+        // for phase drain (CRITICAL — it must never block a phase transition);
+        // and it is its own discriminant. The primary never dispatches it to a
+        // worker, never requeues it on death, and never routes it through the
+        // setup executor.
+        let k = TaskKind::SecondaryEagerPrep;
+        assert!(!k.is_worker_assignable(), "never worker-assignable");
+        assert!(!k.is_reassignable(), "never reassignable");
+        assert!(!k.is_setup(), "not a setup task");
+        assert!(!k.is_secondary_affine(), "distinct from affine");
+        assert!(k.is_secondary_eager_prep(), "is its own kind");
+        assert!(
+            !k.counts_for_phase_drain(),
+            "must NOT hold a phase open — phase-agnostic idle filler"
+        );
+
+        // The other kinds answer the new discriminant false.
+        assert!(!TaskKind::Work.is_secondary_eager_prep());
+        assert!(!TaskKind::Setup.is_secondary_eager_prep());
+        assert!(!TaskKind::SecondaryAffine.is_secondary_eager_prep());
+
+        // Its counting category is its own flat-count partition.
+        assert_eq!(k.count_category(), TaskCountCategory::SecondaryEagerPrep);
     }
 
     #[test]
@@ -958,5 +1020,21 @@ mod task_kind_tests {
             TaskKind::Work,
             "a frame without a kind field decodes to Work"
         );
+    }
+
+    #[test]
+    fn secondary_eager_prep_round_trips_on_the_wire() {
+        // Like SecondaryAffine (and unlike the skipped default `Work`), a
+        // SecondaryEagerPrep task MUST appear on the wire — dropping it would
+        // lose the prep declaration. Assert the `kind` field is PRESENT in the
+        // JSON and decodes back to SecondaryEagerPrep.
+        let task = mk_task(TaskKind::SecondaryEagerPrep);
+        let value = serde_json::to_value(&task).expect("serialize");
+        assert_eq!(
+            value["kind"], "SecondaryEagerPrep",
+            "SecondaryEagerPrep kind must be serialized, not skipped"
+        );
+        let back: TaskInfo<String> = serde_json::from_value(value).expect("round-trip");
+        assert_eq!(back.kind, TaskKind::SecondaryEagerPrep);
     }
 }

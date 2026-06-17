@@ -956,6 +956,13 @@ pub struct StateCounts {
     /// bitvector, NOT a global pending/done state, so reporting them by
     /// state would be meaningless. EXCLUDED from EVERY per-state bucket.
     pub secondary_affine: usize,
+    /// Per-secondary EAGER-PREP tokens (#638,
+    /// [`dynrunner_core::TaskCountCategory::SecondaryEagerPrep`]) — a SINGLE
+    /// flat count with NO state subdivision, the eager-prep twin of
+    /// [`Self::secondary_affine`]. Phase-uncounted speculative idle-fillers:
+    /// their readiness is the per-secondary 2-bit cell, NOT a global
+    /// pending/done state. EXCLUDED from EVERY per-state bucket.
+    pub secondary_eager_prep: usize,
 }
 
 /// Per-phase task partition over the replicated ledger — the value shape

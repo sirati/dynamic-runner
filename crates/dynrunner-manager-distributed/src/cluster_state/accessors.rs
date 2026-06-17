@@ -252,6 +252,7 @@ impl<I: Identifier> ClusterState<I> {
         for s in self.tasks.values() {
             match s.def().kind.count_category() {
                 TaskCountCategory::SecondaryAffine => c.secondary_affine += 1,
+                TaskCountCategory::SecondaryEagerPrep => c.secondary_eager_prep += 1,
                 TaskCountCategory::Setup => match s {
                     TaskState::Pending { .. } => c.setup_pending += 1,
                     TaskState::InFlight { .. } => c.setup_in_flight += 1,
@@ -293,6 +294,7 @@ impl<I: Identifier> ClusterState<I> {
         for (_, entry) in self.settled_entries() {
             match entry.category {
                 TaskCountCategory::SecondaryAffine => c.secondary_affine += 1,
+                TaskCountCategory::SecondaryEagerPrep => c.secondary_eager_prep += 1,
                 TaskCountCategory::Setup => match entry.class {
                     SettledClass::SetupCompleted => c.setup_succeeded += 1,
                     SettledClass::FailedFinal(_) | SettledClass::InvalidTask => c.setup_failed += 1,
