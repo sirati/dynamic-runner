@@ -468,8 +468,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             self.apply_and_broadcast_cluster_mutations(vec![m]).await;
         }
         self.drop_supplanted_holder(&task_hash);
-        // WORKER SLOT: free the holding slot + ledger entry (no phase cascade).
-        self.free_slot_on_terminal(&secondary_id, worker_id, &task_hash);
+        // WORKER SLOT: free the holding slot for THIS per-secondary run,
+        // addressed by the terminal's OWN (secondary, worker) — slot-direct, NOT
+        // the shared hash-keyed `free_slot_on_terminal`. The import runs the same
+        // hash on multiple secondaries concurrently; the hash-keyed ledger holds
+        // only one holder, so the shared path would free the wrong secondary's
+        // slot and orphan this worker's slot Assigned forever. No phase cascade.
+        self.free_affine_slot_on_terminal(&secondary_id, worker_id, &task_hash);
 
         tracing::warn!(
             secondary = %secondary_id,

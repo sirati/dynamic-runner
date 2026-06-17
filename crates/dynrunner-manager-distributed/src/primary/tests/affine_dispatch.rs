@@ -911,3 +911,145 @@ async fn rebuild_leaves_inflight_queued_import_worker_held() {
         })
         .await;
 }
+
+/// REGRESSION (affine run-completion): a per-secondary affine import that RUNS
+/// ON BOTH SECONDARIES (same hash, N concurrent terminals) plus its dependent
+/// builds must, once everything terminals, satisfy the operational loop's
+/// run-completion gate (`run_complete_check`) — RunComplete-eligible — with the
+/// import counted EXACTLY ONCE toward the run tally.
+///
+/// The wedge this pins: the import dispatches the SAME hash on every secondary,
+/// but the primary's `in_flight` ledger is hash-keyed (one holder per hash), so
+/// each per-secondary `commit_assignment` overwrites the prior secondary's
+/// entry. The pre-fix terminal-free routed through that colliding ledger, freed
+/// the WRONG secondary's slot, and left the reporting worker's slot `Assigned`
+/// forever — `active_workers >= 1` — so BOTH arms of `run_complete_check`
+/// (counter AND pool-drain, each gated on `active_workers == 0`) never tripped
+/// and `RunComplete` never fired despite every phase draining to `Done` and the
+/// CRDT showing all tasks complete. The slot-direct affine terminal-free
+/// (`free_affine_slot_on_terminal`) frees the slot by the terminal's OWN
+/// `(secondary, worker)`, so every per-secondary run releases its own slot.
+///
+/// Includes the EMPTY upstream phases (produce/consume/setup) the live consumer
+/// declares so the topology matches the on-cluster `secondary-affine` scenario —
+/// the same shape the unit tests above omitted, which is why their
+/// `pool().is_run_complete()` assertion passed while the live run hung on the
+/// `active_workers` half of the gate.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_import_on_n_secondaries_satisfies_run_completion_once() {
+    use dynrunner_scheduler_api::pending_pool::PhaseState;
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut import = affine_import("import");
+            import.phase_id = PhaseId::from("import");
+            let import_hash = compute_task_hash(&import);
+            let make_build = |name: &str| {
+                let mut t = make_binary(name, 20);
+                t.phase_id = PhaseId::from("build");
+                t.type_id = TypeId::from("default");
+                t.task_depends_on = vec![TaskDep {
+                    task_id: "import".into(),
+                    phase_id: PhaseId::from("import"),
+                    inherit_outputs: false,
+                    def_id: None,
+                }];
+                t
+            };
+            let mut binaries = vec![import];
+            for i in 0..8 {
+                binaries.push(make_build(&format!("build_{i}")));
+            }
+            // The live `secondary-affine` topology: empty produce/consume/setup
+            // phases ALONGSIDE the import + build phases, no inter-phase
+            // depends_on edges except build→import.
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with_phase_deps(
+                    binaries,
+                    HashMap::from([
+                        (PhaseId::from("produce"), vec![]),
+                        (PhaseId::from("consume"), vec![]),
+                        (PhaseId::from("setup"), vec![]),
+                        (PhaseId::from("import"), vec![]),
+                        (PhaseId::from("build"), vec![PhaseId::from("import")]),
+                    ]),
+                );
+            let on_start: OnPhaseStart = Box::new(|_p: &PhaseId| {});
+            let on_end: OnPhaseEnd = Box::new(move |_p, _c, _f, _o| {});
+            primary.register_phase_lifecycle_callbacks(on_start, on_end);
+            confirm_two(&mut primary).await;
+
+            // Drive to quiescence: import dispatches + completes per-secondary,
+            // builds dispatch (each gated on its own secondary's import cell),
+            // every task terminals.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            loop {
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                if round.is_empty() {
+                    break;
+                }
+                for (_, sec, worker, h) in &round {
+                    primary
+                        .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                        .await;
+                    settle_pump().await;
+                }
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+            }
+
+            // The import ran on BOTH secondaries (N concurrent terminals of the
+            // SAME hash) — the precondition that triggers the ledger collision.
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+            for sec in ["sec-0", "sec-1"] {
+                assert_eq!(
+                    primary.cluster_state_for_test().affine_state(sec, affine_id),
+                    AffineCell::Done,
+                    "the affine import must have RUN on {sec} (N concurrent runs)"
+                );
+            }
+
+            // Every phase drained to Done (incl. the empty upstream phases).
+            for p in ["produce", "consume", "setup", "import", "build"] {
+                assert_eq!(
+                    primary.pool().phase_state(&PhaseId::from(p)),
+                    Some(PhaseState::Done),
+                    "phase {p} must drain to Done"
+                );
+            }
+
+            // EVERY worker slot freed — no orphaned `Assigned` slot from a
+            // per-secondary import terminal that the colliding ledger mis-routed.
+            assert_eq!(
+                primary.active_workers_for_test(),
+                0,
+                "no worker slot may stay Assigned after every task terminals — \
+                 the per-secondary import terminal must free ITS OWN slot, not \
+                 whichever holder the single hash-keyed ledger recorded"
+            );
+
+            // The import counted ONCE toward the run tally despite running on N
+            // secondaries: 1 import + 8 builds = 9 distinct CRDT terminals.
+            assert_eq!(
+                primary.cluster_state_counts_for_test().completed,
+                9,
+                "the import counts exactly once (CRDT TaskCompleted is first-run \
+                 only); 1 import + 8 builds = 9"
+            );
+
+            // THE GATE: the operational loop's run-completion check is satisfied
+            // — RunComplete-eligible. Pre-fix this stayed false forever because
+            // active_workers never reached 0.
+            assert!(
+                primary.run_complete_check(),
+                "run_complete_check must be satisfied once the import + all builds \
+                 terminal and every slot is freed — the affine run-completion arc"
+            );
+        })
+        .await;
+}

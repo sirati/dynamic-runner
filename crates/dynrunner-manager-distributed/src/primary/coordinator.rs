@@ -3841,6 +3841,109 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.free_slot_on_terminal(&holder_secondary, holder_worker, task_hash)
     }
 
+    /// Per-secondary slot-direct terminal-free for a `SecondaryAffine` import.
+    ///
+    /// Unlike [`Self::free_slot_on_terminal`] — which resolves the holder from
+    /// the single hash-keyed `in_flight` ledger — this frees the slot addressed
+    /// by the TERMINAL's OWN `(secondary_id, local_worker_id)`. A per-secondary
+    /// affine import legitimately runs the SAME hash on MULTIPLE secondaries at
+    /// once (each node imports locally), but the hash-keyed ledger can record
+    /// only ONE holder: each fresh `commit_assignment` overwrites the prior
+    /// secondary's entry. Routing the affine terminal through the ledger would
+    /// then free whichever secondary the ledger happens to point at — orphaning
+    /// the reporting worker's slot `Assigned` forever (`active_workers >= 1`),
+    /// which wedges `run_complete_check` (both its counter and pool-drain arms
+    /// gate on `active_workers == 0`) so `RunComplete` never fires.
+    ///
+    /// For an affine import the reporting worker IS the authoritative holder of
+    /// its own slot, so the slot is freed by the terminal's identity directly
+    /// (hash-verified against the slot's held task, so a slot already reassigned
+    /// to a later task is never vacated by a stale terminal). The per-dispatch
+    /// type-slot reserve ([`Self::commit_assignment`]) is released here, keeping
+    /// N dispatches / N terminals symmetric. The shared ledger entry — which
+    /// records at most one of the N concurrent holders — is removed ONLY when it
+    /// points at THIS exact `(secondary, worker)`, so the matching terminal
+    /// cleans the ledger while the others clean their own slots; no terminal
+    /// strands a sibling's slot, and the ledger never retains a phantom import.
+    ///
+    /// Phase-neutral, like its caller: no `note_item_*`, no pool counter touch.
+    pub(super) fn free_affine_slot_on_terminal(
+        &mut self,
+        secondary_id: &str,
+        worker_id: u32,
+        task_hash: &str,
+    ) {
+        if let Some(idx) = self.worker_idx_for(secondary_id, worker_id) {
+            let held_matches = matches!(
+                &self.workers[idx].state,
+                SlotState::Assigned { task_hash: h, .. } if h == task_hash
+            );
+            if held_matches {
+                let type_id = self.workers[idx]
+                    .held_task()
+                    .map(|t| t.type_id.clone());
+                self.workers[idx].state = SlotState::Idle;
+                if let Some(type_id) = type_id {
+                    self.release_type_slot(&type_id);
+                }
+            } else {
+                tracing::trace!(
+                    secondary = %secondary_id,
+                    worker_id,
+                    task_hash = %task_hash,
+                    "affine terminal for a slot that no longer holds this hash; \
+                     slot already reassigned — ignoring"
+                );
+            }
+        }
+        // Clean the shared hash-keyed ledger ONLY if its single recorded holder
+        // is exactly this (secondary, worker): the affine import's per-secondary
+        // runs share the hash, so the ledger holds at most one of them. Removing
+        // it on the matching terminal keeps the ledger free of a phantom import;
+        // a non-matching terminal leaves the ledger for its recorded holder's
+        // own terminal (or the dead-holder recovery) to settle.
+        let ledger_matches = self
+            .in_flight
+            .get(task_hash)
+            .is_some_and(|e| e.secondary_id == secondary_id && e.local_worker_id == Some(worker_id));
+        if ledger_matches {
+            // The ledger-matching dispatch's type-slot was already released
+            // above via the slot's held task; the entry carries the SAME type,
+            // so do NOT double-release. The remove only clears the phantom
+            // ledger record so it cannot strand a sibling secondary's terminal.
+            self.in_flight.remove(task_hash);
+        }
+    }
+
+    /// True iff ANY worker slot on `secondary_id` is currently `Assigned` to
+    /// `task_hash`. The per-secondary dispatch-idempotency guard for the affine
+    /// import: that import is a per-secondary run-ONCE primitive, but the affine
+    /// placement legitimately drags it in once per dependent work task, so a
+    /// burst of K ready dependents on one secondary can enqueue K import units
+    /// before the first dispatch's cell claim is observed — popping all K dumps
+    /// K concurrent dispatches of the SAME hash onto K workers. Only the first
+    /// actually runs (the secondary answers `already_held` for the rest), and
+    /// those already-held slots NEVER receive a terminal — they strand
+    /// `Assigned`, so `active_workers` never returns to 0 and `RunComplete` never
+    /// fires. Gating the dispatch on "no slot here already holds this hash"
+    /// dispatches the import to exactly ONE worker per secondary (the run-once
+    /// model), dropping the redundant queued copies. Scoped to a single
+    /// secondary's workers, so a legitimate per-secondary run on a DIFFERENT
+    /// secondary is never suppressed.
+    pub(super) fn secondary_has_slot_holding_hash(
+        &self,
+        secondary_id: &str,
+        task_hash: &str,
+    ) -> bool {
+        self.workers.iter().any(|w| {
+            w.secondary_id == secondary_id
+                && matches!(
+                    &w.state,
+                    SlotState::Assigned { task_hash: h, .. } if h == task_hash
+                )
+        })
+    }
+
     /// Reclaim a hash from the QUEUED pool when its terminal lands — the
     /// requeue-then-terminal leg of the run_20260610_221140 race. A
     /// failover-recovery requeue (the inherited-slot reconciliation, or

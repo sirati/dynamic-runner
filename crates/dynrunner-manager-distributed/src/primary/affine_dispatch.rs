@@ -345,6 +345,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }
         }
 
+        // PER-SECONDARY RUN-ONCE DISPATCH GUARD (affine import). The import runs
+        // ONCE per secondary, but the placement drags it in once per dependent
+        // work task, so a burst of K ready dependents on one secondary enqueues K
+        // import units. Without this guard, K idle workers pop all K and dispatch
+        // the SAME hash concurrently before the first dispatch's cell claim is
+        // visible: only one actually runs, the secondary answers `already_held`
+        // for the rest, and those already-held slots NEVER terminal — they strand
+        // `Assigned` so `active_workers` never returns to 0 and `RunComplete`
+        // never fires. If a slot on THIS secondary already holds the import, drop
+        // the redundant unit (the running one's terminal nudges the dependents).
+        // Scoped to this secondary, so a legitimate per-secondary run elsewhere
+        // is unaffected. WORK units are not run-once and never gated here.
+        if !is_work && self.secondary_has_slot_holding_hash(secondary, &hash) {
+            return false;
+        }
+
         // POOL ACCOUNTING (Model B). A WORK unit is a pool item (the
         // phase-drain token): take it OUT of its bucket + `mark_in_flight` so
         // the phase accounting goes queued→in_flight exactly as a global

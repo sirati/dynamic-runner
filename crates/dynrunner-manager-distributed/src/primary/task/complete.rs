@@ -386,9 +386,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.backpressured_secondaries.remove(&secondary_id);
         self.drop_supplanted_holder(&task_hash);
 
-        // (2) WORKER SLOT: free the holding slot + ledger entry (worker
-        // bookkeeping for THIS per-secondary run). NO phase cascade.
-        self.free_slot_on_terminal(&secondary_id, worker_id, &task_hash);
+        // (2) WORKER SLOT: free the holding slot for THIS per-secondary run,
+        // addressed by the terminal's OWN (secondary, worker). NOT the shared
+        // hash-keyed `free_slot_on_terminal`: a per-secondary affine import runs
+        // the SAME hash on multiple secondaries at once, but the hash-keyed
+        // `in_flight` ledger records only one holder, so routing the affine
+        // terminal through it frees the wrong secondary's slot and orphans this
+        // worker's slot Assigned forever (active_workers >= 1 → RunComplete never
+        // fires). NO phase cascade (phase-neutral).
+        self.free_affine_slot_on_terminal(&secondary_id, worker_id, &task_hash);
 
         tracing::debug!(
             secondary = %secondary_id,
