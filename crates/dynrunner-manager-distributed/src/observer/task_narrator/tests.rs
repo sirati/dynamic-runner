@@ -12,7 +12,7 @@ use tracing::Level;
 
 use super::*;
 use crate::cluster_state::StateCounts;
-use crate::task_state_change::{TaskStateChange, TaskStateChangeEvent};
+use crate::task_state_change::{TaskStateChange, TaskStateChangeEvent, TaskTxnId};
 use crate::test_capture::{IMPORTANT_TARGET, LeveledEvent, TargetCapture};
 use dynrunner_core::OBSERVER_TASK_TARGET;
 
@@ -65,10 +65,32 @@ fn capture(body: impl FnOnce()) -> Vec<TargetedEvent> {
 }
 
 fn evt(task_id: &str, change: TaskStateChange, holder: Option<(&str, u32)>) -> TaskStateChangeEvent {
+    // Default: a CREATE (no prior state) with a cold txn id. The from→to
+    // and txn-id tests build their own events with `evt_from` / `evt_txn`.
     TaskStateChangeEvent {
         task_id: task_id.to_string(),
         change,
         holder: holder.map(|(s, w)| (s.to_string(), w)),
+        from: None,
+        txn: TaskTxnId { primary_epoch: 0, seq: 0, attempt: 0 },
+    }
+}
+
+/// An event carrying a known FROM-state and a non-trivial CRDT txn id —
+/// for the from→to + correlator assertions.
+fn evt_from(
+    task_id: &str,
+    change: TaskStateChange,
+    holder: Option<(&str, u32)>,
+    from: &'static str,
+    txn: TaskTxnId,
+) -> TaskStateChangeEvent {
+    TaskStateChangeEvent {
+        task_id: task_id.to_string(),
+        change,
+        holder: holder.map(|(s, w)| (s.to_string(), w)),
+        from: Some(from),
+        txn,
     }
 }
 
@@ -304,6 +326,84 @@ fn baseline_splits_setup_and_affine_out_of_generic_pending() {
         msg.contains("200 secondary-affine"),
         "affine reported flat, no state subdivision: {msg:?}",
     );
+}
+
+/// FROM→TO: a non-terminal transition with a known prior state narrates
+/// "changed state from {prev} to {new}" and carries the CRDT txn id.
+#[test]
+fn other_transition_narrates_from_to_with_txn() {
+    let events = capture(|| {
+        let n = armed();
+        assert!(n.narrate_live(&evt_from(
+            "t1",
+            TaskStateChange::Other { state: "pending" },
+            None,
+            "failed",
+            TaskTxnId { primary_epoch: 3, seq: 7, attempt: 1 },
+        )));
+    });
+    assert_eq!(events.len(), 1, "{events:?}");
+    let msg = &events[0].leveled.event.message;
+    assert!(
+        msg.contains("changed state from failed to pending"),
+        "from→to transition: {msg:?}",
+    );
+    assert!(msg.contains("crdt_txn=e3.v7.a1"), "CRDT txn id: {msg:?}");
+}
+
+/// A CREATE (no prior state) narrates the bare "changed state to {new}"
+/// (no dangling arrow) and still carries the txn id.
+#[test]
+fn other_transition_create_has_no_from_arrow() {
+    let events = capture(|| {
+        let n = armed();
+        assert!(n.narrate_live(&evt("t1", TaskStateChange::Other { state: "pending" }, None)));
+    });
+    let msg = &events[0].leveled.event.message;
+    assert!(msg.contains("changed state to pending"), "{msg:?}");
+    assert!(!msg.contains("from"), "no from-arrow on a CREATE: {msg:?}");
+    assert!(msg.contains("crdt_txn=e0.v0.a0"), "txn id even on a CREATE: {msg:?}");
+}
+
+/// An assignment with a known prior state renders the symmetric
+/// `(pending→in-flight)` transition alongside the holder + txn id.
+#[test]
+fn assigned_narrates_from_to_transition() {
+    let events = capture(|| {
+        let n = armed();
+        assert!(n.narrate_live(&evt_from(
+            "t1",
+            TaskStateChange::Assigned,
+            Some(("sec-a", 3)),
+            "pending",
+            TaskTxnId { primary_epoch: 1, seq: 2, attempt: 0 },
+        )));
+    });
+    let msg = &events[0].leveled.event.message;
+    assert!(msg.contains("assigned to sec-a-3"), "{msg:?}");
+    assert!(msg.contains("(pending→in-flight)"), "from→to transition: {msg:?}");
+    assert!(msg.contains("crdt_txn=e1.v2.a0"), "{msg:?}");
+}
+
+/// A completion with a known prior `in-flight` renders
+/// `(in-flight→completed)` + the holder + the txn id.
+#[test]
+fn completed_narrates_from_to_transition() {
+    let events = capture(|| {
+        let n = armed();
+        assert!(n.narrate_live(&evt_from(
+            "t2",
+            TaskStateChange::Completed,
+            Some(("sec-b", 7)),
+            "in-flight",
+            TaskTxnId { primary_epoch: 0, seq: 0, attempt: 2 },
+        )));
+    });
+    let msg = &events[0].leveled.event.message;
+    assert!(msg.contains("completed on sec-b-7"), "{msg:?}");
+    assert!(msg.contains("(in-flight→completed)"), "from→to transition: {msg:?}");
+    // A version-less Completed reports the attempt-only coordinate.
+    assert!(msg.contains("crdt_txn=e0.v0.a2"), "version-less completed txn: {msg:?}");
 }
 
 /// An EMPTY baseline (cold-join before any snapshot) emits NO summary

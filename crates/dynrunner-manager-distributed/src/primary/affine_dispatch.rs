@@ -623,47 +623,74 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
     }
 
-    /// Terminal-fail an affine-dep WORK task whose import `Failed` on every
-    /// eligible secondary (the `Unsatisfiable` gate verdict) — the cascade that
-    /// breaks the all-`Failed` livelock and realizes the owner Q1 default
-    /// (affine failure terminal-by-default).
+    /// Claim a queued affine-dep WORK item for terminal failure: take it OUT of
+    /// its bucket + `mark_in_flight`. Returns `true` iff the item was in a
+    /// dispatchable bucket (so a failure must now follow), `false` if the claim
+    /// is stale (already taken / phase not Active — nothing to fail).
     ///
-    /// Takes the work item OUT of its bucket + `mark_in_flight` (the SAME
-    /// symmetric accounting the dispatch path does, so the subsequent
-    /// `on_item_failed_permanent` in-flight decrement balances — the item was
-    /// never globally dispatched but is queued, so without this the decrement
-    /// would corrupt a sibling's slot), then enqueues a decoupled
-    /// `PrimaryCommand::FailPermanent` onto the self command channel. The
-    /// operational loop drives `apply_fail_permanent` with the proper
-    /// `command_rx` (the dispatch path holds none) — the dispatch-decoupling
-    /// law: the dispatch path EMITS a command, it never drives the cascade
-    /// inline. A `Full`/`Closed` channel is a degenerate teardown state; the
-    /// drop is benign (the run is winding down). The reply oneshot is
-    /// fire-and-forget (the dropped receiver is the documented in-runtime
-    /// shape).
-    fn fail_unsatisfiable_affine_work(&mut self, hash: &str, phase: &dynrunner_core::PhaseId) {
-        // Take the queued work item out of its bucket; if it is not in a
-        // dispatchable bucket (already taken / phase not Active), the claim is
-        // stale and there is nothing to fail here — drop quietly.
+    /// The bucket-take + in-flight bump is the SAME symmetric accounting a real
+    /// dispatch does, so the subsequent `on_item_failed_permanent` in-flight
+    /// DECREMENT (run by `apply_fail_permanent`, whichever way the failure is
+    /// executed) balances — the item was never globally dispatched but is queued,
+    /// so without this the decrement would corrupt a sibling's slot. The single
+    /// owner of this accounting, shared by the per-dispatch single-item path
+    /// ([`Self::fail_unsatisfiable_affine_work`]) and the event-driven batch path
+    /// ([`Self::fast_fail_affine_dependents_if_unsatisfiable`]).
+    #[must_use]
+    fn claim_affine_work_for_fail(&mut self, hash: &str, phase: &dynrunner_core::PhaseId) -> bool {
         let target = hash.to_string();
         if self
             .pool_mut()
             .take_first_match(|t| compute_task_hash(t) == target)
             .is_none()
         {
-            return;
+            return false;
         }
         self.pool_mut().mark_in_flight(phase);
-        let (reply, _rx) = tokio::sync::oneshot::channel();
-        let reason = format!(
+        true
+    }
+
+    /// The canonical reason string for an affine dependent whose import failed
+    /// on every eligible secondary — shared by the single-item + batch paths so
+    /// the operator-visible terminal message is identical.
+    fn affine_unsatisfiable_reason(hash: &str) -> String {
+        format!(
             "affine import for work task {hash} FAILED on every eligible \
              secondary — the per-secondary import cannot be satisfied anywhere, \
              so the dependent is permanently unfulfillable"
-        );
+        )
+    }
+
+    /// Terminal-fail an affine-dep WORK task whose import `Failed` on every
+    /// eligible secondary (the `Unsatisfiable` gate verdict) — the cascade that
+    /// breaks the all-`Failed` livelock and realizes the owner Q1 default
+    /// (affine failure terminal-by-default).
+    ///
+    /// THE DISPATCH-PATH (single-item) caller: invoked from
+    /// [`Self::dispatch_affine_unit`]'s `Unsatisfiable` arm, which holds NO
+    /// `command_rx` — the dispatch-decoupling law: the dispatch path EMITS a
+    /// command, it never drives the cascade inline. This is ALWAYS a SINGLE
+    /// dependent per call (one popped unit), never a burst, so the bounded self
+    /// command channel ([`COMMAND_CHANNEL_CAPACITY`]) is never overflowed by it.
+    /// The event-driven BURST (an all-`Failed` gate's whole dependent set) takes
+    /// the direct path instead ([`Self::fast_fail_affine_dependents_if_unsatisfiable`]),
+    /// precisely BECAUSE a bounded channel cannot carry thousands of dependents
+    /// in one sweep without dropping the overflow.
+    ///
+    /// A `Full`/`Closed` channel is a degenerate teardown state; the drop is
+    /// benign (the run is winding down). The reply oneshot is fire-and-forget
+    /// (the dropped receiver is the documented in-runtime shape).
+    fn fail_unsatisfiable_affine_work(&mut self, hash: &str, phase: &dynrunner_core::PhaseId) {
+        // Claim the queued work item (take out of bucket + mark in-flight); a
+        // stale claim has nothing to fail — drop quietly.
+        if !self.claim_affine_work_for_fail(hash, phase) {
+            return;
+        }
+        let (reply, _rx) = tokio::sync::oneshot::channel();
         let cmd = super::command_channel::PrimaryCommand::FailPermanent {
-            hash: target,
+            hash: hash.to_string(),
             error: dynrunner_core::ErrorType::NonRecoverable,
-            reason,
+            reason: Self::affine_unsatisfiable_reason(hash),
             reply,
         };
         if let Err(err) = self.command_tx.try_send(cmd) {
@@ -679,6 +706,125 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             );
             self.pool_mut().on_item_finished(phase, None);
         }
+    }
+
+    /// EVENT-DRIVEN BATCH fast-fail for an affine import that just FAILED on a
+    /// secondary (the live trigger from
+    /// [`PrimaryCoordinator::handle_affine_task_failed`], called right after the
+    /// terminal flips the cell `→ Failed`). When that failure makes the affine
+    /// gate transition to all-eligible-`Failed` — the import can no longer run on
+    /// any roster secondary — enumerate EVERY WORK unit depending on that
+    /// `affine_id` and terminal-fail the ones that are now `Unsatisfiable` in ONE
+    /// sweep, instead of waiting for each dependent to be popped for a worker and
+    /// lazily gated `Unsatisfiable` at dispatch time (the per-dispatch-tick drain
+    /// that starved the phase: ~0.2 fails/sec across 12.5k dependents).
+    ///
+    /// ## Why this is NOT a new policy
+    /// The terminal-fail decision is the EXACT same predicate the per-dispatch
+    /// gate ([`Self::affine_readiness_gate`] → `Unsatisfiable`) already uses:
+    /// [`Self::affine_unit_satisfiable_secondaries`] is empty (no roster
+    /// secondary can satisfy EVERY one of the dependent's affine deps). A
+    /// dependent with another satisfiable secondary (a `Done`/`Queued`/`NotDone`
+    /// cell elsewhere — incl. a fresh all-`NotDone` secondary) is left untouched,
+    /// so this never over-fast-fails: it is the same roster-aware `Unsatisfiable`
+    /// semantics, applied EAGERLY + BATCHED on the failure transition rather than
+    /// LAZILY per dispatch tick. A dependent with a SECOND affine dep that is
+    /// still placeable somewhere is NOT failed here — only the genuinely-doomed
+    /// ones are.
+    ///
+    /// Each doomed dependent is claimed out of its bucket
+    /// ([`Self::claim_affine_work_for_fail`]) and the whole set is terminal-failed
+    /// by ONE [`PrimaryCoordinator::apply_fail_permanent_batch`] — NOT by
+    /// enqueuing `FailPermanent`s onto the bounded self command channel, and NOT
+    /// by calling `apply_fail_permanent` per item. Two scale flaws this closes:
+    ///
+    ///  1. The channel is bounded ([`COMMAND_CHANNEL_CAPACITY`]), so a
+    ///     synchronous burst of N≫capacity `try_send`s would `Err(Full)` past the
+    ///     cap and DROP the overflow dependents — each already out of its bucket
+    ///     and accounted in-flight, hence permanently LOST (never terminal → the
+    ///     run hangs). The trigger
+    ///     ([`PrimaryCoordinator::handle_affine_task_failed`]) is the operational
+    ///     loop's terminal handler, which HOLDS `command_rx` (unlike the dispatch
+    ///     path), so the burst is failed DIRECTLY — no channel between it and the
+    ///     cascade, nothing dropped no matter how many dependents fail.
+    ///  2. Failing per item would do N broadcasts (each pushed onto the mesh send
+    ///     queue) + N phase-lifecycle passes — an op-loop stall + a mesh-send
+    ///     flood. `apply_fail_permanent_batch` accumulates ALL terminal mutations
+    ///     and broadcasts them ONCE, then runs the lifecycle cascade ONCE.
+    ///
+    /// (The single-item dispatch-path arm keeps the EMIT — it is never a burst.)
+    ///
+    /// The batch is idempotent against an already-terminal dependent (it dedups
+    /// via `failed_tasks` / the CRDT terminal), and a non-bucket / stale
+    /// dependent is dropped by the `claim` returning `false`, so a later stale
+    /// per-secondary re-pop of the same unit is a harmless no-op and the gate is
+    /// effectively not re-evaluated per dependent. Resolving the failed hash to
+    /// no `affine_id` (an ordinary work terminal) is a no-op.
+    pub(crate) async fn fast_fail_affine_dependents_if_unsatisfiable(
+        &mut self,
+        failed_task_hash: &str,
+        command_rx: &mut Option<tokio::sync::mpsc::Receiver<super::command_channel::PrimaryCommand<I>>>,
+    ) {
+        // The terminal must be an AFFINE import for a fast-fail to apply; an
+        // ordinary work terminal binds to no affine-id.
+        let Some(affine_id) = self.cluster_state.affine_id_for_hash(failed_task_hash) else {
+            return;
+        };
+
+        // Enumerate every WORK unit that depends on this affine_id and is NOW
+        // unsatisfiable on the whole roster (the gate's `Unsatisfiable` shape).
+        // Build the `(hash, phase)` failure list first, holding no live ledger
+        // borrow into the mutating fail sweep.
+        let doomed: Vec<(String, dynrunner_core::PhaseId)> = self
+            .cluster_state
+            .tasks_iter()
+            .filter_map(|(_, state)| {
+                let def = state.def();
+                if def.kind.is_secondary_affine() {
+                    return None;
+                }
+                let task = self.cluster_state.task_to_info(state);
+                let placement = self.affine_placement_for(&task);
+                // Only units that actually depend on the just-failed affine_id —
+                // a failure on one import cannot doom a unit that never needed it.
+                if !placement.affine_deps.iter().any(|(aid, _)| *aid == affine_id) {
+                    return None;
+                }
+                // The EXACT `Unsatisfiable` predicate the per-dispatch gate uses:
+                // no roster secondary can satisfy EVERY affine dep of this unit.
+                // A unit with another still-satisfiable secondary (incl. a fresh
+                // all-`NotDone` one, or a second dep placeable elsewhere) is left
+                // for the normal dispatch/reroute path — never over-fast-failed.
+                if !self
+                    .affine_unit_satisfiable_secondaries(&placement)
+                    .is_empty()
+                {
+                    return None;
+                }
+                Some((placement.hash.clone(), task.phase_id.clone()))
+            })
+            .collect();
+
+        // CLAIM each doomed dependent out of its bucket (+ mark in-flight) so the
+        // batch's `on_item_failed_permanent` decrement balances. A stale claim
+        // (already taken / phase not Active) is skipped — nothing to fail there.
+        // Only the successfully-claimed items go to the batch, keeping the
+        // claim ↔ decrement accounting exactly paired.
+        let claimed: Vec<(String, dynrunner_core::ErrorType, String)> = doomed
+            .into_iter()
+            .filter_map(|(hash, phase)| {
+                self.claim_affine_work_for_fail(&hash, &phase).then(|| {
+                    let reason = Self::affine_unsatisfiable_reason(&hash);
+                    (hash, dynrunner_core::ErrorType::NonRecoverable, reason)
+                })
+            })
+            .collect();
+
+        // ONE broadcast + ONE lifecycle pass for the whole burst — no bounded
+        // channel (⇒ no overflow ⇒ none lost) and no N-broadcast mesh flood — so
+        // the all-Failed gate's dependents fail promptly in a single batch
+        // instead of draining one per dispatch tick.
+        self.apply_fail_permanent_batch(claimed, command_rx).await;
     }
 
     /// The candidate secondaries for affine rank selection: the live roster
