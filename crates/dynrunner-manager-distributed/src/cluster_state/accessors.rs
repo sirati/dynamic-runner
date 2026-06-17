@@ -683,6 +683,35 @@ impl<I: Identifier> ClusterState<I> {
         for st in self.tasks.values() {
             let entry = base.entry(&st.def().phase_id).or_insert((false, false));
             entry.0 = true;
+            // `has_live` (the phase-end blocker `phase_can_proceed` vetoes on)
+            // EXCLUDES `SecondaryAffine` tasks, EXACTLY as the pool's
+            // `queued_count` does via the SAME `counts_for_phase_drain`
+            // predicate — the rollup-side twin of the pool's affine exclusion
+            // (#642). A `SecondaryAffine` task is a non-worker-assignable
+            // per-secondary LEDGER TOKEN whose "completion" is the per-secondary
+            // bitvector, NOT a global terminal `TaskState`; its global state can
+            // stay non-terminal indefinitely (a BARRIER import satisfied off the
+            // worker-`TaskComplete` path; the ~323 lazy/NotDone import gates of a
+            // build phase). Counting it as live would pin `has_live = true`
+            // forever and `phase_can_proceed` would veto `PhaseEnded` even after
+            // every WORK task terminalized — the run stalls at the phase
+            // boundary. The phase's affine HOLD is owned SOLELY by the pool's
+            // separate `phase_has_live_affine_prereq` guard, which runs BEFORE a
+            // phase is surfaced as drained; by the time `phase_can_proceed`
+            // reads this rollup the pool has already cleared that hold, so the
+            // rollup re-applying `is_terminal()` to the affine is a divergent
+            // double gate. The affine's DEPENDENCY-gating of its dependent work
+            // is a SEPARATE mechanism (the `TaskDep` edge / per-secondary
+            // bitvector) untouched by this count — the work still waits on the
+            // import; only the phase's `has_live` bit changes. `has_any` keeps
+            // the affine (a task the phase genuinely owns): an affine-only phase
+            // must still read `has_any = true` so `phase_can_proceed`'s
+            // `has_any && !has_live` arm and the narrator's start/complete edges
+            // fire for it (#617 affine-only-phase proceed path; the narrator's
+            // `has_any && phase_boundary_open` start edge).
+            if !st.def().kind.counts_for_phase_drain() {
+                continue;
+            }
             if !st.is_terminal() {
                 entry.1 = true;
             }

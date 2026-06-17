@@ -14,6 +14,20 @@ fn mk_affine_task(name: &str) -> TaskInfo<RunnerIdentifier> {
     t
 }
 
+/// A `TaskKind::SecondaryAffine` task in a chosen phase (twin of `mk_task_in`).
+fn mk_affine_task_in(name: &str, phase: &str) -> TaskInfo<RunnerIdentifier> {
+    let mut t = mk_affine_task(name);
+    t.phase_id = PhaseId::from(phase);
+    t
+}
+
+/// A `Work` task in a chosen phase (twin of `mk_task`, phase-parameterized).
+fn mk_work_task_in(name: &str, phase: &str) -> TaskInfo<RunnerIdentifier> {
+    let mut t = mk_task(name);
+    t.phase_id = PhaseId::from(phase);
+    t
+}
+
 /// Originating a `SecondaryAffine` `TaskAdded` through the broadcast choke
 /// point reserves an affine-id, INJECTS a paired `SecondaryAffineRegistered`,
 /// and binds the def's content hash to that affine-id. A NON-affine task gets
@@ -225,6 +239,238 @@ fn affine_id_binding_survives_snapshot_restore_into_fresh_replica() {
         "the restored replica must re-anchor the affine-id from the def's \
          inline field — else affine placement finds no affine deps and the \
          import never dispatches"
+    );
+}
+
+// ── phase_rollups SecondaryAffine exclusion (rollup-side twin of #642) ──
+//
+// `phase_rollups().has_live` is the phase-end blocker `phase_can_proceed`
+// vetoes on. A `SecondaryAffine` task's global `TaskState` can stay
+// non-terminal indefinitely (its real "completion" is the per-secondary
+// bitvector, not a global terminal), so counting it as live would pin
+// `has_live = true` forever and the phase would never end after its WORK
+// terminalized — the matrix_eval→dependency_graph stall. The fix excludes
+// `SecondaryAffine` from `has_live` (NOT from `has_any`), matching the pool's
+// `queued_count` via the SAME `counts_for_phase_drain` predicate.
+
+/// matrix_eval-SHAPE: a phase with one NON-terminal `SecondaryAffine` BARRIER
+/// import + two TERMINAL `Work` tasks reads `has_live == false` (the affine is
+/// excluded), so `phase_can_proceed`'s `has_any && !has_live` arm fires.
+///
+/// REVERT-CONFIRM (pre-fix): the affine's `Pending` `TaskState` set
+/// `has_live = true` and `phase_can_proceed` vetoed `PhaseEnded` forever — the
+/// observed live stall.
+#[test]
+fn phase_rollup_excludes_nonterminal_affine_barrier_from_has_live() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    // 1 affine BARRIER (stays Pending — never gets a worker TaskComplete) +
+    // 2 work tasks, all in phase `me`.
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "barrier".into(),
+        task: mk_affine_task_in("barrier", "me"),
+        def_id: None,
+    });
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "w0".into(),
+        task: mk_work_task_in("w0", "me"),
+        def_id: None,
+    });
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "w1".into(),
+        task: mk_work_task_in("w1", "me"),
+        def_id: None,
+    });
+    // Both WORK tasks terminalize; the affine barrier stays Pending.
+    s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "w0".into(),
+        result_data: None,
+    });
+    s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "w1".into(),
+        result_data: None,
+    });
+
+    let rollups = s.phase_rollups();
+    let me = PhaseId::from("me");
+    let r = rollups.get(&me).expect("phase present");
+    assert!(r.has_any, "the phase owns tasks (affine kept in has_any)");
+    assert!(
+        !r.has_live,
+        "a non-terminal SecondaryAffine barrier must NOT count as live work \
+         (rollup-side twin of the pool's queued_count exclusion); pre-fix it \
+         pinned has_live=true and stalled the phase boundary"
+    );
+}
+
+/// BUILD-SHAPE (proves GLOBAL scope): a phase with MANY (5) NON-terminal
+/// `SecondaryAffine` import gates + a TERMINAL `Work` task reads
+/// `has_live == false`. The rollup loop builds every phase's entry, so the
+/// exclusion is global by construction — not a one-phase special case.
+///
+/// REVERT-CONFIRM (pre-fix): the 5 `Pending` import gates kept
+/// `has_live = true` after the build work terminalized — the re-stall at
+/// end-of-BUILD the consumer's ~323 import gates would hit.
+#[test]
+fn phase_rollup_excludes_many_affine_gates_global_scope() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    for i in 0..5 {
+        let id = format!("gate{i}");
+        s.apply(ClusterMutation::TaskAdded {
+            hash: id.clone(),
+            task: mk_affine_task_in(&id, "build"),
+            def_id: None,
+        });
+    }
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "build_variant".into(),
+        task: mk_work_task_in("build_variant", "build"),
+        def_id: None,
+    });
+    // The build work terminalizes; all 5 import gates stay Pending (NotDone).
+    s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "build_variant".into(),
+        result_data: None,
+    });
+
+    let rollups = s.phase_rollups();
+    let build = PhaseId::from("build");
+    let r = rollups.get(&build).expect("phase present");
+    assert!(r.has_any, "the phase owns tasks");
+    assert!(
+        !r.has_live,
+        "MANY non-terminal SecondaryAffine gates must ALL be excluded from \
+         has_live — the exclusion is global (the rollup loop builds every \
+         phase's entry), not a single-phase special case"
+    );
+}
+
+/// DEPENDENCY-GATING PRESERVED: excluding the affine from the phase COUNT does
+/// NOT touch the dependency edge. A `Work` task `Blocked` on the affine import
+/// stays `Blocked` (its `TaskDep` is intact) — the count change is orthogonal
+/// to the dependency mechanism that gates the work's dispatch. Because that
+/// `Blocked` work task is a NON-affine LIVE task, the phase correctly still
+/// reads `has_live == true` (it is NOT prematurely proceeded).
+#[test]
+fn affine_exclusion_preserves_dependent_blocked_edge() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "imp".into(),
+        task: mk_affine_task_in("imp", "p"),
+        def_id: None,
+    });
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "dep".into(),
+        task: mk_work_task_in("dep", "p"),
+        def_id: None,
+    });
+    // The dependent work is Blocked on the affine import — the dependency edge.
+    s.apply(ClusterMutation::TaskBlocked {
+        hash: "dep".into(),
+        on: "imp".into(),
+    });
+
+    // The dependency edge is intact: the work is still Blocked (not dispatched).
+    assert!(
+        matches!(s.task_state("dep"), Some(TaskState::Blocked { .. })),
+        "the affine count change must NOT touch the TaskDep edge — the work \
+         still waits on the import"
+    );
+    // And the phase reads has_live=true because of the BLOCKED WORK (a live
+    // non-affine task), NOT because of the affine — proving the exclusion is
+    // surgical to the affine, not a blanket suppression.
+    let rollups = s.phase_rollups();
+    let p = PhaseId::from("p");
+    let r = rollups.get(&p).expect("phase present");
+    assert!(
+        r.has_any && r.has_live,
+        "a live Blocked WORK dependent keeps the phase live (the affine \
+         exclusion does not prematurely proceed it)"
+    );
+}
+
+/// REGRESSION: a phase with a genuine NON-affine non-terminal `Work` task still
+/// reads `has_live == true` — the exclusion is scoped to `SecondaryAffine` and
+/// does NOT let an ordinary live phase proceed prematurely.
+#[test]
+fn phase_rollup_genuine_nonaffine_live_still_holds_phase() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "affine".into(),
+        task: mk_affine_task_in("affine", "p"),
+        def_id: None,
+    });
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "live_work".into(),
+        task: mk_work_task_in("live_work", "p"),
+        def_id: None,
+    });
+    // The work stays Pending (live); the affine stays Pending too.
+    let rollups = s.phase_rollups();
+    let p = PhaseId::from("p");
+    let r = rollups.get(&p).expect("phase present");
+    assert!(
+        r.has_any && r.has_live,
+        "a genuine non-terminal WORK task must keep has_live=true — the \
+         exclusion must not over-fire and proceed a still-live phase"
+    );
+}
+
+/// #617 AFFINE-ONLY PHASE: a phase whose ONLY content is `SecondaryAffine`
+/// tasks keeps `has_any == true` (the affine is a task the phase genuinely
+/// owns). Once the affine's first per-secondary run records its global terminal
+/// (the `TaskCompleted` the manager originates on first run, complete.rs), the
+/// phase reads `has_any && !has_live` and `phase_can_proceed`'s primary arm
+/// fires — the SAME path a work phase takes. Keeping the affine in `has_any`
+/// (rather than excluding it from both) is what preserves this: excluding it
+/// from `has_any` would make an affine-only phase read `has_any == false`,
+/// dropping it out of the proceed arm AND the narrator's start/complete edges.
+///
+/// Pre-terminal (the affine's global state is still Pending) the phase reads
+/// `has_any && !has_live`? NO — `has_live` is false (affine excluded), so the
+/// rollup gate would PASS early. That is SAFE here precisely because this gate
+/// is consulted ONLY after the POOL surfaces the phase as drained, and the
+/// pool's separate `phase_has_live_affine_prereq` guard holds the affine-only
+/// phase open until that first-run terminal (#617's premature-drain guard) —
+/// the pool, not the rollup, owns the affine HOLD.
+#[test]
+fn phase_rollup_affine_only_phase_keeps_has_any() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "only".into(),
+        task: mk_affine_task_in("only", "affine_only"),
+        def_id: None,
+    });
+
+    // Before the affine's global terminal: has_any TRUE (the phase owns the
+    // affine), has_live FALSE (the affine is excluded from has_live).
+    {
+        let rollups = s.phase_rollups();
+        let ph = PhaseId::from("affine_only");
+        let r = rollups.get(&ph).expect("affine-only phase present");
+        assert!(
+            r.has_any,
+            "an affine-only phase must keep has_any=true so phase_can_proceed's \
+             primary arm and the narrator's start/complete edges fire for it"
+        );
+        assert!(!r.has_live, "the affine is excluded from has_live");
+    }
+
+    // After the affine's first-run global terminal (the manager's first-run
+    // TaskCompleted): the phase reads has_any && !has_live — the proceed arm.
+    s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "only".into(),
+        result_data: None,
+    });
+    let rollups = s.phase_rollups();
+    let ph = PhaseId::from("affine_only");
+    let r = rollups.get(&ph).expect("affine-only phase present");
+    assert!(
+        r.has_any && !r.has_live,
+        "post-terminal affine-only phase takes the has_any && !has_live arm"
     );
 }
 
