@@ -870,6 +870,18 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// fire (the `Option::take` IS the fire-once latch, alongside the
     /// `discovery_debt() == Owed` gate — the V6 CRDT-intrinsic latch).
     pub(super) setup_discovery: Option<crate::discovery::SetupDiscovery<I>>,
+    /// The IN-FLIGHT mode-2 discovery — the STARTED `discover_items` future plus
+    /// the phase graph it seeds alongside its result. `Some` only between the
+    /// operational loop's entry-time `start_discovery_if_owed` (which moves
+    /// [`Self::setup_discovery`]'s policy into a started future here, gated on
+    /// `discovery_debt() == Owed`) and the discovery `select!` arm resolving it
+    /// (`finish_discovery` seeds the ledger + re-hydrates, then takes this back
+    /// to `None`). `None` on every non-relocated primary (the gate never seeds
+    /// it) and after the single discovery fire — so the arm is inert. Held here,
+    /// not as a loop-local, so the arm can poll it CONCURRENTLY with every
+    /// sibling arm (the primary stays app-alive + services setup while the ~6min
+    /// collect-all runs) — the fix for the sequential-pre-loop-await app-silence.
+    pub(super) discovery_in_flight: Option<crate::discovery::InFlightDiscovery<I>>,
     /// Phases that have already had `on_phase_start` fired. The pool's
     /// state machine doesn't track "did we observe this transition" —
     /// that's the manager's bookkeeping, kept here so the pool stays
@@ -1884,6 +1896,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             prefer_dependency_decision_count: 0,
             prefer_dependency_gate_armed: false,
             setup_discovery: None,
+            discovery_in_flight: None,
             phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
             own_tick_health,
@@ -5296,88 +5309,72 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `bootstrap_kind` (relocation vs failover) gates the bring-up
             // reservation below.
             BootstrapRole::PromotedDestination(bootstrap_kind) => {
-                // Mode-2 discover-on-promotion (V6). Runs the consumer's
-                // discovery policy IFF the CRDT declares discovery `Owed` (a
+                // Mode-2 discover-on-promotion (V6), as a CONCURRENT op-loop
+                // arm (not a sequential pre-loop await). START the discovery
+                // future here IFF the CRDT declares discovery `Owed` (a
                 // relocated compute-peer primary, or an in-process
                 // `--source-already-staged` local primary, that inherited the
-                // empty-ledger + `Owed` marker via its snapshot), originates
-                // `PhaseDepsSet + TaskAdded* + DiscoverySettled` (NO
-                // run-terminal — an all-skipped / empty corpus finalizes
-                // through the counter machinery once its trailing re-hydrate
-                // projects the skips into `completed_tasks`, exactly as mode-1),
-                // and re-hydrates the pool. INERT on a failover/promotion of an
-                // already-seeded run (reads `Settled`, so the gate short-
-                // circuits). ORDERING is load-bearing: BEFORE
-                // `fire_initial_phase_starts` + the empty-phase cascade so, by
-                // the time the cascade evaluates its `discovery_debt() != Owed`
-                // gate, the driver has already flipped `Owed → Settled` and
-                // hydrated the discovered tasks. The setup peer never reaches
-                // this function (it relocated above), so a setup peer that owed
-                // debt without a discovery policy hands the `Owed` marker on
-                // untouched — the "Owed but no policy = hard error" branch is
-                // reachable ONLY by a `PromotionSnapshot` primary (which MUST
-                // carry the policy). See `mode2-discovery-design.md` Part 3.
-                self.discover_on_promotion().await?;
+                // empty-ledger + `Owed` marker via its snapshot): the consumer
+                // `discover_items` policy is fired ONCE and its started future
+                // parked on `self.discovery_in_flight` for the operational
+                // loop's discovery `select!` arm to poll. INERT on a
+                // failover/promotion of an already-seeded run (reads `Settled`,
+                // so the gate short-circuits and nothing is parked → the arm is
+                // inert). The "Owed but no policy = hard error" branch lives in
+                // `start_discovery_if_owed` and is reachable ONLY by a
+                // `PromotionSnapshot` primary (the setup peer relocated above).
+                //
+                // WHY a concurrent arm, not the old `discover_on_promotion`
+                // await here: `discover_items` is collect-all (~6 min for a 46k
+                // corpus). Awaiting it inline parks the WHOLE operational
+                // control flow for that window — the keepalive arm never fires
+                // (peers see app-silence → primary_silence_exceeded) and the
+                // setup-servicing arms never run (secondaries sit at the 300s
+                // setup deadline → failover election). Parking the future on a
+                // field + polling it as one arm keeps every sibling arm
+                // (inbox, command, heartbeat→keepalive, worker-mgmt→setup-
+                // servicing) running while discovery resolves.
+                //
+                // The SEED + `fire_initial_phase_starts` + empty-phase cascade
+                // + re-hydrate that this used to do post-await now run in the
+                // discovery arm's ON-RESOLVE body (`finish_discovery_arm`),
+                // gated by the arm firing at most once. They are NOT run here:
+                // while discovery is owed the ledger is unseeded and every
+                // declared phase is a transiently-empty `Active`, so firing
+                // starts / draining now would narrate + false-drain phantom
+                // phases. See `finish_discovery_arm` for the on-resolve order.
+                self.start_discovery_if_owed()?;
 
-                // Fire on_phase_start for every phase the pool initialised as
-                // Active (zero-deps phases), THEN cascade trivially-empty
-                // phases. Subsequent activations triggered by `mark_phase_done`
-                // are observed via `process_phase_lifecycle`.
+                // Fire on_phase_start + cascade the empty phases — but ONLY on
+                // the non-discovery paths (`Undeclared` cold mode-1, already-
+                // `Settled` failover). On the discovery-`Owed` path these are
+                // deferred to the discovery arm's on-resolve body, which seeds
+                // first and fires them against the populated ledger. The gate is
+                // the SAME `discovery_debt() != Owed` predicate the cascade
+                // already used; `fire_initial_phase_starts` is now folded UNDER
+                // it (it would otherwise narrate + demand workers for phantom
+                // Owed phases).
                 //
                 // The fire-before-cascade COUPLING is kept intact (the
                 // cascade's `on_phase_end(.., 0, 0)` for an empty initial phase
-                // must come AFTER that phase's `on_phase_start`, so
-                // `fire_initial_phase_starts` stays immediately before the
-                // cascade). The 3a/3b duplicate discriminator is STRUCTURAL
-                // (the code path — `originate_cold_seed` vs `apply_spawn_tasks`
-                // — not a runtime read of `phase_started_emitted`);
-                // `phase_started_emitted` is seeded by hydrate (V3).
-                self.fire_initial_phase_starts();
-
-                // Trivially-empty Active phases (no items at all) need to drain
-                // and cascade Done before initial assignment, otherwise their
-                // `Blocked` dependents — which may hold all the run's actual
-                // work — never become visible to `view_for_worker`. Triggers
-                // `on_phase_end(.., 0, 0)` for each empty phase via the
-                // lifecycle cascade. Runs BEFORE the seed/assignment step
-                // below, preserving the load-bearing "cascade before initial
-                // assignment" ordering.
+                // must come AFTER that phase's `on_phase_start`). The 3a/3b
+                // duplicate discriminator is STRUCTURAL (the code path —
+                // `originate_cold_seed` vs `apply_spawn_tasks` — not a runtime
+                // read of `phase_started_emitted`); `phase_started_emitted` is
+                // seeded by hydrate (V3).
                 //
-                // Required at this pre-loop site (not optional): a consumer
-                // `on_phase_end` callback fired by the initial-empty-phase
-                // cascade can itself queue `spawn_tasks(next_phase_items)`, and
-                // the cascade's next `drain_empty_active_phases` poll would
-                // otherwise false-fire `on_phase_end(.., 0, 0)` on the
-                // successor phase exactly the way the in-loop bug class did.
-                // The `command_rx` taken above is handed into
-                // `process_phase_lifecycle` so the cascade's per-iteration
-                // drain step picks up callback-queued `SpawnTasks` /
-                // `FailPermanent` / `ReinjectTask` /
-                // `UpdatePreferredSecondaries` commands inline.
-                //
-                // Required because `operational_loop`'s entry-time exit check
-                // (`completed + failed >= total_tasks && active_workers == 0`)
-                // trips IMMEDIATELY on entry if every pre-loop-dispatched task
-                // happens to finish (and have its on_phase_end fire) during a
-                // pre-loop wait — without inline drain, the SpawnTasks command
-                // sits on the channel until the entry-time check that exits the
-                // loop without ever polling it. Asm-tokenizer's lazy-spawn
-                // consumer pattern (`FullPipelineTask.on_phase_end →
-                // primary_handle.spawn_tasks`) is the live consumer.
-                //
-                // Gated on `discovery_debt() != Owed` (V6): while discovery is
-                // owed the ledger is unseeded and every declared phase is a
-                // transiently-empty `Active` — draining it now would mark every
-                // phase `Drained` and fire spurious `on_phase_end(.., 0, 0)`.
-                // `discover_on_promotion` (run above) flips `Owed → Settled`
-                // after seeding, so by the time the cascade evaluates this gate
-                // the debt is cleared and the discovered work is hydrated. On
-                // every already-seeded / failover path the marker is
-                // `Undeclared`/`Settled`, so the gate is open. Both halves (the
-                // drain + the cascade) stay paired under ONE gate.
+                // The cascade is required at this pre-loop site (not optional):
+                // a consumer `on_phase_end` callback fired by the initial-empty-
+                // phase cascade can itself queue `spawn_tasks(next_phase_items)`,
+                // and the cascade's next `drain_empty_active_phases` poll would
+                // otherwise false-fire `on_phase_end(.., 0, 0)` on the successor
+                // phase exactly the way the in-loop bug class did. The
+                // `command_rx` taken above is handed into
+                // `process_phase_lifecycle` so the cascade's per-iteration drain
+                // step picks up callback-queued `SpawnTasks` / `FailPermanent` /
+                // `ReinjectTask` / `UpdatePreferredSecondaries` commands inline.
                 if self.cluster_state.discovery_debt() != DiscoveryDebt::Owed {
-                    self.pool_mut().drain_empty_active_phases();
-                    self.process_phase_lifecycle(&mut command_rx).await;
+                    self.run_initial_phase_cascade(&mut command_rx).await;
                 }
 
                 // PROMOTION REPLAY (F5): dispatch every `Unhandled`
@@ -5767,6 +5764,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         );
 
         Ok(())
+    }
+
+    /// The initial-phase cascade — Segment A of the operational primary's
+    /// task-DEPENDENT bring-up tail. `fire_initial_phase_starts` (narrate +
+    /// worker-demand the now-Active phases), then drain trivially-empty Active
+    /// phases and run the lifecycle cascade so an empty initial phase reaches
+    /// `Done`, unblocks its work-bearing dependents, and a consumer
+    /// `on_phase_end` hook can lazily inject the next phase inline (the
+    /// `command_rx` threads callback-queued SpawnTasks into the cascade's
+    /// drain). Shared by BOTH callers so the fire-before-cascade coupling lives
+    /// in ONE place:
+    ///   * the `run_pipeline` pre-loop (the `Undeclared`/`Settled` non-discovery
+    ///     path — runs inline, gated `!= Owed`); and
+    ///   * the discovery arm's on-resolve ([`Self::finish_discovery_arm`], the
+    ///     `Owed` path — deferred until AFTER discovery seeds, so it narrates +
+    ///     drains against the populated ledger rather than phantom-empty phases).
+    pub(super) async fn run_initial_phase_cascade(
+        &mut self,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) {
+        self.fire_initial_phase_starts();
+        self.pool_mut().drain_empty_active_phases();
+        self.process_phase_lifecycle(command_rx).await;
     }
 
     /// Pre-loop collapse bail-out: put the borrowed command-channel receiver

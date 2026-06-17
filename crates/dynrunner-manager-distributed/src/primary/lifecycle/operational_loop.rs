@@ -33,6 +33,7 @@ const ARM_SNAPSHOT_STREAM: usize = 12;
 const ARM_SETTLED_SPILL: usize = 13;
 const ARM_PULL: usize = 14;
 const ARM_PERSISTENT_DIAL_FAILURE: usize = 15;
+const ARM_DISCOVERY: usize = 16;
 
 /// Arm names, index-aligned with the `ARM_*` ids above. The render order of
 /// the compact stats line.
@@ -53,6 +54,7 @@ pub(crate) const OP_LOOP_ARM_NAMES: &[&str] = &[
     "settled_spill",
     "pull",
     "persistent_dial_failure",
+    "discovery",
 ];
 
 /// Follow-on batch-drain cap for the inbox arm (#491, mirrored from the
@@ -484,6 +486,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // iterations re-park on `pending().await`, mirroring the
         // secondary's panik arm.
         let mut panik_signal_rx = self.panik_signal_rx.take();
+
+        // Mode-2 discovery in-flight (the concurrent-arm fix). `start_discovery
+        // _if_owed` (run in the bring-up pre-loop) parked the STARTED
+        // `discover_items` future here when the CRDT declares `DiscoveryDebt::
+        // Owed`; `None` on every non-relocated / already-settled primary (the
+        // discovery arm is then inert). Taken out for the loop's duration so the
+        // arm can `await` the future without conflicting with the per-arm `&mut
+        // self` borrows (the same take-local discipline as `command_rx`). On
+        // resolve the arm calls `finish_discovery_arm` (seed + fire starts +
+        // cascade + dispatch trigger) and leaves this `None`, so the arm goes
+        // inert after the single fire. NOT round-tripped back to `self` at loop
+        // exit: discovery fires at most once per run, so a retry-pass re-entry
+        // must not re-discover (the `Settled` marker would no-op `start_
+        // discovery_if_owed` anyway, but leaving the local consumed is the
+        // explicit fire-once latch).
+        let mut discovery_in_flight = self.discovery_in_flight.take();
 
         // Entry sweep — dispatch is a pure function of state, asserted
         // ONCE the moment the loop is entered. The pre-loop chain may have
@@ -1334,6 +1352,62 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                                  disabling the dial-failure arm for the \
                                  remainder of the loop"
                             );
+                        }
+                    }
+                }
+                // Mode-2 discovery completion arm (the concurrent-arm fix).
+                // While `discovery_in_flight` holds the started `discover_items`
+                // future (a relocated / pre-staged primary that owes discovery),
+                // this arm awaits it CONCURRENTLY with every sibling arm — so
+                // the ~6min collect-all does NOT park the loop's keepalive /
+                // setup-servicing / inbox arms. `None` (every non-relocated /
+                // already-settled primary, and after the single fire) parks the
+                // arm on `pending().await`, the closed-channel hot-loop guard.
+                //
+                // Cancel-safety: the awaited `&mut inflight.future` is a
+                // consumer future the driver only polls; a sibling arm winning
+                // an iteration drops + re-creates the borrow on the next poll
+                // WITHOUT losing progress, because the `Pin<Box<..>>` future
+                // lives on `discovery_in_flight` (the loop-local), not in the
+                // arm. We `take()` the in-flight only AFTER the await resolves,
+                // so a cancelled poll leaves it intact for the next iteration.
+                discovered = async {
+                    match discovery_in_flight.as_mut() {
+                        Some(inflight) => (&mut inflight.future).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    arm_stats.record(ARM_DISCOVERY);
+                    // Fire-once: take the in-flight so the arm goes inert and a
+                    // re-poll parks. `phase_deps` rides out with it for the seed.
+                    let phase_deps = discovery_in_flight
+                        .take()
+                        .map(|i| i.phase_deps)
+                        .unwrap_or_default();
+                    match discovered {
+                        Ok(binaries) => {
+                            // ON-RESOLVE: seed the ledger + re-hydrate + fire
+                            // phase starts + cascade + signal dispatch. Owns the
+                            // whole post-await tail the sequential driver ran in
+                            // the pre-loop (now deferred to here). A composition
+                            // `Err` surfaces as the loop's `Err` exactly as the
+                            // sequential `discover_on_promotion().await?` did —
+                            // the abort verdict was latched + broadcast inside.
+                            self.finish_discovery_arm(binaries, phase_deps, &mut command_rx)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        }
+                        Err(reason) => {
+                            // The consumer `discover_items` policy errored — the
+                            // run cannot seed. Same outcome as the sequential
+                            // driver's `(sd.discover)().await.map_err(..)?`:
+                            // surface as the loop's `Err`, which the pipeline
+                            // tail classifies into the run-fatal exit.
+                            tracing::error!(
+                                error = %reason,
+                                "mode-2 discovery policy failed; aborting the run"
+                            );
+                            return Err(reason);
                         }
                     }
                 }
