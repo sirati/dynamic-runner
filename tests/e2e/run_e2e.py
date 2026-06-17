@@ -927,13 +927,16 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=("slurm", "single-process", "in-process"),
+        choices=("slurm", "local", "single-process", "in-process"),
         default="slurm",
         help=(
             "Dispatch mode. 'slurm' is the canonical e2e mode against "
-            "the slurm-test-env cluster. 'single-process' / 'in-process' "
-            "skip the cluster entirely and are useful for iterating on "
-            "the driver / scenarios."
+            "the slurm-test-env cluster. 'local' runs a network primary "
+            "that spawns local-subprocess secondaries (sized by --workers) "
+            "with no cluster/image — the only host-side mode that exercises "
+            "real multi-secondary topologies (e.g. secondary-affine). "
+            "'single-process' / 'in-process' spawn zero secondaries and are "
+            "useful for iterating on the driver / scenarios."
         ),
     )
     parser.add_argument(

@@ -41,6 +41,7 @@ from dynamic_runner.worker import (
 from dynamic_runner.worker.publish import (
     DEFAULT_SRC_ROOT,
     ENV_SRC_ROOT,
+    dst_root as _dst_root,
 )
 
 
@@ -104,7 +105,10 @@ def _write_and_publish(task_id: str, contents: bytes) -> None:
         out_path.stat().st_size,
         out_path,
     )
-    _publish(out_path)
+    # Land the output at the publish DST root under its staging name
+    # ({task_id}.out) — the surface the inherit scenario's
+    # ``assert_files_present(publish_dst, ...)`` reads back.
+    _publish(out_path, dst=_dst_root() / out_path.name)
 
 
 def _assert_predecessor_nonce(

@@ -36,10 +36,9 @@ from dynamic_runner.worker import (
     task_function,
 )
 from dynamic_runner.worker.publish import (
-    DEFAULT_DST_ROOT,
     DEFAULT_SRC_ROOT,
-    ENV_DST_ROOT,
     ENV_SRC_ROOT,
+    dst_root as _dst_root,
 )
 
 
@@ -119,7 +118,10 @@ def _handle_one(task: Task, source_dir: Path) -> WorkerOutput:
         out_path.stat().st_size,
         out_path,
     )
-    _publish(out_path)
+    # Land the output at the publish DST root under its staging name
+    # ({phase}-{idx}.out) — the /app/out-network surface the
+    # slurm-test-env test-540 harness asserts published outputs land on.
+    _publish(out_path, dst=_dst_root() / out_path.name)
     return WorkerOutput()
 
 
