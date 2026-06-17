@@ -36,6 +36,45 @@ use dynrunner_protocol_primary_secondary::address::PeerId;
 use dynrunner_transport_channel::peer_mesh;
 use std::sync::{Arc, Mutex};
 
+/// Drive a relocate-staging test body on a dedicated thread with a LARGE
+/// stack. The three `relocated_primary_*` tests below run the FULL
+/// `Node::run` relocate→observer path, whose current `into_observer_handoff`
+/// implementation has a DEEP (not large — the future is ~53 KiB) synchronous
+/// poll chain (the `run_consuming` pipeline-vs-demote race + the handoff
+/// destructure) that overflows cargo's 2 MiB spawned-test-thread stack. It
+/// passes at ≥4 MiB; production drives this future via `block_on` on a
+/// `new_current_thread` runtime on the calling thread (~8–12 MiB), so
+/// production is unaffected — a test-harness-thread artifact only. A 16 MiB
+/// thread + a `start_paused` current-thread runtime + a `LocalSet`
+/// reproduces the `#[tokio::test(flavor = "current_thread", start_paused =
+/// true)]` environment these tests need. REMOVE once the demote-shutdown
+/// redesign retires `into_observer_handoff` (a demoted primary then fully
+/// shuts down; the observer is a separate co-resident component), which
+/// eliminates the deep frame and rewrites these tests.
+fn drive_relocate_test_on_big_stack<F, Fut>(body: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    let handle = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let _ = tracing_subscriber::fmt::try_init();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .expect("build current-thread runtime");
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(body()));
+        })
+        .expect("spawn big-stack relocate test thread");
+    // Re-raise the original panic (assert message intact) on join failure.
+    if let Err(panic) = handle.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Tier 1: InitialAssignment-flag-level stamping per facet.
 //
@@ -449,12 +488,9 @@ async fn run_relocate_with_dispatch_target(facet: RelocateStagingFacet) -> (usiz
 // path is entirely message-driven (no timer is needed to complete), so all
 // 3-node coordination happens in a single cooperative LocalSet sweep, making
 // the test deterministic under full-suite CPU pressure.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn relocated_primary_uses_file_based_items_false_no_restage() {
-    let _ = tracing_subscriber::fmt::try_init();
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
+#[test]
+fn relocated_primary_uses_file_based_items_false_no_restage() {
+    drive_relocate_test_on_big_stack(|| async {
             // Opaque (relative) identifiers — would trip the file-based guard.
             let binaries: Vec<TaskInfo<TestId>> = (0..3)
                 .map(|i| {
@@ -480,8 +516,7 @@ async fn relocated_primary_uses_file_based_items_false_no_restage() {
                 "the dispatch-target secondary must have accepted at least one \
                  opaque-identifier task (no 'not pre-staged' rejection)"
             );
-        })
-        .await;
+    });
 }
 
 /// Facet (b) — asm-tokenizer mode-2 shape: `--source-already-staged`. The
@@ -491,12 +526,9 @@ async fn relocated_primary_uses_file_based_items_false_no_restage() {
 /// `wire_local_path`, so the target resolves the bind-mounted file by
 /// existence — no StageFile required.
 // `start_paused = true`: see `relocated_primary_uses_file_based_items_false_no_restage`.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn relocated_primary_pre_staged_mode_no_restage() {
-    let _ = tracing_subscriber::fmt::try_init();
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
+#[test]
+fn relocated_primary_pre_staged_mode_no_restage() {
+    drive_relocate_test_on_big_stack(|| async {
             let gateway = tempfile::TempDir::new().expect("gateway tmpdir");
             let gateway_path = gateway.path().to_path_buf();
             let container = tempfile::TempDir::new().expect("container tmpdir");
@@ -531,8 +563,7 @@ async fn relocated_primary_pre_staged_mode_no_restage() {
                 "the dispatch-target secondary must resolve at least one \
                  bind-mounted task via src_network (no 'not pre-staged' rejection)"
             );
-        })
-        .await;
+    });
 }
 
 /// Facet (c) — mode-1 file-based, NON-pre-staged inputs that the submitter
@@ -543,12 +574,9 @@ async fn relocated_primary_pre_staged_mode_no_restage() {
 /// `source_dir` on the promoted config, auto-stage skips and the target
 /// re-requires a StageFile that never comes.
 // `start_paused = true`: see `relocated_primary_uses_file_based_items_false_no_restage`.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn relocated_primary_mode1_file_based_restages() {
-    let _ = tracing_subscriber::fmt::try_init();
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
+#[test]
+fn relocated_primary_mode1_file_based_restages() {
+    drive_relocate_test_on_big_stack(|| async {
             // The shared source tree the relocated primary re-walks for the
             // content-hash + StageFile fan-out. RELATIVE binary paths so the
             // target (no src_network of its own beyond src_tmp) MUST receive a
@@ -597,8 +625,7 @@ async fn relocated_primary_mode1_file_based_restages() {
                  re-staged file (the relocated primary re-emitted StageFile \
                  records from its threaded source_dir)"
             );
-        })
-        .await;
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────
