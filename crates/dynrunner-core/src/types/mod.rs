@@ -31,7 +31,9 @@ pub use error::{ErrorType, FailedTask, TaskResult};
 pub use identifiers::{AffinityId, Identifier, PhaseId, ResourceKind, RunnerIdentifier, TypeId};
 pub use outputs::{INLINE_VALUE_HARD_CAP_BYTES, ResultValue, TaskOutputs, check_soft_caps};
 pub use resource::{ResourceAmount, ResourceMap, SoftPreferredSecondaries};
-pub use task::{TaskDep, TaskInfo, TaskInput, TaskKind, UploadFileRef, required_files_storage};
+pub use task::{
+    TaskCountCategory, TaskDep, TaskInfo, TaskInput, TaskKind, UploadFileRef, required_files_storage,
+};
 pub use terminal_outcome::TerminalOutcomeCounts;
 pub use version::TaskVersion;
 

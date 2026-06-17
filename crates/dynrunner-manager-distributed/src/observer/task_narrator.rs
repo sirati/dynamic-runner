@@ -116,6 +116,12 @@ impl ObserverTaskNarrator {
         if buffered == 0 && counts == StateCounts::default() {
             return;
         }
+        // The line is partitioned BY KIND (the `counts()` categorization):
+        // the generic buckets are WORK-only; SETUP tasks get their own
+        // `setup-`prefixed per-state categories; per-secondary affine GATE
+        // tokens are ONE flat `secondary-affine` count (phase-uncounted —
+        // their readiness is the per-secondary bitvector, not a global
+        // state). Neither setup nor affine inflates the generic `pending`.
         tracing::info!(
             target: IMPORTANT_TARGET,
             baseline_transitions = buffered,
@@ -125,15 +131,25 @@ impl ObserverTaskNarrator {
             failed = counts.failed,
             blocked = counts.blocked,
             skipped_already_done = counts.skipped_already_done,
-            setup_succeeded = counts.setup_succeeded,
-            "observer mirroring baseline: {} pending / {} in-flight / {} completed / {} failed / {} blocked / {} skipped / {} setup-done — narrating live changes from here",
+            setup_pending = counts.setup_pending,
+            setup_in_flight = counts.setup_in_flight,
+            setup_blocked = counts.setup_blocked,
+            setup_failed = counts.setup_failed,
+            setup_done = counts.setup_succeeded,
+            secondary_affine = counts.secondary_affine,
+            "observer mirroring baseline: {} pending / {} in-flight / {} completed / {} failed / {} blocked / {} skipped | setup: {} setup-pending / {} setup-in-flight / {} setup-blocked / {} setup-failed / {} setup-done | {} secondary-affine — narrating live changes from here",
             counts.pending,
             counts.in_flight,
             counts.completed,
             counts.failed,
             counts.blocked,
             counts.skipped_already_done,
+            counts.setup_pending,
+            counts.setup_in_flight,
+            counts.setup_blocked,
+            counts.setup_failed,
             counts.setup_succeeded,
+            counts.secondary_affine,
         );
     }
 

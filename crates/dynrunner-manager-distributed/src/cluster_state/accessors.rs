@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dynrunner_core::{
-    Identifier, PhaseId, TaskInfo, TaskOutputs, TerminalOutcomeCounts, WorkerId,
+    Identifier, PhaseId, TaskCountCategory, TaskInfo, TaskOutputs, TerminalOutcomeCounts, WorkerId,
 };
 use dynrunner_protocol_primary_secondary::{
     DiscoveryDebt, RoleTable, SecondaryCapacityRecord, SecondaryResourceSampleRecord,
@@ -242,28 +242,73 @@ impl<I: Identifier> ClusterState<I> {
 
     pub fn counts(&self) -> StateCounts {
         let mut c = StateCounts::default();
+        // PARTITION BY KIND FIRST (the modular `count_category` seam), so
+        // setup / secondary-affine tasks are pulled OUT of the generic
+        // work buckets AT the categorization point — never folded in and
+        // subtracted back out. A `SecondaryAffine` token is phase-uncounted
+        // (one flat count, no per-state subdivision); a `Setup` task gets
+        // its own setup-prefixed per-state buckets; only `Work` feeds the
+        // generic buckets.
         for s in self.tasks.values() {
-            match s {
-                TaskState::Pending { .. } => c.pending += 1,
-                TaskState::InFlight { .. } => c.in_flight += 1,
-                TaskState::Completed { .. } => c.completed += 1,
-                TaskState::Failed { .. } => c.failed += 1,
-                TaskState::Unfulfillable { .. } => c.unfulfillable += 1,
-                TaskState::Blocked { .. } => c.blocked += 1,
-                TaskState::InvalidTask { .. } => c.invalid_task += 1,
-                TaskState::SkippedAlreadyDone { .. } => c.skipped_already_done += 1,
-                TaskState::SetupCompleted { .. } => c.setup_succeeded += 1,
+            match s.def().kind.count_category() {
+                TaskCountCategory::SecondaryAffine => c.secondary_affine += 1,
+                TaskCountCategory::Setup => match s {
+                    TaskState::Pending { .. } => c.setup_pending += 1,
+                    TaskState::InFlight { .. } => c.setup_in_flight += 1,
+                    TaskState::Blocked { .. } => c.setup_blocked += 1,
+                    TaskState::SetupCompleted { .. } => c.setup_succeeded += 1,
+                    TaskState::Failed { .. }
+                    | TaskState::Unfulfillable { .. }
+                    | TaskState::InvalidTask { .. } => c.setup_failed += 1,
+                    // A setup task never reaches `Completed` (success →
+                    // `SetupCompleted`) nor `SkippedAlreadyDone` (a
+                    // discovery-time work skip); fold defensively into its
+                    // success/done bucket should the invariant ever break.
+                    TaskState::Completed { .. } | TaskState::SkippedAlreadyDone { .. } => {
+                        c.setup_succeeded += 1
+                    }
+                },
+                TaskCountCategory::Work => match s {
+                    TaskState::Pending { .. } => c.pending += 1,
+                    TaskState::InFlight { .. } => c.in_flight += 1,
+                    TaskState::Completed { .. } => c.completed += 1,
+                    TaskState::Failed { .. } => c.failed += 1,
+                    TaskState::Unfulfillable { .. } => c.unfulfillable += 1,
+                    TaskState::Blocked { .. } => c.blocked += 1,
+                    TaskState::InvalidTask { .. } => c.invalid_task += 1,
+                    TaskState::SkippedAlreadyDone { .. } => c.skipped_already_done += 1,
+                    // A `SetupCompleted` fat state on a Work entry is
+                    // impossible (the variant is setup-only by construction),
+                    // but totality demands an arm; attribute to the setup
+                    // success bucket where the variant belongs.
+                    TaskState::SetupCompleted { .. } => c.setup_succeeded += 1,
+                },
             }
         }
-        // Settled (spilled) entries are LOGICAL ledger entries — fold
-        // their slim classes into the same buckets the fat states feed.
+        // Settled (spilled) entries are LOGICAL ledger entries — fold their
+        // slim classes into the SAME kind-partitioned buckets the fat
+        // states feed, routed by the category stamped at spill time so a
+        // failed-final SETUP task lands in `setup_failed`, not the generic
+        // `failed`.
         for (_, entry) in self.settled_entries() {
-            match entry.class {
-                SettledClass::Completed => c.completed += 1,
-                SettledClass::FailedFinal(_) => c.failed += 1,
-                SettledClass::InvalidTask => c.invalid_task += 1,
-                SettledClass::SkippedAlreadyDone => c.skipped_already_done += 1,
-                SettledClass::SetupCompleted => c.setup_succeeded += 1,
+            match entry.category {
+                TaskCountCategory::SecondaryAffine => c.secondary_affine += 1,
+                TaskCountCategory::Setup => match entry.class {
+                    SettledClass::SetupCompleted => c.setup_succeeded += 1,
+                    SettledClass::FailedFinal(_) | SettledClass::InvalidTask => c.setup_failed += 1,
+                    // A setup task never settles as `Completed` /
+                    // `SkippedAlreadyDone`; fold defensively into setup-done.
+                    SettledClass::Completed | SettledClass::SkippedAlreadyDone => {
+                        c.setup_succeeded += 1
+                    }
+                },
+                TaskCountCategory::Work => match entry.class {
+                    SettledClass::Completed => c.completed += 1,
+                    SettledClass::FailedFinal(_) => c.failed += 1,
+                    SettledClass::InvalidTask => c.invalid_task += 1,
+                    SettledClass::SkippedAlreadyDone => c.skipped_already_done += 1,
+                    SettledClass::SetupCompleted => c.setup_succeeded += 1,
+                },
             }
         }
         c
@@ -293,6 +338,17 @@ impl<I: Identifier> ClusterState<I> {
     /// ≥1 post-dispatch entry exists). A failover therefore can NEVER read
     /// as unstarted — the property the bring-up reservation gate relies on
     /// to preserve the failover exclusion.
+    ///
+    /// The four post-dispatch buckets read here are the WORK-kind generic
+    /// buckets (`counts()` now partitions by kind: `in_flight` / `completed`
+    /// / `failed` / `unfulfillable` count ONLY `TaskCountCategory::Work`).
+    /// That is exactly the documented intent — these are the worker-dispatch
+    /// states a worker outcome or worker-bound assignment produces. A
+    /// SETUP task is executed IN-PROCESS by its affinity member, never
+    /// worker-dispatched, so its in-process `InFlight`/terminal is a
+    /// non-post-dispatch state (the doc already lists `SetupCompleted`
+    /// among them); with the work-only partition that exclusion is now
+    /// uniform across every setup state, not just the success terminal.
     pub fn run_is_unstarted(&self) -> bool {
         let c = self.counts();
         c.in_flight + c.completed + c.failed + c.unfulfillable == 0

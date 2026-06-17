@@ -957,13 +957,23 @@ async fn affine_import_on_n_secondaries_satisfies_run_completion_once() {
                  whichever holder the single hash-keyed ledger recorded"
             );
 
-            // The import counted ONCE toward the run tally despite running on N
-            // secondaries: 1 import + 8 builds = 9 distinct CRDT terminals.
+            // The 8 BUILD (work) tasks counted toward the generic `completed`
+            // tally; the affine IMPORT is EXCLUDED from the work buckets and
+            // reported in its OWN flat `secondary_affine` count (the kind
+            // split — a per-secondary affine GATE token is phase-uncounted,
+            // never folded into generic work `completed`). The import's CRDT
+            // terminal is still recorded ONCE (first-run-only) despite running
+            // on N secondaries — surfaced as `secondary_affine == 1`.
+            let counts = primary.cluster_state_counts_for_test();
             assert_eq!(
-                primary.cluster_state_counts_for_test().completed,
-                9,
-                "the import counts exactly once (CRDT TaskCompleted is first-run \
-                 only); 1 import + 8 builds = 9"
+                counts.completed, 8,
+                "only the 8 work BUILDS count toward generic `completed` — the \
+                 affine import is excluded from the work buckets"
+            );
+            assert_eq!(
+                counts.secondary_affine, 1,
+                "the affine import is reported in its own flat secondary_affine \
+                 count (one CRDT entry despite N per-secondary runs)"
             );
 
             // THE GATE: the operational loop's run-completion check is satisfied

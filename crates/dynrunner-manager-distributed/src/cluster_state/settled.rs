@@ -92,7 +92,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskDep, TaskOutputs};
+use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskCountCategory, TaskDep, TaskOutputs};
 use serde::{Deserialize, Serialize};
 
 use crate::primary::retry_bucket::BucketKind;
@@ -159,6 +159,19 @@ pub(crate) struct SettledEntry {
     pub(crate) phase_id: PhaseId,
     pub(crate) task_depends_on: Vec<TaskDep>,
     pub(crate) class: SettledClass,
+    /// The COUNTING category of the settled task, stamped at commit-spill
+    /// from `state.def().kind.count_category()` (the def is in hand there).
+    /// Retained so the [`super::ClusterState::counts`] settled-fold can
+    /// attribute a settled task to the SAME kind-partition the fat-fold
+    /// does — a failed-final SETUP task must land in `setup_failed`, not
+    /// the generic `failed` bucket, even after its body has spilled. A
+    /// success-like setup terminal is already self-identified by
+    /// [`SettledClass::SetupCompleted`], but `FailedFinal` is kind-blind,
+    /// so the category is the disambiguator. (A `SecondaryAffine` token
+    /// never reaches a settle-eligible terminal — it is a gate, never
+    /// executed by the primary — so `SecondaryAffine` never appears here in
+    /// practice; the field still carries it faithfully for totality.)
+    pub(crate) category: TaskCountCategory,
     pub(super) join_key: TaskJoinKey,
     /// The self-describing [`TaskDefId`] this settled record's def carries,
     /// captured at commit-spill from `state.def().def_id` (the def is in
@@ -791,6 +804,7 @@ impl<I: Identifier> ClusterState<I> {
             let task_id = def.task_id.clone();
             let phase_id = def.phase_id.clone();
             let captured_def_id = def.def_id;
+            let category = def.kind.count_category();
             let dep_refs = def.task_depends_on.clone();
             let digest_contribution = hash_one((&rec.hash, hashable_join_key(state)));
             // Evict the resident output payload: its co-keyed copy already
@@ -817,6 +831,7 @@ impl<I: Identifier> ClusterState<I> {
                 phase_id,
                 task_depends_on,
                 class,
+                category,
                 join_key: rec.join_key,
                 // Self-describing def-id captured here (the def is in hand —
                 // no disk read) so the failover resume floor can include

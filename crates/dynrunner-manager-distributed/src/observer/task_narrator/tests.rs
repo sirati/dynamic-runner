@@ -270,6 +270,42 @@ fn baseline_narrates_one_summary_not_n_lines_and_gates_live() {
     );
 }
 
+/// KIND SPLIT: the baseline line reports SETUP tasks under `setup-`
+/// categories and per-secondary affine GATE tokens as a single flat
+/// `secondary-affine` count — and NEITHER is folded into the generic
+/// `pending`. The bug this pins: a baseline with 100 work-pending + 30
+/// setup-pending + 200 affine tokens previously rendered "330 pending".
+#[test]
+fn baseline_splits_setup_and_affine_out_of_generic_pending() {
+    let events = capture(|| {
+        let mut n = ObserverTaskNarrator::default();
+        let counts = StateCounts {
+            pending: 100,
+            setup_pending: 30,
+            secondary_affine: 200,
+            setup_succeeded: 5,
+            ..Default::default()
+        };
+        n.narrate_baseline(335, counts);
+    });
+    assert_eq!(events.len(), 1, "one summary line");
+    let msg = &events[0].leveled.event.message;
+    // The generic pending is the WORK count alone — NOT the lumped 330.
+    assert!(
+        msg.contains("100 pending"),
+        "generic pending is work-only (100), not the lumped total: {msg:?}",
+    );
+    assert!(!msg.contains("330"), "the old lumped 330 must NOT appear: {msg:?}");
+    // Setup tasks under setup- categories.
+    assert!(msg.contains("30 setup-pending"), "setup-pending split out: {msg:?}");
+    assert!(msg.contains("5 setup-done"), "setup-done present: {msg:?}");
+    // Affine tokens as ONE flat count.
+    assert!(
+        msg.contains("200 secondary-affine"),
+        "affine reported flat, no state subdivision: {msg:?}",
+    );
+}
+
 /// An EMPTY baseline (cold-join before any snapshot) emits NO summary
 /// line but still arms live narration; the live line lands on the
 /// per-task (non-wake-worthy) target.
