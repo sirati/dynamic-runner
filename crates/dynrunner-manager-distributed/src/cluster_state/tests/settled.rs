@@ -1310,3 +1310,89 @@ fn restored_def_with_settled_carried_id_degrades_by_content() {
 
     drop(dir);
 }
+
+// ── Commit 3: settled-aware dep resolution (the recompose linchpin) ──
+
+/// A Pending dependent's L5 def-id dep ref to a COMPLETED + SETTLED prereq
+/// must resolve to the prereq's REAL `(phase_id, task_id)` identity — NOT the
+/// unresolved sentinel. The settled def left the in-memory store, so without
+/// the settled `def_id → identity` fallback the rebuilt edge would be empty
+/// and a promoted-primary hydrate of the still-Pending dependent would fail
+/// `UnknownTaskDep`. The rebuilt edge matches the LIVE graph (the dependent
+/// keeps the completed dep, the pool pre-resolves it satisfied via
+/// `completed_tasks`).
+///
+/// Pre-fix RED: resolve to empty (task_id == ""). Post-fix GREEN: resolves to
+/// the settled prereq's identity.
+#[test]
+fn pending_dependent_resolves_dep_to_settled_prereq_identity() {
+    use dynrunner_core::{TaskDep, TaskKind};
+
+    const G: u32 = 7;
+    let phase = PhaseId::from("BUILD");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Donor: the import gate at wire id g + a Pending build variant depending
+    // on it (its frozen dep ref resolves to g via the identity index at
+    // intern). Complete + spill the gate so g lives only in the settled index.
+    let mut donor = ClusterState::<RunnerIdentifier>::new();
+    let mut gate = mk_task("import_common");
+    gate.phase_id = phase.clone();
+    gate.kind = TaskKind::SecondaryAffine;
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: "import_common".into(),
+        task: gate,
+        def_id: Some(G),
+    });
+    let mut variant = mk_task("build_variant__x");
+    variant.phase_id = phase.clone();
+    variant.task_depends_on = vec![TaskDep {
+        task_id: "import_common".into(),
+        phase_id: phase.clone(),
+        inherit_outputs: false,
+        def_id: None,
+    }];
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: "build_variant__x".into(),
+        task: variant,
+        def_id: Some(3),
+    });
+    donor.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "import_common".into(),
+        result_data: None,
+    });
+    let evicted = donor.test_spill_all(&dir.path().join("spill.cbor"));
+    assert_eq!(evicted, 1, "the gate settles; the variant stays fat Pending");
+    assert_eq!(donor.settled_store().max_def_id(), Some(G));
+
+    // Promote: settled base + restore (the variant rides the snapshot fat).
+    let mut promoted = ClusterState::<RunnerIdentifier>::new();
+    promoted.install_settled_base(donor.settled_base_clone());
+    promoted.restore(donor.snapshot());
+
+    // The recompose dep resolution: the variant's dep ref g resolves to the
+    // SETTLED prereq's identity, not the empty sentinel.
+    let state = promoted
+        .task_state("build_variant__x")
+        .expect("the variant is restored fat (Pending)");
+    let info = promoted.task_to_info(state);
+    let dep = info
+        .task_depends_on
+        .first()
+        .expect("the variant keeps its single dep");
+    assert_eq!(
+        (dep.phase_id.as_str(), dep.task_id.as_str()),
+        ("BUILD", "import_common"),
+        "the dep ref to the settled prereq must resolve to its real identity \
+         (the settled def_id→identity fallback), NOT the empty sentinel"
+    );
+    assert!(
+        !dep.task_id.is_empty(),
+        "a settled prereq's dep ref must not rebuild the unresolved sentinel \
+         (the UnknownTaskDep cause)"
+    );
+
+    drop(dir);
+}

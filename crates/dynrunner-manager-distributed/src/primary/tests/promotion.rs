@@ -2292,3 +2292,96 @@ async fn promoted_mesh_ready_expected_excludes_self_and_departed_primary() {
         })
         .await;
 }
+
+/// RECOMPOSE LINCHPIN: a promoted primary whose inherited ledger holds a
+/// COMPLETED + SETTLED import gate and a still-Pending build variant that
+/// depends on it must HYDRATE cleanly — no `UnknownTaskDep` (the settled
+/// prereq's def-id dep ref resolves to its real identity via the settled
+/// reverse index) and no `TaskDepCycle` (the floor-resume kept the variant
+/// off the settled slot, so the dep never self-aliases). This is the
+/// consumer's forced-failover acceptance shape (import_common done+settled
+/// over an hour before the recompose, build_variant still pending).
+#[test]
+fn recompose_with_settled_gate_and_pending_variant_hydrates_clean() {
+    use crate::primary::wire::compute_task_hash;
+    use dynrunner_core::{PhaseId, TaskDep, TaskKind};
+
+    const G: u32 = 9;
+    let phase = PhaseId::from("BUILD");
+
+    // --- Donor (raw ClusterState owns the spill file): the SecondaryAffine
+    // import gate at wire id g + a Pending build variant depending on it;
+    // complete + spill the gate so g lives only in the settled index. ---
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut donor = crate::cluster_state::ClusterState::<TestId>::new();
+
+    let mut gate = make_binary("import_common", 100);
+    gate.phase_id = phase.clone();
+    gate.kind = TaskKind::SecondaryAffine;
+    let gate_hash = compute_task_hash(&gate);
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: gate_hash.clone(),
+        task: gate,
+        def_id: Some(G),
+    });
+
+    let mut variant = make_binary("build_variant__x", 100);
+    variant.phase_id = phase.clone();
+    variant.task_depends_on = vec![TaskDep {
+        task_id: "import_common".into(),
+        phase_id: phase.clone(),
+        inherit_outputs: false,
+        def_id: None,
+    }];
+    let variant_hash = compute_task_hash(&variant);
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: variant_hash.clone(),
+        task: variant,
+        def_id: Some(3),
+    });
+    donor.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: gate_hash.clone(),
+        result_data: None,
+    });
+    let evicted = donor.test_spill_all(&dir.path().join("spill.cbor"));
+    assert_eq!(evicted, 1, "the import gate settles; the variant stays Pending");
+
+    let base = donor.settled_base_clone();
+    let snapshot = donor.snapshot();
+
+    // --- Promoted primary (coordinator): install settled base + restore +
+    // hydrate via the production promotion construction order. ---
+    let (transport, _ends) = setup_test(1);
+    let (mut promoted, _mesh) = build_test_primary(
+        PrimaryConfig::default(),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    promoted
+        .cluster_state_mut_for_test()
+        .install_settled_base(base);
+    promoted.cluster_state_mut_for_test().restore(snapshot);
+
+    // THE linchpin: hydrate succeeds — neither UnknownTaskDep nor TaskDepCycle.
+    promoted
+        .hydrate_from_cluster_state()
+        .expect("recompose hydrate must succeed: the settled gate dep resolves \
+                 to its identity (no UnknownTaskDep) and never self-aliases (no \
+                 TaskDepCycle)");
+
+    // The variant's dep resolves to the settled gate's identity, not None/self.
+    let info = promoted
+        .cluster_state_for_test()
+        .task_info_for_hash(&variant_hash)
+        .expect("the variant is restored fat");
+    let dep = info.task_depends_on.first().expect("keeps its single dep");
+    assert_eq!(
+        (dep.phase_id.as_str(), dep.task_id.as_str()),
+        ("BUILD", "import_common"),
+        "the variant's dep resolves to the settled import gate's identity"
+    );
+
+    drop(dir);
+}

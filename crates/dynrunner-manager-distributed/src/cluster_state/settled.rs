@@ -417,6 +417,20 @@ impl SettledStore {
         self.def_id_to_hash.contains_key(&id)
     }
 
+    /// The `(phase_id, task_id)` IDENTITY of the settled record holding this
+    /// WIRE-AGREED [`TaskDefId`], if any — the failover/recompose dep-ref
+    /// resolution seam. A Pending dependent's L5 def-id dep ref to a prereq
+    /// that has COMPLETED + SETTLED resolves through here (its def is no
+    /// longer in the in-memory store), so the rebuilt edge carries the
+    /// prereq's REAL identity (matching the live graph) instead of the
+    /// unresolved-sentinel. O(1) via the maintained reverse index.
+    pub(crate) fn identity_for_def_id(&self, id: TaskDefId) -> Option<(&PhaseId, &str)> {
+        self.def_id_to_hash
+            .get(&id)
+            .and_then(|hash| self.index.get(hash))
+            .map(|entry| (&entry.phase_id, entry.task_id.as_str()))
+    }
+
     /// Per-settled-entry `(key, digest_contribution)` pairs — the persisted
     /// per-entry fold term each settled entry contributes to `tasks_hash`
     /// (`digest_contribution` was stamped at spill-commit as the SAME

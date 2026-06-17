@@ -749,25 +749,44 @@ impl<I> TaskDefStore<I> {
     /// gate) surfaces it exactly as a missing string dep would. The rebuilt
     /// `TaskDep` carries `def_id: None` (the wire re-stamps it at the next
     /// origination if needed). Owned: callers need a whole list.
-    pub(crate) fn resolve_dep_refs(&self, refs: &[TaskDepRef]) -> Vec<TaskDep> {
+    /// Rebuild the string-identity [`TaskDep`] list from compact
+    /// [`TaskDepRef`]s (L5). A `fallback` resolves a ref whose def has LEFT
+    /// the in-memory store (a settled + evicted prereq, whose id no longer
+    /// resolves here): the in-memory store is settled-blind, so the
+    /// settled-vs-in-memory split stays a CALLER concern (the
+    /// [`ClusterState`]-level wrapper passes the settled reverse index) without
+    /// duplicating the per-ref iteration. A caller with no settled half passes
+    /// `|_| None`.
+    pub(crate) fn resolve_dep_refs_with_fallback(
+        &self,
+        refs: &[TaskDepRef],
+        fallback: impl Fn(TaskDefId) -> Option<(PhaseId, String)>,
+    ) -> Vec<TaskDep> {
         refs.iter()
-            .map(|r| match self.resolve(r.def_id) {
-                Some(def) => TaskDep {
-                    task_id: def.task_id.clone(),
-                    phase_id: def.phase_id.clone(),
-                    inherit_outputs: r.inherit_outputs,
-                    def_id: None,
-                },
-                None => TaskDep {
-                    // No resolvable prereq: rebuild the migration-sentinel
-                    // shape (empty phase, empty id) so the edge carries no
-                    // false identity and the loud-unknown-dep failure fires
-                    // downstream, exactly as a missing string dep would.
-                    task_id: String::new(),
-                    phase_id: PhaseId::default(),
-                    inherit_outputs: r.inherit_outputs,
-                    def_id: None,
-                },
+            .map(|r| {
+                // In-memory store first, then the caller's fallback (settled).
+                let resolved = self
+                    .resolve(r.def_id)
+                    .map(|def| (def.phase_id.clone(), def.task_id.clone()))
+                    .or_else(|| fallback(r.def_id));
+                match resolved {
+                    Some((phase_id, task_id)) => TaskDep {
+                        task_id,
+                        phase_id,
+                        inherit_outputs: r.inherit_outputs,
+                        def_id: None,
+                    },
+                    None => TaskDep {
+                        // No resolvable prereq: rebuild the migration-sentinel
+                        // shape (empty phase, empty id) so the edge carries no
+                        // false identity and the loud-unknown-dep failure fires
+                        // downstream, exactly as a missing string dep would.
+                        task_id: String::new(),
+                        phase_id: PhaseId::default(),
+                        inherit_outputs: r.inherit_outputs,
+                        def_id: None,
+                    },
+                }
             })
             .collect()
     }
@@ -942,9 +961,26 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
     /// frozen-def dep CONSUMERS route through (the dispatch `to_task_info`,
     /// `task_deps_for_identity`, the affine gate, the settled-spill capture):
     /// they hold `&self` (the store), a `&FrozenTaskDef` does not, so the
-    /// resolution lives here and delegates to [`TaskDefStore::resolve_dep_refs`].
+    /// resolution lives here and delegates to
+    /// [`TaskDefStore::resolve_dep_refs_with_fallback`].
+    ///
+    /// SETTLED-aware (the recompose linchpin): a ref whose prereq has
+    /// COMPLETED + SETTLED no longer resolves in the in-memory `definitions`
+    /// store (the settled def was evicted), so the bare store would rebuild
+    /// the unresolved-sentinel edge and a promoted-primary hydrate of a
+    /// still-Pending dependent would fail `UnknownTaskDep`. We pass the
+    /// settled `def_id → identity` reverse index as the fallback, so the
+    /// rebuilt edge carries the settled prereq's REAL `(phase_id, task_id)` —
+    /// IDENTICAL to the live graph (where the dependent keeps the completed
+    /// dep in `task_depends_on` and the pool's `completed_tasks` pre-resolves
+    /// it as satisfied). The split stays a single concern: the in-memory
+    /// store is settled-blind; this seam composes the two halves.
     pub(crate) fn resolve_dep_refs(&self, refs: &[TaskDepRef]) -> Vec<TaskDep> {
-        self.definitions.resolve_dep_refs(refs)
+        self.definitions.resolve_dep_refs_with_fallback(refs, |id| {
+            self.settled
+                .identity_for_def_id(id)
+                .map(|(phase, task)| (phase.clone(), task.to_string()))
+        })
     }
 
     /// Reconstruct a whole owned [`TaskInfo`] from a [`TaskState`] (L5) —
@@ -1549,7 +1585,7 @@ mod tests {
         assert_eq!(refs[0].def_id, prereq_id, "resolved to the prereq's def id");
         assert!(refs[0].inherit_outputs, "per-edge flag carried onto the ref");
 
-        let rebuilt = store.resolve_dep_refs(&refs);
+        let rebuilt = store.resolve_dep_refs_with_fallback(&refs, |_| None);
         assert_eq!(rebuilt.len(), 1);
         assert_eq!(rebuilt[0].task_id, "prereq");
         assert_eq!(rebuilt[0].phase_id, PhaseId::from("phase-A"));
@@ -1591,7 +1627,7 @@ mod tests {
         }];
         let refs = store.dep_refs_from_deps(&deps);
         assert_eq!(refs[0].def_id, prereq_id);
-        let rebuilt = store.resolve_dep_refs(&refs);
+        let rebuilt = store.resolve_dep_refs_with_fallback(&refs, |_| None);
         assert_eq!(
             rebuilt[0].phase_id,
             PhaseId::from("build"),
@@ -1616,7 +1652,7 @@ mod tests {
         let refs = store.dep_refs_from_deps(&deps);
         assert_eq!(refs[0].def_id, TaskDefId::UNBOUND);
         assert!(refs[0].inherit_outputs, "flag still carried on the sentinel ref");
-        let rebuilt = store.resolve_dep_refs(&refs);
+        let rebuilt = store.resolve_dep_refs_with_fallback(&refs, |_| None);
         assert!(rebuilt[0].task_id.is_empty(), "no false identity fabricated");
         assert!(rebuilt[0].phase_id.as_str().is_empty());
         assert!(rebuilt[0].inherit_outputs, "flag preserved through the sentinel");
