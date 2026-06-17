@@ -34,6 +34,7 @@ fn work_with_required_files(name: &str, sources: &[&str]) -> TaskInfo<TestId> {
             .map(|s| dynrunner_core::UploadFileRef {
                 source: std::path::PathBuf::from(s),
                 dest: None,
+                root: dynrunner_core::UploadRoot::Source,
             })
             .collect(),
     );
@@ -558,6 +559,7 @@ fn manual_spawned_file_setup_task_gates_a_dependent_work_task() {
     shared_upload.upload_file = Some(Box::new(dynrunner_core::UploadFileRef {
         source: std::path::PathBuf::from("/shared/closure.tar"),
         dest: None,
+        root: dynrunner_core::UploadRoot::Source,
     }));
     let upload_hash = compute_task_hash(&shared_upload);
 

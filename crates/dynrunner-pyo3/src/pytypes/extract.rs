@@ -9,7 +9,7 @@ use pyo3::types::PyList;
 
 use dynrunner_core::{
     AffinityId, Identifier, PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskDep, TaskInfo,
-    TypeId, UploadFileRef,
+    TypeId, UploadFileRef, UploadRoot,
 };
 
 use super::identifier::{PyBinaryIdentifier, identifier_from_pyobj};
@@ -65,7 +65,7 @@ pub(crate) fn task_to_pytask<I: Identifier>(task: &TaskInfo<I>) -> PyTaskInfo {
         setup_affinity: task.setup_affinity.clone(),
         // `required_files` IS on `TaskInfo<I>` (#336 P2), so the projection
         // reflects it — each core `UploadFileRef` renders back to its
-        // `(source, optional dest)` pair.
+        // `(source, optional dest, root)` triple (#644).
         required_files: task
             .required_files()
             .iter()
@@ -73,6 +73,7 @@ pub(crate) fn task_to_pytask<I: Identifier>(task: &TaskInfo<I>) -> PyTaskInfo {
                 (
                     f.source.to_string_lossy().into_owned(),
                     f.dest.as_ref().map(|d| d.to_string_lossy().into_owned()),
+                    f.root.into(),
                 )
             })
             .collect(),
@@ -171,39 +172,58 @@ fn extract_task_depends_on(
 
 /// Extract one ``files`` entry into a Rust-side [`UploadFileRef`] (#336 P2).
 ///
-/// Single concern: bridge the two legal Python shapes a consumer writes in
+/// Single concern: bridge the legal Python shapes a consumer writes in
 /// ``TaskInfo.files`` — a bare ``str``/``Path`` source (the common case;
-/// destination is derived), or a ``(source, dest)`` 2-tuple/sequence (explicit
-/// placement for a shared resource that does not live under ``--source``).
-/// Order of attempts:
+/// destination is derived, root defaults to ``UploadRoot.SOURCE``), a
+/// ``(source, dest)`` 2-tuple (explicit placement under the srcbins root), or a
+/// ``(source, dest, root)`` 3-tuple (explicit placement + a framework mount
+/// selector, #644). Order of attempts:
 ///
 /// 1. Try ``extract::<String>``. Succeeds for a bare ``str`` source and (via
 ///    ``PathBuf``'s string coercion) a ``Path``; becomes
-///    ``UploadFileRef { source, dest: None }``.
-/// 2. Fall back to a 2-element ``(source, dest)`` sequence. ``dest`` may be
-///    ``None`` (same as the bare case) or an explicit ``str``/``Path``.
+///    ``UploadFileRef { source, dest: None, root: Source }``.
+/// 2. Fall back to a 3-element ``(source, dest, root)`` sequence.
+/// 3. Fall back to a 2-element ``(source, dest)`` sequence (root ⇒ Source).
+///    ``dest`` may be ``None`` (same as the bare case) or an explicit
+///    ``str``/``Path``.
 ///
-/// A shape that is neither raises a ``ValueError`` naming the offending entry
-/// — the same loud-at-the-boundary contract the surrounding extractors use.
+/// A shape that is none of these raises a ``ValueError`` naming the offending
+/// entry — the same loud-at-the-boundary contract the surrounding extractors
+/// use.
 fn extract_one_required_file(obj: &Bound<'_, PyAny>) -> PyResult<UploadFileRef> {
-    // A bare source (str / Path coerced to str) — destination derived.
+    // A bare source (str / Path coerced to str) — destination derived,
+    // default (srcbins) root.
     if let Ok(source) = obj.extract::<String>() {
         return Ok(UploadFileRef {
             source: PathBuf::from(source),
             dest: None,
+            root: UploadRoot::default(),
         });
     }
-    // A `(source, dest)` pair. Extract as a 2-tuple of (String, Option<String>).
+    // A `(source, dest, root)` triple — explicit placement + framework mount
+    // selector (#644). Tried BEFORE the 2-tuple so a 3-element entry binds the
+    // root rather than failing the 2-tuple extract.
+    if let Ok((source, dest, root)) =
+        obj.extract::<(String, Option<String>, crate::pytypes::PyUploadRoot)>()
+    {
+        return Ok(UploadFileRef {
+            source: PathBuf::from(source),
+            dest: dest.map(PathBuf::from),
+            root: root.into(),
+        });
+    }
+    // A `(source, dest)` pair — default (srcbins) root.
     if let Ok((source, dest)) = obj.extract::<(String, Option<String>)>() {
         return Ok(UploadFileRef {
             source: PathBuf::from(source),
             dest: dest.map(PathBuf::from),
+            root: UploadRoot::default(),
         });
     }
     Err(PyValueError::new_err(
-        "TaskInfo.files entry must be a source path (str/Path) or a \
-         (source, dest) pair; got an unsupported shape. \
-         See `dynamic_runner._shared.task_info.TaskInfo.files`.",
+        "TaskInfo.files entry must be a source path (str/Path), a \
+         (source, dest) pair, or a (source, dest, root) triple; got an \
+         unsupported shape. See `dynamic_runner._shared.task_info.TaskInfo.files`.",
     ))
 }
 
@@ -701,6 +721,11 @@ mod tests {
         // core `required_files`. A missing `files` attribute (the back-compat
         // default) yields empty.
         Python::attach(|py| {
+            // A `(source, dest, root)` 3-tuple selecting the OUTPUT mount (#644).
+            let output_root = py
+                .get_type::<crate::pytypes::PyUploadRoot>()
+                .getattr("OUTPUT")
+                .expect("UploadRoot.OUTPUT");
             let files = PyList::new(
                 py,
                 [
@@ -714,6 +739,16 @@ mod tests {
                     )
                     .expect("pair")
                     .into_any(),
+                    pyo3::types::PyTuple::new(
+                        py,
+                        [
+                            pyo3::types::PyString::new(py, "/src/c").into_any(),
+                            pyo3::types::PyString::new(py, "/dst/c").into_any(),
+                            output_root,
+                        ],
+                    )
+                    .expect("triple")
+                    .into_any(),
                 ],
             )
             .expect("files list");
@@ -723,14 +758,25 @@ mod tests {
 
             let out = extract_binaries(&list).expect("extract");
             assert_eq!(out.len(), 2);
-            // The `files=`-carrying task gets two required files.
+            // The `files=`-carrying task gets three required files.
             let build = &out[0].0;
             assert_eq!(build.task_id, "build");
-            assert_eq!(build.required_files().len(), 2);
+            assert_eq!(build.required_files().len(), 3);
             assert_eq!(build.required_files()[0].source, PathBuf::from("/src/a"));
             assert_eq!(build.required_files()[0].dest, None);
+            // Bare + 2-tuple entries default to the SOURCE root (#644 back-compat).
+            assert_eq!(build.required_files()[0].root, UploadRoot::Source);
             assert_eq!(build.required_files()[1].source, PathBuf::from("/src/b"));
             assert_eq!(build.required_files()[1].dest, Some(PathBuf::from("/dst/b")));
+            assert_eq!(build.required_files()[1].root, UploadRoot::Source);
+            // The 3-tuple entry carries the OUTPUT selector verbatim.
+            assert_eq!(build.required_files()[2].source, PathBuf::from("/src/c"));
+            assert_eq!(build.required_files()[2].dest, Some(PathBuf::from("/dst/c")));
+            assert_eq!(
+                build.required_files()[2].root,
+                UploadRoot::Output,
+                "#644: a (source, dest, root) entry threads the OUTPUT mount selector"
+            );
             // The plain task (no `files` attribute) has none.
             assert!(out[1].0.required_files().is_empty(), "no files -> empty");
         });

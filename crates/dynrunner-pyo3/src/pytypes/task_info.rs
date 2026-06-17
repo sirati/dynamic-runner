@@ -120,15 +120,17 @@ pub(crate) struct PyTaskInfo {
     /// Consumer-boundary surface of the core
     /// [`dynrunner_core::TaskInfo::required_files`] (#336 P2): the files this
     /// WORK task needs UPLOADED to the cluster before it runs, each a
-    /// `(source, optional dest)` pair. Empty (the default) ⇒ no attached
-    /// files — the task behaves exactly as today. The framework's files-attach
-    /// transform DEDUPS these across the batch into one upload setup task per
-    /// unique file + the work task's deps; a consumer declares them via the
-    /// Python `TaskInfo.files=[path, ...]` (or `[(src, dest), ...]`) list. The
-    /// `From<&PyTaskInfo>` / `From<&TaskInfo>` conversions thread it onto
-    /// `required_files`.
+    /// `(source, optional dest, root)` triple. Empty (the default) ⇒ no
+    /// attached files — the task behaves exactly as today. The framework's
+    /// files-attach transform DEDUPS these across the batch into one upload
+    /// setup task per unique file + the work task's deps; a consumer declares
+    /// them via the Python `TaskInfo.files=[path, ...]` (or
+    /// `[(src, dest), ...]` / `[(src, dest, root), ...]`) list. `root` (#644)
+    /// selects the framework mount the upload lands under (default
+    /// [`PyUploadRoot::Source`]). The `From<&PyTaskInfo>` / `From<&TaskInfo>`
+    /// conversions thread the triple onto `required_files`.
     #[pyo3(get)]
-    pub(super) required_files: Vec<(String, Option<String>)>,
+    pub(super) required_files: Vec<(String, Option<String>, super::PyUploadRoot)>,
 }
 
 #[pymethods]
@@ -176,7 +178,7 @@ impl PyTaskInfo {
         is_setup: bool,
         is_secondary_affine: bool,
         setup_affinity: Option<String>,
-        required_files: Vec<(String, Option<String>)>,
+        required_files: Vec<(String, Option<String>, super::PyUploadRoot)>,
     ) -> PyResult<Self> {
         if task_id.is_empty() {
             return Err(PyValueError::new_err(
@@ -205,22 +207,24 @@ impl PyTaskInfo {
     }
 }
 
-/// Convert a `PyTaskInfo`'s `(source, optional dest)` pairs into the core
-/// `TaskInfo::required_files` STORAGE shape (`Option<Box<Vec<UploadFileRef>>>`).
-/// The SINGLE point the pyclass file-attach surface crosses into the core
-/// type. A `None` dest is the derive-destination case (strip-prefix under
-/// srcbins), a `Some` dest is explicit placement. An empty list normalizes to
-/// `None` via [`TaskInfo::required_files_storage`] (the common case never
-/// allocates / never rides the wire).
+/// Convert a `PyTaskInfo`'s `(source, optional dest, root)` triples into the
+/// core `TaskInfo::required_files` STORAGE shape
+/// (`Option<Box<Vec<UploadFileRef>>>`). The SINGLE point the pyclass
+/// file-attach surface crosses into the core type. A `None` dest is the
+/// derive-destination case (strip-prefix under the chosen `root`), a `Some`
+/// dest is explicit placement; `root` selects the framework mount (#644). An
+/// empty list normalizes to `None` via [`TaskInfo::required_files_storage`]
+/// (the common case never allocates / never rides the wire).
 pub(super) fn required_files_to_core(
-    pairs: &[(String, Option<String>)],
+    triples: &[(String, Option<String>, super::PyUploadRoot)],
 ) -> Option<Box<[UploadFileRef]>> {
     dynrunner_core::required_files_storage(
-        pairs
+        triples
             .iter()
-            .map(|(source, dest)| UploadFileRef {
+            .map(|(source, dest, root)| UploadFileRef {
                 source: PathBuf::from(source),
                 dest: dest.as_ref().map(PathBuf::from),
+                root: (*root).into(),
             })
             .collect(),
     )
@@ -347,8 +351,8 @@ impl From<&TaskInfo<RunnerIdentifier>> for PyTaskInfo {
             setup_affinity: bi.setup_affinity.clone(),
             // `required_files` IS carried on the core `TaskInfo<I>` (#336 P2),
             // so the round-trip-back faithfully reflects it — each core
-            // `UploadFileRef` projects back to its `(source, optional dest)`
-            // pair.
+            // `UploadFileRef` projects back to its `(source, optional dest,
+            // root)` triple (#644).
             required_files: bi
                 .required_files()
                 .iter()
@@ -356,6 +360,7 @@ impl From<&TaskInfo<RunnerIdentifier>> for PyTaskInfo {
                     (
                         f.source.to_string_lossy().into_owned(),
                         f.dest.as_ref().map(|d| d.to_string_lossy().into_owned()),
+                        f.root.into(),
                     )
                 })
                 .collect(),
@@ -440,23 +445,40 @@ mod tests {
         // derive-destination case; a `Some` dest is explicit placement.
         let mut py = sample_pytask(Vec::new());
         py.required_files = vec![
-            ("/src/a".to_string(), None),
-            ("/src/b".to_string(), Some("/dst/b".to_string())),
+            ("/src/a".to_string(), None, crate::pytypes::PyUploadRoot::Source),
+            (
+                "/src/b".to_string(),
+                Some("/dst/b".to_string()),
+                crate::pytypes::PyUploadRoot::Output,
+            ),
         ];
         let rust: TaskInfo<RunnerIdentifier> = TaskInfo::from(&py);
         assert_eq!(rust.required_files().len(), 2);
         assert_eq!(rust.required_files()[0].source, PathBuf::from("/src/a"));
         assert_eq!(rust.required_files()[0].dest, None);
+        assert_eq!(
+            rust.required_files()[0].root,
+            dynrunner_core::UploadRoot::Source
+        );
         assert_eq!(rust.required_files()[1].source, PathBuf::from("/src/b"));
         assert_eq!(rust.required_files()[1].dest, Some(PathBuf::from("/dst/b")));
+        assert_eq!(
+            rust.required_files()[1].root,
+            dynrunner_core::UploadRoot::Output,
+            "#644: the OUTPUT root selector crosses the FFI boundary verbatim"
+        );
 
-        // Reverse direction preserves the pairs (incl. the dest option).
+        // Reverse direction preserves the triples (incl. dest option + root).
         let py_back: PyTaskInfo = PyTaskInfo::from(&rust);
         assert_eq!(
             py_back.required_files,
             vec![
-                ("/src/a".to_string(), None),
-                ("/src/b".to_string(), Some("/dst/b".to_string())),
+                ("/src/a".to_string(), None, crate::pytypes::PyUploadRoot::Source),
+                (
+                    "/src/b".to_string(),
+                    Some("/dst/b".to_string()),
+                    crate::pytypes::PyUploadRoot::Output,
+                ),
             ],
         );
 

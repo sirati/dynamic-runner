@@ -46,7 +46,9 @@ use managers::primary_handle::PyPrimaryHandle;
 use managers::run::{compute_task_hash, run_distributed, run_local, run_primary, run_secondary};
 use managers::secondary::PySecondaryCoordinator;
 use pyo3::wrap_pyfunction;
-use pytypes::{PyBinaryIdentifier, PyFailedTask, PyProcessingStats, PyTaskInfo, PyTaskInfoView};
+use pytypes::{
+    PyBinaryIdentifier, PyFailedTask, PyProcessingStats, PyTaskInfo, PyTaskInfoView, PyUploadRoot,
+};
 use slurm::PyRustSlurmJobManager;
 use system_resources::{parse_cores, parse_memory, pick_free_port};
 
@@ -86,6 +88,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBinaryIdentifier>()?;
     m.add_class::<PyTaskInfo>()?;
     m.add_class::<PyTaskInfoView>()?;
+    m.add_class::<PyUploadRoot>()?;
     m.add_class::<PyProcessingStats>()?;
     m.add_class::<PyFailedTask>()?;
     m.add_class::<LogPathConfig>()?;

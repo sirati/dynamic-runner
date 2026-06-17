@@ -25,6 +25,6 @@ pub use types::{
     PhaseId, ResourceAmount, ResourceKind, ResourceMap, ResultValue, RetryClass, RunnerIdentifier,
     SoftPreferredSecondaries, TaskCountCategory, TaskDep, TaskInfo, TaskInput, TaskKind,
     TaskOutputs, TaskResult,
-    TaskVersion, TerminalOutcomeCounts, TypeId, UploadFileRef, WorkerId, check_soft_caps,
-    required_files_storage,
+    TaskVersion, TerminalOutcomeCounts, TypeId, UploadFileRef, UploadRoot, WorkerId,
+    check_soft_caps, required_files_storage,
 };

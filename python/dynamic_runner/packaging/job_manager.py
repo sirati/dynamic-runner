@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import _native
-from .._native import RustSlurmJobManager
+from .._native import RustSlurmJobManager, UploadRoot
 from ..deployment_spec import TaskDeploymentSpec
 from .gateway import retry_transient
 from .podman import PodmanImageMetadata
@@ -327,29 +327,55 @@ class SlurmJobManager:
         )
         return True
 
-    def upload_task_file(self, source: str, dest: str | None = None) -> None:
+    def upload_task_file(
+        self,
+        source: str,
+        dest: str | None = None,
+        root: UploadRoot = UploadRoot.SOURCE,
+    ) -> None:
         """Upload ONE task file to the cluster — the #336 P1 upload-action
         callback target (registered Rust→Python; see the
         ``upload_action``/``UploadAction`` seam).
 
         ``source`` is the file's on-disk location on the source-owning member
         (the submitter / observer that holds it). ``dest`` is the cluster-side
-        destination RELATIVE to the gateway srcbins dir; ``None`` derives it
-        from ``source``'s basename. Either way the file lands under
-        ``<srcbins>/...``, the SAME bind-mount root the bulk walk populates, so
-        a secondary's ``src_network`` view resolves it identically.
+        destination RELATIVE to the chosen mount root; ``None`` derives it from
+        ``source``'s basename.
+
+        ``root`` (#644) selects WHICH framework-owned cluster mount root the
+        upload lands under — the framework owns the host→container mount
+        mapping, so the consumer picks a mount, never a host path:
+
+        * :attr:`UploadRoot.Source` (the default) — the gateway srcbins dir,
+          the SAME bind-mount root the bulk walk populates, surfaced as
+          ``/app/src-network``. Pre-#644 behaviour (every upload landed here).
+        * :attr:`UploadRoot.Output` — the shared output mount
+          (``get_output_dir``), surfaced as ``/app/out-network``, where a
+          consumer's affine import gates read.
 
         Reuses the bulk walk's per-blob ``retry_transient`` transfer — NOT
         re-implemented. Raises ``OSError`` (transient) / other (permanent) on
         a transfer that could not complete after the bounded retry; the Rust
         bridge classifies the exception for the upload action's retry/terminal
         decision.
+
+        The ``root`` default keeps a pre-#644 2-arg caller
+        (``upload_task_file(source, dest)``) landing under the srcbins root
+        exactly as before.
         """
-        srcbins_dir = self._expanded_remote_path(self.slurm_config.get_srcbins_dir())
-        # The srcbins-relative tail: an explicit dest verbatim, else the
+        # The framework mount-root selector → its expanded cluster base dir.
+        # The mapping is the SOLE place this file knows the two roots; both
+        # come off the same `slurm_config` surface the bulk walk / job-submit
+        # already read.
+        base_for_root = {
+            UploadRoot.SOURCE: self.slurm_config.get_srcbins_dir(),
+            UploadRoot.OUTPUT: self.slurm_config.get_output_dir(),
+        }
+        base = self._expanded_remote_path(base_for_root[root])
+        # The root-relative tail: an explicit dest verbatim, else the
         # source's basename (P2 owns richer placement policy).
         rel = Path(dest) if dest is not None else Path(Path(source).name)
-        remote = srcbins_dir / rel
+        remote = base / rel
         self.gateway.create_directory(str(remote.parent))
         retry_transient(
             lambda: self.gateway.transfer_file(Path(source), str(remote)),
