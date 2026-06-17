@@ -191,15 +191,15 @@ impl SettledSpillDriver {
         // opened), but is INDEPENDENT of the settle sweep: a completed
         // task's output is write-through-then-dropped to this file at
         // apply, not on the settle cadence. Every role persists the payload
-        // to disk (`retains_payload = true`) — zero MEMORY residence on
-        // every node, and promotion-safe (a node never loses an output from
-        // memory because it never held it). On any open failure the store
+        // to disk — zero MEMORY residence on every node, and promotion-safe
+        // (a node never loses an output from memory because it never held
+        // it). On any open failure the store
         // stays in resident-fallback (a WARN names it; the run proceeds
         // fat-but-correct — the spill is an optimization, never a gate).
         match Self::open_output_file(role) {
             Ok((path, write_fd, read_fd)) => {
                 let committed = Arc::new(AtomicU64::new(0));
-                state.attach_output_segment(write_fd, Arc::new(read_fd), committed, true);
+                state.attach_output_segment(write_fd, Arc::new(read_fd), committed);
                 tracing::info!(role, path = %path.display(), "always-on output store enabled");
             }
             Err(e) => {
