@@ -33,8 +33,6 @@ use crate::task_def::TypeRegistry;
 mod new;
 pub(crate) mod run;
 
-mod tests;
-
 #[pyclass(name = "RustSecondaryCoordinator")]
 pub(crate) struct PySecondaryCoordinator {
     pub(super) python_executable: PathBuf,

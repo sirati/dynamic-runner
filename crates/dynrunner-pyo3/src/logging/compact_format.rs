@@ -45,11 +45,17 @@ use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::registry::LookupSpan;
 
-use dynrunner_core::{PRIMARY_ROLE_SPAN, SECONDARY_ROLE_SPAN};
+use dynrunner_core::{OBSERVER_ROLE_SPAN, PRIMARY_ROLE_SPAN, SECONDARY_ROLE_SPAN};
 
 /// One entry per role: the span NAME that tags a coordinator's run future,
 /// the single-letter prefix it maps to, and the span field that carries the
 /// human-readable id (primary tags `node = …`, secondary tags `id = …`).
+///
+/// The id is part of the prefix ONLY for the CRDT-generating roles (primary /
+/// secondary): their id identifies which peer authored a change, so it is
+/// load-bearing in the log. An observer generates no CRDT changes, so its id
+/// is noise — it renders as the bare role letter `O` with no id (`id_field:
+/// None`).
 ///
 /// This is the ONLY place a role is mapped to its line prefix; adding a
 /// future role is one new entry here, never a new branch in [`RoleTagLayer`]
@@ -59,12 +65,17 @@ const ROLE_PREFIXES: &[RolePrefix] = &[
     RolePrefix {
         span_name: PRIMARY_ROLE_SPAN,
         letter: 'P',
-        id_field: "node",
+        id_field: Some("node"),
     },
     RolePrefix {
         span_name: SECONDARY_ROLE_SPAN,
         letter: 'S',
-        id_field: "id",
+        id_field: Some("id"),
+    },
+    RolePrefix {
+        span_name: OBSERVER_ROLE_SPAN,
+        letter: 'O',
+        id_field: None,
     },
 ];
 
@@ -72,26 +83,33 @@ const ROLE_PREFIXES: &[RolePrefix] = &[
 struct RolePrefix {
     /// The role span name (a `dynrunner_core` role-span const).
     span_name: &'static str,
-    /// The single-letter prefix (`P` / `S`).
+    /// The single-letter prefix (`P` / `S` / `O`).
     letter: char,
-    /// The span field whose value is the human-readable id.
-    id_field: &'static str,
+    /// The span field whose value is the human-readable id, or `None` for a
+    /// role whose prefix is the bare letter (the observer carries no id).
+    id_field: Option<&'static str>,
 }
 
 /// The role attribution recorded once on a role span at creation and read
-/// back by the formatter: the prefix letter plus the resolved id value
-/// (e.g. `P` + `secondary-0`). Stored as a typed span extension so the
-/// formatter reads a structured value, never a parse of `FormattedFields`.
+/// back by the formatter: the prefix letter plus, for the CRDT-generating
+/// roles, the resolved id value (e.g. `P` + `secondary-0`). An id-less role
+/// (observer) records `id: None` and renders the bare letter. Stored as a
+/// typed span extension so the formatter reads a structured value, never a
+/// parse of `FormattedFields`.
 #[derive(Clone)]
 struct RoleTag {
     letter: char,
-    id: String,
+    id: Option<String>,
 }
 
 impl RoleTag {
-    /// `{letter}-{id}` — the role prefix token, e.g. `P-secondary-0`.
+    /// The role prefix token: `{letter}-{id}` for an id-bearing role (e.g.
+    /// `P-secondary-0`), or the bare `{letter}` for an id-less role (`O`).
     fn render(&self) -> String {
-        format!("{}-{}", self.letter, self.id)
+        match &self.id {
+            Some(id) => format!("{}-{}", self.letter, id),
+            None => self.letter.to_string(),
+        }
     }
 }
 
@@ -143,15 +161,22 @@ where
         else {
             return;
         };
-        let mut visitor = IdFieldVisitor {
-            wanted: role.id_field,
-            found: None,
-        };
-        attrs.record(&mut visitor);
+        // An id-less role (observer) records no id — its prefix is the bare
+        // letter. An id-bearing role reads its id field off the span's
+        // attributes; a missing value falls back to `?` so the prefix is
+        // still readable.
+        let resolved_id = role.id_field.map(|wanted| {
+            let mut visitor = IdFieldVisitor {
+                wanted,
+                found: None,
+            };
+            attrs.record(&mut visitor);
+            visitor.found.unwrap_or_else(|| "?".to_string())
+        });
         let Some(span) = ctx.span(id) else { return };
         span.extensions_mut().insert(RoleTag {
             letter: role.letter,
-            id: visitor.found.unwrap_or_else(|| "?".to_string()),
+            id: resolved_id,
         });
     }
 }
@@ -343,6 +368,32 @@ mod tests {
             .unwrap_or_else(|| panic!("line missing: {out:?}"));
         let role = line.split_whitespace().nth(2).expect("role token");
         assert_eq!(role, "S-sec-7", "secondary role prefix wrong: {line:?}");
+    }
+
+    #[test]
+    fn observer_line_is_bare_o_with_no_id() {
+        // An observer generates no CRDT changes, so its id is noise: the
+        // prefix is the bare role letter `O`, NOT `O-<node>`. The span still
+        // carries `kind`/`node` (display sugar / routing context) but the
+        // formatter drops them from the prefix.
+        let out = capture_role_line(|| {
+            tracing::info_span!(OBSERVER_ROLE_SPAN, kind = "observer", node = "observer-0f26")
+        });
+        let line = out
+            .lines()
+            .find(|l| l.contains("task dispatched"))
+            .unwrap_or_else(|| panic!("line missing: {out:?}"));
+        let role = line.split_whitespace().nth(2).expect("role token");
+        assert_eq!(role, "O", "observer role prefix must be bare `O`: {line:?}");
+        // No id / node leaks into the line anywhere.
+        assert!(
+            !line.contains("observer-0f26"),
+            "observer line leaked its node id: {line:?}"
+        );
+        assert!(
+            !line.contains("kind="),
+            "observer line dumped the role span fields: {line:?}"
+        );
     }
 
     #[test]

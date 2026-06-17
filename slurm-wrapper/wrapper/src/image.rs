@@ -548,9 +548,16 @@ mod tests {
     /// provide path must NOT return a fatal Err — it must fall back to the
     /// per-job writable copy so the secondary still starts.
     ///
+    /// Drives `provide_local_image` DIRECTLY (the fn that owns the
+    /// cache-vs-per-job decision) rather than `copy_and_load`: the fallback
+    /// decision is made entirely before `run_load`, so this test needs no
+    /// `bash -c` fork. Fork-free keeps it fully hermetic — only fs ops
+    /// scoped to a unique tempdir, no subprocess — so it is robust under
+    /// parallel execution and adds no fork pressure to the test pool.
+    ///
     /// Revert-check: with the copy-failure `return copy_per_job(...)`
-    /// reverted to `return Err(...)`, `copy_and_load` errors and this test
-    /// fails — i.e. it pins the stranding bug.
+    /// reverted to `return Err(...)`, `provide_local_image` errors and this
+    /// test fails — i.e. it pins the stranding bug.
     #[test]
     fn unwritable_cache_dir_falls_back_to_per_job_copy() {
         use std::os::unix::fs::PermissionsExt;
@@ -565,7 +572,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let digest = "facefeed1234";
-        let (cfg, layout, bins, bytes) = fixture(dir.path(), "true", digest);
+        let (cfg, layout, _bins, bytes) = fixture(dir.path(), "true", digest);
 
         // Pre-create the cache root mode-0555 (r-xr-xr-x): create_dir_all
         // sees it already exists and "succeeds", but a copy INTO it is
@@ -577,7 +584,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = copy_and_load(&cfg, &layout, &bins);
+        let provided = provide_local_image(&cfg, &layout);
 
         // Restore writability so tempdir cleanup can remove the tree.
         let _ = std::fs::set_permissions(
@@ -585,10 +592,15 @@ mod tests {
             std::fs::Permissions::from_mode(0o755),
         );
 
-        result.expect("unwritable cache must fall back, not strand the secondary");
+        let provided =
+            provided.expect("unwritable cache must fall back, not strand the secondary");
 
-        // The fallback landed the image in the per-job writable scratch,
-        // faithfully copied, and NOT in the unwritable cache.
+        // The fallback returned the per-job writable scratch path, faithfully
+        // copied, and did NOT populate the unwritable cache.
+        assert_eq!(
+            provided, layout.local_image,
+            "fallback must hand back the per-job local_image path"
+        );
         assert!(
             layout.local_image.exists(),
             "fallback must write the per-job local_image"

@@ -58,10 +58,15 @@ use dynrunner_core::{Identifier, TaskInfo};
 /// `SkippedAlreadyDone` rather than dispatching it). The marker rides the
 /// discovery boundary, NOT `TaskInfo<I>` — `discover_on_promotion`
 /// partitions on it via the shared `skip_transitions` helper.
-pub type SetupDiscoveryFn<I> = Box<
-    dyn FnMut() -> Pin<Box<dyn Future<Output = Result<Vec<(TaskInfo<I>, bool)>, String>> + Send>>
-        + Send,
->;
+/// The discovery future the policy returns and the driver `.await`s: the full
+/// discovered batch (each task paired with its `skipped_already_done` marker)
+/// or an `Err` that aborts the run. `Send` (the thread-move contract). Named so
+/// both [`SetupDiscoveryFn`]'s return and [`InFlightDiscovery::future`] share
+/// ONE shape — they are the same future, before vs. after it is started.
+pub type DiscoveryFuture<I> =
+    Pin<Box<dyn Future<Output = Result<Vec<(TaskInfo<I>, bool)>, String>> + Send>>;
+
+pub type SetupDiscoveryFn<I> = Box<dyn FnMut() -> DiscoveryFuture<I> + Send>;
 
 /// The consumer's setup-discovery policy plus the phase-dependency graph
 /// fed alongside the discovered binaries when seeding the replicated
@@ -80,6 +85,44 @@ pub struct SetupDiscovery<I: Identifier> {
     /// The phase-dependency graph broadcast with the discovered tasks. The
     /// consumer resolves this from its `TaskDefinition.get_phases()` once at
     /// construction; discovery only resolves the per-task list.
+    pub phase_deps:
+        std::collections::HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>,
+}
+
+/// An IN-FLIGHT mode-2 discovery: the started discovery future plus the
+/// phase-dependency graph that seeds the ledger ALONGSIDE its result.
+///
+/// # Why this exists (the concurrent-arm contract — correctness)
+///
+/// `discover_items` is collect-all (it returns the FULL `Vec<(TaskInfo, bool)>`
+/// in one await — ~6 min for a 46k corpus). Awaiting it SEQUENTIALLY as a
+/// pre-loop step parks the primary's whole operational `select!` control flow
+/// for that window: the keepalive arm never fires (peers see app-silence) and
+/// the setup-servicing arms never run (secondaries sit at the setup deadline →
+/// failover). Holding the started future HERE — on a coordinator field — lets
+/// the operational loop poll it as ONE concurrent `select!` arm: while it is
+/// pending, every sibling arm (inbox, command, heartbeat→keepalive,
+/// worker-mgmt→setup-servicing) runs normally, so the primary stays app-alive
+/// AND services secondary setup concurrently with discovery.
+///
+/// `phase_deps` rides alongside the future because the post-resolve seed needs
+/// BOTH the discovered batch and the dep graph in ONE atomic ledger mutation
+/// (`PhaseDepsSet + TaskAdded* + DiscoverySettled`) — the future yields only
+/// the batch, so the graph is carried here from the registered
+/// [`SetupDiscovery`] when the future is started.
+///
+/// `Send` (via the inner `SetupDiscoveryFn` contract) so it polls cleanly as a
+/// `select!` arm on the coordinator's own thread. `FnMut`-derived: started by
+/// ONE `(discover)()` call when the CRDT declares `DiscoveryDebt::Owed`.
+pub struct InFlightDiscovery<I: Identifier> {
+    /// The started discovery future — `(SetupDiscovery::discover)()`, polled
+    /// by the operational loop's discovery `select!` arm. Resolves to the full
+    /// discovered batch (each task paired with its `skipped_already_done`
+    /// marker) or an `Err` that aborts the run.
+    pub future: DiscoveryFuture<I>,
+    /// The phase-dependency graph seeded alongside the discovered batch — the
+    /// `SetupDiscovery::phase_deps` carried across the await so the post-resolve
+    /// seed (`PhaseDepsSet`) has it without re-consulting the (now-taken) policy.
     pub phase_deps:
         std::collections::HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>,
 }
