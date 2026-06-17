@@ -394,7 +394,7 @@ impl SettledSpillDriver {
         }
         let (unsettled_eligible, unsettled_live) = state.fat_task_breakdown();
         let outputs = state.output_store();
-        tracing::info!(
+        tracing::trace!(
             role = self.role,
             spill_file_bytes = store.committed_bytes(),
             records_written = store.records_committed(),
