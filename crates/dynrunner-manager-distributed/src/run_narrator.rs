@@ -393,9 +393,6 @@ impl RunNarrator {
                 let (to_run, skipped) = (p.to_run, p.skipped);
                 tracing::info!(
                     target: IMPORTANT_TARGET,
-                    phase = %phase,
-                    to_run = to_run,
-                    skipped = skipped,
                     "phase {phase}: {to_run} to run, {skipped} skipped (already done)",
                 );
                 // Running OVERALL across every phase started so far. DERIVED
@@ -421,10 +418,6 @@ impl RunNarrator {
                     );
                 tracing::info!(
                     target: IMPORTANT_TARGET,
-                    to_run = overall.to_run,
-                    done = overall.done,
-                    failed = overall.failed,
-                    skipped = overall.skipped,
                     "overall: {} to run, {} done, {} failed, {} skipped (already done)",
                     overall.to_run,
                     overall.done,
@@ -667,7 +660,6 @@ impl RunNarrator {
             self.setup_started_emitted = true;
             tracing::info!(
                 target: IMPORTANT_TARGET,
-                setup_total = progress.total,
                 "starting setup phase — {} setup tasks to stage",
                 progress.total,
             );
@@ -685,8 +677,6 @@ impl RunNarrator {
             self.setup_progress_emitted = Some(progress.complete);
             tracing::info!(
                 target: IMPORTANT_TARGET,
-                setup_complete = progress.complete,
-                setup_total = progress.total,
                 "setup: {}/{} tasks complete",
                 progress.complete,
                 progress.total,
@@ -700,7 +690,6 @@ impl RunNarrator {
             self.setup_done_emitted = true;
             tracing::info!(
                 target: IMPORTANT_TARGET,
-                setup_total = progress.total,
                 "setup complete — {} setup tasks done",
                 progress.total,
             );
@@ -1424,9 +1413,10 @@ mod tests {
             1,
             "exactly one setup-started line: {events:?}"
         );
-        assert_eq!(
-            started[0].fields.get("setup_total").map(String::as_str),
-            Some("3")
+        assert!(
+            started[0].message.contains("3 setup tasks to stage"),
+            "setup-started line carries the total in its message: {:?}",
+            started[0].message
         );
 
         // Aggregate progress: 0/3 (sweep 1) + 2/3 (sweep 2) = exactly two
@@ -1462,9 +1452,10 @@ mod tests {
             1,
             "exactly one setup all-done line: {events:?}"
         );
-        assert_eq!(
-            all_done[0].fields.get("setup_total").map(String::as_str),
-            Some("3")
+        assert!(
+            all_done[0].message.contains("3 setup tasks done"),
+            "setup all-done line carries the total in its message: {:?}",
+            all_done[0].message
         );
 
         // ORDERING: every setup line precedes the dependent "build" phase's
@@ -1887,21 +1878,12 @@ mod tests {
 
         let per_phase: Vec<_> = events
             .iter()
-            .filter(|e| e.message.contains("2 to run, 3 skipped (already done)"))
-            .filter(|e| e.fields.get("phase").map(String::as_str) == Some("build"))
+            .filter(|e| e.message.contains("phase build: 2 to run, 3 skipped (already done)"))
             .collect();
         assert_eq!(
             per_phase.len(),
             1,
             "exactly one per-phase skip-partition line for the build phase: {events:?}"
-        );
-        assert_eq!(
-            per_phase[0].fields.get("to_run").map(String::as_str),
-            Some("2")
-        );
-        assert_eq!(
-            per_phase[0].fields.get("skipped").map(String::as_str),
-            Some("3")
         );
 
         let overall: Vec<_> = events
@@ -1920,19 +1902,6 @@ mod tests {
             "overall reflects the single phase's partition: {:?}",
             overall[0].message
         );
-        assert_eq!(
-            overall[0].fields.get("to_run").map(String::as_str),
-            Some("2")
-        );
-        assert_eq!(overall[0].fields.get("done").map(String::as_str), Some("0"));
-        assert_eq!(
-            overall[0].fields.get("failed").map(String::as_str),
-            Some("0")
-        );
-        assert_eq!(
-            overall[0].fields.get("skipped").map(String::as_str),
-            Some("3")
-        );
     }
 
     /// #337: a phase with no already-done skips emits "<N> to run, 0 skipped"
@@ -1950,8 +1919,7 @@ mod tests {
 
         let per_phase: Vec<_> = events
             .iter()
-            .filter(|e| e.message.contains("2 to run, 0 skipped (already done)"))
-            .filter(|e| e.fields.get("phase").map(String::as_str) == Some("compile"))
+            .filter(|e| e.message.contains("phase compile: 2 to run, 0 skipped (already done)"))
             .collect();
         assert_eq!(
             per_phase.len(),
@@ -2043,27 +2011,13 @@ mod tests {
             "phase A's terminal tasks read done, the skip count is unchanged: {:?}",
             overall[1].message
         );
-        assert_eq!(
-            overall[1].fields.get("to_run").map(String::as_str),
-            Some("1")
-        );
-        assert_eq!(overall[1].fields.get("done").map(String::as_str), Some("2"));
-        assert_eq!(
-            overall[1].fields.get("failed").map(String::as_str),
-            Some("0")
-        );
-        assert_eq!(
-            overall[1].fields.get("skipped").map(String::as_str),
-            Some("1")
-        );
         // The per-phase line for the just-spawned phase is unchanged — a
         // freshly-dispatchable phase owns no terminal work at ITS emit
         // moment, so its idiom needs no done/failed split.
         let dep_phase: Vec<_> = events
             .iter()
             .filter(|e| {
-                e.fields.get("phase").map(String::as_str) == Some("dependency_graph")
-                    && e.message.contains("to run")
+                e.message.contains("phase dependency_graph:") && e.message.contains("to run")
             })
             .collect();
         assert_eq!(
@@ -2129,19 +2083,6 @@ mod tests {
                 .contains("3 to run, 1 done, 1 failed, 0 skipped (already done)"),
             "mid-phase partial completions partition honestly: {:?}",
             overall[1].message
-        );
-        assert_eq!(
-            overall[1].fields.get("to_run").map(String::as_str),
-            Some("3")
-        );
-        assert_eq!(overall[1].fields.get("done").map(String::as_str), Some("1"));
-        assert_eq!(
-            overall[1].fields.get("failed").map(String::as_str),
-            Some("1")
-        );
-        assert_eq!(
-            overall[1].fields.get("skipped").map(String::as_str),
-            Some("0")
         );
     }
 
