@@ -251,6 +251,20 @@ pub(crate) struct SettledSegment {
 #[derive(Default)]
 pub struct SettledStore {
     index: HashMap<String, SettledEntry>,
+    /// Reverse lookup from a settled record's WIRE-AGREED [`TaskDefId`] to its
+    /// content hash (its `index` key) — the failover/recompose seam a promoted
+    /// primary resolves a def-id dep ref through when the prereq's def has left
+    /// the in-memory `definitions` store (it settled + evicted). A settled def
+    /// is invisible to the in-memory store, so without this a Pending
+    /// dependent's L5 dep ref to a settled prereq resolves to None; this maps
+    /// the id back to the entry whose `(phase_id, task_id)` identity the
+    /// resolver needs. Maintained alongside `index` (commit-spill inserts,
+    /// unsettle removes) so it is O(1), not an O(N) scan over `index` (a
+    /// per-dep scan would be O(N²) at scale). [`TaskDefId::UNBOUND`] entries
+    /// (node-local interns — intra-node only) are EXCLUDED, mirroring
+    /// [`Self::max_def_id`]: a node-local id is not portable, so it is never a
+    /// cross-replica dep-ref target.
+    def_id_to_hash: HashMap<TaskDefId, String>,
     segments: Vec<SettledSegment>,
     /// XOR accumulator over settled `(key, hashable_join_key)` terms —
     /// `digest()` folds `acc ⊕ fold(fat)`.
@@ -319,6 +333,7 @@ impl SettledStore {
     pub(crate) fn clone_read_only(&self) -> Self {
         Self {
             index: self.index.clone(),
+            def_id_to_hash: self.def_id_to_hash.clone(),
             segments: self.segments.clone(),
             tasks_hash_acc: self.tasks_hash_acc,
             task_outputs_hash_acc: self.task_outputs_hash_acc,
@@ -389,6 +404,31 @@ impl SettledStore {
             .filter(|&id| id != TaskDefId::UNBOUND)
             .map(|id| id.0)
             .max()
+    }
+
+    /// Whether a settled record already occupies this WIRE-AGREED
+    /// [`TaskDefId`] — the allocator settled-safety guard. A settled def left
+    /// the in-memory `definitions` store, so `intern_at`'s in-memory
+    /// free-slot check cannot see it; a new/restored def carrying a settled
+    /// id would otherwise be placed SILENTLY onto the settled slot (the
+    /// cross-epoch aliasing CL-A2 forbids). [`TaskDefId::UNBOUND`] is never
+    /// indexed, so it never reports occupied (a node-local id is intra-node).
+    pub(crate) fn is_def_id_settled(&self, id: TaskDefId) -> bool {
+        self.def_id_to_hash.contains_key(&id)
+    }
+
+    /// The `(phase_id, task_id)` IDENTITY of the settled record holding this
+    /// WIRE-AGREED [`TaskDefId`], if any — the failover/recompose dep-ref
+    /// resolution seam. A Pending dependent's L5 def-id dep ref to a prereq
+    /// that has COMPLETED + SETTLED resolves through here (its def is no
+    /// longer in the in-memory store), so the rebuilt edge carries the
+    /// prereq's REAL identity (matching the live graph) instead of the
+    /// unresolved-sentinel. O(1) via the maintained reverse index.
+    pub(crate) fn identity_for_def_id(&self, id: TaskDefId) -> Option<(&PhaseId, &str)> {
+        self.def_id_to_hash
+            .get(&id)
+            .and_then(|hash| self.index.get(hash))
+            .map(|entry| (&entry.phase_id, entry.task_id.as_str()))
     }
 
     /// Per-settled-entry `(key, digest_contribution)` pairs — the persisted
@@ -850,6 +890,15 @@ impl<I: Identifier> ClusterState<I> {
             }
             self.settled.approx_index_bytes += entry.approx_bytes();
             self.settled.records_committed += 1;
+            // Maintain the def-id→hash reverse index in lockstep with `index`
+            // (wire-agreed ids only — a node-local UNBOUND def is intra-node
+            // and never a portable dep-ref target). The dep-ref resolver reads
+            // it when the prereq's def has left the in-memory store.
+            if captured_def_id != TaskDefId::UNBOUND {
+                self.settled
+                    .def_id_to_hash
+                    .insert(captured_def_id, rec.hash.clone());
+            }
             self.settled.index.insert(rec.hash.clone(), entry);
             self.tasks.remove(&rec.hash);
             // Range-fold memo: a spill is memo-NEUTRAL. The entry stays a
@@ -898,6 +947,11 @@ impl<I: Identifier> ClusterState<I> {
             .index
             .remove(hash)
             .expect("checked present above");
+        // Drop the def-id→hash reverse index in lockstep with `index` (the
+        // inverse of the commit-spill insert; UNBOUND was never inserted).
+        if entry.def_id != TaskDefId::UNBOUND {
+            self.settled.def_id_to_hash.remove(&entry.def_id);
+        }
         self.settled.tasks_hash_acc ^= entry.digest_contribution;
         // Reverse the output eviction: the payload left the resident map at
         // commit-spill (its term moved into `task_outputs_hash_acc`), so

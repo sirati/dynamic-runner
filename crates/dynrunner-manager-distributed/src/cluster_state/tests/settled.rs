@@ -1131,33 +1131,40 @@ fn promotion_resumes_def_alloc_past_settled_and_in_memory_max() {
     promoted.install_settled_base(base);
     promoted.restore(donor.snapshot());
 
-    // BEFORE the promotion seam: the in-memory store re-anchored only the
-    // RESTORED def (id 3 → floor 4); the SETTLED id 7 is INVISIBLE to the
-    // in-memory store (the snapshot ships defs by value, but a settled
-    // entry's fat body — and its def — is NOT in the snapshot's task
-    // batch). This is the exact gap L6a closes.
+    // THE restore seam already re-anchored: `restore` re-anchors the def
+    // allocator PAST max(in-memory 3, settled 7) ⇒ 8 at the HEAD of the
+    // restore chokepoint, BEFORE the per-task `register_restored_def` loop —
+    // the snapshot-restore path crosses the SAME epoch boundary as the live
+    // `PrimaryChanged` apply arm, so the re-anchor fires here too (the gap
+    // L6a closes; it is no longer deferred to the apply arm). The SETTLED id
+    // 7 is still INVISIBLE to the in-memory def MAP (the snapshot ships defs
+    // by value, but a settled entry's fat body — and its def — is NOT in the
+    // snapshot's task batch); only the ALLOCATOR floor accounts for it.
     assert_eq!(
         promoted.def_alloc_floor_for_test(),
-        4,
-        "pre-resume floor reflects only the restored in-memory max"
+        8,
+        "restore re-anchored the floor past the settled id (7) + 1 at the seam"
     );
     assert!(
         promoted
             .resolve_def_for_test(crate::cluster_state::TaskDefId(7))
             .is_none(),
-        "the settled def-id is not in the in-memory store — the gap"
+        "the settled def-id is not in the in-memory store — only the \
+         allocator floor (not the def map) accounts for it"
     );
 
-    // The promotion seam: a freshly-promoted primary originates
-    // `PrimaryChanged { new = self, epoch + 1 }`, whose apply fires the
-    // def-id resume floor over (in-memory ∪ settled).
+    // The promotion seam re-application: a freshly-promoted primary
+    // originates `PrimaryChanged { new = self, epoch + 1 }`, whose apply
+    // re-fires the def-id resume floor — MONOTONE + IDEMPOTENT, so it is a
+    // no-op over the already-anchored floor (the invariant now holds at BOTH
+    // the restore seam and the apply seam).
     apply_primary_changed(&mut promoted, "promoted-self", 1);
 
-    // AFTER: the allocator resumed PAST max(in-memory 3, settled 7) ⇒ 8.
+    // STILL 8 — the apply re-fire neither lowers nor double-counts.
     assert_eq!(
         promoted.def_alloc_floor_for_test(),
         8,
-        "the resume floor includes the settled id (7) + 1"
+        "the apply re-fire is a monotone no-op over the restore-anchored floor"
     );
 
     // A newly-allocated def-id does NOT collide with the settled id 7 nor
@@ -1219,4 +1226,173 @@ fn cross_epoch_promotion_does_not_reuse_settled_def_id() {
         crate::cluster_state::TaskDefId(5),
         "the cross-epoch collision on the settled id is foreclosed"
     );
+}
+
+// ── Commit 2: intern_at settled-safety (a carried id never occupies a
+// settled slot) ──
+
+/// A restored fat def whose CARRIED def-id collides with a SETTLED id must
+/// NOT be placed onto the settled slot. `intern_at`'s free-slot check reads
+/// only the in-memory `defs` vector — a settled def left it, so the slot
+/// looks free and the (DIFFERENT) restored def would be placed SILENTLY at
+/// the settled id, aliasing a def-id dep ref onto the wrong def. The
+/// settled-collision guard in `register_restored_def` degrades it by content
+/// (a fresh local id), exactly like an in-memory IdRebound.
+///
+/// Pre-fix RED: V is placed at the settled id g (resolve(g) == V — the
+/// alias). Post-fix GREEN: V is degraded to a fresh id ≠ g.
+#[test]
+fn restored_def_with_settled_carried_id_degrades_by_content() {
+    use dynrunner_core::TaskKind;
+
+    // g is a wire-agreed SETTLED id; the cross-epoch transient hands a
+    // DIFFERENT fat task ("variant") the SAME carried id g.
+    const G: u32 = 5;
+    let phase = PhaseId::from("BUILD");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Donor 1: the import gate settled at wire id g (g lives only in the
+    // settled index; its slot is FREE in the in-memory def store).
+    let mut gate_donor = ClusterState::<RunnerIdentifier>::new();
+    let mut gate = mk_task("import_common");
+    gate.phase_id = phase.clone();
+    gate.kind = TaskKind::SecondaryAffine;
+    gate_donor.apply(ClusterMutation::TaskAdded {
+        hash: "import_common".into(),
+        task: gate,
+        def_id: Some(G),
+    });
+    gate_donor.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "import_common".into(),
+        result_data: None,
+    });
+    let evicted = gate_donor.test_spill_all(&dir.path().join("spill.cbor"));
+    assert_eq!(evicted, 1);
+    assert_eq!(gate_donor.settled_store().max_def_id(), Some(G));
+
+    // Donor 2 (a DIFFERENT epoch's allocator): a fat build variant minted at
+    // the SAME wire id g — the cross-epoch alias the guard must catch.
+    let mut variant_donor = ClusterState::<RunnerIdentifier>::new();
+    let mut variant = mk_task("build_variant__x");
+    variant.phase_id = phase.clone();
+    variant_donor.apply(ClusterMutation::TaskAdded {
+        hash: "build_variant__x".into(),
+        task: variant,
+        def_id: Some(G),
+    });
+
+    // Promote: install the settled base (gate at g), then restore the variant
+    // snapshot whose def carries the colliding wire id g.
+    let mut promoted = ClusterState::<RunnerIdentifier>::new();
+    promoted.install_settled_base(gate_donor.settled_base_clone());
+    promoted.restore(variant_donor.snapshot());
+
+    // The variant must NOT occupy the settled slot g.
+    let v_id = promoted
+        .def_id_for_hash_for_test("build_variant__x")
+        .expect("the variant's def is restored (degraded by content)");
+    assert_ne!(
+        v_id,
+        crate::cluster_state::TaskDefId(G),
+        "the restored variant must NOT be placed onto the settled id g — \
+         intern_at's in-memory free-slot check cannot see the settled def, so \
+         the settled-collision guard must degrade it by content"
+    );
+    assert!(
+        promoted
+            .resolve_def_for_test(crate::cluster_state::TaskDefId(G))
+            .is_none(),
+        "the settled id g must hold NO in-memory def (the variant did not \
+         alias onto it)"
+    );
+
+    drop(dir);
+}
+
+// ── Commit 3: settled-aware dep resolution (the recompose linchpin) ──
+
+/// A Pending dependent's L5 def-id dep ref to a COMPLETED + SETTLED prereq
+/// must resolve to the prereq's REAL `(phase_id, task_id)` identity — NOT the
+/// unresolved sentinel. The settled def left the in-memory store, so without
+/// the settled `def_id → identity` fallback the rebuilt edge would be empty
+/// and a promoted-primary hydrate of the still-Pending dependent would fail
+/// `UnknownTaskDep`. The rebuilt edge matches the LIVE graph (the dependent
+/// keeps the completed dep, the pool pre-resolves it satisfied via
+/// `completed_tasks`).
+///
+/// Pre-fix RED: resolve to empty (task_id == ""). Post-fix GREEN: resolves to
+/// the settled prereq's identity.
+#[test]
+fn pending_dependent_resolves_dep_to_settled_prereq_identity() {
+    use dynrunner_core::{TaskDep, TaskKind};
+
+    const G: u32 = 7;
+    let phase = PhaseId::from("BUILD");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Donor: the import gate at wire id g + a Pending build variant depending
+    // on it (its frozen dep ref resolves to g via the identity index at
+    // intern). Complete + spill the gate so g lives only in the settled index.
+    let mut donor = ClusterState::<RunnerIdentifier>::new();
+    let mut gate = mk_task("import_common");
+    gate.phase_id = phase.clone();
+    gate.kind = TaskKind::SecondaryAffine;
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: "import_common".into(),
+        task: gate,
+        def_id: Some(G),
+    });
+    let mut variant = mk_task("build_variant__x");
+    variant.phase_id = phase.clone();
+    variant.task_depends_on = vec![TaskDep {
+        task_id: "import_common".into(),
+        phase_id: phase.clone(),
+        inherit_outputs: false,
+        def_id: None,
+    }];
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: "build_variant__x".into(),
+        task: variant,
+        def_id: Some(3),
+    });
+    donor.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "import_common".into(),
+        result_data: None,
+    });
+    let evicted = donor.test_spill_all(&dir.path().join("spill.cbor"));
+    assert_eq!(evicted, 1, "the gate settles; the variant stays fat Pending");
+    assert_eq!(donor.settled_store().max_def_id(), Some(G));
+
+    // Promote: settled base + restore (the variant rides the snapshot fat).
+    let mut promoted = ClusterState::<RunnerIdentifier>::new();
+    promoted.install_settled_base(donor.settled_base_clone());
+    promoted.restore(donor.snapshot());
+
+    // The recompose dep resolution: the variant's dep ref g resolves to the
+    // SETTLED prereq's identity, not the empty sentinel.
+    let state = promoted
+        .task_state("build_variant__x")
+        .expect("the variant is restored fat (Pending)");
+    let info = promoted.task_to_info(state);
+    let dep = info
+        .task_depends_on
+        .first()
+        .expect("the variant keeps its single dep");
+    assert_eq!(
+        (dep.phase_id.as_str(), dep.task_id.as_str()),
+        ("BUILD", "import_common"),
+        "the dep ref to the settled prereq must resolve to its real identity \
+         (the settled def_id→identity fallback), NOT the empty sentinel"
+    );
+    assert!(
+        !dep.task_id.is_empty(),
+        "a settled prereq's dep ref must not rebuild the unresolved sentinel \
+         (the UnknownTaskDep cause)"
+    );
+
+    drop(dir);
 }

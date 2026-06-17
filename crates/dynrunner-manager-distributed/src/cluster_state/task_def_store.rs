@@ -749,25 +749,44 @@ impl<I> TaskDefStore<I> {
     /// gate) surfaces it exactly as a missing string dep would. The rebuilt
     /// `TaskDep` carries `def_id: None` (the wire re-stamps it at the next
     /// origination if needed). Owned: callers need a whole list.
-    pub(crate) fn resolve_dep_refs(&self, refs: &[TaskDepRef]) -> Vec<TaskDep> {
+    /// Rebuild the string-identity [`TaskDep`] list from compact
+    /// [`TaskDepRef`]s (L5). A `fallback` resolves a ref whose def has LEFT
+    /// the in-memory store (a settled + evicted prereq, whose id no longer
+    /// resolves here): the in-memory store is settled-blind, so the
+    /// settled-vs-in-memory split stays a CALLER concern (the
+    /// [`ClusterState`]-level wrapper passes the settled reverse index) without
+    /// duplicating the per-ref iteration. A caller with no settled half passes
+    /// `|_| None`.
+    pub(crate) fn resolve_dep_refs_with_fallback(
+        &self,
+        refs: &[TaskDepRef],
+        fallback: impl Fn(TaskDefId) -> Option<(PhaseId, String)>,
+    ) -> Vec<TaskDep> {
         refs.iter()
-            .map(|r| match self.resolve(r.def_id) {
-                Some(def) => TaskDep {
-                    task_id: def.task_id.clone(),
-                    phase_id: def.phase_id.clone(),
-                    inherit_outputs: r.inherit_outputs,
-                    def_id: None,
-                },
-                None => TaskDep {
-                    // No resolvable prereq: rebuild the migration-sentinel
-                    // shape (empty phase, empty id) so the edge carries no
-                    // false identity and the loud-unknown-dep failure fires
-                    // downstream, exactly as a missing string dep would.
-                    task_id: String::new(),
-                    phase_id: PhaseId::default(),
-                    inherit_outputs: r.inherit_outputs,
-                    def_id: None,
-                },
+            .map(|r| {
+                // In-memory store first, then the caller's fallback (settled).
+                let resolved = self
+                    .resolve(r.def_id)
+                    .map(|def| (def.phase_id.clone(), def.task_id.clone()))
+                    .or_else(|| fallback(r.def_id));
+                match resolved {
+                    Some((phase_id, task_id)) => TaskDep {
+                        task_id,
+                        phase_id,
+                        inherit_outputs: r.inherit_outputs,
+                        def_id: None,
+                    },
+                    None => TaskDep {
+                        // No resolvable prereq: rebuild the migration-sentinel
+                        // shape (empty phase, empty id) so the edge carries no
+                        // false identity and the loud-unknown-dep failure fires
+                        // downstream, exactly as a missing string dep would.
+                        task_id: String::new(),
+                        phase_id: PhaseId::default(),
+                        inherit_outputs: r.inherit_outputs,
+                        def_id: None,
+                    },
+                }
             })
             .collect()
     }
@@ -942,9 +961,26 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
     /// frozen-def dep CONSUMERS route through (the dispatch `to_task_info`,
     /// `task_deps_for_identity`, the affine gate, the settled-spill capture):
     /// they hold `&self` (the store), a `&FrozenTaskDef` does not, so the
-    /// resolution lives here and delegates to [`TaskDefStore::resolve_dep_refs`].
+    /// resolution lives here and delegates to
+    /// [`TaskDefStore::resolve_dep_refs_with_fallback`].
+    ///
+    /// SETTLED-aware (the recompose linchpin): a ref whose prereq has
+    /// COMPLETED + SETTLED no longer resolves in the in-memory `definitions`
+    /// store (the settled def was evicted), so the bare store would rebuild
+    /// the unresolved-sentinel edge and a promoted-primary hydrate of a
+    /// still-Pending dependent would fail `UnknownTaskDep`. We pass the
+    /// settled `def_id → identity` reverse index as the fallback, so the
+    /// rebuilt edge carries the settled prereq's REAL `(phase_id, task_id)` —
+    /// IDENTICAL to the live graph (where the dependent keeps the completed
+    /// dep in `task_depends_on` and the pool's `completed_tasks` pre-resolves
+    /// it as satisfied). The split stays a single concern: the in-memory
+    /// store is settled-blind; this seam composes the two halves.
     pub(crate) fn resolve_dep_refs(&self, refs: &[TaskDepRef]) -> Vec<TaskDep> {
-        self.definitions.resolve_dep_refs(refs)
+        self.definitions.resolve_dep_refs_with_fallback(refs, |id| {
+            self.settled
+                .identity_for_def_id(id)
+                .map(|(phase, task)| (phase.clone(), task.to_string()))
+        })
     }
 
     /// Reconstruct a whole owned [`TaskInfo`] from a [`TaskState`] (L5) —
@@ -1034,6 +1070,28 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
         let Some(wire) = def_id else {
             return Some(self.intern_task_def(hash, task));
         };
+        if self.settled.is_def_id_settled(TaskDefId(wire)) {
+            // SETTLED-id collision (CL-A2 allocator settled-safety): the wire
+            // id already belongs to a SETTLED (evicted) task, invisible to
+            // `intern_at`'s in-memory free-slot check — placing here would
+            // SILENTLY occupy the settled slot and alias a def-id dep ref onto
+            // the wrong def. The settled hash itself NoOps upstream (the
+            // `TaskAdded` arm's `settled_contains` guard), so a NON-settled
+            // hash reaching here with a settled wire id is a genuine
+            // cross-epoch alias — fall back to node-local CONTENT interning
+            // (the `None`-arm path), the same degrade `register_restored_def`
+            // uses; the def resolves by hash under a fresh local id.
+            tracing::error!(
+                target: "dynrunner_cluster_state",
+                hash,
+                wire,
+                "TaskAdded wire def-id collides with a SETTLED id — a new task's \
+                 wire-carried id is already held by a settled (evicted) task \
+                 (a failover cross-epoch transient). Interning node-local by \
+                 content so it never aliases onto the settled prereq's slot."
+            );
+            return Some(self.intern_task_def(hash, task));
+        }
         let (frozen, preferred_secondaries, preferred_version, resolved_path, deps) =
             FrozenTaskDef::from_task_info(task);
         // TWO-STEP intern at the wire id (L5, mirrors `intern_task_def`):
@@ -1126,6 +1184,34 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
             // Un-agreed / legacy def: no self-describing portable id —
             // re-anchor by content hash, exactly like the un-allocated apply
             // fallback.
+            self.definitions.intern(hash.to_string(), (**def).clone());
+            self.reanchor_restored_affine_id(hash, def);
+            return;
+        }
+        if self.settled.is_def_id_settled(carried) {
+            // SETTLED-id collision (CL-A2 allocator settled-safety): the
+            // carried id already belongs to a task that COMPLETED + SETTLED —
+            // its def left the in-memory store, so `intern_at`'s in-memory
+            // free-slot check would NOT see the collision and would place this
+            // (DIFFERENT) restored task SILENTLY onto the settled slot, so a
+            // def-id dep ref pointing at the settled prereq would then resolve
+            // to the WRONG def (the alias the floor-resume guards against on
+            // the node-local-mint path, here on the carried-id path
+            // `intern_at` ignores). A settled prereq's own def never reaches
+            // this loop (a settled entry is evicted from the fat snapshot
+            // batch), so a fat task carrying a settled id is always a genuine
+            // cross-epoch alias — degrade it by CONTENT, identical to the
+            // in-memory IdRebound path below; the def still resolves by hash
+            // under a fresh local id and is never lost.
+            tracing::error!(
+                target: "dynrunner_cluster_state",
+                hash,
+                carried = carried.0,
+                "snapshot-restore def-id collides with a SETTLED id — a restored \
+                 def carries an id a settled (evicted) task already holds (a \
+                 failover cross-epoch transient). Re-anchoring the def by \
+                 content so it never aliases onto the settled prereq's slot."
+            );
             self.definitions.intern(hash.to_string(), (**def).clone());
             self.reanchor_restored_affine_id(hash, def);
             return;
@@ -1499,7 +1585,7 @@ mod tests {
         assert_eq!(refs[0].def_id, prereq_id, "resolved to the prereq's def id");
         assert!(refs[0].inherit_outputs, "per-edge flag carried onto the ref");
 
-        let rebuilt = store.resolve_dep_refs(&refs);
+        let rebuilt = store.resolve_dep_refs_with_fallback(&refs, |_| None);
         assert_eq!(rebuilt.len(), 1);
         assert_eq!(rebuilt[0].task_id, "prereq");
         assert_eq!(rebuilt[0].phase_id, PhaseId::from("phase-A"));
@@ -1541,7 +1627,7 @@ mod tests {
         }];
         let refs = store.dep_refs_from_deps(&deps);
         assert_eq!(refs[0].def_id, prereq_id);
-        let rebuilt = store.resolve_dep_refs(&refs);
+        let rebuilt = store.resolve_dep_refs_with_fallback(&refs, |_| None);
         assert_eq!(
             rebuilt[0].phase_id,
             PhaseId::from("build"),
@@ -1566,7 +1652,7 @@ mod tests {
         let refs = store.dep_refs_from_deps(&deps);
         assert_eq!(refs[0].def_id, TaskDefId::UNBOUND);
         assert!(refs[0].inherit_outputs, "flag still carried on the sentinel ref");
-        let rebuilt = store.resolve_dep_refs(&refs);
+        let rebuilt = store.resolve_dep_refs_with_fallback(&refs, |_| None);
         assert!(rebuilt[0].task_id.is_empty(), "no false identity fabricated");
         assert!(rebuilt[0].phase_id.as_str().is_empty());
         assert!(rebuilt[0].inherit_outputs, "flag preserved through the sentinel");
