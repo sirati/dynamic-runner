@@ -906,6 +906,24 @@ impl<I: Identifier> ClusterState<I> {
             custom_terminal_watermarks,
             affine,
         } = snap;
+        // FAILOVER def-id resume (L6a / CL-A2), at the RESTORE epoch-crossing
+        // seam: re-anchor the def allocator PAST every inherited id over BOTH
+        // halves of the ledger BEFORE the per-task `register_restored_def` loop
+        // (and the downstream hydrate cycle-check) reads `next_id`. A promotion
+        // crosses the `primary_epoch` advance here the SAME way the live
+        // `PrimaryChanged` apply arm does (where this re-anchor already fired);
+        // the snapshot-restore path assigns `primary_epoch` directly below and
+        // would otherwise SKIP the re-anchor, leaving `next_id` not past the
+        // settled max — so a `register_restored_def` IdRebound degradation that
+        // mints via `next_id` could re-mint a settled task's id, aliasing a
+        // stored def-id dep ref onto the wrong def. The settled base is
+        // installed before restore (`adopt_settled_base` precedes
+        // `seed_from_promotion_snapshot`), so `settled.max_def_id()` is correct
+        // here. Monotone + idempotent (`resume_alloc_floor` never lowers) — a
+        // harmless no-op for a non-promoting late-joiner / observer restore and
+        // under re-restore. Path-independent: the invariant now holds at EVERY
+        // epoch-crossing seam, not just the live apply arm.
+        self.resume_def_alloc_floor();
         // Per-task restore now routes through the SHARED `merge_task_state`
         // join — the SAME order apply uses, so apply == restore by
         // construction (no second hand-rolled rank). The co-present output

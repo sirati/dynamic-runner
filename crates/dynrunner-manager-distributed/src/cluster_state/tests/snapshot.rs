@@ -1033,3 +1033,123 @@ fn def_id_does_not_contribute_to_digest() {
         "the def id must not perturb the convergence digest"
     );
 }
+
+/// FAILOVER def-id floor at the RESTORE seam (L6a, the missing seam): a
+/// promoted primary that rebuilds its def store from a snapshot must
+/// re-anchor its def-id allocator PAST every inherited id — over the SETTLED
+/// half too — at the restore chokepoint, BEFORE the per-task
+/// `register_restored_def` loop mints a node-local def. Otherwise a restored
+/// def with no portable id (`TaskDefId::UNBOUND` — a node-local / un-agreed
+/// def, the `register_restored_def` `intern()` path) is minted at `next_id`,
+/// and with the un-resumed floor `next_id` lands on a SETTLED prereq's id g
+/// (FREE in the in-memory `defs` because a settled task's def was evicted —
+/// `intern_at`/`intern` only consult `defs`, never the settled index). The
+/// restored def then OCCUPIES the settled slot g, so a stored def-id dep ref
+/// pointing at g (L5) resolves to the WRONG def — and when the re-minted def
+/// is the dependent ITSELF, the dep ref aliases onto the dependent's own
+/// slot: a `task → task` self-edge the downstream hydrate cycle-check
+/// hard-aborts (`TaskDepCycle`).
+///
+/// DETERMINISTIC shape (no HashMap-order dependence): the settled import gate
+/// G holds the MAX (and only) inherited def-id g = 0, so the in-memory slot 0
+/// is FREE after the settled-base install. The single fat task — the build
+/// variant V — carries NO portable id (`def_id: None` ⇒ its stored def is
+/// `UNBOUND`), so its restore ALWAYS routes through the node-local `intern()`
+/// at `next_id`, and its bare dep on G resolves to g at intern time (the
+/// donor's identity index). Pre-fix `next_id` is 0 ⇒ V is minted at slot
+/// 0 = g ⇒ `resolve(g)` is V ⇒ self-alias. Post-fix the restore-head
+/// re-anchor pushes `next_id` past the settled g ⇒ V mints high ⇒ `resolve(g)`
+/// is NOT V (the self-edge is gone). This is the mechanism-precise RED→GREEN.
+///
+/// (The post-fix dep then resolves to None — G's settled def is not in the
+/// in-memory store — which surfaces a SEPARATE latent recompose bug:
+/// `resolve_dep_refs` cannot see settled defs. That is out of scope for this
+/// floor fix; this test asserts only the self-alias the floor closes.)
+#[test]
+fn restore_reanchor_stops_node_local_remint_aliasing_settled_dep() {
+    use dynrunner_core::{TaskDep, TaskKind};
+
+    // The settled import gate at the MAX inherited def-id g = 0 (its slot is
+    // FREE in the in-memory def store — a settled def is evicted from `defs`).
+    const G: u32 = 0;
+    let phase = PhaseId::from("BUILD");
+
+    // --- Donor: the SecondaryAffine import gate G at wire id g, completed +
+    // spilled so g lives ONLY in the settled index; the build variant V added
+    // node-local (def_id: None ⇒ UNBOUND stored def) with a BARE dep on G. ---
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut donor = ClusterState::<RunnerIdentifier>::new();
+
+    let mut gate = mk_task("import_common");
+    gate.phase_id = phase.clone();
+    gate.kind = TaskKind::SecondaryAffine;
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: "import_common".into(),
+        task: gate,
+        def_id: Some(G),
+    });
+
+    let mut variant = mk_task("build_variant__x");
+    variant.phase_id = phase.clone();
+    variant.task_depends_on = vec![TaskDep {
+        task_id: "import_common".into(),
+        phase_id: phase.clone(),
+        inherit_outputs: false,
+        def_id: None,
+    }];
+    donor.apply(ClusterMutation::TaskAdded {
+        hash: "build_variant__x".into(),
+        // A node-local add (def_id: None): the stored def carries UNBOUND, so
+        // its restore mints node-local at `next_id` — the path the floor
+        // guards. Its bare dep resolves to G's id g (the identity index).
+        task: variant,
+        def_id: None,
+    });
+    // Drive G terminal so it settles + spills (its def leaves the fat map +
+    // the in-memory def store; g survives only in the slim settled index).
+    donor.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "import_common".into(),
+        result_data: None,
+    });
+    let evicted = donor.test_spill_all(&dir.path().join("spill.cbor"));
+    assert_eq!(evicted, 1, "the completed import gate settles + evicts");
+    assert_eq!(
+        donor.settled_store().max_def_id(),
+        Some(G),
+        "the settled import gate's wire def-id g is the inherited MAX"
+    );
+
+    // --- Promoted primary: install the settled base, then restore. ---
+    let mut promoted = ClusterState::<RunnerIdentifier>::new();
+    promoted.install_settled_base(donor.settled_base_clone());
+    promoted.restore(donor.snapshot());
+
+    // The build variant's def-id (whatever node-local id it minted) and its
+    // resolved dep target.
+    let v_id = promoted
+        .def_id_for_hash_for_test("build_variant__x")
+        .expect("the variant's def is restored");
+    let v_dep_target = promoted
+        .resolve_def_for_test(crate::cluster_state::TaskDefId(G))
+        .map(|d| d.task_id.clone());
+
+    // THE self-alias guard: the settled gate's id g must NOT now resolve to
+    // the build variant's OWN def. Pre-fix V was node-local-minted at slot
+    // g (next_id == 0) so `resolve(g)` was V (the self-edge); the restore-head
+    // re-anchor pushes the mint past g so `resolve(g)` is no longer V.
+    assert_ne!(
+        v_id,
+        crate::cluster_state::TaskDefId(G),
+        "the variant must NOT be node-local-minted onto the settled gate's id g \
+         (that is the slot its own dep ref points at — a self-edge)"
+    );
+    assert_ne!(
+        v_dep_target.as_deref(),
+        Some("build_variant__x"),
+        "the settled gate id g must NOT resolve to the variant itself — the \
+         self-alias the floor re-anchor closes"
+    );
+
+    drop(dir);
+}

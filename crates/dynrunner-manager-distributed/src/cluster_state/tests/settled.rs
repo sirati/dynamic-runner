@@ -1131,33 +1131,40 @@ fn promotion_resumes_def_alloc_past_settled_and_in_memory_max() {
     promoted.install_settled_base(base);
     promoted.restore(donor.snapshot());
 
-    // BEFORE the promotion seam: the in-memory store re-anchored only the
-    // RESTORED def (id 3 → floor 4); the SETTLED id 7 is INVISIBLE to the
-    // in-memory store (the snapshot ships defs by value, but a settled
-    // entry's fat body — and its def — is NOT in the snapshot's task
-    // batch). This is the exact gap L6a closes.
+    // THE restore seam already re-anchored: `restore` re-anchors the def
+    // allocator PAST max(in-memory 3, settled 7) ⇒ 8 at the HEAD of the
+    // restore chokepoint, BEFORE the per-task `register_restored_def` loop —
+    // the snapshot-restore path crosses the SAME epoch boundary as the live
+    // `PrimaryChanged` apply arm, so the re-anchor fires here too (the gap
+    // L6a closes; it is no longer deferred to the apply arm). The SETTLED id
+    // 7 is still INVISIBLE to the in-memory def MAP (the snapshot ships defs
+    // by value, but a settled entry's fat body — and its def — is NOT in the
+    // snapshot's task batch); only the ALLOCATOR floor accounts for it.
     assert_eq!(
         promoted.def_alloc_floor_for_test(),
-        4,
-        "pre-resume floor reflects only the restored in-memory max"
+        8,
+        "restore re-anchored the floor past the settled id (7) + 1 at the seam"
     );
     assert!(
         promoted
             .resolve_def_for_test(crate::cluster_state::TaskDefId(7))
             .is_none(),
-        "the settled def-id is not in the in-memory store — the gap"
+        "the settled def-id is not in the in-memory store — only the \
+         allocator floor (not the def map) accounts for it"
     );
 
-    // The promotion seam: a freshly-promoted primary originates
-    // `PrimaryChanged { new = self, epoch + 1 }`, whose apply fires the
-    // def-id resume floor over (in-memory ∪ settled).
+    // The promotion seam re-application: a freshly-promoted primary
+    // originates `PrimaryChanged { new = self, epoch + 1 }`, whose apply
+    // re-fires the def-id resume floor — MONOTONE + IDEMPOTENT, so it is a
+    // no-op over the already-anchored floor (the invariant now holds at BOTH
+    // the restore seam and the apply seam).
     apply_primary_changed(&mut promoted, "promoted-self", 1);
 
-    // AFTER: the allocator resumed PAST max(in-memory 3, settled 7) ⇒ 8.
+    // STILL 8 — the apply re-fire neither lowers nor double-counts.
     assert_eq!(
         promoted.def_alloc_floor_for_test(),
         8,
-        "the resume floor includes the settled id (7) + 1"
+        "the apply re-fire is a monotone no-op over the restore-anchored floor"
     );
 
     // A newly-allocated def-id does NOT collide with the settled id 7 nor
