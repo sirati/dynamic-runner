@@ -1053,3 +1053,99 @@ async fn affine_import_on_n_secondaries_satisfies_run_completion_once() {
         })
         .await;
 }
+
+/// REGRESSION (per-secondary run-once dispatch): the affine import must dispatch
+/// EXACTLY ONCE per secondary even under CONCURRENCY — many idle workers on one
+/// secondary plus many dependents that each drag the import into the queue.
+///
+/// The placement appends the import once PER dependent work task, so K ready
+/// dependents on one secondary enqueue K redundant import units. Pre-fix all K
+/// were popped by K idle workers and dispatched concurrently (the live
+/// `already_held` storm: only one ran, the rest stranded `Assigned` slots that
+/// never terminal — wedging run completion), AND a leftover unit popped after
+/// the first run completed re-dispatched the import a SECOND time (a run-once
+/// violation: the per-secondary import body ran twice). The dispatch guard
+/// (`dispatch_affine_unit` → `secondary_has_slot_holding_hash` + the bitvector
+/// `Done` cell) drops every redundant unit, so the import dispatches once.
+///
+/// Single secondary, MANY workers, MANY dependents → forces the concurrent pop.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_import_dispatches_once_per_secondary_under_concurrency() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let mut binaries = vec![import];
+            for i in 0..6 {
+                binaries.push(work_dep(&format!("build_{i}"), "import"));
+            }
+            // ONE secondary with MANY workers (so K dependents' import units are
+            // all poppable concurrently in a single recheck pass).
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(binaries);
+            // sec-0: 8 workers; sec-1: 1 (kept minimal). Mesh-confirm both.
+            primary
+                .handle_cluster_mutation(capacity_batch("sec-0", 8), &mut None)
+                .await;
+            primary.handle_mesh_ready(mesh_ready_from("sec-0"));
+            primary
+                .handle_cluster_mutation(capacity_batch("sec-1", 1), &mut None)
+                .await;
+            primary.handle_mesh_ready(mesh_ready_from("sec-1"));
+
+            // Drive to quiescence, counting every IMPORT dispatch per secondary.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut import_dispatches_by_sec: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+            loop {
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                if round.is_empty() {
+                    break;
+                }
+                for (_, sec, _, h) in &round {
+                    if *h == import_hash {
+                        *import_dispatches_by_sec.entry(sec.clone()).or_insert(0) += 1;
+                    }
+                }
+                for (_, sec, worker, h) in &round {
+                    primary
+                        .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                        .await;
+                    settle_pump().await;
+                }
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+            }
+
+            // The import dispatched AT MOST ONCE per secondary — no concurrent
+            // storm, no sequential re-run. (Builds on these e2e-local-like runs
+            // cluster on one secondary, so only the building secondary's import
+            // dispatches; whichever secondaries ran it ran it exactly once.)
+            for (sec, count) in &import_dispatches_by_sec {
+                assert_eq!(
+                    *count, 1,
+                    "the affine import must dispatch EXACTLY ONCE on {sec}; got \
+                     {count} (a concurrent storm or a sequential re-run)"
+                );
+            }
+            assert!(
+                !import_dispatches_by_sec.is_empty(),
+                "the import must have dispatched on at least one secondary"
+            );
+
+            // Run completes cleanly: every slot freed, gate satisfied.
+            assert_eq!(
+                primary.active_workers_for_test(),
+                0,
+                "no worker slot may stay Assigned — no stranded already-held import slot"
+            );
+            assert!(
+                primary.run_complete_check(),
+                "run_complete_check must be satisfied once the run drains"
+            );
+        })
+        .await;
+}
