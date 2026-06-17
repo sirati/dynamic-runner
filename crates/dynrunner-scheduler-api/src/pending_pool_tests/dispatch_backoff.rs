@@ -185,7 +185,7 @@ fn terminal_clears_the_streak() {
 }
 
 #[test]
-fn next_expiry_is_strictly_future_and_empties_when_nothing_parked() {
+fn next_expiry_is_strictly_future_then_re_polls_until_dispatched() {
     let mut p = pool_with(&["P"], &[]);
     p.set_dispatch_backoff_params(BASE, CAP);
     p.extend([t("P", "T", "", 10)]).expect("valid extend");
@@ -205,15 +205,259 @@ fn next_expiry_is_strictly_future_and_empties_when_nothing_parked() {
         "wake must not be in the past"
     );
 
-    // Once the window expires the wake disappears (the item is simply
-    // eligible) — a loop parked on this accessor can never hot-fire.
+    // Once the window expires the task is eligible again, but the wake
+    // does NOT vanish: while the task remains queued-and-undispatched
+    // (the recheck has not taken it), the accessor keeps surfacing a
+    // BOUNDED re-poll wake so a missed dispatch is retried instead of
+    // stranding (the #640 deadlock). The level persists until the task
+    // is actually taken.
     std::thread::sleep(BASE + Duration::from_millis(10));
+    let repoll = p
+        .next_dispatch_backoff_expiry()
+        .expect("expired-but-undispatched task must keep a re-poll wake");
+    assert!(
+        repoll > std::time::Instant::now(),
+        "re-poll wake is bounded into the future (no hot-spin)"
+    );
+    // The task IS dispatch-eligible now (the gate is open).
+    let item = p.pop_for_worker(1).expect("eligible after window");
+    // Now that it has actually been taken, the level clears.
+    let _ = item;
     assert!(
         p.next_dispatch_backoff_expiry().is_none(),
-        "an expired stamp must not surface as a wake"
+        "a taken task no longer needs a re-poll wake"
+    );
+}
+
+/// Bug B — the #640 dispatch deadlock. Production sequence (asm-
+/// tokenizer 25-min strand, in_flight=0, task_backoff arm count static
+/// at 1): a task is requeued under backoff; its window expires; the
+/// single post-expiry recheck MISSES (no idle worker / the only
+/// candidate skipped) so the task is NOT taken; pre-#640 the secondary
+/// re-poll would have re-triggered dispatch but #640 removed it and
+/// there is no primary dispatch-sweep — so a wake that returned `None`
+/// on expiry parked the op-loop arm on `pending()` forever and the
+/// eligible-but-undispatched task stranded. The level-trigger fix makes
+/// `next_dispatch_backoff_expiry` keep returning a BOUNDED re-poll wake
+/// across the missed recheck until the task is actually taken.
+#[test]
+fn expired_task_re_polls_across_a_missed_recheck_until_dispatched() {
+    // A fast re-poll cadence so the missed-recheck loop is observable
+    // in a unit test, but still strictly > now (no hot-spin).
+    const REPOLL: Duration = Duration::from_millis(20);
+    let mut p = pool_with(&["P"], &[]);
+    p.set_dispatch_backoff_params(BASE, CAP);
+    p.set_dispatch_repoll_interval(REPOLL);
+    p.extend([t("P", "T", "", 10)]).expect("valid extend");
+
+    // Requeue under backoff: streak 2, a real (future) window.
+    let item = p.pop_for_worker(1).expect("fresh item");
+    p.requeue(item);
+    let item = p.pop_for_worker(1).expect("free first re-entry");
+    p.requeue(item);
+    assert!(
+        p.next_dispatch_backoff_expiry().is_some(),
+        "a backed-off task parks a wake"
+    );
+
+    // Advance past the stamp.
+    std::thread::sleep(BASE + Duration::from_millis(10));
+
+    // The wake fires (op-loop emits TasksAdded). Simulate the recheck
+    // MISSING: NO `pop_for_worker` here — no worker took the task. The
+    // accessor must NOT return None (that was the deadlock); it must
+    // surface a bounded re-poll wake so the arm re-fires.
+    let now = std::time::Instant::now();
+    let w1 = p
+        .next_dispatch_backoff_expiry()
+        .expect("missed recheck must keep a re-poll wake, not strand");
+    assert!(
+        w1 > now,
+        "re-poll wake must be strictly future (bounded, not now-raw): no hot-spin"
     );
     assert!(
-        p.pop_for_worker(1).is_some(),
-        "and the item is dispatch-eligible"
+        w1 <= now + REPOLL + Duration::from_millis(20),
+        "re-poll wake must be BOUNDED to ~one interval, not the full backoff cap"
+    );
+
+    // Recheck misses AGAIN: still no worker. The level persists.
+    std::thread::sleep(REPOLL + Duration::from_millis(5));
+    let now2 = std::time::Instant::now();
+    let w2 = p
+        .next_dispatch_backoff_expiry()
+        .expect("a still-undispatched task keeps re-polling");
+    assert!(w2 > now2, "second re-poll wake is also bounded-future");
+
+    // Finally a worker frees up and the task IS dispatched on this
+    // tick — proving it was never stranded, only awaiting a worker.
+    let taken = p
+        .pop_for_worker(1)
+        .expect("the eligible task dispatches once a worker is free");
+    let _ = taken;
+
+    // Once taken, the level clears — the arm parks (None) instead of
+    // hot-spinning on an already-dispatched task.
+    assert!(
+        p.next_dispatch_backoff_expiry().is_none(),
+        "a dispatched task must end the re-poll level"
+    );
+}
+
+/// A fresh requeue while a task is in the expired-but-undispatched
+/// re-poll state supersedes the re-poll: the task is re-stamped under a
+/// new future window, so the wake is that future stamp (not an
+/// immediate re-poll), and the task is hidden again until it expires.
+#[test]
+fn requeue_supersedes_an_expired_re_poll_state() {
+    const REPOLL: Duration = Duration::from_millis(20);
+    let mut p = pool_with(&["P"], &[]);
+    p.set_dispatch_backoff_params(BASE, CAP);
+    p.set_dispatch_repoll_interval(REPOLL);
+    p.extend([t("P", "T", "", 10)]).expect("valid extend");
+
+    let item = p.pop_for_worker(1).expect("fresh item");
+    p.requeue(item);
+    let item = p.pop_for_worker(1).expect("free first re-entry");
+    p.requeue(item);
+    std::thread::sleep(BASE + Duration::from_millis(10));
+
+    // Observe the expiry → enters the re-poll level.
+    assert!(
+        p.next_dispatch_backoff_expiry().is_some(),
+        "expired task is in re-poll level"
+    );
+
+    // The task is taken, fails, and is requeued again (streak 3): a new
+    // future window. The wake must now be a strictly-future stamp well
+    // beyond the short re-poll interval, and the task hidden again.
+    let item = p.pop_for_worker(1).expect("eligible, taken");
+    p.requeue(item);
+    let now = std::time::Instant::now();
+    let due = p
+        .next_dispatch_backoff_expiry()
+        .expect("re-stamped task parks a future wake");
+    assert!(
+        due > now + REPOLL,
+        "a fresh requeue must supersede the short re-poll with its real backoff window"
+    );
+    assert!(
+        p.pop_for_worker(1).is_none(),
+        "the re-stamped task is hidden again until its new window expires"
+    );
+}
+
+/// `clear_dispatch_backoff` (the settle-when-untracked seam) forgets a
+/// task's backoff streak + its expired-but-undispatched re-poll state
+/// WITHOUT the rest of the terminal bookkeeping — so a genuine terminal
+/// whose hash holds no local residue still stops the Bug-B level-trigger
+/// re-firing for the now-settled hash.
+#[test]
+fn clear_dispatch_backoff_stops_the_level_trigger() {
+    let mut p = pool_with(&["P"], &[]);
+    p.set_dispatch_backoff_params(BASE, CAP);
+    p.extend([t("P", "T", "", 10)]).expect("valid extend");
+
+    // Drive the task into the expired-but-undispatched re-poll level.
+    let item = p.pop_for_worker(1).expect("fresh item");
+    p.requeue(item);
+    let item = p.pop_for_worker(1).expect("free first re-entry");
+    let id = item.task_id.clone();
+    p.requeue(item);
+    std::thread::sleep(BASE + Duration::from_millis(10));
+    assert!(
+        p.next_dispatch_backoff_expiry().is_some(),
+        "the expired task is in the re-poll level (a wake is parked)"
+    );
+
+    // A genuine terminal settles the hash but finds no residue: clear the
+    // backoff directly. The level-trigger must then stop firing.
+    p.clear_dispatch_backoff(&id);
+    assert!(
+        p.next_dispatch_backoff_expiry().is_none(),
+        "clearing the backoff for a settled hash must end the re-poll level"
+    );
+}
+
+/// Bug B — the load-bearing production sequence (run_20260617_220927):
+/// the pre-mesh BACKPRESSURE loop. The mesh-gate dispatches ~10-15s
+/// before the mesh forms, so every dispatch attempt is backpressured
+/// ("not ready to accept") → re-requeue (a NEW, growing backoff stamp)
+/// → the backoff arm must re-fire → dispatch → backpressure again →
+/// ... until a worker readies and accepts. The level-trigger must
+/// CONVERGE through this repeated-backpressure window: a wake every
+/// cycle (never parking on `pending()` while the task is eligible-but-
+/// undispatched), spaced by the per-streak backoff (NOT a hot-spin —
+/// the re-fire cadence rides the growing backoff window, not the poll
+/// instant).
+#[test]
+fn backpressure_loop_converges_via_growing_backoff_no_hot_spin() {
+    let mut p = pool_with(&["P"], &[]);
+    p.set_dispatch_backoff_params(BASE, CAP);
+    p.extend([t("P", "T", "", 10)]).expect("valid extend");
+
+    // First dispatch attempt → backpressure → requeue (streak 1, FREE:
+    // one bounce is not a spin, so it stays immediately dispatchable).
+    let item = p.pop_for_worker(1).expect("fresh item dispatches");
+    p.requeue(item);
+    // The free re-entry is immediately poppable (no wake yet) — the
+    // dispatch is re-attempted and backpressured again, so requeue: NOW
+    // the brake engages (streak 2, the first real backoff window).
+    let item = p
+        .pop_for_worker(1)
+        .expect("free first re-entry stays immediately dispatchable");
+    p.requeue(item);
+
+    // Simulate N repeated-backpressure cycles. Each cycle: the worker is
+    // "not ready" so the dispatch is backpressured and the item is
+    // re-requeued under a GROWING backoff. After each re-requeue the
+    // backoff arm must see a strictly-future wake (the new window),
+    // spaced by the streak's backoff — never a parked `pending()`, never
+    // an instant re-fire.
+    const CYCLES: usize = 4;
+    let mut prev_window = Duration::ZERO;
+    for cycle in 0..CYCLES {
+        // The window for THIS streak (2,3,4,5 → 30,60,120,240ms).
+        let before = std::time::Instant::now();
+        let due = p
+            .next_dispatch_backoff_expiry()
+            .expect("an eligible-but-backed-off task must keep a wake every cycle");
+        let window = due.duration_since(before);
+        assert!(
+            window > Duration::ZERO,
+            "cycle {cycle}: the wake must be strictly future (no hot-spin)"
+        );
+        // The cadence rides the GROWING per-streak backoff, not the poll
+        // instant: each cycle's window is >= the previous (until cap).
+        assert!(
+            window + Duration::from_millis(5) >= prev_window,
+            "cycle {cycle}: re-fire spacing must follow the growing backoff, \
+             got {window:?} after {prev_window:?}"
+        );
+        prev_window = window;
+
+        // Wait out the window; the item is now eligible. The worker is
+        // STILL not ready (pre-mesh): dispatch is backpressured →
+        // re-requeue under the next, larger backoff.
+        std::thread::sleep(window + Duration::from_millis(10));
+        let item = p
+            .pop_for_worker(1)
+            .expect("eligible after its window — the dispatch is attempted");
+        // Backpressure: the worker declined; requeue (next streak).
+        p.requeue(item);
+    }
+
+    // The mesh has now formed: wait out the final window and a worker
+    // ACCEPTS. The task converges to dispatched and the level clears.
+    let due = p
+        .next_dispatch_backoff_expiry()
+        .expect("still parked on the final backoff window");
+    std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()) + Duration::from_millis(10));
+    let accepted = p
+        .pop_for_worker(1)
+        .expect("once a worker is ready the backpressure-looped task dispatches");
+    let _ = accepted;
+    assert!(
+        p.next_dispatch_backoff_expiry().is_none(),
+        "a converged (taken) task must not keep a wake — the loop ends, no hot-spin"
     );
 }

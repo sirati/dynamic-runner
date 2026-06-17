@@ -25,13 +25,30 @@
 //! The streak persists across attempts (cleared only on a TERMINAL
 //! observation — success or permanent failure) so a task that keeps
 //! bouncing keeps doubling, exactly like the worker respawn streak.
-//! [`DispatchBackoff::next_expiry`] exposes the earliest FUTURE stamp
-//! so an event-driven manager loop can park a wake on it instead of
-//! polling; expired stamps are lazily dropped so the wake can never
-//! hot-fire on an already-eligible task.
+//! [`DispatchBackoff::next_expiry`] exposes the earliest wake an
+//! event-driven manager loop should park on instead of polling.
+//!
+//! The wake is a LEVEL, not an edge. When a stamp first expires the
+//! task is eligible again but may not get dispatched on the single
+//! recheck the wake triggers (the only eligible worker was transport-
+//! gate-skipped, no worker was idle at that instant, an affine-dep
+//! gated it). Pre-#640 the secondary's periodic TaskRequest re-poll was
+//! the level-triggered safety net; #640 gated that to failover-only and
+//! there is no periodic dispatch-sweep arm on the primary, so a wake
+//! that lazily-dropped the expired stamp and returned `None` would park
+//! the op-loop's backoff arm on `pending()` FOREVER after one fire — a
+//! genuine 25-min dispatch deadlock (asm-tokenizer: in_flight=0, zero
+//! progress, task_backoff arm count static at 1). To restore the
+//! level, an EXPIRED-BUT-UNTAKEN task keeps surfacing a BOUNDED re-poll
+//! wake (`now + re_poll_interval`, never `now` raw — a bounded interval
+//! cannot hot-spin while a task is legitimately undispatchable) until
+//! it is actually [`note_taken`](DispatchBackoff::note_taken) (taken by
+//! a worker) or re-stamped by a fresh requeue. This is a primary-side
+//! backoff-arm fix; it does NOT restore the per-worker secondary
+//! re-poll #640 removed.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// Re-dispatch delay at the SECOND consecutive re-entry (the first is
@@ -43,6 +60,16 @@ pub const DISPATCH_BACKOFF_BASE: Duration = Duration::from_millis(500);
 /// bounces or fails forever is retried at most once a minute — the
 /// same ceiling as the worker pool's startup-crash respawn backoff.
 pub const DISPATCH_BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+/// Re-poll cadence for a task whose backoff has EXPIRED but which has
+/// not yet been dispatched (the wake's single recheck missed: no idle
+/// worker, the only candidate was transport-gate-skipped, an affine-dep
+/// gated it). The level-triggered net that re-services the eligible-
+/// but-undispatched task until it is actually taken. Bounded (not
+/// `now` raw) so it cannot hot-spin while a task is legitimately
+/// undispatchable, yet short enough that a missed dispatch is retried
+/// within seconds rather than stranding for the whole backoff cap.
+pub const DISPATCH_REPOLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Per-task re-dispatch backoff state. Owned by
 /// [`super::PendingPool`]; see the module docs for the contract.
@@ -60,8 +87,16 @@ pub(super) struct DispatchBackoff {
     /// Entries are lazily invalidated against `until` (a re-stamp or a
     /// take leaves a stale heap entry behind; the pop loop drops it).
     expiry: BinaryHeap<Reverse<(Instant, String)>>,
+    /// Tasks whose stamp has EXPIRED but which have not yet been taken
+    /// (the wake's recheck missed). [`Self::next_expiry`] keeps
+    /// surfacing a bounded re-poll wake while this is non-empty so the
+    /// op-loop backoff arm re-services them; entries are cleared by
+    /// [`Self::note_taken`] (dispatched), [`Self::clear`] (terminal), or
+    /// a fresh [`Self::note_requeued`] (re-stamped under a new window).
+    pending_redispatch: HashSet<String>,
     base: Duration,
     cap: Duration,
+    re_poll_interval: Duration,
 }
 
 impl Default for DispatchBackoff {
@@ -70,8 +105,10 @@ impl Default for DispatchBackoff {
             streak: HashMap::new(),
             until: HashMap::new(),
             expiry: BinaryHeap::new(),
+            pending_redispatch: HashSet::new(),
             base: DISPATCH_BACKOFF_BASE,
             cap: DISPATCH_BACKOFF_CAP,
+            re_poll_interval: DISPATCH_REPOLL_INTERVAL,
         }
     }
 }
@@ -82,6 +119,12 @@ impl DispatchBackoff {
     pub(super) fn set_params(&mut self, base: Duration, cap: Duration) {
         self.base = base;
         self.cap = cap;
+    }
+
+    /// Override the expired-but-undispatched re-poll cadence. Tests use
+    /// a millisecond scale to keep the level-trigger assertion fast.
+    pub(super) fn set_re_poll_interval(&mut self, interval: Duration) {
+        self.re_poll_interval = interval;
     }
 
     /// A task re-entered the queue after a bounced/failed attempt:
@@ -114,6 +157,10 @@ impl DispatchBackoff {
         let eligible_at = now + delay;
         self.until.insert(task_id.to_string(), eligible_at);
         self.expiry.push(Reverse((eligible_at, task_id.to_string())));
+        // A fresh stamp supersedes any expired-but-undispatched state:
+        // the task is now parked under a new (future) window, not
+        // awaiting a missed-dispatch re-poll.
+        self.pending_redispatch.remove(task_id);
         Some(delay)
     }
 
@@ -126,10 +173,13 @@ impl DispatchBackoff {
         }
     }
 
-    /// The task left the queue (dispatched): drop its stamp but KEEP
-    /// the streak — a later re-entry must keep doubling.
+    /// The task left the queue (dispatched): drop its stamp and its
+    /// expired-but-undispatched re-poll state, but KEEP the streak — a
+    /// later re-entry must keep doubling. This is the signal that ENDS
+    /// the level-triggered re-poll: a taken task no longer needs a wake.
     pub(super) fn note_taken(&mut self, task_id: &str) {
         self.until.remove(task_id);
+        self.pending_redispatch.remove(task_id);
     }
 
     /// Terminal observation (success or permanent failure): forget
@@ -137,26 +187,45 @@ impl DispatchBackoff {
     pub(super) fn clear(&mut self, task_id: &str) {
         self.streak.remove(task_id);
         self.until.remove(task_id);
+        self.pending_redispatch.remove(task_id);
     }
 
-    /// Earliest FUTURE eligible-at stamp across the queued
-    /// backed-off tasks, or `None` when nothing is parked. Lazily
-    /// drops heap entries that are stale (re-stamped / taken /
-    /// cleared) and stamps that have EXPIRED (the task is eligible
-    /// again — keeping the stamp would make an event-loop wake parked
-    /// on this value hot-fire forever on a task no worker is free
-    /// for).
+    /// The earliest wake the op-loop backoff arm should park on, or
+    /// `None` when nothing needs re-servicing.
+    ///
+    /// LEVEL-triggered (see the module docs). Two wake kinds, in order:
+    ///
+    ///   1. A still-FUTURE stamp: the earliest `eligible_at` across the
+    ///      queued backed-off tasks. Parking on the absolute instant
+    ///      makes the task visible the moment its window expires.
+    ///   2. A bounded RE-POLL: once a stamp expires the task is
+    ///      eligible (`until` is dropped so `is_eligible` agrees) but
+    ///      may not be dispatched on the single recheck the wake
+    ///      triggers (no idle worker, transport-gate skip, affine-dep).
+    ///      It is moved to `pending_redispatch` and, while any such
+    ///      task remains untaken, this returns `now + re_poll_interval`
+    ///      so the arm re-fires until the task is actually taken (or
+    ///      re-stamped). The interval is bounded, so a legitimately
+    ///      undispatchable task cannot hot-spin — it is re-checked at
+    ///      most once per interval, not every poll instant.
+    ///
+    /// A future stamp (kind 1) always wins over a re-poll (kind 2):
+    /// when a real window is still pending there is no point waking
+    /// early on a sibling that is merely awaiting a worker.
     pub(super) fn next_expiry(&mut self, now: Instant) -> Option<Instant> {
         while let Some(Reverse((at, id))) = self.expiry.peek() {
             match self.until.get(id) {
                 // Live stamp, still in the future: this is the wake.
                 Some(current) if current == at && *at > now => return Some(*at),
                 // Live stamp, expired: the task is eligible — drop the
-                // stamp so `is_eligible` and this scan agree.
+                // stamp so `is_eligible` and this scan agree, but record
+                // it as awaiting re-dispatch so the level persists until
+                // the task is actually taken.
                 Some(current) if current == at => {
                     let id = id.clone();
                     self.until.remove(&id);
                     self.expiry.pop();
+                    self.pending_redispatch.insert(id);
                 }
                 // Stale heap entry (re-stamped elsewhere, taken, or
                 // cleared): drop and keep scanning.
@@ -165,6 +234,12 @@ impl DispatchBackoff {
                 }
             }
         }
-        None
+        // No future stamp parked. If any expired task still awaits
+        // dispatch, keep the level alive with a bounded re-poll wake.
+        if self.pending_redispatch.is_empty() {
+            None
+        } else {
+            Some(now + self.re_poll_interval)
+        }
     }
 }

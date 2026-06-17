@@ -240,6 +240,37 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     secondary_id.clone(),
                     Instant::now() + std::time::Duration::from_millis(backoff_ms),
                 );
+                // Terminal veto (the requeue-BEFORE-terminal race twin of
+                // `reconcile_inherited_slot`'s `VetoedByTerminal`): a
+                // backpressure bounce is a re-queue heuristic ("the task
+                // never ran here, return it to Pending"), but if the
+                // replicated ledger ALREADY records a terminal for this
+                // hash — the genuine completion was delivered out-of-band
+                // while this stale bounce was in flight — re-queueing it
+                // would re-dispatch completed work. Settle the residue
+                // through the ONE canonical CRDT-terminal path instead,
+                // never re-queue. `task_view` (not `task_state`) so a
+                // SETTLED/spilled terminal still vetoes. This is the
+                // symmetric pair to the terminal-handler settle: the
+                // handler covers terminal-AFTER-requeue, this covers
+                // terminal-BEFORE-(this)-requeue.
+                if self
+                    .cluster_state
+                    .task_view(&task_hash)
+                    .is_some_and(|v| v.is_terminal())
+                {
+                    tracing::info!(
+                        secondary = %secondary_id,
+                        worker_id,
+                        task_hash = %task_hash,
+                        "backpressure re-queue VETOED: the replicated ledger \
+                         already records a terminal for this hash; settling \
+                         the residue instead of re-queueing completed work"
+                    );
+                    self.settle_local_state_on_crdt_terminal(&task_hash, command_rx)
+                        .await;
+                    return;
+                }
                 tracing::debug!(
                     secondary = %secondary_id,
                     worker_id,
