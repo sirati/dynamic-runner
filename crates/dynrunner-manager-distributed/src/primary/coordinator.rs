@@ -4149,6 +4149,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         &self.cluster_state
     }
 
+    /// Test-only read of whether a run-fail break outcome has been latched
+    /// (a `RunShouldFail` / `PolicyFatalExit` recorded via
+    /// `record_run_fail_outcome`). The operational loop reads the same field
+    /// to break the run; this lets a synchronous test assert the run did NOT
+    /// false-fail without driving the full loop.
+    #[cfg(test)]
+    pub fn has_run_fail_outcome_for_test(&self) -> bool {
+        self.worker_mgmt_fail_outcome.is_some()
+    }
+
     /// Test-only mutable borrow of the replicated cluster ledger, used
     /// by the hydration tests to seed task states (`TaskAdded` →
     /// Pending, `TaskAssigned` → InFlight, `TaskCompleted` → terminal)

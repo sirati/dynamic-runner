@@ -469,3 +469,143 @@ fn barrier_false_phase_with_items_unaffected_by_gate_588() {
     p.drain_empty_active_phases();
     assert_eq!(p.phase_state(&phase("B")), Some(PhaseState::Drained));
 }
+
+/// Model-B AFFINE-ONLY PHASE drain gate (#affine-only-phase-drain).
+///
+/// Topology: an "import" phase whose ONLY content is a no-dep
+/// `SecondaryAffine` import, with the dependent build in a SEPARATE downstream
+/// "build" phase. The affine import is uncounted for phase drain
+/// (`counts_for_phase_drain == false`), never `mark_in_flight`'d, and not
+/// blocked — so the `(queued, in_flight, blocked)` counters
+/// `maybe_transition_drain` keys on are all ZERO from SEED time, BEFORE the
+/// import has been placed/dispatched/run. Pre-fix the import phase flipped
+/// `Drained` immediately and the manager's drain-edge false-failed the run
+/// against a still-live import.
+///
+/// Asserts the gate: the import phase must NOT drain while its import is live,
+/// then MUST drain once `note_affine_terminal` records the import's first
+/// per-secondary terminal — at which point the build phase activates.
+#[test]
+fn affine_only_phase_does_not_drain_until_import_terminals() {
+    use dynrunner_core::{PhaseId, TaskDep, TaskInfo, TaskKind};
+
+    // Build an affine import (no-dep) in the "import" phase.
+    let mut import: TaskInfo<()> = t("import", "T", "", 1);
+    import.task_id = "import-id".to_string();
+    import.kind = TaskKind::SecondaryAffine;
+
+    // A work dependent in the "build" phase depending on the import. Under
+    // Model B the affine dep is excluded from the build's pool-blocking set
+    // (the bitvector governs its dispatch), so the build is pool-ready on its
+    // (empty) non-affine deps once "build" activates.
+    let mut build: TaskInfo<()> = t("build", "T", "", 1);
+    build.task_id = "build-id".to_string();
+    build.kind = TaskKind::Work;
+    build.task_depends_on = vec![TaskDep {
+        task_id: "import-id".to_string(),
+        phase_id: PhaseId::from("import"),
+        inherit_outputs: false,
+        def_id: None,
+    }];
+
+    let mut p = pool_with(&["import", "build"], &[("build", &["import"])]);
+    // Mark the affine prereq BEFORE extend (the spawn/hydrate ordering the
+    // manager guarantees) so the build's affine dep is excluded from its
+    // blocking set and the drain guard recognises the token.
+    p.mark_affine_prereqs(["import-id".to_string()]);
+    p.extend([import, build]).expect("valid extend");
+
+    // The import is a queued bucket token (uncounted), so the counters are
+    // (0,0,0) for the import phase. WITHOUT the affine guard this would flip
+    // Drained at seed; WITH it the phase stays Active (live import).
+    p.drain_empty_active_phases();
+    assert_eq!(
+        p.phase_state(&phase("import")),
+        Some(PhaseState::Active),
+        "import phase must NOT drain while its affine import is live"
+    );
+    assert!(
+        p.poll_drain_transitions().is_empty(),
+        "no drain edge emitted while the import is live"
+    );
+
+    // The import's FIRST per-secondary terminal records its terminal in the
+    // pool (phase-neutral: no in_flight decrement, no dependent unblock) and
+    // re-runs the drain transition.
+    p.note_affine_terminal(&phase("import"), "import-id");
+    assert_eq!(
+        p.phase_state(&phase("import")),
+        Some(PhaseState::Drained),
+        "import phase drains once its import terminals"
+    );
+    let drained = p.poll_drain_transitions();
+    assert!(
+        drained.contains(&phase("import")),
+        "the drain edge for the import phase is now emitted"
+    );
+
+    // The manager's drain-edge marks the import phase Done; that activates the
+    // build phase (dep satisfied). NON-globally-unblocking holds: the build was
+    // never unblocked by the affine terminal itself (the bitvector governs that
+    // — here we only assert the phase-level cascade).
+    p.mark_phase_done(&phase("import"));
+    assert_eq!(
+        p.phase_state(&phase("build")),
+        Some(PhaseState::Active),
+        "build phase activates once the import phase is Done"
+    );
+}
+
+/// SAME-PHASE topology (work + affine in ONE phase) must be UNCHANGED by the
+/// affine guard: the WORK task is the drain gate, and the import's terminal
+/// precedes the work's, so the guard is already `false` by the time the work
+/// drains. Asserts the phase does NOT prematurely drain while the work is in
+/// flight, and drains on the work's completion (after the import terminaled).
+#[test]
+fn same_phase_work_plus_affine_drains_on_work_completion() {
+    use dynrunner_core::{PhaseId, TaskDep, TaskInfo, TaskKind};
+
+    let mut import: TaskInfo<()> = t("P", "T", "", 1);
+    import.task_id = "imp".to_string();
+    import.kind = TaskKind::SecondaryAffine;
+
+    let mut work: TaskInfo<()> = t("P", "T", "", 1);
+    work.task_id = "wrk".to_string();
+    work.kind = TaskKind::Work;
+    work.task_depends_on = vec![TaskDep {
+        task_id: "imp".to_string(),
+        phase_id: PhaseId::from("P"),
+        inherit_outputs: false,
+        def_id: None,
+    }];
+
+    let mut p = pool_with(&["P"], &[]);
+    p.mark_affine_prereqs(["imp".to_string()]);
+    p.extend([import, work]).expect("valid extend");
+
+    // The import terminals first (its per-secondary run precedes the work).
+    p.note_affine_terminal(&phase("P"), "imp");
+    // The work is still queued (counted), so the phase is Active — NOT drained.
+    assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Active));
+
+    // Dispatch + complete the work — the work is the drain gate. An affine-dep
+    // work task is withheld from the global `pop_for_worker` view (the
+    // bitvector governs its dispatch), so the manager dispatches it through the
+    // per-secondary path: take it out of its bucket by hash + `mark_in_flight`,
+    // exactly as `affine_dispatch::dispatch_affine_unit` does.
+    let item = p
+        .take_first_match(|item| item.task_id == "wrk")
+        .expect("the work item is in its bucket");
+    assert_eq!(item.task_id, "wrk");
+    // `mark_in_flight` is a counter-only bump (the phase transition fires on
+    // the cluster's finish report, not at dispatch), so the phase stays
+    // `Active` while the work is in flight — unchanged by the affine guard.
+    p.mark_in_flight(&phase("P"));
+    assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Active));
+    p.on_item_finished(&phase("P"), Some("wrk"));
+    assert_eq!(
+        p.phase_state(&phase("P")),
+        Some(PhaseState::Drained),
+        "same-phase work+affine drains on the work's completion (unchanged)"
+    );
+}

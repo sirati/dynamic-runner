@@ -1127,6 +1127,7 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
             // re-anchor by content hash, exactly like the un-allocated apply
             // fallback.
             self.definitions.intern(hash.to_string(), (**def).clone());
+            self.reanchor_restored_affine_id(hash, def);
             return;
         }
         if let Err(err) =
@@ -1147,6 +1148,46 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
             // Degrade to content-addressed: the def still resolves by hash on
             // this replica (under its local id), never lost.
             self.definitions.intern(hash.to_string(), (**def).clone());
+        }
+        self.reanchor_restored_affine_id(hash, def);
+    }
+
+    /// Re-anchor a restored `SecondaryAffine` def's affine-id↔hash binding from
+    /// the value the [`FrozenTaskDef::affine_id`] carries inline (the affine
+    /// twin of the `def_id` re-anchor above — both restore self-describing,
+    /// snapshot-portable ids).
+    ///
+    /// The affine-id binding lives in a SEPARATE registry
+    /// ([`TaskDefStore::affine_hash_to_id`]) populated ONLY by
+    /// `intern_affine_at` (driven on the live path by
+    /// `SecondaryAffineRegistered`). Interning the def's CONTENT does NOT touch
+    /// that registry, so without this re-anchor a snapshot-restored affine def
+    /// resolves `affine_id_for_hash == None` on the restoring replica — the
+    /// affine-dep placement (`affine_placement_for`) then finds the dependent's
+    /// affine deps EMPTY, never places the per-secondary unit, and the import
+    /// never dispatches (the run stalls with the import phase held open). The
+    /// `SecondaryAffineRegistered` mutation is a SEED-time fact (injected at cold
+    /// seed); it is not re-broadcast to a primary that promotes from a snapshot,
+    /// so the inline `affine_id` is the ONLY carrier across the relocation/
+    /// failover handoff. `None` for every ordinary (Work/Setup) def — a no-op.
+    ///
+    /// Idempotent + bijection-safe: `intern_affine_at` NoOps a same-(id, hash)
+    /// re-add and rejects (logged loud, dropped) a contradicting binding, the
+    /// same loud-but-safe contract `apply_secondary_affine_registered` uses.
+    fn reanchor_restored_affine_id(&mut self, hash: &str, def: &Arc<FrozenTaskDef<I>>) {
+        let Some(affine_id) = def.affine_id else {
+            return;
+        };
+        if let Err(err) = self.definitions.intern_affine_at(affine_id, hash) {
+            tracing::error!(
+                target: "dynrunner_cluster_state",
+                ?err,
+                hash,
+                "snapshot-restore affine-id collision — a restored affine def's \
+                 self-describing (affine_id, hash) contradicts an established \
+                 binding. Dropping the re-anchor; the def still resolves by \
+                 content hash."
+            );
         }
     }
 }

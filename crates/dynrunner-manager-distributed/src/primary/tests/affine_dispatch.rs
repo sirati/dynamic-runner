@@ -516,6 +516,152 @@ async fn affine_phase_drains_on_phase_end_fires_and_run_completes() {
         .await;
 }
 
+/// AFFINE-ONLY PHASE (#affine-only-phase-drain): a phase whose ONLY content is
+/// the no-dep affine import, with the dependent builds in a SEPARATE downstream
+/// phase. The import phase must NOT proceed-or-fail at SEED time (when its
+/// uncounted token leaves `queued/in_flight/blocked` all zero) — it must wait
+/// for the import's first per-secondary terminal, THEN drain and activate the
+/// build phase. Pre-fix this false-failed at iter=0 ("phase reached drain with
+/// no terminal outcome") because the pool's drain transition fired before the
+/// import ran while the rollup still showed it live.
+///
+/// Drives through the same synchronous `handle_*` seams as the same-phase test
+/// above (which it must NOT regress). The proof: the import phase reaches
+/// `Done` only after the import terminals, the build phase's builds dispatch
+/// (each gated on its own secondary's cell), the run completes, and `on_phase_end`
+/// fires for the import phase WITHOUT any premature drain edge.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_only_phase_waits_for_import_then_drains_and_activates_dependents() {
+    use dynrunner_scheduler_api::pending_pool::PhaseState;
+    use std::sync::{Arc, Mutex};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // The import ALONE in phase "import"; the builds in a SEPARATE
+            // phase "build" depending (per-task) on the import.
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+
+            let make_build = |name: &str| {
+                let mut t = make_binary(name, 20);
+                t.phase_id = PhaseId::from("build");
+                t.type_id = TypeId::from("default");
+                t.task_depends_on = vec![TaskDep {
+                    task_id: "import".into(),
+                    phase_id: PhaseId::from("import"),
+                    inherit_outputs: false,
+                    def_id: None,
+                }];
+                t
+            };
+            let build_0 = make_build("build_0");
+            let build_1 = make_build("build_1");
+
+            // Phase "build" depends on "import" so it starts Blocked and is
+            // activated only by the "import" drain cascade.
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with_phase_deps(
+                    vec![import, build_0, build_1],
+                    HashMap::from([
+                        (PhaseId::from("import"), vec![]),
+                        (PhaseId::from("build"), vec![PhaseId::from("import")]),
+                    ]),
+                );
+
+            let ended: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let ended_cb = Arc::clone(&ended);
+            let on_start: OnPhaseStart = Box::new(|_p: &PhaseId| {});
+            let on_end: OnPhaseEnd =
+                Box::new(move |p: &PhaseId, _c: u32, _f: u32, _outputs| {
+                    ended_cb.lock().unwrap().push(p.to_string());
+                });
+            primary.register_phase_lifecycle_callbacks(on_start, on_end);
+
+            confirm_two(&mut primary).await;
+
+            // The pre-loop / seed-time cascade ran inside `hydrate` + the
+            // confirm path. The import phase must NOT have drained yet (its
+            // import has not run) and the run must NOT have failed.
+            assert_eq!(
+                primary.pool().phase_state(&PhaseId::from("import")),
+                Some(PhaseState::Active),
+                "the affine-only 'import' phase must stay Active until its \
+                 import terminals — NOT prematurely drained at seed time"
+            );
+            assert!(
+                !primary.has_run_fail_outcome_for_test(),
+                "the run must NOT false-fail at seed time on the affine-only phase"
+            );
+            assert!(
+                ended.lock().unwrap().is_empty(),
+                "on_phase_end must NOT fire for the import phase before its \
+                 import terminals; fired: {:?}",
+                ended.lock().unwrap()
+            );
+
+            // Drive to quiescence: imports dispatch + complete per secondary,
+            // which drains the import phase, activates "build", and dispatches
+            // the gated builds (each only on a secondary whose cell is Done).
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            loop {
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                if round.is_empty() {
+                    break;
+                }
+                for (_, sec, worker, h) in &round {
+                    primary
+                        .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                        .await;
+                    settle_pump().await;
+                }
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+            }
+
+            // The import ran on both secondaries.
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+            for sec in ["sec-0", "sec-1"] {
+                assert_eq!(
+                    primary.cluster_state_for_test().affine_state(sec, affine_id),
+                    AffineCell::Done,
+                    "the affine import must have RUN on {sec}"
+                );
+            }
+
+            // The import phase drained to Done AFTER its import terminaled, and
+            // its on_phase_end fired — the affine-only-phase wedge is closed.
+            assert_eq!(
+                primary.pool().phase_state(&PhaseId::from("import")),
+                Some(PhaseState::Done),
+                "the 'import' phase must drain to Done once its import terminals"
+            );
+            assert!(
+                ended.lock().unwrap().iter().any(|p| p == "import"),
+                "on_phase_end('import') must fire at the (post-terminal) drain \
+                 edge; fired: {:?}",
+                ended.lock().unwrap()
+            );
+            assert!(
+                !primary.has_run_fail_outcome_for_test(),
+                "the run must not fail across the whole affine-only-phase run"
+            );
+
+            // The build phase activated and both builds completed (proof the
+            // drain cascade advanced past the import-only phase).
+            assert!(
+                primary.pool().is_run_complete(),
+                "the run must complete once the import + both builds drain"
+            );
+        })
+        .await;
+}
+
 /// FIX 4(c): when the affine import FAILS on a secondary, the gated dependent
 /// RE-ROUTES to a still-satisfiable secondary; when it has failed on EVERY
 /// eligible secondary, the dependent is TERMINAL-FAILED (cascade) rather than

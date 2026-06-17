@@ -185,6 +185,49 @@ fn digest_detects_and_restore_heals_affine_divergence() {
     assert!(!a.digest().is_behind(&b.digest()));
 }
 
+/// The affine-id↔hash BINDING survives snapshot → restore into a FRESH replica
+/// (the relocation / failover handoff). The snapshot does NOT carry the def
+/// store's affine registry; it is rebuilt per-task from each restored def's
+/// INLINE `affine_id`. So the originating side must STAMP the id onto the def
+/// (`intern_affine_at`) and the restoring side must RE-ANCHOR it
+/// (`register_restored_def`). Without both, a snapshot-promoted primary
+/// resolves `affine_id_for_hash == None`, the dependent's affine deps read
+/// empty, the per-secondary import is never placed, and the run stalls with the
+/// import phase held open (the secondary-affine --mode local stall).
+#[test]
+fn affine_id_binding_survives_snapshot_restore_into_fresh_replica() {
+    // Originate the affine def through the broadcast choke (reserves the id,
+    // injects + applies `SecondaryAffineRegistered`, and stamps the def).
+    let mut a = ClusterState::<RunnerIdentifier>::new();
+    let batch = vec![ClusterMutation::TaskAdded {
+        hash: "h-affine".into(),
+        task: mk_affine_task("imp"),
+        def_id: None,
+    }];
+    crate::cluster_state::apply_locally_for_broadcast(&mut a, batch);
+    let bound = a
+        .affine_id_for_hash("h-affine")
+        .expect("origin binds the affine-id");
+
+    // A FRESH replica (no def store, no affine registry) restores A's snapshot
+    // — the relocation/failover handoff shape (the registry is NOT in the
+    // snapshot; it must rebuild from the restored def's inline `affine_id`).
+    let mut fresh = ClusterState::<RunnerIdentifier>::new();
+    assert!(
+        fresh.affine_id_for_hash("h-affine").is_none(),
+        "precondition: the fresh replica knows nothing yet"
+    );
+    fresh.restore(a.snapshot());
+
+    assert_eq!(
+        fresh.affine_id_for_hash("h-affine"),
+        Some(bound),
+        "the restored replica must re-anchor the affine-id from the def's \
+         inline field — else affine placement finds no affine deps and the \
+         import never dispatches"
+    );
+}
+
 /// A promoted primary RESUMES the cell-generation stamp counter PAST every
 /// inherited cell generation at the `PrimaryChanged` epoch advance, so a
 /// later originated cell write out-stamps the inherited cells (the LWW total

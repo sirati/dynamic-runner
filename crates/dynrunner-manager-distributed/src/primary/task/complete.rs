@@ -324,6 +324,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .cluster_state
             .task_state(&task_hash)
             .is_some_and(|s| !s.is_terminal());
+        // Capture the import's phase + task identity on the FIRST run, BEFORE
+        // the `TaskCompleted` apply flips its state, so the pool's phase-neutral
+        // drain re-trigger below can be keyed on it. `None` on a later run (the
+        // gate already false) or a settled/unknown hash — neither reaches the
+        // re-trigger.
+        let first_run_identity: Option<(dynrunner_core::PhaseId, String)> = first_run
+            .then(|| {
+                self.cluster_state
+                    .task_state(&task_hash)
+                    .map(|s| (s.def().phase_id.clone(), s.def().task_id.clone()))
+            })
+            .flatten();
         if first_run {
             self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskCompleted {
                 hash: task_hash.clone(),
@@ -331,6 +343,37 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 attempt: Default::default(),
             }])
             .await;
+            // POOL DRAIN RE-TRIGGER (Model B affine-only-phase). The import's
+            // first global terminal makes its phase genuinely drainable, but
+            // this handler is phase-NEUTRAL — it never calls
+            // `note_item_completed`, so nothing re-runs the pool's drain
+            // transition. Without this, a phase whose ONLY content is the no-dep
+            // affine import (the import in one phase, its dependent builds in a
+            // SEPARATE downstream phase) is held `Active` by the pool's affine
+            // guard (`phase_has_live_affine_prereq`) and never re-evaluated — it
+            // would strand. `note_affine_terminal` records the import terminal
+            // in the pool's `completed_tasks` (flipping the guard) and re-runs
+            // `maybe_transition_drain`, so the now-drained phase is pushed onto
+            // `drained_pending` for the manager's drain-edge cascade. It does
+            // NOT unblock dependents on the global terminal (the per-secondary
+            // bitvector governs dependent dispatch — NOT globally unblocking).
+            // The drained phase's `phase_can_proceed` then takes the existing
+            // `has_any && !has_live` arm (the import's TaskState is now terminal
+            // in the rollup) and the phase advances. Same-phase topologies
+            // (work + affine in one phase) are unaffected: the work's own
+            // `note_item_completed` is the drain gate there, and the import's
+            // terminal precedes it, so the guard is already `false` by the time
+            // the work drains.
+            if let Some((phase, task_id)) = &first_run_identity {
+                self.pool_mut().note_affine_terminal(phase, task_id);
+                // The freshly-drained phase needs the lifecycle cascade to
+                // observe it (fire `on_phase_end`, evaluate `phase_can_proceed`,
+                // activate dependents). The affine terminal path holds no
+                // `command_rx` (it is not a callback-driven cascade entry), so
+                // pass `&mut None` — the same shape the post-loop / pre-loop
+                // non-callback cascade entries use.
+                self.process_phase_lifecycle(&mut None).await;
+            }
         }
 
         // (1) BITVECTOR: mark this secondary's cell Finished (per-secondary; the

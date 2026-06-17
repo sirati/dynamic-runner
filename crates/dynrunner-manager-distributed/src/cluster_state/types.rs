@@ -278,6 +278,28 @@ impl<I> TaskState<I> {
         }
     }
 
+    /// Mutable borrow of the shared frozen-definition `Arc`, regardless of
+    /// variant — the write twin of [`Self::def`]. The `Arc` is shared with the
+    /// def store, so a caller mutating through it must `Arc::make_mut` (copy-on-
+    /// write forks the per-entry def from the store's slot). The ONE writer is
+    /// the affine-id inline stamp (`apply_secondary_affine_registered`): the
+    /// snapshot serializes THIS per-`TaskState` def by value, so the affine-id
+    /// must be stamped HERE (not just on the store slot) to survive
+    /// snapshot/restore.
+    pub(crate) fn def_mut(&mut self) -> &mut Arc<FrozenTaskDef<I>> {
+        match self {
+            TaskState::Pending { def, .. }
+            | TaskState::InFlight { def, .. }
+            | TaskState::Completed { def, .. }
+            | TaskState::Failed { def, .. }
+            | TaskState::Unfulfillable { def, .. }
+            | TaskState::InvalidTask { def, .. }
+            | TaskState::SkippedAlreadyDone { def, .. }
+            | TaskState::SetupCompleted { def, .. }
+            | TaskState::Blocked { def, .. } => def,
+        }
+    }
+
 
     /// Shared borrow of the per-entry MUTABLE routing tail, regardless of
     /// variant. Callers reading a carved field
