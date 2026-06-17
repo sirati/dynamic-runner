@@ -24,6 +24,118 @@ fn mk_setup_task(name: &str) -> TaskInfo<RunnerIdentifier> {
     task
 }
 
+/// Build a `TaskKind::SecondaryAffine` task — `mk_task`'s twin.
+fn mk_affine_task(name: &str) -> TaskInfo<RunnerIdentifier> {
+    let mut task = mk_task(name);
+    task.kind = TaskKind::SecondaryAffine;
+    task
+}
+
+/// Seed a task DIRECTLY into the ledger at a given `Pending`/`InFlight`
+/// state — bypassing the apply rules so a test can place an arbitrary
+/// kind in an arbitrary state. `state` is built from the task's split def.
+fn seed_pending(s: &mut ClusterState<RunnerIdentifier>, task: TaskInfo<RunnerIdentifier>) {
+    let hash = crate::primary::wire::compute_task_hash(&task);
+    let (def, routing) = crate::cluster_state::split_task_def(task);
+    s.seed_task_state_for_test(
+        &hash,
+        TaskState::Pending {
+            def,
+            routing,
+            version: Default::default(),
+            attempt: 0,
+        },
+    );
+}
+
+/// The `counts()` KIND partition: setup-kind tasks accrue to the
+/// `setup_*` per-state buckets and per-secondary affine GATE tokens to
+/// the single flat `secondary_affine` count — NEITHER folded into the
+/// generic work `pending`/etc. The bug this pins: a setup task and an
+/// affine token sitting `Pending` previously inflated `counts().pending`,
+/// so the observer baseline reported "330 pending" lumping all three.
+#[test]
+fn counts_partition_setup_and_affine_excluded_from_generic_buckets() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+
+    // Two ordinary WORK tasks, Pending.
+    seed_pending(&mut s, mk_task("w0"));
+    seed_pending(&mut s, mk_task("w1"));
+
+    // SETUP tasks across several states.
+    seed_pending(&mut s, mk_setup_task("su_pending"));
+    // setup InFlight (assigned to its in-process executor member).
+    {
+        let setup = mk_setup_task("su_inflight");
+        let hash = crate::primary::wire::compute_task_hash(&setup);
+        let (def, routing) = crate::cluster_state::split_task_def(setup);
+        s.seed_task_state_for_test(
+            &hash,
+            TaskState::InFlight {
+                def,
+                routing,
+                secondary: "node".into(),
+                worker: 0,
+                version: Default::default(),
+                attempt: 0,
+            },
+        );
+    }
+    // setup succeeded.
+    {
+        let setup = mk_setup_task("su_done");
+        let hash = crate::primary::wire::compute_task_hash(&setup);
+        let (def, routing) = crate::cluster_state::split_task_def(setup);
+        s.seed_task_state_for_test(
+            &hash,
+            TaskState::SetupCompleted {
+                def,
+                routing,
+                attempt: 0,
+            },
+        );
+    }
+    // setup failed permanently.
+    {
+        let setup = mk_setup_task("su_failed");
+        let hash = crate::primary::wire::compute_task_hash(&setup);
+        let (def, routing) = crate::cluster_state::split_task_def(setup);
+        s.seed_task_state_for_test(
+            &hash,
+            TaskState::Failed {
+                def,
+                routing,
+                kind: dynrunner_core::ErrorType::NonRecoverable,
+                last_error: "boom".into(),
+                version: Default::default(),
+                attempt: 0,
+            },
+        );
+    }
+
+    // Two per-secondary AFFINE gate tokens, Pending.
+    seed_pending(&mut s, mk_affine_task("a0"));
+    seed_pending(&mut s, mk_affine_task("a1"));
+
+    let c = s.counts();
+
+    // Generic buckets are WORK-ONLY: exactly the two work tasks.
+    assert_eq!(c.pending, 2, "only the two WORK tasks are generic-pending");
+    assert_eq!(c.in_flight, 0, "the setup InFlight is NOT generic in_flight");
+    assert_eq!(c.failed, 0, "the failed SETUP is NOT generic failed");
+    assert_eq!(c.completed, 0);
+
+    // Setup-prefixed per-state buckets.
+    assert_eq!(c.setup_pending, 1);
+    assert_eq!(c.setup_in_flight, 1);
+    assert_eq!(c.setup_succeeded, 1, "setup-done");
+    assert_eq!(c.setup_failed, 1);
+    assert_eq!(c.setup_blocked, 0);
+
+    // Affine: ONE flat count, no state subdivision.
+    assert_eq!(c.secondary_affine, 2);
+}
+
 /// A succeeded setup task (`SetupCompleted`) IS terminal for
 /// dependency-resolution / phase-completion purposes — the predicate
 /// every dep walk and phase rollup shares.

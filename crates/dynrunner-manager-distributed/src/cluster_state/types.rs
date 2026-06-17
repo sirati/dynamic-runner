@@ -841,6 +841,17 @@ pub enum ApplyOutcome {
 }
 
 /// Counts of tasks per top-level state. For tests / metrics.
+///
+/// PARTITIONED BY [`dynrunner_core::TaskCountCategory`] FIRST, then by
+/// state: the generic per-state fields (`pending` … `setup_succeeded`)
+/// count ONLY [`TaskCountCategory::Work`] entries; framework SETUP tasks
+/// accrue to the `setup_*` fields; per-secondary affine GATE tokens accrue
+/// to the single flat [`Self::secondary_affine`] count with NO state
+/// subdivision (they are phase-uncounted — readiness is the per-secondary
+/// bitvector, not a global state). The split happens at the categorization
+/// point in [`super::ClusterState::counts`] (each entry is routed by its
+/// kind's `count_category`), so setup/affine are NEVER folded into the
+/// generic work buckets and then subtracted back out.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StateCounts {
     pub pending: usize,
@@ -864,8 +875,30 @@ pub struct StateCounts {
     /// Tasks in `TaskState::SetupCompleted { .. }` — succeeded setup-kind
     /// tasks. SUCCESS-LIKE terminal kept in its OWN category (NOT folded
     /// into `completed` nor any `fail_*`), so the worker-work `completed`
-    /// count reports only worker work.
+    /// count reports only worker work. The setup-DONE bucket — the success
+    /// twin of the `setup_*` per-state fields below.
     pub setup_succeeded: usize,
+    /// Setup-kind ([`dynrunner_core::TaskCountCategory::Setup`]) tasks in
+    /// `TaskState::Pending` — awaiting their in-process executor. EXCLUDED
+    /// from the generic [`Self::pending`] (which is work-only).
+    pub setup_pending: usize,
+    /// Setup-kind tasks in `TaskState::InFlight` — assigned to their
+    /// executor member, running in-process. EXCLUDED from [`Self::in_flight`].
+    pub setup_in_flight: usize,
+    /// Setup-kind tasks in `TaskState::Blocked` — cascade-paused on an
+    /// unfulfillable prerequisite. EXCLUDED from [`Self::blocked`].
+    pub setup_blocked: usize,
+    /// Setup-kind tasks in a non-success terminal (`Failed` / `Unfulfillable`
+    /// / `InvalidTask`) — a setup task that failed permanently. EXCLUDED
+    /// from [`Self::failed`] / [`Self::unfulfillable`] / [`Self::invalid_task`].
+    pub setup_failed: usize,
+    /// Per-secondary affine GATE tokens
+    /// ([`dynrunner_core::TaskCountCategory::SecondaryAffine`]) — a SINGLE
+    /// flat count with NO state subdivision. These are phase-uncounted
+    /// dependency tokens: their readiness is the per-secondary 2-bit
+    /// bitvector, NOT a global pending/done state, so reporting them by
+    /// state would be meaningless. EXCLUDED from EVERY per-state bucket.
+    pub secondary_affine: usize,
 }
 
 /// Per-phase task partition over the replicated ledger — the value shape

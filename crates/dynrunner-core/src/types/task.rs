@@ -76,6 +76,24 @@ pub enum TaskKind {
     SecondaryAffine,
 }
 
+/// The COUNTING category of a task — the mutually-exclusive partition a
+/// tally/reporting concern uses to bucket a ledger entry WITHOUT peeking
+/// at the [`TaskKind`] discriminant itself. Derived ONLY via
+/// [`TaskKind::count_category`], so the kind→category mapping has a
+/// single owner (this enum + that method). See `count_category` for the
+/// per-category contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskCountCategory {
+    /// Ordinary worker work — the generic per-state buckets.
+    Work,
+    /// A framework setup task — its OWN setup-prefixed per-state buckets.
+    Setup,
+    /// A per-secondary import GATE token — one flat count, no per-state
+    /// subdivision (phase-uncounted; readiness is the per-secondary
+    /// bitvector, not a global state).
+    SecondaryAffine,
+}
+
 impl TaskKind {
     /// Whether a task of this kind may be dispatched to a WORKER. Only
     /// `Work` is worker-assignable; a `Setup` task is executed in-process
@@ -135,6 +153,35 @@ impl TaskKind {
     /// the PyO3 boundary mapping an `is_secondary_affine` bool).
     pub fn is_secondary_affine(self) -> bool {
         matches!(self, TaskKind::SecondaryAffine)
+    }
+
+    /// The COUNTING category this kind belongs to — the single modular
+    /// projection a tally/reporting concern dispatches on so it never
+    /// spells a bare `if kind == Setup` (the antipattern the four-seam
+    /// design forbids). The three categories are mutually exclusive and
+    /// exhaust the kinds, mirroring the counting seam's contract:
+    ///
+    ///   - [`TaskCountCategory::Work`] — ordinary worker work; counted in
+    ///     the generic per-STATE buckets.
+    ///   - [`TaskCountCategory::Setup`] — a framework setup task; counted
+    ///     in its OWN setup-prefixed per-STATE buckets, EXCLUDED from the
+    ///     generic ones, so an operator sees setup progress without it
+    ///     inflating the work tally.
+    ///   - [`TaskCountCategory::SecondaryAffine`] — a per-secondary import
+    ///     GATE token; it is phase-uncounted (its readiness is the
+    ///     per-secondary 2-bit bitvector, not a global pending/done state),
+    ///     so it is reported as ONE flat count with NO state subdivision
+    ///     and EXCLUDED from every per-state bucket.
+    ///
+    /// The counting seam ([`StateCounts`](../../../dynrunner_manager_distributed/cluster_state/struct.StateCounts.html))
+    /// is the sole consumer: it routes each ledger entry by THIS category,
+    /// so adding/retiring a kind moves the partition in ONE place.
+    pub fn count_category(self) -> TaskCountCategory {
+        match self {
+            TaskKind::Work => TaskCountCategory::Work,
+            TaskKind::Setup => TaskCountCategory::Setup,
+            TaskKind::SecondaryAffine => TaskCountCategory::SecondaryAffine,
+        }
     }
 
     /// Whether this is the common `Work` case — the predicate behind the
