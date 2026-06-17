@@ -157,22 +157,42 @@ where
     /// drain departure. Best-effort: a broadcast failure is logged and the
     /// local exit proceeds (mirroring the panik departure).
     pub(in crate::secondary) async fn announce_graceful_drain_departure(&mut self) {
+        self.announce_self_departure("graceful abort: local work drained".to_string())
+            .await;
+    }
+
+    /// Originate + fan out an AUTHORITATIVE self-departure carrying the
+    /// supplied exit `reason`: a self-authored `ClusterMutation::PeerRemoved
+    /// { id: <self>, cause: SelfDeparture(reason), member_gen: <self's
+    /// current incarnation> }`, applied locally and broadcast to every
+    /// known mesh endpoint via [`Self::apply_and_broadcast_mutations`].
+    ///
+    /// Single source of truth for "this node is leaving the mesh; mark it
+    /// Dead-deliberately and stop dialing it". The graceful-drain departure,
+    /// the panik file-source departure, and the setup-timeout abort all
+    /// route through here — they differ ONLY in the reason string, so the
+    /// `PeerRemoved` shape + member_gen stamp + apply-then-broadcast +
+    /// best-effort error handling live in ONE place.
+    ///
+    /// Best-effort: a broadcast failure is logged with the reason and the
+    /// caller proceeds with its exit anyway (the node is leaving regardless;
+    /// peers' keepalive/setup watchdogs reap the membership entry as the
+    /// fallback). Observability + membership only: it does NOT cancel
+    /// cluster work, terminate the run on peers, or touch failover.
+    pub(in crate::secondary) async fn announce_self_departure(&mut self, reason: String) {
         let mutation = ClusterMutation::PeerRemoved {
             id: self.config.secondary_id.clone(),
-            cause: RemovalCause::SelfDeparture(BoundedString::from(
-                "graceful abort: local work drained".to_string(),
-            )),
-            // Kills THIS node's current membership incarnation (same
-            // stamp as the panik self-departure above).
+            cause: RemovalCause::SelfDeparture(BoundedString::from(reason.clone())),
+            // Kills THIS node's current membership incarnation.
             member_gen: self.cluster_state.peer_member_gen(&self.config.secondary_id),
         };
         if let Err(e) = self.apply_and_broadcast_mutations(vec![mutation]).await {
             tracing::warn!(
                 error = %e,
-                "graceful-drain self-departure apply+broadcast failed; \
-                 exiting anyway (the primary's keepalive watchdog reaps the \
-                 membership entry, and its requeue path finds nothing in \
-                 flight on a drained secondary)"
+                reason = %reason,
+                "self-departure apply+broadcast failed; exiting anyway \
+                 (peers' keepalive/setup watchdogs reap the membership entry \
+                 as the fallback)"
             );
         }
     }
@@ -268,21 +288,11 @@ where
             // Self-authored departure announcement: peers LOG it and
             // mark this node Dead (observability only). It does NOT
             // cancel cluster work or terminate the run on peers — the
-            // mesh stays free to continue / re-elect. `BoundedString::from`
-            // truncates at the 1 KiB cap `SelfDeparture` carries.
-            let mutation = ClusterMutation::PeerRemoved {
-                id: self.config.secondary_id.clone(),
-                cause: RemovalCause::SelfDeparture(BoundedString::from(reason.clone())),
-                // Kills THIS node's current membership incarnation.
-                member_gen: self.cluster_state.peer_member_gen(&self.config.secondary_id),
-            };
-            if let Err(e) = self.apply_and_broadcast_mutations(vec![mutation]).await {
-                tracing::warn!(
-                    error = %e,
-                    "panik self-departure apply+broadcast failed; \
-                     proceeding with local worker teardown anyway"
-                );
-            }
+            // mesh stays free to continue / re-elect. The shared helper
+            // truncates the reason at the 1 KiB `SelfDeparture` cap, then
+            // proceeds with the local worker teardown below even on a
+            // broadcast failure.
+            self.announce_self_departure(reason.clone()).await;
         }
         // Drain the per-task memprofile sampler BEFORE the bulk
         // kill drops the worker pool's `SubcgroupHandle`s (which
