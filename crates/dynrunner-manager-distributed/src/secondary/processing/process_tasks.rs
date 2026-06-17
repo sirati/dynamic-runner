@@ -992,15 +992,18 @@ where
                     // /proc reads off the runtime), `apply_sweep`
                     // (in-pool write-back), `check_resource_pressure`
                     // (scheduler decision), `report_stuck_workers`
-                    // (phase-progress WARNs). The TRACE emit below
+                    // (phase-progress WARNs). The gated TRACE emit below
                     // reports the total wall-clock the loop spent on
                     // THIS sweep — high values indicate the sweep is
-                    // structurally responsible for inbox wait-time, low
-                    // values confirm the OOM cadence is honest. Per
+                    // structurally responsible for inbox wait-time. Per
                     // [[feedback_oom_observability_is_framework]] +
                     // trace-vs-info classifier: per-sweep is DECISION
                     // cadence → trace level (file-log only via #585), not
-                    // info (which would flood stdout at 20Hz).
+                    // info (which would flood stdout at 20Hz). The emit is
+                    // further gated on cost_ms > 50 || kills > 0: a fast
+                    // no-kill sweep is the steady state and stays silent
+                    // (the honest-cadence confirmation is the ABSENCE of
+                    // the line, not a per-fire repeat of it).
                     let sweep_started_at = tokio::time::Instant::now();
                     // Collect the CURRENT worker set's read inputs
                     // (respawns / type-shifts picked up each sweep),
@@ -1042,7 +1045,9 @@ where
                     };
                     resource_buffer
                         .push(tokio::time::Instant::now().into_std(), raw_sample);
-                    self.check_resource_pressure_via_watcher(&mut oom_watcher, factory).await;
+                    let kills = self
+                        .check_resource_pressure_via_watcher(&mut oom_watcher, factory)
+                        .await;
                     // Per-worker phase-progress observability — the
                     // SAME shared seam LocalManager fires off ITS sweep
                     // (manager/worker_loop.rs). A long quiet task (deep
@@ -1058,12 +1063,19 @@ where
                     let intervals = self.config.phase_status_log_intervals.clone();
                     self.op_mut().pool.report_stuck_workers(&intervals);
                     let cost_ms = sweep_started_at.elapsed().as_millis() as u64;
-                    tracing::trace!(
-                        target: "oom_sweep",
-                        scanned = scanned_workers,
-                        cost_ms,
-                        "oom_sweep fired"
-                    );
+                    // A sweep is only log-worthy if it was SLOW (a
+                    // structural inbox-latency contributor) or it actually
+                    // KILLED a worker. A fast no-kill sweep is the steady
+                    // state at 20Hz and stays silent (no per-fire spam).
+                    if cost_ms > 50 || kills > 0 {
+                        tracing::trace!(
+                            target: "oom_sweep",
+                            scanned = scanned_workers,
+                            cost_ms,
+                            kills,
+                            "oom_sweep fired"
+                        );
+                    }
                     // Await-before-resleep: arm the next sweep a full
                     // interval after THIS one completed.
                     next_sweep_due = tokio::time::Instant::now() + oom_sweep_interval;

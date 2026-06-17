@@ -1293,11 +1293,14 @@ where
     /// trigger; the secondary-specific kill-outcome handling
     /// (TaskFailed mesh broadcast + worker restart + request new
     /// task) stays here.
+    /// Returns the number of workers killed by this decision tick (0 or 1)
+    /// so the caller can gate per-sweep logging on whether the sweep
+    /// actually issued a kill directive.
     pub(super) async fn check_resource_pressure_via_watcher(
         &mut self,
         watcher: &mut OomWatcher,
         factory: &mut impl WorkerFactory<M>,
-    ) {
+    ) -> usize {
         let max = self.max_resources();
         // Clone the scheduler before borrowing the operational pool: the
         // pool now lives inside `OperationalState` (reached via
@@ -1308,7 +1311,7 @@ where
         // disjoint borrows clean without a manual struct destructure.
         let scheduler = self.scheduler.clone();
         let result = watcher.on_decision(&mut self.op_mut().pool, &scheduler, &max, false);
-        self.handle_resource_pressure_result(result, factory).await;
+        self.handle_resource_pressure_result(result, factory).await
     }
 
     /// Secondary-specific outcome handler. Pulled out of the prior
@@ -1332,11 +1335,14 @@ where
     /// Worker restart + new-task request runs in both arms — the
     /// killed worker is gone either way, so the slot needs a fresh
     /// subprocess and a new assignment from the primary.
+    ///
+    /// Returns the kill count (0 or 1) so the per-sweep log can gate on
+    /// "did this sweep actually kill anything".
     async fn handle_resource_pressure_result(
         &mut self,
         result: ResourcePressureResult<I>,
         factory: &mut impl WorkerFactory<M>,
-    ) {
+    ) -> usize {
         match result {
             ResourcePressureResult::Killed {
                 worker_id, reason, ..
@@ -1416,8 +1422,9 @@ where
                 {
                     tracing::error!(worker_id, error = %e, "secondary OOM-restart failed");
                 }
+                1
             }
-            ResourcePressureResult::NoAction => {}
+            ResourcePressureResult::NoAction => 0,
         }
     }
 
