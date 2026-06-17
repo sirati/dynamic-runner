@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import socket
 from pathlib import Path
 
 from dynamic_runner.worker import (
@@ -316,7 +315,7 @@ def _import(task: Task) -> WorkerOutput:
     carrying one line per distinct node identity.
 
     Mirrors :func:`_build`'s marker-write idiom (same ``_destination_root()`` +
-    ``socket.gethostname()`` shared-NFS append); the import marker NAME is owned
+    ``_secondary_id()`` shared-NFS append); the import marker NAME is owned
     by the consumer task module (``AFFINE_IMPORT_MARKER``). The gate publishes
     no asserted output — a clean return is its successful terminal, which is
     what releases the dependents (``expected_affine_outputs`` lists only the
@@ -326,7 +325,7 @@ def _import(task: Task) -> WorkerOutput:
     _maybe_sleep()
     payload = task.payload or {}
     idx = payload.get("idx")
-    node = socket.gethostname()
+    node = _secondary_id()
     dst_root = _destination_root()
     dst_root.mkdir(parents=True, exist_ok=True)
     marker = dst_root / AFFINE_IMPORT_MARKER
@@ -364,7 +363,7 @@ def _build(task: Task) -> WorkerOutput:
         raise NonRecoverableError(
             f"build task has no 'build_id' in payload: {payload!r}"
         )
-    node = socket.gethostname()
+    node = _secondary_id()
     dst_root = _destination_root()
     dst_root.mkdir(parents=True, exist_ok=True)
     marker = dst_root / AFFINE_BUILD_MARKER
@@ -426,6 +425,35 @@ def handle(task: Task) -> WorkerOutput:
 _SOURCE_DIR: Path | None = None
 _OUTPUT_DIR: Path | None = None
 
+# The per-secondary identity this worker subprocess belongs to, derived
+# from ``--log-file`` in :func:`_on_args` (see :func:`_secondary_id`).
+_SECONDARY_ID: str | None = None
+
+
+def _secondary_id() -> str:
+    """The id of the secondary that spawned this worker.
+
+    Single concern: a per-secondary identity that is DISTINCT for every
+    secondary on BOTH SLURM (one host per secondary) and ``--multi-computer
+    local`` (many secondaries sharing one host). ``socket.gethostname()``
+    fails the latter — co-located secondaries collide on one hostname — so
+    the affine markers key on this instead.
+
+    Source: the framework lands each worker's ``--log-file`` at
+    ``<log-root>/<secondary_id>/worker_<id>.log`` — the ``{secondary_id}``
+    log-dir template (``config/log_paths.rs::resolve_log_dir``, fed
+    ``secondary-{i}`` by ``managers/primary/run.rs``). The parent
+    directory name IS the secondary id, available to the worker with no
+    new framework plumbing. Fails loud if ``--log-file`` was absent so a
+    deployment that drops it surfaces here rather than silently colliding.
+    """
+    if _SECONDARY_ID is None:
+        raise NonRecoverableError(
+            "worker secondary_id not configured — did the framework "
+            "forget to pass --log-file?"
+        )
+    return _SECONDARY_ID
+
 
 def _output_dir() -> Path:
     """The framework-threaded ``--output`` directory.
@@ -477,9 +505,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _on_args(args: argparse.Namespace) -> None:
-    global _SOURCE_DIR, _OUTPUT_DIR
+    global _SOURCE_DIR, _OUTPUT_DIR, _SECONDARY_ID
     _SOURCE_DIR = Path(args.source)
     _OUTPUT_DIR = Path(args.output)
+    # The framework lands this worker's log at
+    # ``<log-root>/<secondary_id>/worker_<id>.log``; the parent directory
+    # name is the per-secondary identity the affine markers key on.
+    if args.log_file:
+        _SECONDARY_ID = Path(args.log_file).parent.name
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [worker] %(levelname)s %(name)s: %(message)s",
