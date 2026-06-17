@@ -115,6 +115,39 @@ pub enum TaskStateChange {
     Other { state: &'static str },
 }
 
+/// Which CRDT ingestion path produced one winning task transition —
+/// the discriminator the observer's narrator routes on (#636-followup).
+///
+/// The merge seam is DELIBERATELY path-INDEPENDENT for the CRDT (a
+/// transition that lands via snapshot restore is byte-identical to one
+/// that lands via a live broadcast — see
+/// [`crate::cluster_state::ClusterState::merge_task_state`]); that
+/// unification is correct for convergence but WRONG for the operator,
+/// who would otherwise see a relocated/late-join observer's whole
+/// bootstrap InFlight partition narrated task-by-task as if it were live
+/// changes (the ~10-min spew at 40k scale). This tag — and ONLY this tag
+/// — re-introduces the operator-facing distinction the CRDT erased: the
+/// seam stays CRDT-path-independent, it just stamps which path it took.
+///
+/// Stamped at the single emit chokepoint
+/// ([`crate::cluster_state::ClusterState::emit_task_state_change_event`])
+/// from a scoped restore marker on `ClusterState`, NOT threaded through
+/// the write-path signatures — so a `set_task_state` / `merge_task_state`
+/// / `rewrite_task_state` caller never learns of narration source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NarrationSource {
+    /// The transition landed via a LIVE broadcast apply (the steady-state
+    /// path): the originator's local apply or a mirror apply of a peer's
+    /// broadcast. Narrated INDIVIDUALLY, one operator line per transition.
+    LiveBroadcast,
+    /// The transition landed via a snapshot RESTORE / catch-up merge (a
+    /// bootstrap full-ledger pull, a recovery re-stream, a failover
+    /// re-bootstrap) — a re-narration of converged STATE, not a live
+    /// change. Folded into a per-restore-batch SUMMARY line, exactly as
+    /// the pre-loop bootstrap is folded by `narrate_baseline`.
+    CatchUp,
+}
+
 /// One winning task transition surfaced on the state-change dispatcher
 /// mpsc when [`crate::cluster_state::ClusterState::merge_task_state`]
 /// accepts an `incoming` state. Fires at most once per winning join key
@@ -140,6 +173,14 @@ pub enum TaskStateChange {
 /// - `txn`: the CRDT transaction coordinates of the WINNING (post-write)
 ///   state — the id the operator correlates the line to the originating
 ///   CRDT change. See [`TaskTxnId`].
+/// - `source`: which CRDT ingestion path produced the transition (see
+///   [`NarrationSource`]). AUTHORITATIVELY stamped by
+///   [`crate::cluster_state::ClusterState::emit_task_state_change_event`]
+///   from the scoped restore marker — the build site at
+///   `set_task_state` sets the [`NarrationSource::LiveBroadcast`]
+///   default and the emit chokepoint overwrites it when the restore
+///   marker is set, so the write path carries no narration-source
+///   concern.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskStateChangeEvent {
     pub task_id: String,
@@ -147,4 +188,5 @@ pub struct TaskStateChangeEvent {
     pub holder: Option<(String, WorkerId)>,
     pub from: Option<&'static str>,
     pub txn: TaskTxnId,
+    pub source: NarrationSource,
 }

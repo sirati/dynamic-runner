@@ -12,7 +12,7 @@ use tracing::Level;
 
 use super::*;
 use crate::cluster_state::StateCounts;
-use crate::task_state_change::{TaskStateChange, TaskStateChangeEvent, TaskTxnId};
+use crate::task_state_change::{NarrationSource, TaskStateChange, TaskStateChangeEvent, TaskTxnId};
 use crate::test_capture::{IMPORTANT_TARGET, LeveledEvent, TargetCapture};
 use dynrunner_core::OBSERVER_TASK_TARGET;
 
@@ -73,6 +73,9 @@ fn evt(task_id: &str, change: TaskStateChange, holder: Option<(&str, u32)>) -> T
         holder: holder.map(|(s, w)| (s.to_string(), w)),
         from: None,
         txn: TaskTxnId { primary_epoch: 0, seq: 0, attempt: 0 },
+        // The narrate_live unit tests drive the LIVE path (CatchUp routing
+        // is exercised end-to-end in the coordinator integration test).
+        source: NarrationSource::LiveBroadcast,
     }
 }
 
@@ -91,6 +94,7 @@ fn evt_from(
         holder: holder.map(|(s, w)| (s.to_string(), w)),
         from: Some(from),
         txn,
+        source: NarrationSource::LiveBroadcast,
     }
 }
 
@@ -404,6 +408,79 @@ fn completed_narrates_from_to_transition() {
     assert!(msg.contains("(in-flight→completed)"), "from→to transition: {msg:?}");
     // A version-less Completed reports the attempt-only coordinate.
     assert!(msg.contains("crdt_txn=e0.v0.a2"), "version-less completed txn: {msg:?}");
+}
+
+/// An `evt` re-tagged as a snapshot-restore CATCH-UP transition (the
+/// shape a relocated / late-join observer's in-loop bootstrap restore
+/// fires) — the `observe`-routing tests below.
+fn catch_up(task_id: &str, change: TaskStateChange, holder: Option<(&str, u32)>) -> TaskStateChangeEvent {
+    TaskStateChangeEvent { source: NarrationSource::CatchUp, ..evt(task_id, change, holder) }
+}
+
+/// CATCH-UP ROUTING (#636-followup): `observe` folds N CatchUp
+/// transitions into ONE summary on `flush_catch_up` (naming the distinct
+/// task + transition counts), narrates NOTHING per-task for them, and the
+/// counter RESETS per batch — while a LiveBroadcast event in the SAME
+/// stream still narrates individually.
+#[test]
+fn observe_folds_catch_up_into_one_summary_and_narrates_live_individually() {
+    let events = capture(|| {
+        let mut n = armed();
+        // Three restored InFlight transitions over THREE distinct tasks +
+        // one re-touch of the first (4 transitions, 3 tasks) — accumulate,
+        // emit nothing yet.
+        for id in ["a", "b", "c", "a"] {
+            assert!(
+                !n.observe(&catch_up(id, TaskStateChange::Assigned, Some(("sec-0", 1)))),
+                "a catch-up transition narrates nothing individually"
+            );
+        }
+        // A genuine LIVE assignment in the same stream → ONE individual line.
+        assert!(
+            n.observe(&evt("live", TaskStateChange::Assigned, Some(("sec-0", 2)))),
+            "a live-broadcast transition narrates individually"
+        );
+        // Terminal package: flush the batch → ONE summary line.
+        assert!(n.flush_catch_up(), "a non-empty batch flushes one summary");
+        // Counter reset: a second flush over an empty batch emits nothing.
+        assert!(!n.flush_catch_up(), "an empty batch (post-reset) emits nothing");
+    });
+    let summaries: Vec<_> = events
+        .iter()
+        .filter(|e| e.leveled.event.message.contains("observer caught up"))
+        .collect();
+    assert_eq!(summaries.len(), 1, "exactly one catch-up summary: {events:?}");
+    assert_eq!(summaries[0].target, IMPORTANT_TARGET, "summary is wake-worthy");
+    assert_eq!(
+        summaries[0].leveled.event.fields.get("catch_up_tasks").map(String::as_str),
+        Some("3"),
+        "3 distinct catch-up tasks (a re-touched): {:?}",
+        summaries[0]
+    );
+    assert_eq!(
+        summaries[0].leveled.event.fields.get("catch_up_transitions").map(String::as_str),
+        Some("4"),
+        "4 catch-up transitions: {:?}",
+        summaries[0]
+    );
+    // The ONLY individual per-task line is the LIVE one (none of a/b/c).
+    let per_task: Vec<_> = events
+        .iter()
+        .filter(|e| e.target == OBSERVER_TASK_TARGET)
+        .collect();
+    assert_eq!(per_task.len(), 1, "only the live transition narrates per-task: {events:?}");
+    assert!(per_task[0].leveled.event.message.contains("task live assigned"));
+}
+
+/// An empty catch-up batch (a `done` over a converged re-stream that won
+/// no transitions) flushes NOTHING — the quiescent-observer no-op.
+#[test]
+fn empty_catch_up_batch_flushes_nothing() {
+    let events = capture(|| {
+        let mut n = armed();
+        assert!(!n.flush_catch_up(), "an empty batch emits no summary");
+    });
+    assert!(events.is_empty(), "no line for an empty catch-up batch: {events:?}");
 }
 
 /// An EMPTY baseline (cold-join before any snapshot) emits NO summary

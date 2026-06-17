@@ -221,6 +221,12 @@ impl<I: Identifier> ClusterState<I> {
                 // path-independent across apply / restore / rank-drop.
                 from: from_state,
                 txn: state.txn_id(),
+                // The build site carries no narration-source concern: the
+                // write seam is CRDT-path-independent. The emit chokepoint
+                // (`emit_task_state_change_event`) AUTHORITATIVELY stamps
+                // this from the scoped restore marker — `LiveBroadcast`
+                // here is the default it overwrites under restore scope.
+                source: crate::task_state_change::NarrationSource::LiveBroadcast,
             };
             self.emit_task_state_change_event(event);
         }
