@@ -168,6 +168,27 @@ fn evict_stale_cache_entries(cache_dir: &Path, keep_digest: &str) {
     }
 }
 
+/// Copy the shared-FS image straight to the per-job writable scratch
+/// (`layout.local_image`, under the random `$RNDTMP` this uid owns) and
+/// return that path. This is the cache-free path: used when there is no
+/// content key to cache by, AND as the universal fallback whenever the
+/// node-local cache dir cannot be written (foreign-owned root, ENOSPC,
+/// EROFS, ...). The per-job scratch is always this uid's own writable
+/// tree, so this never collides across uids — it trades the cache's
+/// shared-FS-read saving for guaranteed startup.
+fn copy_per_job(cfg: &WrapperConfig, layout: &Layout) -> Result<PathBuf, String> {
+    println!("Copying image to local temp directory...");
+    std::fs::copy(&cfg.image_path, &layout.local_image).map_err(|e| {
+        format!(
+            "failed to copy image {} to {}: {e}",
+            cfg.image_path,
+            layout.local_image.display()
+        )
+    })?;
+    println!("Image copied to: {}", layout.local_image.display());
+    Ok(layout.local_image.clone())
+}
+
 /// Ensure a node-local copy of the image tar exists and return the path
 /// the `load` command should read as `$LOCAL_IMAGE`.
 ///
@@ -178,16 +199,7 @@ fn evict_stale_cache_entries(cache_dir: &Path, keep_digest: &str) {
 fn provide_local_image(cfg: &WrapperConfig, layout: &Layout) -> Result<PathBuf, String> {
     let Some(cache) = cache_path(cfg, layout) else {
         // No content key → cannot safely cache; copy per job.
-        println!("Copying image to local temp directory...");
-        std::fs::copy(&cfg.image_path, &layout.local_image).map_err(|e| {
-            format!(
-                "failed to copy image {} to {}: {e}",
-                cfg.image_path,
-                layout.local_image.display()
-            )
-        })?;
-        println!("Image copied to: {}", layout.local_image.display());
-        return Ok(layout.local_image.clone());
+        return copy_per_job(cfg, layout);
     };
 
     // Cache hit: the digest-named file already exists on this node. The
@@ -204,12 +216,20 @@ fn provide_local_image(cfg: &WrapperConfig, layout: &Layout) -> Result<PathBuf, 
     let cache_dir = cache
         .parent()
         .expect("cache_path always has a parent under /tmp");
-    std::fs::create_dir_all(cache_dir).map_err(|e| {
-        format!(
-            "failed to create image cache dir {}: {e}",
+    // A failure to provision the cache dir is NEVER fatal: the cache is an
+    // optimisation, not a correctness requirement. An unwritable cache dir
+    // (e.g. a foreign-uid-owned `/tmp/<prefix>-imgcache` collision, or any
+    // other ENOSPC/EROFS/EACCES) falls back to the per-job writable copy so
+    // the secondary still starts. (uid-namespacing the root in dirs.rs is
+    // the primary fix for the collision; this is the belt-and-braces guard
+    // against any unexpected unwritable cache.)
+    if let Err(e) = std::fs::create_dir_all(cache_dir) {
+        eprintln!(
+            "WARNING: cannot create image cache dir {} ({e}); falling back to per-job copy",
             cache_dir.display()
-        )
-    })?;
+        );
+        return copy_per_job(cfg, layout);
+    }
 
     // Temp name disambiguated by (rand_suffix, pid): two cold-start
     // secondaries racing to populate the same digest each write their
@@ -228,11 +248,16 @@ fn provide_local_image(cfg: &WrapperConfig, layout: &Layout) -> Result<PathBuf, 
     if let Err(e) = std::fs::copy(&cfg.image_path, &tmp) {
         // Best-effort temp cleanup so a failed copy doesn't litter.
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!(
-            "failed to copy image {} to cache temp {}: {e}",
-            cfg.image_path,
+        // Copying INTO the cache dir failed (classically EACCES on a
+        // foreign-owned cache root that `create_dir_all` "succeeded" on
+        // because it already existed). The cache is an optimisation: fall
+        // back to the per-job writable copy rather than stranding the
+        // secondary.
+        eprintln!(
+            "WARNING: cannot populate image cache temp {} ({e}); falling back to per-job copy",
             tmp.display()
-        ));
+        );
+        return copy_per_job(cfg, layout);
     }
     // Atomic publish. A concurrent populate may have published first;
     // rename overwrites with byte-identical content, so the winner is
@@ -513,6 +538,69 @@ mod tests {
         copy_and_load(&cfg, &layout, &bins).expect("cache hit must not need the source");
 
         assert_eq!(std::fs::read(&probe).unwrap(), cached_bytes);
+    }
+
+    // ---- unwritable-cache fallback (the cross-uid collision fix) ----
+
+    /// When the cache dir exists but is NOT writable by this process (the
+    /// shape of a foreign-uid-owned `/tmp/<prefix>-imgcache` on a shared
+    /// SLURM node), the populate copy INTO it fails with EACCES. The
+    /// provide path must NOT return a fatal Err — it must fall back to the
+    /// per-job writable copy so the secondary still starts.
+    ///
+    /// Revert-check: with the copy-failure `return copy_per_job(...)`
+    /// reverted to `return Err(...)`, `copy_and_load` errors and this test
+    /// fails — i.e. it pins the stranding bug.
+    #[test]
+    fn unwritable_cache_dir_falls_back_to_per_job_copy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Running as root would bypass the permission check (root ignores
+        // mode bits), so the EACCES we rely on never fires. Skip rather
+        // than assert a false negative.
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipping: euid 0 bypasses mode-bit permission checks");
+            return;
+        }
+
+        let dir = tempdir().unwrap();
+        let digest = "facefeed1234";
+        let (cfg, layout, bins, bytes) = fixture(dir.path(), "true", digest);
+
+        // Pre-create the cache root mode-0555 (r-xr-xr-x): create_dir_all
+        // sees it already exists and "succeeds", but a copy INTO it is
+        // EACCES — exactly the foreign-owned-root collision shape.
+        std::fs::create_dir_all(&layout.image_cache_root).unwrap();
+        std::fs::set_permissions(
+            &layout.image_cache_root,
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+
+        let result = copy_and_load(&cfg, &layout, &bins);
+
+        // Restore writability so tempdir cleanup can remove the tree.
+        let _ = std::fs::set_permissions(
+            &layout.image_cache_root,
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        result.expect("unwritable cache must fall back, not strand the secondary");
+
+        // The fallback landed the image in the per-job writable scratch,
+        // faithfully copied, and NOT in the unwritable cache.
+        assert!(
+            layout.local_image.exists(),
+            "fallback must write the per-job local_image"
+        );
+        assert_eq!(std::fs::read(&layout.local_image).unwrap(), bytes);
+        assert!(
+            !layout
+                .image_cache_root
+                .join(format!("{digest}.tar"))
+                .exists(),
+            "the unwritable cache must not have been populated"
+        );
     }
 
     // ---- bounded eviction (the resource-leak fix) ----
