@@ -60,16 +60,11 @@ use crate::cluster_state::AffineId;
 ///
 /// The placement/pop/steal/rebuild surface (this enum, [`WorkPlacement`], and
 /// the matching [`AffineScheduler`] methods) is consumed by the operational
-/// dispatch LEAF — the per-secondary-first pop + idle-steal + placement-trigger
-/// call sites. Until that leaf wires it, the surface is `#[allow(dead_code)]`:
-/// it is real + fully unit-tested, just not yet called outside this module's
-/// tests — the SAME consumer-less-surface staging the AF-id state layer used in
-/// `cluster_state::affine_state` (whose query helpers were `#[allow(dead_code)]`
-/// "until that leaf wires the scheduler"). The terminal→bitvector seam
-/// ([`PrimaryCoordinator::affine_terminal_mutation`]) IS already wired live into
-/// the completion / failure paths.
+/// dispatch LEAF (`primary::affine_dispatch`) — the per-secondary-first pop +
+/// idle-steal + placement-trigger call sites + the failover rebuild. The
+/// terminal→bitvector seam ([`PrimaryCoordinator::affine_terminal_mutation`]) is
+/// wired live into the completion / failure paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum QueuedUnit {
     /// An affine prereq: run this affine def on the owning secondary. Carries
     /// the affine-id (the bitvector cell key) and the content hash (the
@@ -94,7 +89,6 @@ impl QueuedUnit {
 /// `cluster_state::affine_id_for_hash`. A non-affine dep never appears here
 /// (it was already satisfied by the pool's ordinary dep check before placement).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct WorkPlacement {
     /// The work task's content hash — the dispatch key and the deterministic
     /// tie-break source for the two-lowest-rank choice.
@@ -118,16 +112,40 @@ pub(crate) struct WorkPlacement {
 pub(crate) struct AffineScheduler {
     /// `secondary_id → ordered local queue`. A missing entry is an empty queue.
     queues: HashMap<String, Vec<QueuedUnit>>,
+    /// Content hashes of WORK tasks already PLACED onto a secondary's queue —
+    /// the once-per-work-task idempotency guard for the placement trigger (the
+    /// `place` policy always appends, so a re-run must not double-queue an
+    /// already-placed work task). Co-located with the queues it guards (it is
+    /// reset together with them by [`Self::clear`] on failover rebuild). The
+    /// CONSUMER records a placed work hash via [`Self::record_placed_work`]
+    /// (returns `false` if already placed — the gate) and undoes it via
+    /// [`Self::unrecord_placed_work`].
+    placed_work: std::collections::HashSet<String>,
 }
 
-// Consumer-less until the dispatch leaf wires it (see [`QueuedUnit`] doc); the
-// surface is real + fully unit-tested.
-#[allow(dead_code)]
 impl AffineScheduler {
-    /// Drop every local queue — the failover seam (the queues are local and not
-    /// replicated; a promoted primary [`Self::rebuild`]s them).
+    /// Drop every local queue AND the placement-idempotency guard — the
+    /// failover seam (the queues + guard are local and not replicated; a
+    /// promoted primary [`Self::rebuild`]s them from the inherited bitvector).
     pub(crate) fn clear(&mut self) {
         self.queues.clear();
+        self.placed_work.clear();
+    }
+
+    /// Record `work_hash` as PLACED (the placement trigger queued its unit) and
+    /// report whether it was newly recorded (`true`) or already present
+    /// (`false`) — the once-per-work-task idempotency gate. A `false` return
+    /// means a prior placement already queued this work task; the caller skips
+    /// re-placing it (the `place` policy would otherwise double-append).
+    pub(crate) fn record_placed_work(&mut self, work_hash: &str) -> bool {
+        self.placed_work.insert(work_hash.to_string())
+    }
+
+    /// Undo a [`Self::record_placed_work`] (the caller recorded a work hash but
+    /// then could not place it — e.g. no secondary to select), so a later pass
+    /// retries the placement.
+    pub(crate) fn unrecord_placed_work(&mut self, work_hash: &str) {
+        self.placed_work.remove(work_hash);
     }
 
     /// This secondary's current queue length (0 for an unseen secondary) — the
@@ -138,7 +156,8 @@ impl AffineScheduler {
     }
 
     /// The whole current queue for a secondary (empty slice for an unseen one)
-    /// — read seam for tests + the rebuild's idempotency checks.
+    /// — the read seam this module's unit tests assert layout against.
+    #[cfg(test)]
     pub(crate) fn queue(&self, secondary: &str) -> &[QueuedUnit] {
         self.queues.get(secondary).map_or(&[], Vec::as_slice)
     }
@@ -259,6 +278,21 @@ impl AffineScheduler {
             return None;
         }
         Some(queue.remove(0))
+    }
+
+    /// Re-push a previously-[`Self::pop_next`]'d `unit` to the FRONT of `S`'s
+    /// queue — the exact inverse of `pop_next`, for the caller's dispatch
+    /// rollback: a popped unit whose worker dispatch then fails (commit refused
+    /// / send failed) is returned to the head so it is retried before any other
+    /// queued unit, preserving the queue order. A pure FIFO-front queue
+    /// primitive (no cell read / mutation): the cell stays whatever `place` /
+    /// `steal_for` last set it to, because the unit was popped, not dequeued
+    /// from the bitvector's perspective — its `Queued` claim never changed.
+    pub(crate) fn requeue_front(&mut self, secondary: &str, unit: QueuedUnit) {
+        self.queues
+            .entry(secondary.to_string())
+            .or_default()
+            .insert(0, unit);
     }
 
     /// Idle-steal for secondary `S` (the caller's precondition: BOTH the global
@@ -422,9 +456,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// affine deps drive per-secondary locality. The single seam translating a
     /// task's string-identity deps into affine-id placement input.
     ///
-    /// Consumed by the dispatch leaf's placement trigger (see [`QueuedUnit`]
-    /// doc); `#[allow(dead_code)]` until that leaf wires it.
-    #[allow(dead_code)]
+    /// Consumed by the dispatch leaf's placement trigger + the failover rebuild
+    /// (`primary::affine_dispatch`).
     pub(crate) fn affine_placement_for(&self, task: &TaskInfo<I>) -> WorkPlacement {
         let mut affine_deps = Vec::new();
         for dep in &task.task_depends_on {
@@ -439,21 +472,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         WorkPlacement {
             hash: compute_task_hash(task),
             affine_deps,
-        }
-    }
-
-    /// A `cell_of` closure over the replicated AF-id bitvector — the AF-sched
-    /// read seam the pure placement/steal/rebuild APIs take. Borrows
-    /// `cluster_state` immutably for the closure's lifetime.
-    ///
-    /// Consumed by the dispatch leaf (see [`QueuedUnit`] doc);
-    /// `#[allow(dead_code)]` until that leaf wires it.
-    #[allow(dead_code)]
-    pub(crate) fn affine_cell_reader(
-        &self,
-    ) -> impl Fn(&str, AffineId) -> AffineCell + Copy + '_ {
-        move |secondary: &str, affine_id: AffineId| {
-            self.cluster_state.affine_state(secondary, affine_id)
         }
     }
 

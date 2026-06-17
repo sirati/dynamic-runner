@@ -104,6 +104,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // recheck because the two select disjoint task sets (worker work
             // vs setup) over the SAME pool.
             self.dispatch_setup_tasks(command_rx).await;
+            // Affine placement: queue every WORK task whose affine prereqs are
+            // now ready onto a rank-selected secondary, dragging in its
+            // still-not-done affine prereqs. The SAME recheck seam the removed
+            // `resolve_dependency_satisfied_affine_gates` used: an affine prereq
+            // the pool's dep walk just unblocked into a bucket is the placement
+            // signal. The queued units are then drained per-secondary by the
+            // per-worker-first pop, running affine-then-work in order on the
+            // chosen secondary (the bitvector tracks per-secondary doneness).
+            // Runs alongside the worker/setup passes (it selects the affine-dep
+            // subset over the SAME pool); the recheck never learns the affine
+            // concern. Self-contained in `primary::affine_dispatch`.
+            self.place_dependency_satisfied_affine_tasks().await;
             // Lazy on-demand dead-secondary requeue. AFTER the dispatch
             // pass returns (NEVER inside the per-worker loop:
             // `requeue_dead_secondary` runs `self.workers.retain(..)`,

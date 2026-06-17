@@ -278,6 +278,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // and the toggle flip; it returns `false` whenever the cached
             // gate verdict is disarmed (pre-#519 view).
             let prefer_dependency = self.prefer_dependency_for_decision();
+            // Per-secondary-FIRST affine source (ADDITIVE): pop this worker's
+            // secondary's affine queue BEFORE building the global-pool view, so
+            // the design's "per-secondary queue first, then the global queue"
+            // ordering holds. A committed affine dispatch refreshes the budget
+            // snapshot and advances to the next worker. When the queue is empty
+            // this is a no-op and the unchanged global path below runs (the
+            // 1536 baseline is preserved).
+            if self.try_affine_pop_for_worker(worker_idx).await {
+                all_infos[worker_idx] = self.workers[worker_idx].budget_info();
+                continue;
+            }
             // Dispatch-shape view pipeline: pool view → soft
             // preferred-secondaries tie-break → strict
             // preferred-secondaries gate (OOM bucket only) → cap
@@ -285,6 +296,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // accessor so OOM-bucket policy never leaks here.
             let view = self.dispatch_view_for_worker(worker_idx, prefer_dependency);
             if view.is_empty() {
+                // Idle-steal trigger: BOTH the global pool view AND this
+                // worker's per-secondary queue are empty — steal a whole
+                // schedulable unit from the longest-queue donor and dispatch
+                // it. Drop the (empty) view borrow first so the steal can take
+                // `&mut self`.
+                drop(view);
+                if self.try_affine_steal_for_worker(worker_idx).await {
+                    all_infos[worker_idx] = self.workers[worker_idx].budget_info();
+                }
                 continue;
             }
             let max_res = self.workers[worker_idx].resource_budgets.clone();

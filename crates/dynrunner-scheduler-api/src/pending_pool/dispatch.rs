@@ -426,7 +426,27 @@ impl<I: Identifier> PendingPool<I> {
     /// scattering `if kind == Setup` across the four soft-pin classes)
     /// keeps the kind→behavior mapping at one seam.
     fn dispatch_eligible(&self, item: &TaskInfo<I>, now: std::time::Instant) -> bool {
-        item.kind.is_worker_assignable() && self.dispatch_backoff.is_eligible(&item.task_id, now)
+        item.kind.is_worker_assignable()
+            && self.dispatch_backoff.is_eligible(&item.task_id, now)
+            && !self.has_affine_dep(item)
+    }
+
+    /// Whether `item` depends on a `TaskKind::SecondaryAffine` prereq — the
+    /// affine-dep WORK-task gate. Such a task must NOT dispatch from the GLOBAL
+    /// worker view: its toolchain import is per-secondary (the affine
+    /// bitvector), so global dispatch could send it to a secondary that never
+    /// imported and it would run without its toolchain. It dispatches ONLY
+    /// through the primary's per-secondary affine queue (the import runs THEN
+    /// the work, in order, on the chosen secondary). The `affine_prereq_ids`
+    /// set is empty on a run with no affine task, so this is `false` for every
+    /// task and the view is byte-identical to the pre-affine behaviour.
+    fn has_affine_dep(&self, item: &TaskInfo<I>) -> bool {
+        if self.affine_prereq_ids.is_empty() {
+            return false;
+        }
+        item.task_depends_on
+            .iter()
+            .any(|d| self.affine_prereq_ids.contains(d.task_id.as_str()))
     }
 
     /// [`Self::dispatch_eligible`] sampled at the current instant — the

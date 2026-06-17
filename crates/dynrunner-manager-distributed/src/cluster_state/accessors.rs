@@ -109,6 +109,22 @@ impl<I: Identifier> ClusterState<I> {
         self.tasks.iter()
     }
 
+    /// Reconstruct the whole owned [`TaskInfo`] for a FAT ledger entry by
+    /// its content `hash`, resolving its def's dep refs through the store
+    /// (the same [`Self::task_to_info`] every dispatch consumer routes
+    /// through). `None` for a hash absent from the fat ledger (never added,
+    /// or settled-spilled). The seam the AF-sched per-secondary dispatch uses
+    /// to turn a queued `(hash)` unit back into a worker-dispatchable
+    /// `TaskInfo`, exactly as the global-pool dispatch resolves a pool item.
+    pub(crate) fn task_info_for_hash(&self, hash: &str) -> Option<TaskInfo<I>>
+    where
+        I: Clone,
+    {
+        self.tasks
+            .get(hash)
+            .map(|state| self.task_to_info(state))
+    }
+
     /// Read-only handle on the `blocked_by` reverse-index (#547) for the
     /// invariant test in `tests/blocked_by_index.rs` — comparing the
     /// incrementally-maintained index against a fresh ledger scan. NOT a

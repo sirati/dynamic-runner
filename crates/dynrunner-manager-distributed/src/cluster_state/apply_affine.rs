@@ -111,21 +111,22 @@ impl<I: Identifier> ClusterState<I> {
 
     // ── AF-sched state-query helpers ──
     //
-    // The query surface AF-sched (the next leaf) reads to rank secondaries by
-    // affine locality + map affine deps to cells. ADDITIVE in AF-id, so
-    // `#[allow(dead_code)]` until that leaf calls them — the methods are real +
-    // tested, just not yet called outside this crate's tests (the same pattern
-    // the def-store's not-yet-called surfaces use).
+    // The query surface AF-sched reads to rank secondaries by affine locality +
+    // map affine deps to cells.
 
     /// The affine cell for `(secondary, affine_id)` — AF-sched's locality-rank
     /// input (`Done`/`Queued` count better). `NotDone` for an unwritten cell.
-    #[allow(dead_code)]
+    /// Consumed by `primary::affine_dispatch`'s `cell_of` reads.
     pub(crate) fn affine_state(&self, secondary: &str, affine_id: AffineId) -> AffineCell {
         self.affine.bitvector().cell(secondary, affine_id)
     }
 
     /// The secondaries on which EVERY affine-id in `affine_ids` is `Done` —
-    /// AF-sched's "fully warmed for this task's affine prereqs" query.
+    /// AF-sched's "fully warmed for this task's affine prereqs" query. Part of
+    /// the AF-sched read API; the current rank policy reads per-cell state via
+    /// [`Self::affine_state`] (so it counts `Done` OR `Queued`, not just the
+    /// all-`Done` subset), leaving this all-`Done` query for a future
+    /// locality-aware caller — `#[allow(dead_code)]` until then (real + tested).
     #[allow(dead_code)]
     pub(crate) fn secondaries_with_all_done(&self, affine_ids: &[AffineId]) -> Vec<String> {
         self.affine.bitvector().secondaries_with_all_done(affine_ids)
@@ -133,8 +134,8 @@ impl<I: Identifier> ClusterState<I> {
 
     /// The affine-id bound to a `SecondaryAffine` def's content `hash`, if any —
     /// the seam AF-sched uses to map an affine dep (resolved by content hash) to
-    /// its bitvector cell index.
-    #[allow(dead_code)]
+    /// its bitvector cell index. Consumed by `affine_placement_for` +
+    /// `affine_terminal_mutation`.
     pub(crate) fn affine_id_for_hash(&self, hash: &str) -> Option<AffineId> {
         self.definitions.affine_id_for_hash(hash)
     }

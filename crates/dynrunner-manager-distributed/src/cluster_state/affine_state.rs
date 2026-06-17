@@ -227,12 +227,8 @@ pub(crate) struct AffineBitvector {
 
 impl AffineBitvector {
     /// The cell for `(secondary, affine_id)` — `NotDone` for an unwritten one.
-    /// The primary read AF-sched's locality ranking consumes.
-    ///
-    /// AF-sched is the consumer (the locality ranker); ADDITIVE in AF-id, so it
-    /// is `#[allow(dead_code)]` until that leaf wires the scheduler — the method
-    /// is real + tested, just not yet called outside this crate's tests.
-    #[allow(dead_code)]
+    /// The primary read AF-sched's locality ranking consumes (via
+    /// `ClusterState::affine_state` → `primary::affine_dispatch`).
     pub(crate) fn cell(&self, secondary: &str, affine_id: AffineId) -> AffineCell {
         self.secondaries
             .get(secondary)

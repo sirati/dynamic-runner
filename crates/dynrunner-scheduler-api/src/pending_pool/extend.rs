@@ -255,11 +255,21 @@ impl<I: Identifier> PendingPool<I> {
         }
 
         // Compute unresolved prereqs (ones not yet in `completed_tasks`).
+        // AFFINE deps are EXCLUDED: a `TaskKind::SecondaryAffine` prereq's
+        // readiness is per-secondary (the bitvector + the per-secondary queue
+        // order), NOT a global terminal — so it must never block its dependent
+        // work task in this global pool (the work task is ready on its
+        // NON-affine deps, and is routed per-secondary by the affine
+        // scheduler). The set is empty on a run with no affine task, so a
+        // non-affine work task's blocking set is unchanged (baseline-preserved).
         let unresolved: HashSet<String> = item
             .task_depends_on
             .iter()
             .map(|d| d.task_id.clone())
-            .filter(|id| !self.completed_tasks.contains(id.as_str()))
+            .filter(|id| {
+                !self.completed_tasks.contains(id.as_str())
+                    && !self.affine_prereq_ids.contains(id.as_str())
+            })
             .collect();
 
         let task_id = item.task_id.clone();
