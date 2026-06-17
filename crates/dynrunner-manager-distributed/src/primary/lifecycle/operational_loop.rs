@@ -1519,9 +1519,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // `TasksAdded` onto the decoupled worker-management bus
                 // (never a direct dispatch call) so the worker-
                 // management arm coalesces it into one batched recheck.
-                // The pool drops expired stamps lazily, so the next
-                // iteration's recompute returns a strictly-future
-                // instant (or None) — this arm can never hot-fire.
+                // The wake is LEVEL-triggered (see `pending_pool::backoff`):
+                // if that single recheck MISSES (the eligible task could
+                // not be placed — no idle worker, transport-gate skip,
+                // affine-dep), the next iteration's recompute returns a
+                // BOUNDED re-poll instant (`now + interval`), so this arm
+                // re-fires until the task is actually dispatched instead
+                // of parking on `pending()` forever after one fire (the
+                // #640 25-min dispatch deadlock). The interval is bounded,
+                // so an undispatchable task is re-checked once per
+                // interval — never a hot-spin.
                 _ = async {
                     match task_backoff_due {
                         Some(due) => tokio::time::sleep_until(due.into()).await,

@@ -301,6 +301,14 @@ impl<I: Identifier> PendingPool<I> {
         self.dispatch_backoff.set_params(base, cap);
     }
 
+    /// Override the expired-but-undispatched re-poll cadence (the
+    /// level-trigger interval; default
+    /// [`super::backoff::DISPATCH_REPOLL_INTERVAL`]). Tests use a
+    /// millisecond scale to drive the missed-recheck path fast.
+    pub fn set_dispatch_repoll_interval(&mut self, interval: std::time::Duration) {
+        self.dispatch_backoff.set_re_poll_interval(interval);
+    }
+
     /// Mark the listed phases as `PhaseSpec.barrier=False`: their initial
     /// state flips from `Blocked` → `Active` regardless of `depends_on`,
     /// authorizing the scheduler to dispatch tasks from them as soon as
@@ -340,14 +348,17 @@ impl<I: Identifier> PendingPool<I> {
         }
     }
 
-    /// Earliest FUTURE instant at which a currently-backed-off queued
-    /// task becomes dispatch-eligible again, or `None` when no task is
-    /// parked under an unexpired backoff stamp. Event-driven managers
-    /// park a wake on this so a backed-off task is re-checked the
-    /// moment its window expires rather than on the next unrelated
-    /// signal. Expired stamps are lazily dropped, so the returned
-    /// instant is always strictly in the future — a wake parked on it
-    /// can never hot-fire.
+    /// The earliest wake an event-driven manager loop should park on to
+    /// re-service the backoff queue, or `None` when nothing needs
+    /// re-checking. Either a still-future stamp (a backed-off task's
+    /// window expiry) or — once a stamp expires and the task is eligible
+    /// but its dispatch recheck missed (no idle worker, transport-gate
+    /// skip, affine-dep) — a bounded re-poll wake that persists until
+    /// the task is actually taken. The re-poll cadence is bounded (see
+    /// [`set_dispatch_repoll_interval`](Self::set_dispatch_repoll_interval)),
+    /// so a legitimately-undispatchable task is re-checked once per
+    /// interval, never hot-spun. See [`super::backoff`] for the
+    /// level-trigger contract and the #640 deadlock it closes.
     pub fn next_dispatch_backoff_expiry(&mut self) -> Option<std::time::Instant> {
         self.dispatch_backoff.next_expiry(std::time::Instant::now())
     }

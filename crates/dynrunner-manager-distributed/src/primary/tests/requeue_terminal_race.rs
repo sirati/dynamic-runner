@@ -30,6 +30,82 @@ use dynrunner_core::{PhaseId, ResourceAmount, ResourceKind, TaskDep, TypeId};
 
 use crate::primary::wire::compute_task_hash;
 
+/// The member's `MeshReady` confirmation — without it the proactive
+/// dispatch recheck withholds (the mesh-confirmation gate). Mirrors
+/// `backpressure_requeue.rs`.
+fn mesh_ready_from(secondary_id: &str) -> DistributedMessage<TestId> {
+    DistributedMessage::MeshReady {
+        target: None,
+        sender_id: secondary_id.into(),
+        timestamp: 0.0,
+        secondary_id: secondary_id.into(),
+        peer_count: 1,
+    }
+}
+
+/// The secondary router's capacity bounce, mirrored VERBATIM from
+/// `backpressure_requeue.rs`: a `TaskFailed` whose `error_message` is the
+/// recognised backpressure marker.
+fn backpressure_bounce(secondary_id: &str, worker_id: u32, hash: &str) -> DistributedMessage<TestId> {
+    DistributedMessage::TaskFailed {
+        target: None,
+        sender_id: secondary_id.into(),
+        timestamp: 0.0,
+        secondary_id: secondary_id.into(),
+        worker_id,
+        task_hash: hash.into(),
+        error_type: dynrunner_core::ErrorType::Recoverable,
+        error_message: "No idle worker available".into(),
+        delivery_seq: None,
+        msgs_posted_through: None,
+    }
+}
+
+/// Seed a LIVE (mesh-confirmed) single-secondary fixture and dispatch
+/// `task` so it commits an in-flight slot + ledger entry. Returns the
+/// task's hash. Mirrors `backpressure_requeue.rs`'s live-dispatch setup —
+/// the path that produces a genuine in-flight entry (vs the inherited
+/// hydrate fixture above).
+async fn seed_live_inflight(
+    primary: &mut PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
+    task: TaskInfo<TestId>,
+) -> String {
+    let hash = compute_task_hash(&task);
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([(PhaseId::from("default"), vec![])]),
+        });
+        cs.apply(ClusterMutation::PeerJoined {
+            peer_id: "sec-0".into(),
+            is_observer: false,
+            can_be_primary: true,
+            cap_version: Default::default(),
+            member_gen: 0,
+        });
+        cs.apply(ClusterMutation::SecondaryCapacity {
+            secondary: "sec-0".into(),
+            worker_count: 1,
+            resources: mem(8 * 1024 * 1024 * 1024),
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: hash.clone(),
+            task,
+            def_id: None,
+        });
+    }
+    primary
+        .hydrate_from_cluster_state()
+        .expect("test fixture: composed task graph is valid");
+    primary.handle_mesh_ready(mesh_ready_from("sec-0"));
+    primary
+        .dispatch_to_idle_workers(true)
+        .await
+        .expect("dispatch recheck");
+    settle_pump().await;
+    hash
+}
+
 /// One advertised-memory resource amount (in bytes) for a secondary
 /// capacity record / task request. Mirrors the live welcome shape: a
 /// single `memory` `ResourceAmount`. (Same fixture as `hydrate.rs`.)
@@ -396,6 +472,298 @@ async fn replayed_wire_terminal_reclaims_requeued_task_from_pool() {
                 "an ALREADY-COMPLETED task must never be re-assigned after \
                  its erroneous requeue (the production second execution); \
                  assigned: {assigned:?}"
+            );
+        })
+        .await;
+}
+
+/// Bug A — the CONSUMER's exact sequence (run_20260617_220927): a task is
+/// BACKPRESSURE-requeued (the pre-mesh "not ready" bounce), and THEN a
+/// genuine `TaskComplete` for that hash lands from the secondary that
+/// actually ran it. The completion must SETTLE (CRDT → Completed,
+/// succeeded += 1) exactly once, the pool's per-task re-dispatch backoff
+/// must be cleared so the Bug-B level-trigger stops re-firing for the
+/// settled hash, and the task must never re-dispatch — without a deadlock
+/// or a double-count.
+#[tokio::test(flavor = "current_thread")]
+async fn genuine_completion_after_backpressure_requeue_settles_and_stops_repoll() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let task = make_binary("ran-elsewhere", 100);
+            let hash = seed_live_inflight(&mut primary, task).await;
+            // Tight backoff so the level-trigger window is observable. Set
+            // AFTER seed: the pool is built by `hydrate_from_cluster_state`.
+            primary.pool_mut().set_dispatch_backoff_params(
+                Duration::from_millis(20),
+                Duration::from_millis(80),
+            );
+            let _ = drain_assigned_task_ids(&mut ends[0].1);
+
+            // BOUNCE #1 (pre-mesh "not ready"): a backpressure requeue.
+            // streak 1 is free, so a SECOND bounce engages the brake and
+            // stamps the backoff (the level-trigger's home).
+            primary
+                .handle_task_failed(backpressure_bounce("sec-0", 0, &hash), &mut None)
+                .await;
+            settle_pump().await;
+            // Re-dispatch the free re-entry so it re-commits in-flight, then
+            // bounce again → streak 2 → a real backoff stamp.
+            primary
+                .dispatch_to_idle_workers(true)
+                .await
+                .expect("dispatch recheck");
+            settle_pump().await;
+            let _ = drain_assigned_task_ids(&mut ends[0].1);
+            primary
+                .handle_task_failed(backpressure_bounce("sec-0", 0, &hash), &mut None)
+                .await;
+            settle_pump().await;
+            assert!(
+                primary.next_task_dispatch_backoff_expiry().is_some(),
+                "fixture: the second backpressure bounce stamped a backoff \
+                 (the Bug-B level-trigger is armed for this hash)"
+            );
+
+            // The genuine completion finally arrives from the secondary that
+            // ACTUALLY ran it (the task was queued/backed-off here, NOT
+            // in-flight — free_slot + reclaim both miss).
+            let genuine_terminal = DistributedMessage::TaskComplete {
+                target: None,
+                sender_id: "sec-0".into(),
+                timestamp: 0.0,
+                secondary_id: "sec-0".into(),
+                worker_id: 0,
+                task_hash: hash.clone(),
+                result_data: None,
+                delivery_seq: Some(1),
+                msgs_posted_through: None,
+            };
+            primary
+                .dispatch_message(genuine_terminal, &mut None)
+                .await
+                .expect("terminal ingest ok");
+            settle_pump().await;
+
+            // SETTLE: the CRDT converges to Completed and succeeded == 1
+            // (the completion is NOT discarded — the succeeded=0 strand the
+            // consumer saw).
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&hash),
+                    Some(crate::cluster_state::TaskState::Completed { .. })
+                ),
+                "a genuine completion after a backpressure requeue must settle \
+                 the CRDT; got {:?}",
+                primary.cluster_state_for_test().task_state(&hash)
+            );
+            assert_eq!(
+                primary.outcome_summary().succeeded,
+                1,
+                "the completion must count exactly once (no succeeded=0 strand)"
+            );
+
+            // RE-POLL STOPS: the settle cleared the dispatch_backoff stamp, so
+            // the Bug-B level-trigger no longer re-fires for the settled hash
+            // (the important interaction with the Bug B fix).
+            assert!(
+                primary.next_task_dispatch_backoff_expiry().is_none(),
+                "a settled-but-untracked terminal must clear the backoff stamp \
+                 so the level-trigger does not re-poll an already-completed hash"
+            );
+
+            // NO RE-DISPATCH / NO DOUBLE-COUNT: a later idle re-poll must not
+            // re-assign the settled task, and a re-delivered terminal must
+            // dedup (completed_tasks) — succeeded stays 1.
+            primary
+                .dispatch_to_idle_workers(true)
+                .await
+                .expect("dispatch recheck");
+            settle_pump().await;
+            let assigned = drain_assigned_task_ids(&mut ends[0].1);
+            assert!(
+                !assigned.contains(&"ran-elsewhere".to_string()),
+                "a settled task must never re-dispatch; assigned: {assigned:?}"
+            );
+            primary
+                .dispatch_message(
+                    DistributedMessage::TaskComplete {
+                        target: None,
+                        sender_id: "sec-0".into(),
+                        timestamp: 0.0,
+                        secondary_id: "sec-0".into(),
+                        worker_id: 0,
+                        task_hash: hash.clone(),
+                        result_data: None,
+                        delivery_seq: Some(2),
+                        msgs_posted_through: None,
+                    },
+                    &mut None,
+                )
+                .await
+                .expect("re-delivered terminal ingest ok");
+            settle_pump().await;
+            assert_eq!(
+                primary.outcome_summary().succeeded,
+                1,
+                "a re-delivered terminal must dedup (completed_tasks) — no \
+                 double-count"
+            );
+        })
+        .await;
+}
+
+/// Bug A (B) — terminal-BEFORE-(this)-requeue, BACKPRESSURE path: a stale
+/// backpressure bounce arrives for a hash the CRDT ALREADY records
+/// terminal (the genuine completion landed first). The bounce must NOT
+/// requeue completed work — it settles the residue and leaves the hash
+/// terminal.
+#[tokio::test(flavor = "current_thread")]
+async fn backpressure_bounce_vetoes_requeue_when_crdt_terminal() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let task = make_binary("done-first", 100);
+            let hash = seed_live_inflight(&mut primary, task).await;
+            let _ = drain_assigned_task_ids(&mut ends[0].1);
+
+            // The genuine completion lands FIRST → CRDT terminal.
+            primary
+                .dispatch_message(
+                    DistributedMessage::TaskComplete {
+                        target: None,
+                        sender_id: "sec-0".into(),
+                        timestamp: 0.0,
+                        secondary_id: "sec-0".into(),
+                        worker_id: 0,
+                        task_hash: hash.clone(),
+                        result_data: None,
+                        delivery_seq: Some(1),
+                        msgs_posted_through: None,
+                    },
+                    &mut None,
+                )
+                .await
+                .expect("terminal ingest ok");
+            settle_pump().await;
+            assert_eq!(primary.outcome_summary().succeeded, 1);
+
+            // A STALE backpressure bounce for the same hash arrives late.
+            // Pre-fix it would requeue the completed task (Completed →
+            // Pending) and re-dispatch it. The veto must settle instead.
+            primary
+                .handle_task_failed(backpressure_bounce("sec-0", 0, &hash), &mut None)
+                .await;
+            settle_pump().await;
+
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&hash),
+                    Some(crate::cluster_state::TaskState::Completed { .. })
+                ),
+                "a stale backpressure bounce must NOT regress a CRDT-terminal \
+                 hash to Pending; got {:?}",
+                primary.cluster_state_for_test().task_state(&hash)
+            );
+            assert!(
+                primary.pool().is_run_complete(),
+                "the vetoed bounce must not leave a queued copy in the pool"
+            );
+            primary
+                .dispatch_to_idle_workers(true)
+                .await
+                .expect("dispatch recheck");
+            settle_pump().await;
+            let assigned = drain_assigned_task_ids(&mut ends[0].1);
+            assert!(
+                !assigned.contains(&"done-first".to_string()),
+                "the vetoed bounce must never re-dispatch completed work; \
+                 assigned: {assigned:?}"
+            );
+        })
+        .await;
+}
+
+/// Bug A (B) — terminal-BEFORE-requeue, DEAD-SECONDARY recovery path:
+/// `recover_inflight_for_dead_secondary` is a requeue heuristic ("its
+/// holder died; return its work to Pending"). If the CRDT already records
+/// a terminal for the in-flight hash (the genuine completion was delivered
+/// out-of-band before the recovery ran), the recovery must NOT requeue it
+/// — it drops the stale in-flight entry and emits no `TaskRequeued`.
+#[tokio::test(flavor = "current_thread")]
+async fn dead_secondary_recovery_vetoes_requeue_when_crdt_terminal() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let task = make_binary("held-by-dead", 100);
+            let hash = seed_live_inflight(&mut primary, task).await;
+            assert_eq!(
+                primary.in_flight_len_for_test(),
+                1,
+                "fixture: the task is in-flight on sec-0"
+            );
+
+            // The genuine completion lands in the CRDT (out-of-band) while
+            // the in-flight ledger entry still records sec-0 as holder —
+            // apply it directly to the ledger (restore-residue shape: no
+            // per-hash settle hook), so the in-flight entry survives for the
+            // recovery to race.
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::TaskCompleted {
+                    hash: hash.clone(),
+                    result_data: None,
+                    attempt: 0,
+                });
+
+            // sec-0 is declared dead: recovery runs. It must VETO the requeue
+            // (the hash is CRDT-terminal) — drop the entry, emit nothing.
+            let mutations = primary.recover_inflight_for_dead_secondary("sec-0");
+            assert!(
+                mutations.is_empty(),
+                "a dead-secondary recovery for a CRDT-terminal hash must emit \
+                 NO TaskRequeued; got {mutations:?}"
+            );
+            assert_eq!(
+                primary.in_flight_len_for_test(),
+                0,
+                "the stale in-flight entry is dropped (cleaned), not requeued"
+            );
+            assert!(
+                primary.pool().is_run_complete(),
+                "the completed task must NOT be returned to the pool by the \
+                 dead-secondary recovery"
+            );
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&hash),
+                    Some(crate::cluster_state::TaskState::Completed { .. })
+                ),
+                "the CRDT terminal survives the recovery (never regressed)"
             );
         })
         .await;

@@ -108,6 +108,21 @@ impl<I: Identifier> PendingPool<I> {
         self.maybe_transition_drain(phase_id);
     }
 
+    /// Forget a task's re-dispatch backoff streak + any expired-but-
+    /// undispatched re-poll state, WITHOUT the rest of the terminal
+    /// bookkeeping (`on_item_finished`'s in-flight decrement / dependent
+    /// resolution). The settle-when-untracked seam: a genuine terminal
+    /// whose hash holds no local residue (no in-flight slot, no queued
+    /// copy) still settles the CRDT, but runs no `on_item_finished`, so
+    /// the task's backoff stamp would otherwise persist and keep the
+    /// level-triggered backoff arm ([`super::backoff::DispatchBackoff::next_expiry`])
+    /// re-firing for an already-settled hash. Idempotent: clearing an
+    /// untracked id is a no-op. Distinct from `on_item_finished` — this
+    /// is JUST the backoff forget, for a path that owns no counter.
+    pub fn clear_dispatch_backoff(&mut self, task_id: &str) {
+        self.dispatch_backoff.clear(task_id);
+    }
+
     /// Record `id` completed and unblock every dependent whose final
     /// unresolved prereq this resolves: move it `blocked → FRONT of its
     /// bucket` (matching `requeue` so freshly-unblocked tasks dispatch ahead

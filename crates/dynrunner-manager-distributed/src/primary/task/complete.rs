@@ -184,6 +184,30 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             .map(|t| (t.phase_id.clone(), t.type_id.clone(), t.task_id.clone()))
                     });
 
+            // Settle-when-untracked backoff cancel (interaction with the
+            // Bug-B level-trigger): when neither a slot nor a queued copy
+            // held this hash, `note_item_completed` below does NOT run, so
+            // the pool's per-task re-dispatch backoff stamp for this
+            // task is never cleared by the success path. Left in place, the
+            // level-triggered backoff arm would keep re-firing `TasksAdded`
+            // for an already-completed hash. The CRDT already settled the
+            // terminal above (:114), so the completion is authoritative —
+            // forget the backoff streak directly, keyed by the task's
+            // CRDT-recorded identity (the residue that would have carried
+            // the task_id is absent). Idempotent: a no-op for an untracked
+            // id. Gated on `pending.is_some()` (the same pool-presence gate
+            // `reclaim_requeued_on_terminal` uses) so it is inert before
+            // the pool exists.
+            if completed_meta.is_none()
+                && self.pending.is_some()
+                && let Some(task_id) = self
+                    .cluster_state
+                    .task_view(task_hash)
+                    .map(|v| v.task_id().to_string())
+            {
+                self.pool_mut().clear_dispatch_backoff(&task_id);
+            }
+
             // Operator-facing INFO: enough to grep "did task X
             // complete and how are aggregate counts moving?". The
             // per-task identity fields (task_id / phase / task_type)

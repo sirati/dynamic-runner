@@ -3736,7 +3736,51 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                          the canonical path; the filter will hold on re-dispatch."
                     );
                 }
-                if entry.task.kind.is_reassignable() {
+                // Terminal veto (the requeue-BEFORE-terminal race twin of
+                // `reconcile_inherited_slot`'s `VetoedByTerminal`): the dead-
+                // secondary recovery is a re-queue heuristic ("its holder
+                // died; return its work to Pending"). If the replicated
+                // ledger ALREADY records a terminal for this hash — the
+                // genuine completion was delivered out-of-band before this
+                // recovery ran — re-queueing it would re-dispatch completed
+                // work. The in-flight entry + type slot were already cleaned
+                // above; just DON'T requeue and emit NO `TaskRequeued`, so
+                // the hash stays terminal. `task_view` (not `task_state`) so
+                // a SETTLED/spilled terminal still vetoes. No residue settle
+                // is needed here: the dead secondary's slot is dropped by the
+                // caller and no queued copy exists yet (this IS the requeue
+                // site). Applies to the reassignable WORK arm only — a
+                // non-reassignable setup task is already being driven to a
+                // terminal `Failed` below, and a terminal hash there NoOps in
+                // the CRDT.
+                let already_terminal = self
+                    .cluster_state
+                    .task_view(&hash)
+                    .is_some_and(|v| v.is_terminal());
+                if entry.task.kind.is_reassignable() && already_terminal {
+                    tracing::info!(
+                        dead_secondary = %secondary_id,
+                        task_hash = %hash,
+                        task_id = %entry.task.task_id,
+                        "dead-secondary requeue VETOED: the replicated ledger \
+                         already records a terminal for this hash; settling the \
+                         pool accounting instead of re-queueing completed work"
+                    );
+                    // Settle the POOL accounting in place of the requeue: the
+                    // original dispatch left this phase's in-flight counter +1,
+                    // which `pool.requeue` would normally decrement. Vetoing the
+                    // requeue must still drain that counter (and clear the
+                    // backoff streak / resolve dependents), or the phase never
+                    // drains. `on_item_finished` is the success-side settle
+                    // (in-flight -1, dependents resolved, backoff cleared, drain
+                    // re-evaluated) — the correct terminal accounting for a hash
+                    // the CRDT already records done. No `TaskRequeued` is
+                    // emitted, so the replicated state stays terminal.
+                    let phase = entry.task.phase_id.clone();
+                    let task_id = entry.task.task_id.clone();
+                    self.pool_mut().on_item_finished(&phase, Some(&task_id));
+                    // No requeue, no `TaskRequeued` mutation — fall through.
+                } else if entry.task.kind.is_reassignable() {
                     // WORK task: recover it to `Pending` for another worker
                     // (`InFlight → Pending`, the dead-secondary requeue).
                     self.pool_mut().requeue(entry.task);
