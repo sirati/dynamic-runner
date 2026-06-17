@@ -6836,13 +6836,49 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // (F4) bump is owned by the `merge_task_state` join (#358) — the
         // caller's `ClusterMutation::TaskFailed` apply bumped it before this
         // bookkeeping runs, identically on every mirror.
-        match (task_id, kind) {
-            (Some(id), Some(k))
-                if !matches!(k, dynrunner_core::ErrorType::Unfulfillable { .. }) =>
-            {
+        //
+        // The POOL routing is decided by the error's permanence class
+        // (`ErrorType::retry_class`, the single owner of that decision —
+        // no carve-out re-derived here). A `None` kind / `None` id is the
+        // legacy in-flight-only decrement, for callers whose failure
+        // identity+permanence the pool already observed (e.g.
+        // `apply_fail_permanent`, whose `on_item_failed_permanent` ran
+        // first).
+        match (task_id, kind.map(dynrunner_core::ErrorType::retry_class)) {
+            // Retryable (Recoverable / memory-OOM): soft retry-pending
+            // marker; permanence is decided at the phase drain edge by the
+            // retry buckets / `finalize_phase_soft_failures`.
+            (Some(id), Some(dynrunner_core::RetryClass::Retryable)) => {
                 self.pool_mut().on_item_failed_pending_retry(phase_id, id);
             }
-            _ => {
+            // Permanent (NonRecoverable / InvalidTask / non-memory
+            // ResourceExhausted): terminal NOW. Permanence into the pool's
+            // `failed_tasks` + an IMMEDIATE dependent cascade — no soft
+            // marker (no retry bucket would ever accept it, so a soft
+            // marker would only wedge its dependents until a drain edge).
+            // The root's `TaskFailed` was already broadcast by the caller
+            // (the wire handler / the cascade helper); each cascaded
+            // dependent is recorded in the per-pass `failed_tasks` hash
+            // ledger AND broadcast as its own `TaskFailed` so the
+            // replicated per-phase rollup (`phase_can_proceed` reads
+            // `has_live`) and the run-completion counter (`completed +
+            // failed >= total`) both account it — the SAME shared
+            // `cascade_fail_dependents_terminal` the drain-edge finalize
+            // uses, so the cascade shape never drifts. Idempotent on a
+            // re-delivered terminal: a dependent already in
+            // `completed_tasks`/`failed_tasks` is skipped.
+            (Some(id), Some(dynrunner_core::RetryClass::Permanent)) => {
+                let cascaded = self.pool_mut().on_item_failed_permanent(phase_id, id);
+                self.cascade_fail_dependents_terminal(id, cascaded).await;
+            }
+            // Reinjectable (Unfulfillable): operator-reinjectable dormancy —
+            // dependents stay BLOCKED awaiting the reinject, NOT cascaded.
+            // Also the `None`-kind / `None`-id legacy in-flight-only
+            // decrement (callers whose permanence the pool already observed,
+            // e.g. `apply_fail_permanent`).
+            (Some(_), Some(dynrunner_core::RetryClass::Reinjectable))
+            | (None, _)
+            | (_, None) => {
                 self.pool_mut().on_item_finished(phase_id, None);
             }
         }

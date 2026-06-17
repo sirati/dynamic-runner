@@ -23,6 +23,192 @@ use dynrunner_core::{PhaseId, TaskDep};
 
 use super::*;
 
+/// Commit-1 (Defect 1): a `NonRecoverable` Work task with NO dependents
+/// must terminalize to `fail_final` IMMEDIATELY — it must NOT be routed to
+/// the soft / retry-pending path (NonRecoverable can never be a retry
+/// candidate, so a soft marker would only delay its terminalization to the
+/// drain edge). The run reaches a clean terminal with `succeeded=0`,
+/// `fail_final=1`, and `retry_passes_used==0` (no pass is burned on a
+/// permanently-failed task), and NO hang.
+#[tokio::test(flavor = "current_thread")]
+async fn nonrecoverable_no_deps_fails_final_immediately() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let secondary_id = "secondary-0".to_string();
+            let max_res = dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                1024 * 1024 * 1024u64,
+            )]);
+            let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
+                spawn_real_secondary(secondary_id.clone(), 1, max_res);
+            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+            outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
+            tokio::task::spawn_local(async move {
+                let mut rx = sec_to_pri_rx;
+                while let Some(msg) = rx.recv().await {
+                    if incoming_tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+            let transport =
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
+            let config = PrimaryConfig {
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                keepalive_interval: Duration::from_millis(50),
+                // A generous retry budget proves the NonRecoverable is NOT a
+                // candidate: if it were mis-routed to the soft path it could
+                // burn a pass; the assertion below requires it stays 0.
+                retry_max_passes: 3,
+                ..test_primary_config()
+            };
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            // Relative path + no staging on the secondary → the
+            // unresolvable-task guard fails it NonRecoverable.
+            let a = make_relative_binary("missing/only", 50);
+            let (deps, ops, ope) = noop_phase_args();
+            seed_operational_ledger(&mut primary, vec![a], deps);
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                primary.run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                ),
+            )
+            .await
+            .expect("a NonRecoverable no-dep task must terminalize, not hang")
+            .unwrap();
+
+            assert_eq!(primary.completed_count(), 0, "nothing succeeds");
+            assert_eq!(
+                primary.failed_count(),
+                1,
+                "the NonRecoverable task is fail_final"
+            );
+            assert_eq!(
+                primary.retry_passes_used_for_test(),
+                0,
+                "a NonRecoverable failure must NEVER consume a retry pass"
+            );
+
+            drop(primary);
+            let _ = sec_handle.await;
+        })
+        .await;
+}
+
+/// Commit-2 (Defect 2): a PERPETUAL-recoverable prereq (fails every
+/// attempt; `retry_max_passes = 1`) with a dependent must, after the one
+/// pass EXHAUSTS, finalize (soft → permanent) and cascade-fail the
+/// dependent — reaching a clean terminal, NOT a hang and NOT a wholesale
+/// abort. The prereq counts as `fail_retry` (it exhausted its bucket) and
+/// the dependent as `fail_final` (cascade); the run exits within the
+/// bound.
+#[tokio::test(flavor = "current_thread")]
+async fn perpetual_recoverable_prereq_exhausts_then_cascades_dependent() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let max_res = dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                1024 * 1024 * 1024u64,
+            )]);
+            // "root" fails on EVERY attempt (quota = u32::MAX), Recoverable.
+            let mut quotas = HashMap::new();
+            quotas.insert("/tmp/root".to_string(), u32::MAX);
+            let flaky = super::test_helpers::FlakyWorkerFactory::with_quotas(quotas);
+            let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) = spawn_real_secondary_flaky(
+                "sec-0".into(),
+                /* num_workers = */ 1,
+                max_res,
+                flaky,
+                /* retry_max_passes = */ 1,
+            );
+            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+            outgoing.insert("sec-0".to_string(), pri_to_sec_tx);
+            tokio::task::spawn_local(async move {
+                let mut rx = sec_to_pri_rx;
+                while let Some(msg) = rx.recv().await {
+                    if incoming_tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+            let transport =
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
+            let config = PrimaryConfig {
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                keepalive_interval: Duration::from_millis(50),
+                retry_max_passes: 1,
+                ..test_primary_config()
+            };
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            // "root" (perpetual-recoverable) + "child" depends on it.
+            let root = make_binary("root", 50);
+            let mut child = make_binary("child", 40);
+            child.task_depends_on = vec![TaskDep {
+                task_id: root.task_id.clone(),
+                phase_id: PhaseId::from("default"),
+                inherit_outputs: false,
+                def_id: None,
+            }];
+            let (deps, ops, ope) = noop_phase_args();
+            seed_operational_ledger(&mut primary, vec![root, child], deps);
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                primary.run(
+                    SeedSource::PromotionSnapshot {
+                        kind: crate::process::BootstrapKind::Failover,
+                    },
+                    ops,
+                    ope,
+                ),
+            )
+            .await
+            .expect(
+                "after the retry budget exhausts, the soft prereq must \
+                 finalize and cascade its dependent — a timeout is the hang",
+            )
+            .unwrap();
+
+            assert_eq!(primary.completed_count(), 0, "nothing succeeds");
+            assert_eq!(
+                primary.failed_count(),
+                2,
+                "root (exhausted) AND child (cascade) are both accounted"
+            );
+            assert_eq!(
+                primary.retry_passes_used_for_test(),
+                1,
+                "exactly one Recoverable retry pass consumed before exhaustion"
+            );
+
+            drop(primary);
+            let _ = sec_handle.await;
+        })
+        .await;
+}
+
 /// `b` depends on `a`; `a` fails NonRecoverable on dispatch (the
 /// unresolvable-task "expected StageFile notification first" guard —
 /// the exact production failure class). The run MUST terminate within
