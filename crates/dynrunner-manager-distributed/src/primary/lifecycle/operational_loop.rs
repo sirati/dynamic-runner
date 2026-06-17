@@ -804,6 +804,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // regression re-introduces a non-yielding hot body, the
             // heartbeat still fires within `keepalive_interval` of its
             // prior fire — peers never falsely depart.
+            //
+            // Mark the IDLE-window open immediately before awaiting the
+            // `select!`: the span until the winning arm's body records its
+            // id is the loop's idle (select!-wait) time; the span from that
+            // record to this next `begin_select` is the prior arm's body
+            // time (an out-of-band `fire_heartbeat_if_overdue` record above
+            // is correctly attributed as a HEARTBEAT body span). Oploop
+            // time-instrumentation — observation only.
+            arm_stats.begin_select(std::time::Instant::now());
             tokio::select! {
                 biased;
                 // Panik (operator-initiated emergency stop) arm. The

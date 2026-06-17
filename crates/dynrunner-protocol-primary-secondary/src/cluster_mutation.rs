@@ -123,12 +123,26 @@ pub struct SecondaryResourceSampleRecord {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub dominant_arm_name: String,
     /// #589 loop-health: the dominant arm's share of the emit window's
-    /// iteration deltas, in milli-percent (`55_000` = 55%). `0` is the
+    /// total WALL-CLOCK TIME, in milli-percent (`55_000` = 55%). The arm
+    /// (or the `idle` select!-wait pseudo-arm) whose body-time delta is the
+    /// largest share of `idle + Σ arm-time` over the window. `0` is the
     /// cold-start / no-signal sentinel (empty `dominant_arm_name`); the
-    /// observer's max-by-pct aggregation passes over zero. Wire-compat:
-    /// serde-default + skip-if-default.
+    /// observer's max-by-pct aggregation passes over zero. TIME, not
+    /// COUNT: a frequent-but-fast arm no longer falsely "dominates" a
+    /// rare-but-slow one, and a lightly-loaded loop reads as `idle:NN%`.
+    /// Wire-compat: serde-default + skip-if-default.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub dominant_arm_pct_milli: u32,
+    /// #589 loop-health: the dominant arm's body-time per wall-clock
+    /// second over the emit window, in milliseconds-per-second
+    /// (`425` = the loop spent 425ms of each second in this arm — so
+    /// `idle:78%` light load reports ~`780`, an overloaded slow arm
+    /// reports a high non-idle value). Paired with
+    /// [`Self::dominant_arm_pct_milli`] (the share); rendered as
+    /// `time={ms}/s`. `0` is the cold-start / no-signal sentinel.
+    /// Wire-compat: serde-default + skip-if-default.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub dominant_arm_time_ms_per_sec: u64,
     /// #589 loop-health: the longest age (in seconds) of any retained
     /// confirmable report on this secondary's buffered-report-replay
     /// queue (#582) at emit time — `max(now - first_retained_at)` over

@@ -154,13 +154,15 @@ pub struct StatsSnapshot {
     /// catches the #586 mem_check class (low host CPU + low iter-rate).
     pub avg_oploop_iters_per_sec_milli: Option<u64>,
     /// #589 loop-health: the SINGLE alive compute secondary with the
-    /// HIGHEST `dominant_arm_pct_milli` across the fleet — paired with
-    /// its arm name. `None` when no live secondary has a non-empty
-    /// dominant-arm name (every alive secondary is either pre-#589
-    /// (serde-default empty string) or cold-start (the tracker's seed
-    /// emit). Max-by-pct because the operator's signal is "is ANY
-    /// secondary's loop monopolised by a non-inbox arm" — the fleet
-    /// average would average a hot secondary down to noise.
+    /// HIGHEST `dominant_arm_pct_milli` (by WALL-CLOCK TIME share) across
+    /// the fleet — paired with its arm name + body-time-per-second.
+    /// `None` when no live secondary has a non-empty dominant-arm name
+    /// (every alive secondary is either pre-#589 (serde-default empty
+    /// string) or cold-start (the tracker's seed emit). Max-by-pct because
+    /// the operator's signal is "is ANY secondary's loop monopolised by a
+    /// non-idle arm (or, conversely, healthily idle)" — the fleet average
+    /// would average a hot secondary down to noise. The dominant may be
+    /// the `idle` pseudo-arm (light load reads `idle:NN%`).
     pub dominant_arm: Option<DominantArm>,
     /// #589 loop-health: the fleet maximum of every alive compute
     /// secondary's `max_unacked_for_secs` — the longest unACKed
@@ -173,19 +175,24 @@ pub struct StatsSnapshot {
 }
 
 /// #589 loop-health: the fleet's single hottest arm, by share of the
-/// originating secondary's emit-window iteration deltas. The (name,
-/// pct) pair the format layer renders as "dominant arm:
-/// `mem_check`:55.0%". Lives on the snapshot (not as two separate
-/// `Option<String>` / `Option<u32>` fields) so the format layer
-/// renders ONE atomic line — a non-empty name without a pct, or vice
-/// versa, would be a structural lie the type system rules out.
+/// originating secondary's emit-window WALL-CLOCK TIME (including the
+/// `idle` select!-wait pseudo-arm). The (name, pct, time-ms/s) triple the
+/// format layer renders as "dominant arm: `idle`:78.49% time=425ms/s".
+/// Lives on the snapshot as one struct (not separate
+/// `Option<String>` / `Option<u32>` fields) so the format layer renders
+/// ONE atomic line — a non-empty name without a pct/time, or vice versa,
+/// would be a structural lie the type system rules out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DominantArm {
-    /// The arm name from the winning secondary (e.g. `"mem_check"`).
+    /// The arm name from the winning secondary — a real `select!` arm OR
+    /// the `idle` select!-wait pseudo-arm (e.g. `"idle"`, `"mem_check"`).
     pub arm_name: String,
-    /// That arm's share of the secondary's emit-window iteration
-    /// deltas, in milli-percent (`55_000` = 55.0%).
+    /// That arm's share of the secondary's emit-window total WALL-CLOCK
+    /// TIME, in milli-percent (`55_000` = 55.0%).
     pub pct_milli: u32,
+    /// That arm's body-time per wall-clock second over the window, in
+    /// milliseconds-per-second (`425` = 425ms/s). Rendered `time={ms}/s`.
+    pub time_ms_per_sec: u64,
 }
 
 impl StatsSnapshot {
@@ -455,6 +462,7 @@ impl StatsSnapshot {
                     {
                         lh.dominant_pct_max = record.dominant_arm_pct_milli;
                         lh.dominant_name = Some(record.dominant_arm_name.clone());
+                        lh.dominant_time_ms_per_sec = record.dominant_arm_time_ms_per_sec;
                     }
                     if record.max_unacked_for_secs > lh.unacked_max {
                         lh.unacked_max = record.max_unacked_for_secs;
@@ -486,6 +494,7 @@ impl StatsSnapshot {
                 .map(|arm_name| DominantArm {
                     arm_name,
                     pct_milli: loop_health_sum.dominant_pct_max,
+                    time_ms_per_sec: loop_health_sum.dominant_time_ms_per_sec,
                 });
         let max_unacked_for_secs = if loop_health_sum.unacked_seen {
             Some(loop_health_sum.unacked_max)
@@ -566,6 +575,11 @@ struct LoopHealthFieldSums {
     iters_n: u64,
     dominant_pct_max: u32,
     dominant_name: Option<String>,
+    /// The winning (max-pct) secondary's dominant-arm body-time per
+    /// second (ms/s) — carried alongside the name/pct so the rendered
+    /// line shows `time={ms}/s` from the SAME secondary that won the
+    /// max-pct competition (not a fleet aggregate of an unrelated arm).
+    dominant_time_ms_per_sec: u64,
     unacked_max: u32,
     /// `true` once any secondary's `max_unacked_for_secs` exceeded the
     /// running max (i.e. was non-zero) — the "saw a real reading"

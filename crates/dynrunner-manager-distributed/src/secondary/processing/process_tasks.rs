@@ -403,9 +403,16 @@ where
             // (liveness: starvation = false-departure declarations),
             // (5) external control / off-loop completion arms,
             // (6) periodic broadcasts + storm-killer pull arm,
-            // (7) ARM_OOM_SWEEP last (forensic — 20Hz cadence preserved
+            // (7) ARM_MEM_CHECK last (forensic — 20Hz cadence preserved
             // when no higher arm is ready, but never beats a ready
             // data-path or liveness arm).
+            //
+            // Mark the IDLE-window open immediately before awaiting the
+            // `select!`: the span until the winning arm's body records its
+            // id is the loop's idle (select!-wait) time; the span from that
+            // record to this next `begin_select` is the prior arm's body
+            // time (oploop time-instrumentation — observation only).
+            arm_stats.begin_select(std::time::Instant::now());
             tokio::select! {
                 biased;
                 // Panik (operator-initiated emergency stop) arm. The

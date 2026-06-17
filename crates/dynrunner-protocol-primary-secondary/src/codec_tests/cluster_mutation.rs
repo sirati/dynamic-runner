@@ -296,6 +296,7 @@ fn roundtrip_secondary_resource_sample() {
         oploop_iters_per_sec_milli: 12_500,
         dominant_arm_name: "mem_check".to_string(),
         dominant_arm_pct_milli: 55_000,
+        dominant_arm_time_ms_per_sec: 425,
         max_unacked_for_secs: 120,
     };
     let mutation: ClusterMutation<TestId> = ClusterMutation::SecondaryResourceSample {
@@ -324,6 +325,7 @@ fn roundtrip_secondary_resource_sample() {
             assert_eq!(record.oploop_iters_per_sec_milli, 12_500);
             assert_eq!(record.dominant_arm_name, "mem_check");
             assert_eq!(record.dominant_arm_pct_milli, 55_000);
+            assert_eq!(record.dominant_arm_time_ms_per_sec, 425);
             assert_eq!(record.max_unacked_for_secs, 120);
         }
         _ => panic!("expected SecondaryResourceSample"),

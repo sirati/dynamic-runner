@@ -197,11 +197,12 @@ impl ResourceSampleBuffer {
             total_free_swap_bytes,
             cpu_utilization_milli,
             // #589 loop-health stamped below — `stamp_onto` writes the
-            // 4 wire fields. Default zeros pre-stamp keep the partial
+            // 5 wire fields. Default zeros pre-stamp keep the partial
             // record well-formed if a future refactor reorders.
             oploop_iters_per_sec_milli: 0,
             dominant_arm_name: String::new(),
             dominant_arm_pct_milli: 0,
+            dominant_arm_time_ms_per_sec: 0,
             max_unacked_for_secs: 0,
         };
         loop_health.stamp_onto(&mut record);
