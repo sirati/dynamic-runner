@@ -76,6 +76,12 @@ pub struct Router<I: Identifier> {
     /// NOT touch the timestamp; only Relay outcomes (send-side) and
     /// Relay envelopes addressed to us (recv-side) do.
     pub(super) route_state: HashMap<String, PeerRouteState>,
+    /// Per-`(kind, target)` WARN rate-limit gate: the recurring
+    /// relay-path failure/flip WARNs route through it so a flapping or
+    /// freshly-dead peer emits the first occurrence then at most one per
+    /// window (naming the suppressed count) instead of one WARN per flip
+    /// / per message. See [`super::log_rate`].
+    pub(super) warn_gate: super::log_rate::RelayWarnGate,
 }
 
 impl<I: Identifier> Router<I> {
@@ -87,6 +93,7 @@ impl<I: Identifier> Router<I> {
             outgoing_relays: HashMap::new(),
             failed_forwarders: HashMap::new(),
             route_state: HashMap::new(),
+            warn_gate: super::log_rate::RelayWarnGate::default(),
         }
     }
 
@@ -109,6 +116,7 @@ impl<I: Identifier> Router<I> {
     pub fn prune(&mut self, now: Instant) {
         prune_stale(&mut self.outgoing_relays, now);
         prune_blacklist(&mut self.failed_forwarders, now);
+        self.warn_gate.prune(now);
     }
 
     /// Deliverability read for one target: would a `send_to_peer(target)`
@@ -374,11 +382,18 @@ impl<I: Identifier> Router<I> {
                 }
             }
             DistributedMessage::Relay { target_id, .. } => {
-                tracing::warn!(
-                    target: RELAY_LOG_TARGET,
-                    target_peer = %target_id,
-                    "try_recv path dropped relay: cannot forward synchronously, use recv_peer"
-                );
+                if let Some(suppressed) = self.warn_gate.admit(
+                    super::log_rate::RelayWarnKind::SyncDropForward,
+                    &target_id,
+                    clocks.now,
+                ) {
+                    tracing::warn!(
+                        target: RELAY_LOG_TARGET,
+                        target_peer = %target_id,
+                        suppressed_repeats = suppressed,
+                        "try_recv path dropped relay: cannot forward synchronously, use recv_peer"
+                    );
+                }
                 InboundOutcome::Handled {
                     redial_target: None,
                 }

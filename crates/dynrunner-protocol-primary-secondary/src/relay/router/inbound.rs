@@ -14,6 +14,7 @@ use dynrunner_core::Identifier;
 use crate::messages::DistributedMessage;
 use crate::relay::channel::OutboundChannel;
 use crate::relay::router::dispatcher::Router;
+use crate::relay::router::log_rate::RelayWarnKind;
 use crate::relay::router::state::{
     Clocks, MSG_DROPPED_AT_ORIGINATOR, RELAY_LOG_TARGET, blacklist_for,
 };
@@ -40,18 +41,32 @@ impl<I: Identifier> Router<I> {
                     Some(Ok(())) => {}
                     Some(Err(_)) => {
                         connections.remove(&target_id);
-                        tracing::warn!(
-                            target: RELAY_LOG_TARGET,
-                            target_peer = %target_id,
-                            "relay forward failed: target connection closed"
-                        );
+                        if let Some(suppressed) = self.warn_gate.admit(
+                            RelayWarnKind::DirectForwardClosed,
+                            &target_id,
+                            clocks.now,
+                        ) {
+                            tracing::warn!(
+                                target: RELAY_LOG_TARGET,
+                                target_peer = %target_id,
+                                suppressed_repeats = suppressed,
+                                "relay forward failed: target connection closed"
+                            );
+                        }
                     }
                     None => {
-                        tracing::warn!(
-                            target: RELAY_LOG_TARGET,
-                            target_peer = %target_id,
-                            "relay forward target unexpectedly missing"
-                        );
+                        if let Some(suppressed) = self.warn_gate.admit(
+                            RelayWarnKind::DirectForwardMissing,
+                            &target_id,
+                            clocks.now,
+                        ) {
+                            tracing::warn!(
+                                target: RELAY_LOG_TARGET,
+                                target_peer = %target_id,
+                                suppressed_repeats = suppressed,
+                                "relay forward target unexpectedly missing"
+                            );
+                        }
                     }
                 }
             }
@@ -68,20 +83,34 @@ impl<I: Identifier> Router<I> {
                     }
                     Some(Err(_)) => {
                         connections.remove(&via);
-                        tracing::warn!(
-                            target: RELAY_LOG_TARGET,
-                            target_peer = %target_id,
-                            next = %via,
-                            "relay forward failed: forwarder connection closed"
-                        );
+                        if let Some(suppressed) = self.warn_gate.admit(
+                            RelayWarnKind::RelayForwardClosed,
+                            &target_id,
+                            clocks.now,
+                        ) {
+                            tracing::warn!(
+                                target: RELAY_LOG_TARGET,
+                                target_peer = %target_id,
+                                next = %via,
+                                suppressed_repeats = suppressed,
+                                "relay forward failed: forwarder connection closed"
+                            );
+                        }
                     }
                     None => {
-                        tracing::warn!(
-                            target: RELAY_LOG_TARGET,
-                            target_peer = %target_id,
-                            next = %via,
-                            "relay forward target unexpectedly missing"
-                        );
+                        if let Some(suppressed) = self.warn_gate.admit(
+                            RelayWarnKind::RelayForwardMissing,
+                            &target_id,
+                            clocks.now,
+                        ) {
+                            tracing::warn!(
+                                target: RELAY_LOG_TARGET,
+                                target_peer = %target_id,
+                                next = %via,
+                                suppressed_repeats = suppressed,
+                                "relay forward target unexpectedly missing"
+                            );
+                        }
                     }
                 }
             }
@@ -94,27 +123,45 @@ impl<I: Identifier> Router<I> {
                         original_sender: sender_id.clone(),
                         relay_id,
                     };
-                    if let Some(chan) = connections.get(predecessor) {
-                        if chan.dispatch(backoff).is_err() {
+                    let backoff_failed = match connections.get(predecessor) {
+                        Some(chan) => chan.dispatch(backoff).is_err(),
+                        None => true,
+                    };
+                    if backoff_failed {
+                        // Discriminate closed-vs-missing for the message, but
+                        // throttle each kind per `(kind, target)`.
+                        let (kind, msg) = if connections.contains_key(predecessor) {
+                            (
+                                RelayWarnKind::BackoffPredecessorClosed,
+                                "relay backoff send failed: predecessor connection closed",
+                            )
+                        } else {
+                            (
+                                RelayWarnKind::BackoffPredecessorMissing,
+                                "relay backoff send failed: predecessor not in connections",
+                            )
+                        };
+                        let predecessor = predecessor.clone();
+                        if let Some(suppressed) =
+                            self.warn_gate.admit(kind, &target_id, clocks.now)
+                        {
                             tracing::warn!(
                                 target: RELAY_LOG_TARGET,
                                 target_peer = %target_id,
                                 predecessor = %predecessor,
-                                "relay backoff send failed: predecessor connection closed"
+                                suppressed_repeats = suppressed,
+                                "{msg}"
                             );
                         }
-                    } else {
-                        tracing::warn!(
-                            target: RELAY_LOG_TARGET,
-                            target_peer = %target_id,
-                            predecessor = %predecessor,
-                            "relay backoff send failed: predecessor not in connections"
-                        );
                     }
-                } else {
+                } else if let Some(suppressed) =
+                    self.warn_gate
+                        .admit(RelayWarnKind::BackoffEmptyPath, &target_id, clocks.now)
+                {
                     tracing::warn!(
                         target: RELAY_LOG_TARGET,
                         target_peer = %target_id,
+                        suppressed_repeats = suppressed,
                         "dropping relay: empty path on dead-end (no predecessor to back off to)"
                     );
                 }
@@ -135,8 +182,13 @@ impl<I: Identifier> Router<I> {
         clocks: Clocks,
     ) {
         let key = (original_sender.clone(), relay_id);
-        let state = match self.outgoing_relays.get_mut(&key) {
-            Some(s) => s,
+        // Own the target up front and release the `&mut` borrow: the
+        // per-target WARN gate (`self.warn_gate`) is a second mutable
+        // borrow of `self`, so it cannot coexist with a live `&mut
+        // self.outgoing_relays` entry. `handle_backoff` re-fetches its
+        // `&mut state` below, after the gate work is done.
+        let target = match self.outgoing_relays.get(&key) {
+            Some(s) => s.target.clone(),
             None => {
                 // Stale or duplicate backoff — our state was already
                 // pruned (TTL) or we never had this relay. Silent.
@@ -145,28 +197,39 @@ impl<I: Identifier> Router<I> {
         };
         // Record per-target so subsequent relays don't keep paying
         // the same dead-end. Keyed by (target, forwarder) so the
-        // failure of `failed_via` to deliver to `state.target`
+        // failure of `failed_via` to deliver to `target`
         // doesn't blacklist it for any other destination.
         self.failed_forwarders
-            .insert((state.target.clone(), failed_via.clone()), clocks.now);
-        let blacklist = blacklist_for(&self.failed_forwarders, &state.target, clocks.now);
+            .insert((target.clone(), failed_via.clone()), clocks.now);
+        let blacklist = blacklist_for(&self.failed_forwarders, &target, clocks.now);
         // Routability state transition (the silent-branch rule): if THIS
         // blacklist entry exhausted the last candidate path to the
         // target, the link just flipped no-route — the condition the
         // egress no-route gate and the death-evidence reads key on via
-        // `has_route`. Name it once at the flip; the restore side is
-        // narrated by the existing "peer direct link restored" /
+        // `has_route`. Name it once at the flip; on a FLAPPING link the
+        // per-target gate keeps it to one WARN per window (naming the
+        // suppressed repeats) instead of one per flip. The restore side
+        // is narrated by the existing "peer direct link restored" /
         // blacklist-TTL expiry (entries age out silently into a re-try).
-        if !crate::relay::route_exists(connections, &self.self_id, &state.target, &blacklist) {
+        if !crate::relay::route_exists(connections, &self.self_id, &target, &blacklist)
+            && let Some(suppressed) =
+                self.warn_gate
+                    .admit(RelayWarnKind::PeerUnroutable, &target, clocks.now)
+        {
             tracing::warn!(
                 target: RELAY_LOG_TARGET,
-                target_peer = %state.target,
+                target_peer = %target,
                 exhausted_forwarder = %failed_via,
+                suppressed_repeats = suppressed,
                 "peer unroutable: no direct link and every connected \
                  forwarder is blacklisted for it — sends will no-route \
                  until a path or the blacklist TTL recovers"
             );
         }
+        let state = self
+            .outgoing_relays
+            .get_mut(&key)
+            .expect("relay state present: guarded above, never removed in between");
         let decision = handle_backoff(
             state,
             connections,
@@ -183,37 +246,48 @@ impl<I: Identifier> Router<I> {
                     Some(Ok(())) => {}
                     Some(Err(_)) | None => {
                         connections.remove(&via);
-                        tracing::warn!(
-                            target: RELAY_LOG_TARGET,
-                            target_peer = %state.target,
-                            next = %via,
-                            "relay retry send failed; further retries will fire on next backoff"
-                        );
+                        if let Some(suppressed) =
+                            self.warn_gate
+                                .admit(RelayWarnKind::RetrySendFailed, &target, clocks.now)
+                        {
+                            tracing::warn!(
+                                target: RELAY_LOG_TARGET,
+                                target_peer = %target,
+                                next = %via,
+                                suppressed_repeats = suppressed,
+                                "relay retry send failed; further retries will fire on next backoff"
+                            );
+                        }
                     }
                 }
             }
             BackoffDecision::PropagateBackoff { to, msg } => {
-                let target_for_log = state.target.clone();
                 let send_res = connections.get(&to).map(|chan| chan.dispatch(msg));
                 self.outgoing_relays.remove(&key);
                 match send_res {
                     Some(Ok(())) => {}
                     Some(Err(_)) | None => {
-                        tracing::warn!(
-                            target: RELAY_LOG_TARGET,
-                            target_peer = %target_for_log,
-                            predecessor = %to,
-                            "relay backoff propagation failed: predecessor connection closed"
-                        );
+                        if let Some(suppressed) = self.warn_gate.admit(
+                            RelayWarnKind::BackoffPropagationFailed,
+                            &target,
+                            clocks.now,
+                        ) {
+                            tracing::warn!(
+                                target: RELAY_LOG_TARGET,
+                                target_peer = %target,
+                                predecessor = %to,
+                                suppressed_repeats = suppressed,
+                                "relay backoff propagation failed: predecessor connection closed"
+                            );
+                        }
                     }
                 }
             }
             BackoffDecision::Drop => {
-                let target_for_log = state.target.clone();
                 self.outgoing_relays.remove(&key);
                 tracing::warn!(
                     target: RELAY_LOG_TARGET,
-                    target_peer = %target_for_log,
+                    target_peer = %target,
                     relay_id,
                     original_sender = %original_sender,
                     "{MSG_DROPPED_AT_ORIGINATOR}"

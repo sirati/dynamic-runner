@@ -13,11 +13,15 @@
 //!   - [`inbound`] — private inbound-side helpers
 //!     (`apply_forward_decision`/`handle_inbound_backoff`) — the only
 //!     `Router` methods that BOTH mutate state AND dispatch outbound.
+//!   - [`log_rate`] — per-`(kind, target)` WARN rate-limit gate so a
+//!     flapping/dead peer never storms the operator stream with one WARN
+//!     per flip / per message.
 //!
 //! See the per-submodule docs for the design rationale of each split.
 
 pub(crate) mod dispatcher;
 pub(crate) mod inbound;
+pub(crate) mod log_rate;
 pub(crate) mod observe;
 pub(crate) mod state;
 
