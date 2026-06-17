@@ -690,6 +690,62 @@ impl<I: Identifier> PendingPool<I> {
         std::mem::take(&mut self.drained_pending)
     }
 
+    /// Phases that own a retry-pending (`soft_failed`) root AND have no
+    /// LIVE WORK OF THEIR OWN — `queued_count == 0` and `in_flight == 0` —
+    /// REGARDLESS of any foreign-phase-blocked dependents that
+    /// [`Self::live_blocked_count`] would otherwise count as live work.
+    ///
+    /// # Why this exists — the cross-phase drain-edge deadlock
+    ///
+    /// `maybe_transition_drain` keeps a phase out of `Drained` while it has
+    /// LIVE blocked work, and `live_blocked_count` treats a dependent
+    /// blocked on a soft root in a DIFFERENT phase as live (that root's
+    /// retry decision belongs to the OTHER phase's drain edge, and a later
+    /// revival there must not be stranded). That is correct in isolation,
+    /// but it can form a CYCLE: phase A owns soft root `a` and a dependent
+    /// blocked on phase B's soft root `b`; phase B owns soft root `b` and a
+    /// dependent blocked on `a`. Each phase's blocked dependent keeps it
+    /// out of `Drained`, so NEITHER reaches the drain edge where its own
+    /// soft root would be finalized — neither promotes, neither cascades,
+    /// the run hangs forever.
+    ///
+    /// This predicate breaks the cycle by surfacing such a phase to the
+    /// MANAGER, which owns the retry-EXHAUSTION decision the pool cannot
+    /// see. The manager runs this phase's retry buckets exactly as it does
+    /// at a normal drain edge: if a bucket still has budget the soft root
+    /// is REVIVABLE — the manager reinjects it and does NOT finalize (so a
+    /// later success is never stranded). Only if every bucket DECLINES
+    /// (exhausted) does the manager call `finalize_soft_failures`, moving
+    /// the soft root to `failed_tasks` (permanent) and cascading its
+    /// dependents — at which point the OTHER phase's dependent sees a
+    /// genuinely `is_dead_ended` prereq via the EXISTING `live_blocked_count`
+    /// path and drains naturally. Only the FIRST phase in the cycle needs
+    /// this surfacing; the rest fall out of the normal machinery.
+    ///
+    /// The pool stays the sole owner of the COUNTERS and drain state and
+    /// learns NOTHING about retry budgets — it only reports the structural
+    /// fact "this phase has no live work of its own yet still owns a soft
+    /// root". A phase that has NO soft roots, or still owns queued /
+    /// in-flight work, is never returned (it reaches its drain edge through
+    /// the ordinary `maybe_transition_drain` path).
+    pub fn phases_pending_soft_finalize(&self) -> Vec<PhaseId> {
+        let mut phases: Vec<PhaseId> = self
+            .soft_failed
+            .values()
+            .filter(|phase_id| {
+                matches!(
+                    self.phase_state.get(*phase_id),
+                    Some(PhaseState::Active | PhaseState::Draining)
+                ) && self.queued_count(phase_id) == 0
+                    && self.in_flight(phase_id) == 0
+            })
+            .cloned()
+            .collect();
+        phases.sort();
+        phases.dedup();
+        phases
+    }
+
     /// Drop every `SecondaryAffine` ledger-token item still sitting in
     /// `phase_id`'s buckets — the phase-end cleanup of Model B's
     /// placement-readiness signal.
