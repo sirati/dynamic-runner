@@ -8,6 +8,14 @@ use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::coordinator::InheritedSlotReconcile;
 use crate::primary::lifecycle::dispatch::DispatchOutcome;
 
+/// Minimum spacing between two rolled-up unassignable-PARK operator lines
+/// (`coordinator::unassignable_park_warn`). At scale every idle worker
+/// re-requests once per backoff tick while a phase is drained, so the
+/// per-event DEBUG line spammed; one rollup per interval names the parked
+/// count + the suppressed re-requests instead.
+pub(in crate::primary) const UNASSIGNABLE_PARK_WARN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// `command_rx` threads the operational-loop's command-channel
     /// receiver into the terminal-veto settle cascade (its
@@ -244,14 +252,50 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // starved and ingest froze. `PrimaryCoordinator::send_to`
             // now rejects `Destination::Primary` outright as the
             // structural backstop; this site simply has nothing to send.
+            //
+            // Split by sub-cause:
+            //   * `target_idx == None` — the worker addressed an
+            //     unknown/dead secondary slot (a membership/liveness
+            //     condition, rare and orthogonal to park churn). Keep an
+            //     INDIVIDUAL line.
+            //   * `target_idx == Some` + unassigned — the worker holds a
+            //     known roster slot but no work fit it: it is PARKED
+            //     awaiting the push. At scale every idle worker re-requests
+            //     once per backoff tick, so this is the spam case — roll it
+            //     up through `unassignable_park_warn` (one line per
+            //     interval naming the parked count + suppressed
+            //     re-requests). The parked-worker count is computed LAZILY
+            //     only on the permitted tick (an O(workers) sweep).
             if !assigned {
-                tracing::debug!(
-                    secondary = %secondary_id,
-                    worker_id,
-                    "TaskRequest not assignable (no roster slot / no \
-                     dispatchable work); dropped — the worker re-polls on \
-                     its backoff tick"
-                );
+                match target_idx {
+                    None => {
+                        tracing::debug!(
+                            secondary = %secondary_id,
+                            worker_id,
+                            "TaskRequest names no roster slot (unknown / dead \
+                             secondary); dropped — the worker re-polls on its \
+                             backoff tick"
+                        );
+                    }
+                    Some(_) => {
+                        if let Some(suppressed) = self.unassignable_park_warn.permit() {
+                            let parked = self
+                                .workers
+                                .iter()
+                                .filter(|w| w.held_task().is_none())
+                                .count();
+                            tracing::debug!(
+                                parked_workers = parked,
+                                suppressed_re_requests = suppressed,
+                                "idle workers parked awaiting work; \
+                                 unassignable re-requests suppressed in the \
+                                 last {:?} — each worker is assigned by the \
+                                 dispatch push as soon as work fits",
+                                UNASSIGNABLE_PARK_WARN_INTERVAL
+                            );
+                        }
+                    }
+                }
             }
         }
         Ok(())
