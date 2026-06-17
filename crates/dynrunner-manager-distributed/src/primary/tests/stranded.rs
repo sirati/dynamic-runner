@@ -216,6 +216,89 @@ async fn fake_secondary_dies_at_transfer_complete(
     drop(outgoing_to_primary);
 }
 
+/// Discovery-collapse helper (concurrent-order): the fake completes the full
+/// handshake (Welcome + Cert + MeshReady), survives the pre-loop bring-up AND
+/// the operational loop entry, drains inbound until it sees the FIRST
+/// `TaskAssignment` — the operational dispatch of the post-discovery seeded
+/// corpus (its arrival PROVES discovery ran in the op-loop's ARM_DISCOVERY,
+/// seeded the ledger, and the dispatch reached this member) — then drops its
+/// outbound channel and dies.
+///
+/// Dropping it closes this peer; once every fake has dropped, the primary's
+/// operational inbox `recv()` returns `None` → the op-loop's `transport_closed`
+/// guard breaks into `finalize_terminal_accounting`, where the dispatched-but-
+/// unconfirmed corpus is classified stranded against the LIVE `total_tasks`
+/// (refreshed to N by the discovery arm's re-hydrate). This is the
+/// concurrent-order twin of the obsolete `fake_secondary_dies_post_mesh_ready`
+/// premise (collapse at the SEQUENTIAL pre-loop `perform_initial_assignment`):
+/// under the concurrent arm, discovery seeds INSIDE the op-loop, so the strand
+/// is observed via the op-loop's collapse path, not a pre-loop assignment send.
+///
+/// Kept next to the test for the same reason as the siblings: the shape
+/// ("survive into the op-loop, die at the post-discovery dispatch") is specific
+/// to this discovery-collapse regression.
+async fn fake_secondary_dies_after_discovery_dispatch(
+    secondary_id: String,
+    num_workers: u32,
+    ram_bytes: u64,
+    mut incoming_from_primary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    outgoing_to_primary: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+) {
+    outgoing_to_primary
+        .send(DistributedMessage::SecondaryWelcome {
+            target: None,
+            sender_id: secondary_id.clone(),
+            timestamp: 0.0,
+            secondary_id: secondary_id.clone(),
+            resources: vec![dynrunner_core::ResourceAmount {
+                kind: dynrunner_core::ResourceKind::memory(),
+                amount: ram_bytes,
+            }],
+            worker_count: num_workers,
+            hostname: "test-host".into(),
+            is_observer: false,
+            can_be_primary: false,
+        })
+        .unwrap();
+    outgoing_to_primary
+        .send(DistributedMessage::CertExchange {
+            target: None,
+            sender_id: secondary_id.clone(),
+            timestamp: 0.0,
+            secondary_id: secondary_id.clone(),
+            public_cert_pem: "FAKE_CERT".into(),
+            ipv4_address: Some("127.0.0.1".into()),
+            ipv6_address: None,
+            quic_port: 5000,
+            liveness_port: None,
+        })
+        .unwrap();
+    outgoing_to_primary
+        .send(DistributedMessage::MeshReady {
+            target: None,
+            sender_id: secondary_id.clone(),
+            timestamp: 0.0,
+            secondary_id: secondary_id.clone(),
+            peer_count: 0,
+        })
+        .unwrap();
+
+    // Drain inbound through the entire bring-up (PeerInfo, the cold-seed
+    // ClusterMutation batch, the EMPTY pre-loop InitialAssignment, Transfer
+    // Complete) and into the operational loop, until the FIRST operational
+    // `TaskAssignment` lands — that frame exists ONLY after the discovery arm
+    // seeded the corpus (the Owed→Settled re-hydrate) and dispatch_to_idle_
+    // workers fanned it to this confirmed member. Then drop the outbound
+    // channel so the primary's operational inbox closes and the op-loop strands
+    // the dispatched corpus.
+    while let Some(msg) = incoming_from_primary.recv().await {
+        if matches!(msg, DistributedMessage::TaskAssignment { .. }) {
+            break;
+        }
+    }
+    drop(outgoing_to_primary);
+}
+
 /// Thread-local tracing buffer: captures every ERROR event emitted on the
 /// current thread for the lifetime of the returned guard.
 ///
@@ -721,13 +804,22 @@ async fn stranded_after_owed_discovery_collapse_returns_err_not_run_complete() {
                 fires.clone(),
             ));
 
-            // Secondaries die post-mesh-ready → they are gone by the time the
-            // operational primary's `perform_initial_assignment` fans out (the
-            // assignment-time collapse), which fires AFTER `discover_on_promotion`
-            // has already seeded + re-hydrated to N. So the full discovered pool
-            // is stranded.
+            // Concurrent-order collapse (post-fix): discovery is now an op-loop
+            // ARM, so it seeds INSIDE the operational loop, not in the pre-loop.
+            // The fakes complete the handshake, survive into the op-loop, and die
+            // the instant the FIRST operational `TaskAssignment` lands — the
+            // dispatch of the post-discovery seeded corpus (its arrival proves
+            // ARM_DISCOVERY seeded + re-hydrated to N). Their death closes the
+            // operational inbox → the op-loop's `transport_closed` break finalizes
+            // and strands the dispatched-but-unconfirmed corpus against the LIVE
+            // `total_tasks` (= N). This replaces the obsolete premise (collapse at
+            // the SEQUENTIAL pre-loop `perform_initial_assignment` after discovery
+            // had already seeded) — under the concurrent arm that sequence no
+            // longer exists, but the SAME regression is guarded: a stale
+            // pre-discovery `total = 0` snapshot would still false-green
+            // `stranded = 0 ⇒ RunComplete`.
             for (id, rx, tx) in secondary_ends {
-                tokio::task::spawn_local(fake_secondary_dies_post_mesh_ready(
+                tokio::task::spawn_local(fake_secondary_dies_after_discovery_dispatch(
                     id,
                     /* num_workers = */ 1,
                     1024 * 1024 * 1024,

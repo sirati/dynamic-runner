@@ -507,11 +507,13 @@ async fn mode2_zero_to_run_phase1_with_lazy_spawn_phase2_does_not_prematurely_co
             let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
             let mut outgoing = HashMap::new();
             let mut sec_handles = Vec::new();
+            let mut sec_ids = Vec::new();
             for i in 0..2u32 {
                 let sec_id = format!("sec-{i}");
                 let (pri_to_sec_tx, sec_to_pri_rx, handle) =
                     spawn_real_secondary(sec_id.clone(), 1, max_res.clone());
-                outgoing.insert(sec_id, pri_to_sec_tx);
+                outgoing.insert(sec_id.clone(), pri_to_sec_tx);
+                sec_ids.push(sec_id);
                 sec_handles.push(handle);
                 let tx = incoming_tx.clone();
                 tokio::task::spawn_local(async move {
@@ -523,6 +525,20 @@ async fn mode2_zero_to_run_phase1_with_lazy_spawn_phase2_does_not_prematurely_co
                     }
                 });
             }
+            // Concurrent-discovery delivery (post-fix): discovery is now an
+            // op-loop ARM, so the discovered corpus is delivered via the
+            // OPERATIONAL dispatch path (TasksAdded → dispatch_to_idle_workers),
+            // which is MeshReady-gated. On a real mesh-always discovery primary
+            // every cert-exchanged member is operationalized by the op-loop's
+            // incremental serve DURING discovery and reports MeshReady once its
+            // peer-mesh watchdog settles, so it pulls the corpus when the seed
+            // lands. This channel fixture never settles the secondary↔secondary
+            // leg (the 30s watchdog can't fire in-window), so inject the
+            // MeshReady each secondary WOULD send on a real mesh — the gated
+            // operational dispatch then delivers exactly as production does.
+            // (Pre-fix this fixture delivered via the sequential-discovery
+            // perform_initial_assignment push — the obsolete bring-up order.)
+            inject_mesh_ready_for(&incoming_tx, &sec_ids);
             drop(incoming_tx);
 
             let transport =
@@ -712,11 +728,13 @@ async fn mode2_all_skipped_phase1_fires_on_phase_end_once_and_lazy_spawn_lands()
             let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
             let mut outgoing = HashMap::new();
             let mut sec_handles = Vec::new();
+            let mut sec_ids = Vec::new();
             for i in 0..2u32 {
                 let sec_id = format!("sec-{i}");
                 let (pri_to_sec_tx, sec_to_pri_rx, handle) =
                     spawn_real_secondary(sec_id.clone(), 1, max_res.clone());
-                outgoing.insert(sec_id, pri_to_sec_tx);
+                outgoing.insert(sec_id.clone(), pri_to_sec_tx);
+                sec_ids.push(sec_id);
                 sec_handles.push(handle);
                 let tx = incoming_tx.clone();
                 tokio::task::spawn_local(async move {
@@ -728,6 +746,20 @@ async fn mode2_all_skipped_phase1_fires_on_phase_end_once_and_lazy_spawn_lands()
                     }
                 });
             }
+            // Concurrent-discovery delivery (post-fix): discovery is now an
+            // op-loop ARM, so the discovered corpus is delivered via the
+            // OPERATIONAL dispatch path (TasksAdded → dispatch_to_idle_workers),
+            // which is MeshReady-gated. On a real mesh-always discovery primary
+            // every cert-exchanged member is operationalized by the op-loop's
+            // incremental serve DURING discovery and reports MeshReady once its
+            // peer-mesh watchdog settles, so it pulls the corpus when the seed
+            // lands. This channel fixture never settles the secondary↔secondary
+            // leg (the 30s watchdog can't fire in-window), so inject the
+            // MeshReady each secondary WOULD send on a real mesh — the gated
+            // operational dispatch then delivers exactly as production does.
+            // (Pre-fix this fixture delivered via the sequential-discovery
+            // perform_initial_assignment push — the obsolete bring-up order.)
+            inject_mesh_ready_for(&incoming_tx, &sec_ids);
             drop(incoming_tx);
 
             let transport =
