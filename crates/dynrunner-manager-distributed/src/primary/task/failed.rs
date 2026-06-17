@@ -147,7 +147,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // inline into `handle_task_failed`'s state machine (the
                 // relocation-future stack-depth sensitivity; see the twin in
                 // `complete.rs`).
-                Box::pin(self.handle_affine_task_failed(&msg)).await;
+                Box::pin(self.handle_affine_task_failed(&msg, command_rx)).await;
                 return;
             }
             // Dedup gate (#50 peer-forwarding redundancy):
@@ -448,7 +448,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// reads the bitvector — a `Failed` cell is neither `Done` nor `Queued`, so
     /// that secondary is simply not preferred). Worker bookkeeping
     /// (`free_slot_on_terminal`) still applies to this run.
-    async fn handle_affine_task_failed(&mut self, msg: &DistributedMessage<I>) {
+    async fn handle_affine_task_failed(
+        &mut self,
+        msg: &DistributedMessage<I>,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) {
         let DistributedMessage::TaskFailed {
             secondary_id,
             worker_id,
@@ -467,6 +471,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         if let Some(m) = self.affine_terminal_mutation(&secondary_id, &task_hash, false) {
             self.apply_and_broadcast_cluster_mutations(vec![m]).await;
         }
+        // EVENT-DRIVEN BATCH fast-fail: if this failure made the affine gate
+        // all-eligible-`Failed` (the import can no longer run on any roster
+        // secondary), terminal-fail EVERY now-`Unsatisfiable` dependent in ONE
+        // batched sweep — instead of draining one per dispatch tick (the ~0.2
+        // fails/sec starvation across thousands of dependents). The affine
+        // subsystem owns the gate→dependents enumeration; this is the same
+        // roster-aware `Unsatisfiable` predicate the per-dispatch gate uses,
+        // applied eagerly. Runs AFTER the cell flip so the satisfiability read
+        // sees this `Failed`. Threaded `command_rx`: the burst is failed DIRECTLY
+        // via the batched `apply_fail_permanent_batch` (ONE broadcast, ONE
+        // lifecycle pass) — never enqueued onto the bounded command channel,
+        // whose overflow would drop dependents at scale.
+        self.fast_fail_affine_dependents_if_unsatisfiable(&task_hash, command_rx)
+            .await;
         self.drop_supplanted_holder(&task_hash);
         // WORKER SLOT: free the holding slot for THIS per-secondary run,
         // addressed by the terminal's OWN (secondary, worker) — slot-direct, NOT

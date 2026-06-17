@@ -42,6 +42,45 @@
 
 use dynrunner_core::WorkerId;
 
+/// The CRDT transaction coordinates of one winning task transition — the
+/// id the operator correlates an observer narration line to the
+/// originating CRDT change.
+///
+/// These are exactly the fields the per-task monotone join
+/// (`crate::cluster_state::merge::task_join_key`) arbitrates on: the
+/// primary-stamped [`dynrunner_core::TaskVersion`] `(primary_epoch, seq)`
+/// — the C3/D-V authoritative per-transition stamp — paired with the F2
+/// retry `attempt` generation. There is NO invented id: this is the
+/// CRDT's own transaction arbiter surfaced verbatim.
+///
+/// The version-LESS terminals (`Completed`, `Blocked`,
+/// `SkippedAlreadyDone`, `SetupCompleted`) carry no per-transition
+/// `TaskVersion` stamp — the terminal RANK settles them, not a version —
+/// so for those `epoch`/`seq` are the [`dynrunner_core::TaskVersion`]
+/// default `(0, 0)` and the `attempt` is the meaningful coordinate. This
+/// is honest by construction: the rendered `crdt_txn=e0.v0.a{attempt}`
+/// tells the operator the transition was terminal-rank-settled at
+/// generation `attempt`, not version-arbitrated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskTxnId {
+    /// The `TaskVersion.primary_epoch` of the winning state (the cluster
+    /// epoch that stamped it). `0` for a version-less terminal.
+    pub primary_epoch: u64,
+    /// The `TaskVersion.seq` of the winning state (the per-task monotone
+    /// counter within the epoch). `0` for a version-less terminal.
+    pub seq: u32,
+    /// The F2 retry-attempt generation, present on EVERY state.
+    pub attempt: u32,
+}
+
+impl std::fmt::Display for TaskTxnId {
+    /// `e{primary_epoch}.v{seq}.a{attempt}` — the compact CRDT-transaction
+    /// rendering the narration line carries (`crdt_txn=e0.v0.a0`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "e{}.v{}.a{}", self.primary_epoch, self.seq, self.attempt)
+    }
+}
+
 /// The classification of one winning task transition, mapped to the
 /// operator-narration level + wording the observer emits. Derived purely
 /// from the POST-merge [`crate::cluster_state::TaskState`] discriminant
@@ -93,9 +132,19 @@ pub enum TaskStateChange {
 ///   failure (the PRIOR holder captured at the merge). `None` for a
 ///   transition that has no holder on either side (e.g. a spawn-time
 ///   `Pending`, a `Blocked` cascade-pause, a `SkippedAlreadyDone` skip).
+/// - `from`: the human state tag of the PRE-write state (the slot's
+///   prior occupant), captured at the `set_task_state` apply seam BEFORE
+///   the move-in overwrites it. `None` for a logical CREATE (the slot was
+///   vacant — a spawn-time first write), where there is no prior state to
+///   name. The narrator renders the transition as "from {from} to {new}".
+/// - `txn`: the CRDT transaction coordinates of the WINNING (post-write)
+///   state — the id the operator correlates the line to the originating
+///   CRDT change. See [`TaskTxnId`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskStateChangeEvent {
     pub task_id: String,
     pub change: TaskStateChange,
     pub holder: Option<(String, WorkerId)>,
+    pub from: Option<&'static str>,
+    pub txn: TaskTxnId,
 }

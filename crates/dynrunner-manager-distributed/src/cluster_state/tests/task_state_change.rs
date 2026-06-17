@@ -93,6 +93,13 @@ async fn assign_then_complete_emits_assigned_then_completed_with_holder() {
         Some(("sec-a", 5)),
         "the assignment carries the new InFlight holder"
     );
+    // From→to (#520): the assignment's prior slot occupant is the Pending
+    // the assign superseded — captured at the apply seam.
+    assert_eq!(
+        events[1].from,
+        Some("pending"),
+        "the assign carries the PRE-write Pending as its from-state"
+    );
 
     assert!(matches!(events[2].change, TaskStateChange::Completed));
     assert_eq!(
@@ -101,6 +108,69 @@ async fn assign_then_complete_emits_assigned_then_completed_with_holder() {
         "the completion carries the PRIOR InFlight holder, resolved at the merge"
     );
     assert_eq!(events[2].task_id, "h1");
+    // From→to (#520): the completion's prior slot occupant is the InFlight
+    // it superseded.
+    assert_eq!(
+        events[2].from,
+        Some("in-flight"),
+        "the completion carries the PRE-write InFlight as its from-state"
+    );
+    // The spawn-time Pending is a logical CREATE (vacant slot) — no
+    // from-state to name.
+    assert_eq!(events[0].from, None, "a CREATE names no prior state");
+    // CRDT txn id (#520): the version-less Completed reports the
+    // attempt-only coordinate (epoch/seq default to 0; attempt is 0 here).
+    assert_eq!(
+        events[2].txn,
+        crate::task_state_change::TaskTxnId { primary_epoch: 0, seq: 0, attempt: 0 },
+        "the completion's CRDT txn id is its (version, attempt) coordinate"
+    );
+}
+
+/// From→to + CRDT txn id PATH-INDEPENDENCE: a retry reset
+/// (`Failed → Pending`) at a stamped epoch surfaces the failed→pending
+/// transition AND the reset's stamped `TaskVersion` as the txn id, so the
+/// operator correlates the re-queue line to the exact CRDT reset.
+#[tokio::test]
+async fn retry_reset_carries_from_failed_and_stamped_txn_version() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    s.install_task_state_change_sender(tx);
+
+    add_and_assign(&mut s, "h9", "sec-h", 1);
+    s.apply(ClusterMutation::TaskFailed {
+        hash: "h9".into(),
+        kind: ErrorType::Recoverable,
+        error: "blip".into(),
+        version: TaskVersion { primary_epoch: 1, seq: 0 },
+        attempt: 0,
+    });
+    s.apply(ClusterMutation::TaskRetried {
+        hash: "h9".into(),
+        attempt: 1,
+        version: TaskVersion { primary_epoch: 2, seq: 4 },
+    });
+
+    let events = drain(&mut rx);
+    // The reset is the LAST event: Failed → Pending.
+    let reset = events
+        .iter()
+        .rev()
+        .find(|e| matches!(&e.change, TaskStateChange::Other { state: "pending" }))
+        .expect("the TaskRetried reset narrates a Pending transition");
+    assert_eq!(
+        reset.from,
+        Some("failed"),
+        "the retry reset names the PRE-write Failed as its from-state"
+    );
+    // The reset Pending carries the originator-stamped (epoch 2, seq 4)
+    // version + the bumped attempt 1 — the exact CRDT transaction
+    // coordinates of the reset.
+    assert_eq!(
+        reset.txn,
+        crate::task_state_change::TaskTxnId { primary_epoch: 2, seq: 4, attempt: 1 },
+        "the reset's CRDT txn id is the stamped (epoch, seq) + bumped attempt"
+    );
 }
 
 /// LIVE path, the assign → terminal-fail script: a `NonRecoverable`

@@ -49,6 +49,31 @@ fn work_dep(name: &str, dep: &str) -> TaskInfo<TestId> {
     t
 }
 
+/// A `Work` task depending IN ORDER on two affine prereqs `[base, delta]` — the
+/// consumer's `build_variant` shape (a shared base import precedes the
+/// per-variant delta layered on top of it). The dep ORDER (base first) is the
+/// dispatch order the list-order gate must respect.
+fn work_two_deps(name: &str, base: &str, delta: &str) -> TaskInfo<TestId> {
+    let mut t = make_binary(name, 20);
+    t.phase_id = PhaseId::from("work");
+    t.type_id = TypeId::from("default");
+    t.task_depends_on = vec![
+        TaskDep {
+            task_id: base.into(),
+            phase_id: PhaseId::from("work"),
+            inherit_outputs: false,
+            def_id: None,
+        },
+        TaskDep {
+            task_id: delta.into(),
+            phase_id: PhaseId::from("work"),
+            inherit_outputs: false,
+            def_id: None,
+        },
+    ];
+    t
+}
+
 /// `PeerJoined` + `SecondaryCapacity` for `secondary` with `n` workers.
 fn capacity_batch(secondary: &str, n: u32) -> DistributedMessage<TestId> {
     DistributedMessage::ClusterMutation {
@@ -1079,6 +1104,779 @@ async fn affine_import_dispatches_once_per_secondary_under_concurrency() {
             assert!(
                 primary.run_complete_check(),
                 "run_complete_check must be satisfied once the run drains"
+            );
+        })
+        .await;
+}
+
+/// EVENT-DRIVEN BATCH FAST-FAIL (the slow-drain fix): when the affine import
+/// fails on the LAST eligible secondary — the gate transitions to
+/// all-eligible-`Failed` — EVERY dependent WORK unit is terminal-failed in ONE
+/// sweep, driven by the failure EVENT, NOT lazily one-per-dispatch-tick.
+///
+/// The slow-drain bug: `Unsatisfiable → FailPermanent` was only evaluated
+/// per-WORK-unit at dispatch time, so N dependents drained at the dispatch
+/// loop's per-tick rate (the live ~0.2 fails/sec across 12.5k dependents while
+/// workers sat idle). This pins the fix: N dependents on a single failed
+/// affine_id all terminal-fail PROMPTLY off the LAST import-failure terminal,
+/// WITHOUT N separate dispatch rounds. The proof of BATCH (not per-tick): we
+/// fail the import on both secondaries (NO build dispatch round in between) and
+/// then assert ALL N builds are terminal after a single command drain.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_all_failed_batch_fast_fails_every_dependent_promptly() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            // MANY dependents on the one affine_id — the batch must fail them all
+            // off the single failure transition, not one per dispatch tick.
+            let mut binaries = vec![import];
+            let mut build_hashes = Vec::new();
+            for i in 0..10 {
+                let b = work_dep(&format!("build_{i}"), "import");
+                build_hashes.push(compute_task_hash(&b));
+                binaries.push(b);
+            }
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(binaries);
+            confirm_two(&mut primary).await;
+
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+
+            // Dispatch the placement + per-secondary import pops, then FAIL every
+            // dispatched IMPORT (never a build — builds gate `NotDone`/`Failed`).
+            // Crucially we keep draining/failing imports until BOTH secondaries'
+            // cells are `Failed`, never feeding a build terminal — so any builds
+            // that fail must fail via the BATCH event-driven sweep, not a
+            // per-build dispatch gate.
+            for _round in 0..6 {
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                for (_, sec, worker, h) in &round {
+                    if *h == import_hash {
+                        primary
+                            .handle_task_failed(task_failed(sec, *worker, h), &mut None)
+                            .await;
+                        settle_pump().await;
+                    } else {
+                        // A build dispatching would mean the fast-fail did NOT
+                        // pre-empt the per-dispatch drain — fail loudly.
+                        assert!(
+                            !build_hashes.contains(h),
+                            "a build dispatched ({h}) — the batch fast-fail should \
+                             have terminal-failed every dependent off the import \
+                             failure, before any build was popped for a worker"
+                        );
+                    }
+                }
+                let both_failed = ["sec-0", "sec-1"].iter().all(|sec| {
+                    primary.cluster_state_for_test().affine_state(sec, affine_id)
+                        == AffineCell::Failed
+                });
+                if both_failed {
+                    break;
+                }
+            }
+
+            // The import failed on BOTH secondaries — the all-eligible-`Failed`
+            // transition that arms the batch fast-fail.
+            for sec in ["sec-0", "sec-1"] {
+                assert_eq!(
+                    primary.cluster_state_for_test().affine_state(sec, affine_id),
+                    AffineCell::Failed,
+                    "the import cell must be Failed on {sec} (the arming transition)"
+                );
+            }
+
+            // ONE command drain (the batch enqueued N decoupled `FailPermanent`s
+            // off the LAST failure event) — and then EVERY dependent is terminal.
+            // No per-build dispatch rounds were needed.
+            drain_commands(&mut primary).await;
+
+            for (i, h) in build_hashes.iter().enumerate() {
+                assert!(
+                    primary
+                        .cluster_state_for_test()
+                        .task_state(h)
+                        .is_some_and(|s| s.is_terminal()),
+                    "build_{i} must be terminal-failed by the BATCH sweep off the \
+                     all-Failed transition — not drained one per dispatch tick"
+                );
+                // And removed from its pool bucket (the symmetric accounting the
+                // fast-fail path does).
+                assert_eq!(
+                    primary.pool().iter().filter(|t| compute_task_hash(t) == *h).count(),
+                    0,
+                    "build_{i} must be taken out of its bucket by the fast-fail sweep"
+                );
+            }
+        })
+        .await;
+}
+
+/// ROSTER-AWARE / NO OVER-FAST-FAIL (partial): when the import has `Failed` on
+/// one secondary but a DIFFERENT secondary can still satisfy it, the dependents
+/// are NOT batch-failed — they dispatch to the still-satisfiable secondary once
+/// its import is `Done`. The batch fast-fail only fires when the gate is
+/// all-eligible-`Failed`, so a partial failure (one Done elsewhere) preserves
+/// the existing reroute/dispatch semantics exactly.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_partial_failed_does_not_fast_fail_dependents() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            confirm_two(&mut primary).await;
+
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+
+            // Drive the run: FAIL the import on the FIRST secondary it dispatches
+            // to, but COMPLETE it on the second. The dependent must NOT be
+            // batch-failed (a satisfiable secondary still exists), and must
+            // ultimately dispatch + complete on the Done secondary.
+            let mut build_completed = false;
+            for _round in 0..12 {
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+                drain_commands(&mut primary).await;
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                if round.is_empty() {
+                    break;
+                }
+                for (_, sec, worker, h) in &round {
+                    if *h == import_hash {
+                        // Fail on sec-0, complete on sec-1 (one stays satisfiable).
+                        if sec == "sec-0" {
+                            primary
+                                .handle_task_failed(task_failed(sec, *worker, h), &mut None)
+                                .await;
+                        } else {
+                            primary
+                                .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                                .await;
+                        }
+                        settle_pump().await;
+                    } else if *h == build_hash {
+                        // The build dispatched on a Done secondary — complete it.
+                        assert_eq!(
+                            primary.cluster_state_for_test().affine_state(sec, affine_id),
+                            AffineCell::Done,
+                            "the build must only dispatch where the import is Done"
+                        );
+                        primary
+                            .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                            .await;
+                        build_completed = true;
+                        settle_pump().await;
+                    }
+                }
+            }
+            drain_commands(&mut primary).await;
+
+            // The build was NOT fast-failed — it RAN to completion on the Done
+            // secondary. (A terminal that is a SUCCESS, not the permanent fail
+            // the all-Failed batch would produce.)
+            assert!(
+                build_completed,
+                "the build must dispatch + complete on the still-satisfiable \
+                 secondary — a partial failure must NOT batch-fast-fail it"
+            );
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&build_hash),
+                    Some(crate::cluster_state::TaskState::Completed { .. })
+                ),
+                "the build's terminal must be a COMPLETION (not the permanent \
+                 fail the over-fast-fail bug would produce)"
+            );
+        })
+        .await;
+}
+
+/// ROSTER-AWARE / FRESH SECONDARY (no premature fail): a dependent whose import
+/// has `Failed` on the only WRITTEN secondary is NOT batch-failed when a FRESH
+/// secondary (all cells `NotDone`) is still on the roster — the gate reads the
+/// ROSTER, not just the written cells, so a placeable secondary keeps the unit
+/// satisfiable. The build must re-route to (and run on) the fresh secondary.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_fresh_secondary_keeps_gate_satisfiable_no_premature_fail() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let build = work_dep("build", "import");
+            let build_hash = compute_task_hash(&build);
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![import, build]);
+            // Confirm ONLY sec-0 first — sec-1 stays off-roster (fresh) while we
+            // fail the import on sec-0. With sec-1 on the roster (all cells
+            // NotDone), the gate must NOT fast-fail despite sec-0's Failed cell.
+            primary
+                .handle_cluster_mutation(capacity_batch("sec-0", 1), &mut None)
+                .await;
+            primary.handle_mesh_ready(mesh_ready_from("sec-0"));
+            primary
+                .handle_cluster_mutation(capacity_batch("sec-1", 1), &mut None)
+                .await;
+            primary.handle_mesh_ready(mesh_ready_from("sec-1"));
+
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+
+            let mut build_completed = false;
+            let mut import_failed_on_sec0 = false;
+            for _round in 0..12 {
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+                drain_commands(&mut primary).await;
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                if round.is_empty() {
+                    break;
+                }
+                for (_, sec, worker, h) in &round {
+                    if *h == import_hash {
+                        // Fail the FIRST sec-0 import; complete every other import
+                        // (e.g. the reroute onto sec-1, the fresh secondary).
+                        if sec == "sec-0" && !import_failed_on_sec0 {
+                            import_failed_on_sec0 = true;
+                            primary
+                                .handle_task_failed(task_failed(sec, *worker, h), &mut None)
+                                .await;
+                        } else {
+                            primary
+                                .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                                .await;
+                        }
+                        settle_pump().await;
+                    } else if *h == build_hash {
+                        assert_eq!(
+                            primary.cluster_state_for_test().affine_state(sec, affine_id),
+                            AffineCell::Done,
+                            "the build must only dispatch where the import is Done"
+                        );
+                        primary
+                            .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                            .await;
+                        build_completed = true;
+                        settle_pump().await;
+                    }
+                }
+            }
+            drain_commands(&mut primary).await;
+
+            assert!(
+                import_failed_on_sec0,
+                "the import must have been attempted + failed on sec-0 (the setup)"
+            );
+            // The build was NOT prematurely failed — the fresh sec-1 (all-NotDone,
+            // on the roster) kept the gate satisfiable, so the build re-routed and
+            // ran there.
+            assert!(
+                build_completed,
+                "the build must re-route to and run on the fresh secondary — a \
+                 roster secondary with all-NotDone cells keeps the gate \
+                 satisfiable, so the build must NOT be prematurely batch-failed"
+            );
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&build_hash),
+                    Some(crate::cluster_state::TaskState::Completed { .. })
+                ),
+                "the build's terminal must be a COMPLETION (no premature fail)"
+            );
+        })
+        .await;
+}
+
+/// SCALE (the two burst flaws): an all-`Failed` affine gate with N dependents
+/// FAR ABOVE the bounded self command channel capacity
+/// (`COMMAND_CHANNEL_CAPACITY` = 256) must fast-fail EVERY dependent — NONE
+/// lost — AND in exactly ONE broadcast.
+///
+/// Flaw 1 (overflow → lost → hang): enqueuing N `FailPermanent`s onto the
+/// bounded channel would `Err(Full)` past 256 and DROP the overflow dependents,
+/// each already taken out of its bucket ⇒ permanently lost ⇒ the run never
+/// completes. The fix drives the batch DIRECTLY (no channel), so the test
+/// asserts ALL N reach terminal and the command channel stays EMPTY.
+///
+/// Flaw 2 (N broadcasts → op-loop stall + mesh flood): failing per item would
+/// ship N `ClusterMutation` broadcast frames. The fix accumulates all N
+/// terminals into ONE broadcast, so the test asserts exactly ONE frame carried
+/// the burst's `TaskFailed`s and it carried ALL N.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_all_failed_batch_scales_past_command_channel_capacity() {
+    use crate::primary::command_channel::COMMAND_CHANNEL_CAPACITY;
+
+    /// Drain a secondary end ONCE, separating the two frame shapes the test
+    /// cares about: the `(…, file_hash)` of every `TaskAssignment` (so imports
+    /// can be failed) AND the per-frame `TaskFailed` count of every
+    /// `ClusterMutation` broadcast (so the test can assert the burst arrived in a
+    /// SINGLE frame). One drain so the two reads never race on the same receiver.
+    #[allow(clippy::type_complexity)]
+    fn drain_assignments_and_taskfailed_frames(
+        rx: &mut tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    ) -> (Vec<(String, String, u32, String)>, Vec<usize>) {
+        let mut assigns = Vec::new();
+        let mut frame_sizes = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                DistributedMessage::TaskAssignment {
+                    binary_info,
+                    secondary_id,
+                    worker_id,
+                    file_hash,
+                    ..
+                } => assigns.push((binary_info.task_id, secondary_id, worker_id, file_hash)),
+                DistributedMessage::ClusterMutation { mutations, .. } => {
+                    let n = mutations
+                        .iter()
+                        .filter(|m| matches!(m, ClusterMutation::TaskFailed { .. }))
+                        .count();
+                    if n > 0 {
+                        frame_sizes.push(n);
+                    }
+                }
+                _ => {}
+            }
+        }
+        (assigns, frame_sizes)
+    }
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // N comfortably above the channel capacity so the pre-fix overflow
+            // would drop ~(N - 256) dependents.
+            let n_deps: usize = COMMAND_CHANNEL_CAPACITY * 3 + 17; // 785
+            let import = affine_import("import");
+            let import_hash = compute_task_hash(&import);
+            let mut binaries = vec![import];
+            let mut build_hashes = Vec::with_capacity(n_deps);
+            for i in 0..n_deps {
+                let b = work_dep(&format!("build_{i}"), "import");
+                build_hashes.push(compute_task_hash(&b));
+                binaries.push(b);
+            }
+
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(binaries);
+            confirm_two(&mut primary).await;
+
+            let affine_id = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&import_hash)
+                .expect("registered affine-id");
+
+            // Dispatch placement + per-secondary import pops, then FAIL every
+            // dispatched import until BOTH cells are Failed (never feeding a build
+            // terminal). One drain per round separates the import assignments from
+            // the TaskFailed broadcast frames the batch ships.
+            let mut taskfailed_frame_sizes_seen: Vec<usize> = Vec::new();
+            for _round in 0..8 {
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+                let mut round_assignments: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    let (assigns, frames) = drain_assignments_and_taskfailed_frames(rx);
+                    round_assignments.extend(assigns);
+                    taskfailed_frame_sizes_seen.extend(frames);
+                }
+                for (_, sec, worker, h) in &round_assignments {
+                    if *h == import_hash {
+                        primary
+                            .handle_task_failed(task_failed(sec, *worker, h), &mut None)
+                            .await;
+                        settle_pump().await;
+                    } else {
+                        assert!(
+                            !build_hashes.contains(h),
+                            "a build dispatched before the batch fast-fail; the \
+                             burst must terminal-fail every dependent off the \
+                             import failure"
+                        );
+                    }
+                }
+                let both_failed = ["sec-0", "sec-1"].iter().all(|sec| {
+                    primary.cluster_state_for_test().affine_state(sec, affine_id)
+                        == AffineCell::Failed
+                });
+                if both_failed {
+                    break;
+                }
+            }
+
+            for sec in ["sec-0", "sec-1"] {
+                assert_eq!(
+                    primary.cluster_state_for_test().affine_state(sec, affine_id),
+                    AffineCell::Failed,
+                    "the import cell must be Failed on {sec} (arming transition)"
+                );
+            }
+
+            // Collect any final TaskFailed broadcast frames the last failure's
+            // batch shipped.
+            for (_id, rx, _tx) in ends.iter_mut() {
+                let (_assigns, frames) = drain_assignments_and_taskfailed_frames(rx);
+                taskfailed_frame_sizes_seen.extend(frames);
+            }
+
+            // FLAW 1 — NONE LOST: every one of the N dependents is terminal.
+            let mut terminal = 0usize;
+            for h in &build_hashes {
+                if primary
+                    .cluster_state_for_test()
+                    .task_state(h)
+                    .is_some_and(|s| s.is_terminal())
+                {
+                    terminal += 1;
+                }
+            }
+            assert_eq!(
+                terminal, n_deps,
+                "ALL {n_deps} dependents (>> channel capacity \
+                 {COMMAND_CHANNEL_CAPACITY}) must terminal-fail — none dropped by \
+                 a bounded-channel overflow"
+            );
+
+            // FLAW 1 — the command channel was NEVER used for the burst (the
+            // batch is driven directly): no FailPermanent queued.
+            {
+                let mut rx = primary.command_rx.take().expect("command_rx present");
+                assert!(
+                    rx.try_recv().is_err(),
+                    "the burst must NOT enqueue any FailPermanent onto the bounded \
+                     command channel — it is failed directly via the batch"
+                );
+                primary.command_rx = Some(rx);
+            }
+
+            // FLAW 2 — ONE broadcast: the burst's TaskFaileds were shipped to
+            // each secondary in EXACTLY ONE ClusterMutation frame (not N frames).
+            // Each of the 2 secondaries receives the single broadcast once, so we
+            // expect every recorded frame to carry the whole burst and the
+            // per-secondary frame count to be 1.
+            assert!(
+                !taskfailed_frame_sizes_seen.is_empty(),
+                "the burst must have produced at least one TaskFailed broadcast"
+            );
+            // The single batch broadcast carries ALL N dependents' TaskFaileds in
+            // one frame; replicated to 2 secondaries ⇒ at most 2 frames, each of
+            // size N. (If the per-item path regressed, we'd see N*2 frames of
+            // size 1.)
+            assert!(
+                taskfailed_frame_sizes_seen.len() <= ends.len(),
+                "the burst must be ONE broadcast per secondary (≤ {} frames), got \
+                 {} frames {:?} — a per-item regression would show ~{} frames",
+                ends.len(),
+                taskfailed_frame_sizes_seen.len(),
+                taskfailed_frame_sizes_seen,
+                n_deps * ends.len()
+            );
+            for sz in &taskfailed_frame_sizes_seen {
+                assert_eq!(
+                    *sz, n_deps,
+                    "each broadcast frame must carry ALL {n_deps} TaskFaileds in \
+                     one batch (got a frame of {sz}) — proof the broadcast is \
+                     batched, not per-item"
+                );
+            }
+        })
+        .await;
+}
+
+/// IN-FLIGHT DEP IS UNMET (the multi-worker-same-node race): a WORK unit whose
+/// affine deps are `[base, delta]` IN ORDER must treat an in-flight (`Queued`)
+/// `base` as NOT MET — the readiness gate must classify it `InFlightHere` and
+/// WAIT (withhold assignment), NEVER skip the unmet base to `StrandedHere`-
+/// dispatch the later `NotDone` delta.
+///
+/// The bug: with ≥2 workers on the same secondary, worker A claims the shared
+/// `base` import (its cell → `Queued`, in flight). Worker B then pops a
+/// `build_variant` whose deps are `[base, delta]`. The old ORDER-BLIND gate
+/// (`Failed` > `NotDone` > `Queued`) saw `base=Queued` + `delta=NotDone`, and
+/// since `NotDone` outranked `Queued` it returned `StrandedHere` — ASSIGNING the
+/// delta import to a worker BEFORE the base had landed on the node (the delta's
+/// imported path is invalid until the base is present ⇒ "path … is not valid"
+/// NonRecoverable). The list-order dependency-not-met gate classifies
+/// `base=Queued` as `InFlightHere` (unmet ⇒ wait) instead, so the delta is never
+/// considered — let alone assigned — until the base is `Done`.
+///
+/// Pins all the shapes the gate must produce, so a regression to the order-blind
+/// skip is caught directly at the classification:
+///   * `[base=Queued, delta=NotDone]` → `InFlightHere` (the BUG: was StrandedHere).
+///   * `[base=NotDone, delta=NotDone]` → `StrandedHere` (first not-Done is NotDone).
+///   * `[base=Done,    delta=NotDone]` → `StrandedHere` (advance past Done to delta).
+///   * `[base=Done,    delta=Queued ]` → `InFlightHere` (delta now the unmet one).
+///   * `[base=Done,    delta=Done   ]` → `Ready`.
+///   * `[base=Failed,  delta=NotDone]` → terminal (Failed is order-independent):
+///     Reroute to the still-satisfiable sibling secondary.
+///   * `base Failed on EVERY secondary`  → `Unsatisfiable` (unchanged).
+#[tokio::test(flavor = "current_thread")]
+async fn affine_gate_inflight_dep_is_unmet_not_skipped_to_delta() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let base = affine_import("base");
+            let delta = affine_import("delta");
+            let base_hash = compute_task_hash(&base);
+            let delta_hash = compute_task_hash(&delta);
+            let build = work_two_deps("build", "base", "delta");
+
+            let (mut primary, _ends, _wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![base, delta, build.clone()]);
+            confirm_two(&mut primary).await;
+
+            let base_aid = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&base_hash)
+                .expect("registered base affine-id");
+            let delta_aid = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&delta_hash)
+                .expect("registered delta affine-id");
+
+            // Helper: set a cell on a secondary directly. Cells are LWW by an
+            // ever-increasing generation, so each write (incl. a NotDone reset via
+            // SecondaryAffineUnqueued) out-stamps the previous — the gate test can
+            // walk a cell through any sequence of states. `gen` is a shared
+            // monotone counter so every write wins over the prior cell value.
+            let mut cell_gen: u64 = 1;
+            let mut set = |primary: &mut TestPrimary,
+                           sec: &str,
+                           aid: crate::cluster_state::AffineId,
+                           cell: AffineCell| {
+                let g = cell_gen;
+                cell_gen += 1;
+                let mutation = match cell {
+                    AffineCell::Queued => ClusterMutation::SecondaryAffineQueued {
+                        secondary: sec.into(),
+                        affine_id: aid.0,
+                        generation: g,
+                    },
+                    AffineCell::Done => ClusterMutation::SecondaryAffineFinished {
+                        secondary: sec.into(),
+                        affine_id: aid.0,
+                        generation: g,
+                    },
+                    AffineCell::Failed => ClusterMutation::SecondaryAffineFailed {
+                        secondary: sec.into(),
+                        affine_id: aid.0,
+                        generation: g,
+                    },
+                    AffineCell::NotDone => ClusterMutation::SecondaryAffineUnqueued {
+                        secondary: sec.into(),
+                        affine_id: aid.0,
+                        generation: g,
+                    },
+                };
+                primary.cluster_state_mut_for_test().apply(mutation);
+            };
+            let label =
+                |primary: &TestPrimary| primary.affine_gate_label_for_test("sec-0", &build);
+
+            // THE BUG SHAPE: base in flight (Queued), delta NotDone. Must WAIT on
+            // the unmet in-flight base — NOT skip to (and assign) the delta.
+            set(&mut primary, "sec-0", base_aid, AffineCell::Queued);
+            assert_eq!(
+                label(&primary),
+                "InFlightHere",
+                "an in-flight (Queued) base is UNMET — the gate must WAIT (withhold \
+                 assignment), never skip it to StrandedHere-dispatch the later \
+                 NotDone delta (the multi-worker-same-node 'path is not valid' race)"
+            );
+
+            // base NotDone, delta NotDone → first not-Done is the base (NotDone),
+            // so StrandedHere dispatches the base import (correct: base first).
+            set(&mut primary, "sec-0", base_aid, AffineCell::NotDone);
+            assert_eq!(
+                label(&primary),
+                "StrandedHere",
+                "both NotDone → stranded on the FIRST (base) import"
+            );
+
+            // base Done, delta NotDone → advance past the met base to the delta
+            // (NotDone) → StrandedHere on the delta (the original single-worker
+            // order: base lands, THEN the delta dispatches).
+            set(&mut primary, "sec-0", base_aid, AffineCell::Done);
+            assert_eq!(
+                label(&primary),
+                "StrandedHere",
+                "base Done (met) → advance to the delta (NotDone) and dispatch it"
+            );
+
+            // base Done, delta Queued (in flight) → the delta is now the unmet one.
+            set(&mut primary, "sec-0", delta_aid, AffineCell::Queued);
+            assert_eq!(
+                label(&primary),
+                "InFlightHere",
+                "base met + delta in flight → wait on the unmet delta"
+            );
+
+            // base Done, delta Done → Ready.
+            set(&mut primary, "sec-0", delta_aid, AffineCell::Done);
+            assert_eq!(label(&primary), "Ready", "all deps Done → Ready");
+
+            // FAILED IS ORDER-INDEPENDENT (unchanged): base Failed on sec-0 but
+            // sec-1 still satisfiable → Reroute(sec-1). Reset sec-0's delta cell so
+            // only the (order-independent) Failed base drives the decision.
+            set(&mut primary, "sec-0", delta_aid, AffineCell::NotDone);
+            set(&mut primary, "sec-0", base_aid, AffineCell::Failed);
+            assert_eq!(
+                label(&primary),
+                "Reroute(sec-1)",
+                "a Failed base is order-independent terminal → reroute to the \
+                 still-satisfiable sibling secondary"
+            );
+
+            // base Failed on EVERY secondary → Unsatisfiable (unchanged).
+            set(&mut primary, "sec-1", base_aid, AffineCell::Failed);
+            assert_eq!(
+                primary.affine_gate_label_for_test("sec-0", &build),
+                "Unsatisfiable",
+                "a base Failed on EVERY eligible secondary is Unsatisfiable \
+                 (the all-Failed terminal — unchanged)"
+            );
+        })
+        .await;
+}
+
+/// END-TO-END under ≥2 workers on the SAME secondary (the live race): two
+/// `build_variant`s share a base import and each layer a distinct delta on top
+/// (`build_a` deps `[base, delta_a]`, `build_b` deps `[base, delta_b]`). With 2
+/// idle workers on one secondary, the first build to commit claims the base
+/// import (cell → Queued, in flight); the SECOND build, popped for the sibling
+/// worker while the base is still `Queued` (UNMET), must NOT be assigned its
+/// delta import ahead of the base — it `InFlightHere`-waits at the queue front.
+/// Only after the base reaches `Done` (met) does each build's delta dispatch.
+/// The invariant re-checked every round: NO delta import is ever ASSIGNED on a
+/// secondary whose base cell is not yet `Done`.
+#[tokio::test(flavor = "current_thread")]
+async fn affine_multiworker_same_node_delta_never_assigned_before_base_done() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let base = affine_import("base");
+            let delta_a = affine_import("delta_a");
+            let delta_b = affine_import("delta_b");
+            let base_hash = compute_task_hash(&base);
+            let delta_a_hash = compute_task_hash(&delta_a);
+            let delta_b_hash = compute_task_hash(&delta_b);
+            let build_a = work_two_deps("build_a", "base", "delta_a");
+            let build_b = work_two_deps("build_b", "base", "delta_b");
+
+            // 2 workers on sec-0 (forces the same-node concurrent pop); sec-1 has 1.
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_two_secondaries_with(vec![base, delta_a, delta_b, build_a, build_b]);
+            primary
+                .handle_cluster_mutation(capacity_batch("sec-0", 2), &mut None)
+                .await;
+            primary.handle_mesh_ready(mesh_ready_from("sec-0"));
+            primary
+                .handle_cluster_mutation(capacity_batch("sec-1", 1), &mut None)
+                .await;
+            primary.handle_mesh_ready(mesh_ready_from("sec-1"));
+
+            let base_aid = primary
+                .cluster_state_for_test()
+                .affine_id_for_hash(&base_hash)
+                .expect("registered base affine-id");
+
+            // INVARIANT: a DELTA import is never ASSIGNED to a secondary whose BASE
+            // cell is not yet `Done`. A delta assigned before the base is the exact
+            // "path is not valid" race the dependency-not-met gate closes.
+            let assert_delta_only_after_base_done =
+                |primary: &TestPrimary, round: &[(String, String, u32, String)]| {
+                    for (_, sec, _, h) in round {
+                        if *h == delta_a_hash || *h == delta_b_hash {
+                            assert_eq!(
+                                primary.cluster_state_for_test().affine_state(sec, base_aid),
+                                AffineCell::Done,
+                                "a DELTA import was assigned on {sec} whose BASE cell \
+                                 is NOT Done — an unmet in-flight base was skipped \
+                                 (the multi-worker race); got {round:?}"
+                            );
+                        }
+                    }
+                };
+
+            // Drive to quiescence, completing every dispatched import on its
+            // secondary. The base must dispatch (and complete) before any delta on
+            // that node; the invariant catches any premature delta assignment.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let mut base_dispatches_by_sec: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+            loop {
+                let mut round: Vec<(String, String, u32, String)> = Vec::new();
+                for (_id, rx, _tx) in ends.iter_mut() {
+                    round.extend(assignments(rx));
+                }
+                if round.is_empty() {
+                    break;
+                }
+                assert_delta_only_after_base_done(&primary, &round);
+                for (_, sec, _, h) in &round {
+                    if *h == base_hash {
+                        *base_dispatches_by_sec.entry(sec.clone()).or_insert(0) += 1;
+                    }
+                }
+                for (_, sec, worker, h) in &round {
+                    primary
+                        .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                        .await;
+                    settle_pump().await;
+                }
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+            }
+
+            // The base dispatched EXACTLY ONCE on each secondary that ran it (the
+            // dependency-not-met wait serializes it, the run-once guard dedups it
+            // — not once-per-build). At least one node ran it.
+            assert!(
+                !base_dispatches_by_sec.is_empty(),
+                "the shared base import must have dispatched on at least one secondary"
+            );
+            for (sec, count) in &base_dispatches_by_sec {
+                assert_eq!(
+                    *count, 1,
+                    "the shared base import must dispatch EXACTLY ONCE on {sec}; got {count}"
+                );
+            }
+
+            // Both builds completed (each on a node whose base + its own delta
+            // reached Done — enforced by the per-round invariant), and the run
+            // drains cleanly with every slot freed.
+            assert_eq!(
+                primary.active_workers_for_test(),
+                0,
+                "no worker slot may stay Assigned after the run drains"
+            );
+            assert!(
+                primary.run_complete_check(),
+                "the run must complete once the base + both deltas + both builds drain"
             );
         })
         .await;
