@@ -720,12 +720,14 @@ impl<I: Identifier> ClusterState<I> {
             // gather route through), NOT shipped as a head field.
             // `_`-dropped exactly like `settled`.
             output_store: _output_store,
-            // Frozen task-def registry — REPLICATED, but NOT carried in the
-            // snapshot HEAD in L1: a restoring replica rebuilds it (empty,
-            // re-populated as it interns defs it observes); the full
-            // def-transfer over the stream is a later leaf. `_`-dropped here
-            // exactly like `settled` (a task-batch / file-served concern,
-            // not a head field) and bound for the exhaustive guard.
+            // Frozen task-def registry — REPLICATED, but NOT carried as a
+            // SEPARATE snapshot HEAD field: each def rides INLINE by value on
+            // its own `TaskState` (the self-describing `def_id`), so the
+            // restoring replica rebuilds its id↔def + hash↔id bindings per-task
+            // via `register_restored_def` in the task-batch loop (so
+            // `resolve(def_id)` works post-restore). `_`-dropped here exactly
+            // like `settled` (a task-batch concern, not a head field) and bound
+            // for the exhaustive guard.
             definitions: _definitions,
             // ── head partition: REPLICATED CRDT, head-safe ──: the
             // per-secondary affine bitvector is per-cell LWW (never join-bumped
