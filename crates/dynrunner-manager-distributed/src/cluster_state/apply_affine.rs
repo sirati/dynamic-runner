@@ -30,7 +30,26 @@ impl<I: Identifier> ClusterState<I> {
         let already = self.definitions.affine_id_for_hash(hash) == Some(AffineId(affine_id));
         match self.definitions.intern_affine_at(AffineId(affine_id), hash) {
             Ok(_) if already => ApplyOutcome::NoOp,
-            Ok(_) => ApplyOutcome::Applied,
+            Ok(_) => {
+                // Stamp the affine-id INLINE onto the live `TaskState`'s def so
+                // the binding is self-describing in a snapshot. The snapshot
+                // serializes THIS per-task def by value (NOT the def store's
+                // registry, which it discards + rebuilds per-task via
+                // `register_restored_def`), so a snapshot-promoted / relocated
+                // primary's ONLY carrier of the affine binding is the def's own
+                // `affine_id` field. Without this, the restored def resolves
+                // `affine_id_for_hash == None`, the dependent's affine deps read
+                // EMPTY in `affine_placement_for`, the per-secondary import is
+                // never placed, and the run stalls with the import phase held
+                // open (the secondary-affine --mode local stall). The
+                // `TaskState`'s def is a separate `Arc` from the store slot, so
+                // stamping the store slot alone would fork an unstamped per-task
+                // copy into the snapshot — the stamp MUST happen here.
+                if let Some(state) = self.tasks.get_mut(hash) {
+                    std::sync::Arc::make_mut(state.def_mut()).affine_id = Some(AffineId(affine_id));
+                }
+                ApplyOutcome::Applied
+            }
             Err(err) => {
                 Self::log_affine_bijection_violation(&err);
                 ApplyOutcome::NoOp

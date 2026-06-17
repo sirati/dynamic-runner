@@ -78,6 +78,36 @@ impl<I: Identifier> PendingPool<I> {
         self.maybe_transition_drain(phase_id);
     }
 
+    /// Record an AFFINE prereq's FIRST per-secondary terminal — the
+    /// phase-neutral pool notification fired by the manager's
+    /// `handle_affine_task_complete` once the import's first run originates its
+    /// global `TaskCompleted`.
+    ///
+    /// DISTINCT from [`Self::on_item_finished`]: an affine import is uncounted
+    /// for phase drain (never `mark_in_flight`'d, excluded from `queued_count`),
+    /// so there is NO `in_flight_per_phase` decrement to do; and its dependents'
+    /// readiness is the per-secondary bitvector, NOT this global terminal, so it
+    /// must NOT run `resolve_completed_dependents` (which would unblock a
+    /// dependent against a single global terminal — the head-of-line-blocking
+    /// the per-secondary model removes). The ONLY two effects are:
+    ///   1. record the affine `task_id` terminal in `completed_tasks` so
+    ///      [`Self::phase_has_live_affine_prereq`] flips `false` for its phase
+    ///      (the import is no longer live); and
+    ///   2. re-run [`Self::maybe_transition_drain`] for its phase so the
+    ///      now-genuinely-drained affine-only phase is pushed onto
+    ///      `drained_pending` for the manager's drain-edge — the re-trigger the
+    ///      affine terminal otherwise lacks (it is phase-neutral and emits only
+    ///      `TasksAdded`, which never re-polls the lifecycle).
+    ///
+    /// Idempotent: a re-delivered same-/other-secondary terminal re-inserts an
+    /// already-present id (a no-op `HashSet` insert) and re-runs an idempotent
+    /// transition. Only the FIRST run reaches here (the manager gates on the
+    /// global `TaskState` not-yet-terminal), but the method is safe regardless.
+    pub fn note_affine_terminal(&mut self, phase_id: &PhaseId, task_id: &str) {
+        self.completed_tasks.insert(task_id.to_string());
+        self.maybe_transition_drain(phase_id);
+    }
+
     /// Record `id` completed and unblock every dependent whose final
     /// unresolved prereq this resolves: move it `blocked → FRONT of its
     /// bucket` (matching `requeue` so freshly-unblocked tasks dispatch ahead
@@ -912,8 +942,23 @@ impl<I: Identifier> PendingPool<I> {
         // phase before its predecessor finished injecting.
         let predecessors_done = self.predecessors_done(phase_id);
 
+        // Model-B affine guard. A phase holding a LIVE (non-terminal)
+        // `SecondaryAffine` import is NOT drained — the import is real work
+        // that has not reached a terminal. Its bucket token is uncounted in
+        // `queued` (and it is never `in_flight`/`blocked`), so the counters
+        // alone read `(0,0,0)` for an affine-only phase from SEED time; this
+        // guard suppresses the `Drained`-producing arms until the import's
+        // first per-secondary run records its terminal via
+        // `note_affine_terminal`, which re-runs this transition. The pool-side
+        // counterpart of the CRDT rollup's `has_live` (the manager's
+        // `phase_can_proceed` arm), keeping the pool the single owner of the
+        // drain decision rather than the manager re-deciding it. The non-
+        // `Drained` arms (`Active` / `Draining` / hold-`current`) are
+        // unaffected — they already keep a phase with live work open.
+        let drained_eligible = !self.phase_has_live_affine_prereq(phase_id);
+
         let next = match (queued, in_flight, blocked) {
-            (0, 0, 0) if predecessors_done => PhaseState::Drained,
+            (0, 0, 0) if predecessors_done && drained_eligible => PhaseState::Drained,
             (0, 0, 0) => current,
             // Blocked items remain, but every one of them is DOOMED by a
             // dead prereq (final-failed anywhere, or soft-failed in THIS
@@ -929,7 +974,14 @@ impl<I: Identifier> PendingPool<I> {
             // dependents stay blocked) or finalizes
             // (`finalize_soft_failures` cascade-fails the dependents
             // before `on_phase_end` fires).
-            (0, 0, _) if self.live_blocked_count(phase_id) == 0 => PhaseState::Drained,
+            //
+            // A live affine import suppresses this drain arm too (`Draining`
+            // is the honest state: the queue is empty of counted work but the
+            // import is still live), so a phase whose blocked dependents are
+            // all doomed yet still holds a live import waits for the import.
+            (0, 0, _) if drained_eligible && self.live_blocked_count(phase_id) == 0 => {
+                PhaseState::Drained
+            }
             (0, _, _) => PhaseState::Draining,
             (_, _, _) => PhaseState::Active,
         };
@@ -1032,5 +1084,46 @@ impl<I: Identifier> PendingPool<I> {
                     .count()
             })
             .sum()
+    }
+
+    /// Whether `phase_id` still holds a LIVE (non-terminal) `SecondaryAffine`
+    /// prereq token — the drain-detection's affine guard.
+    ///
+    /// Under Model B the affine prereq stays in its bucket as a
+    /// non-worker-assignable LEDGER TOKEN, EXCLUDED from [`Self::queued_count`]
+    /// (it is never consumed from the bucket on a drain path) and never
+    /// `mark_in_flight`'d (its per-secondary runs are driven off-queue). So the
+    /// `(queued, in_flight, blocked)` counters `maybe_transition_drain` keys on
+    /// are all ZERO for a phase whose ONLY content is a no-dep affine import —
+    /// at SEED time, BEFORE that import has been placed/dispatched/run. Without
+    /// this guard the phase would flip `Drained` immediately and the manager's
+    /// drain-edge `phase_can_proceed` would evaluate against a still-live import
+    /// (its global `TaskState` is `Pending` until its FIRST per-secondary run
+    /// originates a `TaskCompleted`), false-failing the run. A phase with a live
+    /// import is NOT drained — it owns work that has not yet reached a terminal,
+    /// exactly the invariant the CRDT rollup's `has_live` expresses; this is its
+    /// pool-side counterpart, keyed on the pool's own terminal sets so the pool
+    /// stays the single owner of the drain decision.
+    ///
+    /// "Live" = the token's `task_id` is in `affine_prereq_ids` but NOT yet in
+    /// `completed_tasks` / `failed_tasks` — the affine first-run terminal is
+    /// recorded into `completed_tasks` by [`Self::note_affine_terminal`] (the
+    /// phase-neutral pool notification the manager fires from
+    /// `handle_affine_task_complete`), which flips this predicate and re-runs
+    /// the drain transition so the now-genuinely-drained phase is observed. The
+    /// token stays in the bucket until `mark_phase_done → drop_affine_items`, so
+    /// bucket-membership alone cannot distinguish "never run" from "first run
+    /// done" — the terminal set is the discriminator.
+    fn phase_has_live_affine_prereq(&self, phase_id: &PhaseId) -> bool {
+        self.buckets
+            .iter()
+            .filter(|((p, _, _), _)| p == phase_id)
+            .flat_map(|(_, b)| b.items.iter())
+            .any(|item| {
+                item.kind.is_secondary_affine()
+                    && self.affine_prereq_ids.contains(item.task_id.as_str())
+                    && !self.completed_tasks.contains(item.task_id.as_str())
+                    && !self.failed_tasks.contains(item.task_id.as_str())
+            })
     }
 }
