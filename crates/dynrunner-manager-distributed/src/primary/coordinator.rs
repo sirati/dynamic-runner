@@ -3049,6 +3049,50 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         {
             return true;
         }
+        // Transport-deliverability gate (RCA disco-prune, edge C). A member
+        // that was silently dropped (its raw mesh leg disconnected) lingers
+        // `Alive` in every membership view until the slow
+        // keepalive→consensus removal converges. `is_peer_alive` (CRDT
+        // membership) therefore reads `true` for the SAME lag window the bug
+        // lives in — useless here. The transport's live deliverability set
+        // (`MeshClient::has_route`, pump-published from a LIVE transport
+        // read) flips to `false` the moment a dispatched `TaskAssignment`
+        // can no longer be DELIVERED to the secondary — INDEPENDENT of the
+        // consensus removal. Dispatching to a peer the transport cannot
+        // reach strands the work on a dead leg until that slow removal, so a
+        // member with no delivery route RIGHT NOW is skipped.
+        //
+        // `has_route`, NOT `has_peer`: deliverability is direct OR relay. A
+        // member whose DIRECT leg never registered (or dropped) is still a
+        // valid dispatch target while a connected forwarder can relay the
+        // directed frame to it — the live mid-run-joiner-via-sibling-relay
+        // path the dispatch tests pin. `has_peer` (direct-wire only) would
+        // wrongly skip such a relay-reachable member; `has_route` skips ONLY
+        // when the transport has NO path at all (no direct wire AND every
+        // forwarder blacklisted / the fleet isolated) — exactly the
+        // silently-dropped/unreachable state the bug strands work into, and
+        // the same `has_route` predicate the observer-delivery reachability
+        // gate (`broadcast_observer_relocation`) already uses.
+        //
+        // This is the primary↔secondary OPERATIONAL leg the dispatch's
+        // `TaskAssignment` rides — NOT the secondary↔secondary failover peer
+        // mesh the docstring above deliberately refuses to veto on. The
+        // primary's own `MembershipView` projects the routes THIS primary
+        // has to the secondaries.
+        //
+        // The colocated self-secondary (same node as this primary, sharing
+        // `PrimaryConfig.node_id` as its id — see the primary-pinned filter
+        // at `cluster_view_for_worker`) has NO transport route to itself by
+        // construction: the mesh forbids self-links and resolves its frames
+        // as in-process loopback, so `has_route(node_id)` is ALWAYS `false`.
+        // It is always dispatchable and must be exempted from this gate, or
+        // the primary would wrongly refuse to feed its own workers.
+        if sec_id != self.config.node_id {
+            let leg = dynrunner_protocol_primary_secondary::PeerId::from(sec_id);
+            if !self.client.has_route(&leg) {
+                return true;
+            }
+        }
         if !bypass_backpressure && self.is_backpressured(sec_id) {
             return true;
         }
