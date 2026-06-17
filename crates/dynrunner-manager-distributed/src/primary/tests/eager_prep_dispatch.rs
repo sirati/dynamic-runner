@@ -206,6 +206,151 @@ fn cell_of(primary: &TestPrimary, prep_hash: &str) -> crate::cluster_state::Seco
         .expect("registered eager-prep cell-id")
 }
 
+/// A `SecondaryCellQueued` mutation for `(secondary, cell_id)`.
+fn cell_queued(secondary: &str, cell_id: crate::cluster_state::SecondaryCellId) -> ClusterMutation<TestId> {
+    ClusterMutation::SecondaryCellQueued {
+        secondary: secondary.into(),
+        cell_id: cell_id.0,
+        generation: 0,
+    }
+}
+
+/// (Step 6a) A phase boundary resets a STALE `Queued` eager-prep cell (no
+/// running prep) back to `NotDone` so a later tick can re-pick it.
+#[tokio::test(flavor = "current_thread")]
+async fn phase_transition_resets_stale_queued_eager_prep_cell() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let prep = eager_prep("prep");
+            let prep_hash = compute_task_hash(&prep);
+            let (mut primary, _ends, _wm_rx, _mesh) = primary_one_secondary_with(vec![prep]);
+            confirm_one(&mut primary).await;
+            let cid = cell_of(&primary, &prep_hash);
+
+            // Stamp a STALE Queued claim (no worker actually holds the hash).
+            crate::cluster_state::apply_locally_for_broadcast(
+                primary.cluster_state_mut_for_test(),
+                vec![cell_queued("sec-0", cid)],
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state("sec-0", cid),
+                SecondaryCell::Queued,
+            );
+
+            // The phase-boundary reset clears the stale claim.
+            primary.reset_stale_eager_prep_cells().await;
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state("sec-0", cid),
+                SecondaryCell::NotDone,
+                "a stale Queued eager-prep cell must reset to NotDone at the phase boundary"
+            );
+        })
+        .await;
+}
+
+/// (Step 6b) A RUNNING eager-prep cell (a live slot holds its hash) is NOT
+/// reset across a phase boundary (Q1 leave-running).
+#[tokio::test(flavor = "current_thread")]
+async fn phase_transition_does_not_reset_running_eager_prep_cell() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let prep = eager_prep("prep");
+            let prep_hash = compute_task_hash(&prep);
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_one_secondary_with(vec![prep]);
+            confirm_one(&mut primary).await;
+            let cid = cell_of(&primary, &prep_hash);
+
+            // Let the filler actually DISPATCH the prep: the worker slot now
+            // holds the hash (RUNNING) and the cell is Queued.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            let dispatched = assignments(&mut ends[0].1);
+            assert!(
+                dispatched.iter().any(|(_, _, _, h)| *h == prep_hash),
+                "prep should have dispatched (running); got {dispatched:?}"
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state("sec-0", cid),
+                SecondaryCell::Queued,
+            );
+
+            // The phase-boundary reset must LEAVE a running prep's cell Queued.
+            primary.reset_stale_eager_prep_cells().await;
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state("sec-0", cid),
+                SecondaryCell::Queued,
+                "a RUNNING eager-prep cell must NOT be reset (Q1 leave-running)"
+            );
+        })
+        .await;
+}
+
+/// (Step 6c) A phase transition COMPLETES even with a live (Queued) eager-prep
+/// cell — proving `counts_for_phase_drain=false` end-to-end: the real work
+/// drains the phase, and the live eager-prep cell never holds it open.
+#[tokio::test(flavor = "current_thread")]
+async fn phase_completes_with_live_eager_prep_cell() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let prep = eager_prep("prep");
+            let prep_hash = compute_task_hash(&prep);
+            let job = work("job");
+            let job_hash = compute_task_hash(&job);
+            let (mut primary, mut ends, mut wm_rx, _mesh) =
+                primary_one_secondary_with(vec![prep, job]);
+            confirm_one(&mut primary).await;
+            let cid = cell_of(&primary, &prep_hash);
+
+            // Hold the eager-prep cell Queued (a "live" eager-prep claim) for
+            // the whole phase. The real work must still drain the phase.
+            crate::cluster_state::apply_locally_for_broadcast(
+                primary.cluster_state_mut_for_test(),
+                vec![cell_queued("sec-0", cid)],
+            );
+
+            // Dispatch + complete the REAL work, draining the phase.
+            drain_rechecks(&mut primary, &mut wm_rx).await;
+            for _ in 0..6 {
+                let round = assignments(&mut ends[0].1);
+                let mut completed_job = false;
+                for (_, sec, worker, h) in &round {
+                    if *h == job_hash {
+                        primary
+                            .handle_task_complete(task_complete(sec, *worker, h), &mut None)
+                            .await;
+                        completed_job = true;
+                    }
+                    settle_pump().await;
+                }
+                drain_rechecks(&mut primary, &mut wm_rx).await;
+                if completed_job {
+                    break;
+                }
+            }
+
+            // The phase reached `Done` despite the still-Queued eager-prep cell
+            // (uncounted for drain). The eager-prep cell is unaffected by the
+            // work's phase drain.
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&job_hash),
+                    Some(crate::cluster_state::TaskState::Completed { .. })
+                ),
+                "the real work completed and drained the phase (got {:?})",
+                primary.cluster_state_for_test().task_state(&job_hash),
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().affine_state("sec-0", cid),
+                SecondaryCell::Queued,
+                "the live eager-prep cell is untouched by the work's phase drain"
+            );
+        })
+        .await;
+}
+
 /// (a) The filler fires ONLY when the worker has nothing else: with an
 /// eager-prep task and NO pending work, an idle worker speculatively runs the
 /// prep, claims the cell `Queued`, and dispatches it.

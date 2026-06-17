@@ -6851,6 +6851,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     }])
                     .await;
                     self.pool_mut().mark_phase_done(p);
+                    // EAGER-PREP stale-claim reset (#638, Q2 pre-existing-only):
+                    // at this phase boundary, reset any pre-existing eager-prep
+                    // `Queued → NotDone` cell whose prep is NOT currently RUNNING
+                    // — a claimed-but-abandoned speculative prep, so a later tick
+                    // can re-pick it. A RUNNING prep (a slot holds its hash) is
+                    // EXCEPTED (Q1 leave-running). This is a PRIMARY cell-reset
+                    // (the shared `SecondaryCellUnqueued`), NOT a pool-bucket drop
+                    // — eager-prep is never a pool token, so the phase buckets are
+                    // untouched (keeping `queued_count` / `drop_affine_items`
+                    // byte-identical). Phase-AGNOSTIC: it touches only stale
+                    // eager-prep cells, nothing about this phase's work.
+                    self.reset_stale_eager_prep_cells().await;
                 } else {
                     // Same run-fail chokepoint as the raise branch
                     // above: the emit synchronously freezes dispatch.

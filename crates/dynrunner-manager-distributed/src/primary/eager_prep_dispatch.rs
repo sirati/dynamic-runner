@@ -96,6 +96,60 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .await
     }
 
+    /// Phase-boundary STALE-CLAIM reset (#638, Q2 pre-existing-only): reset
+    /// every eager-prep cell that is `Queued` on a live secondary but whose prep
+    /// is NOT currently RUNNING there back to `NotDone`, so a later tick can
+    /// re-pick it. A `Queued` cell with a live holding slot is a RUNNING prep
+    /// (Q1 leave-running) and is EXCEPTED. Done/Failed/NotDone cells are
+    /// untouched (only a stale `01 → 00` un-queue). Emits the shared
+    /// `SecondaryCellUnqueued` — a PRIMARY cell-reset, never a pool-bucket drop
+    /// (eager-prep is not a pool token), so the phase buckets stay byte-identical.
+    ///
+    /// Phase-AGNOSTIC: invoked at the SAME `mark_phase_done` site `drop_affine_items`
+    /// is, but it touches ONLY stale eager-prep cells — nothing about the phase's
+    /// work or any incoming task. A run with no eager-prep cell is a cheap no-op.
+    pub(crate) async fn reset_stale_eager_prep_cells(&mut self) {
+        let cell_ids = self.cluster_state.eager_prep_cell_ids();
+        if cell_ids.is_empty() {
+            return;
+        }
+        // The live roster secondaries (deduped) — a stale claim on a departed
+        // secondary is moot (its cells re-derive on the next placement anyway).
+        let mut secondaries: Vec<String> =
+            self.workers.iter().map(|w| w.secondary_id.clone()).collect();
+        secondaries.sort();
+        secondaries.dedup();
+
+        let mut resets: Vec<ClusterMutation<I>> = Vec::new();
+        for cell_id in cell_ids {
+            let Some(hash) = self
+                .cluster_state
+                .hash_for_cell_id(cell_id)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            for secondary in &secondaries {
+                if self.cluster_state.affine_state(secondary, cell_id) != SecondaryCell::Queued {
+                    continue;
+                }
+                // EXCEPT a RUNNING prep — a live slot holding the hash means the
+                // dispatch is in flight here (leave it running, Q1).
+                if self.secondary_has_slot_holding_hash(secondary, &hash) {
+                    continue;
+                }
+                resets.push(ClusterMutation::SecondaryCellUnqueued {
+                    secondary: secondary.clone(),
+                    cell_id: cell_id.0,
+                    generation: 0,
+                });
+            }
+        }
+        if !resets.is_empty() {
+            self.apply_and_broadcast_cluster_mutations(resets).await;
+        }
+    }
+
     /// Claim the chosen eager-prep cell `Queued` on `secondary` and dispatch its
     /// task to `worker_idx` through the shared `dispatch_one_assignment` seam.
     /// On a non-committed outcome, reset the cell `Queued → NotDone` (the shared

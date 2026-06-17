@@ -14,6 +14,13 @@ fn mk_affine_task(name: &str) -> TaskInfo<RunnerIdentifier> {
     t
 }
 
+/// A `TaskKind::SecondaryEagerPrep` task fixture (twin of `mk_affine_task`).
+fn mk_eager_prep_task(name: &str) -> TaskInfo<RunnerIdentifier> {
+    let mut t = mk_task(name);
+    t.kind = TaskKind::SecondaryEagerPrep;
+    t
+}
+
 /// A `TaskKind::SecondaryAffine` task in a chosen phase (twin of `mk_task_in`).
 fn mk_affine_task_in(name: &str, phase: &str) -> TaskInfo<RunnerIdentifier> {
     let mut t = mk_affine_task(name);
@@ -239,6 +246,67 @@ fn affine_id_binding_survives_snapshot_restore_into_fresh_replica() {
         "the restored replica must re-anchor the affine-id from the def's \
          inline field — else affine placement finds no affine deps and the \
          import never dispatches"
+    );
+}
+
+/// (Step 7 failover, #638) Eager-prep cells live in the REPLICATED bitvector
+/// and their def kind survives snapshot/restore, so a promoted primary
+/// re-derives its eager-prep candidates from the inherited cells with NO queue
+/// to rebuild (model A). Originate an eager-prep def (the kind-blind cell
+/// registration pass binds its cell-id + stamps the inline id), write a Done
+/// cell on one secondary, restore into a fresh replica, and assert the
+/// candidate set, the cell value, and the binding all survive.
+#[test]
+fn eager_prep_cells_and_candidates_survive_failover_into_fresh_replica() {
+    let mut a = ClusterState::<RunnerIdentifier>::new();
+    crate::cluster_state::apply_locally_for_broadcast(
+        &mut a,
+        vec![ClusterMutation::TaskAdded {
+            hash: "h-prep".into(),
+            task: mk_eager_prep_task("prep"),
+            def_id: None,
+        }],
+    );
+    let cid = a
+        .affine_id_for_hash("h-prep")
+        .expect("origin binds the eager-prep cell-id");
+    // The def store reports the cell-id as eager-prep (derived from its kind).
+    assert_eq!(a.eager_prep_cell_ids(), vec![cid]);
+    // Run the prep on sec-0 (cell → Done).
+    crate::cluster_state::apply_locally_for_broadcast(
+        &mut a,
+        vec![ClusterMutation::SecondaryCellFinished {
+            secondary: "sec-0".into(),
+            cell_id: cid.0,
+            generation: 0,
+        }],
+    );
+    assert_eq!(a.affine_state("sec-0", cid), SecondaryCell::Done);
+
+    // A FRESH replica (promoted primary) restores A's snapshot.
+    let mut fresh = ClusterState::<RunnerIdentifier>::new();
+    fresh.restore(a.snapshot());
+
+    // The promoted primary re-derives the SAME eager-prep candidate set (no
+    // queue to rebuild — the cells + def kinds are replicated) and inherits the
+    // Done cell, so its filler skips sec-0 (already run) and would prep only a
+    // not-yet-run secondary.
+    assert_eq!(
+        fresh.eager_prep_cell_ids(),
+        vec![cid],
+        "the promoted primary re-derives the eager-prep candidates from \
+         inherited cells"
+    );
+    assert_eq!(
+        fresh.affine_state("sec-0", cid),
+        SecondaryCell::Done,
+        "the inherited Done cell survives — the prep is not re-run on sec-0"
+    );
+    // A fresh secondary's cell is the default NotDone ⇒ still a candidate.
+    assert_eq!(
+        fresh.non_terminal_cells_for("sec-1", &[cid]),
+        vec![cid],
+        "an un-run secondary is still a placeable eager-prep candidate post-failover"
     );
 }
 
