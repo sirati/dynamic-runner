@@ -271,9 +271,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         secondary: &str,
         unit: QueuedUnit,
     ) -> bool {
-        let (hash, is_work) = match &unit {
-            QueuedUnit::Affine { hash, .. } => (hash.clone(), false),
-            QueuedUnit::Work { hash } => (hash.clone(), true),
+        let (hash, is_work, affine_unit_id) = match &unit {
+            QueuedUnit::Affine { hash, affine_id } => (hash.clone(), false, Some(*affine_id)),
+            QueuedUnit::Work { hash } => (hash.clone(), true, None),
         };
         let Some(task) = self.cluster_state.task_info_for_hash(&hash) else {
             // Not in the fat ledger (settled / gone): the unit is stale. Drop
@@ -346,19 +346,38 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
 
         // PER-SECONDARY RUN-ONCE DISPATCH GUARD (affine import). The import runs
-        // ONCE per secondary, but the placement drags it in once per dependent
+        // ONCE per secondary, but the placement drags it in once PER dependent
         // work task, so a burst of K ready dependents on one secondary enqueues K
-        // import units. Without this guard, K idle workers pop all K and dispatch
-        // the SAME hash concurrently before the first dispatch's cell claim is
-        // visible: only one actually runs, the secondary answers `already_held`
-        // for the rest, and those already-held slots NEVER terminal — they strand
-        // `Assigned` so `active_workers` never returns to 0 and `RunComplete`
-        // never fires. If a slot on THIS secondary already holds the import, drop
-        // the redundant unit (the running one's terminal nudges the dependents).
-        // Scoped to this secondary, so a legitimate per-secondary run elsewhere
-        // is unaffected. WORK units are not run-once and never gated here.
-        if !is_work && self.secondary_has_slot_holding_hash(secondary, &hash) {
-            return false;
+        // redundant import units. Two redundant-run shapes follow, both gated
+        // here against the per-secondary authorities (slot occupancy + the
+        // replicated bitvector cell):
+        //
+        //   * CONCURRENT (the `already_held` storm): K idle workers pop all K
+        //     import units and dispatch the SAME hash at once, before the first
+        //     dispatch's terminal lands. Only one actually runs; the secondary
+        //     answers `already_held` for the rest, and those already-held slots
+        //     NEVER receive a terminal — they strand `Assigned`, so
+        //     `active_workers` never returns to 0 and `RunComplete` never fires.
+        //     Guard: a slot on THIS secondary already holds the hash (in flight
+        //     here now).
+        //   * SEQUENTIAL (a SECOND run-once violation): a leftover import unit
+        //     popped AFTER the first run already completed re-dispatches the
+        //     import — running the per-secondary run-once body twice. Guard: the
+        //     bitvector cell is already `Done` on THIS secondary (the run-once
+        //     authority — it ran here). NOT gated on `Queued`: `place` sets the
+        //     cell `Queued` at placement time, BEFORE the legitimate first
+        //     dispatch, so a `Queued` skip would suppress the real first run.
+        //
+        // Both are scoped to THIS secondary, so a legitimate per-secondary run on
+        // a different secondary is never suppressed. WORK units are not run-once
+        // and are never gated here.
+        if !is_work {
+            let cell_done = affine_unit_id.is_some_and(|aid| {
+                self.cluster_state.affine_state(secondary, aid) == AffineCell::Done
+            });
+            if cell_done || self.secondary_has_slot_holding_hash(secondary, &hash) {
+                return false;
+            }
         }
 
         // POOL ACCOUNTING (Model B). A WORK unit is a pool item (the

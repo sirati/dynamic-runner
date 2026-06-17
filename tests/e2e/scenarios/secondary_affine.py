@@ -28,16 +28,18 @@ FOUND that the two surfaces are NOT both wired in the distributed seed flow:
 The proof (no-dep, the passing gate)
 ------------------------------------
 
-The consumer's ``import_action`` runs ONCE per secondary inside the
-secondary process and appends ``socket.gethostname()`` (the per-node
-identity — the wrapper sets ``--hostname`` to the SLURM worker node's
-FQDN) to a shared-NFS marker file. The build worker appends its own node
-identity to a sibling marker. The assertions read both markers back
-(via gateway ssh in SLURM mode, the publish_dst tmpdir in local mode):
+The consumer's import gate runs ONCE per secondary inside the secondary
+process and appends the worker's SECONDARY-ID (``secondary-{i}``, derived
+from the framework-threaded ``--log-file`` path — distinct per secondary on
+BOTH SLURM and ``--multi-computer local``; ``socket.gethostname()`` would
+collide when co-located secondaries share one host) to a shared marker
+file. The build worker appends its own secondary-id to a sibling marker.
+The assertions read both markers back (via gateway ssh in SLURM mode, the
+publish_dst tmpdir in local mode):
 
-  1. ``import_action`` ran EXACTLY ONCE per secondary that received ≥1
-     build: distinct import-marker nodes == distinct build-marker nodes,
-     and NO node appears in the import marker more than once.
+  1. the import gate ran EXACTLY ONCE per secondary that received ≥1
+     build: distinct import-marker secondaries == distinct build-marker
+     secondaries, and NO secondary appears in the import marker more than once.
   2. ALL k builds completed (none stranded/deadlocked behind the gate).
   3. Multi-dependent-same-secondary: at least one node ran ≥2 builds yet
      imported exactly once (non-vacuous run-once-under-concurrency).
