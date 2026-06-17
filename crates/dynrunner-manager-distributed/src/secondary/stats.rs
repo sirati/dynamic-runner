@@ -50,7 +50,12 @@ where
         };
         let breaches = snapshot.breaches();
         if breaches.is_empty() {
-            tracing::info!(
+            // No threshold breached: a routine periodic heartbeat of the
+            // watched collections, non-actionable on its own. Keep it on
+            // the forensic-complete file log at TRACE rather than the
+            // operator stream — the WARN branch below is the actionable
+            // signal an operator must see.
+            tracing::trace!(
                 custom_unhandled = snapshot.custom_inbox.unhandled,
                 custom_terminal = snapshot.custom_inbox.terminal,
                 custom_payload_bytes = snapshot.custom_inbox.payload_bytes,

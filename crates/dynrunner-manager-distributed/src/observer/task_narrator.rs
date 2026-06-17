@@ -154,52 +154,36 @@ impl ObserverTaskNarrator {
             TaskStateChange::Assigned => {
                 tracing::info!(
                     target: PER_TASK_TARGET,
-                    task = %id,
-                    holder = %holder,
                     "task {id} assigned to {holder}",
                 );
             }
             TaskStateChange::Completed => {
                 tracing::info!(
                     target: PER_TASK_TARGET,
-                    task = %id,
-                    holder = %holder,
                     "task {id} completed on {holder}",
                 );
             }
             TaskStateChange::TerminalFailure { reason, last_error } => {
                 tracing::error!(
                     target: PER_TASK_TARGET,
-                    task = %id,
-                    holder = %holder,
-                    reason = %reason,
-                    last_error = %last_error,
                     "task {id} terminally failed on {holder}: {reason} — {last_error}",
                 );
             }
             TaskStateChange::RecoverableFailure { reason } => {
                 tracing::warn!(
                     target: PER_TASK_TARGET,
-                    task = %id,
-                    holder = %holder,
-                    reason = %reason,
                     "task {id} failed (recoverable) on {holder}: {reason}",
                 );
             }
             TaskStateChange::OomFailure { reason } => {
                 tracing::warn!(
                     target: PER_TASK_TARGET,
-                    task = %id,
-                    holder = %holder,
-                    reason = %reason,
                     "task {id} failed (oom) on {holder}: {reason}",
                 );
             }
             TaskStateChange::Other { state } => {
                 tracing::info!(
                     target: PER_TASK_TARGET,
-                    task = %id,
-                    state = %state,
                     "task {id} changed state to {state}",
                 );
             }
