@@ -566,6 +566,12 @@ impl<I: Identifier> ClusterState<I> {
     pub fn snapshot(&self) -> ClusterStateSnapshot<I> {
         let mut snap = self.stream_head();
         snap.tasks = self.tasks.clone();
+        // INVARIANT GUARD (all tasks are global): a snapshot ships every fat def
+        // INLINE by value, so an UNBOUND def captured here would re-mint
+        // node-local on the restoring replica's `register_restored_def` — the
+        // recompose self-cycle bug class. Loud-fail at this persist seam so an
+        // unstamped task-creation path is caught here, not as a downstream cycle.
+        self.assert_all_defs_global(&snap.tasks, "snapshot");
         // Outputs are served storage-agnostically: under zero-residence the
         // resident `task_outputs` map is (near-)empty — the payload was
         // write-through-then-dropped to the always-on output store at

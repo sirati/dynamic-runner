@@ -959,6 +959,70 @@ fn two_replicas_agree_on_wire_def_id() {
     assert_eq!(b.def_id_for_hash_for_test("h1"), Some(id_a1));
 }
 
+/// `all tasks are global` (the generalized invariant): EVERY task-bearing
+/// mutation that crosses the originate broadcast chokepoint emerges with a
+/// GLOBAL, primary-allocated def_id on every task — NOT just `TaskAdded`. This
+/// drives BOTH task-bearing variants (`TaskAdded` AND the runtime-spawned
+/// `TasksSpawned`) through `apply_locally_for_broadcast` in ONE batch and
+/// asserts: (a) every spawned task's parallel `def_ids` slot is `Some`; (b) the
+/// originator's own store bound a non-UNBOUND id for every task's hash. If a
+/// future task-creation path were added to the enum but NOT wired into the
+/// `tasks_to_stamp` accessor, its tasks would emerge UNBOUND and this test (or
+/// the broadcast-seam guard's debug_assert) would fire.
+#[test]
+fn every_task_bearing_mutation_emerges_globally_stamped() {
+    use crate::primary::wire::compute_task_hash;
+
+    let mut a = ClusterState::<RunnerIdentifier>::new();
+    let added = mk_task("added-task");
+    let added_hash = compute_task_hash(&added);
+    let spawn_a = mk_task("spawn-a");
+    let spawn_b = mk_task("spawn-b");
+    let spawn_a_hash = compute_task_hash(&spawn_a);
+    let spawn_b_hash = compute_task_hash(&spawn_b);
+
+    let batch = vec![
+        ClusterMutation::TaskAdded {
+            hash: added_hash.clone(),
+            task: added,
+            def_id: None,
+        },
+        ClusterMutation::TasksSpawned {
+            tasks: vec![spawn_a, spawn_b],
+            def_ids: Vec::new(),
+        },
+    ];
+    let applied = crate::cluster_state::apply_locally_for_broadcast(&mut a, batch);
+    assert_eq!(applied.applied.len(), 2, "both task-bearing mutations applied");
+
+    // (a) the spawned batch's parallel def_ids are ALL stamped on the wire.
+    let spawn_def_ids = applied
+        .applied
+        .iter()
+        .find_map(|m| match m {
+            ClusterMutation::TasksSpawned { def_ids, .. } => Some(def_ids.clone()),
+            _ => None,
+        })
+        .expect("the TasksSpawned mutation is in the applied set");
+    assert!(
+        spawn_def_ids.len() == 2 && spawn_def_ids.iter().all(|d| d.is_some()),
+        "every spawned task carries a wire def_id: {spawn_def_ids:?}"
+    );
+
+    // (b) the originator's own store bound a GLOBAL (non-UNBOUND) id for EVERY
+    // task's hash, regardless of which variant introduced it.
+    for hash in [&added_hash, &spawn_a_hash, &spawn_b_hash] {
+        let id = a
+            .def_id_for_hash_for_test(hash)
+            .unwrap_or_else(|| panic!("{hash} is interned"));
+        assert_ne!(
+            id,
+            crate::cluster_state::TaskDefId::UNBOUND,
+            "{hash}'s def is globally stamped (the all-tasks-global invariant)"
+        );
+    }
+}
+
 /// A re-added hash REUSES its existing def id (the bijection is idempotent
 /// on hash): a second wire `TaskAdded` for the same hash NoOps at the ledger
 /// (the entry already exists) and never re-binds the id.

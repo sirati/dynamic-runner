@@ -45,7 +45,7 @@ fn assert_index_matches(state: &ClusterState<RunnerIdentifier>) {
 fn no_deps_spawn_leaves_index_empty() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
     let t = mk_task("t");
-    s.apply(ClusterMutation::TasksSpawned { tasks: vec![t] });
+    s.apply(ClusterMutation::TasksSpawned { tasks: vec![t], def_ids: Vec::new() });
     assert!(s.blocked_by_for_test().is_empty());
     assert_index_matches(&s);
 }
@@ -73,7 +73,7 @@ fn spawn_with_pending_dep_indexes_blocked() {
         def_id: None,
     }];
     let dep_hash = crate::primary::wire::compute_task_hash(&dep);
-    s.apply(ClusterMutation::TasksSpawned { tasks: vec![dep] });
+    s.apply(ClusterMutation::TasksSpawned { tasks: vec![dep], def_ids: Vec::new() });
 
     // Sanity: dependent is Blocked-on-prereq.
     match s.task_state(&dep_hash) {
@@ -111,7 +111,7 @@ fn complete_cascade_drains_index_entry() {
             inherit_outputs: false,
             def_id: None,
         }];
-        s.apply(ClusterMutation::TasksSpawned { tasks: vec![dep] });
+        s.apply(ClusterMutation::TasksSpawned { tasks: vec![dep], def_ids: Vec::new() });
     }
     assert_eq!(s.blocked_by_for_test().get(&prereq_hash).map(|s| s.len()), Some(2));
     assert_index_matches(&s);
@@ -170,7 +170,7 @@ fn blocked_idempotent_apply_leaves_index_unchanged() {
         def_id: None,
     }];
     let dep_hash = crate::primary::wire::compute_task_hash(&dep);
-    s.apply(ClusterMutation::TasksSpawned { tasks: vec![dep] });
+    s.apply(ClusterMutation::TasksSpawned { tasks: vec![dep], def_ids: Vec::new() });
     assert_index_matches(&s);
 
     // Same-`on` re-broadcast: NoOp at the apply level. Index unchanged.
@@ -226,6 +226,7 @@ fn set_task_state_blocked_to_blocked_different_on_rebuckets() {
     let dep_hash = crate::primary::wire::compute_task_hash(&dep);
     s.apply(ClusterMutation::TasksSpawned {
         tasks: vec![dep.clone()],
+        def_ids: Vec::new(),
     });
     assert!(
         s.blocked_by_for_test()

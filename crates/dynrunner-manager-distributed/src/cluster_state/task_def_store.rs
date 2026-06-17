@@ -1238,6 +1238,52 @@ impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
         self.reanchor_restored_affine_id(hash, def);
     }
 
+    /// INVARIANT GUARD (`all tasks are global`): every task that crosses a
+    /// persist / broadcast / restore seam MUST carry a GLOBAL, primary-allocated
+    /// `def_id` — `TaskDefId::UNBOUND` is valid ONLY transiently on the
+    /// originating primary BEFORE the stamp pass runs. This durable guard catches
+    /// the WHOLE bug class at the seam: a future task-creation path that skips the
+    /// originate def-id stamp (the recompose self-cycle's root cause) fails LOUD
+    /// here instead of silently re-minting onto a live id on the next failover.
+    ///
+    /// Loud-but-safe, LOG-ONLY (the `register_restored_def` precedent): this
+    /// persist/restore seam is DEFENCE-IN-DEPTH behind the hard `debug_assert!`
+    /// the originate broadcast seam (`broadcast::assert_stamped_for_broadcast`)
+    /// already carries — that one fires at development time on the REAL
+    /// production origination path. Here we only `tracing::error!` per offending
+    /// hash and do NOT panic: a snapshot is also taken in many in-process unit
+    /// fixtures that intern via the node-local L2 fallback (a bare
+    /// `apply(TaskAdded { def_id: None })`), a legitimate non-broadcast shape, so
+    /// a panic here would conflate "an unstamped PRODUCTION origination path"
+    /// (the bug class) with "a node-local test seed" (intended). The loud log
+    /// keeps production observability without aborting a live primary's snapshot.
+    /// `seam` names the crossing for the operator. Returns the count of UNBOUND
+    /// defs found (0 on the healthy production path).
+    pub(crate) fn assert_all_defs_global(
+        &self,
+        tasks: &std::collections::HashMap<String, super::types::TaskState<I>>,
+        seam: &str,
+    ) -> usize {
+        let mut unbound = 0usize;
+        for (hash, state) in tasks {
+            if state.def().def_id == TaskDefId::UNBOUND {
+                unbound += 1;
+                tracing::error!(
+                    target: "dynrunner_cluster_state",
+                    hash = %hash,
+                    seam,
+                    "INVARIANT (all tasks are global): a task with an UNBOUND \
+                     def_id is crossing the {seam} seam — every broadcast / \
+                     persisted / restored task should carry a primary-allocated, \
+                     wire-agreed def_id. A PRODUCTION origination path that hits \
+                     this slipped past the def-id stamp chokepoint \
+                     (broadcast::stamp_def_ids); a node-local unit seed is benign."
+                );
+            }
+        }
+        unbound
+    }
+
     /// Re-anchor a restored `SecondaryAffine` def's affine-id↔hash binding from
     /// the value the [`FrozenTaskDef::affine_id`] carries inline (the affine
     /// twin of the `def_id` re-anchor above — both restore self-describing,

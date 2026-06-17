@@ -1020,6 +1020,12 @@ where
 
         self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TasksSpawned {
             tasks: valid_tasks,
+            // Left empty here; the broadcast choke point's `stamp_def_ids`
+            // pass reserves the primary-allocated, CRDT-agreed def id for
+            // each spawned task and fills this vector BEFORE the apply+wire
+            // (the runtime-spawned analogue of the `TaskAdded { def_id: None }`
+            // origination shape).
+            def_ids: Vec::new(),
         }])
         .await;
 

@@ -1117,6 +1117,37 @@ pub enum ClusterMutation<I> {
     /// from `apply_fail_permanent`.
     TasksSpawned {
         tasks: Vec<TaskInfo<I>>,
+        /// The PRIMARY-allocated, CRDT-agreed compact def index for each
+        /// spawned task's content, ALIGNED BY POSITION to `tasks` (entry
+        /// `i` carries `tasks[i]`'s def id). The runtime-spawned analogue of
+        /// [`Self::TaskAdded`]'s `def_id`: a `TasksSpawned` batch is ALSO
+        /// def-id-stamped at the broadcast choke point
+        /// (`broadcast::stamp_def_ids`) so EVERY replica interns each spawned
+        /// def under the SAME id (the prerequisite for deps-as-index AND for
+        /// a portable, non-UNBOUND def_id surviving into the failover
+        /// snapshot — without it a promoted primary re-mints every spawned
+        /// def node-local from a low floor and aliases live setup-phase ids).
+        /// A parallel `Vec<Option<u32>>` (NOT a per-task `{hash, task,
+        /// def_id}` carrier): `TasksSpawned` is a BATCH mutation whose single
+        /// concern is "one wire event for N tasks" and which carries NO
+        /// per-task hash on the wire (the receiver recomputes it via
+        /// `compute_task_hash`); a positional id vector adds the missing
+        /// carrier with no redundant hash and no second source of truth. The
+        /// per-edge dep ids already ride `TaskDep.def_id` inside each
+        /// `TaskInfo`, exactly as for `TaskAdded`.
+        ///
+        /// `None` per slot (or a SHORT / EMPTY vector — the receiver reads it
+        /// positionally with `get(i).copied().flatten()`) is the un-allocated
+        /// shape: a local-apply caller that does not route through the
+        /// broadcast stamp leaves it empty, and the receiver falls back to
+        /// node-local allocation (the L2 by-content-hash convergence). The
+        /// production WIRE always carries a `Some` per task (the stamp pass
+        /// fills it before the mutation is broadcast). `#[serde(default)]`
+        /// decodes a pre-field sender's frame to an empty vector (wire-safe,
+        /// reads as all-`None`); `skip_serializing_if` trims the bytes on the
+        /// un-allocated local shape.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        def_ids: Vec<Option<u32>>,
     },
     /// An IMPORTANT secondary→primary custom message LANDED at the
     /// authority (F5): the primary (the ONLY originator of this
@@ -1304,4 +1335,57 @@ pub enum ClusterMutation<I> {
         affine_id: u32,
         generation: u64,
     },
+}
+
+/// A single task-bearing entry exposed for def-id stamping: a mutable view
+/// over one task's `TaskInfo` and its primary-allocated def-id carrier slot.
+/// The uniform shape the originate chokepoint stamps, regardless of whether
+/// the source mutation carries ONE task (`TaskAdded`) or a BATCH
+/// (`TasksSpawned`).
+pub struct TaskStampEntry<'a, I> {
+    /// The task whose content this entry's def_id identifies. Mutable so the
+    /// chokepoint can stamp the prerequisite def-ids onto its `task_depends_on`
+    /// edges in the same pass.
+    pub task: &'a mut TaskInfo<I>,
+    /// The primary-allocated, CRDT-agreed def-id carrier for `task`. `None`
+    /// before stamping (the un-allocated originate shape); the chokepoint
+    /// fills it with the allocated id. The receiver reads it to intern the def
+    /// at the wire-agreed slot.
+    pub def_id: &'a mut Option<u32>,
+}
+
+impl<I> ClusterMutation<I> {
+    /// The SINGLE source of truth for "which mutations introduce a task def"
+    /// (the `all tasks are global` invariant's enumeration point): yield a
+    /// uniform [`TaskStampEntry`] per task this mutation introduces, so the
+    /// originate def-id stamp chokepoint stays variant-AGNOSTIC — it iterates
+    /// these entries and never matches a concrete variant. A NEW task-bearing
+    /// variant added to the enum that is not wired into THIS accessor cannot
+    /// be stamped, so the enumeration is forced to live here (the one place a
+    /// reviewer audits), not scattered across the stamp pass.
+    ///
+    /// `TasksSpawned`'s parallel `def_ids` vector is GROWN to align with
+    /// `tasks` here (a fresh origination arrives empty), so every spawned task
+    /// has a carrier slot to stamp. A non-task-bearing mutation yields an empty
+    /// iterator. Hash-keyed task mutations (`TaskAssigned`/`TaskCompleted`/…)
+    /// introduce NO new def — they reuse the ledger entry's existing def — so
+    /// they correctly yield nothing.
+    pub fn tasks_to_stamp(&mut self) -> Vec<TaskStampEntry<'_, I>> {
+        match self {
+            ClusterMutation::TaskAdded { task, def_id, .. } => {
+                vec![TaskStampEntry { task, def_id }]
+            }
+            ClusterMutation::TasksSpawned { tasks, def_ids } => {
+                if def_ids.len() < tasks.len() {
+                    def_ids.resize(tasks.len(), None);
+                }
+                tasks
+                    .iter_mut()
+                    .zip(def_ids.iter_mut())
+                    .map(|(task, def_id)| TaskStampEntry { task, def_id })
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
 }

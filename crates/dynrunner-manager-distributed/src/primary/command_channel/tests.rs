@@ -1735,11 +1735,12 @@ fn tasks_spawned_mutation_round_trips_through_serde() {
     }];
     let m: ClusterMutation<TestId> = ClusterMutation::TasksSpawned {
         tasks: vec![a.clone(), b.clone()],
+        def_ids: Vec::new(),
     };
     let json = serde_json::to_string(&m).expect("serialize");
     let round: ClusterMutation<TestId> = serde_json::from_str(&json).expect("deserialize");
     match round {
-        ClusterMutation::TasksSpawned { tasks } => {
+        ClusterMutation::TasksSpawned { tasks, .. } => {
             assert_eq!(tasks.len(), 2);
             assert_eq!(tasks[0].task_id, "a_id");
             assert_eq!(tasks[1].task_id, "b_id");

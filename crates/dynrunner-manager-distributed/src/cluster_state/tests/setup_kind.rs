@@ -183,7 +183,7 @@ fn dependent_of_succeeded_setup_task_is_dispatchable() {
         def_id: None,
     }];
     let build_hash = crate::primary::wire::compute_task_hash(&build);
-    s.apply(ClusterMutation::TasksSpawned { tasks: vec![build] });
+    s.apply(ClusterMutation::TasksSpawned { tasks: vec![build], def_ids: Vec::new() });
 
     // The dependent resolved its dep against the succeeded setup task and
     // is dispatchable (Pending), NOT Blocked.
