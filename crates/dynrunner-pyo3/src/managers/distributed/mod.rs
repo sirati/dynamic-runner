@@ -142,18 +142,6 @@ pub(crate) struct PyDistributedManager {
     /// `worker_module` holds the `@task_function` handler that executes
     /// the gate body.
 
-    /// Optional Python per-(gate,node) satisfied probe callable supplied at
-    /// `__init__` (#537). UNLIKE the two listeners above (a single
-    /// primary-side concern), the probe is a per-secondary affine-executor
-    /// concern: it is installed on EVERY in-process secondary the manager
-    /// spawns (via the inner coordinator's
-    /// `set_affine_satisfied_probe`), bridged through
-    /// [`crate::affine_satisfied_bridge::PyAffineSatisfiedProbe`]. Each
-    /// spawned secondary's run-once affine executor consults it BEFORE the
-    /// import action on each gate, to short-circuit the producing node.
-    /// Absence leaves each executor with today's behaviour bit-for-bit.
-    pub(super) affine_satisfied_probe: Option<Py<PyAny>>,
-
     /// Optional Python upload callable supplied at `__init__` (#336 P1 /
     /// #493 option-A). `Some` iff the caller passed `upload_action=<callable>`;
     /// the callable is bridged through

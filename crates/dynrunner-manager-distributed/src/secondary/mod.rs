@@ -36,7 +36,6 @@ use crate::zip_extract::ExtractionCache;
 
 use self::lifecycle::{MeshFormation, SecondaryLifecycle};
 
-pub(crate) mod affine_exec;
 pub mod control;
 mod coordinator;
 pub(crate) mod custom_message;
@@ -124,71 +123,6 @@ pub(super) struct PendingFirstBind<I: Identifier> {
     pub(super) file_hash: String,
     pub(super) estimated: dynrunner_core::ResourceMap,
     pub(super) predecessor_outputs: std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>,
-}
-
-/// A work task `B` QUEUED behind this secondary's local SecondaryAffine import
-/// (#497 P4).
-///
-/// When a dispatch assignment for `B` (Phase 5) finds `B` gates on a
-/// SecondaryAffine task `I` whose import is not yet locally done on this node,
-/// the dependent is parked here (in `OperationalState::affine_running[I]`)
-/// until the single per-secondary import for `I` finishes. On the import's
-/// success the executor drains the queued dependents and emits one
-/// `LocalDependencyReleased` per dependent (→ the primary originates
-/// `TaskAssigned` → `B` `InFlight`); on failure it emits one `TaskFailed` per
-/// dependent (re-routable per #495).
-///
-/// Carries EVERYTHING the assignment release (the router's `assign_task`)
-/// needs, mirroring [`PendingFirstBind`]: the resolved [`TaskInfo`] for `B`,
-/// its wire-side `work_hash` (the `active_tasks` key + the release/queue wire
-/// frames' `task_hash`), the chosen `worker_id` slot (pinned onto the
-/// originated `TaskAssigned`), the scheduler's `estimated` usage, and the
-/// `predecessor_outputs` forwarded verbatim so the dependent worker observes
-/// the same shape a non-gated assignment would have produced.
-#[derive(Debug, Clone)]
-pub(super) struct PendingAffineDependent<I: Identifier> {
-    pub(super) work_hash: String,
-    pub(super) worker_id: dynrunner_core::WorkerId,
-    // The resolved binary + scheduler estimate + predecessor outputs are
-    // forwarded VERBATIM to the release dispatch
-    // (`dispatch_released_affine_dependent` → `assign_resolved_task`) when the
-    // import completes (#497 P5 — same "carries everything assign needs"
-    // contract as `PendingFirstBind`).
-    pub(super) binary: TaskInfo<I>,
-    pub(super) estimated: dynrunner_core::ResourceMap,
-    pub(super) predecessor_outputs: std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>,
-}
-
-/// Outcome of [`SecondaryCoordinator::ensure_affine_import`] (#497 P4) — what
-/// the dispatch router (Phase 5) does with the work task `B` after gating it
-/// on its SecondaryAffine dependency `I`.
-///
-/// The three outcomes are mutually exclusive by construction (the node-local
-/// `affine_done` / `affine_running` sets partition the affine hash into
-/// done / in-flight / not-yet-seen):
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AffineGateOutcome {
-    /// `I` is already locally imported (`affine_hash ∈ affine_done`): the
-    /// caller releases `B` STRAIGHT to `InFlight` — no queue, no import, no
-    /// `QueuedAfterLocalDependency` report.
-    AlreadyDone,
-    /// `I`'s import is already in flight (`affine_hash ∈ affine_running`):
-    /// `B` was APPENDED to the existing queue and reported
-    /// `QueuedAfterLocalDependency`; NO second import was started. `B`
-    /// releases when the single in-flight import finishes.
-    QueuedBehindRun,
-    /// `B` is the FIRST dependent on `I`: it inserted the queue, reported
-    /// `QueuedAfterLocalDependency`, and EXACTLY ONE import run was spawned.
-    StartedRun,
-    /// `B`'s primary-assigned target worker is NOT idle, so it was NOT
-    /// parked behind the import: the secondary self-bounds (it holds no
-    /// scheduling authority — the dispatch-decoupling law) by bouncing a
-    /// typed `IllegallyAssignedToNonidleWorker` through the SAME honor-or-
-    /// bounce seam every dispatch uses, leaving the primary to reconcile
-    /// its diverged occupancy and requeue `B`. NOT a `TaskFailed` (no
-    /// retry-budget burn), NOT a park (so it can never silently pile up
-    /// onto a busy worker). The caller dispatches nothing.
-    Bounced,
 }
 
 /// The secondary coordinator: connects to primary, manages local workers.
@@ -515,19 +449,6 @@ where
     /// [`crate::upload_action`].
     pub(super) upload_action: crate::upload_action::UploadActionHandle,
 
-    /// The OPTIONAL per-(gate,node) satisfied probe (#537). Consulted by
-    /// this secondary's run-once affine executor ([`affine_exec`]) BEFORE
-    /// the run-once latch — when the probe returns `true`, the gate's hash
-    /// enters `affine_done` immediately and the dependent dispatches on
-    /// the `AlreadyDone` path with no `QueuedAfterLocalDependency` /
-    /// `LocalDependencyReleased` frames and no [`tokio::task::spawn_local`].
-    /// `None` (the default) leaves the executor with today's behaviour
-    /// bit-for-bit. Set before `run` via
-    /// [`Self::set_affine_satisfied_probe`]. See
-    /// [`crate::affine_satisfied`].
-    pub(super) affine_satisfied_probe:
-        crate::affine_satisfied::AffineSatisfiedProbeHandle<I>,
-
     /// Handle to the task-completion dispatcher task. Mirrors
     /// `lifecycle_dispatcher_handle` — same Drop-vs-explicit cleanup
     /// rationale.
@@ -580,13 +501,6 @@ where
     /// discipline as `fatal_exit_signal_rx`).
     pub(super) secondary_control_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<control::SecondaryControlCommand>>,
-
-    /// (#577) The dedicated off-loop affine-import completion channel is
-    /// GONE — gate bodies now run in worker subprocesses dispatched via
-    /// `assign_resolved_task`, and their terminal `WorkerEvent::TaskCompleted`
-    /// / `TaskFailed` arrives through the existing pool-event arm. The
-    /// release body (`complete_affine_import`) is reached via
-    /// `on_affine_gate_worker_terminal` from `handle_worker_event`.
 
     /// Announcer-outbox sender. Cloned out via
     /// [`Self::attach_observer_announcer`] into the

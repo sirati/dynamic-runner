@@ -148,8 +148,6 @@ fn variant_name(s: &TaskState<RunnerIdentifier>) -> &'static str {
         TaskState::InvalidTask { .. } => "invalid",
         TaskState::SkippedAlreadyDone { .. } => "skipped",
         TaskState::SetupCompleted { .. } => "setup_completed",
-        TaskState::AffineReady { .. } => "affine_ready",
-        TaskState::QueuedAfterLocalDependency { .. } => "queued_after_local_dependency",
     }
 }
 

@@ -923,10 +923,37 @@ where
             .map(crate::primary::wire::compute_task_hash)
             .collect();
 
+        // Affine-dep exclusion refresh (Model B), mirroring hydrate's
+        // `mark_affine_prereqs` seed: a runtime-spawned `SecondaryAffine` def
+        // must enter the pool's `affine_prereq_ids` set BEFORE its dependent
+        // work task reinjects below, so `has_affine_dep` withholds that work
+        // task from the GLOBAL worker view (it must dispatch only via the
+        // per-secondary affine queue). Without this a runtime-spawned
+        // affine-dep work task would be globally dispatchable and could land
+        // on a secondary that never imported (the head-of-line bug the
+        // redesign closes). Collected from the spawned ids by the SAME
+        // `def.task_id` identity hydrate uses; empty (no-op) on a non-affine
+        // spawn batch.
+        let spawned_affine_prereq_ids: Vec<String> = valid_tasks
+            .iter()
+            .filter(|t| t.kind.is_secondary_affine())
+            .map(|t| t.task_id.clone())
+            .collect();
+
         self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TasksSpawned {
             tasks: valid_tasks,
         }])
         .await;
+
+        // Refresh the affine-dep exclusion set with this batch's newly-spawned
+        // `SecondaryAffine` ids BEFORE the reinject loop's work-task reinjects,
+        // so the dispatch view withholds an affine-dep work task from the
+        // global pool (it routes only per-secondary). No-op when the batch
+        // spawned no affine prereq.
+        if !spawned_affine_prereq_ids.is_empty() {
+            self.pool_mut()
+                .mark_affine_prereqs(spawned_affine_prereq_ids);
+        }
 
         // Symmetric with the receive-side mirror in
         // `handle_cluster_mutation` (primary/task/mutation.rs): every

@@ -182,14 +182,6 @@ pub enum MessageType {
     /// setup-task execution (success → `SetupCompleted`, failure →
     /// `TaskFailed { NonRecoverable }`).
     SetupTerminal,
-    /// Secondary -> primary: a work task is now queued behind that
-    /// secondary's local SecondaryAffine import (#497). The primary
-    /// originates `ClusterMutation::QueuedAfterLocalDependencySet`.
-    TaskQueuedAfterLocalDependency,
-    /// Secondary -> primary: that secondary's local SecondaryAffine import
-    /// for a queued work task is done — release it (#497). The primary
-    /// originates the EXISTING `ClusterMutation::TaskAssigned`.
-    LocalDependencyReleased,
     /// Secondary -> primary: the primary assigned a task to a NON-idle
     /// worker slot (#517). The secondary honors the assigned `worker_id`
     /// (never re-picks) and bounces this typed report — NOT a `TaskFailed`,

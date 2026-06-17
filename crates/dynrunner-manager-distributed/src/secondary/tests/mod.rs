@@ -97,7 +97,6 @@
 #![cfg(test)]
 
 mod abort_gates;
-mod affine_exec_on_worker;
 mod anti_entropy_heal;
 mod beacon_fresh_starved_anchor;
 mod consensus_wiring;

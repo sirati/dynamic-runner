@@ -327,19 +327,6 @@ impl PyDistributedManager {
         // `worker_module` holds the `@task_function` handler that executes
         // the gate body.
 
-        // Per-(gate,node) satisfied probe (#537): take the Python callable
-        // out of `self` and wrap it as an
-        // `Arc<dyn AffineSatisfiedProbe<RunnerIdentifier>>` at the bridge
-        // boundary, once under the GIL before `py.detach`. The cloneable
-        // `Arc` is captured into the detached runtime and cloned per spawned
-        // secondary below; each install runs via
-        // `set_affine_satisfied_probe`. `Send + Sync` (the trait-object
-        // contract) lets the `Arc` cross `py.detach`.
-        let affine_satisfied_probe = self
-            .affine_satisfied_probe
-            .take()
-            .map(crate::affine_satisfied_bridge::PyAffineSatisfiedProbe::new);
-
         // Take the Python upload callable (#336 P1 / #493 option-A) out of
         // `self` and wrap it as an `Arc<dyn UploadAction>` at the bridge
         // boundary, once under the GIL before `py.detach`. The upload
@@ -518,15 +505,6 @@ impl PyDistributedManager {
                     let sec_scheduler_config = scheduler_config.clone();
                     let sec_panik_paths = panik_watcher_paths.clone();
                     let sec_panik_poll = panik_watcher_poll_interval;
-                    // (#577) No `sec_import_action` — gate bodies run in
-                    // worker subprocesses; no per-secondary inline-Python
-                    // callable to thread through.
-                    // Per-secondary clone of the satisfied probe (#537) — a
-                    // cheap `Arc` refcount bump. Each spawned secondary
-                    // installs its own clone via `set_affine_satisfied_probe`;
-                    // the underlying Python callable is shared (one consumer
-                    // `affine_instance_satisfied`).
-                    let sec_affine_satisfied_probe = affine_satisfied_probe.clone();
                     let sec_memprofile_output_dir = memprofile_output_dir.clone();
                     let sec_memuse_log_path = memuse_log_path.clone();
                     // Per-secondary clone so the spawned `move` task owns its
@@ -724,14 +702,6 @@ impl PyDistributedManager {
                         // (#577) `set_import_action` is GONE — gate bodies
                         // run in worker subprocesses dispatched via the normal
                         // task-dispatch path; no inline-Python install needed.
-                        // Install the per-(gate,node) satisfied probe (#537)
-                        // BEFORE `run()`. Each in-process secondary gets its
-                        // own `Arc` clone sharing the one consumer callable.
-                        // Absence leaves the executor with today's behaviour
-                        // bit-for-bit.
-                        if let Some(probe) = sec_affine_satisfied_probe {
-                            secondary.set_affine_satisfied_probe(probe);
-                        }
 
                         // The egress edge resolves `Destination::Primary` to
                         // the in-process submitter id while the role table is

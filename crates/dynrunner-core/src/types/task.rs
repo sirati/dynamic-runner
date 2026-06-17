@@ -87,6 +87,24 @@ impl TaskKind {
         matches!(self, TaskKind::Work)
     }
 
+    /// Whether a QUEUED task of this kind holds its phase open against the
+    /// drain transition — i.e. it is real work the phase must wait to
+    /// consume from its bucket before it can drain. `Work` (dispatched to a
+    /// worker) and `Setup` (consumed from the bucket by its in-process
+    /// executor) BOTH count: while either sits queued, its phase has
+    /// outstanding bucket work. A `SecondaryAffine` task does NOT count: under
+    /// Model B it is a non-worker-assignable LEDGER TOKEN — the
+    /// placement-readiness signal kept in the bucket whose per-secondary runs
+    /// are driven off-queue by the affine scheduler + bitvector, never
+    /// consumed from the bucket on a phase-drain path. Counting it would pin
+    /// `queued_count > 0` forever and the phase would never drain. The
+    /// drain-side counterpart of [`Self::is_worker_assignable`]: the latter
+    /// gates the worker VIEW, this gates the drain COUNT. The scheduling seam
+    /// (`PendingPool::queued_count`) reads this.
+    pub fn counts_for_phase_drain(self) -> bool {
+        !matches!(self, TaskKind::SecondaryAffine)
+    }
+
     /// Whether an in-flight task of this kind may be REASSIGNED (requeued
     /// to `Pending`) when its holder dies. `Work` is reassignable —
     /// another worker picks it up. A `Setup` task is NOT: its executor is

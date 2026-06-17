@@ -326,55 +326,6 @@ pub(in crate::secondary) struct OperationalState<M: ManagerEndpoint, I: Identifi
     /// Tasks deferred because the target worker's per-type subprocess is
     /// mid-respawn (respawn-HOLD, #58). Keyed by `WorkerId`.
     pub(in crate::secondary) pending_first_bind: HashMap<WorkerId, PendingFirstBind<I>>,
-
-    /// NODE-LOCAL SecondaryAffine import tracking (#497 P4) — NOT CRDT.
-    /// SecondaryAffine hashes whose per-secondary import has COMPLETED on this
-    /// node. Keyed by the affine task's content hash. A work task gating on a
-    /// hash IN this set runs straight to `InFlight` (no queue); the set is the
-    /// run-once latch that survives every later dependent on the same import.
-    /// Lives in `Operational` (where the dispatch router runs) — a fresh
-    /// `Operational` session starts empty because the in-process import is
-    /// node-LOCAL to the running process, not replicated.
-    pub(in crate::secondary) affine_done: std::collections::HashSet<String>,
-
-    /// NODE-LOCAL SecondaryAffine import tracking (#497 P4) — NOT CRDT.
-    /// SecondaryAffine hashes whose per-secondary import is IN FLIGHT, mapped
-    /// to the work-task dependents queued behind that single run. The PRESENCE
-    /// of a hash key IS the run-once notify: the first dependent inserts the
-    /// vec and spawns exactly one import; the 2nd..Nth APPEND to the vec and
-    /// start NO second import; the import's completion drains the vec (one
-    /// release / failure per queued dependent) and clears the key. Keyed by
-    /// the affine task's content hash.
-    pub(in crate::secondary) affine_running:
-        HashMap<String, Vec<super::PendingAffineDependent<I>>>,
-
-    /// O(1) reverse index over `affine_running`: a parked dependent's
-    /// `work_hash -> worker_id`. DERIVED state of `affine_running`, owned
-    /// here and maintained at the SAME two `affine_running` mutation sites
-    /// (the park APPEND and the import-completion drain in `affine_exec`):
-    /// the probe responder (`holding_worker`) reads it instead of scanning
-    /// `affine_running.values().flatten()` — an O(parked) walk on the
-    /// dispatch hot path that contributed to secondary-loop starvation at
-    /// affine scale (thousands of dependents per gate). The presence /
-    /// worker of a dependent in `affine_running` and in this index are kept
-    /// identical by construction (insert on park, remove on drain), so the
-    /// index answer equals the old scan's answer.
-    pub(in crate::secondary) affine_dependent_worker: HashMap<String, WorkerId>,
-
-    /// NODE-LOCAL per-(gate,node) satisfied-probe verdict cache (#537) —
-    /// NOT CRDT. Keyed by the same SecondaryAffine task content hash
-    /// `affine_done` / `affine_running` use. Holds the most recent
-    /// `ProbeOutcome` for each gate so a fixed-graph fleet of N dependents
-    /// in flight on this node consults the consumer probe only ONCE per
-    /// gate (per TTL window) — bounded probe call frequency even at
-    /// thousands of dependents per gate. A `Satisfied` verdict never
-    /// expires (locally-present-store-path invariant persists for the
-    /// run); `NotSatisfied` / `Errored` expire on the constants in
-    /// [`crate::affine_satisfied`]. Independent of `affine_done`: a
-    /// `Satisfied` verdict ALSO seeds `affine_done` so subsequent
-    /// dependents short-circuit on the existing run-once latch.
-    pub(in crate::secondary) affine_probe_cache:
-        HashMap<String, crate::affine_satisfied::ProbeOutcome>,
 }
 
 /// Peer-mesh formation progress — the orthogonal sub-concern.
@@ -657,13 +608,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
                     pending_peer_messages,
                     pending_worker_restarts,
                     pending_first_bind,
-                    // SecondaryAffine import tracking is node-LOCAL to this
-                    // running session; a freshly Operational secondary has
-                    // imported nothing yet (#497 P4).
-                    affine_done: std::collections::HashSet::new(),
-                    affine_running: HashMap::new(),
-                    affine_dependent_worker: HashMap::new(),
-                    affine_probe_cache: HashMap::new(),
                 }));
                 (next, latches)
             }
@@ -701,13 +645,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
             pending_peer_messages: Vec::new(),
             pending_worker_restarts: HashMap::new(),
             pending_first_bind: HashMap::new(),
-            // An observer runs no workers and dispatches no work tasks, so it
-            // never gates on a SecondaryAffine import — but the fields exist
-            // on every Operational state, so start them empty (#497 P4).
-            affine_done: std::collections::HashSet::new(),
-            affine_running: HashMap::new(),
-            affine_dependent_worker: HashMap::new(),
-            affine_probe_cache: HashMap::new(),
         }));
         (state, latches)
     }
@@ -887,13 +824,8 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     /// (generation-aware, post-#341-truthful) `active_tasks` map in
     /// whichever state carries it, PLUS the `Operational`-only
     /// `pending_first_bind` deferrals (a respawn-HOLD task is genuinely
-    /// held — its dispatch is parked, not lost) AND the `Operational`-only
-    /// `affine_running` deferrals (#497 — a work task parked behind this
-    /// node's local SecondaryAffine import is ALSO genuinely held: it was
-    /// assigned to this node, its dispatch is withheld until the import
-    /// releases, and the release self-dispatches it locally). Any state
-    /// with no such bookkeeping (pre-`Configuring`, terminal) holds
-    /// nothing.
+    /// held — its dispatch is parked, not lost). Any state with no such
+    /// bookkeeping (pre-`Configuring`, terminal) holds nothing.
     ///
     /// `false` is a POSITIVE denial the primary acts on (fail +
     /// requeue), which is exactly right in every reachable case: a node
@@ -922,18 +854,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
                         op.pending_first_bind.iter().find_map(|(wid, pending)| {
                             (pending.file_hash == task_hash).then_some(*wid)
                         })
-                    })
-                    .or_else(|| {
-                        // #497: a work task parked behind this node's local
-                        // SecondaryAffine import is held on the worker the
-                        // first dependent reserved (the same slot the gate
-                        // body runs on, then the released work task). Read the
-                        // O(1) reverse index over `affine_running` (keyed by
-                        // the dependent's `work_hash`) instead of an
-                        // O(parked) `values().flatten()` scan on the dispatch
-                        // hot path — the index is maintained at the same park
-                        // / drain sites, so its answer equals the scan's.
-                        op.affine_dependent_worker.get(task_hash).copied()
                     })
             }
             _ => None,

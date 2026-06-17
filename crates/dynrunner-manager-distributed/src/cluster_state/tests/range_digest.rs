@@ -379,21 +379,12 @@ fn range_digest_memo_matches_fresh_fold() {
     });
     assert_range_memo_invariant(&s);
 
-    // --- setup-completed (InFlight/Pending→SetupCompleted) + affine-ready ---
+    // --- setup-completed (InFlight/Pending→SetupCompleted) ---
     s.apply(ClusterMutation::SetupCompleted { hash: "t5".into() });
-    assert_range_memo_invariant(&s);
-    s.apply(ClusterMutation::AffineReady { hash: "t6".into() });
     assert_range_memo_invariant(&s);
 
     // --- skip (Pending→SkippedAlreadyDone) ---
     s.apply(ClusterMutation::TaskSkippedAlreadyDone { hash: "t7".into() });
-    assert_range_memo_invariant(&s);
-
-    // --- queued-after-local-dependency (Pending→Queued rank drop) ---
-    s.apply(ClusterMutation::QueuedAfterLocalDependencySet {
-        hash: "t8".into(),
-        secondary: "s1".into(),
-    });
     assert_range_memo_invariant(&s);
 
     // --- TasksSpawned create batch (apply_tasks.rs insert) ---

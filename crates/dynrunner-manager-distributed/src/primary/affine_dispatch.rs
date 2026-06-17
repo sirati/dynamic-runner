@@ -1,177 +1,629 @@
-//! Primary-side RESOLUTION of dependency-satisfied `TaskKind::SecondaryAffine`
-//! gates — the WITH-dep firing surface (#506) the seed originator (#502) and
-//! the live spawn/resume delta originator both structurally miss.
+//! The dispatch CONSUMER of the per-secondary affine scheduler
+//! ([`super::affine_scheduler::AffineScheduler`]) — the operational leaf that
+//! makes `TaskKind::SecondaryAffine` work tasks RUN again on the new
+//! primary-modeled bitvector.
 //!
 //! ## The one concern
-//! Drive the affine-gate `Pending → AffineReady` resolution from the AUTHORITY
-//! side for a gate whose dependency completes AFTER seed: pick each queued
-//! `SecondaryAffine` gate whose own deps are now all terminal, originate its
-//! `AffineReady` terminal, and unblock its dependents. A gate is invisible to
-//! every worker-dispatch path (it is never worker-assignable, like a `Setup`
-//! task); this module is the ONLY thing that moves a WITH-dep gate out of
-//! `Pending` once its dep completes post-seed.
+//! Feed the affine scheduler's per-secondary queues as a DISPATCH SOURCE, on
+//! top of the unchanged global-pool dispatch. Three operational seams + one
+//! failover seam, each delegating to the pure policy
+//! ([`super::affine_scheduler::AffineScheduler`]) and routing the emitted cell
+//! mutations through the originate/broadcast choke
+//! ([`PrimaryCoordinator::apply_and_broadcast_cluster_mutations`], where the
+//! generation is stamped):
 //!
-//! ## Why this surface is REQUIRED (the #506 gap)
-//! The affine originator has exactly two PRE-#506 firing surfaces, and a
-//! with-dep gate whose dep completes after seed rides NEITHER:
-//!   * the SEED scan (`originate_cold_seed` / `discover_on_promotion`'s
-//!     `affine_ready_mutations_for_ledger`, the #502 fix) runs ONCE at seed —
-//!     it correctly SKIPS a with-dep gate (its dep is not yet terminal);
-//!   * the live DELTA surface (`apply_and_broadcast_cluster_mutations`'s
-//!     `became_pending`) fires ONLY on a CRDT `Blocked → Pending` resume. But
-//!     the seed path classifies EVERY `TaskAdded` task `Pending` (dep-blocking
-//!     lives in the POOL's blocked-map, not CRDT `Blocked`), so a with-dep
-//!     gate is born CRDT-`Pending` and `resume_blocked_on(<its dep>)` finds
-//!     nothing when the dep completes — `became_pending` is empty, the
-//!     originator never re-fires, and the gate sits `Pending` forever (a gate
-//!     is not worker-assignable, so the pool never dispatches it) wedging its
-//!     dependents Blocked → DEADLOCK.
-//!
-//! The MISSING surface is the gate's DEPENDENCY completing. The pool's
-//! existing dep-resolution authority already computes it: when the dep
-//! completes, `on_item_finished` walks `dependents_of[<dep>]` and unblocks the
-//! gate from `blocked` into a dispatch bucket. This pass observes that result
-//! — a gate now QUEUED (`pool().iter()` yields only bucket items, never
-//! blocked ones) is exactly "a gate whose deps the pool just satisfied" — and
-//! routes it to the EXISTING `AffineReady` originator. No re-scan of the
-//! ledger (the #504 O(n²) trap), no parallel affine-specific dep-scan beside
-//! the pool's: the pool already did the dep resolution, this reads it.
+//! - PLACEMENT trigger ([`Self::place_dependency_satisfied_affine_tasks`]):
+//!   when an affine-dep WORK task is otherwise ready-to-schedule (its non-affine
+//!   deps satisfied AND all its affine prereqs themselves ready), select a
+//!   secondary by rank ([`PrimaryCoordinator::affine_placement_for`] +
+//!   `AffineScheduler::select_secondary`) and `AffineScheduler::place` the work
+//!   task there after its still-not-done affine prereqs, emitting the resulting
+//!   `SecondaryAffineQueued` mutations. Detection REUSES the pool's
+//!   already-computed readiness (a `SecondaryAffine` task in a bucket = its deps
+//!   are met) — it never re-decides dep resolution.
+//! - PER-SECONDARY-FIRST pop ([`Self::try_affine_pop_for_worker`]): when
+//!   assigning to a worker on secondary `S`, pop `S`'s per-secondary queue FIRST
+//!   and dispatch the popped unit through the shared
+//!   [`PrimaryCoordinator::dispatch_one_assignment`] seam, BEFORE the global
+//!   pool view. The popped unit's `TaskInfo` is reconstructed by hash
+//!   ([`crate::cluster_state::ClusterState::task_info_for_hash`]); a popped WORK
+//!   unit is gated on EVERY affine dep being `Done` on `S` (the bitvector is the
+//!   readiness authority) and re-derived if stranded without its import.
+//! - IDLE-STEAL ([`Self::try_affine_steal_for_worker`]): when BOTH the global
+//!   pool view AND `S`'s queue are empty at assignment time,
+//!   `AffineScheduler::steal_for` a whole schedulable unit from the
+//!   longest-queue donor, emit the `SecondaryAffineUnqueued`/re-`Queued`
+//!   mutations, and dispatch the stolen unit.
+//! - FAILOVER rebuild ([`Self::rebuild_affine_schedule`], called from
+//!   [`PrimaryCoordinator::hydrate_from_cluster_state`]): discard the local
+//!   queues and re-derive them from the inherited bitvector + work pool.
 //!
 //! ## Module boundary (CLAUDE.md design-first)
-//!   * Owner: the primary. The single seam it crosses is the existing
-//!     worker-management reaction (`react_to_worker_signal_batch` calls
-//!     [`Self::resolve_dependency_satisfied_affine_gates`] right after the
-//!     worker recheck + setup dispatch — a gate entering a bucket emits the
-//!     same `TasksAdded` a new work/setup task does).
-//!   * API the caller sees: ONE one-line delegate — "resolve
-//!     dependency-satisfied affine gates". The caller learns nothing about
-//!     gate internals; no `if kind == SecondaryAffine` in the loop.
-//!   * Detection owner is REUSED, not reinvented: the gate's READY condition
-//!     is decided by `cluster_state`'s `affine_ready_mutations_for` (the same
-//!     detector the seed + delta surfaces use); the dependent unblock is the
-//!     pool's `on_gate_resolved` (the same walk `on_item_finished` uses).
+//!
+//! Owner: the primary. The seams it crosses are (1) the worker-management
+//! reaction's `TasksAdded` branch (placement, the same seam the removed
+//! gate-resolver used) and (2) the per-worker assignment sites
+//! (`dispatch_to_idle_workers` + `handle_task_request`), which call the ADDITIVE
+//! per-secondary-first pop BEFORE their unchanged global-pool decision. The pure
+//! policy is consumed, never reimplemented: ranking / append / pop / steal /
+//! rebuild all live in `affine_scheduler`; the cell state + merge live in
+//! `cluster_state::affine_state`; this module only wires the two together.
 
-use dynrunner_core::{Identifier, PhaseId};
-use dynrunner_protocol_primary_secondary::ClusterMutation;
+use std::collections::HashSet;
+
+use dynrunner_core::{Identifier, TaskInfo};
+use dynrunner_protocol_primary_secondary::AffineCell;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
-use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::primary::PrimaryCoordinator;
-use crate::primary::command_channel::PrimaryCommand;
-use crate::primary::wire::compute_task_hash;
+use super::affine_scheduler::{QueuedUnit, WorkPlacement};
+use super::lifecycle::dispatch::DispatchOutcome;
+use super::wire::compute_task_hash;
+use super::PrimaryCoordinator;
+use crate::cluster_state::AffineId;
+
+/// The per-secondary affine-readiness verdict for a popped WORK unit, derived
+/// from its affine deps' bitvector cells on the dispatching secondary (the
+/// readiness authority — never a global terminal). Discriminates the cell
+/// states so the gate acts correctly per shape instead of blindly re-placing
+/// on any non-`Done` (which storms on an in-flight import and livelocks on a
+/// failed one). Computed by [`PrimaryCoordinator::affine_readiness_gate`].
+enum AffineGateOutcome {
+    /// Every affine dep is `Done` on this secondary — dispatch now.
+    Ready,
+    /// A dep is `Queued` (the import is IN FLIGHT here), none `NotDone`/`Failed`
+    /// — leave the work at the queue front and let the import's terminal
+    /// re-nudge (no re-place, no re-emit: re-placing here would storm).
+    InFlightHere,
+    /// A dep is `NotDone` here (and none `Failed`) — the import was never
+    /// placed/run here: re-derive the prereq prefix + work onto THIS secondary.
+    StrandedHere,
+    /// A dep is `Failed` here, but the named OTHER secondary can still satisfy
+    /// every dep (none `Failed` there) — re-route the unit onto it. A `Failed`
+    /// cell is non-sticky, so the re-route recovers.
+    Reroute(String),
+    /// A dep is `Failed` on EVERY eligible secondary — the import cannot run
+    /// anywhere: terminal-fail the dependent (cascade) rather than spin.
+    Unsatisfiable,
+}
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
-    /// Resolve every queued `SecondaryAffine` gate whose own deps are now all
-    /// terminal: originate its `AffineReady` terminal and unblock its
-    /// dependents.
+    /// Placement trigger: queue every WORK task whose non-affine deps are
+    /// satisfied AND whose affine prereqs are now all ready onto a
+    /// rank-selected secondary, dragging in its still-not-done affine prereqs.
     ///
-    /// Called from the worker-management reaction's `TasksAdded` branch — the
-    /// same recheck that dispatches work + setup tasks. A gate whose dep just
-    /// completed was unblocked `blocked → bucket` by the pool's
-    /// `on_item_finished` dep walk on that completion, which emits
-    /// `TasksAdded`; this pass then drains the now-queued gate. A gate whose
-    /// deps are NOT yet all terminal is left queued and re-evaluated on the
-    /// next `TasksAdded` (it cannot be dispatched to a worker either way, so
-    /// leaving it is harmless — it never wedges a worker slot).
+    /// Called from the worker-management `TasksAdded` reaction — the SAME
+    /// recheck seam the removed `resolve_dependency_satisfied_affine_gates`
+    /// used. A `SecondaryAffine` prereq whose deps just completed was unblocked
+    /// `blocked → bucket` by the pool's dep walk (which emits `TasksAdded`), so
+    /// it appears in `pool().iter()` (queued, never worker-assignable). That is
+    /// the readiness signal — the pool already did the dep resolution; this
+    /// reuses it rather than re-scanning the ledger.
     ///
-    /// Coalesced + idempotent: the loop drains every currently-resolvable
-    /// gate; one is resolved at most once (it is removed from the pool on
-    /// resolution). Re-running with nothing resolvable is a cheap no-op.
-    pub(crate) async fn resolve_dependency_satisfied_affine_gates(
-        &mut self,
-        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
-    ) {
-        // Two-phase per iteration to keep the `cluster_state` (detection) borrow
-        // and the pool (take) borrow disjoint, mirroring `dispatch_setup_tasks`:
-        // resolve the READY gate's hash against the detection owner FIRST, then
-        // take it by hash.
-        while let Some(hash) = self.pool_ref_resolvable_affine_gate() {
-            // Remove exactly that gate from the pool by hash. A gate is never
-            // worker-assignable, so it can only ever sit queued; taking it is
-            // the ONLY consumer of a queued gate (no worker dispatch competes).
-            let Some(gate) = self
-                .pool_mut()
-                .take_first_match(|t| compute_task_hash(t) == hash)
-            else {
-                // Raced away (e.g. a concurrent drain). Stop the pass; the next
-                // `TasksAdded` re-evaluates.
-                break;
-            };
-            self.resolve_affine_gate(gate, command_rx).await;
+    /// A work task is placed only when ALL its affine prereqs are
+    /// ready-in-bucket (the whole schedulable unit is runnable), so a placed
+    /// affine `QueuedUnit` is always dispatchable when popped. The work task
+    /// itself stays in the global pool, ready on its non-affine deps but
+    /// withheld from the global worker view by `has_affine_dep` (the affine
+    /// deps are excluded from its pool-blocking set under Model B): it
+    /// dispatches ONLY through the per-secondary queue, whose per-secondary
+    /// bitvector readiness gate is the authority — the per-secondary queue is
+    /// a locality HINT, not a second dependency authority.
+    ///
+    /// The affine prereq STAYS in the pool bucket (it is NOT taken out): under
+    /// Model B it is the pool's placement-readiness SIGNAL + ledger token. It
+    /// is non-worker-assignable (the global worker view never grabs it) and
+    /// EXCLUDED from the phase-drain count (`counts_for_phase_drain` —
+    /// `pool::queued_count`), so it neither double-counts nor wedges the
+    /// drain; its per-secondary runs are driven off-queue by the affine
+    /// scheduler + bitvector. The token is dropped at the phase's
+    /// `Drained → Done` edge (`pool::mark_phase_done → drop_affine_items`), so
+    /// a drained phase's token can never bleed into a later phase's placement
+    /// scan.
+    ///
+    /// Idempotent + coalesced: a prereq already `Queued`/`Done` for the chosen
+    /// secondary is not re-appended (the `place` policy skips it) and is the
+    /// only `SecondaryAffine` pool item this pass takes; re-running with
+    /// nothing newly ready is a cheap no-op.
+    pub(crate) async fn place_dependency_satisfied_affine_tasks(&mut self) {
+        // The candidate secondaries for rank selection: the live roster. An
+        // empty roster (no secondary yet) means nothing can be placed.
+        let secondaries: Vec<String> = self.affine_placement_secondaries();
+        if secondaries.is_empty() {
+            return;
         }
-    }
 
-    /// Find the FIRST queued gate that is a dependency-resolved
-    /// `SecondaryAffine` gate per the SINGLE detection owner
-    /// (`affine_ready_mutations_for`), returning its content hash. `None` when
-    /// no queued gate is currently resolvable.
-    ///
-    /// Reuses the cluster_state detector rather than re-deciding readiness here
-    /// (one detection owner): the pool's queued view feeds candidate hashes,
-    /// the detector filters to the `Pending` gates whose deps are all terminal.
-    /// `pool().iter()` yields only QUEUED (bucket) items — a gate appears only
-    /// once the pool's dep walk has unblocked it — so a still-blocked gate is
-    /// never a candidate. Reads the pool's queued view and `cluster_state` in
-    /// ONE `&self` borrow so the caller can then take by hash without a borrow
-    /// conflict.
-    fn pool_ref_resolvable_affine_gate(&self) -> Option<String> {
-        let gate_hashes = self
+        // The set of affine-prereq hashes the pool has marked READY (a
+        // `SecondaryAffine` task sitting in a bucket = its own deps are met).
+        // `pool().iter()` yields only queued (bucket) items, never blocked
+        // ones, so a still-blocked affine prereq is correctly NOT ready.
+        let ready_affine: HashSet<String> = self
             .pool()
             .iter()
             .filter(|t| t.kind.is_secondary_affine())
-            .map(compute_task_hash);
-        self.cluster_state
-            .affine_ready_mutations_for(gate_hashes)
-            .into_iter()
-            .find_map(|m| match m {
-                ClusterMutation::AffineReady { hash } => Some(hash),
-                _ => None,
+            .map(compute_task_hash)
+            .collect();
+        if ready_affine.is_empty() {
+            return;
+        }
+
+        // Find every WORK task whose affine prereqs are ALL in `ready_affine`
+        // (the whole schedulable unit is runnable). A work task with no affine
+        // dep is never a candidate (it dispatches from the global pool as
+        // today). Resolve the candidate's `WorkPlacement` while iterating, so
+        // the placement input is built once per candidate.
+        let placements: Vec<(String, super::affine_scheduler::WorkPlacement)> = self
+            .cluster_state
+            .tasks_iter()
+            .filter_map(|(_, state)| {
+                let def = state.def();
+                if def.kind.is_secondary_affine() {
+                    return None;
+                }
+                let task = self.cluster_state.task_to_info(state);
+                let placement = self.affine_placement_for(&task);
+                if placement.affine_deps.is_empty() {
+                    return None;
+                }
+                // Every affine prereq must be ready-in-bucket: otherwise the
+                // unit is not yet wholly runnable, so defer (a later
+                // `TasksAdded`, fired when the lagging prereq's deps complete,
+                // re-evaluates it).
+                let all_ready = placement
+                    .affine_deps
+                    .iter()
+                    .all(|(_, hash)| ready_affine.contains(hash));
+                all_ready.then(|| (placement.hash.clone(), placement))
             })
+            .collect();
+
+        // Apply each placement once: select a secondary by rank, append the
+        // [not-done affine prereqs…, work task] unit to that secondary's queue,
+        // and emit the resulting Queued cell mutations. The affine prereq is
+        // NOT removed from the global pool — under Model B it stays the pool's
+        // ledger TOKEN (uncounted for phase drain; non-worker-assignable so the
+        // global view never grabs it) until its FIRST per-secondary run gives
+        // it a global terminal; subsequent per-secondary runs are
+        // bitvector-only. The work task likewise stays a pool item (ready on
+        // its non-affine deps, withheld from the global view by `has_affine_dep`
+        // so it dispatches ONLY through the per-secondary queue).
+        //
+        // Idempotency: a work task is placed AT MOST ONCE (the `place` policy
+        // always appends, so a second placement would double-queue). The
+        // scheduler's `placed_work` guard records placed work hashes (co-located
+        // with the queues it guards; reset together with them by the failover
+        // rebuild). A work task placed once runs its whole unit on its chosen
+        // secondary; another dependent of the same affine prereq routed to a
+        // DIFFERENT secondary re-appends the prereq to THAT secondary's queue
+        // (the per-secondary re-run), which `place` does because that
+        // secondary's cell is still NotDone.
+        for (work_hash, placement) in placements {
+            if !self.affine_scheduler.record_placed_work(&work_hash) {
+                continue;
+            }
+            let Some(sec) = self.affine_scheduler.select_secondary(
+                &secondaries,
+                &placement,
+                |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
+            ) else {
+                self.affine_scheduler.unrecord_placed_work(&work_hash);
+                continue;
+            };
+            let mutations = self.affine_scheduler.place::<I, _>(
+                &sec,
+                &placement,
+                |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
+            );
+            if !mutations.is_empty() {
+                self.apply_and_broadcast_cluster_mutations(mutations).await;
+            }
+        }
     }
 
-    /// Originate the authoritative `AffineReady` terminal for a resolved gate,
-    /// then run the pool's dependent-unblock + phase cascade.
-    ///
-    /// `AffineReady` (READY-not-EXECUTED): the primary NEVER runs the gate.
-    /// Origination rides the EXISTING `apply_and_broadcast_cluster_mutations`
-    /// path (so the terminal replicates to every secondary and the CRDT
-    /// `resume_blocked_on(<gate>)` resumes any dependent that WAS CRDT-`Blocked`
-    /// — the chained-gate case where a downstream gate was spawned blocked).
-    /// Then `on_gate_resolved` runs the pool side: it records the gate
-    /// completed and unblocks every POOL-blocked dependent (the build tasks,
-    /// which were seeded CRDT-`Pending` and so are not CRDT-`Blocked` — only
-    /// the pool's blocked-map holds them), moving them `blocked → queued`
-    /// dispatchable. NO in-flight decrement (a gate is never in-flight — see
-    /// `PendingPool::on_gate_resolved`), and the phase drain transition runs so
-    /// the gate's phase progresses now that its inert gate item is gone.
-    ///
-    /// A freshly-unblocked dependent that is ITSELF an affine gate (a chained
-    /// import) lands queued in this same pass and the caller's loop drains it
-    /// on its next iteration. The unblocked builds become dispatchable; the
-    /// per-completion `TasksAdded` that drove this pass re-runs the worker
-    /// recheck after it, and any subsequent completion re-emits `TasksAdded`,
-    /// so the builds are picked up by the standard dispatch recheck.
-    async fn resolve_affine_gate(
-        &mut self,
-        gate: std::sync::Arc<dynrunner_core::TaskInfo<I>>,
-        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
-    ) {
-        let hash = compute_task_hash(&gate);
-        let phase: PhaseId = gate.phase_id.clone();
-        let task_id = gate.task_id.clone();
-        tracing::info!(
-            task_hash = %hash,
-            phase = %phase,
-            "affine gate dependency-satisfied post-seed; resolving to AffineReady"
+    /// Per-secondary-FIRST pop for the idle worker at `worker_idx`: pop the
+    /// worker's secondary's affine queue and dispatch the popped unit, BEFORE
+    /// the caller's global-pool decision. Returns `true` iff a unit was
+    /// committed (the caller skips its global path for this worker this tick);
+    /// `false` leaves the worker for the unchanged global dispatch (empty
+    /// queue, or a stale/uncommittable unit — harmless under the HINT
+    /// property). The caller invokes this with NO live pool borrow (it precedes
+    /// view construction), so the design's "per-secondary queue FIRST, then the
+    /// global queue" ordering holds.
+    pub(crate) async fn try_affine_pop_for_worker(&mut self, worker_idx: usize) -> bool {
+        let secondary = self.workers[worker_idx].secondary_id.clone();
+        let Some(unit) = self.affine_scheduler.pop_next(&secondary) else {
+            return false;
+        };
+        self.dispatch_affine_unit(worker_idx, &secondary, unit).await
+    }
+
+    /// Idle-steal for the idle worker at `worker_idx`: the caller's
+    /// precondition is that BOTH the global pool view AND this worker's
+    /// secondary's queue are empty (the design's idle-steal trigger). Steal a
+    /// whole schedulable unit from the longest-queue donor — emitting the
+    /// `SecondaryAffineUnqueued`/re-`Queued` cell mutations — then pop +
+    /// dispatch it. Returns `true` iff a stolen unit was committed; `false`
+    /// when no donor had work to steal (the worker stays idle this tick).
+    pub(crate) async fn try_affine_steal_for_worker(&mut self, worker_idx: usize) -> bool {
+        let secondary = self.workers[worker_idx].secondary_id.clone();
+        let mutations = self.affine_scheduler.steal_for::<I, _>(
+            &secondary,
+            |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
         );
-        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::AffineReady {
-            hash: hash.clone(),
-        }])
-        .await;
-        // Pool side: unblock the gate's dependents WITHOUT an in-flight
-        // decrement (the gate was never dispatched), then run the phase
-        // cascade — the SAME drain edge + hooks a worker/setup completion runs.
-        self.pool_mut().on_gate_resolved(&phase, &task_id);
-        self.process_phase_lifecycle(command_rx).await;
+        if !mutations.is_empty() {
+            self.apply_and_broadcast_cluster_mutations(mutations).await;
+        }
+        let Some(unit) = self.affine_scheduler.pop_next(&secondary) else {
+            return false;
+        };
+        self.dispatch_affine_unit(worker_idx, &secondary, unit).await
+    }
+
+    /// Reconstruct a popped [`QueuedUnit`]'s worker-dispatchable `TaskInfo` by
+    /// hash and dispatch it through the shared
+    /// [`PrimaryCoordinator::dispatch_one_assignment`] seam. On a non-committed
+    /// outcome the unit's binary came from the per-secondary queue (NOT the
+    /// pool), so it is re-pushed to the FRONT of `secondary`'s queue
+    /// ([`super::affine_scheduler::AffineScheduler::requeue_front`]) to be
+    /// retried before any other queued unit. Returns `true` iff committed.
+    async fn dispatch_affine_unit(
+        &mut self,
+        worker_idx: usize,
+        secondary: &str,
+        unit: QueuedUnit,
+    ) -> bool {
+        let (hash, is_work) = match &unit {
+            QueuedUnit::Affine { hash, .. } => (hash.clone(), false),
+            QueuedUnit::Work { hash } => (hash.clone(), true),
+        };
+        let Some(task) = self.cluster_state.task_info_for_hash(&hash) else {
+            // Not in the fat ledger (settled / gone): the unit is stale. Drop
+            // it (HINT property — a fresh placement re-derives a still-needed
+            // prereq) and fall through to the global path.
+            return false;
+        };
+        let phase = task.phase_id.clone();
+
+        // PER-SECONDARY AFFINE-READINESS GATE (the design's HINT-property safety
+        // net, Model B). Before dispatching a WORK unit, DISCRIMINATE its affine
+        // deps' per-secondary bitvector cells on THIS secondary (the bitvector is
+        // the readiness authority — never a global terminal) and act per the cell
+        // state, rather than blindly re-placing on any non-`Done`. The four shapes
+        // and their owners are computed once in [`Self::affine_readiness_gate`];
+        // here we only carry out the chosen action:
+        //
+        //   * `Ready` (every dep `Done` here) — fall through to dispatch.
+        //   * `InFlightHere` (a dep `Queued` here, none `NotDone`/`Failed`) — the
+        //     import is RUNNING on this secondary. Do NOT re-place or re-emit
+        //     (that would storm: an idle worker re-pops W → re-place → re-emit →
+        //     loop until the import lands). Leave W at the FRONT of this queue and
+        //     return; the import's own terminal (`handle_affine_task_complete` /
+        //     `handle_affine_task_failed`) is the single owner of the re-pop nudge
+        //     (it emits `TasksAdded`), re-popping W once the cell goes
+        //     `Done`/`Failed`.
+        //   * `StrandedHere` (a dep `NotDone` here, none `Failed`) — genuinely
+        //     stranded without its import. RE-DERIVE: re-place the not-done
+        //     prereqs + the work onto THIS secondary's queue; discard the popped
+        //     orphan; re-nudge so the freshly-queued import is popped first.
+        //   * `Reroute(sec)` (a dep `Failed` here, but some OTHER eligible
+        //     secondary can still satisfy every dep) — re-place onto that
+        //     secondary; discard the orphan; re-nudge. A `Failed` cell is
+        //     non-sticky, so a re-route to a still-satisfiable secondary recovers.
+        //   * `Unsatisfiable` (a dep `Failed` on EVERY eligible secondary — the
+        //     import cannot run anywhere) — TERMINAL-FAIL the dependent (cascade),
+        //     do NOT spin. This both fixes the all-Failed LIVELOCK and realizes
+        //     the owner Q1 default (affine failure terminal-by-default).
+        if is_work {
+            let placement = self.affine_placement_for(&task);
+            match self.affine_readiness_gate(secondary, &placement) {
+                AffineGateOutcome::Ready => {}
+                AffineGateOutcome::InFlightHere => {
+                    // Import in flight here: leave W at the front, let the
+                    // import's terminal re-nudge. No re-place, no emit.
+                    self.affine_scheduler.requeue_front(secondary, unit);
+                    return false;
+                }
+                AffineGateOutcome::StrandedHere => {
+                    self.affine_replace_and_nudge(secondary, &placement).await;
+                    return false;
+                }
+                AffineGateOutcome::Reroute(target) => {
+                    self.affine_replace_and_nudge(&target, &placement).await;
+                    return false;
+                }
+                AffineGateOutcome::Unsatisfiable => {
+                    // The import failed on every eligible secondary — the work
+                    // task can never run. Take it OUT of its bucket and account
+                    // it in-flight (the symmetric accounting the dispatch path
+                    // below does), then enqueue a decoupled `FailPermanent` so
+                    // the operational loop cascades the terminal to dependents
+                    // with the proper `command_rx` (the dispatch path holds none
+                    // — the dispatch-decoupling law: emit a command, never drive
+                    // the cascade inline). The popped orphan is discarded.
+                    self.fail_unsatisfiable_affine_work(&hash, &phase);
+                    return false;
+                }
+            }
+        }
+
+        // POOL ACCOUNTING (Model B). A WORK unit is a pool item (the
+        // phase-drain token): take it OUT of its bucket + `mark_in_flight` so
+        // the phase accounting goes queued→in_flight exactly as a global
+        // dispatch's `take_selected` would (its terminal then runs
+        // `note_item_completed`, draining the phase). Without this the work task
+        // lingers in its bucket forever (queued_count > 0 ⇒ the phase never
+        // drains ⇒ the run hangs). An AFFINE unit is UNcounted (the import is
+        // not phase-completion work): no pool take, no in_flight bump — it is
+        // dispatched purely by-hash and its terminal is phase-neutral
+        // (`handle_affine_task_complete`).
+        if is_work {
+            let target = hash.clone();
+            if self
+                .pool_mut()
+                .take_first_match(|t| compute_task_hash(t) == target)
+                .is_none()
+            {
+                // The work item is not in a dispatchable bucket (already taken /
+                // its phase not Active) — the per-secondary queue claim is
+                // stale. Drop the unit and fall through to the global path
+                // (HINT property — a fresh placement re-derives it).
+                return false;
+            }
+            self.pool_mut().mark_in_flight(&phase);
+        }
+
+        let estimated = self.estimator.estimate(&task);
+        match self
+            .dispatch_one_assignment(worker_idx, std::sync::Arc::new(task), estimated)
+            .await
+        {
+            DispatchOutcome::Committed => true,
+            DispatchOutcome::CommitRefused(binary) | DispatchOutcome::SendFailed(binary) => {
+                // Re-push the unit to the FRONT of S's queue so it is retried.
+                // For a WORK unit, also undo the pool take + in_flight bump
+                // (requeue restores the bucket item AND decrements in_flight),
+                // keeping the phase accounting balanced.
+                if is_work {
+                    self.pool_mut().requeue(binary);
+                }
+                self.affine_scheduler.requeue_front(secondary, unit);
+                false
+            }
+        }
+    }
+
+    /// Discriminate a popped WORK unit's affine-readiness on `secondary` by
+    /// reading its deps' bitvector cells (the readiness authority). Returns the
+    /// action the gate must take — see [`AffineGateOutcome`]. The priority
+    /// among non-`Done` deps is `Failed` > `NotDone` > `Queued`: a `Failed` dep
+    /// means this secondary cannot run the unit regardless of any other dep's
+    /// state, so it forces the re-route / terminal-fail decision; a `NotDone`
+    /// dep (none failed) is the genuine stranded re-derive; an only-`Queued`
+    /// (the rest `Done`) dep is the in-flight-here no-op-but-wait. Pure reads —
+    /// no mutation, no emit.
+    fn affine_readiness_gate(
+        &self,
+        secondary: &str,
+        placement: &WorkPlacement,
+    ) -> AffineGateOutcome {
+        let mut any_failed = false;
+        let mut any_not_done = false;
+        let mut any_queued = false;
+        for (aid, _) in &placement.affine_deps {
+            match self.cluster_state.affine_state(secondary, *aid) {
+                AffineCell::Done => {}
+                AffineCell::Failed => any_failed = true,
+                AffineCell::NotDone => any_not_done = true,
+                AffineCell::Queued => any_queued = true,
+            }
+        }
+        if any_failed {
+            // This secondary cannot satisfy the unit. Re-route to an eligible
+            // secondary that can still satisfy EVERY dep (none `Failed` there),
+            // preferring it by the same locality rank a fresh placement uses; if
+            // none exists (the import failed everywhere), the unit is doomed.
+            let satisfiable = self.affine_unit_satisfiable_secondaries(placement);
+            return match self.affine_scheduler.select_secondary(
+                &satisfiable,
+                placement,
+                |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
+            ) {
+                Some(target) => AffineGateOutcome::Reroute(target),
+                None => AffineGateOutcome::Unsatisfiable,
+            };
+        }
+        if any_not_done {
+            return AffineGateOutcome::StrandedHere;
+        }
+        if any_queued {
+            return AffineGateOutcome::InFlightHere;
+        }
+        AffineGateOutcome::Ready
+    }
+
+    /// The eligible (roster) secondaries on which the unit is still SATISFIABLE
+    /// — every affine dep's cell is NOT `Failed` (a `Done`/`Queued`/`NotDone`
+    /// cell is satisfied, in flight, or placeable). The "any eligible secondary
+    /// still satisfiable?" check behind the re-route-vs-terminal-fail decision:
+    /// an empty result means the import `Failed` on every eligible secondary, so
+    /// the dependent is doomed. Reads the roster (not just the bitvector's
+    /// written secondaries) so a fresh all-`NotDone` secondary counts as
+    /// placeable.
+    fn affine_unit_satisfiable_secondaries(&self, placement: &WorkPlacement) -> Vec<String> {
+        self.affine_placement_secondaries()
+            .into_iter()
+            .filter(|sec| {
+                placement.affine_deps.iter().all(|(aid, _)| {
+                    self.cluster_state.affine_state(sec, *aid) != AffineCell::Failed
+                })
+            })
+            .collect()
+    }
+
+    /// Re-place `placement`'s still-not-done prereqs + the work onto `target`'s
+    /// per-secondary queue (the design's "re-derive and re-queue the missing
+    /// affine deps") and re-nudge the recheck so the freshly-queued import is
+    /// popped first. The popped orphan copy is DISCARDED by the caller (it
+    /// returns `false`), so the queue now carries the properly-ordered
+    /// import→work prefix. Shared by the `StrandedHere` (re-place on THIS
+    /// secondary) and `Reroute` (re-place on another satisfiable secondary)
+    /// arms — one re-derive owner.
+    async fn affine_replace_and_nudge(&mut self, target: &str, placement: &WorkPlacement) {
+        let mutations = self.affine_scheduler.place::<I, _>(
+            target,
+            placement,
+            |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
+        );
+        if !mutations.is_empty() {
+            self.apply_and_broadcast_cluster_mutations(mutations).await;
+        }
+        self.cluster_state
+            .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
+    }
+
+    /// Terminal-fail an affine-dep WORK task whose import `Failed` on every
+    /// eligible secondary (the `Unsatisfiable` gate verdict) — the cascade that
+    /// breaks the all-`Failed` livelock and realizes the owner Q1 default
+    /// (affine failure terminal-by-default).
+    ///
+    /// Takes the work item OUT of its bucket + `mark_in_flight` (the SAME
+    /// symmetric accounting the dispatch path does, so the subsequent
+    /// `on_item_failed_permanent` in-flight decrement balances — the item was
+    /// never globally dispatched but is queued, so without this the decrement
+    /// would corrupt a sibling's slot), then enqueues a decoupled
+    /// `PrimaryCommand::FailPermanent` onto the self command channel. The
+    /// operational loop drives `apply_fail_permanent` with the proper
+    /// `command_rx` (the dispatch path holds none) — the dispatch-decoupling
+    /// law: the dispatch path EMITS a command, it never drives the cascade
+    /// inline. A `Full`/`Closed` channel is a degenerate teardown state; the
+    /// drop is benign (the run is winding down). The reply oneshot is
+    /// fire-and-forget (the dropped receiver is the documented in-runtime
+    /// shape).
+    fn fail_unsatisfiable_affine_work(&mut self, hash: &str, phase: &dynrunner_core::PhaseId) {
+        // Take the queued work item out of its bucket; if it is not in a
+        // dispatchable bucket (already taken / phase not Active), the claim is
+        // stale and there is nothing to fail here — drop quietly.
+        let target = hash.to_string();
+        if self
+            .pool_mut()
+            .take_first_match(|t| compute_task_hash(t) == target)
+            .is_none()
+        {
+            return;
+        }
+        self.pool_mut().mark_in_flight(phase);
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        let reason = format!(
+            "affine import for work task {hash} FAILED on every eligible \
+             secondary — the per-secondary import cannot be satisfied anywhere, \
+             so the dependent is permanently unfulfillable"
+        );
+        let cmd = super::command_channel::PrimaryCommand::FailPermanent {
+            hash: target,
+            error: dynrunner_core::ErrorType::NonRecoverable,
+            reason,
+            reply,
+        };
+        if let Err(err) = self.command_tx.try_send(cmd) {
+            // A full/closed self-channel is a degenerate teardown state; the
+            // cascade is dropped (the work item is already out of the bucket +
+            // accounted in-flight, so it no longer dispatches — the run is
+            // winding down). Undo the in-flight bump so a surviving phase
+            // machine is not left with a phantom slot.
+            tracing::debug!(
+                task_hash = %hash,
+                error = %err,
+                "affine terminal-fail: command channel unavailable; dropping cascade"
+            );
+            self.pool_mut().on_item_finished(phase, None);
+        }
+    }
+
+    /// The candidate secondaries for affine rank selection: the live roster
+    /// (every secondary with ≥1 worker slot). Name-deduplicated + sorted for
+    /// the deterministic tie-break `select_secondary` / `rebuild` rely on.
+    fn affine_placement_secondaries(&self) -> Vec<String> {
+        let mut secs: Vec<String> = self
+            .workers
+            .iter()
+            .map(|w| w.secondary_id.clone())
+            .collect();
+        secs.sort();
+        secs.dedup();
+        secs
+    }
+
+    /// Build the rank-selection placement list for the failover rebuild: the
+    /// [`super::affine_scheduler::WorkPlacement`] of every WORK task with ≥1
+    /// affine dep, in a DETERMINISTIC (hash-sorted) order so the rebuild
+    /// reproduces the same per-secondary layout on every promoted primary
+    /// (the bitvector — incl. `Queued` — is replicated, so re-placing against
+    /// it lands each unit on the same secondary up to the deterministic
+    /// tie-break). Consumed by [`Self::rebuild_affine_schedule`].
+    pub(crate) fn affine_rebuild_placements(&self) -> Vec<super::affine_scheduler::WorkPlacement> {
+        let mut placements: Vec<super::affine_scheduler::WorkPlacement> = self
+            .cluster_state
+            .tasks_iter()
+            .filter_map(|(_, state)| {
+                let def = state.def();
+                if def.kind.is_secondary_affine() {
+                    return None;
+                }
+                let task: TaskInfo<I> = self.cluster_state.task_to_info(state);
+                let placement = self.affine_placement_for(&task);
+                (!placement.affine_deps.is_empty()).then_some(placement)
+            })
+            .collect();
+        placements.sort_by(|a, b| a.hash.cmp(&b.hash));
+        placements
+    }
+
+    /// Failover rebuild: discard the local per-secondary queues and re-run
+    /// rank placement over the pending work pool against the inherited
+    /// (replicated) bitvector. The promoted-primary seam — the queues are
+    /// LOCAL (not replicated), so a promotion re-derives them from the
+    /// replicated bitvector + the work pool, reproducing the per-secondary
+    /// layout up to the deterministic tie-break (the bitvector, incl. `Queued`,
+    /// IS replicated, so re-placing lands each unit on the same secondary).
+    ///
+    /// Called by [`PrimaryCoordinator::hydrate_from_cluster_state`] AFTER the
+    /// pool + roster are reconstructed. Hydrate is a SYNC constructor-time
+    /// derived-cache rebuild (it runs in `seed_from_promotion_snapshot` BEFORE
+    /// the run loop + dispatchers start, so no async broadcast transport
+    /// exists), so the rebuild's emitted cell mutations are applied LOCALLY
+    /// through the same stamping choke the async originator uses
+    /// ([`crate::cluster_state::apply_locally_for_broadcast`], which stamps the
+    /// per-cell LWW generation), NOT broadcast. The bitvector is replicated, so
+    /// a re-claim against an already-`Queued` inherited cell emits NOTHING
+    /// (`place` skips it); a NotDone→Queued re-claim is applied locally and the
+    /// promoted primary's subsequent anti-entropy + live origination propagate
+    /// it — the LWW generation keeps convergence intact across the epoch.
+    pub(crate) fn rebuild_affine_schedule(&mut self) {
+        // `clear` drops both the queues AND the placement guard, so the rebuild
+        // re-derives placements from scratch against the inherited bitvector (a
+        // placement whose `Queued` claim survived in the replicated bitvector
+        // re-appends nothing — `place` skips an already-queued cell — but the
+        // work-task append must be allowed to re-run).
+        self.affine_scheduler.clear();
+        let secondaries = self.affine_placement_secondaries();
+        if secondaries.is_empty() {
+            return;
+        }
+        let placements = self.affine_rebuild_placements();
+        // Seed the idempotency guard with every work hash the rebuild places,
+        // so the next LIVE placement trigger does not re-queue an already-
+        // rebuilt work task (the rebuild placed the whole pending affine-dep
+        // pool; `rebuild` calls `place` for each, bypassing the per-call
+        // guard).
+        for placement in &placements {
+            self.affine_scheduler.record_placed_work(&placement.hash);
+        }
+        let mutations = self.affine_scheduler.rebuild::<I, _>(
+            &secondaries,
+            &placements,
+            |s: &str, a: AffineId| self.cluster_state.affine_state(s, a),
+        );
+        if !mutations.is_empty() {
+            crate::cluster_state::apply_locally_for_broadcast(&mut self.cluster_state, mutations);
+        }
     }
 }

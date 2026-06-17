@@ -27,7 +27,7 @@
 //!
 //! [`outcome_bucket_of`] maps a live [`TaskState`] to its
 //! [`OutcomeBucket`], or `None` for a NON-terminal state (Pending / InFlight
-//! / QueuedAfterLocalDependency / Blocked — uncounted). It is the SOLE
+//! / Blocked — uncounted). It is the SOLE
 //! mapping: the incremental tally folds through it at the write seam, and the
 //! `#[cfg(test)]` oracle ([`ClusterState::outcome_counts_by_scan`](super::ClusterState::outcome_counts_by_scan))
 //! folds through it (plus [`settled_bucket_of`] for the settled half) so the
@@ -71,7 +71,6 @@ pub(super) enum OutcomeBucket {
     FailFinal,
     Skipped,
     SetupSucceeded,
-    AffineReady,
 }
 
 /// The SINGLE `Failed { kind }` → bucket split. `Recoverable` → `FailRetry`,
@@ -102,9 +101,7 @@ pub(super) fn bucket_for_failed_kind(kind: &ErrorType) -> OutcomeBucket {
 /// * `Unfulfillable` / `InvalidTask` → `FailFinal`
 /// * `SkippedAlreadyDone` → `Skipped`
 /// * `SetupCompleted` → `SetupSucceeded`
-/// * `AffineReady` → `AffineReady`
-/// * `Pending` / `InFlight` / `QueuedAfterLocalDependency` / `Blocked` →
-///   `None` (non-terminal, uncounted)
+/// * `Pending` / `InFlight` / `Blocked` → `None` (non-terminal, uncounted)
 pub(super) fn outcome_bucket_of<I>(state: &TaskState<I>) -> Option<OutcomeBucket> {
     match state {
         TaskState::Completed { .. } => Some(OutcomeBucket::Succeeded),
@@ -117,13 +114,11 @@ pub(super) fn outcome_bucket_of<I>(state: &TaskState<I>) -> Option<OutcomeBucket
         }
         TaskState::SkippedAlreadyDone { .. } => Some(OutcomeBucket::Skipped),
         TaskState::SetupCompleted { .. } => Some(OutcomeBucket::SetupSucceeded),
-        TaskState::AffineReady { .. } => Some(OutcomeBucket::AffineReady),
         // Non-terminal: contribute to no bucket. A transition INTO one of
         // these from a terminal (a Recoverable Failed reinjected to Pending,
         // a reset) DECREMENTS the prior bucket.
         TaskState::Pending { .. }
         | TaskState::InFlight { .. }
-        | TaskState::QueuedAfterLocalDependency { .. }
         | TaskState::Blocked { .. } => None,
     }
 }
@@ -143,7 +138,6 @@ pub(super) fn settled_bucket_of(class: &SettledClass) -> OutcomeBucket {
         SettledClass::InvalidTask => OutcomeBucket::FailFinal,
         SettledClass::SkippedAlreadyDone => OutcomeBucket::Skipped,
         SettledClass::SetupCompleted => OutcomeBucket::SetupSucceeded,
-        SettledClass::AffineReady => OutcomeBucket::AffineReady,
     }
 }
 
@@ -200,7 +194,6 @@ impl OutcomeTally {
             OutcomeBucket::FailFinal => &mut self.summary.fail_final,
             OutcomeBucket::Skipped => &mut self.summary.skipped,
             OutcomeBucket::SetupSucceeded => &mut self.summary.setup_succeeded,
-            OutcomeBucket::AffineReady => &mut self.summary.affine_ready,
         }
     }
 }

@@ -41,6 +41,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             ..
         } = &msg
         {
+            // AFFINE terminal (Model B): an affine task is the per-secondary
+            // IMPORT primitive — it runs PER-SECONDARY and the SAME hash
+            // legitimately completes on MULTIPLE secondaries. So its terminal
+            // is handled OUTSIDE the global `completed_tasks` dedup (which would
+            // suppress every per-secondary run after the first, leaking each
+            // later secondary's worker slot and never marking its bitvector
+            // cell). The affine handler is phase-NEUTRAL + NON-pool-unblocking
+            // (the dependent work task's affine readiness is the per-secondary
+            // bitvector + queue order, not this global terminal) and
+            // per-secondary IDEMPOTENT (the bitvector LWW + the slot's
+            // held-hash guard absorb a re-delivered same-secondary terminal).
+            if self.cluster_state.affine_id_for_hash(task_hash).is_some() {
+                // `Box::pin` the affine sub-handler so its future does NOT
+                // inline into `handle_task_complete`'s async state machine: the
+                // coordinator is held by-value across these `.await`s in deep
+                // relocation futures, which sit near the debug test stack limit
+                // (the same sensitivity the boxed `affine_scheduler` field
+                // addresses), so keeping the rare affine branch off the hot
+                // future's inline size is load-bearing.
+                Box::pin(self.handle_affine_task_complete(&msg)).await;
+                return;
+            }
+
             // Dedup gate (#50 peer-forwarding redundancy):
             // peers forward observed-via-peer-mesh TaskCompletes
             // to the primary so wire-loss on the originator's
@@ -97,6 +120,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 attempt: Default::default(),
             }])
             .await;
+
+            // AF-sched terminal→bitvector seam (design point 7): a secondary
+            // runs an affine task like ANY other and reports its terminal here.
+            // If this hash binds to an affine-id, mark that secondary's cell
+            // Done. `None` for an ordinary work task — no affine reaction. The
+            // ONE affine-specific effect of a terminal; the cell generation is
+            // stamped at the broadcast choke point.
+            if let Some(m) = self.affine_terminal_mutation(&secondary_id, task_hash, true) {
+                self.apply_and_broadcast_cluster_mutations(vec![m]).await;
+            }
 
             // A successful TaskComplete from this secondary proves
             // it's healthy — clear any backpressure backoff. The
@@ -240,6 +273,98 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             self.forward_completion_to_secondaries(&msg, &secondary_id)
                 .await;
         }
+    }
+
+    /// Handle a `TaskComplete` for an AFFINE task (Model B) — the per-secondary
+    /// IMPORT terminal. SEPARATE from the work-task path because an affine task
+    /// runs PER-SECONDARY: the same hash completes on every secondary that
+    /// imported its toolchain, so it is NOT subject to the global
+    /// `completed_tasks` dedup (each run must free its own worker slot + mark
+    /// its own bitvector cell).
+    ///
+    /// The three effects, all per-secondary idempotent:
+    ///   1. BITVECTOR: mark `(secondary, affine_id)` `Finished` — the authority
+    ///      for the dependent work task's per-secondary affine readiness. The
+    ///      LWW cell join absorbs a re-delivered same-secondary terminal.
+    ///   2. WORKER SLOT: free the holding slot + the in-flight ledger entry via
+    ///      the same `free_slot_on_terminal` the work path uses (worker
+    ///      bookkeeping applies to EVERY per-secondary run; the slot's held-hash
+    ///      guard makes a re-delivery a safe no-op).
+    ///   3. LEDGER CLEANLINESS: on the FIRST run (the global TaskState is not
+    ///      yet terminal), originate a global `TaskCompleted` so the affine
+    ///      TaskState reaches `Completed` and the ledger is clean; subsequent
+    ///      per-secondary runs skip it (bitvector-only).
+    ///
+    /// Phase-NEUTRAL + NON-pool-unblocking: it never calls `note_item_completed`
+    /// (no `in_flight_per_phase` decrement — affine is uncounted; no
+    /// `resolve_completed_dependents` for the affine task_id — the dependent's
+    /// readiness is the bitvector, not this terminal). It emits `TasksAdded` so
+    /// the freed worker + the next per-secondary queued unit (the dependent work
+    /// task, or the next affine prereq) are re-evaluated by the dispatch
+    /// recheck, and forwards the completion to peers for replica coherence.
+    async fn handle_affine_task_complete(&mut self, msg: &DistributedMessage<I>) {
+        let DistributedMessage::TaskComplete {
+            secondary_id,
+            worker_id,
+            task_hash,
+            ..
+        } = msg
+        else {
+            return;
+        };
+        let secondary_id = secondary_id.clone();
+        let worker_id = *worker_id;
+        let task_hash = task_hash.clone();
+
+        // (3) FIRST-run ledger cleanliness: originate the global `TaskCompleted`
+        // only while the affine TaskState is not yet terminal. A later
+        // per-secondary run finds it already `Completed` and skips (the apply
+        // would NoOp anyway, but skipping keeps re-runs purely bitvector-side).
+        let first_run = self
+            .cluster_state
+            .task_state(&task_hash)
+            .is_some_and(|s| !s.is_terminal());
+        if first_run {
+            self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskCompleted {
+                hash: task_hash.clone(),
+                result_data: None,
+                attempt: Default::default(),
+            }])
+            .await;
+        }
+
+        // (1) BITVECTOR: mark this secondary's cell Finished (per-secondary; the
+        // cell generation is stamped at the broadcast choke).
+        if let Some(m) = self.affine_terminal_mutation(&secondary_id, &task_hash, true) {
+            self.apply_and_broadcast_cluster_mutations(vec![m]).await;
+        }
+
+        // A healthy completion proves the secondary live — clear its backoff.
+        self.backpressured_secondaries.remove(&secondary_id);
+        self.drop_supplanted_holder(&task_hash);
+
+        // (2) WORKER SLOT: free the holding slot + ledger entry (worker
+        // bookkeeping for THIS per-secondary run). NO phase cascade.
+        self.free_slot_on_terminal(&secondary_id, worker_id, &task_hash);
+
+        tracing::debug!(
+            secondary = %secondary_id,
+            worker_id,
+            task_hash = %task_hash,
+            first_run,
+            "affine import complete on secondary (bitvector Finished); phase-neutral"
+        );
+
+        // The freed worker + the next per-secondary queued unit (the dependent
+        // work task now that its import ran here, or the next affine prereq) are
+        // re-evaluated by the dispatch recheck. Decoupled emit, never a direct
+        // dispatch call (the dispatch-decoupling law).
+        self.cluster_state
+            .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
+
+        // Forward to peers for replica coherence (same as the work path).
+        self.forward_completion_to_secondaries(msg, &secondary_id)
+            .await;
     }
 
     /// Send `msg` to every connected secondary except the one that

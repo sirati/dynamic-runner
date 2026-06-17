@@ -76,7 +76,6 @@ fn run_complete_latches_carried_counts_atomically() {
         counts: dynrunner_core::TerminalOutcomeCounts {
             succeeded: 2,
             fail_final: 538,
-            affine_ready: 44,
             ..Default::default()
         },
     });
@@ -86,7 +85,6 @@ fn run_complete_latches_carried_counts_atomically() {
         .expect("the carried counts latch with the run-complete flag");
     assert_eq!(counts.succeeded, 2);
     assert_eq!(counts.fail_final, 538, "the authoritative fail_final is in hand");
-    assert_eq!(counts.affine_ready, 44);
 }
 
 /// #513 — first-writer-wins on the carried counts, mirroring `run_aborted`'s

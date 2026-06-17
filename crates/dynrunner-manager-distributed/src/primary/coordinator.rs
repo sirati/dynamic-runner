@@ -1101,6 +1101,25 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// happens-before constraint) live in `cluster_state.rs`.
     pub(super) cluster_state: ClusterState<I>,
 
+    /// Primary-LOCAL per-secondary affine queues plus the placement/steal
+    /// policy (the AF-sched locality layer over the replicated AF-id
+    /// bitvector). NOT replicated — a promoted primary rebuilds it from the
+    /// inherited bitvector and the pending work pool
+    /// (`AffineScheduler::rebuild`); see `primary::affine_scheduler`. Read by
+    /// the dispatch leaf (per-secondary pop, idle-steal, placement) and the
+    /// failover rebuild (`primary::affine_dispatch`).
+    ///
+    /// BOXED so the per-secondary-affine consumer state (the queues + the
+    /// placement-idempotency guard) adds exactly ONE pointer to the
+    /// coordinator's already-large inline footprint — the same boxing rationale
+    /// `cluster_state::affine_state::AffineState` documents: the coordinator is
+    /// held BY VALUE across `.await` in the deeply-nested operational /
+    /// relocation futures, so inline growth costs STACK (the debug-build
+    /// relocation futures sit near the default test stack limit; an inline
+    /// `HashSet` field pushed `relocated_primary_mode1_file_based_restages` over
+    /// it). Boxing keeps the future-size impact flat.
+    pub(super) affine_scheduler: Box<super::affine_scheduler::AffineScheduler>,
+
     /// Outbound snapshot-stream driver: serves `RequestSnapshotStream`
     /// pulls (late joiners, behind peers) one bounded package per
     /// operational-loop wakeup — see `crate::snapshot_stream`. The
@@ -1882,6 +1901,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             pending_observer: None,
             pending_stage_files: Vec::new(),
             cluster_state,
+            affine_scheduler: Box::new(super::affine_scheduler::AffineScheduler::default()),
             snapshot_streams,
             settled_spill,
             inbound_snapshots,

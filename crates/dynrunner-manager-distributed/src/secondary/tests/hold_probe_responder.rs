@@ -13,23 +13,11 @@
 #![cfg(test)]
 
 use super::super::test_helpers::{
-    FakeWorkerFactory, TestId, election_config, make_secondary_recording_with_membership,
+    FakeWorkerFactory, election_config, make_secondary_recording_with_membership,
 };
-use super::super::{PendingAffineDependent, *};
+use super::super::*;
 use super::processing::make_binary;
 use dynrunner_protocol_primary_secondary::DistributedMessage;
-
-/// Build a `PendingAffineDependent` for work task `B` (`work_hash`) parked
-/// behind a local SecondaryAffine import on `worker_id` (#497).
-fn make_affine_dependent(work_hash: &str, worker_id: u32) -> PendingAffineDependent<TestId> {
-    PendingAffineDependent {
-        work_hash: work_hash.to_string(),
-        worker_id,
-        binary: make_binary(work_hash, 50),
-        estimated: dynrunner_core::ResourceMap::new(),
-        predecessor_outputs: Default::default(),
-    }
-}
 
 /// Collect every `TaskHoldResponse` in the recorded wire log as
 /// `(task_hash, held)` pairs.
@@ -112,62 +100,6 @@ async fn responder_answers_from_active_tasks_and_pending_first_bind() {
                 ],
                 "active_tasks => held; pending_first_bind => held; \
                  neither => the positive denial"
-            );
-        })
-        .await;
-}
-
-/// #497 — a work task parked in `affine_running` (deferred behind this
-/// node's local SecondaryAffine import) answers `held = true`: it was
-/// assigned to this node and its dispatch is merely withheld until the
-/// import releases, so it is genuinely held own-worker bookkeeping. Without
-/// this branch the parked dependent answers the positive denial, the
-/// primary requeues it onto the SAME affine secondary, it defers again, and
-/// the reconciliation probe loops forever (the never-registering-task leak).
-///
-/// REVERT-CHECK: drop the `affine_running` branch from `holding_worker` and
-/// this asserts `held = false` (the looping pre-fix shape).
-#[tokio::test(flavor = "current_thread")]
-async fn responder_answers_held_for_affine_running_parked_dependent() {
-    let _ = tracing_subscriber::fmt::try_init();
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (mut secondary, log, _membership) =
-                make_secondary_recording_with_membership(election_config("sec-2"), 1);
-            secondary.set_bootstrap_primary_id("setup".to_string());
-            let mut factory = FakeWorkerFactory;
-            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
-            secondary.enter_operational_for_test();
-            *secondary.pool_mut() = pool;
-
-            // Park work task B (h-parked) behind a local import gate
-            // (gate-I), bound to worker 0 — exactly what `ensure_affine_import`
-            // does on a defer: APPEND to `affine_running` AND maintain the O(1)
-            // `affine_dependent_worker` reverse index the probe responder reads
-            // (the two are kept in lockstep at the real park site).
-            secondary
-                .op_mut()
-                .affine_running
-                .entry("gate-I".into())
-                .or_default()
-                .push(make_affine_dependent("h-parked", 0));
-            secondary
-                .op_mut()
-                .affine_dependent_worker
-                .insert("h-parked".into(), 0);
-
-            probe(&mut secondary, "h-parked").await;
-            probe(&mut secondary, "h-unknown").await;
-
-            assert_eq!(
-                hold_responses(&log),
-                vec![
-                    ("h-parked".to_string(), true),
-                    ("h-unknown".to_string(), false),
-                ],
-                "a dependent parked in affine_running is HELD (it is owned, \
-                 just deferred); an unknown hash is the positive denial"
             );
         })
         .await;

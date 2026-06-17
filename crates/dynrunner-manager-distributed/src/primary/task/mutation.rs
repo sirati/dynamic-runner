@@ -488,14 +488,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     match &entry.class {
                         SettledClass::Completed
                         | SettledClass::SkippedAlreadyDone
-                        | SettledClass::SetupCompleted
-                        // A resolved SecondaryAffine gate is success-like for
-                        // the cascade (dependents resolve) and goes in the
-                        // completed dep-resolution mirror, exactly like a
-                        // succeeded setup task. It has no local execution
-                        // residue (a gate is never worker-dispatched), so the
-                        // residue steps below are harmless no-ops for it.
-                        | SettledClass::AffineReady => (true, None, true),
+                        | SettledClass::SetupCompleted => (true, None, true),
                         SettledClass::FailedFinal(kind) => (false, Some(kind.clone()), false),
                         SettledClass::InvalidTask => (true, None, false),
                     }

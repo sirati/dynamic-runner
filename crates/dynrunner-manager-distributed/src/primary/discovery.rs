@@ -153,20 +153,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         batch.push(ClusterMutation::DiscoverySettled);
         self.apply_and_broadcast_cluster_mutations(batch).await;
 
-        // SecondaryAffine ready-resolution over the SEED surface (#502). The
-        // `TaskAdded` fan-out above seeds each gate `Pending` WITHOUT riding
-        // the apply-pass delta surface the live AffineReady originator fires
-        // on (`TaskAdded`'s apply arm deliberately does not feed
-        // `newly_pending_from_spawn`), so a no-dep gate — or one whose deps
-        // are pre-succeeded staging setup tasks, already terminal in the same
-        // batch — is born `Pending`-all-resolved yet never transitions to
-        // `AffineReady`. Drive the originator now — AFTER the seed apply (so
-        // each gate's deps' terminality is settled) and BEFORE the hydrate
-        // below (so hydrate seeds the resolved gate terminal and OUT of the
-        // pool, its dependents entering dispatchable). Inert when the corpus
-        // carries no resolvable gate.
-        self.originate_affine_ready_for_seeded_gates().await;
-
         // `all_binaries` is a pure derived cache of the CRDT task universe;
         // hydrate rebuilds it from `tasks_iter()` below, so we do NOT set it
         // here (single builder).

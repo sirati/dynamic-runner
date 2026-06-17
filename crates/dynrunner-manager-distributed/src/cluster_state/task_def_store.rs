@@ -54,6 +54,17 @@ impl TaskDefId {
     pub(crate) const UNBOUND: TaskDefId = TaskDefId(u32::MAX);
 }
 
+/// Compact, monotonically-minted handle for a [`TaskKind::SecondaryAffine`]
+/// task DEFINITION — a SIBLING id space to [`TaskDefId`], minted ONLY for
+/// affine defs so the value stays DENSE (the per-secondary affine bitvector
+/// indexes a cell by it; a sparse def-id space would waste two bits per
+/// non-affine def). Allocated the SAME way as `TaskDefId` (primary-side
+/// `alloc_for_affine_hash` reservation → wire-agreed `intern_affine_at`
+/// placement, hash↔id bijection-enforced, failover resume floor), so it is
+/// CRDT-agreed + failover-stable + snapshot-portable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct AffineId(pub u32);
+
 /// One dep-graph edge on a [`FrozenTaskDef`] (L5): the compact
 /// `TaskDefId` of the PREREQUISITE task's def, plus the per-edge
 /// `inherit_outputs` opt-in carried verbatim from the source
@@ -117,6 +128,16 @@ pub struct FrozenTaskDef<I> {
     /// fields are `pub` for the def-transfer wire — and [`TaskDefId`] is
     /// itself crate-private, so a `pub` field would leak a private type.
     pub(crate) def_id: TaskDefId,
+    /// This def's affine-id IFF it is a [`TaskKind::SecondaryAffine`] def —
+    /// `None` for every ordinary (Work/Setup) def. STAMPED at the wire-agreed
+    /// affine intern ([`TaskDefStore::intern_affine_at`]) so the inline
+    /// serialization is self-describing exactly like `def_id`: a restoring
+    /// replica re-anchors the affine-id↔hash binding from the carried value
+    /// ([`super::ClusterState::register_restored_def`]), so the affine bitvector
+    /// cell index survives snapshot/restore/failover with no separate wire
+    /// field. `None` on an un-interned def (the [`Self::from_task_info`]
+    /// splitter has no store to allocate against) and on every non-affine def.
+    pub(crate) affine_id: Option<AffineId>,
     pub path: PathBuf,
     pub size: u64,
     pub identifier: I,
@@ -190,6 +211,9 @@ impl<I> FrozenTaskDef<I> {
                 // UN-interned: the intern step stamps the real id over this
                 // sentinel before the def is stored or observed.
                 def_id: TaskDefId::UNBOUND,
+                // Un-allocated: the affine intern step stamps the real
+                // affine-id (only for a SecondaryAffine def) before storage.
+                affine_id: None,
                 path,
                 size,
                 identifier,
@@ -350,6 +374,40 @@ pub(crate) struct TaskDefStore<I> {
     /// binding wins; the phased `identity_to_id` is consulted FIRST so an
     /// exact match always dominates a phaseless one.
     task_id_to_id: HashMap<String, TaskDefId>,
+    /// Content hash → the def's COMMITTED AFFINE-id, populated ONLY for
+    /// [`TaskKind::SecondaryAffine`] defs whose `SecondaryAffineRegistered`
+    /// has been APPLIED (the affine analogue of `hash_to_id`): the dedup gate
+    /// AND one half of the hash↔affine_id BIJECTION the wire-agreed
+    /// [`Self::intern_affine_at`] enforces, so every replica converges on the
+    /// SAME dense affine-id for an affine def's content. A non-affine def is
+    /// never recorded here, keeping the affine-id space dense for the
+    /// per-secondary bitvector index. The COMMITTED binding the AF-sched query
+    /// [`Self::affine_id_for_hash`] reads — distinct from the primary's
+    /// pre-broadcast `affine_reserved` below (the affine twin of how a def's
+    /// `hash_to_id` reservation is distinct from its placed def slot, so the
+    /// originator's own registration apply still does real work / is Applied).
+    affine_hash_to_id: HashMap<String, AffineId>,
+    /// PRIMARY-side pre-broadcast affine-id RESERVATIONS — `hash → affine_id`
+    /// minted by [`Self::alloc_for_affine_hash`] at the broadcast stamp step
+    /// BEFORE the matching `SecondaryAffineRegistered` is applied. Keeps the
+    /// stamp pass's id allocation idempotent on hash (a re-stamp reuses the
+    /// reservation) WITHOUT pre-committing the binding, so the originator's own
+    /// apply of its `SecondaryAffineRegistered` is the FIRST commit (Applied,
+    /// hence broadcast) rather than a NoOp the wire-filter would drop — the
+    /// affine twin of `alloc_for_hash`-reserves / `intern_at`-fills.
+    affine_reserved: HashMap<String, AffineId>,
+    /// AFFINE-id → the content hash it is bound to — the reverse of
+    /// `affine_hash_to_id`, the half of the bijection [`Self::intern_affine_at`]
+    /// consults to detect an id rebind (a new hash claiming an already-bound
+    /// affine slot). Also the seam AF-sched reads to map a bitvector cell
+    /// index back to its affine def.
+    affine_id_to_hash: HashMap<AffineId, String>,
+    /// The next affine-id this store's allocator would mint — the affine
+    /// twin of `next_id`, re-anchored PAST every observed affine-id by
+    /// [`Self::resume_affine_alloc_floor`] on failover so a promoted primary
+    /// never re-mints a live affine-id (the same epoch-/failover-safety the
+    /// def-id allocator has; a node-local cold counter would alias).
+    next_affine_id: u32,
 }
 
 /// A hash↔id BIJECTION violation observed by [`TaskDefStore::intern_at`]:
@@ -383,6 +441,10 @@ impl<I> Default for TaskDefStore<I> {
             str_intern: HashMap::new(),
             identity_to_id: HashMap::new(),
             task_id_to_id: HashMap::new(),
+            affine_hash_to_id: HashMap::new(),
+            affine_reserved: HashMap::new(),
+            affine_id_to_hash: HashMap::new(),
+            next_affine_id: 0,
         }
     }
 }
@@ -396,6 +458,10 @@ impl<I> Clone for TaskDefStore<I> {
             str_intern: self.str_intern.clone(),
             identity_to_id: self.identity_to_id.clone(),
             task_id_to_id: self.task_id_to_id.clone(),
+            affine_hash_to_id: self.affine_hash_to_id.clone(),
+            affine_reserved: self.affine_reserved.clone(),
+            affine_id_to_hash: self.affine_id_to_hash.clone(),
+            next_affine_id: self.next_affine_id,
         }
     }
 }
@@ -407,6 +473,8 @@ impl<I> std::fmt::Debug for TaskDefStore<I> {
             .field("hash_to_id", &self.hash_to_id.len())
             .field("next_id", &self.next_id)
             .field("str_intern", &self.str_intern.len())
+            .field("affine_hash_to_id", &self.affine_hash_to_id.len())
+            .field("next_affine_id", &self.next_affine_id)
             .finish()
     }
 }
@@ -737,6 +805,108 @@ impl<I> TaskDefStore<I> {
     pub(crate) fn resume_alloc_floor(&mut self, floor: u32) {
         self.next_id = self.next_id.max(floor);
     }
+
+    // ── AFFINE-id allocation (sibling id space to TaskDefId) ──
+    //
+    // Mints a DENSE u32 affine-id per SecondaryAffine def, the SAME way the
+    // def-id machinery above mints `TaskDefId`: a primary-side
+    // `alloc_for_affine_hash` reservation, a wire-agreed `intern_affine_at`
+    // placement under hash↔id bijection, and a `resume_affine_alloc_floor`
+    // failover re-anchor. Only the SecondaryAffine subset is recorded, so the
+    // value stays dense for the per-secondary bitvector index.
+
+    /// Mint the next affine-id from the epoch-safe `next_affine_id` allocator.
+    fn alloc_affine(&mut self) -> AffineId {
+        let id = AffineId(self.next_affine_id);
+        self.next_affine_id += 1;
+        id
+    }
+
+    /// PRIMARY-side affine-id RESERVATION for an affine def's content `hash`,
+    /// idempotent on hash: returns the COMMITTED id if already bound, else the
+    /// existing RESERVATION, else mints a fresh one into `affine_reserved`. The
+    /// affine twin of [`Self::alloc_for_hash`] — the broadcast stamp step calls
+    /// it for a SecondaryAffine `TaskAdded` so the wire `SecondaryAffineRegistered`
+    /// carries the agreed affine-id. It RESERVES but does NOT commit the
+    /// binding (so the matching registration apply is the first commit / is
+    /// Applied / is broadcast), exactly as `alloc_for_hash` reserves without
+    /// placing the def slot.
+    pub(crate) fn alloc_for_affine_hash(&mut self, hash: &str) -> AffineId {
+        if let Some(&committed) = self.affine_hash_to_id.get(hash) {
+            return committed;
+        }
+        if let Some(&reserved) = self.affine_reserved.get(hash) {
+            return reserved;
+        }
+        let id = self.alloc_affine();
+        self.affine_reserved.insert(hash.to_string(), id);
+        id
+    }
+
+    /// RECEIVE-side wire-agreed affine intern: bind the affine def's `hash` to
+    /// EXACTLY `id`, enforcing the hash↔affine_id BIJECTION so every replica
+    /// converges on the same affine-id. The affine twin of [`Self::intern_at`]
+    /// (def-id placement), but bijection-only — it records the hash↔id binding,
+    /// NOT a def slot (the def itself is placed by the def-id `intern_at`; this
+    /// path only owns the affine-id binding). Idempotent on a same-id re-add;
+    /// a [`DefBijectionError`] on a contradiction (a converged registry never
+    /// produces one).
+    pub(crate) fn intern_affine_at(
+        &mut self,
+        id: AffineId,
+        hash: &str,
+    ) -> Result<AffineId, DefBijectionError> {
+        if let Some(&existing) = self.affine_hash_to_id.get(hash) {
+            if existing != id {
+                return Err(DefBijectionError::HashRebound {
+                    hash: hash.to_string(),
+                    existing: TaskDefId(existing.0),
+                    wire: TaskDefId(id.0),
+                });
+            }
+            return Ok(existing);
+        }
+        // Hash is NEW: the affine slot must be free (a new hash claiming an
+        // occupied affine-id is the id-rebind fault).
+        if self.affine_id_to_hash.contains_key(&id) {
+            return Err(DefBijectionError::IdRebound { id: TaskDefId(id.0) });
+        }
+        self.affine_hash_to_id.insert(hash.to_string(), id);
+        self.affine_id_to_hash.insert(id, hash.to_string());
+        // Drop any pre-broadcast reservation now that the binding is COMMITTED
+        // (the originator's own commit retires its reservation).
+        self.affine_reserved.remove(hash);
+        // Keep the allocator strictly above every observed affine-id so a
+        // later node-local mint never collides with a wire-placed id.
+        self.next_affine_id = self.next_affine_id.max(id.0 + 1);
+        Ok(id)
+    }
+
+    /// The affine-id a content `hash` resolves to, if bound (an affine def).
+    pub(crate) fn affine_id_for_hash(&self, hash: &str) -> Option<AffineId> {
+        self.affine_hash_to_id.get(hash).copied()
+    }
+
+    /// The content hash an affine-id is bound to — the AF-sched seam mapping a
+    /// bitvector cell index back to its affine def.
+    #[allow(dead_code)]
+    pub(crate) fn affine_hash_for_id(&self, id: AffineId) -> Option<&str> {
+        self.affine_id_to_hash.get(&id).map(String::as_str)
+    }
+
+    /// The next affine-id the allocator would mint — the failover-resume floor
+    /// a promoted primary re-anchors against (the affine twin of
+    /// [`Self::next_id_floor`]).
+    pub(crate) fn next_affine_id_floor(&self) -> u32 {
+        self.next_affine_id
+    }
+
+    /// Re-anchor the affine-id allocator so the next minted id is at least
+    /// `floor` — the failover-safety seam (the affine twin of
+    /// [`Self::resume_alloc_floor`]). Monotone: never lowers `next_affine_id`.
+    pub(crate) fn resume_affine_alloc_floor(&mut self, floor: u32) {
+        self.next_affine_id = self.next_affine_id.max(floor);
+    }
 }
 
 impl<I: dynrunner_core::Identifier> super::ClusterState<I> {
@@ -993,6 +1163,7 @@ mod tests {
         FrozenTaskDef {
             // UN-interned literal: intern stamps the real id on store.
             def_id: TaskDefId::UNBOUND,
+            affine_id: None,
             path: PathBuf::from(format!("/tasks/{name}")),
             size: 0,
             identifier: RunnerIdentifier::from(name),

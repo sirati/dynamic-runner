@@ -256,65 +256,6 @@ pub enum TaskState<I> {
         routing: TaskRouting,
         attempt: u32,
     },
-    /// A `TaskKind::SecondaryAffine` gate `I` that became dependency-
-    /// SATISFIED (all of ITS OWN deps resolved). READY-not-EXECUTED: it is
-    /// terminal for DEPENDENCY-RESOLUTION + phase-completion purposes (so
-    /// its dependents — the build tasks — unblock and the phase rolls up),
-    /// but the primary NEVER executes it and it is NEVER counted in any
-    /// outcome class (success / fail / setup_succeeded). The per-secondary
-    /// IMPORT it represents runs once-per-secondary, locally, OFF the CRDT
-    /// graph (Phase 4); this gate's only job is "are my dependents
-    /// schedulable yet", answered yes the moment my own deps are done.
-    ///
-    /// Distinct terminal variant (rather than folding the kind onto
-    /// `Completed` or reusing `SetupCompleted`) for the SAME reason
-    /// `SkippedAlreadyDone` / `SetupCompleted` are distinct: every counter
-    /// dispatches on the discriminant — `counts()` tallies it in its OWN
-    /// inert `affine_ready` bucket, `outcome_counts()` keeps it OUT of
-    /// `succeeded`/`fail_*`/`setup_succeeded` yet INCLUDED in
-    /// `total_terminal()` (so a resolved gate is not mis-classified STRANDED
-    /// at finalize), and the narrator never folds it into worker WORK. A
-    /// gate is born `Pending` and transitions here authoritatively at the
-    /// originator's read of "all deps resolved" — never worker-dispatched,
-    /// so it carries NO `version` and NO error payload, and ranks as the
-    /// weakest non-skip terminal in [`TerminalRank`]. LOAD-BEARING: its
-    /// `to_completed_event` is `None` so the gate stays silent on the
-    /// completion channel (it is neither a success nor a failure
-    /// observation a downstream Policy could fold).
-    AffineReady {
-        def: Arc<FrozenTaskDef<I>>,
-        routing: TaskRouting,
-        attempt: u32,
-    },
-    /// A work task `B` assigned to secondary `secondary` and WAITING on that
-    /// secondary's LOCAL `TaskKind::SecondaryAffine` import (#497). A
-    /// NON-TERMINAL state — `B` will run on `secondary` once the local
-    /// import finishes — that is CRDT-replicated + observable so primary and
-    /// observer SEE `B` waiting on a local dep (not lost, not silently stuck
-    /// mid-`InFlight`). Transition: `InFlight | Pending →
-    /// QueuedAfterLocalDependency` (the secondary's
-    /// `TaskQueuedAfterLocalDependency` report → the primary's
-    /// `QueuedAfterLocalDependencySet`); → `InFlight` when the local import
-    /// finishes (the secondary's `LocalDependencyReleased` report → the
-    /// primary's EXISTING `TaskAssigned` originator).
-    ///
-    /// Discrete variant (rather than a flag on `InFlight`) so the observer
-    /// stats arm and the death-seam recovery dispatch on the discriminant and
-    /// read `secondary` directly, never parsing an inner field. It carries
-    /// `version` and `attempt` (preserved from the source `InFlight`/`Pending`)
-    /// so the join places it coherently in the non-terminal band
-    /// ([`NonTerminalRank::QueuedAfterLocalDependency`], between `Pending`
-    /// and `InFlight`) and the subsequent release `TaskAssigned` (minting a
-    /// strictly-higher version) dominates it. On the holding secondary's
-    /// death the death seam requeues it back to `Pending` (re-routable per
-    /// #495), like `InFlight`.
-    QueuedAfterLocalDependency {
-        def: Arc<FrozenTaskDef<I>>,
-        routing: TaskRouting,
-        secondary: String,
-        version: TaskVersion,
-        attempt: u32,
-    },
 }
 
 impl<I> TaskState<I> {
@@ -333,8 +274,6 @@ impl<I> TaskState<I> {
             | TaskState::InvalidTask { def, .. }
             | TaskState::SkippedAlreadyDone { def, .. }
             | TaskState::SetupCompleted { def, .. }
-            | TaskState::AffineReady { def, .. }
-            | TaskState::QueuedAfterLocalDependency { def, .. }
             | TaskState::Blocked { def, .. } => def,
         }
     }
@@ -354,8 +293,6 @@ impl<I> TaskState<I> {
             | TaskState::InvalidTask { routing, .. }
             | TaskState::SkippedAlreadyDone { routing, .. }
             | TaskState::SetupCompleted { routing, .. }
-            | TaskState::AffineReady { routing, .. }
-            | TaskState::QueuedAfterLocalDependency { routing, .. }
             | TaskState::Blocked { routing, .. } => routing,
         }
     }
@@ -374,8 +311,6 @@ impl<I> TaskState<I> {
             | TaskState::InvalidTask { routing, .. }
             | TaskState::SkippedAlreadyDone { routing, .. }
             | TaskState::SetupCompleted { routing, .. }
-            | TaskState::AffineReady { routing, .. }
-            | TaskState::QueuedAfterLocalDependency { routing, .. }
             | TaskState::Blocked { routing, .. } => routing,
         }
     }
@@ -417,8 +352,6 @@ impl<I> TaskState<I> {
             | TaskState::InvalidTask { attempt, .. }
             | TaskState::SkippedAlreadyDone { attempt, .. }
             | TaskState::SetupCompleted { attempt, .. }
-            | TaskState::AffineReady { attempt, .. }
-            | TaskState::QueuedAfterLocalDependency { attempt, .. }
             | TaskState::Blocked { attempt, .. } => *attempt,
         }
     }
@@ -451,13 +384,6 @@ impl<I> TaskState<I> {
     /// `SetupCompleted` IS terminal for the same reason: a build task that
     /// gates on a setup task (`TaskDep`) unblocks the moment that setup
     /// task succeeds — overlapping, per the setup-task primitive's design.
-    /// `AffineReady` IS terminal for dependency-resolution purposes for the
-    /// same reason: a build task that gates on a SecondaryAffine gate
-    /// unblocks the moment that gate becomes dependency-satisfied (the
-    /// READY-not-EXECUTED resolution — the primary never runs the gate, but
-    /// its dependents are schedulable). `QueuedAfterLocalDependency` is NOT
-    /// terminal — `B` is an active assignment still pending execution on its
-    /// secondary, exactly like `InFlight`.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -467,7 +393,6 @@ impl<I> TaskState<I> {
                 | TaskState::InvalidTask { .. }
                 | TaskState::SkippedAlreadyDone { .. }
                 | TaskState::SetupCompleted { .. }
-                | TaskState::AffineReady { .. }
         )
     }
 
@@ -533,35 +458,19 @@ impl<I> TaskState<I> {
             // a downstream consumer Policy could fold into its success
             // tally. Its dependents are unblocked through the cascade-resume
             // path (the terminal-resume seam), not this event projection.
-            //
-            // An `AffineReady` is silent for the STRONGEST form of this
-            // reason: it is neither a success nor a failure — the primary
-            // never executed the gate, it merely became dependency-
-            // satisfied — so it is NEVER counted in any outcome class and
-            // must surface no completion event. Its dependents unblock via
-            // the cascade-resume path (the apply arm runs `resume_blocked_on`),
-            // not this projection. A `QueuedAfterLocalDependency` is
-            // non-terminal (an active assignment awaiting its secondary's
-            // local import), so like `InFlight`/`Pending` it projects to no
-            // terminal event.
             TaskState::Pending { .. }
             | TaskState::InFlight { .. }
             | TaskState::Blocked { .. }
             | TaskState::SkippedAlreadyDone { .. }
-            | TaskState::SetupCompleted { .. }
-            | TaskState::AffineReady { .. }
-            | TaskState::QueuedAfterLocalDependency { .. } => None,
+            | TaskState::SetupCompleted { .. } => None,
         }
     }
 
     /// The `(secondary, worker)` holder this state names, if any — ONLY
     /// `InFlight` names a full `(secondary, worker)`: it is the one state a
-    /// task is RUNNING on a specific worker slot. `QueuedAfterLocalDependency`
-    /// carries only a `secondary` (committed to a secondary but not yet on a
-    /// worker — it is narrated as the "changed state to
-    /// queued-after-local-dependency" Other line, which needs no worker
-    /// holder); every other state (`Pending`, `Blocked`, the terminals)
-    /// names no holder. Read by the merge join to stamp the #520 narration
+    /// task is RUNNING on a specific worker slot. Every other state
+    /// (`Pending`, `Blocked`, the terminals) names no holder. Read by the
+    /// merge join to stamp the #520 narration
     /// event's holder (post-merge for an `InFlight` assignment; the PRE-merge
     /// holder for a terminal that superseded an `InFlight`).
     pub(crate) fn holder(&self) -> Option<(String, WorkerId)> {
@@ -630,17 +539,11 @@ impl<I> TaskState<I> {
             // non-fail terminals the completion channel stays silent on.
             TaskState::Pending { .. } => TaskStateChange::Other { state: "pending" },
             TaskState::Blocked { .. } => TaskStateChange::Other { state: "blocked" },
-            TaskState::QueuedAfterLocalDependency { .. } => TaskStateChange::Other {
-                state: "queued-after-local-dependency",
-            },
             TaskState::SkippedAlreadyDone { .. } => TaskStateChange::Other {
                 state: "skipped-already-done",
             },
             TaskState::SetupCompleted { .. } => TaskStateChange::Other {
                 state: "setup-completed",
-            },
-            TaskState::AffineReady { .. } => TaskStateChange::Other {
-                state: "affine-ready",
             },
         }
     }
@@ -808,7 +711,7 @@ pub(super) enum JoinBand {
 }
 
 /// Within the `Terminal` band: `SkippedAlreadyDone < SetupCompleted <
-/// AffineReady < {Failed, Unfulfillable} < Completed < InvalidTask` (D-T —
+/// {Failed, Unfulfillable} < Completed < InvalidTask` (D-T —
 /// InvalidTask is the unique TOP among WORK terminals). `SkippedAlreadyDone`
 /// is the WEAKEST terminal so a skip never out-ranks a real outcome in a
 /// hypothetical hash collision (a real
@@ -817,38 +720,25 @@ pub(super) enum JoinBand {
 /// weakest, and like the skip it is a NON-COMPETING terminal: a setup-kind
 /// task's hash is only ever originated terminal by its in-process executor
 /// (never worker-dispatched), so its rank never decides a real collision —
-/// it sits low purely for a total, deterministic order. `AffineReady` is a
-/// NON-COMPETING terminal for the SAME reason: a SecondaryAffine gate's
-/// hash is only ever originated terminal by the primary's ready-resolution
-/// hook (it is NEVER worker-dispatched and never re-failed), so no real
-/// worker outcome competes for it — it ranks just above `SetupCompleted`
-/// purely for a total, deterministic order. `FailedLike` covers `Failed |
-/// Unfulfillable`; they tie-break below by a fixed `failedlike`
+/// it sits low purely for a total, deterministic order. `FailedLike` covers
+/// `Failed | Unfulfillable`; they tie-break below by a fixed `failedlike`
 /// discriminant then the payload content hash, but only when both are
 /// `FailedLike` at equal version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum TerminalRank {
     SkippedAlreadyDone = 0,
     SetupCompleted = 1,
-    AffineReady = 2,
-    FailedLike = 3,
-    Completed = 4,
-    InvalidTask = 5,
+    FailedLike = 2,
+    Completed = 3,
+    InvalidTask = 4,
 }
 
-/// Within the `NonTerminal` band, the rank sub-key (`Pending <
-/// QueuedAfterLocalDependency < InFlight`), consulted ONLY as the last
-/// tiebreak at EQUAL version. `QueuedAfterLocalDependency` sits between
-/// `Pending` and `InFlight`: a work task queued behind a secondary's local
-/// import is MORE committed than a bare `Pending` (it is assigned to a
-/// specific secondary) but LESS than a running `InFlight`, so the release
-/// `TaskAssigned` (minting a strictly-higher version) cleanly dominates it
-/// and a stale re-delivery never resurrects an `InFlight` over it.
+/// Within the `NonTerminal` band, the rank sub-key (`Pending < InFlight`),
+/// consulted ONLY as the last tiebreak at EQUAL version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum NonTerminalRank {
     Pending = 0,
-    QueuedAfterLocalDependency = 1,
-    InFlight = 2,
+    InFlight = 1,
 }
 
 /// Within `TerminalRank::FailedLike` at EQUAL version, a fixed total
@@ -954,20 +844,6 @@ pub struct StateCounts {
     /// into `completed` nor any `fail_*`), so the worker-work `completed`
     /// count reports only worker work.
     pub setup_succeeded: usize,
-    /// Tasks in `TaskState::AffineReady { .. }` — SecondaryAffine gates that
-    /// became dependency-satisfied (READY-not-EXECUTED). An INERT terminal
-    /// kept in its OWN category: the primary never executed the gate, so it
-    /// is NOT folded into `completed`, `setup_succeeded`, nor any `fail_*` —
-    /// it is a schedulability gate only. It IS a terminal ledger entry, so
-    /// `total_terminal()` counts it (no STRANDED false-abort at finalize).
-    pub affine_ready: usize,
-    /// Tasks in `TaskState::QueuedAfterLocalDependency { .. }` — work tasks
-    /// assigned to a secondary but waiting on that secondary's local
-    /// SecondaryAffine import. A NON-TERMINAL live state kept in its OWN
-    /// category (NOT folded into `in_flight`): the task is committed to a
-    /// secondary but not yet running, an honest live-work count distinct
-    /// from a running `InFlight`.
-    pub queued_after_local_dependency: usize,
 }
 
 /// Per-phase task partition over the replicated ledger — the value shape
@@ -1123,16 +999,6 @@ pub struct OutcomeSummary {
     /// reason (a setup task left out of `total_terminal` would be
     /// mis-classified as STRANDED).
     pub setup_succeeded: usize,
-    /// `TaskState::AffineReady` terminals — SecondaryAffine gates that
-    /// became dependency-satisfied (READY-not-EXECUTED). An INERT terminal
-    /// in its OWN bucket: NEVER folded into `succeeded` / `setup_succeeded`
-    /// / any failure class (the primary never executed the gate — it is a
-    /// schedulability gate, not work). It IS a terminal, fully-accounted
-    /// ledger outcome, so [`Self::total_terminal`] includes it — sibling to
-    /// `skipped`/`setup_succeeded`, for the same finalize-accounting reason
-    /// (a gate left out of `total_terminal` would be mis-classified STRANDED
-    /// and false-abort a clean gate-bearing run as `ClusterCollapsed`).
-    pub affine_ready: usize,
 }
 
 impl OutcomeSummary {
@@ -1148,7 +1014,6 @@ impl OutcomeSummary {
             + self.fail_final
             + self.skipped
             + self.setup_succeeded
-            + self.affine_ready
     }
 }
 
@@ -1166,7 +1031,6 @@ impl From<OutcomeSummary> for TerminalOutcomeCounts {
             fail_final: o.fail_final as u64,
             skipped: o.skipped as u64,
             setup_succeeded: o.setup_succeeded as u64,
-            affine_ready: o.affine_ready as u64,
         }
     }
 }

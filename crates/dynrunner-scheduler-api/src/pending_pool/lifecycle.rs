@@ -26,8 +26,9 @@
 //! * `maybe_transition_drain` (private to the submodule) — the
 //!   `Active → Draining → Drained` state machine; called by every
 //!   path that may zero out queued + in-flight + blocked counts.
-//! * `queued_count` (private to the submodule) — sum of queued items
-//!   across all buckets of a phase.
+//! * `queued_count` (private to the submodule) — count of a phase's
+//!   queued items that hold it open against the drain (the
+//!   `counts_for_phase_drain` kinds; the affine ledger token is excluded).
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -77,30 +78,6 @@ impl<I: Identifier> PendingPool<I> {
         self.maybe_transition_drain(phase_id);
     }
 
-    /// Notify the pool that a `TaskKind::SecondaryAffine` GATE resolved to
-    /// its terminal `AffineReady` (#506) — the gate's own deps are all done,
-    /// so it satisfies its dependents WITHOUT ever having been dispatched.
-    ///
-    /// The gate is the structural twin of a `Setup` task on the
-    /// dispatch-eligibility seam: NEVER worker-assignable, so it never enters
-    /// `in_flight_per_phase` — a free worker can't run it, and the primary
-    /// resolves it in-process (originating `AffineReady`) the moment its deps
-    /// complete. So this is `on_item_finished` WITHOUT the in-flight
-    /// decrement: a decrement would corrupt the phase's count when a sibling
-    /// IS in-flight (the gate's `on_item_finished` twin would wrongly drop a
-    /// real in-flight task's slot). It records the gate completed and runs
-    /// the SAME dependent-unblock walk + drain transition `on_item_finished`
-    /// uses (one walk owner), so a build gated on the gate moves
-    /// `blocked → queued` exactly as it would behind a completed work task.
-    ///
-    /// The caller has ALREADY removed the gate item from its bucket (the
-    /// drain pass takes it by hash before resolving), so the gate never
-    /// lingers as an inert non-dispatchable queued item wedging its phase.
-    pub fn on_gate_resolved(&mut self, phase_id: &PhaseId, task_id: &str) {
-        self.resolve_completed_dependents(task_id);
-        self.maybe_transition_drain(phase_id);
-    }
-
     /// Record `id` completed and unblock every dependent whose final
     /// unresolved prereq this resolves: move it `blocked → FRONT of its
     /// bucket` (matching `requeue` so freshly-unblocked tasks dispatch ahead
@@ -108,12 +85,11 @@ impl<I: Identifier> PendingPool<I> {
     /// phase was draining only because everything was blocked, and stale out
     /// any pending-drained record for it.
     ///
-    /// The SINGLE dependent-unblock walk, shared by the in-flight terminal
+    /// The SINGLE dependent-unblock walk, owned by the in-flight terminal
     /// path ([`Self::on_item_finished`], which additionally owns the
-    /// in-flight decrement) and the never-dispatched gate path
-    /// ([`Self::on_gate_resolved`], which does not). Collects the dependent
-    /// ids first to avoid borrowing `self.dependents_of` while mutating
-    /// `self.blocked` / `self.task_deps`.
+    /// in-flight decrement). Collects the dependent ids first to avoid
+    /// borrowing `self.dependents_of` while mutating `self.blocked` /
+    /// `self.task_deps`.
     fn resolve_completed_dependents(&mut self, id: &str) {
         self.completed_tasks.insert(id.to_string());
         // Terminal: forget the task's re-dispatch backoff streak.
@@ -684,11 +660,43 @@ impl<I: Identifier> PendingPool<I> {
         std::mem::take(&mut self.drained_pending)
     }
 
+    /// Drop every `SecondaryAffine` ledger-token item still sitting in
+    /// `phase_id`'s buckets — the phase-end cleanup of Model B's
+    /// placement-readiness signal.
+    ///
+    /// The affine prereq stays in the pool as a non-worker-assignable ledger
+    /// token (the placement-readiness signal `place_dependency_satisfied_affine_tasks`
+    /// reads, and the per-secondary ledger), EXCLUDED from
+    /// [`Self::queued_count`] so it never wedges the drain. It is the ONE
+    /// queued item a drained phase legitimately still holds. But the
+    /// placement-readiness scan reads ready-affine across ALL buckets (not
+    /// phase-filtered), so a drained phase's stale token would bleed into a
+    /// later phase's placement and re-place a prereq whose dependents are all
+    /// terminal. Dropping it at the phase's `Drained → Done` edge (this
+    /// phase's work is wholly done — every affine-dep work task dispatched +
+    /// completed, so no remaining dependent needs the signal) keeps the scan
+    /// phase-honest without phase-filtering it. Non-affine items are left
+    /// untouched (a `Done` phase holds none of them anyway).
+    fn drop_affine_items(&mut self, phase_id: &PhaseId) {
+        for ((p, _, _), bucket) in self.buckets.iter_mut() {
+            if p == phase_id {
+                bucket
+                    .items
+                    .retain(|item| !item.kind.is_secondary_affine());
+            }
+        }
+    }
+
     /// Mark a phase `Done` after the manager has fired
     /// `on_phase_end` for it. Activates any `Blocked` phase whose
     /// `depends_on` set is now fully `Done`.
     pub fn mark_phase_done(&mut self, phase_id: &PhaseId) {
         self.phase_state.insert(phase_id.clone(), PhaseState::Done);
+        // Phase-end cleanup: the affine ledger token (kept in the bucket as
+        // the placement-readiness signal, uncounted for drain) has served its
+        // purpose now this phase's work is wholly done — drop it so it cannot
+        // bleed into a later phase's (un-phase-filtered) placement scan.
+        self.drop_affine_items(phase_id);
         // Activation pass: any Blocked phase whose deps are all Done
         // becomes Active. We do not recurse — a phase can only be
         // Done by an explicit `mark_phase_done` call, which the
@@ -996,12 +1004,33 @@ impl<I: Identifier> PendingPool<I> {
             .count()
     }
 
-    /// Sum of queued items across all buckets of `phase_id`.
+    /// Count of `phase_id`'s queued items that hold the phase open against
+    /// the drain transition — the items the phase must still consume from its
+    /// buckets before it can drain.
+    ///
+    /// Counts only items for which [`dynrunner_core::TaskKind::counts_for_phase_drain`]
+    /// holds: `Work` (dispatched to a worker) and `Setup` (consumed from the
+    /// bucket by its in-process executor) both count — while either sits
+    /// queued, the phase has outstanding bucket work. A `SecondaryAffine`
+    /// ledger token does NOT: under Model B it is a non-worker-assignable
+    /// placement-readiness signal whose per-secondary runs are driven
+    /// off-queue by the affine scheduler + bitvector and is never consumed
+    /// from the bucket on a drain path, so counting it would pin
+    /// `queued_count > 0` forever and the phase would never drain (the
+    /// affine-dep producer's `on_phase_end` would never fire). The drain-side
+    /// counterpart of the dispatch view's `is_worker_assignable` gate: an item
+    /// the phase will never consume from its bucket must not be counted as
+    /// queued work the drain waits on.
     pub(super) fn queued_count(&self, phase_id: &PhaseId) -> usize {
         self.buckets
             .iter()
             .filter(|((p, _, _), _)| p == phase_id)
-            .map(|(_, b)| b.items.len())
+            .map(|(_, b)| {
+                b.items
+                    .iter()
+                    .filter(|item| item.kind.counts_for_phase_drain())
+                    .count()
+            })
             .sum()
     }
 }

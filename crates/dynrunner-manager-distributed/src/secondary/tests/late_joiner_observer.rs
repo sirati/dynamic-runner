@@ -108,6 +108,7 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
         custom_messages: HashMap::new(),
         custom_terminal_watermarks: HashMap::new(),
         member_generations: HashMap::new(),
+        affine: HashMap::new(),
     }
 }
 

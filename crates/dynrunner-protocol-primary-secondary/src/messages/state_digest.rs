@@ -222,6 +222,19 @@ pub struct StateDigest {
     /// prunes the subsumed local tombstones.
     #[serde(default)]
     pub custom_terminal_watermarks_hash: u64,
+    /// Number of WRITTEN per-secondary affine bitvector cells (cells set away
+    /// from the default `NotDone`). The AF-id state layer's replicated CRDT.
+    #[serde(default)]
+    pub affine_count: u64,
+    /// XOR-fold over the written affine cells'
+    /// `(secondary, affine_id, cell-bits, generation)` (the AF-id bitvector).
+    /// Folds the VALUE + LWW GENERATION so a same-count divergence (a cell at a
+    /// different value or generation) is detected; the snapshot pull's per-cell
+    /// LWW restore heals the lagging side (detect-WITH-heal). `#[serde(default)]`
+    /// keeps wire compat with a pre-field peer (decodes as zero — the
+    /// conservative never-claims-ahead shape).
+    #[serde(default)]
+    pub affine_hash: u64,
 }
 
 impl StateDigest {
@@ -425,6 +438,17 @@ impl StateDigest {
                 self.custom_terminal_watermarks_hash,
                 other.custom_terminal_watermarks_count,
                 other.custom_terminal_watermarks_hash,
+            )
+            // Per-secondary affine bitvector (AF-id): count-OR-hash compare,
+            // same shape as the other count-bearing fields. A peer that wrote a
+            // cell (or advanced one to a higher LWW generation) this replica
+            // lacks makes the replica behind; the snapshot pull's per-cell LWW
+            // restore-merge converges both sides deterministically.
+            || field_behind(
+                self.affine_count,
+                self.affine_hash,
+                other.affine_count,
+                other.affine_hash,
             )
     }
 }

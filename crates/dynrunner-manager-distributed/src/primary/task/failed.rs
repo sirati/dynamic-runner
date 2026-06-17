@@ -32,14 +32,6 @@ use crate::worker_signal::WorkerMgmtSignal;
 ///     incarnation of the addressee secondary. The lease was wholly
 ///     invalid; the task never ran, so it requeues for re-dispatch
 ///     under the live incarnation without burning retry budget.
-///   * [`crate::secondary::affine_exec::AFFINE_GATE_ABSENT_WIRE_MESSAGE`]
-///     — the #509 gate-absent SYNC RACE: a deferred dependent's
-///     SecondaryAffine gate body was not yet synced to the holder's
-///     ledger (its assignment outran the gate's `TaskAdded`). The
-///     dependent never ran, so it RE-ROUTES (requeue, no retry-budget
-///     burn) and runs once the gate's `TaskAdded` arrives — NOT a fault.
-///     A genuine gate-BODY failure carries a different reason and IS
-///     charged.
 ///
 /// Deliberately NOT in this set:
 /// [`crate::secondary::TASK_ALREADY_HELD_WIRE_MESSAGE`] — the
@@ -56,7 +48,6 @@ fn is_backpressure_shaped(error_message: &str) -> bool {
         || error_message == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE
         || error_message == crate::primary::reconciliation_probe::RECONCILIATION_LOST_WIRE_MESSAGE
         || error_message == crate::secondary::TASK_STALE_ADDRESSEE_GEN_WIRE_MESSAGE
-        || error_message == crate::secondary::affine_exec::AFFINE_GATE_ABSENT_WIRE_MESSAGE
 }
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
@@ -135,6 +126,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                          post-start dedup remains"
                     );
                 }
+                return;
+            }
+            // AFFINE failure (Model B): an affine task is the per-secondary
+            // IMPORT primitive — a failure on THIS secondary marks its
+            // bitvector cell `Failed` (per-secondary, Q1 non-sticky) and frees
+            // the worker slot, but is phase-NEUTRAL and consumes NO global retry
+            // budget (affine is not phase-completion work; the dependent
+            // re-routes to another secondary via re-placement, not a global
+            // cascade). Handled OUTSIDE the global `failed_tasks` dedup for the
+            // same per-secondary-rerun reason `handle_affine_task_complete` is.
+            // A backpressure-shaped affine bounce falls through to the ordinary
+            // requeue arm below (the import never ran; it re-enters via the
+            // per-secondary queue's re-derivation, harmless under the HINT
+            // property) — only a genuine terminal failure routes here.
+            if !is_backpressure_shaped(error_message)
+                && self.cluster_state.affine_id_for_hash(task_hash).is_some()
+            {
+                // `Box::pin` the affine sub-handler so its future does not
+                // inline into `handle_task_failed`'s state machine (the
+                // relocation-future stack-depth sensitivity; see the twin in
+                // `complete.rs`).
+                Box::pin(self.handle_affine_task_failed(&msg)).await;
                 return;
             }
             // Dedup gate (#50 peer-forwarding redundancy):
@@ -342,6 +355,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }])
             .await;
 
+            // AF-sched terminal→bitvector seam (design point 7, Q1 non-sticky):
+            // an affine build that failed on this secondary marks its cell
+            // Failed (10). `None` for an ordinary work task. Failed is NOT
+            // sticky under the AF-id LWW lattice — a later re-route/retry's
+            // Queued/Done overrides it — so a dependent re-routes to another
+            // secondary via the ordinary cascade/re-placement, never a new
+            // affine-specific wedge.
+            if let Some(m) = self.affine_terminal_mutation(&secondary_id, &task_hash, false) {
+                self.apply_and_broadcast_cluster_mutations(vec![m]).await;
+            }
+
             // Operator-facing WARN: per-class for retry/policy
             // decisions (error_type discriminates retry/oom/final);
             // the error message itself is essential for debugging
@@ -412,6 +436,56 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             self.forward_completion_to_secondaries(&msg, &secondary_id)
                 .await;
         }
+    }
+
+    /// Handle a `TaskFailed` for an AFFINE task (Model B) — a per-secondary
+    /// IMPORT failure. SEPARATE from the work-task path: the affine task runs
+    /// per-secondary, so its failure is per-secondary (the bitvector cell goes
+    /// `Failed` for THIS secondary, Q1 non-sticky) and phase-NEUTRAL — it
+    /// consumes no global retry budget and runs no `note_item_failed` cascade
+    /// (the dependent work task is not blocked on a global affine terminal; it
+    /// re-routes to another secondary via the placement trigger, whose rank
+    /// reads the bitvector — a `Failed` cell is neither `Done` nor `Queued`, so
+    /// that secondary is simply not preferred). Worker bookkeeping
+    /// (`free_slot_on_terminal`) still applies to this run.
+    async fn handle_affine_task_failed(&mut self, msg: &DistributedMessage<I>) {
+        let DistributedMessage::TaskFailed {
+            secondary_id,
+            worker_id,
+            task_hash,
+            ..
+        } = msg
+        else {
+            return;
+        };
+        let secondary_id = secondary_id.clone();
+        let worker_id = *worker_id;
+        let task_hash = task_hash.clone();
+
+        // BITVECTOR: mark this secondary's cell Failed (per-secondary,
+        // non-sticky — a later re-route/retry's Queued/Done overrides it).
+        if let Some(m) = self.affine_terminal_mutation(&secondary_id, &task_hash, false) {
+            self.apply_and_broadcast_cluster_mutations(vec![m]).await;
+        }
+        self.drop_supplanted_holder(&task_hash);
+        // WORKER SLOT: free the holding slot + ledger entry (no phase cascade).
+        self.free_slot_on_terminal(&secondary_id, worker_id, &task_hash);
+
+        tracing::warn!(
+            secondary = %secondary_id,
+            worker_id,
+            task_hash = %task_hash,
+            "affine import FAILED on secondary (bitvector Failed, non-sticky); \
+             phase-neutral — dependents re-route via re-placement"
+        );
+
+        // The freed worker is re-evaluated by the dispatch recheck; the
+        // placement trigger re-routes the dependent away from this secondary
+        // (its cell is now Failed, not Done/Queued). Decoupled emit.
+        self.cluster_state
+            .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
+        self.forward_completion_to_secondaries(msg, &secondary_id)
+            .await;
     }
 
     /// Drain-edge failure-permanence promotion for one drained phase:

@@ -24,6 +24,7 @@
 //! [`task`], [`wire`].
 
 mod affine_dispatch;
+mod affine_scheduler;
 mod assignment;
 mod bringup_reservation;
 mod command_channel;

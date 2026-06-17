@@ -235,6 +235,33 @@ pub enum PrimaryChangeReason {
     Transferred,
 }
 
+/// The per-(secondary, affine-id) completion CELL of the replicated affine
+/// bitvector — the value half of one 2-bit cell (the bitvector packs these
+/// two bits each; this is the logical view the mutations + state-query helpers
+/// speak). Every cell starts [`Self::NotDone`].
+///
+/// LATTICE NOTE: the cell is NOT a join-semilattice on its own — the idle-steal
+/// performs a `Queued → NotDone` un-queue (it relinquishes a queued claim), so
+/// there is no monotone partial order under which every transition only moves
+/// UP. Convergence is therefore achieved by a per-cell LAST-WRITER-WINS stamp
+/// (the `generation` the mutations carry — primary-monotone, failover-resumed),
+/// NOT by a value max-join. See the `affine_state` module's merge doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AffineCell {
+    /// `00` — the affine def is neither queued nor terminal on this secondary.
+    #[default]
+    NotDone,
+    /// `01` — the affine def is QUEUED on this secondary (a locality claim the
+    /// primary placed; the idle-steal resets it back to `NotDone`).
+    Queued,
+    /// `10` — the affine def FAILED on this secondary. NOT sticky-terminal by
+    /// the chosen Q1 default: a later higher-stamp `Queued`/`Done` overrides it
+    /// (a dependent re-routes/retries, or the secondary itself retries).
+    Failed,
+    /// `11` — the affine def is DONE (built/imported) on this secondary.
+    Done,
+}
+
 /// One CRDT mutation. Idempotent under repetition; safe under reorder
 /// within the per-task happens-before constraint that the dispatcher
 /// emits `TaskAdded` before any subsequent mutation for the same hash.
@@ -828,85 +855,6 @@ pub enum ClusterMutation<I> {
     SetupCompleted {
         hash: String,
     },
-    /// A `TaskKind::SecondaryAffine` task `I` became dependency-SATISFIED:
-    /// all of ITS OWN deps resolved while it was `Pending`, so it
-    /// transitions to the terminal `TaskState::AffineReady` and its
-    /// dependents (the build tasks gated on it) unblock — WITHOUT the
-    /// primary ever executing it. A SecondaryAffine task is a primary-side
-    /// dependency GATE: the per-secondary IMPORT it represents runs
-    /// once-per-secondary, locally, OFF the CRDT graph (Phase 4); the
-    /// primary's only concern is "can this gate's dependents be scheduled
-    /// yet", and the answer is yes the moment the gate's own deps are done.
-    ///
-    /// READY-not-EXECUTED (the load-bearing distinction from
-    /// [`Self::SetupCompleted`]): a setup task is EXECUTED in-process by its
-    /// affinity member and counts in `setup_succeeded`; an affine gate is
-    /// NEVER executed by the primary and is NEVER counted in
-    /// success/fail/setup_succeeded — it is a schedulability gate only (its
-    /// own inert `affine_ready` bucket keeps `total_terminal()` exact so a
-    /// resolved gate is not mis-classified STRANDED at finalize, while it
-    /// stays out of every outcome class).
-    ///
-    /// Originated by the primary's originator hook (the apply-and-broadcast
-    /// choke point) for a `kind.is_secondary_affine()` task that became
-    /// `Pending` with all deps resolved — fired BOTH when its upload dep
-    /// resolves (`resume_blocked_on` surfaces the `Blocked → Pending`
-    /// transition) AND at SPAWN for a zero-dep SecondaryAffine (born
-    /// `Pending` all-resolved → ready immediately, dependents unblocked from
-    /// t=0). Carries only `hash` (mirroring [`Self::SetupCompleted`] /
-    /// [`Self::TaskSkippedAlreadyDone`]): the `TaskInfo` lives on the ledger
-    /// entry a prior `TaskAdded`/`TasksSpawned` seeded.
-    ///
-    /// Apply rule (see `cluster_state/apply.rs`): an AUTHORITATIVE
-    /// spawn-time transition (like `TaskSkippedAlreadyDone`/`SetupCompleted`,
-    /// NOT a monotone join), so it keeps an explicit precondition arm:
-    /// `Pending → AffineReady` (Applied; the `attempt` preserved from the
-    /// `Pending` source), then `resume_blocked_on(&hash)` so the gate's
-    /// dependents unblock; any non-`Pending` state (an in-flight assignment
-    /// — which a gate never gets — or a real terminal, or an idempotent
-    /// re-application against an already-`AffineReady` entry) is a NoOp.
-    ///
-    /// Wire-safe under rolling upgrade exactly like `SetupCompleted` /
-    /// `TaskSkippedAlreadyDone`: the originator is always the newest primary;
-    /// a deployment with no SecondaryAffine tasks never originates it, so
-    /// non-adopters see zero new wire.
-    AffineReady {
-        hash: String,
-    },
-    /// A work task `B` assigned to secondary `S` is now WAITING on `S`'s
-    /// LOCAL SecondaryAffine import: `S` received `B`, found `B` depends on
-    /// a SecondaryAffine gate whose import is not yet locally done on `S`,
-    /// scheduled that import once, and QUEUED `B` behind it. The ledger
-    /// entry transitions `InFlight | Pending → TaskState::QueuedAfterLocalDependency
-    /// { secondary: S, .. }` — a CRDT-replicated, observable NON-TERMINAL
-    /// state so primary/observer SEE `B` waiting on a local dep (not lost,
-    /// not silently stuck mid-`InFlight`).
-    ///
-    /// Originated by the primary on receipt of `S`'s
-    /// [`crate::DistributedMessage::TaskQueuedAfterLocalDependency`] report
-    /// (the secondary REPORTS, the primary ORIGINATES — the work-split law):
-    /// the first such report for `B` moves it off the just-assigned
-    /// `InFlight` (or off `Pending`, on a deferred-assignment race) into the
-    /// queued state. The RELEASE half reuses the EXISTING `TaskAssigned`
-    /// originator (the standard `→ InFlight` choke point) on `S`'s
-    /// `LocalDependencyReleased` report — NOT a second InFlight originator.
-    ///
-    /// Carries `hash` + `secondary` (the queueing member, so the observable
-    /// projection and the death-seam recovery name S). The `TaskInfo`,
-    /// `version`, and `attempt` are PRESERVED from the source state onto the
-    /// resulting `QueuedAfterLocalDependency` (an authoritative rank-DROP,
-    /// like the requeue resets — it does NOT route through the monotone
-    /// join; the subsequent release `TaskAssigned` mints a strictly-higher
-    /// version that dominates the queued entry).
-    ///
-    /// Apply rule (see `cluster_state/apply.rs`): explicit precondition arm
-    /// `InFlight | Pending → QueuedAfterLocalDependency`; any other state (a
-    /// terminal that already settled `B`, or an idempotent re-application
-    /// against an already-queued entry) is a NoOp.
-    QueuedAfterLocalDependencySet {
-        hash: String,
-        secondary: String,
-    },
     /// External-control update of the per-task preferred-secondaries
     /// list. The future dispatch policy consults this field when
     /// picking a worker; this mutation lets external control planes
@@ -1288,10 +1236,58 @@ pub enum ClusterMutation<I> {
     /// see zero new wire bytes. A receiver that doesn't recognise the
     /// variant cannot occur — JSON-tag dispatch fails the whole frame,
     /// and serde flags the closed enum; rolling upgrade is therefore
-    /// release-gated (matching the
-    /// `QueuedAfterLocalDependencySet` / `AffineReady` discipline).
+    /// release-gated.
     SecondaryResourceSample {
         secondary: String,
         record: SecondaryResourceSampleRecord,
+    },
+    /// Bind a `TaskKind::SecondaryAffine` def's content `hash` to its
+    /// PRIMARY-allocated, CRDT-agreed dense AFFINE-id (the per-secondary
+    /// bitvector cell index). The affine analogue of the `def_id` stamp on
+    /// `TaskAdded`, carried as its OWN mutation (its own single concern — the
+    /// affine-id agreement — so it touches NO existing `TaskAdded` originator).
+    /// Originated by the primary alongside the affine `TaskAdded`; idempotent
+    /// (keyed by hash, bijection-enforced on apply), so order vs the
+    /// `TaskAdded` is free. Carries no `generation` — the binding is set-once /
+    /// content-addressed (like the def-id stamp), not LWW.
+    SecondaryAffineRegistered {
+        hash: String,
+        affine_id: u32,
+    },
+    /// Set the affine bitvector CELL for `(secondary, affine_id)` to DONE
+    /// (`11`). LWW per cell on `generation` (see [`AffineCell`]'s lattice
+    /// note): a strictly-greater generation wins; equal/older is a NoOp
+    /// (idempotent under at-least-once + snapshot replay).
+    SecondaryAffineFinished {
+        secondary: String,
+        affine_id: u32,
+        generation: u64,
+    },
+    /// Set the affine bitvector CELL for `(secondary, affine_id)` to QUEUED
+    /// (`01`). LWW per cell on `generation`. The locality claim the primary
+    /// places when it appends an affine prereq to a secondary's queue.
+    SecondaryAffineQueued {
+        secondary: String,
+        affine_id: u32,
+        generation: u64,
+    },
+    /// Set the affine bitvector CELL for `(secondary, affine_id)` to FAILED
+    /// (`10`). LWW per cell on `generation`. NOT sticky (Q1 default): a later
+    /// higher-generation Queued/Done overrides it.
+    SecondaryAffineFailed {
+        secondary: String,
+        affine_id: u32,
+        generation: u64,
+    },
+    /// Reset the affine bitvector CELL for `(secondary, affine_id)` to NOT_DONE
+    /// (`00`). LWW per cell on `generation`. The idle-steal's `01 → 00`
+    /// un-queue (the source secondary relinquishes its queued claim when the
+    /// schedulable unit moves to another secondary). AF-sched originates this;
+    /// it carries a generation strictly greater than the Queued it undoes so
+    /// the reset wins the LWW.
+    SecondaryAffineUnqueued {
+        secondary: String,
+        affine_id: u32,
+        generation: u64,
     },
 }

@@ -24,7 +24,7 @@ pub use address::{
     routing_target_for,
 };
 pub use cluster_mutation::{
-    ClusterMutation, DiscoveryDebt, PrimaryChangeReason, SecondaryCapacityRecord,
+    AffineCell, ClusterMutation, DiscoveryDebt, PrimaryChangeReason, SecondaryCapacityRecord,
     SecondaryResourceSampleRecord,
 };
 pub use chunking::{

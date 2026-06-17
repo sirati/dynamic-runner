@@ -192,75 +192,6 @@ fn setup_completed_decodes_literal_sender_bytes() {
     }
 }
 
-/// `AffineReady` (#497) round-trips with its `hash` preserved — the
-/// SecondaryAffine ready-not-executed gate terminal carries only the hash
-/// (version-LESS / attempt-LESS, like `SetupCompleted`; the `TaskInfo` +
-/// `attempt` live on the ledger entry, not the wire).
-#[test]
-fn roundtrip_affine_ready() {
-    let mutation: ClusterMutation<TestId> = ClusterMutation::AffineReady {
-        hash: "h-gate".into(),
-    };
-    let json = serde_json::to_string(&mutation).unwrap();
-    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
-    match decoded {
-        ClusterMutation::AffineReady { hash } => assert_eq!(hash, "h-gate"),
-        _ => panic!("expected AffineReady"),
-    }
-}
-
-/// Wire-shape mirror (NOT symmetric-on-the-wrong-shape): decode the EXACT
-/// JSON bytes the primary's ready-resolution originator emits —
-/// `{"AffineReady":{"hash":"..."}}` (externally-tagged) — pinning the shape
-/// the other side must produce.
-#[test]
-fn affine_ready_decodes_literal_sender_bytes() {
-    let bytes = r#"{"AffineReady":{"hash":"h-from-primary"}}"#;
-    let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
-    match decoded {
-        ClusterMutation::AffineReady { hash } => assert_eq!(hash, "h-from-primary"),
-        _ => panic!("expected AffineReady"),
-    }
-}
-
-/// `QueuedAfterLocalDependencySet` (#497) round-trips with its `hash` +
-/// `secondary` preserved — the queued-behind-local-import transition the
-/// primary originates on the secondary's report (the `TaskInfo` / version /
-/// attempt are preserved from the source state on the ledger, not the wire).
-#[test]
-fn roundtrip_queued_after_local_dependency_set() {
-    let mutation: ClusterMutation<TestId> = ClusterMutation::QueuedAfterLocalDependencySet {
-        hash: "h-build".into(),
-        secondary: "sec-2".into(),
-    };
-    let json = serde_json::to_string(&mutation).unwrap();
-    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
-    match decoded {
-        ClusterMutation::QueuedAfterLocalDependencySet { hash, secondary } => {
-            assert_eq!(hash, "h-build");
-            assert_eq!(secondary, "sec-2");
-        }
-        _ => panic!("expected QueuedAfterLocalDependencySet"),
-    }
-}
-
-/// Wire-shape mirror: decode the EXACT JSON bytes the primary emits for the
-/// queued-set mutation — `{"QueuedAfterLocalDependencySet":{"hash":"...",
-/// "secondary":"..."}}` — pinning the field names + tag the other side
-/// must produce.
-#[test]
-fn queued_after_local_dependency_set_decodes_literal_sender_bytes() {
-    let bytes = r#"{"QueuedAfterLocalDependencySet":{"hash":"h-from-primary","secondary":"sec-9"}}"#;
-    let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
-    match decoded {
-        ClusterMutation::QueuedAfterLocalDependencySet { hash, secondary } => {
-            assert_eq!(hash, "h-from-primary");
-            assert_eq!(secondary, "sec-9");
-        }
-        _ => panic!("expected QueuedAfterLocalDependencySet"),
-    }
-}
-
 /// `PhaseEnded` round-trips through serde with its `phase` preserved
 /// (the replicated "on_phase_end edge completed" fact carries only the
 /// phase id — grow-only set semantics live in the apply rule, not on the
@@ -1401,7 +1332,6 @@ fn roundtrip_run_complete_with_counts() {
             fail_final: 538,
             skipped: 0,
             setup_succeeded: 1,
-            affine_ready: 44,
         },
     };
     let json = serde_json::to_string(&mutation).unwrap();
@@ -1411,7 +1341,6 @@ fn roundtrip_run_complete_with_counts() {
             assert_eq!(counts.succeeded, 2);
             assert_eq!(counts.fail_final, 538);
             assert_eq!(counts.setup_succeeded, 1);
-            assert_eq!(counts.affine_ready, 44);
         }
         _ => panic!("expected RunComplete"),
     }
@@ -1449,14 +1378,13 @@ fn roundtrip_run_aborted_with_reason_and_counts() {
 /// crate's own encode/decode stay self-consistent.
 #[test]
 fn run_complete_decodes_literal_sender_bytes() {
-    let bytes = r#"{"RunComplete":{"counts":{"succeeded":2,"fail_retry":0,"fail_oom":0,"fail_final":538,"skipped":0,"setup_succeeded":1,"affine_ready":44}}}"#;
+    let bytes = r#"{"RunComplete":{"counts":{"succeeded":2,"fail_retry":0,"fail_oom":0,"fail_final":538,"skipped":0,"setup_succeeded":1}}}"#;
     let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
     match decoded {
         ClusterMutation::RunComplete { counts } => {
             assert_eq!(counts.succeeded, 2);
             assert_eq!(counts.fail_final, 538);
             assert_eq!(counts.setup_succeeded, 1);
-            assert_eq!(counts.affine_ready, 44);
         }
         _ => panic!("expected RunComplete"),
     }
@@ -1471,7 +1399,6 @@ fn run_complete_decodes_literal_sender_bytes() {
             fail_final: 538,
             skipped: 0,
             setup_succeeded: 1,
-            affine_ready: 44,
         },
     };
     assert_eq!(serde_json::to_string(&encoded).unwrap(), bytes);
@@ -1481,7 +1408,7 @@ fn run_complete_decodes_literal_sender_bytes() {
 /// abort emits: `{"RunAborted":{"reason":"...","counts":{...}}}`.
 #[test]
 fn run_aborted_decodes_literal_sender_bytes() {
-    let bytes = r#"{"RunAborted":{"reason":"collapsed","counts":{"succeeded":7,"fail_retry":0,"fail_oom":0,"fail_final":3,"skipped":0,"setup_succeeded":0,"affine_ready":0}}}"#;
+    let bytes = r#"{"RunAborted":{"reason":"collapsed","counts":{"succeeded":7,"fail_retry":0,"fail_oom":0,"fail_final":3,"skipped":0,"setup_succeeded":0}}}"#;
     let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
     match decoded {
         ClusterMutation::RunAborted { reason, counts } => {
@@ -1522,4 +1449,99 @@ fn run_complete_literal_carries_counts_object() {
         json.contains("\"counts\""),
         "RunComplete must serialize a counts object: {json}"
     );
+}
+
+// ── AF-id: affine state-layer mutations ──
+
+/// `SecondaryAffineRegistered` round-trips with its `hash` + affine-id (the
+/// content→affine-id binding, the per-secondary bitvector cell index).
+#[test]
+fn roundtrip_secondary_affine_registered() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::SecondaryAffineRegistered {
+        hash: "h-affine".into(),
+        affine_id: 11,
+    };
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+    match decoded {
+        ClusterMutation::SecondaryAffineRegistered { hash, affine_id } => {
+            assert_eq!(hash, "h-affine");
+            assert_eq!(affine_id, 11);
+        }
+        _ => panic!("expected SecondaryAffineRegistered"),
+    }
+}
+
+/// The four affine bitvector CELL mutations round-trip with their
+/// `(secondary, affine_id, generation)` preserved — pinning a dropped
+/// `generation` (the per-cell LWW stamp) on the wire.
+#[test]
+fn roundtrip_secondary_affine_cell_mutations() {
+    let cells: Vec<ClusterMutation<TestId>> = vec![
+        ClusterMutation::SecondaryAffineFinished {
+            secondary: "s1".into(),
+            affine_id: 3,
+            generation: 7,
+        },
+        ClusterMutation::SecondaryAffineQueued {
+            secondary: "s2".into(),
+            affine_id: 4,
+            generation: 8,
+        },
+        ClusterMutation::SecondaryAffineFailed {
+            secondary: "s3".into(),
+            affine_id: 5,
+            generation: 9,
+        },
+        ClusterMutation::SecondaryAffineUnqueued {
+            secondary: "s4".into(),
+            affine_id: 6,
+            generation: 10,
+        },
+    ];
+    for m in cells {
+        let json = serde_json::to_string(&m).unwrap();
+        let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+        match (m, decoded) {
+            (
+                ClusterMutation::SecondaryAffineFinished { secondary: a, affine_id: b, generation: c },
+                ClusterMutation::SecondaryAffineFinished { secondary: x, affine_id: y, generation: z },
+            )
+            | (
+                ClusterMutation::SecondaryAffineQueued { secondary: a, affine_id: b, generation: c },
+                ClusterMutation::SecondaryAffineQueued { secondary: x, affine_id: y, generation: z },
+            )
+            | (
+                ClusterMutation::SecondaryAffineFailed { secondary: a, affine_id: b, generation: c },
+                ClusterMutation::SecondaryAffineFailed { secondary: x, affine_id: y, generation: z },
+            )
+            | (
+                ClusterMutation::SecondaryAffineUnqueued { secondary: a, affine_id: b, generation: c },
+                ClusterMutation::SecondaryAffineUnqueued { secondary: x, affine_id: y, generation: z },
+            ) => {
+                assert_eq!((a, b, c), (x, y, z));
+            }
+            _ => panic!("affine cell mutation variant changed across round-trip"),
+        }
+    }
+}
+
+/// Wire-shape mirror: decode the EXACT externally-tagged bytes the originator
+/// emits for a queued-cell mutation, pinning the shape the other side produces.
+#[test]
+fn secondary_affine_queued_decodes_literal_bytes() {
+    let bytes = r#"{"SecondaryAffineQueued":{"secondary":"node-7","affine_id":2,"generation":5}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
+    match decoded {
+        ClusterMutation::SecondaryAffineQueued {
+            secondary,
+            affine_id,
+            generation,
+        } => {
+            assert_eq!(secondary, "node-7");
+            assert_eq!(affine_id, 2);
+            assert_eq!(generation, 5);
+        }
+        _ => panic!("expected SecondaryAffineQueued"),
+    }
 }

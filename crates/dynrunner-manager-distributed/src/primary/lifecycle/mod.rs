@@ -36,7 +36,7 @@ use dynrunner_core::Identifier;
 
 use crate::primary::RemoteWorkerState;
 
-mod dispatch;
+pub(crate) mod dispatch;
 mod graceful_abort;
 mod mutations;
 mod operational_loop;

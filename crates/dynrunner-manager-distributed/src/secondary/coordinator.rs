@@ -176,7 +176,6 @@ where
             task_completed_rx: Some(task_completed_rx),
             task_completed_listeners: Vec::new(),
             upload_action: None,
-            affine_satisfied_probe: None,
             task_completed_dispatcher_handle: None,
             worker_message_tx,
             worker_message_rx: Some(worker_message_rx),
@@ -523,29 +522,6 @@ where
         action: std::sync::Arc<dyn crate::upload_action::UploadAction>,
     ) {
         self.upload_action = Some(action);
-    }
-
-    // (#577) `set_import_action` is GONE. Affine gate bodies now run in
-    // worker subprocesses dispatched via the normal task-dispatch path; the
-    // consumer registers a `TaskTypeSpec(worker_module=...)` for the gate's
-    // `type_id` whose `@task_function` handler runs the import body
-    // (receives `task.payload` = the pre-#577 `payload_json` verbatim, and
-    // `task.relative_path` = the pre-#577 `task_id`).
-
-    /// Wire the OPTIONAL per-(gate,node) satisfied probe (#537) this
-    /// secondary's run-once affine executor consults BEFORE invoking the
-    /// `ImportAction`. A registered probe lets the PRODUCING node (the
-    /// member that built and published the gate's product) skip the
-    /// entire run-once scaffolding — no `tokio::task::spawn_local`, no
-    /// `QueuedAfterLocalDependency` / `LocalDependencyReleased` frames —
-    /// when it already holds the closure locally. Set before `run`;
-    /// absence (the default) leaves the executor with today's behaviour
-    /// bit-for-bit. See [`crate::affine_satisfied`].
-    pub fn set_affine_satisfied_probe(
-        &mut self,
-        probe: std::sync::Arc<dyn crate::affine_satisfied::AffineSatisfiedProbe<I>>,
-    ) {
-        self.affine_satisfied_probe = Some(probe);
     }
 
     /// Register a [`crate::worker_messages::WorkerMessageListener`]

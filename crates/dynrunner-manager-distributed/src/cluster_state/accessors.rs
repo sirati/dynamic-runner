@@ -18,8 +18,6 @@ use dynrunner_protocol_primary_secondary::{
 };
 
 use super::settled::{SettledClass, SettledEntry};
-use super::task_def_store::FrozenTaskDef;
-use super::types::TaskRouting;
 use super::{
     ClusterState, OutcomeSummary, PeerReadmission, PhaseRollup, PhaseTaskPartition, SetupProgress,
     StateCounts, TaskState,
@@ -71,63 +69,6 @@ impl<I> TaskView<'_, I> {
         }
     }
 
-    /// Whether this entry is a RESOLVED SecondaryAffine import gate
-    /// (`AffineReady`) — the #497 P5 per-secondary-import gate detector,
-    /// answered identically whether the gate is still FAT or has SPILLED.
-    ///
-    /// `AffineReady` is the join fixed-point a SecondaryAffine gate reaches
-    /// and is therefore SETTLE-ELIGIBLE: once it spills, its fat
-    /// `TaskState::AffineReady` is evicted and only the slim
-    /// `SettledClass::AffineReady` index entry remains. Both arms answer the
-    /// SAME question without a disk read, so a build's gate detection
-    /// survives the spill (the live-`task_state`-only check went blind).
-    ///
-    /// The `Live` arm still confirms `kind.is_secondary_affine()`; the
-    /// `Settled` arm needs no kind check because `SettledClass::AffineReady`
-    /// is produced ONLY from `TaskState::AffineReady`, which a SecondaryAffine
-    /// gate is the only task that ever reaches — the class IS the
-    /// "AffineReady SecondaryAffine gate" fact.
-    pub(crate) fn is_affine_ready_gate(&self) -> bool {
-        match self {
-            TaskView::Live(state @ TaskState::AffineReady { .. }) => {
-                state.def().kind.is_secondary_affine()
-            }
-            TaskView::Live(_) => false,
-            TaskView::Settled(entry) => matches!(entry.class, SettledClass::AffineReady),
-        }
-    }
-}
-
-/// A SecondaryAffine gate resolved over the FULL LOGICAL ledger in ONE
-/// fat∪settled read — the SINGLE source both the gate DETECTION
-/// ([`ClusterState::is_affine_ready_gate`]) and the import-DRIVE body
-/// ([`ClusterState::affine_gate_task`]) now derive from (#516). Carries the
-/// OWNED gate [`TaskInfo`] (`task`) AND the gate-recognition fact
-/// (`is_ready_gate`).
-///
-/// Why a struct, not two reads: detection and the body resolve used to be
-/// SEPARATE ledger reads that merely had to AGREE on the same fat∪settled
-/// universe — the #515 RCA was exactly a DRIFT between them (fe840943 made
-/// detection fat∪settled but left the body fat-only, so a spilled gate was
-/// detected-but-could-not-resolve → phantom "absent gate"). #509 re-aligned
-/// them, but two reads can drift again. Folding both answers into ONE read
-/// makes the invariant "detected ⟹ body-resolvable" TAUTOLOGICAL: there is one
-/// lookup, one hit, both fields off the same entry.
-#[derive(Debug)]
-pub(crate) struct ResolvedAffineGate<I> {
-    /// The gate's body, carried as the SHARED frozen `def` (cheap `Arc`
-    /// clone — never the whole owned [`TaskInfo`]) + its per-entry `routing`
-    /// tail, so the `cluster_state` borrow ends at the call site. A consumer
-    /// that needs a whole owned `TaskInfo` reconstructs one (a transient
-    /// alloc); the gate itself retains only the Arc.
-    pub(crate) def: Arc<FrozenTaskDef<I>>,
-    pub(crate) routing: TaskRouting,
-    /// Whether the resolved entry IS a `AffineReady` SecondaryAffine gate (the
-    /// `unmet_local_affine_dep` recognition predicate). The body resolves for
-    /// ANY state/class (an import re-routed by the #509 sync race re-runs once
-    /// its `TaskAdded` lands the gate `Pending`); this flag isolates the
-    /// ready-gate fact detection keys on.
-    pub(crate) is_ready_gate: bool,
 }
 
 impl<I: Identifier> ClusterState<I> {
@@ -156,87 +97,6 @@ impl<I: Identifier> ClusterState<I> {
         self.settled_entry(hash).map(TaskView::Settled)
     }
 
-    /// Resolve `hash`'s SecondaryAffine gate over the FULL LOGICAL ledger
-    /// in ONE fat∪settled read — the unified resolver (#516) both the gate
-    /// DETECTION and the import-DRIVE body route through, so they can NEVER
-    /// again key DIFFERENT ledger universes.
-    ///
-    /// Reads fat (`tasks.get`) FIRST, else the settled index (`settled.get`,
-    /// then the per-key pread of the spilled fat body — the SAME pread the
-    /// snapshot-stream responder uses). `None` ONLY when the hash is in
-    /// NEITHER half — the gate's `TaskAdded` has genuinely not synced to this
-    /// node yet (the #509 sync race), which the drive classifies as a
-    /// transient (re-routable) condition, never a permanent loss. A gate that
-    /// resolved-then-SPILLED (its `AffineReady` join fixed-point is
-    /// settle-eligible) is NOT absent — its body is read back from disk and
-    /// `is_ready_gate` stays `true` via the slim `SettledClass::AffineReady`
-    /// index entry.
-    ///
-    /// `is_ready_gate` answers the SAME gate-recognition question as the
-    /// fat/settled arms of [`TaskView::is_affine_ready_gate`]: a fat entry
-    /// must be `AffineReady` with a SecondaryAffine kind; a settled entry's
-    /// `SettledClass::AffineReady` IS the "AffineReady SecondaryAffine gate"
-    /// fact (the class is produced ONLY from `TaskState::AffineReady`, which
-    /// only a SecondaryAffine gate ever reaches).
-    pub(crate) fn resolve_affine_ready_gate(&self, hash: &str) -> Option<ResolvedAffineGate<I>> {
-        // ONE fat∪settled lookup. The gate-recognition fact is the single
-        // [`TaskView::is_affine_ready_gate`] predicate (its sole owner); the
-        // body comes off the SAME resolved entry — fat in-place, or the
-        // spilled fat body read back from disk. Detection and body can no
-        // longer key different ledger universes: there is one `task_view`.
-        let view = self.task_view(hash)?;
-        let is_ready_gate = view.is_affine_ready_gate();
-        let (def, routing) = match view {
-            // Fat: the body is the live state's shared def + routing, in memory.
-            TaskView::Live(state) => (state.def().clone(), state.routing().clone()),
-            // Settled: read the fat body back from the spill file (the same
-            // per-key pread the snapshot-stream responder uses). `None` here
-            // would mean a settled index entry whose record is unreadable —
-            // the SAME absent outcome `affine_gate_task` returned before, so
-            // the resolver returns `None` and the drive re-routes (#509).
-            TaskView::Settled(_) => {
-                let rec = self.settled_record(hash)?;
-                (rec.0.def().clone(), rec.0.routing().clone())
-            }
-        };
-        Some(ResolvedAffineGate {
-            def,
-            routing,
-            is_ready_gate,
-        })
-    }
-
-    /// Whether `hash` is a RESOLVED SecondaryAffine import gate
-    /// (`AffineReady`) — the #497 P5 spill-safe gate detector the
-    /// secondary's `unmet_local_affine_dep` keys on. A thin projection of
-    /// the unified [`Self::resolve_affine_ready_gate`] (#516): the gate is
-    /// detected IFF the hash resolves over the fat∪settled ledger AND that
-    /// SAME resolved entry IS a ready gate. A hash the ledger does not know
-    /// is `false`.
-    pub(crate) fn is_affine_ready_gate(&self, hash: &str) -> bool {
-        self.resolve_affine_ready_gate(hash)
-            .is_some_and(|gate| gate.is_ready_gate)
-    }
-
-    /// The OWNED [`TaskInfo`] of a SecondaryAffine gate — a thin projection
-    /// of the unified [`Self::resolve_affine_ready_gate`] (#516): the gate
-    /// body the import drives, resolved over the SAME fat∪settled read
-    /// detection uses, so a gate that resolved-then-SPILLED still resolves
-    /// (the fat-only read went blind pre-#509) and a detected gate is ALWAYS
-    /// body-resolvable (the drift class #515 flagged is structurally gone).
-    /// `None` ONLY for the #509 sync race (hash in neither half), which the
-    /// drive classifies as transient (re-routable), never a permanent loss.
-    ///
-    /// The body resolves for ANY resolved state/class (NOT gated on
-    /// `is_ready_gate`): a #509-rerouted import re-runs once its `TaskAdded`
-    /// lands the gate `Pending`, before it reaches `AffineReady`.
-    pub(crate) fn affine_gate_task(&self, hash: &str) -> Option<TaskInfo<I>> {
-        self.resolve_affine_ready_gate(hash).map(|gate| {
-            let deps = self.resolve_dep_refs(&gate.def.task_depends_on);
-            gate.def.to_task_info(&gate.routing, deps)
-        })
-    }
-
     /// Iterator over `(&hash, &TaskState)` for every FAT (in-memory)
     /// entry. A SETTLED entry's fat body lives in the spill file and is
     /// NOT yielded — callers that need the full logical ledger pair
@@ -247,6 +107,22 @@ impl<I: Identifier> ClusterState<I> {
     /// InFlight → skip).
     pub fn tasks_iter(&self) -> impl Iterator<Item = (&String, &TaskState<I>)> {
         self.tasks.iter()
+    }
+
+    /// Reconstruct the whole owned [`TaskInfo`] for a FAT ledger entry by
+    /// its content `hash`, resolving its def's dep refs through the store
+    /// (the same [`Self::task_to_info`] every dispatch consumer routes
+    /// through). `None` for a hash absent from the fat ledger (never added,
+    /// or settled-spilled). The seam the AF-sched per-secondary dispatch uses
+    /// to turn a queued `(hash)` unit back into a worker-dispatchable
+    /// `TaskInfo`, exactly as the global-pool dispatch resolves a pool item.
+    pub(crate) fn task_info_for_hash(&self, hash: &str) -> Option<TaskInfo<I>>
+    where
+        I: Clone,
+    {
+        self.tasks
+            .get(hash)
+            .map(|state| self.task_to_info(state))
     }
 
     /// Read-only handle on the `blocked_by` reverse-index (#547) for the
@@ -377,16 +253,10 @@ impl<I: Identifier> ClusterState<I> {
                 TaskState::InvalidTask { .. } => c.invalid_task += 1,
                 TaskState::SkippedAlreadyDone { .. } => c.skipped_already_done += 1,
                 TaskState::SetupCompleted { .. } => c.setup_succeeded += 1,
-                TaskState::AffineReady { .. } => c.affine_ready += 1,
-                TaskState::QueuedAfterLocalDependency { .. } => {
-                    c.queued_after_local_dependency += 1
-                }
             }
         }
         // Settled (spilled) entries are LOGICAL ledger entries — fold
         // their slim classes into the same buckets the fat states feed.
-        // (`QueuedAfterLocalDependency` is non-terminal and never settles,
-        // so it has no `SettledClass` arm.)
         for (_, entry) in self.settled_entries() {
             match entry.class {
                 SettledClass::Completed => c.completed += 1,
@@ -394,7 +264,6 @@ impl<I: Identifier> ClusterState<I> {
                 SettledClass::InvalidTask => c.invalid_task += 1,
                 SettledClass::SkippedAlreadyDone => c.skipped_already_done += 1,
                 SettledClass::SetupCompleted => c.setup_succeeded += 1,
-                SettledClass::AffineReady => c.affine_ready += 1,
             }
         }
         c
@@ -512,9 +381,8 @@ impl<I: Identifier> ClusterState<I> {
 
     /// Iterator over `(task_hash, &TaskInfo)` for FAT (in-memory)
     /// terminal entries (`Completed`, `Failed`, `Unfulfillable`,
-    /// `InvalidTask`, `SkippedAlreadyDone`, `SetupCompleted`,
-    /// `AffineReady`). `Blocked` and `QueuedAfterLocalDependency` are
-    /// non-terminal and are excluded. A `SkippedAlreadyDone` IS surfaced —
+    /// `InvalidTask`, `SkippedAlreadyDone`, `SetupCompleted`). `Blocked` is
+    /// non-terminal and is excluded. A `SkippedAlreadyDone` IS surfaced —
     /// its dependents
     /// resolve their `task_depends_on` reference against it exactly as
     /// against a `Completed` prereq. SETTLED terminals are not yielded
@@ -527,11 +395,7 @@ impl<I: Identifier> ClusterState<I> {
             | TaskState::Unfulfillable { .. }
             | TaskState::InvalidTask { .. }
             | TaskState::SkippedAlreadyDone { .. }
-            | TaskState::SetupCompleted { .. }
-            // `AffineReady` IS terminal for dependency-resolution: a build
-            // gated on the gate resolves its dep against it exactly as
-            // against a `Completed`/`SetupCompleted` prereq.
-            | TaskState::AffineReady { .. } => Some((h, self.task_to_info(s))),
+            | TaskState::SetupCompleted { .. } => Some((h, self.task_to_info(s))),
             _ => None,
         })
     }
@@ -1000,24 +864,14 @@ impl<I: Identifier> ClusterState<I> {
             match state {
                 TaskState::Pending { .. }
                 | TaskState::InFlight { .. }
-                // `QueuedAfterLocalDependency` is live remaining work — a
-                // task committed to a secondary but not yet running (awaiting
-                // its local import) — so it is `to_run`, exactly like
-                // `InFlight`/`Pending`/`Blocked`.
-                | TaskState::QueuedAfterLocalDependency { .. }
                 | TaskState::Blocked { .. } => p.to_run += 1,
                 // `SetupCompleted` is success-like work this run performed
                 // in-process — folded into `done` for the per-phase
                 // progress partition (the OUTCOME-level `setup_succeeded`
                 // bucket keeps it out of the global success count; this
-                // phase-progress view is a distinct concern). `AffineReady`
-                // (a resolved SecondaryAffine gate) folds into `done` for the
-                // SAME reason: the gate resolved so the phase advances, while
-                // the OUTCOME-level `affine_ready` bucket keeps it out of the
-                // global success count.
+                // phase-progress view is a distinct concern).
                 TaskState::Completed { .. }
-                | TaskState::SetupCompleted { .. }
-                | TaskState::AffineReady { .. } => p.done += 1,
+                | TaskState::SetupCompleted { .. } => p.done += 1,
                 TaskState::Failed { .. }
                 | TaskState::Unfulfillable { .. }
                 | TaskState::InvalidTask { .. } => p.failed += 1,
@@ -1032,8 +886,7 @@ impl<I: Identifier> ClusterState<I> {
             }
             match entry.class {
                 SettledClass::Completed
-                | SettledClass::SetupCompleted
-                | SettledClass::AffineReady => p.done += 1,
+                | SettledClass::SetupCompleted => p.done += 1,
                 SettledClass::FailedFinal(_) | SettledClass::InvalidTask => p.failed += 1,
                 SettledClass::SkippedAlreadyDone => p.skipped += 1,
             }

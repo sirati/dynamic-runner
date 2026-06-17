@@ -185,21 +185,6 @@ fn stamp_versions<I: Identifier>(
             // outcome ever competes for (a setup task is never
             // worker-dispatched), so the terminal rank alone settles it.
             | ClusterMutation::SetupCompleted { .. }
-            // `AffineReady` is version-LESS and attempt-LESS for the same
-            // reason as `SetupCompleted`: an authoritative spawn-time
-            // terminal whose `attempt` the apply arm preserves from the
-            // `Pending` source (no stamped transition), and whose hash no
-            // worker outcome ever competes for (a SecondaryAffine gate is
-            // never worker-dispatched), so the terminal rank alone settles it.
-            | ClusterMutation::AffineReady { .. }
-            // `QueuedAfterLocalDependencySet` is version-LESS: an
-            // authoritative rank-DROP (`InFlight | Pending → Queued`) whose
-            // apply arm PRESERVES the source `version`+`attempt` (no stamp,
-            // no bump) — the subsequent release `TaskAssigned` mints the
-            // strictly-higher version that dominates the queued entry, so a
-            // redelivered stale `TaskAssigned` (at the preserved version) only
-            // ties and NoOps, never resurrecting an `InFlight` over the queue.
-            | ClusterMutation::QueuedAfterLocalDependencySet { .. }
             | ClusterMutation::PrimaryChanged { .. }
             | ClusterMutation::PhaseDepsSet { .. }
             | ClusterMutation::PhaseMayBeEmptySet { .. }
@@ -247,7 +232,23 @@ fn stamp_versions<I: Identifier>(
             // and the latch join is order-free.
             | ClusterMutation::CustomMessagePosted { .. }
             | ClusterMutation::CustomMessageHandled { .. }
-            | ClusterMutation::CustomMessageFailed { .. } => {}
+            | ClusterMutation::CustomMessageFailed { .. }
+            // `SecondaryAffineRegistered` (AF-id) is generation-LESS: the
+            // affine-id binding is set-once / content-addressed (bijection-
+            // enforced on apply), like the def-id stamp — no LWW arbitration.
+            | ClusterMutation::SecondaryAffineRegistered { .. } => {}
+            // The affine bitvector CELL mutations (AF-id) carry a per-cell LWW
+            // `generation`: stamp it here from the originator's global monotone
+            // counter (a strictly-increasing source, so a later write — incl.
+            // the steal's `Unqueued` reset — always out-stamps the write it
+            // supersedes), the affine twin of the `TaskVersion` stamp above.
+            // One arm for all four cell variants — no per-variant duplication.
+            ClusterMutation::SecondaryAffineFinished { generation, .. }
+            | ClusterMutation::SecondaryAffineQueued { generation, .. }
+            | ClusterMutation::SecondaryAffineFailed { generation, .. }
+            | ClusterMutation::SecondaryAffineUnqueued { generation, .. } => {
+                *generation = state.next_affine_cell_generation();
+            }
         }
     }
 }
@@ -317,6 +318,32 @@ fn stamp_def_ids<I: Identifier>(
     }
 }
 
+/// Reserve the CRDT-agreed dense affine-id for every originated
+/// `TaskKind::SecondaryAffine` `TaskAdded` and INJECT a paired
+/// `SecondaryAffineRegistered` mutation (AF-id) — the affine analogue of the
+/// def-id stamp, but its own pass on the OWNED `Vec` (it GROWS the batch, so
+/// it cannot ride the in-place `&mut [_]` stamp). Reservation is idempotent on
+/// hash (a re-added affine def reuses its affine-id and injects a registration
+/// the receiver NoOps), so the pass is safe under at-least-once re-origination.
+fn inject_affine_registrations<I: Identifier>(
+    state: &mut ClusterState<I>,
+    mutations: &mut Vec<ClusterMutation<I>>,
+) {
+    let mut registrations: Vec<ClusterMutation<I>> = Vec::new();
+    for m in mutations.iter() {
+        if let ClusterMutation::TaskAdded { hash, task, .. } = m
+            && task.kind.is_secondary_affine()
+        {
+            let affine_id = state.allocate_affine_id(hash).0;
+            registrations.push(ClusterMutation::SecondaryAffineRegistered {
+                hash: hash.clone(),
+                affine_id,
+            });
+        }
+    }
+    mutations.extend(registrations);
+}
+
 /// `ClusterState` is the authoritative role-table owner; transports
 /// register their write-through cache through this boundary trait.
 ///
@@ -348,17 +375,6 @@ impl<I: Identifier> RoleChangeHookRegistrar for ClusterState<I> {
 pub(crate) struct AppliedBatch<I: Identifier> {
     pub applied: Vec<ClusterMutation<I>>,
     pub resumed_for_dispatch: Vec<TaskInfo<I>>,
-    /// Ledger hashes of every task that transitioned INTO `Pending` in
-    /// this apply pass — the union of the `Blocked → Pending` auto-resumes
-    /// (`resumed_for_dispatch`) and the freshly-`Pending` spawn-classified
-    /// entries (no deps, or all deps already terminal). The originator
-    /// feeds this to `ClusterState::affine_ready_mutations_for` (#497) so a
-    /// `TaskKind::SecondaryAffine` gate that just became Pending-all-resolved
-    /// is detected and its `AffineReady` mutation broadcast — covering BOTH
-    /// the no-dep spawn case (the gate is born Pending all-resolved) and the
-    /// resume case (its upload dep just completed). A non-gate (Work/Setup)
-    /// hash in this list is harmlessly filtered out by the detector.
-    pub became_pending: Vec<String>,
 }
 
 /// Apply each mutation to `state` locally and return the subset that
@@ -402,18 +418,18 @@ pub(crate) fn apply_locally_for_broadcast<I: Identifier>(
     // the def under the SAME id. Its own pass — a distinct concern from the
     // version/attempt stamp above.
     stamp_def_ids(state, &mut mutations);
+    // Affine-id registration pass (AF-id): for every originated SecondaryAffine
+    // `TaskAdded`, reserve its CRDT-agreed dense affine-id and INJECT a paired
+    // `SecondaryAffineRegistered` so every replica binds the affine def's
+    // content to the SAME affine-id (the per-secondary bitvector cell index).
+    // Its own pass — a distinct concern from the def-id stamp above (a sibling
+    // id space, minted only for the affine subset).
+    inject_affine_registrations(state, &mut mutations);
     let mut applied: Vec<ClusterMutation<I>> = Vec::with_capacity(mutations.len());
     let mut resumed_for_dispatch: Vec<TaskInfo<I>> = Vec::new();
-    // The originator paths (live primary's `apply_spawn_tasks`,
-    // promoted-secondary's `apply_spawn_tasks`) already walk the
-    // post-apply CRDT via `task_state(&hash)` lookups to reinject
-    // freshly-Pending entries for the POOL; the apply rule's
-    // `newly_pending_from_spawn` surface targets the receive-side
-    // callers (`apply_cluster_mutations`) for that. But the SecondaryAffine
-    // ready-resolution (#497) needs the union of the resume AND spawn
-    // surfaces to detect a gate that just became Pending-all-resolved, so
-    // we collect both here into `became_pending` (the buffer is allocated
-    // once and reused across the batch).
+    // The spawn-classified `newly_pending_from_spawn` surface is consumed by
+    // the receive-side pool-growth callers, not by this originator path — it
+    // is discarded here (the originator reinjects via `resumed_for_dispatch`).
     let mut newly_pending_from_spawn: Vec<TaskInfo<I>> = Vec::new();
     for m in mutations {
         let outcome = state.apply_with_resumed_blocked(
@@ -425,18 +441,8 @@ pub(crate) fn apply_locally_for_broadcast<I: Identifier>(
             applied.push(m);
         }
     }
-    // Hashes of every task that transitioned INTO Pending this pass — the
-    // resumed `Blocked → Pending` set ∪ the spawn-classified Pending set —
-    // for the originator's affine-ready detection. Hash via the same
-    // wire-canonical `compute_task_hash` the apply rule keys on.
-    let became_pending: Vec<String> = resumed_for_dispatch
-        .iter()
-        .chain(newly_pending_from_spawn.iter())
-        .map(crate::primary::wire::compute_task_hash)
-        .collect();
     AppliedBatch {
         applied,
         resumed_for_dispatch,
-        became_pending,
     }
 }

@@ -315,12 +315,7 @@ impl<I: Identifier> ClusterState<I> {
                     match &entry.class {
                         SettledClass::Completed
                         | SettledClass::SkippedAlreadyDone
-                        | SettledClass::SetupCompleted
-                        // A resolved SecondaryAffine gate satisfies the dep
-                        // exactly like a succeeded setup task: the gate's
-                        // dependents are schedulable the moment it is
-                        // AffineReady (the READY-not-EXECUTED resolution).
-                        | SettledClass::AffineReady => {}
+                        | SettledClass::SetupCompleted => {}
                         SettledClass::InvalidTask => {
                             cascade_fail = true;
                             break;
@@ -376,8 +371,7 @@ impl<I: Identifier> ClusterState<I> {
                     }
                     Some(TaskState::Completed { .. })
                     | Some(TaskState::SkippedAlreadyDone { .. })
-                    | Some(TaskState::SetupCompleted { .. })
-                    | Some(TaskState::AffineReady { .. }) => {
+                    | Some(TaskState::SetupCompleted { .. }) => {
                         // Resolved dep — contributes nothing to the
                         // blocking decision. A skipped prereq's outputs
                         // already exist on the shared fs, so a dependent of
@@ -385,17 +379,9 @@ impl<I: Identifier> ClusterState<I> {
                         // completed task. A SUCCEEDED setup task likewise
                         // satisfies the dep (the setup-task primitive's
                         // whole point: build tasks gate on it overlapping).
-                        // A resolved SecondaryAffine gate (AffineReady)
-                        // satisfies the dep too — its dependents are
-                        // schedulable the moment it becomes ready (the
-                        // READY-not-EXECUTED resolution).
                     }
                     Some(TaskState::Pending { .. })
                     | Some(TaskState::InFlight { .. })
-                    // A dep queued behind a secondary's local import is not
-                    // yet terminal — the dependent stays blocked until it
-                    // runs and completes, exactly like a dep on `InFlight`.
-                    | Some(TaskState::QueuedAfterLocalDependency { .. })
                     | Some(TaskState::Blocked { .. }) => {
                         if blocked_on_pending.is_none() {
                             blocked_on_pending = Some(dep_hash);

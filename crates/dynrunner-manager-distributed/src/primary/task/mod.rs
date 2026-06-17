@@ -5,14 +5,6 @@
 //! - [`complete`] — `TaskComplete` and the per-secondary
 //!   completion-forwarding helper.
 //! - [`failed`] — `TaskFailed` (Recoverable/Unfulfillable/NonRecoverable).
-//! - [`affine_deferral`] — the SecondaryAffine local-import gate reports
-//!   (#497): `TaskQueuedAfterLocalDependency` (a secondary parked a work
-//!   task behind its local import — originate `QueuedAfterLocalDependencySet`
-//!   and DROP the parked dependent from `self.in_flight` so the
-//!   reconciliation probe stops looping on it) and `LocalDependencyReleased`
-//!   (the import finished and the secondary self-dispatched the dependent —
-//!   re-originate the EXISTING `TaskAssigned` and re-enter the ledger; NO
-//!   re-pushed `TaskAssignment`, the secondary already dispatched it).
 //! - [`already_held`] — the duplicate-assignment coherence report
 //!   (`TASK_ALREADY_HELD_WIRE_MESSAGE`, recognised at the top of the
 //!   `TaskFailed` handler): the holder is ALREADY RUNNING the assigned
@@ -43,7 +35,6 @@
 //! Every handler is an inherent method on `PrimaryCoordinator`; the
 //! sub-files only re-open the impl block with the matching generics.
 
-mod affine_deferral;
 mod already_held;
 mod complete;
 mod failed;

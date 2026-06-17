@@ -207,12 +207,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // primary would have).
         let mut phases_with_terminal: HashSet<PhaseId> = HashSet::new();
         let mut phases_with_live_work: HashSet<PhaseId> = HashSet::new();
+        // AFFINE-dep exclusion seed (Model B): every `TaskKind::SecondaryAffine`
+        // task's task_id, so the pool excludes affine deps from a work task's
+        // blocking set AND withholds an affine-dep work task from the global
+        // worker view (it dispatches per-secondary). Collected over the SAME
+        // ledger scan and seeded BEFORE `extend` (the pre-seed contract, like
+        // `mark_tasks_completed`). EMPTY on a run with no affine task.
+        let mut affine_prereq_ids: HashSet<String> = HashSet::new();
 
         for (hash, state) in self.cluster_state.tasks_iter() {
             // L5: resolve dep refs via the store (two shared borrows of
             // `self.cluster_state` — the iter + the resolve — is fine).
             all_binaries.push(self.cluster_state.task_to_info(state));
             let def = state.def();
+            if def.kind.is_secondary_affine() {
+                affine_prereq_ids.insert(def.task_id.clone());
+            }
             match state {
                 // A FAILED terminal must NOT satisfy dependents' deps: it
                 // never produced its outputs. Its task_id seeds the pool's
@@ -409,43 +419,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         self.cluster_state.task_to_info(state),
                     ));
                 }
-                // A resolved SecondaryAffine gate (#497): a terminal that was
-                // NEVER dispatched (the primary does not execute the gate),
-                // so it is seeded like `SkippedAlreadyDone` — its task_id
-                // resolves dependents' `task_depends_on` in `extend()`, it
-                // enters `primary_completed` for the run-completion counter
-                // slot (the gate IS an accounted terminal, so the local
-                // counter must reach it or completion wedges — consistent
-                // with `OutcomeSummary::total_terminal` including
-                // `affine_ready`), and it is CRITICALLY NOT pushed into
-                // `items` (re-dispatching it is meaningless — the primary
-                // never runs a gate). NOT marked started (#343-style: a gate
-                // resolving is spawn-time evidence, not phase activation). The
-                // CRDT entry stays `AffineReady`. The OUTCOME-level success
-                // count reads the CRDT's `succeeded` (which excludes
-                // `affine_ready`), so this counter slot never inflates the
-                // operator success report.
-                TaskState::AffineReady { .. } => {
-                    phases_with_terminal.insert(def.phase_id.clone());
-                    primary_completed.insert(hash.clone());
-                    completed_task_ids.insert(def.task_id.clone());
-                }
-                // A work task queued behind a secondary's LOCAL SecondaryAffine
-                // import (#497). The per-secondary import progress is
-                // node-local on that secondary and NOT in the CRDT, so a
-                // promoted primary cannot resume it. Re-seed as live pool work
-                // (like `Blocked`/`Pending`): the new primary re-dispatches it,
-                // which re-triggers the affine-import gate on whichever
-                // secondary it lands on, and the freshly-minted `TaskAssigned`
-                // cleanly dominates the stale `QueuedAfterLocalDependency` in
-                // the join. (Mirrors the death-seam's requeue philosophy: a
-                // queued task whose holder's local state is unknown re-routes
-                // per #495 rather than wedging on an un-observable import.)
-                TaskState::QueuedAfterLocalDependency { .. } => {
-                    phases_with_live_work.insert(def.phase_id.clone());
-                    // L5: resolve dep refs via the store.
-                    items.push(self.cluster_state.task_to_info(state));
-                }
             }
         }
 
@@ -500,17 +473,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // re-dispatched).
                 SettledClass::SetupCompleted => {
                     started_phases.insert(entry.phase_id.clone());
-                    phases_with_terminal.insert(entry.phase_id.clone());
-                    primary_completed.insert(hash.clone());
-                    completed_task_ids.insert(entry.task_id.clone());
-                }
-                // AffineReady → terminal + completed mirror + dep seed,
-                // mirroring the fat `AffineReady` arm above (a resolved
-                // SecondaryAffine gate satisfies dependents and counts toward
-                // the run-completion total, but was NEVER dispatched so it
-                // does NOT mark the phase started — #343-style — and is never
-                // re-dispatched).
-                SettledClass::AffineReady => {
                     phases_with_terminal.insert(entry.phase_id.clone());
                     primary_completed.insert(hash.clone());
                     completed_task_ids.insert(entry.task_id.clone());
@@ -590,6 +552,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // which is reserved for terminals that produced outputs).
                 p.mark_tasks_failed_pending_retry(soft_failed_seed);
                 p.mark_tasks_dormant(dormant_seed);
+                // Affine-dep exclusion seed (Model B): every SecondaryAffine
+                // task_id, so `extend` excludes affine deps from work tasks'
+                // blocking sets and the dispatch view withholds affine-dep work
+                // tasks. BEFORE `extend` (the pre-seed contract). EMPTY on a
+                // non-affine run, so the blocking set + view are unchanged.
+                p.mark_affine_prereqs(affine_prereq_ids);
                 p.mark_tasks_in_flight(in_flight_pairs);
                 if let Err(e) = p.extend(items) {
                     tracing::error!(
@@ -731,6 +699,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let pending_count = pool.len();
         let in_flight_count = self.in_flight.len();
         self.pending = Some(pool);
+
+        // Failover rebuild of the LOCAL per-secondary affine queues (AF-sched).
+        // The queues are primary-local + ephemeral (NOT replicated), so a
+        // promoted primary discards them and re-derives them by re-running rank
+        // placement over the pending work pool against the inherited
+        // (replicated) bitvector. Runs AFTER the pool + roster are
+        // reconstructed (it ranks over the live roster + reads the work tasks'
+        // affine deps), and applies its cell re-claims locally through the
+        // stamping choke (hydrate is sync constructor-time; see
+        // `rebuild_affine_schedule`). EMPTY on a cold seed (no affine-dep work
+        // task is placed until its prereqs are ready), so the cold path is
+        // untouched.
+        self.rebuild_affine_schedule();
 
         tracing::info!(
             pending = pending_count,

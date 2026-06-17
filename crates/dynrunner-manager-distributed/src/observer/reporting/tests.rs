@@ -1745,17 +1745,10 @@ fn diff_subset_of_skip_eligible_classifies_fields_correctly() {
     cur.total_workers = 1;
     assert!(!cur.diff_subset_of_skip_eligible(&base));
     let mut cur = base.clone();
-    cur.queued_after_local_dependency = 1;
-    assert!(!cur.diff_subset_of_skip_eligible(&base));
-    let mut cur = base.clone();
     cur.alive_secondaries.insert("sec-x".to_string());
     assert!(!cur.diff_subset_of_skip_eligible(&base));
     let mut cur = base.clone();
     cur.per_secondary_in_flight
-        .insert("sec-x".to_string(), 1);
-    assert!(!cur.diff_subset_of_skip_eligible(&base));
-    let mut cur = base.clone();
-    cur.per_secondary_queued_after_local_dep
         .insert("sec-x".to_string(), 1);
     assert!(!cur.diff_subset_of_skip_eligible(&base));
 }

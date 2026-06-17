@@ -100,6 +100,36 @@ pub struct PendingPool<I: Identifier> {
     /// dependents resolve their `task_depends_on` reference instead
     /// of failing `UnknownTaskDep`.
     pub(super) dormant_tasks: HashSet<String>,
+    /// Task ids of `TaskKind::SecondaryAffine` prereqs — the AFFINE-DEP
+    /// exclusion set. A `SecondaryAffine` task is the per-secondary toolchain
+    /// IMPORT primitive: it runs PER-SECONDARY (each node imports locally) and
+    /// its readiness is tracked by the primary's per-secondary affine BITVECTOR
+    /// plus the per-secondary queue order, NOT a single global terminal. So an
+    /// affine dep must NOT block its dependent work task in this global pool
+    /// (no global terminal satisfies it) — the work task is POOL-READY when its
+    /// NON-affine deps are satisfied, and is then routed PER-SECONDARY by the
+    /// primary's affine scheduler. Two coupled read effects, both keyed on this
+    /// set (populated by [`PendingPool::mark_affine_prereqs`] from the primary's
+    /// `cluster_state` def kinds at spawn + hydrate, BEFORE the referencing
+    /// `extend`):
+    ///   - [`PendingPool::commit_item`] EXCLUDES an affine dep from a work
+    ///     task's unresolved blocking set (so the work task is ready on its
+    ///     non-affine deps alone, never blocked-forever on an affine dep with no
+    ///     global terminal); and
+    ///   - the worker dispatch view ([`PendingPool::dispatch_eligible`])
+    ///     EXCLUDES a work task that HAS an affine dep (so the global pool never
+    ///     dispatches it to a secondary that has not imported its toolchain —
+    ///     the head-of-line-blocking bug the per-secondary model fixes). Such a
+    ///     work task dispatches ONLY through the primary's per-secondary affine
+    ///     queue, which runs the import THEN the work in order on the chosen
+    ///     secondary.
+    ///
+    /// An affine TASK itself is already non-worker-assignable (its kind), so it
+    /// never enters the worker view nor `in_flight_per_phase` here (it is
+    /// dispatched by-hash from the per-secondary queue, never `take_selected`
+    /// from a bucket) — the phase drains on its WORK tasks, the import being a
+    /// transitively-required dep that ran as needed.
+    pub(super) affine_prereq_ids: HashSet<String>,
     /// Task ids that have been dispatched (popped from a bucket) and
     /// not yet observed as terminal. Two write sites:
     ///   * `take_at` — when this pool dispatches a task with a
@@ -251,6 +281,7 @@ impl<I: Identifier> PendingPool<I> {
             failed_tasks: HashSet::new(),
             soft_failed: HashMap::new(),
             dormant_tasks: HashSet::new(),
+            affine_prereq_ids: HashSet::new(),
             in_flight_tasks: HashSet::new(),
             blocked_per_phase: HashMap::new(),
             dispatch_backoff: super::backoff::DispatchBackoff::default(),
@@ -424,6 +455,25 @@ impl<I: Identifier> PendingPool<I> {
     /// the finalize cascade. Must be called BEFORE `extend()`.
     pub fn mark_tasks_dormant(&mut self, ids: impl IntoIterator<Item = String>) {
         self.dormant_tasks.extend(ids);
+    }
+
+    /// Register `ids` as `TaskKind::SecondaryAffine` PREREQ task ids — the
+    /// affine-dep exclusion set (see the `affine_prereq_ids` field doc). The
+    /// per-class pre-seed sibling of [`Self::mark_tasks_completed`] /
+    /// [`Self::mark_tasks_dormant`]: the primary populates it from its
+    /// `cluster_state` def kinds at spawn + hydrate, BEFORE the referencing
+    /// [`Self::extend`], so a work task's affine deps are EXCLUDED from its
+    /// blocking set at commit (the work task is ready on its non-affine deps)
+    /// AND a work task that HAS an affine dep is withheld from the global
+    /// worker view (it dispatches only via the primary's per-secondary affine
+    /// queue).
+    ///
+    /// Idempotent on repeated ids. Additive: a run with no `SecondaryAffine`
+    /// task seeds an empty set, so every non-affine work task's blocking set +
+    /// view eligibility are byte-identical to the pre-affine behaviour (the
+    /// baseline-preservation guarantee).
+    pub fn mark_affine_prereqs(&mut self, ids: impl IntoIterator<Item = String>) {
+        self.affine_prereq_ids.extend(ids);
     }
 
     /// Pre-seed `in_flight_tasks` (and bump `in_flight_per_phase`) with
