@@ -89,13 +89,15 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskCountCategory, TaskDep, TaskOutputs};
 use serde::{Deserialize, Serialize};
 
 use crate::primary::retry_bucket::BucketKind;
+use crate::warn_throttle::WarnThrottle;
 
 use super::merge::{hashable_join_key, task_join_key, task_join_key_dominates};
 use super::types::TaskJoinKey;
@@ -248,7 +250,10 @@ pub(crate) struct SettledSegment {
 /// [`crate::process::PromotionSignal`] field / builder parameter — the
 /// pyo3 recipe threads it into the promoted primary opaquely
 /// (`adopt_settled_base`); every method stays `pub(crate)`.
-#[derive(Default)]
+///
+/// Manual [`Default`] (the decode-skip throttle below carries no
+/// `Default`): every other field is `Default`; the throttle is built
+/// with its fixed interval.
 pub struct SettledStore {
     index: HashMap<String, SettledEntry>,
     /// Reverse lookup from a settled record's WIRE-AGREED [`TaskDefId`] to its
@@ -291,6 +296,43 @@ pub struct SettledStore {
     records_committed: u64,
     /// Running estimate of resident index bytes (the memory-pin seam).
     approx_index_bytes: usize,
+    /// Read-path log-hygiene: an UNDECODABLE record body (an old on-disk
+    /// format inherited across the promotion seam from a prior-version
+    /// donor, say) is SKIPPED — the index entry's framing
+    /// (`offset`/`len`) is intact, so the read advances exactly past it
+    /// and every other record still decodes. Without throttling, an
+    /// adopted old-format base re-emits one ERROR per record on every
+    /// dominance probe / output read / stream package — per-record
+    /// spam for the process lifetime. This gate rolls those into ONE
+    /// WARN per interval naming the skipped count. Interior-mutable
+    /// (`Mutex`) so the read path stays `&self` (no caller threads a
+    /// `&mut`); node-local runtime state, reset on `clone_read_only`.
+    /// A STRUCTURAL fault (read past the committed offset, or an IO
+    /// error) stays a loud un-throttled ERROR — it is distinct from an
+    /// old-format body and signals real incoherence/corruption.
+    decode_skip_warn: Mutex<WarnThrottle>,
+}
+
+/// Roll up undecodable-record skips into at most one WARN this often.
+/// Matched to the other operator-fault throttles (a stuck fault must
+/// surface, but not once per record).
+const DECODE_SKIP_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+impl Default for SettledStore {
+    fn default() -> Self {
+        Self {
+            index: HashMap::new(),
+            def_id_to_hash: HashMap::new(),
+            segments: Vec::new(),
+            tasks_hash_acc: 0,
+            task_outputs_hash_acc: 0,
+            settled_outputs_count: 0,
+            own_segment: None,
+            records_committed: 0,
+            approx_index_bytes: 0,
+            decode_skip_warn: Mutex::new(WarnThrottle::new(DECODE_SKIP_WARN_INTERVAL)),
+        }
+    }
 }
 
 /// `Clone` IS the read-only clone ([`SettledStore::clone_read_only`]):
@@ -341,6 +383,11 @@ impl SettledStore {
             own_segment: None,
             records_committed: self.records_committed,
             approx_index_bytes: self.approx_index_bytes,
+            // Node-local runtime state (like `own_segment`): the clone
+            // gets a fresh throttle, so its first decode-skip on this
+            // replica emits immediately rather than inheriting the
+            // donor's suppression window.
+            decode_skip_warn: Mutex::new(WarnThrottle::new(DECODE_SKIP_WARN_INTERVAL)),
         }
     }
 
@@ -511,27 +558,35 @@ impl SettledStore {
     /// caller treats the entry as unreadable and degrades loudly at its
     /// own seam. Never reads past the segment's committed offset.
     fn read_record<I: Identifier>(&self, entry: &SettledEntry) -> Option<SettledRecord<I>> {
-        let segment = self.segments.get(entry.segment as usize)?;
-        let committed = segment.committed.load(Ordering::Acquire);
-        let end = entry.offset.checked_add(u64::from(entry.len))?;
+        self.read_at(entry.segment, entry.offset, entry.len)
+    }
+
+    /// Locate + decode the record at `(segment, offset, len)` — the
+    /// coordinate-keyed core both [`Self::read_record`] and the
+    /// decode-skip test seam share, so the locate/range-check/decode path
+    /// (and its log shape) is spelled ONCE.
+    fn read_at<I: Identifier>(&self, segment: u32, offset: u64, len: u32) -> Option<SettledRecord<I>> {
+        let seg = self.segments.get(segment as usize)?;
+        let committed = seg.committed.load(Ordering::Acquire);
+        let end = offset.checked_add(u64::from(len))?;
         if end > committed {
             // Index entries are only minted at commit (post-flush), so
             // this is structurally unreachable for a coherent store;
             // refuse rather than risk a torn read.
             tracing::error!(
-                offset = entry.offset,
-                len = entry.len,
+                offset,
+                len,
                 committed,
                 "settled-spill read past committed offset refused (index/commit incoherence)"
             );
             return None;
         }
-        let mut buf = vec![0u8; entry.len as usize];
-        if let Err(e) = read_exact_at(&segment.file, &mut buf, entry.offset) {
+        let mut buf = vec![0u8; len as usize];
+        if let Err(e) = read_exact_at(&seg.file, &mut buf, offset) {
             tracing::error!(
                 error = %e,
-                offset = entry.offset,
-                len = entry.len,
+                offset,
+                len,
                 "settled-spill record read failed"
             );
             return None;
@@ -541,14 +596,72 @@ impl SettledStore {
         match ciborium::from_reader(body) {
             Ok(rec) => Some(rec),
             Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    offset = entry.offset,
-                    "settled-spill record decode failed"
-                );
+                // An UNDECODABLE body is an old/foreign on-disk format,
+                // NOT corruption of THIS store's framing: the index
+                // carried the record's exact `(offset, len)`, so the
+                // read already advanced past it and every other record
+                // still decodes. SKIP it gracefully (return `None`, the
+                // index entry is untouched — the caller degrades at its
+                // own seam) and roll the skip into the throttled WARN so
+                // an adopted old-format base does not spam one ERROR per
+                // record on every read.
+                self.note_decode_skip(&e);
                 None
             }
         }
+    }
+
+    /// Account one skipped undecodable record and, at most once per
+    /// [`DECODE_SKIP_WARN_INTERVAL`], emit a rolled-up WARN naming how
+    /// many were suppressed since the last emit. Distinct from the loud
+    /// un-throttled ERRORs the structural-fault arms emit (read past
+    /// committed, IO error) — an old-format body is expected-and-skipped,
+    /// a torn/short read is real incoherence.
+    fn note_decode_skip(&self, error: &dyn std::fmt::Display) {
+        // A poisoned throttle lock (a prior panic mid-emit) must not
+        // gate the read; recover the guard and proceed.
+        let mut throttle = self
+            .decode_skip_warn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(suppressed) = throttle.permit() {
+            tracing::warn!(
+                error = %error,
+                also_skipped_since_last = suppressed,
+                "skipped undecodable settled-spill record(s) (old/foreign on-disk \
+                 format); the decodable records still load — set is not corrupted"
+            );
+        }
+    }
+
+    /// Test-only: register a read-only segment over `file` whose
+    /// published committed offset is `committed_to` (the bytes a reader
+    /// may reach), returning its segment id. Mirrors the production read
+    /// segment without the writer affiliation, so a test can hand-place a
+    /// mix of decodable + undecodable records and drive the decode path.
+    #[cfg(test)]
+    pub(crate) fn attach_read_segment_for_test(&mut self, file: Arc<File>, committed_to: u64) -> u32 {
+        let id = self.segments.len() as u32;
+        self.segments.push(SettledSegment {
+            file,
+            committed: Arc::new(AtomicU64::new(committed_to)),
+        });
+        id
+    }
+
+    /// Test-only: drive the coordinate-keyed decode at `(segment, offset,
+    /// len)` exactly as the production readers do (same range check, same
+    /// log shape, same decode-skip throttle). `Some` for a decodable
+    /// record, `None` for an undecodable/old-format one (skipped + counted
+    /// into the throttled WARN).
+    #[cfg(test)]
+    pub(crate) fn read_at_for_test<I: Identifier>(
+        &self,
+        segment: u32,
+        offset: u64,
+        len: u32,
+    ) -> Option<SettledRecord<I>> {
+        self.read_at(segment, offset, len)
     }
 }
 

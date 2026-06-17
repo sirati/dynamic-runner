@@ -370,8 +370,8 @@ fn capture_logs_thread_local() -> (
 /// `run` must return `RunError::ClusterCollapsed` carrying the per-category
 /// counts; the post-call accounting must satisfy
 /// `completed + failed + stranded == total`; and the diagnostic log line must
-/// fire so consumers grepping for "tasks left unassigned because cluster
-/// routing collapsed" see it on every collapse.
+/// fire so consumers grepping for "never reached a terminal outcome" see it
+/// on every collapse.
 ///
 /// This pins the assignment-time collapse path specifically: the secondaries
 /// die post-mesh-ready, so they are gone by the time the operational primary's
@@ -494,8 +494,8 @@ async fn stranded_on_cluster_collapse_returns_err_with_counts() {
             // `capture_logs_thread_local`).
             let captured = String::from_utf8_lossy(&log_buf.lock().unwrap()).into_owned();
             assert!(
-                captured.contains("tasks left unassigned because cluster routing collapsed"),
-                "diagnostic 'tasks left unassigned because cluster routing collapsed' must \
+                captured.contains("never reached a terminal outcome"),
+                "diagnostic 'never reached a terminal outcome' must \
              fire on the cluster-collapse arm so ops scripts can detect it; captured \
              error-level logs:\n{captured}"
             );
@@ -611,7 +611,7 @@ async fn strand_broadcasts_run_aborted_not_run_complete() {
             // per-class breakdown so the observer's narrator emits a
             // meaningful aborted line on the important channel.
             assert!(
-                reason.contains("cluster routing collapsed"),
+                reason.contains("never reached a terminal outcome"),
                 "abort reason must carry the ClusterCollapsed render, got: {reason}"
             );
         })
@@ -724,7 +724,7 @@ async fn stranded_at_transfer_complete_window_returns_err_with_counts() {
             // log detect this window's collapse too.
             let captured = String::from_utf8_lossy(&log_buf.lock().unwrap()).into_owned();
             assert!(
-                captured.contains("tasks left unassigned because cluster routing collapsed"),
+                captured.contains("never reached a terminal outcome"),
                 "the collapse diagnostic must fire on the transfer-complete-window arm; \
                  captured error-level logs:\n{captured}"
             );
@@ -918,7 +918,7 @@ async fn stranded_after_owed_discovery_collapse_returns_err_not_run_complete() {
             // The shared collapse diagnostic must fire so ops scripts detect it.
             let captured = String::from_utf8_lossy(&log_buf.lock().unwrap()).into_owned();
             assert!(
-                captured.contains("tasks left unassigned because cluster routing collapsed"),
+                captured.contains("never reached a terminal outcome"),
                 "the collapse diagnostic must fire on the Owed-discovery collapse arm; \
                  captured error-level logs:\n{captured}"
             );

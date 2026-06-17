@@ -6074,7 +6074,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 skipped = outcome.skipped,
                 stranded,
                 total,
-                "{stranded} tasks left unassigned because cluster routing collapsed \
+                "{stranded} task(s) never reached a terminal outcome — the run \
+                 loop exited (transport collapse / fleet-dead / inactivity) before \
+                 they were dispatched or accounted \
                  (succeeded={s} fail_retry={r} fail_oom={o} fail_final={fi} \
                  skipped={sk} stranded={stranded})",
                 s = outcome.succeeded,
@@ -6580,6 +6582,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }
             let drained = self.pool_mut().poll_drain_transitions();
             if drained.is_empty() {
+                // No phase reached its drain edge through the ordinary
+                // counter machinery. Before breaking, break the cross-phase
+                // drain-edge DEADLOCK (a doom cycle through soft roots: each
+                // phase's foreign-blocked dependent keeps it out of `Drained`,
+                // so neither reaches the edge where its own soft root would
+                // finalize). The pool surfaces every phase that owns a soft
+                // root yet has no live work OF ITS OWN; the manager — the
+                // sole owner of the retry-EXHAUSTION decision the pool cannot
+                // see — runs that phase's retry buckets exactly as at a normal
+                // drain edge. If a bucket still has budget the root is
+                // REVIVABLE (reinject, no finalize — a later success is never
+                // stranded); only when every bucket DECLINES do we finalize,
+                // promoting the soft root to permanent and cascading its
+                // dependents. The cascade flips genuinely-doomed phases to
+                // `Drained` (their dependents now see an `is_dead_ended`
+                // prereq), so we re-enter the loop to process them through the
+                // ordinary `on_phase_end` / `mark_phase_done` path. Drives
+                // progress ONLY when the ordinary poll is empty, so a normal
+                // drain edge is always preferred and this never short-circuits
+                // a phase that could still drain conventionally.
+                if self.drive_soft_finalize_deadlock(command_rx).await {
+                    continue;
+                }
                 break;
             }
             for p in &drained {
@@ -6811,6 +6836,85 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
     }
 
+    /// Break the cross-phase drain-edge DEADLOCK by driving the
+    /// retry-or-finalize decision for every phase the pool surfaces as
+    /// owning a soft root with no live work of its own
+    /// ([`PendingPool::phases_pending_soft_finalize`]) — but which a
+    /// foreign-blocked dependent keeps out of `Drained` (so the ordinary
+    /// `poll_drain_transitions` never returns it).
+    ///
+    /// Runs the SAME per-phase decision the drained-phase block uses (the
+    /// shared `try_run_phase_retry_bucket` + `finalize_phase_soft_failures`
+    /// helpers — no duplicated policy): a bucket with remaining budget
+    /// reinjects the soft root (REVIVABLE — no finalize, a later success is
+    /// not stranded); both buckets declining (EXHAUSTED) finalizes the soft
+    /// root, promoting it to permanent and cascading its dependents.
+    /// Deliberately does NOT fire `on_phase_end` / `mark_phase_done`: the
+    /// phase is NOT drained (it still owns the foreign-blocked dependent
+    /// until the cascade resolves it), and the finalize's cascade flips
+    /// every genuinely-doomed phase to `Drained` for the caller's ordinary
+    /// path to complete.
+    ///
+    /// Returns `true` iff at least one surfaced phase was acted on
+    /// (reinjected or finalized) — the caller re-enters its cascade loop so
+    /// the freshly-`Active` (reinject) or freshly-`Drained` (finalize)
+    /// phases are processed conventionally. `false` when nothing was
+    /// surfaced (no deadlock) so the caller breaks.
+    async fn drive_soft_finalize_deadlock(
+        &mut self,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) -> bool {
+        let surfaced = self.pool_mut().phases_pending_soft_finalize();
+        if surfaced.is_empty() {
+            return false;
+        }
+        let mut acted = false;
+        for p in &surfaced {
+            // Per-phase run-terminal re-check, same as the drained-phase
+            // block: a prior phase's finalize cascade could have latched the
+            // verdict via a queued command.
+            if self.run_terminal_cascade_gate() {
+                return acted;
+            }
+            // Same retry-bucket decision as the normal drain edge. A
+            // non-empty reinject (Ok(true)) means the root is REVIVABLE — the
+            // phase flipped Drained→Active and must NOT finalize.
+            if self
+                .try_run_phase_retry_bucket(
+                    p,
+                    crate::primary::retry_bucket::BucketKind::Recoverable,
+                    command_rx,
+                )
+                .await
+                .unwrap_or(false)
+            {
+                acted = true;
+                continue;
+            }
+            if self
+                .try_run_phase_retry_bucket(
+                    p,
+                    crate::primary::retry_bucket::BucketKind::Oom,
+                    command_rx,
+                )
+                .await
+                .unwrap_or(false)
+            {
+                acted = true;
+                continue;
+            }
+            // Both buckets declined (EXHAUSTED): promote this phase's soft
+            // roots to permanent and cascade their dependents. The cascade
+            // flips genuinely-doomed phases to `Drained` (their dependents
+            // now see an `is_dead_ended` prereq via the ordinary
+            // `live_blocked_count` path), which the caller's next loop
+            // iteration processes conventionally.
+            self.finalize_phase_soft_failures(p).await;
+            acted = true;
+        }
+        acted
+    }
+
     /// Per-completion bookkeeping shared between `handle_task_complete`
     /// and the failover path: increments per-phase counters and runs
     /// the lifecycle cascade. Decoupled so the call sites stay focused
@@ -6880,13 +6984,49 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // (F4) bump is owned by the `merge_task_state` join (#358) — the
         // caller's `ClusterMutation::TaskFailed` apply bumped it before this
         // bookkeeping runs, identically on every mirror.
-        match (task_id, kind) {
-            (Some(id), Some(k))
-                if !matches!(k, dynrunner_core::ErrorType::Unfulfillable { .. }) =>
-            {
+        //
+        // The POOL routing is decided by the error's permanence class
+        // (`ErrorType::retry_class`, the single owner of that decision —
+        // no carve-out re-derived here). A `None` kind / `None` id is the
+        // legacy in-flight-only decrement, for callers whose failure
+        // identity+permanence the pool already observed (e.g.
+        // `apply_fail_permanent`, whose `on_item_failed_permanent` ran
+        // first).
+        match (task_id, kind.map(dynrunner_core::ErrorType::retry_class)) {
+            // Retryable (Recoverable / memory-OOM): soft retry-pending
+            // marker; permanence is decided at the phase drain edge by the
+            // retry buckets / `finalize_phase_soft_failures`.
+            (Some(id), Some(dynrunner_core::RetryClass::Retryable)) => {
                 self.pool_mut().on_item_failed_pending_retry(phase_id, id);
             }
-            _ => {
+            // Permanent (NonRecoverable / InvalidTask / non-memory
+            // ResourceExhausted): terminal NOW. Permanence into the pool's
+            // `failed_tasks` + an IMMEDIATE dependent cascade — no soft
+            // marker (no retry bucket would ever accept it, so a soft
+            // marker would only wedge its dependents until a drain edge).
+            // The root's `TaskFailed` was already broadcast by the caller
+            // (the wire handler / the cascade helper); each cascaded
+            // dependent is recorded in the per-pass `failed_tasks` hash
+            // ledger AND broadcast as its own `TaskFailed` so the
+            // replicated per-phase rollup (`phase_can_proceed` reads
+            // `has_live`) and the run-completion counter (`completed +
+            // failed >= total`) both account it — the SAME shared
+            // `cascade_fail_dependents_terminal` the drain-edge finalize
+            // uses, so the cascade shape never drifts. Idempotent on a
+            // re-delivered terminal: a dependent already in
+            // `completed_tasks`/`failed_tasks` is skipped.
+            (Some(id), Some(dynrunner_core::RetryClass::Permanent)) => {
+                let cascaded = self.pool_mut().on_item_failed_permanent(phase_id, id);
+                self.cascade_fail_dependents_terminal(id, cascaded).await;
+            }
+            // Reinjectable (Unfulfillable): operator-reinjectable dormancy —
+            // dependents stay BLOCKED awaiting the reinject, NOT cascaded.
+            // Also the `None`-kind / `None`-id legacy in-flight-only
+            // decrement (callers whose permanence the pool already observed,
+            // e.g. `apply_fail_permanent`).
+            (Some(_), Some(dynrunner_core::RetryClass::Reinjectable))
+            | (None, _)
+            | (_, None) => {
                 self.pool_mut().on_item_finished(phase_id, None);
             }
         }
