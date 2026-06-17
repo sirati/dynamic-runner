@@ -546,6 +546,33 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }
         })
     }
+
+    /// Map a per-secondary affine import's BACKPRESSURE bounce onto the
+    /// bitvector: reset `(secondary, affine_id)` `Queued → NotDone` (the
+    /// `SecondaryAffineUnqueued` mutation — the SAME `01 → 00` cell reset
+    /// `steal_for` emits when a donor relinquishes its queued claim). `None` ⇒
+    /// the hash is not an affine def (an ordinary work task), so nothing
+    /// affine-side happens — symmetric with [`Self::affine_terminal_mutation`].
+    ///
+    /// This is the NON-terminal twin of `affine_terminal_mutation`: a bounce
+    /// means the import never ran here, so its cell must NOT go `Failed` (which
+    /// would mislead the readiness gate into a `Reroute`/`Unsatisfiable`) and
+    /// must NOT stay `Queued` (which would wedge the dependent `InFlightHere`
+    /// forever — the import's terminal already left as the swallowed bounce).
+    /// Resetting to `NotDone` lets the dependent's next pop read `StrandedHere`
+    /// and re-derive the import on-demand.
+    pub(crate) fn affine_unqueue_mutation(
+        &self,
+        secondary: &str,
+        task_hash: &str,
+    ) -> Option<ClusterMutation<I>> {
+        let affine_id = self.cluster_state.affine_id_for_hash(task_hash)?;
+        Some(ClusterMutation::SecondaryAffineUnqueued {
+            secondary: secondary.to_string(),
+            affine_id: affine_id.0,
+            generation: 0,
+        })
+    }
 }
 
 #[cfg(test)]

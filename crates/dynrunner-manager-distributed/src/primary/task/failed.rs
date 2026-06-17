@@ -129,20 +129,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 return;
             }
             // AFFINE failure (Model B): an affine task is the per-secondary
-            // IMPORT primitive — a failure on THIS secondary marks its
-            // bitvector cell `Failed` (per-secondary, Q1 non-sticky) and frees
-            // the worker slot, but is phase-NEUTRAL and consumes NO global retry
+            // IMPORT primitive — its terminal is per-secondary (the bitvector
+            // cell, Q1 non-sticky), phase-NEUTRAL, and consumes NO global retry
             // budget (affine is not phase-completion work; the dependent
             // re-routes to another secondary via re-placement, not a global
             // cascade). Handled OUTSIDE the global `failed_tasks` dedup for the
             // same per-secondary-rerun reason `handle_affine_task_complete` is.
-            // A backpressure-shaped affine bounce falls through to the ordinary
-            // requeue arm below (the import never ran; it re-enters via the
-            // per-secondary queue's re-derivation, harmless under the HINT
-            // property) — only a genuine terminal failure routes here.
-            if !is_backpressure_shaped(error_message)
-                && self.cluster_state.affine_id_for_hash(task_hash).is_some()
-            {
+            //
+            // The gate fires for EVERY affine hash regardless of backpressure
+            // shape — symmetric with the `handle_task_complete` affine gate
+            // (which is also unconditional on the affine-id) — because the
+            // affine subsystem is the SOLE owner of the per-secondary bitvector
+            // cell, the one piece of state a bounce must mutate. The
+            // backpressure-vs-genuine-terminal split is made INSIDE
+            // `handle_affine_task_failed`: a backpressure bounce of an import
+            // resets its cell `Queued → NotDone` (it never ran here, so the
+            // dependent must re-derive the import via `StrandedHere`, not see a
+            // `Failed`/`InFlightHere` wedge); a genuine terminal flips the cell
+            // `Failed`. Routing a backpressure-shaped affine bounce through the
+            // generic work-pool requeue arm below would `pool.requeue` a
+            // `SecondaryAffine` task — which `is_worker_assignable() == false`
+            // can never re-surface — AND leave its cell `Queued`, the original
+            // `InFlightHere` wedge.
+            if self.cluster_state.affine_id_for_hash(task_hash).is_some() {
                 // `Box::pin` the affine sub-handler so its future does not
                 // inline into `handle_task_failed`'s state machine (the
                 // relocation-future stack-depth sensitivity; see the twin in
@@ -470,15 +479,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     }
 
     /// Handle a `TaskFailed` for an AFFINE task (Model B) — a per-secondary
-    /// IMPORT failure. SEPARATE from the work-task path: the affine task runs
-    /// per-secondary, so its failure is per-secondary (the bitvector cell goes
-    /// `Failed` for THIS secondary, Q1 non-sticky) and phase-NEUTRAL — it
-    /// consumes no global retry budget and runs no `note_item_failed` cascade
-    /// (the dependent work task is not blocked on a global affine terminal; it
-    /// re-routes to another secondary via the placement trigger, whose rank
-    /// reads the bitvector — a `Failed` cell is neither `Done` nor `Queued`, so
-    /// that secondary is simply not preferred). Worker bookkeeping
-    /// (`free_slot_on_terminal`) still applies to this run.
+    /// IMPORT terminal. SEPARATE from the work-task path: the affine task runs
+    /// per-secondary, so its terminal is per-secondary (the bitvector cell) and
+    /// phase-NEUTRAL — it consumes no global retry budget and runs no
+    /// `note_item_failed` cascade (the dependent work task is not blocked on a
+    /// global affine terminal; it re-routes via the placement trigger, whose
+    /// rank reads the bitvector). Worker bookkeeping
+    /// (`free_affine_slot_on_terminal`) applies to every per-secondary run.
+    ///
+    /// The single split this function owns: a BACKPRESSURE-shaped bounce is NOT
+    /// a terminal — the import never ran on this secondary (a worker-pipe
+    /// respawn, a full pool, a no-fault preempt …), so it RESETS the cell
+    /// `Queued → NotDone` (the same `SecondaryAffineUnqueued` mutation `steal_for`
+    /// emits when a donor relinquishes a queued claim). The dependent work unit
+    /// sitting `InFlightHere` at the front of this secondary's affine queue then
+    /// reads `NotDone` on its next pop → `StrandedHere` →
+    /// `dispatch_affine_import_on_demand` re-runs the import on a Ready worker.
+    /// A genuine terminal failure instead flips the cell `Failed` (Q1
+    /// non-sticky) and fast-fails any now-`Unsatisfiable` dependents. The
+    /// backpressure case must NEVER `pool.requeue` the import (the generic
+    /// work-pool arm in `handle_task_failed`): a `SecondaryAffine` task is not
+    /// `is_worker_assignable`, so the work pool can never re-surface it, and the
+    /// cell would stay `Queued` — the original permanent `InFlightHere` wedge.
     async fn handle_affine_task_failed(
         &mut self,
         msg: &DistributedMessage<I>,
@@ -488,6 +510,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             secondary_id,
             worker_id,
             task_hash,
+            error_message,
             ..
         } = msg
         else {
@@ -496,46 +519,75 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let secondary_id = secondary_id.clone();
         let worker_id = *worker_id;
         let task_hash = task_hash.clone();
+        let is_backpressure = is_backpressure_shaped(error_message);
 
-        // BITVECTOR: mark this secondary's cell Failed (per-secondary,
-        // non-sticky — a later re-route/retry's Queued/Done overrides it).
-        if let Some(m) = self.affine_terminal_mutation(&secondary_id, &task_hash, false) {
-            self.apply_and_broadcast_cluster_mutations(vec![m]).await;
+        if is_backpressure {
+            // BACKPRESSURE BOUNCE: the import never ran here. Reset the cell
+            // `Queued → NotDone` so the dependent re-derives the import via the
+            // `StrandedHere` gate, rather than waiting forever on a `Queued`
+            // (`InFlightHere`) cell whose terminal already left as this bounce.
+            // `affine_unqueue_mutation` is `None` only for a hash with no
+            // affine-id — but the caller already gated on `affine_id_for_hash`,
+            // so it is `Some` here; the `if let` is defensive. NO `Failed`
+            // flip, NO `fast_fail` (the import is recoverable), and NO
+            // `drop_supplanted_holder` (symmetric with the work-pool
+            // backpressure arm: the hash re-enters, so the next on-demand
+            // dispatch must still be fenced).
+            if let Some(m) = self.affine_unqueue_mutation(&secondary_id, &task_hash) {
+                self.apply_and_broadcast_cluster_mutations(vec![m]).await;
+            }
+            tracing::debug!(
+                secondary = %secondary_id,
+                worker_id,
+                task_hash = %task_hash,
+                error = %error_message,
+                "affine import BOUNCED (backpressure) on secondary; cell reset \
+                 Queued → NotDone — dependent re-derives the import on-demand"
+            );
+        } else {
+            // GENUINE TERMINAL: mark this secondary's cell Failed (per-secondary,
+            // non-sticky — a later re-route/retry's Queued/Done overrides it).
+            if let Some(m) = self.affine_terminal_mutation(&secondary_id, &task_hash, false) {
+                self.apply_and_broadcast_cluster_mutations(vec![m]).await;
+            }
+            // EVENT-DRIVEN BATCH fast-fail: if this failure made the affine gate
+            // all-eligible-`Failed` (the import can no longer run on any roster
+            // secondary), terminal-fail EVERY now-`Unsatisfiable` dependent in ONE
+            // batched sweep — instead of draining one per dispatch tick (the ~0.2
+            // fails/sec starvation across thousands of dependents). The affine
+            // subsystem owns the gate→dependents enumeration; this is the same
+            // roster-aware `Unsatisfiable` predicate the per-dispatch gate uses,
+            // applied eagerly. Runs AFTER the cell flip so the satisfiability read
+            // sees this `Failed`. Threaded `command_rx`: the burst is failed DIRECTLY
+            // via the batched `apply_fail_permanent_batch` (ONE broadcast, ONE
+            // lifecycle pass) — never enqueued onto the bounded command channel,
+            // whose overflow would drop dependents at scale.
+            self.fast_fail_affine_dependents_if_unsatisfiable(&task_hash, command_rx)
+                .await;
+            self.drop_supplanted_holder(&task_hash);
+            tracing::warn!(
+                secondary = %secondary_id,
+                worker_id,
+                task_hash = %task_hash,
+                "affine import FAILED on secondary (bitvector Failed, non-sticky); \
+                 phase-neutral — dependents re-route via re-placement"
+            );
         }
-        // EVENT-DRIVEN BATCH fast-fail: if this failure made the affine gate
-        // all-eligible-`Failed` (the import can no longer run on any roster
-        // secondary), terminal-fail EVERY now-`Unsatisfiable` dependent in ONE
-        // batched sweep — instead of draining one per dispatch tick (the ~0.2
-        // fails/sec starvation across thousands of dependents). The affine
-        // subsystem owns the gate→dependents enumeration; this is the same
-        // roster-aware `Unsatisfiable` predicate the per-dispatch gate uses,
-        // applied eagerly. Runs AFTER the cell flip so the satisfiability read
-        // sees this `Failed`. Threaded `command_rx`: the burst is failed DIRECTLY
-        // via the batched `apply_fail_permanent_batch` (ONE broadcast, ONE
-        // lifecycle pass) — never enqueued onto the bounded command channel,
-        // whose overflow would drop dependents at scale.
-        self.fast_fail_affine_dependents_if_unsatisfiable(&task_hash, command_rx)
-            .await;
-        self.drop_supplanted_holder(&task_hash);
-        // WORKER SLOT: free the holding slot for THIS per-secondary run,
-        // addressed by the terminal's OWN (secondary, worker) — slot-direct, NOT
-        // the shared hash-keyed `free_slot_on_terminal`. The import runs the same
-        // hash on multiple secondaries concurrently; the hash-keyed ledger holds
-        // only one holder, so the shared path would free the wrong secondary's
-        // slot and orphan this worker's slot Assigned forever. No phase cascade.
+
+        // WORKER SLOT (both branches): free the holding slot for THIS
+        // per-secondary run, addressed by the terminal's OWN (secondary, worker)
+        // — slot-direct, NOT the shared hash-keyed `free_slot_on_terminal`. The
+        // import runs the same hash on multiple secondaries concurrently; the
+        // hash-keyed ledger holds only one holder, so the shared path would free
+        // the wrong secondary's slot and orphan this worker's slot Assigned
+        // forever. No phase cascade.
         self.free_affine_slot_on_terminal(&secondary_id, worker_id, &task_hash);
 
-        tracing::warn!(
-            secondary = %secondary_id,
-            worker_id,
-            task_hash = %task_hash,
-            "affine import FAILED on secondary (bitvector Failed, non-sticky); \
-             phase-neutral — dependents re-route via re-placement"
-        );
-
-        // The freed worker is re-evaluated by the dispatch recheck; the
-        // placement trigger re-routes the dependent away from this secondary
-        // (its cell is now Failed, not Done/Queued). Decoupled emit.
+        // The freed worker is re-evaluated by the dispatch recheck; on a
+        // backpressure reset the dependent re-pops `StrandedHere` and re-runs
+        // the import, on a genuine terminal the placement trigger re-routes the
+        // dependent away from this secondary (its cell is now Failed). Decoupled
+        // emit.
         self.cluster_state
             .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
         self.forward_completion_to_secondaries(msg, &secondary_id)
